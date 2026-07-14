@@ -1,5 +1,6 @@
 //! Direct, daemon-free harnesses for exercising pb internals.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -62,6 +63,8 @@ enum RunIndexRecord {
         run_journal: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_config: Option<WorkspaceConfigMetadata>,
+        #[serde(default)]
+        workflow_config: WorkflowConfigMetadata,
     },
     Finished {
         version: u32,
@@ -81,6 +84,8 @@ enum RunIndexRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_config: Option<WorkspaceConfigMetadata>,
         #[serde(default)]
+        workflow_config: WorkflowConfigMetadata,
+        #[serde(default)]
         audit: HarnessRunAudit,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
@@ -96,7 +101,42 @@ struct WorkspaceConfigMetadata {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowConfigMetadata {
+    source: String,
+    source_sha256: String,
+    policy_sha256: String,
+    delivery: crate::workflow::DeliveryPolicy,
+    default_intent: crate::workflow::TurnIntent,
+    limits: crate::workflow::WorkflowLimits,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct HarnessRunAudit {
+    strict_workflow: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_id: Option<String>,
+    #[serde(default)]
+    workflow_stage_sequence: Vec<crate::workflow::WorkflowStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_outcome: Option<crate::workflow::WorkflowOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_checkpoint_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_review_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code_review_sha256: Option<String>,
+    plan_cycles: usize,
+    repair_cycles: usize,
+    workflow_model_invocations: usize,
+    workflow_generated_tokens: usize,
+    workflow_advisory_calls: usize,
+    #[serde(default)]
+    workflow_stage_steps: BTreeMap<crate::workflow::WorkflowStage, usize>,
+    rejected_workflow_actions: usize,
+    evidence_invalidations: usize,
+    strict_workflow_satisfied: bool,
     #[serde(default)]
     affected_components: Vec<String>,
     #[serde(default)]
@@ -252,6 +292,50 @@ impl EventSink for HarnessEventSink {
                 if summary.contains("handoff teammate returned failed checks") {
                     state.audit.repair_turns += 1;
                 }
+                if matches!(
+                    summary.as_str(),
+                    "Workflow stage submission required"
+                        | "Workflow artifact validation failed"
+                        | "Tool not available"
+                ) {
+                    state.audit.rejected_workflow_actions += 1;
+                }
+            }
+            AgentEvent::WorkflowStarted { workflow_id, .. } => {
+                state.audit.strict_workflow = true;
+                state.audit.workflow_id = Some(workflow_id.clone());
+            }
+            AgentEvent::WorkflowStageStarted { stage, .. } => {
+                state.audit.workflow_stage_sequence.push(*stage);
+            }
+            AgentEvent::WorkflowArtifactAccepted {
+                artifact_kind,
+                sha256,
+                ..
+            } => match artifact_kind.as_str() {
+                "plan" => state.audit.plan_sha256 = Some(sha256.clone()),
+                "plan_review" => state.audit.plan_review_sha256 = Some(sha256.clone()),
+                "code_review" => state.audit.code_review_sha256 = Some(sha256.clone()),
+                _ => {}
+            },
+            AgentEvent::WorkflowEvidenceInvalidated { .. } => {
+                state.audit.evidence_invalidations += 1;
+            }
+            AgentEvent::WorkflowCompleted {
+                workflow_id,
+                outcome,
+                checkpoint_sha256,
+                ..
+            } => {
+                state.audit.strict_workflow = true;
+                state.audit.workflow_id = Some(workflow_id.clone());
+                state.audit.workflow_outcome = Some(*outcome);
+                state.audit.workflow_checkpoint_sha256 = Some(checkpoint_sha256.clone());
+                state.audit.strict_workflow_satisfied = matches!(
+                    outcome,
+                    crate::workflow::WorkflowOutcome::Ready
+                        | crate::workflow::WorkflowOutcome::NoChange
+                );
             }
             AgentEvent::SessionSummary {
                 branch,
@@ -382,12 +466,36 @@ impl EventSink for HarnessEventSink {
         checkpoint: &crate::workflow::WorkflowCheckpoint,
     ) -> Result<()> {
         checkpoint.validate()?;
-        let path = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("harness event journal lock was poisoned"))?
-            .workflow_checkpoint
-            .clone();
+        let path = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("harness event journal lock was poisoned"))?;
+            let run = &checkpoint.run;
+            state.audit.strict_workflow = true;
+            state.audit.workflow_id = Some(run.id.clone());
+            state.audit.workflow_outcome = run.outcome;
+            state.audit.workflow_checkpoint_sha256 = Some(checkpoint.sha256.clone());
+            state.audit.plan_sha256 = run.plan.as_ref().map(|plan| plan.sha256.clone());
+            state.audit.plan_review_sha256 =
+                run.plan_review.as_ref().map(|review| review.sha256.clone());
+            state.audit.code_review_sha256 =
+                run.code_review.as_ref().map(|review| review.sha256.clone());
+            state.audit.plan_cycles = run.counters.plan_cycles;
+            state.audit.repair_cycles = run.counters.repair_cycles;
+            state.audit.workflow_model_invocations = run.counters.model_invocations;
+            state.audit.workflow_generated_tokens = run.counters.generated_tokens;
+            state.audit.workflow_advisory_calls = run.counters.advisory_calls;
+            state.audit.workflow_stage_steps = run.counters.stage_steps.clone();
+            state.audit.strict_workflow_satisfied = matches!(
+                run.outcome,
+                Some(
+                    crate::workflow::WorkflowOutcome::Ready
+                        | crate::workflow::WorkflowOutcome::NoChange
+                )
+            );
+            state.workflow_checkpoint.clone()
+        };
         let bytes = serde_json::to_vec_pretty(checkpoint)
             .context("failed to serialize harness workflow checkpoint")?;
         atomic_write(&path, &bytes)
@@ -425,13 +533,18 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         .zip(trusted_workspace_graph.as_ref())
         .map(|(path, graph)| workspace_config_metadata(path, graph))
         .transpose()?;
-    let workflow_policy = args
+    let workflow_document = args
         .workflow_config
         .as_deref()
         .map(crate::workflow::WorkflowConfigDocument::from_path)
         .transpose()?
-        .unwrap_or_default()
-        .compile()?;
+        .unwrap_or_default();
+    let workflow_policy = workflow_document.clone().compile()?;
+    let workflow_config_metadata = workflow_config_metadata(
+        args.workflow_config.as_deref(),
+        &workflow_document,
+        &workflow_policy,
+    )?;
     let layout = prepare_scratch(args.scratch_dir.as_deref())?;
     println!("pb harness: scratch={}", layout.root.display());
     println!("pb harness: workspace={}", layout.workspace.display());
@@ -528,8 +641,18 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         contract,
     };
 
-    write_running_journal(&layout, &args.task, workspace_config_metadata.as_ref())?;
-    append_run_index_started(&layout, &args.task, workspace_config_metadata.as_ref())?;
+    write_running_journal(
+        &layout,
+        &args.task,
+        workspace_config_metadata.as_ref(),
+        &workflow_config_metadata,
+    )?;
+    append_run_index_started(
+        &layout,
+        &args.task,
+        workspace_config_metadata.as_ref(),
+        &workflow_config_metadata,
+    )?;
     let sink = HarnessEventSink::new(
         &layout.events,
         &layout.run_events,
@@ -545,6 +668,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         &summary,
         &audit,
         workspace_config_metadata.as_ref(),
+        &workflow_config_metadata,
         &mut observations,
     )?;
     append_run_index_finished(
@@ -552,6 +676,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         &run_result,
         &audit,
         workspace_config_metadata.as_ref(),
+        &workflow_config_metadata,
     )?;
 
     match run_result {
@@ -635,6 +760,37 @@ fn workspace_config_metadata(
     })
 }
 
+fn workflow_config_metadata(
+    path: Option<&Path>,
+    document: &crate::workflow::WorkflowConfigDocument,
+    policy: &crate::workflow::CompiledWorkflowPolicy,
+) -> Result<WorkflowConfigMetadata> {
+    let (source, bytes) = if let Some(path) = path {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read workflow config {}", path.display()))?;
+        let source = path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve workflow config {}", path.display()))?
+            .to_string_lossy()
+            .into_owned();
+        (source, bytes)
+    } else {
+        (
+            "builtin:strict-default".to_string(),
+            serde_json::to_vec(document)
+                .context("failed to serialize built-in workflow configuration")?,
+        )
+    };
+    Ok(WorkflowConfigMetadata {
+        source,
+        source_sha256: format!("{:x}", Sha256::digest(bytes)),
+        policy_sha256: policy.sha256.clone(),
+        delivery: policy.delivery,
+        default_intent: policy.default_intent,
+        limits: policy.limits,
+    })
+}
+
 fn load_check_evidence(path: &Path) -> Result<crate::checks::CheckEvidenceLedger> {
     if !path.exists() {
         return Ok(crate::checks::CheckEvidenceLedger::default());
@@ -712,6 +868,7 @@ fn append_run_index_started(
     layout: &ScratchLayout,
     task: &str,
     workspace_config: Option<&WorkspaceConfigMetadata>,
+    workflow_config: &WorkflowConfigMetadata,
 ) -> Result<()> {
     append_run_index_record(
         &layout.run_index,
@@ -723,6 +880,7 @@ fn append_run_index_started(
             run_events: relative_to_root(&layout.root, &layout.run_events),
             run_journal: relative_to_root(&layout.root, &layout.run_journal),
             workspace_config: workspace_config.cloned(),
+            workflow_config: workflow_config.clone(),
         },
     )
 }
@@ -732,6 +890,7 @@ fn append_run_index_finished(
     result: &Result<AgentRunResult>,
     audit: &HarnessRunAudit,
     workspace_config: Option<&WorkspaceConfigMetadata>,
+    workflow_config: &WorkflowConfigMetadata,
 ) -> Result<()> {
     let (status, reached_final, contract_status, verified_completed, termination_reason, error) =
         match result {
@@ -827,6 +986,7 @@ fn append_run_index_finished(
                 .and_then(|result| result.repository_context.as_ref())
                 .map(|context| context.invocation_baseline.id.clone()),
             workspace_config: workspace_config.cloned(),
+            workflow_config: workflow_config.clone(),
             audit: audit.clone(),
             error,
         },
@@ -1130,7 +1290,7 @@ fn add_run_observations(
     let committed =
         require_git_success(workspace, &["log", "--oneline", "main..HEAD"]).unwrap_or_default();
     if matches!(result, Ok(result) if result.reached_final
-        && result.handoff_outcome != Some(crate::events::HandoffOutcome::NoChange))
+        && matches!(result.handoff_outcome, Some(outcome) if outcome != crate::events::HandoffOutcome::NoChange))
         && committed.trim().is_empty()
     {
         observations.push(Observation {
@@ -1172,6 +1332,7 @@ fn write_journal(
     summary: &CapturedSummary,
     audit: &HarnessRunAudit,
     workspace_config: Option<&WorkspaceConfigMetadata>,
+    workflow_config: &WorkflowConfigMetadata,
     observations: &mut Vec<Observation>,
 ) -> Result<()> {
     observations.sort_by(|left, right| {
@@ -1247,6 +1408,14 @@ fn write_journal(
             metadata.executor_policy.join(", ")
         ));
     }
+    journal.push_str(&format!(
+        "- Workflow config: `{}`\n- Workflow config SHA-256: `{}`\n- Workflow policy SHA-256: `{}`\n- Workflow policy: `{:?}` (default intent `{:?}`)\n",
+        workflow_config.source,
+        workflow_config.source_sha256,
+        workflow_config.policy_sha256,
+        workflow_config.delivery,
+        workflow_config.default_intent,
+    ));
     journal.push_str(&format!("- Task: {task}\n"));
     journal.push_str(&format!("- Workspace: `{}`\n", layout.workspace.display()));
     journal.push_str(&format!("- Branch: `{branch}`\n"));
@@ -1257,6 +1426,39 @@ fn write_journal(
     journal.push_str(&format!(
         "- Cumulative events: `{}`\n",
         layout.events.display()
+    ));
+    journal.push_str("\n## Workflow audit\n\n");
+    journal.push_str(&format!(
+        "- Strict workflow enabled/satisfied: `{}` / `{}`\n- Workflow ID: `{}`\n- Outcome: `{}`\n- Stage sequence: `{}`\n- Plan / plan review / code review SHA-256: `{}` / `{}` / `{}`\n- Plan / repair cycles: `{}` / `{}`\n- Model invocations / generated tokens / advisory calls: `{}` / `{}` / `{}`\n- Stage steps: `{}`\n- Rejected workflow actions: `{}`\n- Evidence invalidations: `{}`\n- Checkpoint SHA-256: `{}`\n",
+        audit.strict_workflow,
+        audit.strict_workflow_satisfied,
+        audit.workflow_id.as_deref().unwrap_or("none"),
+        audit
+            .workflow_outcome
+            .map(|outcome| format!("{outcome:?}").to_ascii_lowercase())
+            .unwrap_or_else(|| "none".to_string()),
+        audit
+            .workflow_stage_sequence
+            .iter()
+            .map(|stage| format!("{stage:?}").to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(" -> "),
+        audit.plan_sha256.as_deref().unwrap_or("none"),
+        audit.plan_review_sha256.as_deref().unwrap_or("none"),
+        audit.code_review_sha256.as_deref().unwrap_or("none"),
+        audit.plan_cycles,
+        audit.repair_cycles,
+        audit.workflow_model_invocations,
+        audit.workflow_generated_tokens,
+        audit.workflow_advisory_calls,
+        serde_json::to_string(&audit.workflow_stage_steps)
+            .context("failed to serialize workflow stage step audit")?,
+        audit.rejected_workflow_actions,
+        audit.evidence_invalidations,
+        audit
+            .workflow_checkpoint_sha256
+            .as_deref()
+            .unwrap_or("none"),
     ));
     journal.push_str("\n## Handoff audit\n\n");
     journal.push_str(&format!(
@@ -1324,6 +1526,7 @@ fn write_running_journal(
     layout: &ScratchLayout,
     task: &str,
     workspace_config: Option<&WorkspaceConfigMetadata>,
+    workflow_config: &WorkflowConfigMetadata,
 ) -> Result<()> {
     let workspace_metadata = workspace_config
         .map(|metadata| {
@@ -1335,6 +1538,10 @@ fn write_running_journal(
             )
         })
         .unwrap_or_default();
+    let workflow_metadata = format!(
+        "- Workflow config: `{}`\n- Workflow config SHA-256: `{}`\n- Workflow policy SHA-256: `{}`\n",
+        workflow_config.source, workflow_config.source_sha256, workflow_config.policy_sha256,
+    );
     let journal = format!(
         "# pb harness journal\n\n\
          - Status: `running`\n\
@@ -1343,7 +1550,7 @@ fn write_running_journal(
          - Workspace: `{workspace}`\n\
          - Run events: `{run_events}`\n\
          - Cumulative events: `{events}`\n\
-         {workspace_metadata}\n\
+         {workspace_metadata}{workflow_metadata}\n\
          ## Ranked observations\n\n\
          1. **P1 — run has not finalized.** If the harness was interrupted, inspect the raw event stream and workspace before deciding whether to rerun.\n\n\
          ## Follow-up improvement plan\n\n\
@@ -1707,6 +1914,237 @@ mod tests {
     }
 
     #[test]
+    fn workflow_config_metadata_is_external_hash_bound_and_not_copied() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("workflow.toml");
+        let bytes = b"version = 1\ndefault_intent = \"deliver\"\n";
+        std::fs::write(&path, bytes).unwrap();
+        let document = crate::workflow::WorkflowConfigDocument::from_path(&path).unwrap();
+        let policy = document.clone().compile().unwrap();
+
+        let metadata = workflow_config_metadata(Some(&path), &document, &policy).unwrap();
+
+        assert_eq!(
+            metadata.source,
+            path.canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(
+            metadata.source_sha256,
+            format!("{:x}", Sha256::digest(bytes))
+        );
+        assert_eq!(metadata.policy_sha256, policy.sha256);
+        assert_eq!(metadata.delivery, policy.delivery);
+        assert_eq!(
+            metadata.default_intent,
+            crate::workflow::TurnIntent::Deliver
+        );
+        assert_eq!(metadata.limits, policy.limits);
+
+        let layout = prepare_scratch(Some(&parent.path().join("run"))).unwrap();
+        assert!(!layout.workspace.join("workflow.toml").exists());
+        assert!(!layout.workspace.join(".pb/workflow.toml").exists());
+        let repository =
+            crate::workspace::RepositoryContext::capture(&layout.workspace, &layout.workspace)
+                .unwrap();
+        assert!(repository.task_changed_paths().unwrap().is_empty());
+    }
+
+    #[test]
+    fn workflow_checkpoint_audit_and_config_persist_exactly() {
+        let parent = tempfile::tempdir().unwrap();
+        let layout = prepare_scratch(Some(&parent.path().join("run"))).unwrap();
+        let repository = harness_repository_context(&layout).unwrap();
+        let document = crate::workflow::WorkflowConfigDocument::default();
+        let policy = document.clone().compile().unwrap();
+        let metadata = workflow_config_metadata(None, &document, &policy).unwrap();
+        let mut run = crate::workflow::WorkflowRun::start(
+            "workflow-audit",
+            "turn-audit",
+            "deliver audited change",
+            policy,
+            repository,
+        )
+        .unwrap();
+        let plan = crate::workflow::ArtifactEnvelope::new(
+            "plan-audit",
+            crate::workflow::PlanArtifact {
+                summary: "Audited plan".to_string(),
+                requirements: Vec::new(),
+                steps: Vec::new(),
+                acceptance: Vec::new(),
+                risks: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                resolved_challenge_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let plan_review = crate::workflow::ArtifactEnvelope::new(
+            "plan-review-audit",
+            crate::workflow::PlanReviewArtifact {
+                plan_id: plan.id.clone(),
+                plan_sha256: plan.sha256.clone(),
+                assessments: Vec::new(),
+                challenges: Vec::new(),
+                verdict: crate::workflow::ReviewVerdict::Pass,
+            },
+        )
+        .unwrap();
+        let code_review = crate::workflow::ArtifactEnvelope::new(
+            "code-review-audit",
+            crate::workflow::CodeReviewArtifact {
+                content_fingerprint: "content-audit".to_string(),
+                assessments: Vec::new(),
+                findings: Vec::new(),
+                verdict: crate::workflow::ReviewVerdict::Pass,
+            },
+        )
+        .unwrap();
+        run.plan = Some(plan.clone());
+        run.plan_review = Some(plan_review.clone());
+        run.code_review = Some(code_review.clone());
+        run.content_fingerprint = Some("content-audit".to_string());
+        run.stage = crate::workflow::WorkflowStage::Ready;
+        run.outcome = Some(crate::workflow::WorkflowOutcome::Ready);
+        run.counters.plan_cycles = 1;
+        run.counters.repair_cycles = 2;
+        run.counters.model_invocations = 9;
+        run.counters.generated_tokens = 1234;
+        run.counters.advisory_calls = 3;
+        run.counters
+            .stage_steps
+            .insert(crate::workflow::WorkflowStage::Planning, 2);
+        run.counters
+            .stage_steps
+            .insert(crate::workflow::WorkflowStage::Repairing, 4);
+        let checkpoint = crate::workflow::WorkflowCheckpoint::new(run.clone()).unwrap();
+        let mut sink = HarnessEventSink::new(
+            &layout.events,
+            &layout.run_events,
+            &layout.workflow_checkpoint,
+        )
+        .unwrap();
+        for stage in [
+            crate::workflow::WorkflowStage::Planning,
+            crate::workflow::WorkflowStage::PlanReview,
+            crate::workflow::WorkflowStage::Implementing,
+            crate::workflow::WorkflowStage::Checking,
+            crate::workflow::WorkflowStage::CodeReview,
+            crate::workflow::WorkflowStage::Committing,
+        ] {
+            sink.emit(AgentEvent::WorkflowStageStarted {
+                workflow_id: run.id.clone(),
+                stage,
+                timestamp_ms: None,
+            });
+        }
+        sink.emit(AgentEvent::Correction {
+            message: "mutation denied".to_string(),
+            summary: "Tool not available".to_string(),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        sink.emit(AgentEvent::WorkflowEvidenceInvalidated {
+            workflow_id: run.id.clone(),
+            previous_fingerprint: "before".to_string(),
+            current_fingerprint: "after".to_string(),
+            reason: "mutation".to_string(),
+            timestamp_ms: None,
+        });
+        sink.checkpoint_workflow(&checkpoint).unwrap();
+
+        let persisted: crate::workflow::WorkflowCheckpoint =
+            serde_json::from_slice(&std::fs::read(&layout.workflow_checkpoint).unwrap()).unwrap();
+        assert_eq!(persisted, checkpoint);
+        let (_, summary, audit) = sink.snapshot().unwrap();
+        assert!(audit.strict_workflow);
+        assert!(audit.strict_workflow_satisfied);
+        assert_eq!(audit.workflow_id.as_deref(), Some("workflow-audit"));
+        assert_eq!(
+            audit.workflow_outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready)
+        );
+        assert_eq!(
+            audit.workflow_checkpoint_sha256.as_deref(),
+            Some(checkpoint.sha256.as_str())
+        );
+        assert_eq!(audit.plan_sha256.as_deref(), Some(plan.sha256.as_str()));
+        assert_eq!(
+            audit.plan_review_sha256.as_deref(),
+            Some(plan_review.sha256.as_str())
+        );
+        assert_eq!(
+            audit.code_review_sha256.as_deref(),
+            Some(code_review.sha256.as_str())
+        );
+        assert_eq!(audit.plan_cycles, 1);
+        assert_eq!(audit.repair_cycles, 2);
+        assert_eq!(audit.workflow_model_invocations, 9);
+        assert_eq!(audit.workflow_generated_tokens, 1234);
+        assert_eq!(audit.workflow_advisory_calls, 3);
+        assert_eq!(audit.workflow_stage_steps, run.counters.stage_steps);
+        assert_eq!(audit.rejected_workflow_actions, 1);
+        assert_eq!(audit.evidence_invalidations, 1);
+
+        let result = Ok(AgentRunResult {
+            branch: "main".to_string(),
+            workspace_root: layout.workspace.clone(),
+            focus_root: layout.workspace.clone(),
+            repository_context: Some(run.repository.clone()),
+            workspace_graph: None,
+            reached_final: true,
+            contract_status: crate::events::ContractStatus::Unspecified,
+            verified_completed: false,
+            termination_reason: crate::events::TerminationReason::Final,
+            handoff_outcome: Some(crate::events::HandoffOutcome::Ready),
+            workflow: Some(checkpoint.clone()),
+            delivery_proposal: None,
+            requested_delivery: None,
+        });
+        append_run_index_started(&layout, &run.task, None, &metadata).unwrap();
+        append_run_index_finished(&layout, &result, &audit, None, &metadata).unwrap();
+        write_journal(
+            &layout,
+            &run.task,
+            &result,
+            &summary,
+            &audit,
+            None,
+            &metadata,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let records = std::fs::read_to_string(&layout.run_index).unwrap();
+        let records = records
+            .lines()
+            .map(|line| serde_json::from_str::<RunIndexRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            &records[0],
+            RunIndexRecord::Started { workflow_config, .. } if workflow_config == &metadata
+        ));
+        assert!(matches!(
+            &records[1],
+            RunIndexRecord::Finished { workflow_config, audit: stored, .. }
+                if workflow_config == &metadata && stored == &audit
+        ));
+        let journal = std::fs::read_to_string(&layout.run_journal).unwrap();
+        assert!(journal.contains("Strict workflow enabled/satisfied: `true` / `true`"));
+        assert!(journal.contains(&checkpoint.sha256));
+        assert!(journal.contains(&plan.sha256));
+        assert!(
+            journal.contains(
+                "Model invocations / generated tokens / advisory calls: `9` / `1234` / `3`"
+            )
+        );
+        assert!(journal.contains("Rejected workflow actions: `1`"));
+        assert!(journal.contains("Evidence invalidations: `1`"));
+        assert!(journal.contains("builtin:strict-default"));
+        assert!(journal.contains(&metadata.policy_sha256));
+    }
+
+    #[test]
     fn valid_no_change_does_not_report_a_missing_commit_problem() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("run");
@@ -1728,6 +2166,41 @@ mod tests {
         });
         let summary = CapturedSummary {
             summary: "No changes were needed.".to_string(),
+            ..CapturedSummary::default()
+        };
+        let mut observations = Vec::new();
+
+        add_run_observations(&mut observations, &result, &layout.workspace, &summary);
+
+        assert!(
+            !observations
+                .iter()
+                .any(|observation| observation.title == "completed run produced no commits")
+        );
+    }
+
+    #[test]
+    fn discussion_does_not_report_a_missing_commit_problem() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        let layout = prepare_scratch(Some(&root)).unwrap();
+        let result = Ok(AgentRunResult {
+            branch: "main".to_string(),
+            workspace_root: layout.workspace.clone(),
+            focus_root: layout.workspace.clone(),
+            repository_context: None,
+            workspace_graph: None,
+            reached_final: true,
+            contract_status: crate::events::ContractStatus::Unspecified,
+            verified_completed: false,
+            termination_reason: crate::events::TerminationReason::Final,
+            handoff_outcome: None,
+            workflow: None,
+            delivery_proposal: None,
+            requested_delivery: None,
+        });
+        let summary = CapturedSummary {
+            summary: "Discussion answer.".to_string(),
             ..CapturedSummary::default()
         };
         let mut observations = Vec::new();
@@ -1868,7 +2341,13 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("run");
         let layout = prepare_scratch(Some(&root)).unwrap();
-        write_running_journal(&layout, "Build a test project", None).unwrap();
+        write_running_journal(
+            &layout,
+            "Build a test project",
+            None,
+            &WorkflowConfigMetadata::default(),
+        )
+        .unwrap();
 
         let journal = std::fs::read_to_string(layout.journal).unwrap();
         assert!(journal.contains("Status: `running`"));
@@ -1877,8 +2356,8 @@ mod tests {
     }
 
     fn finish_test_run(layout: &ScratchLayout, task: &str, branch: &str) {
-        write_running_journal(layout, task, None).unwrap();
-        append_run_index_started(layout, task, None).unwrap();
+        write_running_journal(layout, task, None, &WorkflowConfigMetadata::default()).unwrap();
+        append_run_index_started(layout, task, None, &WorkflowConfigMetadata::default()).unwrap();
         let sink = HarnessEventSink::new(
             &layout.events,
             &layout.run_events,
@@ -1918,10 +2397,18 @@ mod tests {
             &summary,
             &audit,
             None,
+            &WorkflowConfigMetadata::default(),
             &mut Vec::new(),
         )
         .unwrap();
-        append_run_index_finished(layout, &result, &audit, None).unwrap();
+        append_run_index_finished(
+            layout,
+            &result,
+            &audit,
+            None,
+            &WorkflowConfigMetadata::default(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1963,8 +2450,20 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("run");
         let layout = prepare_scratch(Some(&root)).unwrap();
-        write_running_journal(&layout, "interrupted task", None).unwrap();
-        append_run_index_started(&layout, "interrupted task", None).unwrap();
+        write_running_journal(
+            &layout,
+            "interrupted task",
+            None,
+            &WorkflowConfigMetadata::default(),
+        )
+        .unwrap();
+        append_run_index_started(
+            &layout,
+            "interrupted task",
+            None,
+            &WorkflowConfigMetadata::default(),
+        )
+        .unwrap();
 
         let records = std::fs::read_to_string(&layout.run_index).unwrap();
         let records = records

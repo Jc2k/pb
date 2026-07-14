@@ -12,19 +12,59 @@ use sha2::{Digest, Sha256};
 
 use crate::agent_core::{
     AgentProfile, AgentRequest, LocalModelEvalEngine, LocalModelEvalOutcome, ScriptedAgentOutcome,
-    ScriptedCompletion, run_local_model_eval_steps, run_scripted_agent_steps,
+    ScriptedCompletion, StageContext, run_local_model_eval_steps, run_scripted_agent_steps,
+    run_scripted_delivery_workflow, run_scripted_stage,
 };
 use crate::events::{AgentEvent, ContractStatus};
 use crate::{HarnessEvalArgs, config::UserConfig};
 
 const CONTROL_FIXTURES: &str = include_str!("../fixtures/harness-control-fixtures.json");
-const HARNESS_EVAL_SCHEMA_VERSION: u32 = 2;
+const HARNESS_EVAL_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlFixtureCorpus {
     pub version: u32,
     pub fixtures: Vec<ControlFixture>,
+    pub workflow_fixtures: Vec<WorkflowControlFixture>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowControlFixture {
+    pub id: String,
+    pub hypothesis: String,
+    pub assertion: WorkflowControlAssertion,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowControlAssertion {
+    DiscussionNoBranch,
+    DiscussionNoMutation,
+    ExplicitDeliveryStartsPlanning,
+    PlanningRequiresSubmission,
+    PlanningAuthorityIsReadOnly,
+    PlanStructureValidated,
+    PlanReviewHashBound,
+    PlanReviewEvidenceRequired,
+    PlanChallengeForcesRevision,
+    ImplementationRequiresAcceptedPlan,
+    ImplementationCanReplan,
+    RunCommandCannotBypassGates,
+    CheckFailureForcesRepair,
+    PostCheckMutationInvalidatesEvidence,
+    CodeReviewFingerprintBound,
+    CodeReviewPathEvidenceRequired,
+    CodeFindingForcesRepair,
+    PostReviewMutationBlocksCommit,
+    DelegationCannotEscalateAuthority,
+    WorkflowBudgetsAreGlobal,
+    ManagedCommitIsTaskOwned,
+    NoChangeCreatesNoCommit,
+    ResumePreservesStageAndBudget,
+    WebHarnessProjectionParity,
+    LegacyStateHasNoStrictClaim,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,9 +164,33 @@ pub struct ControlFixtureTurn {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ControlFixtureResult {
     pub id: String,
+    #[serde(default)]
+    pub strict_workflow: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_assertion_passed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_outcome: Option<crate::workflow::WorkflowOutcome>,
+    #[serde(default)]
+    pub workflow_stage_sequence: Vec<crate::workflow::WorkflowStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_plan_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_plan_review_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_code_review_sha256: Option<String>,
+    #[serde(default)]
+    pub workflow_plan_cycles: usize,
+    #[serde(default)]
+    pub workflow_repair_cycles: usize,
+    #[serde(default)]
+    pub workflow_advisory_calls: usize,
+    #[serde(default)]
+    pub workflow_rejected_actions: usize,
+    #[serde(default)]
+    pub workflow_evidence_invalidations: usize,
     pub reached_final: bool,
     #[serde(default)]
     pub contract_status: ContractStatus,
@@ -198,9 +262,9 @@ pub fn control_fixture_corpus() -> Result<ControlFixtureCorpus> {
 fn parse_control_fixture_corpus(contents: &str) -> Result<ControlFixtureCorpus> {
     let corpus: ControlFixtureCorpus = serde_json::from_str(contents)
         .context("failed to parse built-in harness control fixtures")?;
-    if corpus.version != 2 {
+    if corpus.version != 3 {
         bail!(
-            "unsupported harness control fixture version {}; expected 2",
+            "unsupported harness control fixture version {}; expected 3",
             corpus.version
         );
     }
@@ -223,6 +287,20 @@ fn parse_control_fixture_corpus(contents: &str) -> Result<ControlFixtureCorpus> 
                 "harness control fixture '{}' needs positive steps and at least one turn",
                 fixture.id
             );
+        }
+    }
+    if corpus.workflow_fixtures.len() != 25 {
+        bail!(
+            "harness workflow fixture corpus must contain the 25 required assertions; found {}",
+            corpus.workflow_fixtures.len()
+        );
+    }
+    for fixture in &corpus.workflow_fixtures {
+        if fixture.id.trim().is_empty() || fixture.hypothesis.trim().is_empty() {
+            bail!("harness workflow fixture id and hypothesis must not be empty");
+        }
+        if !ids.insert(fixture.id.as_str()) {
+            bail!("duplicate harness control fixture id '{}'", fixture.id);
         }
     }
     Ok(corpus)
@@ -288,6 +366,1125 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
     summarize_fixture(fixture, scratch.path(), outcome.into(), &events, false)
 }
 
+struct WorkflowFixtureState {
+    scratch: tempfile::TempDir,
+    graph: crate::workspace::WorkspaceGraph,
+    run: crate::workflow::WorkflowRun,
+    plan: crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>,
+}
+
+fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
+    let repository = crate::workspace::RepositoryContext::capture(root, root)?;
+    Ok(AgentRequest {
+        task: "exercise strict workflow control".to_string(),
+        turn_id: "turn-workflow-fixture".to_string(),
+        intent: Some(crate::workflow::TurnIntent::Deliver),
+        workflow_policy: Some(crate::workflow::WorkflowConfigDocument::default().compile()?),
+        workflow_stage: None,
+        workflow_checkpoint: None,
+        conversation_handoff: None,
+        model: "scripted-workflow-fixture".to_string(),
+        model_dir: None,
+        workdir: Some(root.to_path_buf()),
+        branch: None,
+        max_steps: 3,
+        max_tokens: 256,
+        turn_max_tokens_cap: Some(256),
+        tool_allowlist: Some(vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "run_command".to_string(),
+            "sub_agent".to_string(),
+        ]),
+        accept_existing_workspace_changes: false,
+        ctx_size: 1024,
+        threads: None,
+        threads_batch: None,
+        gpu_layers: 0,
+        temperature: 0.0,
+        profile: AgentProfile::Build,
+        infer_profile: false,
+        sub_agent_depth: 0,
+        repository_less: false,
+        top_k: 1,
+        seed: 0,
+        environment: None,
+        workspace_graph: Some(crate::workspace::WorkspaceGraph::legacy(&[])),
+        repository_context: Some(repository),
+        prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
+        session_id: "workflow-fixture".to_string(),
+        attachments: Vec::new(),
+        contract: None,
+    })
+}
+
+fn workflow_fixture_state() -> Result<WorkflowFixtureState> {
+    let scratch = tempfile::Builder::new()
+        .prefix("pb-workflow-fixture-")
+        .tempdir()?;
+    initialize_fixture_workspace(
+        scratch.path(),
+        &BTreeMap::from([("existing.txt".to_string(), "baseline\n".to_string())]),
+    )?;
+    let graph = crate::workspace::WorkspaceGraph::legacy(&[]);
+    let repository = crate::workspace::RepositoryContext::capture(scratch.path(), scratch.path())?;
+    let mut run = crate::workflow::WorkflowRun::start(
+        "workflow-control-fixture",
+        "turn-workflow-fixture",
+        "deliver the fixture change",
+        crate::workflow::WorkflowConfigDocument::default().compile()?,
+        repository,
+    )?;
+    let plan = workflow_fixture_plan(Vec::new())?;
+    plan.artifact
+        .validate(&graph, &run.repository.task_baseline.content)?;
+    run.apply(crate::workflow::WorkflowEvent::PlanSubmitted { plan: plan.clone() })?;
+    run.apply(crate::workflow::WorkflowEvent::PlanReviewSubmitted {
+        review: workflow_fixture_plan_review(&plan, crate::workflow::ReviewVerdict::Pass)?,
+    })?;
+    Ok(WorkflowFixtureState {
+        scratch,
+        graph,
+        run,
+        plan,
+    })
+}
+
+fn workflow_fixture_plan(
+    resolved_challenge_ids: Vec<String>,
+) -> Result<crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>> {
+    crate::workflow::ArtifactEnvelope::new(
+        "plan-workflow-fixture",
+        crate::workflow::PlanArtifact {
+            summary: "Modify the fixture and verify the result".to_string(),
+            requirements: vec![crate::workflow::PlanRequirement {
+                id: "req-fixture".to_string(),
+                description: "Deliver the requested fixture change".to_string(),
+                source: "current user task".to_string(),
+            }],
+            steps: vec![crate::workflow::PlanStep {
+                id: "step-fixture".to_string(),
+                requirement_ids: vec!["req-fixture".to_string()],
+                component_ids: Vec::new(),
+                paths: vec![crate::workflow::PlanPath {
+                    path: "existing.txt".to_string(),
+                    change: crate::workflow::PlannedChange::Modify,
+                }],
+                description: "Update the fixture".to_string(),
+            }],
+            acceptance: vec![crate::workflow::PlanAcceptance {
+                id: "accept-fixture".to_string(),
+                requirement_ids: vec!["req-fixture".to_string()],
+                check_ids: Vec::new(),
+                description: "The fixture content is updated".to_string(),
+            }],
+            risks: Vec::new(),
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            resolved_challenge_ids,
+        },
+    )
+}
+
+fn workflow_fixture_plan_review(
+    plan: &crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>,
+    verdict: crate::workflow::ReviewVerdict,
+) -> Result<crate::workflow::ArtifactEnvelope<crate::workflow::PlanReviewArtifact>> {
+    let blocking = verdict == crate::workflow::ReviewVerdict::Revise;
+    crate::workflow::ArtifactEnvelope::new(
+        if blocking {
+            "plan-review-revise"
+        } else {
+            "plan-review-pass"
+        },
+        crate::workflow::PlanReviewArtifact {
+            plan_id: plan.id.clone(),
+            plan_sha256: plan.sha256.clone(),
+            assessments: crate::workflow::REQUIRED_PLAN_ASSESSMENTS
+                .into_iter()
+                .map(|kind| crate::workflow::PlanAssessment {
+                    kind,
+                    status: if blocking {
+                        crate::workflow::AssessmentStatus::Concern
+                    } else {
+                        crate::workflow::AssessmentStatus::Pass
+                    },
+                    evidence: Vec::new(),
+                    explanation: "reviewed in a fresh context".to_string(),
+                })
+                .collect(),
+            challenges: blocking
+                .then(|| crate::workflow::ReviewChallenge {
+                    id: "challenge-fixture".to_string(),
+                    severity: crate::workflow::ReviewSeverity::P1,
+                    requirement_ids: vec!["req-fixture".to_string()],
+                    description: "The plan must address a blocking risk".to_string(),
+                    evidence: Vec::new(),
+                })
+                .into_iter()
+                .collect(),
+            verdict,
+        },
+    )
+}
+
+fn workflow_fixture_implementation(
+    plan: &crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>,
+    fingerprint: String,
+    no_change: bool,
+) -> Result<crate::workflow::ArtifactEnvelope<crate::workflow::ImplementationArtifact>> {
+    crate::workflow::ArtifactEnvelope::new(
+        if no_change {
+            "implementation-no-change"
+        } else {
+            "implementation-change"
+        },
+        crate::workflow::ImplementationArtifact {
+            plan_id: plan.id.clone(),
+            plan_sha256: plan.sha256.clone(),
+            content_fingerprint: fingerprint,
+            steps: vec![crate::workflow::ImplementationStep {
+                step_id: "step-fixture".to_string(),
+                status: if no_change {
+                    crate::workflow::ImplementationStepStatus::NoChange
+                } else {
+                    crate::workflow::ImplementationStepStatus::Completed
+                },
+                touched_paths: if no_change {
+                    Vec::new()
+                } else {
+                    vec!["existing.txt".to_string()]
+                },
+                summary: "accounted for the fixture step".to_string(),
+            }],
+            summary: "implemented the fixture plan".to_string(),
+            no_change,
+            semantic_commit_subject: "feat: deliver workflow fixture".to_string(),
+        },
+    )
+}
+
+fn workflow_fixture_code_review(
+    fingerprint: String,
+    verdict: crate::workflow::ReviewVerdict,
+) -> Result<crate::workflow::ArtifactEnvelope<crate::workflow::CodeReviewArtifact>> {
+    let blocking = verdict == crate::workflow::ReviewVerdict::Revise;
+    crate::workflow::ArtifactEnvelope::new(
+        if blocking {
+            "code-review-revise"
+        } else {
+            "code-review-pass"
+        },
+        crate::workflow::CodeReviewArtifact {
+            content_fingerprint: fingerprint,
+            assessments: crate::workflow::REQUIRED_CODE_ASSESSMENTS
+                .into_iter()
+                .map(|kind| crate::workflow::CodeAssessment {
+                    kind,
+                    status: if blocking {
+                        crate::workflow::AssessmentStatus::Concern
+                    } else {
+                        crate::workflow::AssessmentStatus::Pass
+                    },
+                    evidence: Vec::new(),
+                    explanation: "reviewed exact checked content".to_string(),
+                })
+                .collect(),
+            findings: blocking
+                .then(|| crate::workflow::CodeFinding {
+                    id: "finding-fixture".to_string(),
+                    severity: crate::workflow::ReviewSeverity::P1,
+                    path: Some("existing.txt".to_string()),
+                    line: Some(1),
+                    requirement_ids: vec!["req-fixture".to_string()],
+                    plan_step_ids: vec!["step-fixture".to_string()],
+                    evidence: Vec::new(),
+                    explanation: "the implementation requires repair".to_string(),
+                })
+                .into_iter()
+                .collect(),
+            verdict,
+        },
+    )
+}
+
+fn workflow_fixture_at_code_review() -> Result<WorkflowFixtureState> {
+    let mut state = workflow_fixture_state()?;
+    std::fs::write(state.scratch.path().join("existing.txt"), "delivered\n")?;
+    let snapshot = crate::workspace::ContentSnapshot::capture(state.scratch.path())?;
+    state
+        .run
+        .apply(crate::workflow::WorkflowEvent::ImplementationSubmitted {
+            implementation: workflow_fixture_implementation(
+                &state.plan,
+                snapshot.fingerprint.clone(),
+                false,
+            )?,
+        })?;
+    state
+        .run
+        .apply(crate::workflow::WorkflowEvent::ChecksPassed {
+            content_fingerprint: snapshot.fingerprint,
+            selected_checks: Vec::new(),
+            evidence: crate::checks::CheckEvidenceLedger::default(),
+        })?;
+    Ok(state)
+}
+
+#[derive(Default)]
+struct WorkflowAssertionObservation {
+    run: Option<crate::workflow::WorkflowRun>,
+    stage_sequence: Vec<crate::workflow::WorkflowStage>,
+    rejected_actions: usize,
+    evidence_invalidations: usize,
+    llm_invocations: usize,
+    tool_calls: usize,
+}
+
+impl WorkflowAssertionObservation {
+    fn from_run(run: crate::workflow::WorkflowRun) -> Self {
+        Self {
+            run: Some(run),
+            ..Self::default()
+        }
+    }
+}
+
+fn require_workflow_fixture(condition: bool, message: &str) -> Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        bail!("{message}")
+    }
+}
+
+fn plan_submission_completion(
+    plan: &crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>,
+) -> ScriptedCompletion {
+    ScriptedCompletion {
+        content: serde_json::json!({
+            "type": "tool_call",
+            "tool": "submit_plan",
+            "arguments": {"id": plan.id, "plan": plan.artifact}
+        })
+        .to_string(),
+        truncated: false,
+    }
+}
+
+fn workflow_tool_completion(tool: &str, arguments: serde_json::Value) -> ScriptedCompletion {
+    ScriptedCompletion {
+        content: serde_json::json!({
+            "type": "tool_call",
+            "tool": tool,
+            "arguments": arguments,
+        })
+        .to_string(),
+        truncated: false,
+    }
+}
+
+fn execute_workflow_assertion(
+    assertion: WorkflowControlAssertion,
+) -> Result<WorkflowAssertionObservation> {
+    match assertion {
+        WorkflowControlAssertion::DiscussionNoBranch => {
+            let state = workflow_fixture_state()?;
+            let mut request = workflow_fixture_request(state.scratch.path())?;
+            request.intent = Some(crate::workflow::TurnIntent::Discuss);
+            let before = git_output(state.scratch.path(), &["branch", "--show-current"])?;
+            let outcome = run_scripted_agent_steps(
+                &request,
+                vec![ScriptedCompletion {
+                    content:
+                        r#"{"type":"final","content":"We can discuss this without building."}"#
+                            .to_string(),
+                    truncated: false,
+                }],
+                state.scratch.path(),
+                &mut |_| {},
+            )?;
+            let after = git_output(state.scratch.path(), &["branch", "--show-current"])?;
+            require_workflow_fixture(outcome.reached_final, "discussion did not finish normally")?;
+            require_workflow_fixture(before == after, "discussion changed the task branch")?;
+            Ok(WorkflowAssertionObservation {
+                llm_invocations: outcome.llm_invocations,
+                tool_calls: outcome.tool_calls,
+                ..WorkflowAssertionObservation::default()
+            })
+        }
+        WorkflowControlAssertion::DiscussionNoMutation => {
+            let state = workflow_fixture_state()?;
+            let mut request = workflow_fixture_request(state.scratch.path())?;
+            request.intent = Some(crate::workflow::TurnIntent::Discuss);
+            request.max_steps = 2;
+            let outcome = run_scripted_agent_steps(
+                &request,
+                vec![
+                    ScriptedCompletion {
+                        content: r#"{"type":"tool_call","tool":"write_file","arguments":{"path":"forbidden.txt","content":"no"}}"#.to_string(),
+                        truncated: false,
+                    },
+                    ScriptedCompletion {
+                        content: r#"{"type":"final","content":"No repository mutation was performed."}"#.to_string(),
+                        truncated: false,
+                    },
+                ],
+                state.scratch.path(),
+                &mut |_| {},
+            )?;
+            require_workflow_fixture(
+                !state.scratch.path().join("forbidden.txt").exists(),
+                "discussion mutated the repository",
+            )?;
+            Ok(WorkflowAssertionObservation {
+                llm_invocations: outcome.llm_invocations,
+                tool_calls: outcome.tool_calls,
+                rejected_actions: 1,
+                ..WorkflowAssertionObservation::default()
+            })
+        }
+        WorkflowControlAssertion::ExplicitDeliveryStartsPlanning => {
+            let state = workflow_fixture_state()?;
+            let run = crate::workflow::WorkflowRun::start(
+                "workflow-starts-planning",
+                "turn-starts-planning",
+                "deliver",
+                state.run.policy.clone(),
+                state.run.repository.clone(),
+            )?;
+            require_workflow_fixture(
+                run.stage == crate::workflow::WorkflowStage::Planning,
+                "explicit delivery did not start at planning",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(run))
+        }
+        WorkflowControlAssertion::PlanningRequiresSubmission => {
+            let state = workflow_fixture_state()?;
+            let request = workflow_fixture_request(state.scratch.path())?;
+            let contract = crate::workflow::StageContract::strict(
+                crate::workflow::WorkflowStage::Planning,
+                request.workflow_policy.as_ref().unwrap().limits,
+                request.max_tokens,
+            )?;
+            let mut events = Vec::new();
+            let outcome = run_scripted_stage(
+                &request,
+                &contract,
+                StageContext {
+                    system_prompt: "plan".to_string(),
+                    user_prompt: "plan".to_string(),
+                },
+                vec![
+                    ScriptedCompletion {
+                        content: r#"{"type":"final","content":"prose plan"}"#.to_string(),
+                        truncated: false,
+                    },
+                    plan_submission_completion(&state.plan),
+                ],
+                state.scratch.path(),
+                &mut |event| events.push(event),
+            )?;
+            require_workflow_fixture(
+                matches!(
+                    outcome.stage.submission,
+                    Some(crate::workflow::StageSubmission::Plan { .. })
+                ),
+                "planning advanced without submit_plan",
+            )?;
+            require_workflow_fixture(
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::Correction { summary, .. }
+                            if summary == "Workflow stage submission required"
+                    )
+                }),
+                "prose final was not rejected",
+            )?;
+            Ok(WorkflowAssertionObservation {
+                llm_invocations: outcome.stage.usage.model_invocations,
+                rejected_actions: 1,
+                ..WorkflowAssertionObservation::default()
+            })
+        }
+        WorkflowControlAssertion::PlanningAuthorityIsReadOnly => {
+            let state = workflow_fixture_state()?;
+            let request = workflow_fixture_request(state.scratch.path())?;
+            let capabilities = crate::workflow::StageCapabilities::for_stage(
+                crate::workflow::WorkflowStage::Planning,
+            );
+            require_workflow_fixture(
+                !capabilities.allows_tool("write_file")
+                    && !capabilities.allows_tool("run_command")
+                    && capabilities.allows_tool("sub_agent"),
+                "planning capability surface grants mutation or shell authority",
+            )?;
+            let contract = crate::workflow::StageContract::strict(
+                crate::workflow::WorkflowStage::Planning,
+                request.workflow_policy.as_ref().unwrap().limits,
+                request.max_tokens,
+            )?;
+            let outcome = run_scripted_stage(
+                &request,
+                &contract,
+                StageContext {
+                    system_prompt: "plan".to_string(),
+                    user_prompt: "plan".to_string(),
+                },
+                vec![
+                    ScriptedCompletion {
+                        content: r#"{"type":"tool_call","tool":"run_command","arguments":{"cmd":"touch forbidden.txt"}}"#.to_string(),
+                        truncated: false,
+                    },
+                    plan_submission_completion(&state.plan),
+                ],
+                state.scratch.path(),
+                &mut |_| {},
+            )?;
+            require_workflow_fixture(
+                !state.scratch.path().join("forbidden.txt").exists(),
+                "hidden planning shell action executed",
+            )?;
+            Ok(WorkflowAssertionObservation {
+                llm_invocations: outcome.stage.usage.model_invocations,
+                rejected_actions: 1,
+                ..WorkflowAssertionObservation::default()
+            })
+        }
+        WorkflowControlAssertion::PlanStructureValidated => {
+            let state = workflow_fixture_state()?;
+            let invalid = crate::workflow::PlanArtifact {
+                summary: "incomplete".to_string(),
+                requirements: Vec::new(),
+                steps: Vec::new(),
+                acceptance: Vec::new(),
+                risks: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                resolved_challenge_ids: Vec::new(),
+            };
+            require_workflow_fixture(
+                invalid
+                    .validate(&state.graph, state.run.planning_content())
+                    .is_err(),
+                "malformed plan passed structural validation",
+            )?;
+            Ok(WorkflowAssertionObservation::default())
+        }
+        WorkflowControlAssertion::PlanReviewHashBound => {
+            let state = workflow_fixture_state()?;
+            let mut review =
+                workflow_fixture_plan_review(&state.plan, crate::workflow::ReviewVerdict::Pass)?;
+            review.artifact.plan_sha256 = "wrong".to_string();
+            require_workflow_fixture(
+                review.artifact.validate(&state.plan).is_err(),
+                "plan review accepted the wrong plan hash",
+            )?;
+            Ok(WorkflowAssertionObservation::default())
+        }
+        WorkflowControlAssertion::PlanReviewEvidenceRequired => {
+            let state = workflow_fixture_state()?;
+            let mut review =
+                workflow_fixture_plan_review(&state.plan, crate::workflow::ReviewVerdict::Pass)?;
+            review.artifact.assessments[0].evidence = vec![crate::workflow::EvidenceReference {
+                path: Some("existing.txt".to_string()),
+                line: Some(1),
+                check_id: None,
+                description: "fixture evidence".to_string(),
+            }];
+            require_workflow_fixture(
+                review
+                    .artifact
+                    .validate_observed_evidence(&state.graph, &HashSet::new())
+                    .is_err(),
+                "plan review accepted unread path evidence",
+            )?;
+            Ok(WorkflowAssertionObservation::default())
+        }
+        WorkflowControlAssertion::PlanChallengeForcesRevision => {
+            let state = workflow_fixture_state()?;
+            let mut run = crate::workflow::WorkflowRun::start(
+                "workflow-plan-revision",
+                "turn-plan-revision",
+                "deliver",
+                state.run.policy.clone(),
+                state.run.repository.clone(),
+            )?;
+            run.apply(crate::workflow::WorkflowEvent::PlanSubmitted {
+                plan: state.plan.clone(),
+            })?;
+            run.apply(crate::workflow::WorkflowEvent::PlanReviewSubmitted {
+                review: workflow_fixture_plan_review(
+                    &state.plan,
+                    crate::workflow::ReviewVerdict::Revise,
+                )?,
+            })?;
+            require_workflow_fixture(
+                run.stage == crate::workflow::WorkflowStage::PlanRevision
+                    && run.counters.plan_cycles == 1,
+                "blocking plan challenge did not force bounded revision",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(run))
+        }
+        WorkflowControlAssertion::ImplementationRequiresAcceptedPlan => {
+            let state = workflow_fixture_state()?;
+            let mut run = crate::workflow::WorkflowRun::start(
+                "workflow-no-plan-skip",
+                "turn-no-plan-skip",
+                "deliver",
+                state.run.policy.clone(),
+                state.run.repository.clone(),
+            )?;
+            let implementation = workflow_fixture_implementation(
+                &state.plan,
+                run.repository.task_baseline.content.fingerprint.clone(),
+                true,
+            )?;
+            require_workflow_fixture(
+                run.apply(crate::workflow::WorkflowEvent::ImplementationSubmitted {
+                    implementation,
+                })
+                .is_err(),
+                "implementation started before plan acceptance",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(run))
+        }
+        WorkflowControlAssertion::ImplementationCanReplan => {
+            let mut state = workflow_fixture_state()?;
+            std::fs::write(state.scratch.path().join("existing.txt"), "partial\n")?;
+            let snapshot = crate::workspace::ContentSnapshot::capture(state.scratch.path())?;
+            state
+                .run
+                .apply(crate::workflow::WorkflowEvent::ReplanRequested {
+                    reason: "material architecture discovery".to_string(),
+                    planning_snapshot: Some(snapshot.clone()),
+                })?;
+            require_workflow_fixture(
+                state.run.stage == crate::workflow::WorkflowStage::Planning
+                    && state.run.plan.is_none()
+                    && state.run.planning_content() == &snapshot,
+                "request_replan did not preserve and bind the current content snapshot",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(state.run))
+        }
+        WorkflowControlAssertion::RunCommandCannotBypassGates => {
+            let state = workflow_fixture_state()?;
+            let request = workflow_fixture_request(state.scratch.path())?;
+            let contract = crate::workflow::StageContract::strict(
+                crate::workflow::WorkflowStage::Implementing,
+                request.workflow_policy.as_ref().unwrap().limits,
+                request.max_tokens,
+            )?;
+            let outcome = run_scripted_stage(
+                &request,
+                &contract,
+                StageContext {
+                    system_prompt: "implement".to_string(),
+                    user_prompt: "implement".to_string(),
+                },
+                vec![
+                    ScriptedCompletion {
+                        content: r#"{"type":"tool_call","tool":"run_command","arguments":{"cmd":"touch shell.txt"}}"#.to_string(),
+                        truncated: false,
+                    },
+                    ScriptedCompletion {
+                        content: r#"{"type":"final","content":"done"}"#.to_string(),
+                        truncated: false,
+                    },
+                ],
+                state.scratch.path(),
+                &mut |_| {},
+            )?;
+            require_workflow_fixture(
+                state.scratch.path().join("shell.txt").exists()
+                    && outcome.stage.submission.is_none()
+                    && outcome.stage.termination_reason != crate::events::TerminationReason::Final,
+                "run_command either failed as an escape hatch or bypassed structured submission",
+            )?;
+            Ok(WorkflowAssertionObservation {
+                llm_invocations: outcome.stage.usage.model_invocations,
+                tool_calls: 1,
+                rejected_actions: 1,
+                ..WorkflowAssertionObservation::default()
+            })
+        }
+        _ => execute_workflow_assertion_tail(assertion),
+    }
+}
+
+fn workflow_fixture_at_checking() -> Result<WorkflowFixtureState> {
+    let mut state = workflow_fixture_state()?;
+    std::fs::write(state.scratch.path().join("existing.txt"), "delivered\n")?;
+    let snapshot = crate::workspace::ContentSnapshot::capture(state.scratch.path())?;
+    state
+        .run
+        .apply(crate::workflow::WorkflowEvent::ImplementationSubmitted {
+            implementation: workflow_fixture_implementation(
+                &state.plan,
+                snapshot.fingerprint,
+                false,
+            )?,
+        })?;
+    Ok(state)
+}
+
+fn execute_workflow_assertion_tail(
+    assertion: WorkflowControlAssertion,
+) -> Result<WorkflowAssertionObservation> {
+    match assertion {
+        WorkflowControlAssertion::CheckFailureForcesRepair => {
+            let mut state = workflow_fixture_at_checking()?;
+            let fingerprint = state.run.content_fingerprint.clone().unwrap();
+            state
+                .run
+                .apply(crate::workflow::WorkflowEvent::ChecksFailed {
+                    content_fingerprint: fingerprint,
+                    selected_checks: vec!["fixture-check".to_string()],
+                    evidence: crate::checks::CheckEvidenceLedger::default(),
+                    failed_check_ids: vec!["fixture-check".to_string()],
+                })?;
+            require_workflow_fixture(
+                state.run.stage == crate::workflow::WorkflowStage::Repairing
+                    && state.run.counters.repair_cycles == 1,
+                "failed required check did not force repair",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(state.run))
+        }
+        WorkflowControlAssertion::PostCheckMutationInvalidatesEvidence => {
+            let mut state = workflow_fixture_at_code_review()?;
+            state
+                .run
+                .apply(crate::workflow::WorkflowEvent::MutationObserved {
+                    content_fingerprint: "post-check-mutation".to_string(),
+                })?;
+            require_workflow_fixture(
+                state.run.stage == crate::workflow::WorkflowStage::Checking
+                    && state.run.checks == crate::checks::CheckEvidenceLedger::default()
+                    && state.run.code_review.is_none(),
+                "post-check mutation retained stale evidence",
+            )?;
+            Ok(WorkflowAssertionObservation {
+                run: Some(state.run),
+                evidence_invalidations: 1,
+                ..WorkflowAssertionObservation::default()
+            })
+        }
+        WorkflowControlAssertion::CodeReviewFingerprintBound => {
+            let mut state = workflow_fixture_at_code_review()?;
+            let review = workflow_fixture_code_review(
+                "wrong-fingerprint".to_string(),
+                crate::workflow::ReviewVerdict::Pass,
+            )?;
+            require_workflow_fixture(
+                state
+                    .run
+                    .apply(crate::workflow::WorkflowEvent::CodeReviewSubmitted { review })
+                    .is_err(),
+                "code review accepted the wrong content fingerprint",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(state.run))
+        }
+        WorkflowControlAssertion::CodeReviewPathEvidenceRequired => {
+            let state = workflow_fixture_at_code_review()?;
+            let review = workflow_fixture_code_review(
+                state.run.content_fingerprint.clone().unwrap(),
+                crate::workflow::ReviewVerdict::Pass,
+            )?;
+            require_workflow_fixture(
+                crate::agent_core::validate_code_review_submission(
+                    &review,
+                    &state.run,
+                    &state.graph,
+                    state.scratch.path(),
+                    &HashSet::new(),
+                )
+                .is_err(),
+                "code review passed without reading every changed path",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(state.run))
+        }
+        WorkflowControlAssertion::CodeFindingForcesRepair => {
+            let mut state = workflow_fixture_at_code_review()?;
+            let review = workflow_fixture_code_review(
+                state.run.content_fingerprint.clone().unwrap(),
+                crate::workflow::ReviewVerdict::Revise,
+            )?;
+            state
+                .run
+                .apply(crate::workflow::WorkflowEvent::CodeReviewSubmitted { review })?;
+            require_workflow_fixture(
+                state.run.stage == crate::workflow::WorkflowStage::Repairing
+                    && state.run.counters.repair_cycles == 1,
+                "blocking code finding did not force bounded repair",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(state.run))
+        }
+        WorkflowControlAssertion::PostReviewMutationBlocksCommit => {
+            let mut state = workflow_fixture_at_code_review()?;
+            let review = workflow_fixture_code_review(
+                state.run.content_fingerprint.clone().unwrap(),
+                crate::workflow::ReviewVerdict::Pass,
+            )?;
+            state
+                .run
+                .apply(crate::workflow::WorkflowEvent::CodeReviewSubmitted { review })?;
+            require_workflow_fixture(
+                state.run.stage == crate::workflow::WorkflowStage::Committing,
+                "passing review did not reach committing",
+            )?;
+            state
+                .run
+                .apply(crate::workflow::WorkflowEvent::MutationObserved {
+                    content_fingerprint: "post-review-mutation".to_string(),
+                })?;
+            require_workflow_fixture(
+                state.run.stage == crate::workflow::WorkflowStage::Checking
+                    && state.run.code_review.is_none(),
+                "post-review mutation did not return to checks and clear review",
+            )?;
+            Ok(WorkflowAssertionObservation {
+                run: Some(state.run),
+                evidence_invalidations: 1,
+                ..WorkflowAssertionObservation::default()
+            })
+        }
+        WorkflowControlAssertion::DelegationCannotEscalateAuthority => {
+            let state = workflow_fixture_state()?;
+            let mut request = workflow_fixture_request(state.scratch.path())?;
+            request.intent = Some(crate::workflow::TurnIntent::Discuss);
+            request.max_steps = 2;
+            let mut events = Vec::new();
+            let outcome = run_scripted_agent_steps(
+                &request,
+                vec![
+                    ScriptedCompletion {
+                        content: r#"{"type":"tool_call","tool":"sub_agent","arguments":{"profile":"build","task":"mutate the project","max_steps":1}}"#.to_string(),
+                        truncated: false,
+                    },
+                    ScriptedCompletion {
+                        content: r#"{"type":"final","content":"No mutating teammate was started."}"#.to_string(),
+                        truncated: false,
+                    },
+                ],
+                state.scratch.path(),
+                &mut |event| events.push(event),
+            )?;
+            require_workflow_fixture(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::SubAgentStarted { .. })),
+                "read-only parent delegated mutating authority",
+            )?;
+            Ok(WorkflowAssertionObservation {
+                llm_invocations: outcome.llm_invocations,
+                tool_calls: outcome.tool_calls,
+                rejected_actions: 1,
+                ..WorkflowAssertionObservation::default()
+            })
+        }
+        WorkflowControlAssertion::WorkflowBudgetsAreGlobal => {
+            let state = workflow_fixture_state()?;
+            let mut policy_document = crate::workflow::WorkflowConfigDocument::default();
+            policy_document.limits.advisory_calls = 1;
+            let mut run = crate::workflow::WorkflowRun::start(
+                "workflow-global-budget",
+                "turn-global-budget",
+                "deliver",
+                policy_document.compile()?,
+                state.run.repository.clone(),
+            )?;
+            run.apply(crate::workflow::WorkflowEvent::UsageRecorded {
+                usage: crate::workflow::WorkflowUsage {
+                    advisory_calls: 1,
+                    ..crate::workflow::WorkflowUsage::default()
+                },
+            })?;
+            run.apply(crate::workflow::WorkflowEvent::UsageRecorded {
+                usage: crate::workflow::WorkflowUsage {
+                    advisory_calls: 1,
+                    ..crate::workflow::WorkflowUsage::default()
+                },
+            })?;
+            require_workflow_fixture(
+                run.stage == crate::workflow::WorkflowStage::Failed
+                    && run.outcome == Some(crate::workflow::WorkflowOutcome::InvocationLimit),
+                "workflow-wide advisory budget could be multiplied",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(run))
+        }
+        WorkflowControlAssertion::ManagedCommitIsTaskOwned => {
+            let state = workflow_fixture_state()?;
+            std::fs::write(state.scratch.path().join("unrelated.txt"), "preserve\n")?;
+            let repository = crate::workspace::RepositoryContext::capture(
+                state.scratch.path(),
+                state.scratch.path(),
+            )?;
+            std::fs::write(state.scratch.path().join("existing.txt"), "owned\n")?;
+            let outcome = crate::handoff::managed_commit(
+                &repository,
+                "feat: commit reviewed fixture",
+                None,
+                &mut |_| {},
+            )?;
+            require_workflow_fixture(
+                matches!(outcome, crate::handoff::ManagedCommitOutcome::Created(_)),
+                "managed commit was not created",
+            )?;
+            let changed = git_output(
+                state.scratch.path(),
+                &["show", "--pretty=", "--name-only", "HEAD"],
+            )?;
+            require_workflow_fixture(
+                changed.trim() == "existing.txt"
+                    && state.scratch.path().join("unrelated.txt").exists(),
+                "managed commit included or removed unrelated content",
+            )?;
+            Ok(WorkflowAssertionObservation::default())
+        }
+        WorkflowControlAssertion::NoChangeCreatesNoCommit => {
+            let mut state = workflow_fixture_state()?;
+            let head_before = git_output(state.scratch.path(), &["rev-parse", "HEAD"])?;
+            let fingerprint = state
+                .run
+                .repository
+                .task_baseline
+                .content
+                .fingerprint
+                .clone();
+            state
+                .run
+                .apply(crate::workflow::WorkflowEvent::ImplementationSubmitted {
+                    implementation: workflow_fixture_implementation(
+                        &state.plan,
+                        fingerprint.clone(),
+                        true,
+                    )?,
+                })?;
+            state
+                .run
+                .apply(crate::workflow::WorkflowEvent::ChecksPassed {
+                    content_fingerprint: fingerprint,
+                    selected_checks: Vec::new(),
+                    evidence: crate::checks::CheckEvidenceLedger::default(),
+                })?;
+            let head_after = git_output(state.scratch.path(), &["rev-parse", "HEAD"])?;
+            require_workflow_fixture(
+                state.run.outcome == Some(crate::workflow::WorkflowOutcome::NoChange)
+                    && state.run.commit.is_none()
+                    && head_before == head_after,
+                "no-change delivery invented a commit or skipped its challenged plan",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(state.run))
+        }
+        WorkflowControlAssertion::ResumePreservesStageAndBudget => {
+            let mut state = workflow_fixture_state()?;
+            state
+                .run
+                .apply(crate::workflow::WorkflowEvent::UsageRecorded {
+                    usage: crate::workflow::WorkflowUsage {
+                        stage_steps: 2,
+                        model_invocations: 2,
+                        generated_tokens: 17,
+                        advisory_calls: 1,
+                    },
+                })?;
+            state.run.apply(crate::workflow::WorkflowEvent::Blocked {
+                outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+                reason: "pause for recovery".to_string(),
+            })?;
+            let encoded = serde_json::to_vec(&crate::workflow::WorkflowCheckpoint::new(
+                state.run.clone(),
+            )?)?;
+            let checkpoint: crate::workflow::WorkflowCheckpoint = serde_json::from_slice(&encoded)?;
+            checkpoint.validate()?;
+            let mut resumed = checkpoint.run;
+            resumed.apply(crate::workflow::WorkflowEvent::Resumed)?;
+            require_workflow_fixture(
+                resumed.stage == crate::workflow::WorkflowStage::Implementing
+                    && resumed.counters.model_invocations == 2
+                    && resumed.counters.generated_tokens == 17
+                    && resumed.counters.advisory_calls == 1,
+                "resume did not restore exact stage and global budgets",
+            )?;
+            Ok(WorkflowAssertionObservation::from_run(resumed))
+        }
+        WorkflowControlAssertion::WebHarnessProjectionParity => {
+            let state = workflow_fixture_state()?;
+            let request = workflow_fixture_request(state.scratch.path())?;
+            std::fs::write(state.scratch.path().join("existing.txt"), "delivered\n")?;
+            let fingerprint =
+                crate::workspace::ContentSnapshot::capture(state.scratch.path())?.fingerprint;
+            std::fs::write(state.scratch.path().join("existing.txt"), "baseline\n")?;
+            let plan_review =
+                workflow_fixture_plan_review(&state.plan, crate::workflow::ReviewVerdict::Pass)?;
+            let implementation =
+                workflow_fixture_implementation(&state.plan, fingerprint.clone(), false)?;
+            let code_review =
+                workflow_fixture_code_review(fingerprint, crate::workflow::ReviewVerdict::Pass)?;
+            let mut events = Vec::new();
+            let outcome = run_scripted_delivery_workflow(
+                &request,
+                vec![
+                    plan_submission_completion(&state.plan),
+                    workflow_tool_completion(
+                        "submit_plan_review",
+                        serde_json::json!({
+                            "id": plan_review.id,
+                            "review": plan_review.artifact,
+                        }),
+                    ),
+                    workflow_tool_completion(
+                        "read_file",
+                        serde_json::json!({"path": "existing.txt"}),
+                    ),
+                    workflow_tool_completion(
+                        "replace_file",
+                        serde_json::json!({"path": "existing.txt", "content": "delivered\n"}),
+                    ),
+                    workflow_tool_completion(
+                        "submit_implementation",
+                        serde_json::json!({
+                            "id": implementation.id,
+                            "implementation": implementation.artifact,
+                        }),
+                    ),
+                    workflow_tool_completion(
+                        "read_file",
+                        serde_json::json!({"path": "existing.txt"}),
+                    ),
+                    workflow_tool_completion(
+                        "submit_code_review",
+                        serde_json::json!({
+                            "id": code_review.id,
+                            "review": code_review.artifact,
+                        }),
+                    ),
+                ],
+                state.scratch.path(),
+                &mut |event| events.push(event),
+            )?;
+            let web_projection = crate::workflow::WorkflowSummary::from(&outcome.workflow.run);
+            let harness_outcome = events.iter().find_map(|event| match event {
+                AgentEvent::WorkflowCompleted { outcome, .. } => Some(*outcome),
+                _ => None,
+            });
+            let stage_sequence = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::WorkflowStageStarted { stage, .. } => Some(*stage),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            require_workflow_fixture(
+                web_projection.stage == crate::workflow::WorkflowStage::Ready
+                    && web_projection.outcome == harness_outcome
+                    && stage_sequence
+                        == vec![
+                            crate::workflow::WorkflowStage::Planning,
+                            crate::workflow::WorkflowStage::PlanReview,
+                            crate::workflow::WorkflowStage::Implementing,
+                            crate::workflow::WorkflowStage::Checking,
+                            crate::workflow::WorkflowStage::CodeReview,
+                            crate::workflow::WorkflowStage::Committing,
+                        ]
+                    && outcome.remaining_completions == 0
+                    && outcome.reached_final
+                    && outcome.verified_completed
+                    && outcome.termination_reason == crate::events::TerminationReason::Final
+                    && outcome.generation_tool_names.len() == 7,
+                "web and harness workflow projections diverged",
+            )?;
+            Ok(WorkflowAssertionObservation {
+                stage_sequence,
+                run: Some(outcome.workflow.run),
+                llm_invocations: outcome.llm_invocations,
+                tool_calls: outcome.tool_calls,
+                ..WorkflowAssertionObservation::default()
+            })
+        }
+        WorkflowControlAssertion::LegacyStateHasNoStrictClaim => {
+            let state = workflow_fixture_state()?;
+            let request = workflow_fixture_request(state.scratch.path())?;
+            let persisted = crate::session_store::PersistedSession::from_parts(
+                "legacy-workflow-fixture".to_string(),
+                request,
+                None,
+                Some(state.scratch.path().to_path_buf()),
+                false,
+                crate::session_store::SessionStatus::Completed,
+                Vec::new(),
+            );
+            let mut value = serde_json::to_value(persisted)?;
+            let object = value
+                .as_object_mut()
+                .context("persisted session is not an object")?;
+            object.remove("workflow");
+            object.remove("completed_workflows");
+            if let Some(request) = object
+                .get_mut("request_template")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                request.remove("intent");
+                request.remove("workflow_policy");
+                request.remove("workflow_checkpoint");
+                request.remove("turn_id");
+            }
+            let restored: crate::session_store::PersistedSession = serde_json::from_value(value)?;
+            require_workflow_fixture(
+                restored.workflow.is_none()
+                    && restored.completed_workflows.is_empty()
+                    && restored.request_template.workflow_policy.is_none()
+                    && restored.request_template.workflow_checkpoint.is_none(),
+                "legacy state acquired a strict workflow claim",
+            )?;
+            Ok(WorkflowAssertionObservation::default())
+        }
+        _ => bail!("workflow assertion was routed to the wrong evaluator"),
+    }
+}
+
+fn run_workflow_control_fixture(fixture: &WorkflowControlFixture) -> Result<ControlFixtureResult> {
+    let execution = execute_workflow_assertion(fixture.assertion);
+    let (passed, observation, diagnostic) = match execution {
+        Ok(observation) => (true, observation, None),
+        Err(error) => (
+            false,
+            WorkflowAssertionObservation::default(),
+            Some(format!("{error:#}")),
+        ),
+    };
+    let run = observation.run.as_ref();
+    Ok(ControlFixtureResult {
+        id: fixture.id.clone(),
+        strict_workflow: true,
+        workflow_assertion_passed: Some(passed),
+        workflow_outcome: run.and_then(|run| run.outcome),
+        workflow_stage_sequence: observation.stage_sequence,
+        workflow_plan_sha256: run.and_then(|run| run.plan.as_ref().map(|plan| plan.sha256.clone())),
+        workflow_plan_review_sha256: run
+            .and_then(|run| run.plan_review.as_ref().map(|review| review.sha256.clone())),
+        workflow_code_review_sha256: run
+            .and_then(|run| run.code_review.as_ref().map(|review| review.sha256.clone())),
+        workflow_plan_cycles: run.map_or(0, |run| run.counters.plan_cycles),
+        workflow_repair_cycles: run.map_or(0, |run| run.counters.repair_cycles),
+        workflow_advisory_calls: run.map_or(0, |run| run.counters.advisory_calls),
+        workflow_rejected_actions: observation.rejected_actions,
+        workflow_evidence_invalidations: observation.evidence_invalidations,
+        reached_final: passed,
+        termination_reason: if passed {
+            "fixture_pass".to_string()
+        } else {
+            "fixture_failed".to_string()
+        },
+        llm_invocations: observation.llm_invocations,
+        tool_calls: observation.tool_calls,
+        false_completion: false,
+        artifact_quality: diagnostic,
+        ..ControlFixtureResult::default()
+    })
+}
+
 fn fixture_runtime(
     fixture: &ControlFixture,
     workspace: &Path,
@@ -337,11 +1534,20 @@ fn fixture_workspace_graph(
 }
 
 pub fn run_control_fixture_corpus() -> Result<Vec<ControlFixtureResult>> {
-    control_fixture_corpus()?
+    let corpus = control_fixture_corpus()?;
+    let mut results = corpus
         .fixtures
         .iter()
         .map(run_control_fixture)
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    results.extend(
+        corpus
+            .workflow_fixtures
+            .iter()
+            .map(run_workflow_control_fixture)
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(results)
 }
 
 pub fn run_eval_command(args: HarnessEvalArgs) -> Result<()> {
@@ -354,6 +1560,12 @@ pub fn run_eval_command(args: HarnessEvalArgs) -> Result<()> {
                 .fixtures
                 .iter()
                 .map(run_control_fixture)
+                .chain(
+                    corpus
+                        .workflow_fixtures
+                        .iter()
+                        .map(run_workflow_control_fixture),
+                )
                 .collect::<Result<Vec<_>>>()?,
         ),
     };
@@ -437,13 +1649,16 @@ fn run_real_model_corpus(
         workspace_config_sha256: None,
         executor_policy: Vec::new(),
     };
-    let mut results = Vec::with_capacity(corpus.fixtures.len());
+    let mut results = Vec::with_capacity(corpus.fixtures.len() + corpus.workflow_fixtures.len());
     for fixture in &corpus.fixtures {
         results.push(run_real_model_fixture(
             fixture,
             &configuration,
             &mut engine,
         )?);
+    }
+    for fixture in &corpus.workflow_fixtures {
+        results.push(run_workflow_control_fixture(fixture)?);
     }
     Ok((configuration, results))
 }
@@ -517,41 +1732,70 @@ fn build_eval_records(
     configuration: HarnessEvalConfiguration,
     results: Vec<ControlFixtureResult>,
 ) -> Result<Vec<HarnessEvalRecord>> {
-    if results.len() != corpus.fixtures.len() {
+    let expected_count = corpus.fixtures.len() + corpus.workflow_fixtures.len();
+    if results.len() != expected_count {
         bail!(
             "harness evaluation produced {} results for {} fixtures",
             results.len(),
-            corpus.fixtures.len()
+            expected_count
         );
     }
-    corpus
-        .fixtures
-        .iter()
-        .zip(results)
-        .map(|(fixture, result)| {
-            if fixture.id != result.id {
-                bail!(
-                    "harness evaluation result order mismatch: expected {}, got {}",
-                    fixture.id,
-                    result.id
-                );
-            }
-            let protocol_failures = protocol_failures(&fixture.expected, &result);
-            let mut record_configuration = configuration.clone();
-            if let Some((sha256, executor_policy)) = fixture_workspace_metadata(fixture)? {
-                record_configuration.workspace_config_sha256 = Some(sha256);
-                record_configuration.executor_policy = executor_policy;
-            }
-            Ok(HarnessEvalRecord {
-                schema_version: HARNESS_EVAL_SCHEMA_VERSION,
-                fixture_version: corpus.version,
-                configuration: record_configuration,
-                protocol_pass: protocol_failures.is_empty(),
-                protocol_failures,
-                result,
-            })
-        })
-        .collect()
+    let mut records = Vec::with_capacity(expected_count);
+    let mut results = results.into_iter();
+    for fixture in &corpus.fixtures {
+        let result = results.next().context("missing legacy fixture result")?;
+        if fixture.id != result.id {
+            bail!(
+                "harness evaluation result order mismatch: expected {}, got {}",
+                fixture.id,
+                result.id
+            );
+        }
+        let protocol_failures = protocol_failures(&fixture.expected, &result);
+        let mut record_configuration = configuration.clone();
+        if let Some((sha256, executor_policy)) = fixture_workspace_metadata(fixture)? {
+            record_configuration.workspace_config_sha256 = Some(sha256);
+            record_configuration.executor_policy = executor_policy;
+        }
+        records.push(HarnessEvalRecord {
+            schema_version: HARNESS_EVAL_SCHEMA_VERSION,
+            fixture_version: corpus.version,
+            configuration: record_configuration,
+            protocol_pass: protocol_failures.is_empty(),
+            protocol_failures,
+            result,
+        });
+    }
+    for fixture in &corpus.workflow_fixtures {
+        let result = results.next().context("missing workflow fixture result")?;
+        if fixture.id != result.id {
+            bail!(
+                "harness evaluation result order mismatch: expected {}, got {}",
+                fixture.id,
+                result.id
+            );
+        }
+        let protocol_failures = if result.workflow_assertion_passed == Some(true) {
+            Vec::new()
+        } else {
+            vec![format!(
+                "workflow assertion failed: {}",
+                result
+                    .artifact_quality
+                    .as_deref()
+                    .unwrap_or("no diagnostic was recorded")
+            )]
+        };
+        records.push(HarnessEvalRecord {
+            schema_version: HARNESS_EVAL_SCHEMA_VERSION,
+            fixture_version: corpus.version,
+            configuration: configuration.clone(),
+            protocol_pass: protocol_failures.is_empty(),
+            protocol_failures,
+            result,
+        });
+    }
+    Ok(records)
 }
 
 fn validate_eval_record_schema(record: &HarnessEvalRecord) -> Result<()> {
@@ -1008,6 +2252,18 @@ fn summarize_fixture(
 
     Ok(ControlFixtureResult {
         id: fixture.id.clone(),
+        strict_workflow: false,
+        workflow_assertion_passed: None,
+        workflow_outcome: None,
+        workflow_stage_sequence: Vec::new(),
+        workflow_plan_sha256: None,
+        workflow_plan_review_sha256: None,
+        workflow_code_review_sha256: None,
+        workflow_plan_cycles: 0,
+        workflow_repair_cycles: 0,
+        workflow_advisory_calls: 0,
+        workflow_rejected_actions: 0,
+        workflow_evidence_invalidations: 0,
         reached_final: outcome.reached_final,
         contract_status: outcome.contract_status,
         verified_completed: outcome.verified_completed,
@@ -1116,6 +2372,22 @@ fn run_git(root: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn git_output(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,11 +2419,17 @@ mod tests {
         let baseline: BaselineReport = serde_json::from_str(BASELINE).unwrap();
 
         assert_eq!(baseline.fixture_version, corpus.version);
-        assert_eq!(baseline.captured_at, "2026-07-13");
+        assert_eq!(baseline.captured_at, "2026-07-14");
         let fixture_ids = corpus
             .fixtures
             .iter()
             .map(|fixture| fixture.id.as_str())
+            .chain(
+                corpus
+                    .workflow_fixtures
+                    .iter()
+                    .map(|fixture| fixture.id.as_str()),
+            )
             .collect::<std::collections::BTreeSet<_>>();
         let observation_ids = baseline
             .observations
@@ -1275,8 +2553,10 @@ mod tests {
 
     #[test]
     fn version_one_fixture_and_result_schemas_are_rejected_explicitly() {
-        let error = parse_control_fixture_corpus(r#"{"version":1,"fixtures":[]}"#).unwrap_err();
-        assert!(error.to_string().contains("expected 2"));
+        let error =
+            parse_control_fixture_corpus(r#"{"version":1,"fixtures":[],"workflow_fixtures":[]}"#)
+                .unwrap_err();
+        assert!(error.to_string().contains("expected 3"));
 
         let corpus = control_fixture_corpus().unwrap();
         let mut record = build_eval_records(
@@ -1288,7 +2568,7 @@ mod tests {
         .remove(0);
         record.schema_version = 1;
         let error = validate_eval_record_schema(&record).unwrap_err();
-        assert!(error.to_string().contains("expected 2"));
+        assert!(error.to_string().contains("expected 3"));
     }
 
     #[test]
@@ -1341,7 +2621,7 @@ mod tests {
         assert_eq!(first_jsonl, second_jsonl);
         for line in first_jsonl.lines() {
             let record: HarnessEvalRecord = serde_json::from_str(line).unwrap();
-            assert_eq!(record.schema_version, 2);
+            assert_eq!(record.schema_version, 3);
             assert_eq!(record.configuration.mode, "scripted");
         }
     }

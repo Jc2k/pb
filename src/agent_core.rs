@@ -2834,17 +2834,17 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
         builtin_tool(
             "submit_plan",
             "Submit the complete structured plan and end this planning stage. Prose or final responses do not advance delivery.",
-            submission_schema("plan", "Validated plan artifact."),
+            plan_submission_schema(),
         ),
         builtin_tool(
             "submit_plan_review",
             "Submit the structured critique of the exact accepted plan and end this review stage.",
-            submission_schema("review", "Plan review artifact."),
+            plan_review_submission_schema(),
         ),
         builtin_tool(
             "submit_implementation",
             "Submit structured accounting for every accepted plan step and end this implementation or repair stage.",
-            submission_schema("implementation", "Implementation artifact."),
+            implementation_submission_schema(),
         ),
         builtin_tool(
             "request_replan",
@@ -2860,18 +2860,271 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
         builtin_tool(
             "submit_code_review",
             "Submit the structured critique of the exact checked content and end this code-review stage.",
-            submission_schema("review", "Code review artifact."),
+            code_review_submission_schema(),
         ),
     ]
 }
 
-fn submission_schema(field: &'static str, description: &'static str) -> Value {
+fn artifact_submission_schema(
+    field: &'static str,
+    description: &'static str,
+    artifact_schema: Value,
+) -> Value {
     object_schema(
         [
             string_property("id", "Stable artifact id for this stage submission."),
-            object_property(field, description),
+            (
+                field,
+                json!({
+                    "description": description,
+                    "allOf": [artifact_schema],
+                }),
+            ),
         ],
         ["id", field],
+    )
+}
+
+fn string_array_schema(description: &'static str) -> Value {
+    json!({
+        "type": "array",
+        "description": description,
+        "items": {"type": "string"},
+    })
+}
+
+fn evidence_reference_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "line": {"type": "integer", "minimum": 1},
+            "check_id": {"type": "string"},
+            "description": {"type": "string"},
+        },
+        "required": ["description"],
+        "additionalProperties": false,
+    })
+}
+
+fn assessment_schema(kinds: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": kinds},
+            "status": {"type": "string", "enum": ["pass", "concern", "fail"]},
+            "evidence": {"type": "array", "items": evidence_reference_schema()},
+            "explanation": {"type": "string"},
+        },
+        "required": ["kind", "status", "evidence", "explanation"],
+        "additionalProperties": false,
+    })
+}
+
+fn plan_submission_schema() -> Value {
+    artifact_submission_schema(
+        "plan",
+        "Validated plan artifact.",
+        json!({
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "requirements": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "description": {"type": "string"},
+                            "source": {"type": "string"},
+                        },
+                        "required": ["id", "description", "source"],
+                        "additionalProperties": false,
+                    },
+                },
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "requirement_ids": string_array_schema("Requirement ids covered by this step."),
+                            "component_ids": string_array_schema("Workspace component ids affected by this step."),
+                            "paths": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "change": {"type": "string", "enum": ["create", "modify", "delete"]},
+                                    },
+                                    "required": ["path", "change"],
+                                    "additionalProperties": false,
+                                },
+                            },
+                            "description": {"type": "string"},
+                        },
+                        "required": ["id", "requirement_ids", "component_ids", "paths", "description"],
+                        "additionalProperties": false,
+                    },
+                },
+                "acceptance": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "requirement_ids": string_array_schema("Requirement ids proved by this fact."),
+                            "check_ids": string_array_schema("Configured check ids that prove this fact."),
+                            "description": {"type": "string"},
+                        },
+                        "required": ["id", "requirement_ids", "check_ids", "description"],
+                        "additionalProperties": false,
+                    },
+                },
+                "risks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "description": {"type": "string"},
+                            "mitigation": {"type": "string"},
+                        },
+                        "required": ["id", "description", "mitigation"],
+                        "additionalProperties": false,
+                    },
+                },
+                "assumptions": string_array_schema("Explicit assumptions."),
+                "open_questions": string_array_schema("Must be empty at submission."),
+                "resolved_challenge_ids": string_array_schema("Blocking challenge ids resolved by this revision."),
+            },
+            "required": [
+                "summary", "requirements", "steps", "acceptance", "risks", "assumptions",
+                "open_questions", "resolved_challenge_ids"
+            ],
+            "additionalProperties": false,
+        }),
+    )
+}
+
+fn plan_review_submission_schema() -> Value {
+    artifact_submission_schema(
+        "review",
+        "Plan review artifact.",
+        json!({
+            "type": "object",
+            "properties": {
+                "plan_id": {"type": "string"},
+                "plan_sha256": {"type": "string"},
+                "assessments": {
+                    "type": "array",
+                    "items": assessment_schema(&[
+                        "requirement_coverage", "architecture", "component_impact",
+                        "test_strategy", "failure_modes", "assumptions"
+                    ]),
+                },
+                "challenges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "severity": {"type": "string", "enum": ["p0", "p1", "p2", "p3"]},
+                            "requirement_ids": string_array_schema("Affected requirement ids."),
+                            "description": {"type": "string"},
+                            "evidence": {"type": "array", "items": evidence_reference_schema()},
+                        },
+                        "required": ["id", "severity", "requirement_ids", "description", "evidence"],
+                        "additionalProperties": false,
+                    },
+                },
+                "verdict": {"type": "string", "enum": ["pass", "revise"]},
+            },
+            "required": ["plan_id", "plan_sha256", "assessments", "challenges", "verdict"],
+            "additionalProperties": false,
+        }),
+    )
+}
+
+fn implementation_submission_schema() -> Value {
+    artifact_submission_schema(
+        "implementation",
+        "Implementation artifact.",
+        json!({
+            "type": "object",
+            "properties": {
+                "plan_id": {"type": "string"},
+                "plan_sha256": {"type": "string"},
+                "content_fingerprint": {"type": "string"},
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step_id": {"type": "string"},
+                            "status": {"type": "string", "enum": ["completed", "no_change", "incomplete"]},
+                            "touched_paths": string_array_schema("Actual repository-relative paths touched by this step."),
+                            "summary": {"type": "string"},
+                        },
+                        "required": ["step_id", "status", "touched_paths", "summary"],
+                        "additionalProperties": false,
+                    },
+                },
+                "summary": {"type": "string"},
+                "no_change": {"type": "boolean"},
+                "semantic_commit_subject": {"type": "string"},
+            },
+            "required": [
+                "plan_id", "plan_sha256", "content_fingerprint", "steps", "summary",
+                "no_change", "semantic_commit_subject"
+            ],
+            "additionalProperties": false,
+        }),
+    )
+}
+
+fn code_review_submission_schema() -> Value {
+    artifact_submission_schema(
+        "review",
+        "Code review artifact.",
+        json!({
+            "type": "object",
+            "properties": {
+                "content_fingerprint": {"type": "string"},
+                "assessments": {
+                    "type": "array",
+                    "items": assessment_schema(&[
+                        "correctness", "requirements", "architecture",
+                        "tests", "regressions", "maintainability"
+                    ]),
+                },
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "severity": {"type": "string", "enum": ["p0", "p1", "p2", "p3"]},
+                            "path": {"type": "string"},
+                            "line": {"type": "integer", "minimum": 1},
+                            "requirement_ids": string_array_schema("Affected requirement ids."),
+                            "plan_step_ids": string_array_schema("Affected accepted plan step ids."),
+                            "evidence": {"type": "array", "items": evidence_reference_schema()},
+                            "explanation": {"type": "string"},
+                        },
+                        "required": [
+                            "id", "severity", "requirement_ids", "plan_step_ids",
+                            "evidence", "explanation"
+                        ],
+                        "additionalProperties": false,
+                    },
+                },
+                "verdict": {"type": "string", "enum": ["pass", "revise"]},
+            },
+            "required": ["content_fingerprint", "assessments", "findings", "verdict"],
+            "additionalProperties": false,
+        }),
     )
 }
 
@@ -2932,13 +3185,6 @@ fn boolean_property(name: &'static str, description: &'static str) -> (&'static 
     (
         name,
         json!({ "type": "boolean", "description": description }),
-    )
-}
-
-fn object_property(name: &'static str, description: &'static str) -> (&'static str, Value) {
-    (
-        name,
-        json!({ "type": "object", "description": description }),
     )
 }
 
@@ -3168,6 +3414,7 @@ fn run_agent_steps(
     let mut consecutive_parse_failures = 0usize;
     let mut deterministic_failures = DeterministicFailureTracker::default();
     let mut tool_loop_guard = ToolLoopGuard::default();
+    let mut terminal_submission_only = false;
     let gate_state = RefCell::new(initial_gate_state(
         args,
         workspace_root,
@@ -3238,11 +3485,38 @@ fn run_agent_steps(
             timestamp_ms: Some(now_millis()),
         });
 
+        let terminal_precondition =
+            workflow_terminal_precondition_feedback(args, &gate_state.borrow(), workspace_root)?;
+        let mut scoped_tools = available_tools.clone();
+        if terminal_precondition.is_some()
+            && let Some(required) = args.workflow_stage.and_then(workflow_terminal_tool_name)
+        {
+            scoped_tools.retain(|tool| tool.name != required);
+        }
+        let terminal_tools = terminal_submission_only
+            .then(|| {
+                args.workflow_stage
+                    .and_then(workflow_terminal_tool_name)
+                    .map(|required| {
+                        scoped_tools
+                            .iter()
+                            .filter(|tool| tool.name == required)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let generation_tools = if terminal_submission_only {
+            terminal_tools.as_slice()
+        } else {
+            scoped_tools.as_slice()
+        };
         let generated = match generate_and_parse_action_with_retries(
             generator,
             args,
             messages,
-            &available_tools,
+            generation_tools,
             step,
             &mut metrics,
             sink,
@@ -3346,9 +3620,18 @@ fn run_agent_steps(
                 if let Some(stage) = args.workflow_stage {
                     let required =
                         crate::workflow::StageCapabilities::for_stage(stage).terminal_action;
-                    let feedback = format!(
-                        "workflow stage {stage:?} requires its named {required:?} tool; a prose/final response cannot advance delivery"
+                    let mut feedback = format!(
+                        "workflow stage {stage:?} requires its named {required:?} tool; a prose/final response cannot advance delivery\n\n{}",
+                        workflow_terminal_submission_guidance(stage),
                     );
+                    if let Some(precondition) = workflow_terminal_precondition_feedback(
+                        args,
+                        &gate_state.borrow(),
+                        workspace_root,
+                    )? {
+                        feedback.push_str("\n\n");
+                        feedback.push_str(&precondition);
+                    }
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
                         summary: "Workflow stage submission required".to_string(),
@@ -3371,6 +3654,12 @@ fn run_agent_steps(
                         "Workflow stage submission required",
                         &feedback,
                     ));
+                    terminal_submission_only = workflow_terminal_precondition_feedback(
+                        args,
+                        &gate_state.borrow(),
+                        workspace_root,
+                    )?
+                    .is_none();
                     step += 1;
                     continue;
                 }
@@ -3857,7 +4146,7 @@ fn run_agent_steps(
             }
         }
 
-        if step == original_max_steps {
+        if step == original_max_steps && args.workflow_stage.is_none() {
             let gate_feedback =
                 request_completion_gate_feedback(args, &gate_state.borrow(), workspace_root)?;
             if gate_feedback.is_none() {
@@ -4539,6 +4828,17 @@ fn execute_tool_calls(
             timestamp_ms: Some(now_millis()),
         });
 
+        if args_workflow_terminal_tool(env.args, &call.tool)
+            && let Some(feedback) = workflow_terminal_precondition_feedback(
+                env.args,
+                &env.gate_state.borrow(),
+                env.workspace_root,
+            )?
+        {
+            results.push((call.id, call.tool, call.arguments, feedback, 0, None));
+            continue;
+        }
+
         if let Some(capabilities) = active_stage_capabilities(env.args)?
             && !workflow_tool_allowed(&call.tool, capabilities, env.mcp_registry, env.lsp_registry)
         {
@@ -4678,6 +4978,12 @@ fn execute_tool_calls(
                     result
                 }
             };
+            let result = append_workflow_content_fingerprint(
+                env.args,
+                &call.tool,
+                env.workspace_root,
+                result,
+            )?;
             let energy =
                 energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
             let duration_ms = duration_millis(started);
@@ -4717,6 +5023,36 @@ fn execute_tool_calls(
         messages.push(ChatMessage::tool_result(tool, tool_call_id, result));
     }
     Ok(())
+}
+
+fn append_workflow_content_fingerprint(
+    args: &AgentRequest,
+    tool: &str,
+    workspace_root: &Path,
+    result: String,
+) -> Result<String> {
+    if !matches!(
+        args.workflow_stage,
+        Some(
+            crate::workflow::WorkflowStage::Implementing
+                | crate::workflow::WorkflowStage::Repairing
+        )
+    ) || matches!(
+        tool,
+        "submit_implementation"
+            | "request_replan"
+            | "submit_plan"
+            | "submit_plan_review"
+            | "submit_code_review"
+    ) {
+        return Ok(result);
+    }
+    let fingerprint = crate::workspace::ContentSnapshot::capture(workspace_root)
+        .context("failed to fingerprint build-stage workspace after tool execution")?
+        .fingerprint;
+    Ok(format!(
+        "{result}\n\nHarness current content fingerprint: {fingerprint}"
+    ))
 }
 
 #[cfg(test)]
@@ -5459,13 +5795,28 @@ fn run_delivery_workflow(
         ) {
             bail!("delivery orchestrator cannot execute stage {stage:?}");
         }
+        let consumed_stage_steps = run.counters.stage_steps.get(&stage).copied().unwrap_or(0);
+        if consumed_stage_steps >= policy.limits.stage_steps {
+            run.apply(crate::workflow::WorkflowEvent::Failed {
+                outcome: crate::workflow::WorkflowOutcome::StepLimit,
+                reason: format!(
+                    "model stage {stage:?} exhausted its cumulative {}-step budget across validation attempts",
+                    policy.limits.stage_steps
+                ),
+            })?;
+            return delivery_terminal_outcome(run, metrics, sink);
+        }
         sink.emit(AgentEvent::WorkflowStageStarted {
             workflow_id: run.id.clone(),
             stage,
             timestamp_ms: Some(now_millis()),
         });
-        let contract =
+        let mut contract =
             crate::workflow::StageContract::strict(stage, policy.limits, args.max_tokens)?;
+        contract.max_steps = policy
+            .limits
+            .stage_steps
+            .saturating_sub(consumed_stage_steps);
         if stage == crate::workflow::WorkflowStage::CodeReview {
             let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
             if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
@@ -6115,7 +6466,7 @@ fn changed_binary_path_requires_check_evidence(workspace_root: &Path, path: &str
     Ok(bytes.contains(&0))
 }
 
-fn validate_code_review_submission(
+pub(crate) fn validate_code_review_submission(
     review: &crate::workflow::ArtifactEnvelope<crate::workflow::CodeReviewArtifact>,
     run: &crate::workflow::WorkflowRun,
     graph: &crate::workspace::WorkspaceGraph,
@@ -6316,6 +6667,93 @@ fn run_delivery_commit(
     Ok(())
 }
 
+const PLAN_SUBMISSION_GUIDANCE: &str = r#"
+Required terminal action: return exactly one pb tool-call JSON object shaped as:
+{"type":"tool_call","tool":"submit_plan","arguments":{"id":"plan-1","plan":{"summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"component_ids":["real-component-id"],"paths":[{"path":"repo/relative/path","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["real-check-id"],"description":"..."}],"risks":[],"assumptions":[],"open_questions":[],"resolved_challenge_ids":[]}}}
+Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. Use [] for component_ids or check_ids only when the normalized graph genuinely has none. Do not return this as prose or a final action."#;
+
+const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
+Required terminal action: return exactly one pb tool-call JSON object shaped as:
+{"type":"tool_call","tool":"submit_plan_review","arguments":{"id":"plan-review-1","review":{"plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","assessments":[{"kind":"requirement_coverage","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"component_impact","status":"pass","evidence":[],"explanation":"..."},{"kind":"test_strategy","status":"pass","evidence":[],"explanation":"..."},{"kind":"failure_modes","status":"pass","evidence":[],"explanation":"..."},{"kind":"assumptions","status":"pass","evidence":[],"explanation":"..."}],"challenges":[],"verdict":"pass"}}}
+For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]} and set verdict to revise. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, include no p0/p1 challenge. Do not return prose or a final action."#;
+
+const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
+When the plan creates a file, first return a tool call such as {"type":"tool_call","tool":"write_file","arguments":{"path":"repo/relative/path","content":"exact contents"}}. For an existing file, use read_file followed by replace_file, edit_file, or apply_patch. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
+After the last build-stage tool result, copy its exact "Harness current content fingerprint" into content_fingerprint. Required terminal action: return exactly one pb tool-call JSON object shaped as:
+{"type":"tool_call","tool":"submit_implementation","arguments":{"id":"implementation-1","implementation":{"plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","content_fingerprint":"<exact latest harness fingerprint>","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","touched_paths":["repo/relative/path"],"summary":"..."}],"summary":"...","no_change":false,"semantic_commit_subject":"feat: concise semantic subject"}}}
+For a genuine no-change result, use status no_change, empty touched_paths, no_change true, and an empty semantic_commit_subject. Do not return prose or a final action."#;
+
+const CODE_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
+Required terminal action: return exactly one pb tool-call JSON object shaped as:
+{"type":"tool_call","tool":"submit_code_review","arguments":{"id":"code-review-1","review":{"content_fingerprint":"<exact checked fingerprint>","assessments":[{"kind":"correctness","status":"pass","evidence":[],"explanation":"..."},{"kind":"requirements","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"tests","status":"pass","evidence":[],"explanation":"..."},{"kind":"regressions","status":"pass","evidence":[],"explanation":"..."},{"kind":"maintainability","status":"pass","evidence":[],"explanation":"..."}],"findings":[],"verdict":"pass"}}}
+For revise, use a finding shaped exactly as {"id":"finding-1","severity":"p1","path":"repo/relative/path","line":1,"requirement_ids":["r1"],"plan_step_ids":["s1"],"evidence":[{"path":"repo/relative/path","line":1,"description":"..."}],"explanation":"..."} and set verdict to revise. The field is severity with lowercase p1, not kind. For pass, include no p0/p1 finding. Do not return prose or a final action."#;
+
+fn workflow_terminal_submission_guidance(stage: crate::workflow::WorkflowStage) -> &'static str {
+    match stage {
+        crate::workflow::WorkflowStage::Planning | crate::workflow::WorkflowStage::PlanRevision => {
+            PLAN_SUBMISSION_GUIDANCE
+        }
+        crate::workflow::WorkflowStage::PlanReview => PLAN_REVIEW_SUBMISSION_GUIDANCE,
+        crate::workflow::WorkflowStage::Implementing
+        | crate::workflow::WorkflowStage::Repairing => IMPLEMENTATION_SUBMISSION_GUIDANCE,
+        crate::workflow::WorkflowStage::CodeReview => CODE_REVIEW_SUBMISSION_GUIDANCE,
+        _ => "This deterministic stage has no model terminal submission.",
+    }
+}
+
+fn workflow_terminal_tool_name(stage: crate::workflow::WorkflowStage) -> Option<&'static str> {
+    match stage {
+        crate::workflow::WorkflowStage::Planning | crate::workflow::WorkflowStage::PlanRevision => {
+            Some("submit_plan")
+        }
+        crate::workflow::WorkflowStage::PlanReview => Some("submit_plan_review"),
+        crate::workflow::WorkflowStage::Implementing
+        | crate::workflow::WorkflowStage::Repairing => Some("submit_implementation"),
+        crate::workflow::WorkflowStage::CodeReview => Some("submit_code_review"),
+        _ => None,
+    }
+}
+
+fn args_workflow_terminal_tool(args: &AgentRequest, tool: &str) -> bool {
+    args.workflow_stage
+        .and_then(workflow_terminal_tool_name)
+        .is_some_and(|required| required == tool)
+}
+
+fn workflow_terminal_precondition_feedback(
+    args: &AgentRequest,
+    gate_state: &GateState,
+    workspace_root: &Path,
+) -> Result<Option<String>> {
+    if args.workflow_stage != Some(crate::workflow::WorkflowStage::CodeReview) {
+        return Ok(None);
+    }
+    let repository = args
+        .repository_context
+        .as_ref()
+        .context("code-review stage requires a repository baseline")?;
+    let missing = repository
+        .task_changed_paths()?
+        .into_iter()
+        .map(|path| {
+            reviewable_current_path(workspace_root, &path).map(|reviewable| (path, reviewable))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|(path, reviewable)| {
+            (reviewable && !gate_state.read_paths.contains(&path)).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "submit_code_review is unavailable until this fresh reviewer calls read_file for every changed text path. Missing: {}",
+            missing.join(", ")
+        )))
+    }
+}
+
 fn delivery_stage_context(
     run: &crate::workflow::WorkflowRun,
     graph: &crate::workspace::WorkspaceGraph,
@@ -6345,7 +6783,7 @@ fn delivery_stage_context(
             Ok(StageContext {
                 system_prompt: "You are the planning stage of a harness-controlled delivery workflow. You have read-only repository tools. Produce a concrete, structurally complete plan tied to real workspace component/check ids and repository-relative paths. Resolve human ambiguity with ask_user before submission. End only by calling submit_plan; prose final responses cannot advance the workflow.".to_string(),
                 user_prompt: format!(
-                    "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}\n\nNormalized workspace graph:\n{graph_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{handoff_note}{correction}",
+                    "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}\n\nNormalized workspace graph:\n{graph_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{handoff_note}\n\n{PLAN_SUBMISSION_GUIDANCE}{correction}",
                     run.task,
                     run.planning_content().fingerprint,
                 ),
@@ -6360,7 +6798,7 @@ fn delivery_stage_context(
             Ok(StageContext {
                 system_prompt: "You are a fresh-context adversarial plan critic. You did not receive the planner transcript. Inspect repository evidence yourself with read-only tools, challenge requirement coverage, architecture, component impact, test strategy, failure modes, and assumptions, then end only with submit_plan_review. Do not invent a blocker when the plan is sound, but a pass with a P0/P1 challenge is invalid. Every repository path cited as evidence must have been read in this invocation.".to_string(),
                 user_prompt: format!(
-                    "Task:\n{}\n\nExact proposed plan:\n{plan_json}\n\nPlanning snapshot fingerprint: {}\n\nNormalized workspace graph:\n{graph_json}\n\n{handoff_note}{correction}",
+                    "Task:\n{}\n\nExact proposed plan:\n{plan_json}\n\nPlanning snapshot fingerprint: {}\n\nNormalized workspace graph:\n{graph_json}\n\n{handoff_note}\n\n{PLAN_REVIEW_SUBMISSION_GUIDANCE}{correction}",
                     run.task,
                     run.planning_content().fingerprint,
                 ),
@@ -6386,9 +6824,9 @@ fn delivery_stage_context(
                 .unwrap_or_else(|| "[]".to_string());
             let current = crate::workspace::ContentSnapshot::capture(&run.repository.repo_root)?;
             Ok(StageContext {
-                system_prompt: "You are the implementation or repair stage of a harness-controlled delivery workflow. Implement exactly the accepted plan. Built-in edits, configured run_task/run_check, and run_command are available, but run_command is only a journaled escape hatch and cannot earn check, review, or commit credit. You cannot commit. If the accepted plan is materially wrong, call request_replan. Otherwise account for every plan step and end only with submit_implementation using the exact current content fingerprint and actual touched paths.".to_string(),
+                system_prompt: "You are the implementation or repair stage of a harness-controlled delivery workflow. Implement exactly the accepted plan. A submit_implementation call only reports work; it never performs edits. When the plan requires a delta, first call the available write/edit tools in earlier turns, observe their results, and only then submit accounting for actual touched paths. Never report a touched path that you did not mutate. If validation reports an empty actual delta for a required change, call an edit tool next instead of repeating the submission. Built-in edits, configured run_task/run_check, and run_command are available, but run_command is only a journaled escape hatch and cannot earn check, review, or commit credit. You cannot commit. If the accepted plan is materially wrong, call request_replan. Otherwise account for every plan step and end only with submit_implementation using the exact current content fingerprint and actual touched paths.".to_string(),
                 user_prompt: format!(
-                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nPassing plan critique:\n{review_json}\n\nCurrent harness content fingerprint: {}\n\nBlocking code findings from the prior review:\n{findings}\n\n{handoff_note}{repair_note}{correction}",
+                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nPassing plan critique:\n{review_json}\n\nCurrent harness content fingerprint: {}\n\nBlocking code findings from the prior review:\n{findings}\n\n{handoff_note}\n\n{IMPLEMENTATION_SUBMISSION_GUIDANCE}{repair_note}{correction}",
                     run.task, current.fingerprint,
                 ),
             })
@@ -6410,7 +6848,7 @@ fn delivery_stage_context(
             Ok(StageContext {
                 system_prompt: "You are a fresh-context adversarial code critic. You did not receive implementation reasoning or tool transcript. Review the exact isolated checked bytes against the task and accepted plan. Read every changed text/source/test path yourself, assess correctness, requirements, architecture, tests, regressions, and maintainability, then end only with submit_code_review. Every cited path must have been read in this invocation. A pass containing P0/P1 findings is invalid.".to_string(),
                 user_prompt: format!(
-                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nImplementation accounting:\n{implementation_json}\n\nExact checked content fingerprint: {}\n\nSuccessful selected check ids:\n{selected_checks_json}\n\nHarness-owned check evidence and bounded output:\n{checks_json}\n\nBounded task delta:\n{delta}\n\n{handoff_note}{correction}",
+                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nImplementation accounting:\n{implementation_json}\n\nExact checked content fingerprint: {}\n\nSuccessful selected check ids:\n{selected_checks_json}\n\nHarness-owned check evidence and bounded output:\n{checks_json}\n\nBounded task delta:\n{delta}\n\n{handoff_note}\n\n{CODE_REVIEW_SUBMISSION_GUIDANCE}{correction}",
                     run.task,
                     run.content_fingerprint.as_deref().unwrap_or("<missing>"),
                 ),
@@ -6637,6 +7075,71 @@ pub(crate) fn run_scripted_agent_steps(
         workflow_submission: outcome.gate_state.workflow_submission,
         delivery_proposal: outcome.gate_state.delivery_proposal,
         requested_delivery: outcome.gate_state.requested_delivery,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScriptedDeliveryOutcome {
+    pub workflow: crate::workflow::WorkflowCheckpoint,
+    pub reached_final: bool,
+    pub verified_completed: bool,
+    pub termination_reason: TerminationReason,
+    pub llm_invocations: usize,
+    pub tool_calls: usize,
+    pub remaining_completions: usize,
+    pub generation_tool_names: Vec<Vec<String>>,
+}
+
+/// Exercise the complete strict delivery orchestrator with deterministic completions.
+///
+/// Harness evaluation and web/harness parity tests use this entry point so they observe the same
+/// reducer, capability boundaries, check runner, isolated reviews, recovery, and managed commit as
+/// production delivery without loading a model.
+pub(crate) fn run_scripted_delivery_workflow(
+    args: &AgentRequest,
+    completions: Vec<ScriptedCompletion>,
+    workspace_root: &Path,
+    sink: &mut dyn EventSink,
+) -> Result<ScriptedDeliveryOutcome> {
+    let mut generator = ScriptedCompletionEngine {
+        completions: completions.into(),
+        generation_tool_counts: Vec::new(),
+        generation_max_tokens: Vec::new(),
+        generation_tool_names: Vec::new(),
+    };
+    let command_backend = CommandBackend::Local {
+        workspace_root: workspace_root.to_path_buf(),
+    };
+    let todo_memory = RefCell::new(TodoMemory::default());
+    let mcp_registry = McpToolRegistry::default();
+    let lsp_registry = LspToolRegistry::default();
+    let policy_config = PolicyConfig::default();
+    let outcome = run_delivery_workflow(
+        &mut generator,
+        TextBackendKind::LlamaCpp,
+        None,
+        args,
+        workspace_root,
+        workspace_root,
+        Some(&command_backend),
+        None,
+        &todo_memory,
+        &mcp_registry,
+        &lsp_registry,
+        &policy_config,
+        None,
+        None,
+        sink,
+    )?;
+    Ok(ScriptedDeliveryOutcome {
+        workflow: outcome.checkpoint,
+        reached_final: outcome.step.reached_final,
+        verified_completed: outcome.step.verified_completed,
+        termination_reason: outcome.step.termination_reason,
+        llm_invocations: outcome.step.metrics.llm_invocations,
+        tool_calls: outcome.step.metrics.tool_calls,
+        remaining_completions: generator.completions.len(),
+        generation_tool_names: generator.generation_tool_names,
     })
 }
 
@@ -11872,6 +12375,89 @@ mod tests {
     }
 
     #[test]
+    fn workflow_terminal_tools_expose_complete_nested_artifact_schemas() {
+        let tools = all_builtin_tool_specs();
+        let schema = |name: &str| {
+            &tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap()
+                .input_schema
+        };
+
+        assert_eq!(
+            schema("submit_plan")
+                .pointer("/properties/plan/allOf/0/properties/steps/items/properties/paths/items/properties/change/enum")
+                .unwrap(),
+            &json!(["create", "modify", "delete"])
+        );
+        assert_eq!(
+            schema("submit_plan_review")
+                .pointer(
+                    "/properties/review/allOf/0/properties/assessments/items/properties/kind/enum"
+                )
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
+        assert_eq!(
+            schema("submit_implementation")
+                .pointer("/properties/implementation/allOf/0/properties/steps/items/properties/status/enum")
+                .unwrap(),
+            &json!(["completed", "no_change", "incomplete"])
+        );
+        assert_eq!(
+            schema("submit_code_review")
+                .pointer(
+                    "/properties/review/allOf/0/properties/assessments/items/properties/kind/enum"
+                )
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
+        assert!(PLAN_SUBMISSION_GUIDANCE.contains("resolved_challenge_ids"));
+        assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("submit_plan_review"));
+        assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Harness current content fingerprint"));
+        assert!(CODE_REVIEW_SUBMISSION_GUIDANCE.contains("submit_code_review"));
+    }
+
+    #[test]
+    fn build_stage_tool_feedback_reports_the_harness_content_fingerprint() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("changed.txt"), "changed\n").unwrap();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        let expected = crate::workspace::ContentSnapshot::capture(repo.path())
+            .unwrap()
+            .fingerprint;
+
+        let result = append_workflow_content_fingerprint(
+            &request,
+            "write_file",
+            repo.path(),
+            "created changed.txt".to_string(),
+        )
+        .unwrap();
+        assert!(result.ends_with(&format!("Harness current content fingerprint: {expected}")));
+
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Planning);
+        assert_eq!(
+            append_workflow_content_fingerprint(
+                &request,
+                "read_file",
+                repo.path(),
+                "contents".to_string(),
+            )
+            .unwrap(),
+            "contents"
+        );
+    }
+
+    #[test]
     fn discussion_authority_overrides_a_build_profile_at_schema_and_execution() {
         let workspace = tempfile::tempdir().unwrap();
         let mut request = test_agent_request(AgentProfile::Build, 256);
@@ -13173,6 +13759,76 @@ mod tests {
                 ..
             } if reason.contains("outside the accepted plan")
         )));
+    }
+
+    #[test]
+    fn workflow_stage_budget_is_cumulative_across_validation_attempts() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        let baseline = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let invalid =
+            implementation_submission(&plan, &baseline.fingerprint, vec!["existing.txt"], false);
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        let mut document = crate::workflow::WorkflowConfigDocument::default();
+        document.limits.stage_steps = 2;
+        request.workflow_policy = Some(document.compile().unwrap());
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-cumulative-stage-budget".to_string();
+
+        let (outcome, generator, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                text_completion(invalid.clone()),
+                text_completion(invalid),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::StepLimit)
+        );
+        assert_eq!(
+            outcome
+                .checkpoint
+                .run
+                .counters
+                .stage_steps
+                .get(&crate::workflow::WorkflowStage::Implementing),
+            Some(&2)
+        );
+        assert!(
+            outcome
+                .checkpoint
+                .run
+                .blocked_reason
+                .as_deref()
+                .unwrap()
+                .contains("cumulative 2-step budget")
+        );
+        assert!(generator.completions.is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::WorkflowStageStarted {
+                        stage: crate::workflow::WorkflowStage::Implementing,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -14831,6 +15487,119 @@ mod tests {
                 status: FinalGraceStatus::Accepted,
                 ..
             }
+        )));
+    }
+
+    #[test]
+    fn workflow_stage_never_uses_legacy_final_grace() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Plan, 256);
+        request.max_steps = 1;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Planning);
+        request.workflow_policy = Some(
+            crate::workflow::WorkflowConfigDocument::default()
+                .compile()
+                .unwrap(),
+        );
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                scripted_final("prose cannot submit a workflow plan"),
+                scripted_final("must not run"),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(!outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert_eq!(outcome.llm_invocations, 1);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::FinalGrace { .. }))
+        );
+    }
+
+    #[test]
+    fn workflow_final_retry_exposes_only_the_required_terminal_tool() {
+        let tmp = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Plan, tmp.path());
+        request.max_steps = 2;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Planning);
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                scripted_final("the plan in prose must be rejected"),
+                ScriptedCompletion {
+                    content: plan_submission(),
+                    truncated: false,
+                },
+            ],
+            tmp.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.workflow_submission,
+            Some(crate::workflow::StageSubmission::Plan { .. })
+        ));
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["submit_plan".to_string()]
+        );
+    }
+
+    #[test]
+    fn code_review_terminal_is_unavailable_until_changed_text_is_read() {
+        let repo = init_contract_test_repo();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("changed.txt"), "review me\n").unwrap();
+        let fingerprint = crate::workspace::ContentSnapshot::capture(repo.path())
+            .unwrap()
+            .fingerprint;
+        let mut request = workflow_request(AgentProfile::Review, repo.path());
+        request.max_steps = 3;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::CodeReview);
+        request.repository_context = Some(repository);
+        let submission =
+            code_review_submission(&fingerprint, crate::workflow::ReviewVerdict::Pass, None);
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                ScriptedCompletion {
+                    content: submission.clone(),
+                    truncated: false,
+                },
+                tool_completion("read_file", json!({"path": "changed.txt"})),
+                ScriptedCompletion {
+                    content: submission,
+                    truncated: false,
+                },
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.workflow_submission,
+            Some(crate::workflow::StageSubmission::CodeReview { .. })
+        ));
+        assert!(!outcome.generation_tool_names[0].contains(&"submit_code_review".to_string()));
+        assert!(outcome.generation_tool_names[0].contains(&"read_file".to_string()));
+        assert!(outcome.generation_tool_names[2].contains(&"submit_code_review".to_string()));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, result, .. }
+                if tool == "submit_code_review" && result.contains("Missing: changed.txt")
         )));
     }
 

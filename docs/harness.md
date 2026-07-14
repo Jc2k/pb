@@ -143,11 +143,13 @@ Run the deterministic, model-free control suite with:
 pb harness eval --jsonl harness-eval.jsonl
 ```
 
-The command writes one schema-v2 JSON object per fixture and prints a compact table covering valid
+The command writes one schema-v3 JSON object per fixture and prints a compact table covering valid
 actions, named-check compliance, false completion, recovery loops, turns, latency, tokens, energy,
 and termination. JSONL additionally records selected components/checks, runtime executions versus
 model `run_check` calls, reuse and dependency skips, started/avoided executors, team messages,
-repair turns, no-change, commit disposition, and output fingerprints. Without `--jsonl`, JSONL
+repair turns, no-change, commit disposition, output fingerprints, workflow stages, and artifact
+hashes. The bounded open-weight protocol matrix and its known limitations are recorded in
+[Enforced workflow open-weight model evaluation](harness-workflow-model-evaluation.md). Without `--jsonl`, JSONL
 goes to stdout and the table goes to stderr so the machine stream stays parseable. The scripted
 report contains no timestamps, scratch paths, or nondeterministic commit IDs and is stable enough
 to diff directly; real-model records retain the resulting commit hash. A protocol mismatch exits

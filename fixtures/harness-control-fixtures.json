@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "fixtures": [
     {
       "id": "first_action_only",
@@ -367,5 +367,32 @@
       ],
       "observe_paths": ["web/dist/bundle.txt"]
     }
+  ],
+  "workflow_fixtures": [
+    {"id":"workflow_discussion_no_branch","hypothesis":"Discussion answers without creating or switching a task branch.","assertion":"discussion_no_branch"},
+    {"id":"workflow_discussion_no_mutation","hypothesis":"Discussion cannot mutate through built-in tools or a mutating teammate.","assertion":"discussion_no_mutation"},
+    {"id":"workflow_explicit_delivery_plans","hypothesis":"Explicit delivery starts at harness-owned planning.","assertion":"explicit_delivery_starts_planning"},
+    {"id":"workflow_planning_requires_submission","hypothesis":"Planning prose cannot skip the structured plan submission.","assertion":"planning_requires_submission"},
+    {"id":"workflow_planning_read_only","hypothesis":"Planning cannot mutate through direct tools, shell, or delegation.","assertion":"planning_authority_is_read_only"},
+    {"id":"workflow_plan_structure","hypothesis":"Malformed and incomplete plans are rejected structurally.","assertion":"plan_structure_validated"},
+    {"id":"workflow_plan_review_hash","hypothesis":"Plan review must reference the exact accepted plan hash.","assertion":"plan_review_hash_bound"},
+    {"id":"workflow_plan_review_evidence","hypothesis":"Plan review requires all dimensions and observed read evidence.","assertion":"plan_review_evidence_required"},
+    {"id":"workflow_plan_challenge_revision","hypothesis":"Blocking plan challenges force a bounded revision cycle.","assertion":"plan_challenge_forces_revision"},
+    {"id":"workflow_implementation_after_plan","hypothesis":"Implementation cannot start before plan acceptance.","assertion":"implementation_requires_accepted_plan"},
+    {"id":"workflow_implementation_replan","hypothesis":"Implementation can request replan without silently diverging.","assertion":"implementation_can_replan"},
+    {"id":"workflow_run_command_gated","hypothesis":"Implementation run_command remains useful but cannot bypass checks, review, or commit gates.","assertion":"run_command_cannot_bypass_gates"},
+    {"id":"workflow_check_failure_repair","hypothesis":"A configured check failure forces repair and blocks review and commit.","assertion":"check_failure_forces_repair"},
+    {"id":"workflow_post_check_mutation","hypothesis":"Mutation after checks invalidates affected evidence.","assertion":"post_check_mutation_invalidates_evidence"},
+    {"id":"workflow_code_review_fingerprint","hypothesis":"Code review is bound to the exact current content fingerprint.","assertion":"code_review_fingerprint_bound"},
+    {"id":"workflow_code_review_path_evidence","hypothesis":"Code review cannot pass without reading every changed reviewable path.","assertion":"code_review_path_evidence_required"},
+    {"id":"workflow_code_finding_repair","hypothesis":"Blocking code findings force repair, recheck, and rereview.","assertion":"code_finding_forces_repair"},
+    {"id":"workflow_post_review_mutation","hypothesis":"Mutation after review blocks commit until checks and review recur.","assertion":"post_review_mutation_blocks_commit"},
+    {"id":"workflow_delegation_authority","hypothesis":"A read-only parent cannot delegate build or scout authority.","assertion":"delegation_cannot_escalate_authority"},
+    {"id":"workflow_global_budgets","hypothesis":"Advisory, invocation, token, plan, and repair budgets are global.","assertion":"workflow_budgets_are_global"},
+    {"id":"workflow_managed_commit_scope","hypothesis":"Managed commit contains only task-owned reviewed content.","assertion":"managed_commit_is_task_owned"},
+    {"id":"workflow_no_change","hypothesis":"No-change delivery creates no fictional edit or commit.","assertion":"no_change_creates_no_commit"},
+    {"id":"workflow_resume_exact","hypothesis":"Resume reconstructs the exact stage, artifacts, and remaining budget.","assertion":"resume_preserves_stage_and_budget"},
+    {"id":"workflow_web_harness_parity","hypothesis":"Web and harness projections agree for the same workflow state.","assertion":"web_harness_projection_parity"},
+    {"id":"workflow_legacy_compatibility","hypothesis":"Legacy stored requests deserialize without strict completion claims.","assertion":"legacy_state_has_no_strict_claim"}
   ]
 }
