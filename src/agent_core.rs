@@ -57,6 +57,10 @@ const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "target"];
 const TOOL_USER_AGENT: &str = "pb-agent/1.0";
 const MAX_SUB_AGENT_DEPTH: usize = 1;
 const DEFAULT_SUB_AGENT_MAX_STEPS: usize = 6;
+const MAX_ADVISORY_CALLS_PER_RUN: usize = 4;
+const MAX_MODEL_INVOCATIONS_PER_RUN: usize = 40;
+const MAX_GENERATED_TOKENS_PER_RUN: usize = 24_000;
+const MAX_SUB_AGENT_RESULT_CHARS: usize = 4_000;
 const MONITOR_STEP_BUDGET: usize = 3;
 const MONITOR_AGENT_MAX_STEPS: usize = 1;
 const MONITOR_TURN_MAX_TOKENS: i32 = 512;
@@ -308,6 +312,14 @@ impl AgentProfile {
         }
     }
 
+    const fn can_mutate_repository(self) -> bool {
+        matches!(self, Self::Build | Self::Scout)
+    }
+
+    const fn is_advisory_target(self) -> bool {
+        !matches!(self, Self::Build | Self::Scout)
+    }
+
     fn teammate_name(self) -> &'static str {
         match self {
             Self::Build => "Kate Libby",
@@ -330,7 +342,7 @@ impl AgentProfile {
     fn instructions(self) -> &'static str {
         match self {
             Self::Build => {
-                "Profile: build. You are Kate, a 10x programmer permanently at Ballmer peak. Orchestrate implementation work for requests that make, change, or fix something. For multi-step or ambiguous work, call Dade with sub_agent profile=\"plan\" to break the request into concrete build tasks; for a single clear change, proceed directly. Automatically call Ramon with sub_agent profile=\"scout\" when you need to establish or refresh a working development environment. After implementation, when you think you have finished building the requested work, call Eugene with sub_agent profile=\"review\" before finalizing. If the review profile passes the work, run applicable guard commands and try to git_commit with a semantic commit message that follows the project guidelines. If the review profile does not pass the work, address the review output and request another review. Use todos only to track multiple meaningful tasks or discovered follow-up work; do not create a todo list for one straightforward task, and avoid separate start/complete todo calls when a final response or commit already records the work. You may edit files and commit logical changes."
+                "Profile: build. You are Kate, a 10x programmer permanently at Ballmer peak. Orchestrate implementation work for requests that make, change, or fix something. For multi-step or ambiguous work, call Dade with sub_agent profile=\"plan\" to break the request into concrete build tasks; for a single clear change, proceed directly. Implementation and environment mutation stay with the primary build stage: build and scout are not advisory sub-agent targets. After implementation, when you think you have finished building the requested work, call Eugene with sub_agent profile=\"review\" before finalizing. If the review profile passes the work, run applicable guard commands and try to git_commit with a semantic commit message that follows the project guidelines. If the review profile does not pass the work, address the review output and request another review. Use todos only to track multiple meaningful tasks or discovered follow-up work; do not create a todo list for one straightforward task, and avoid separate start/complete todo calls when a final response or commit already records the work. You may edit files and commit logical changes."
             }
             Self::Scout => {
                 "Profile: scout. First scout the repository's AGENT.md/AGENTS.md, README files, CI workflows, Dockerfiles, and language manifests for dev-environment setup, per-session refresh steps, and commit guard rails. Prefer run_command in the scouted backend. Before committing, run the discovered guard commands and only skip them with a clear reason. You may edit files and commit logical changes."
@@ -551,6 +563,87 @@ impl RunMetrics {
         self.llm_energy_kwh += other.llm_energy_kwh;
         self.tool_energy_joules += other.tool_energy_joules;
         self.tool_energy_kwh += other.tool_energy_kwh;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RunBudgetLimits {
+    advisory_calls: usize,
+    model_invocations: usize,
+    generated_tokens: usize,
+}
+
+impl Default for RunBudgetLimits {
+    fn default() -> Self {
+        Self {
+            advisory_calls: MAX_ADVISORY_CALLS_PER_RUN,
+            model_invocations: MAX_MODEL_INVOCATIONS_PER_RUN,
+            generated_tokens: MAX_GENERATED_TOKENS_PER_RUN,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RunBudget {
+    limits: RunBudgetLimits,
+    advisory_calls: usize,
+    model_invocations: usize,
+    generated_tokens: usize,
+}
+
+impl Default for RunBudget {
+    fn default() -> Self {
+        Self::new(RunBudgetLimits::default())
+    }
+}
+
+impl RunBudget {
+    const fn new(limits: RunBudgetLimits) -> Self {
+        Self {
+            limits,
+            advisory_calls: 0,
+            model_invocations: 0,
+            generated_tokens: 0,
+        }
+    }
+
+    fn reserve_advisory_call(&mut self) -> Result<()> {
+        if self.advisory_calls >= self.limits.advisory_calls {
+            bail!(
+                "advisory call limit reached ({})",
+                self.limits.advisory_calls
+            );
+        }
+        self.advisory_calls = self.advisory_calls.saturating_add(1);
+        Ok(())
+    }
+
+    fn reserve_model_invocation(&mut self, requested_max_tokens: i32) -> Result<i32> {
+        if self.model_invocations >= self.limits.model_invocations {
+            bail!(
+                "model invocation limit reached ({})",
+                self.limits.model_invocations
+            );
+        }
+        if self.generated_tokens >= self.limits.generated_tokens {
+            bail!(
+                "generated token limit reached ({})",
+                self.limits.generated_tokens
+            );
+        }
+
+        let remaining_tokens = self
+            .limits
+            .generated_tokens
+            .saturating_sub(self.generated_tokens)
+            .min(i32::MAX as usize) as i32;
+        let max_tokens = requested_max_tokens.max(1).min(remaining_tokens.max(1));
+        self.model_invocations = self.model_invocations.saturating_add(1);
+        Ok(max_tokens)
+    }
+
+    fn record_generated_tokens(&mut self, generated_tokens: usize) {
+        self.generated_tokens = self.generated_tokens.saturating_add(generated_tokens);
     }
 }
 
@@ -1287,6 +1380,7 @@ pub fn run_agent<S: EventSink>(
     )?;
 
     let todo_memory = RefCell::new(TodoMemory::default());
+    let run_budget = RefCell::new(RunBudget::default());
 
     let mut messages = vec![
         ChatMessage::text("system", instructions),
@@ -1322,6 +1416,7 @@ pub fn run_agent<S: EventSink>(
         &lsp_registry,
         &policy_config,
         user_config.effective_personal_memory_repo().as_deref(),
+        &run_budget,
         0,
         &mut sink,
     )?;
@@ -1331,8 +1426,12 @@ pub fn run_agent<S: EventSink>(
     let termination_reason = outcome.termination_reason;
     let handoff_outcome = classify_handoff_outcome(&args, &outcome, repository_context.as_ref())?;
     let summary = outcome.final_content.unwrap_or_default();
+    let unexpected_root_mutation =
+        unexpected_read_only_mutation_paths(&args)?.is_some_and(|paths| !paths.is_empty());
 
-    if handoff_outcome == Some(crate::events::HandoffOutcome::Incomplete) && !reached_final {
+    if handoff_outcome == Some(crate::events::HandoffOutcome::Incomplete)
+        && (!reached_final || unexpected_root_mutation)
+    {
         sink.emit(AgentEvent::TeamMessage {
             actor: crate::events::TeamActor::Automation(crate::events::AutomationActor::Handoff),
             tone: crate::events::TeamMessageTone::Warning,
@@ -1428,19 +1527,19 @@ fn classify_handoff_outcome(
     repository: Option<&crate::workspace::RepositoryContext>,
 ) -> Result<Option<crate::events::HandoffOutcome>> {
     use crate::events::HandoffOutcome;
-    if args.repository_less
-        || args.sub_agent_depth > 0
-        || !matches!(args.profile, AgentProfile::Build | AgentProfile::Scout)
-    {
+    if args.repository_less || args.sub_agent_depth > 0 {
         return Ok(None);
+    }
+    let changed_paths = repository
+        .map(crate::workspace::RepositoryContext::task_changed_paths)
+        .transpose()?
+        .unwrap_or_default();
+    if !args.profile.can_mutate_repository() {
+        return Ok((!changed_paths.is_empty()).then_some(HandoffOutcome::Incomplete));
     }
     Ok(Some(match outcome.termination_reason {
         TerminationReason::Final => {
-            if repository
-                .map(crate::workspace::RepositoryContext::task_changed_paths)
-                .transpose()?
-                .is_none_or(|paths| paths.is_empty())
-            {
+            if changed_paths.is_empty() {
                 HandoffOutcome::NoChange
             } else {
                 HandoffOutcome::Ready
@@ -1561,7 +1660,7 @@ fn build_agent_instructions_with_tool_allowlist(
     );
     if allow_sub_agents && profile != AgentProfile::Research {
         instructions.push_str(
-            "Use sub_agent(profile,task,max_steps) to ask a teammate for bounded work in a fresh context. Teammate mapping: Dade=plan, Kate=build, Eugene=review, Ramon=scout, Paul=explore, Emmanuel=research, Joey=ask, Trinity=monitor. Use vision_describe directly when work depends on attached images, mockups, screenshots, visual regressions, or comparing UI images. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is summarized back to you so large investigation transcripts do not bloat your primary context.\n",
+            "Use sub_agent(profile,task,max_steps) to ask a read-only teammate for bounded advice in a fresh context. Advisory mapping: Dade=plan, Eugene=review, Paul=explore, Emmanuel=research, Joey=ask, Trinity=monitor. Build and scout are not advisory targets and cannot be delegated. Use vision_describe directly when work depends on attached images, mockups, screenshots, visual regressions, or comparing UI images. Ask Emmanuel when you need external knowledge, current documentation, ecosystem context, or deeper source synthesis to make a better plan, answer a question, research a build failure, review risk, or implement a fix. The teammate's result is bounded and summarized back to you so large investigation transcripts do not bloat your primary context.\n",
         );
     }
     if matches!(profile, AgentProfile::Build | AgentProfile::Scout) {
@@ -2495,10 +2594,7 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                     enum_property(
                         "profile",
                         "Profile for the delegated agent.",
-                        [
-                            "explore", "review", "plan", "ask", "research", "monitor", "scout",
-                            "build",
-                        ],
+                        ["explore", "review", "plan", "ask", "research", "monitor"],
                     ),
                     string_property("task", "Concrete task for the delegated agent."),
                     integer_property(
@@ -2672,7 +2768,11 @@ fn incomplete_contract_status(args: &AgentRequest) -> ContractStatus {
 
 fn termination_reason_for_runtime_error(error: &anyhow::Error) -> TerminationReason {
     let message = format!("{error:#}").to_ascii_lowercase();
-    if message.contains("resource limit")
+    if message.contains("model invocation limit") {
+        TerminationReason::InvocationLimit
+    } else if message.contains("generated token limit") {
+        TerminationReason::TokenLimit
+    } else if message.contains("resource limit")
         || message.contains("resource budget")
         || message.contains("working-set limit")
         || message.contains("out of memory")
@@ -2696,6 +2796,7 @@ struct ToolExecutionEnv<'a> {
     lsp_registry: &'a LspToolRegistry,
     policy_config: &'a PolicyConfig,
     personal_memory_repo: Option<&'a Path>,
+    run_budget: &'a RefCell<RunBudget>,
     gate_state: &'a RefCell<GateState>,
     workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
     nesting_depth: usize,
@@ -2776,6 +2877,7 @@ fn run_agent_steps(
     lsp_registry: &LspToolRegistry,
     policy_config: &PolicyConfig,
     personal_memory_repo: Option<&Path>,
+    run_budget: &RefCell<RunBudget>,
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
@@ -2829,6 +2931,7 @@ fn run_agent_steps(
             &mut metrics,
             sink,
             nesting_depth,
+            run_budget,
         ) {
             Ok(generated) => generated,
             Err(error) => {
@@ -3260,6 +3363,7 @@ fn run_agent_steps(
                         lsp_registry,
                         policy_config,
                         personal_memory_repo,
+                        run_budget,
                         gate_state: &gate_state,
                         workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
@@ -3332,6 +3436,7 @@ fn run_agent_steps(
                         lsp_registry,
                         policy_config,
                         personal_memory_repo,
+                        run_budget,
                         gate_state: &gate_state,
                         workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
@@ -3367,6 +3472,7 @@ fn run_agent_steps(
                     gate_state.borrow().clone(),
                     workspace_checks.as_ref(),
                     metrics,
+                    run_budget,
                     nesting_depth,
                     sink,
                 );
@@ -3399,6 +3505,7 @@ fn run_agent_steps(
                     lsp_registry,
                     policy_config,
                     personal_memory_repo,
+                    run_budget,
                     nesting_depth,
                     sink,
                     &mut metrics,
@@ -3465,6 +3572,7 @@ fn run_final_grace(
     gate_state: GateState,
     workspace_checks: Option<&RefCell<WorkspaceCheckRuntime<'_>>>,
     mut metrics: RunMetrics,
+    run_budget: &RefCell<RunBudget>,
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
@@ -3482,7 +3590,30 @@ fn run_final_grace(
         "FINAL GRACE: All required evidence is current. Tools are unavailable. Return exactly one JSON final action now: {\"type\":\"final\",\"content\":\"concise completion summary\"}. Do not return prose, a tool call, or any other action.",
     ));
     let mut grace_args = args.clone();
-    grace_args.max_tokens = FINAL_GRACE_MAX_TOKENS;
+    grace_args.max_tokens = match run_budget
+        .borrow_mut()
+        .reserve_model_invocation(FINAL_GRACE_MAX_TOKENS)
+    {
+        Ok(max_tokens) => max_tokens,
+        Err(error) => {
+            let termination_reason = termination_reason_for_runtime_error(&error);
+            sink.emit(AgentEvent::FinalGrace {
+                status: FinalGraceStatus::Rejected,
+                detail: format!("final-only generation was blocked: {error:#}"),
+                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            return Ok(StepRunOutcome {
+                reached_final: false,
+                contract_status: incomplete_contract_status(args),
+                verified_completed: false,
+                termination_reason,
+                final_content: None,
+                metrics,
+                gate_state,
+            });
+        }
+    };
     grace_args.turn_max_tokens_cap = Some(FINAL_GRACE_MAX_TOKENS);
     let completion = match generator.generate(&grace_args, messages, &[]) {
         Ok(completion) => completion,
@@ -3515,6 +3646,9 @@ fn run_final_grace(
             });
         }
     };
+    run_budget
+        .borrow_mut()
+        .record_generated_tokens(completion.generated_tokens);
     record_completion_metrics(&completion, grace_step, nesting_depth, &mut metrics, sink);
 
     let action = if completion.finish_reason == CompletionFinishReason::EndOfGeneration
@@ -3786,10 +3920,20 @@ fn run_step_limit_monitor(
     lsp_registry: &LspToolRegistry,
     policy_config: &PolicyConfig,
     personal_memory_repo: Option<&Path>,
+    run_budget: &RefCell<RunBudget>,
     nesting_depth: usize,
     sink: &mut dyn EventSink,
     metrics: &mut RunMetrics,
 ) -> Result<Option<String>> {
+    if let Err(error) = run_budget.borrow_mut().reserve_advisory_call() {
+        sink.emit(AgentEvent::Correction {
+            message: format!("step-limit monitor skipped: {error}"),
+            summary: "Advisory budget exhausted".to_string(),
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+        return Ok(None);
+    }
     let monitor_task = format!(
         "The primary {} agent has just used its configured step budget ({}) without a final response. Audit the current transcript for loops, off-track behavior, blockers, and whether it should receive a small extra step grant. Return status, evidence, immediate next action, whether to grant more steps, and stop conditions.",
         args.profile.as_str(),
@@ -3848,13 +3992,20 @@ fn run_step_limit_monitor(
         lsp_registry,
         policy_config,
         personal_memory_repo,
+        run_budget,
         nesting_depth + 1,
         sink,
     )?;
     metrics.add(&outcome.metrics);
-    let result = outcome
+    let detail = outcome
         .final_content
         .unwrap_or_else(|| "monitor reached its own step limit before finalizing".to_string());
+    let status = if outcome.reached_final {
+        "completed"
+    } else {
+        "step_limit"
+    };
+    let result = bounded_sub_agent_result(AgentProfile::Monitor, status, &detail);
     sink.emit(AgentEvent::SubAgentFinished {
         profile: AgentProfile::Monitor.as_str().to_string(),
         result: result.clone(),
@@ -4029,6 +4180,7 @@ fn execute_tool_calls(
         lsp_registry: env.lsp_registry,
         policy_config: env.policy_config,
         personal_memory_repo: env.personal_memory_repo,
+        run_budget: env.run_budget,
         gate_state: env.gate_state,
         workspace_checks: env.workspace_checks,
     };
@@ -4445,6 +4597,7 @@ pub(crate) fn run_scripted_agent_steps(
     let mcp_registry = McpToolRegistry::default();
     let lsp_registry = LspToolRegistry::default();
     let policy_config = PolicyConfig::default();
+    let run_budget = RefCell::new(RunBudget::default());
     let outcome = run_agent_steps(
         &mut generator,
         TextBackendKind::LlamaCpp,
@@ -4460,6 +4613,7 @@ pub(crate) fn run_scripted_agent_steps(
         &lsp_registry,
         &policy_config,
         None,
+        &run_budget,
         0,
         sink,
     )?;
@@ -4558,6 +4712,7 @@ pub(crate) fn run_local_model_eval_steps(
     ];
     let todo_memory = RefCell::new(TodoMemory::default());
     let policy_config = PolicyConfig::default();
+    let run_budget = RefCell::new(RunBudget::default());
     let outcome = match engine {
         LocalModelEvalEngine::LlamaCpp(llamacpp) => {
             let mut generator = LlamaCompletionEngine { llamacpp };
@@ -4576,6 +4731,7 @@ pub(crate) fn run_local_model_eval_steps(
                 &lsp_registry,
                 &policy_config,
                 None,
+                &run_budget,
                 0,
                 sink,
             )?
@@ -4597,6 +4753,7 @@ pub(crate) fn run_local_model_eval_steps(
                 &lsp_registry,
                 &policy_config,
                 None,
+                &run_budget,
                 0,
                 sink,
             )?
@@ -4727,13 +4884,19 @@ fn generate_and_parse_action_with_retries(
     metrics: &mut RunMetrics,
     sink: &mut dyn EventSink,
     nesting_depth: usize,
+    run_budget: &RefCell<RunBudget>,
 ) -> Result<std::result::Result<(String, AgentAction), ParseFailure>> {
     let mut max_tokens = boosted_max_tokens(args);
 
     loop {
         let mut request = args.clone();
-        request.max_tokens = max_tokens;
+        request.max_tokens = run_budget
+            .borrow_mut()
+            .reserve_model_invocation(max_tokens)?;
         let completion = generator.generate(&request, messages, tools)?;
+        run_budget
+            .borrow_mut()
+            .record_generated_tokens(completion.generated_tokens);
         metrics.llm_invocations += 1;
         metrics.llm_runtime_ms = metrics
             .llm_runtime_ms
@@ -5184,6 +5347,7 @@ struct ToolContext<'a> {
     lsp_registry: &'a LspToolRegistry,
     policy_config: &'a PolicyConfig,
     personal_memory_repo: Option<&'a Path>,
+    run_budget: &'a RefCell<RunBudget>,
     gate_state: &'a RefCell<GateState>,
     workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
 }
@@ -5364,6 +5528,15 @@ fn request_completion_gate_feedback(
     gate_state: &GateState,
     workspace_root: &Path,
 ) -> Result<Option<String>> {
+    if let Some(paths) = unexpected_read_only_mutation_paths(request)?
+        && !paths.is_empty()
+    {
+        return Ok(Some(format!(
+            "the read-only {} profile changed task-owned repository paths: {}; pb will not accept or hand off those changes",
+            request.profile.as_str(),
+            paths.join(", ")
+        )));
+    }
     if request.contract.is_some() {
         contract_gate_feedback(
             request,
@@ -5388,6 +5561,20 @@ fn request_completion_gate_feedback(
     } else {
         Ok(completion_gate_feedback(request.profile, gate_state))
     }
+}
+
+fn unexpected_read_only_mutation_paths(request: &AgentRequest) -> Result<Option<Vec<String>>> {
+    if request.repository_less
+        || request.sub_agent_depth > 0
+        || request.profile.can_mutate_repository()
+    {
+        return Ok(None);
+    }
+    request
+        .repository_context
+        .as_ref()
+        .map(crate::workspace::RepositoryContext::task_changed_paths)
+        .transpose()
 }
 
 fn run_deterministic_handoff(
@@ -6774,6 +6961,7 @@ fn run_sub_agent(
         .and_then(Value::as_str)
         .context("sub_agent requires string argument: profile")?;
     let profile = AgentProfile::parse(profile_name)?;
+    ensure_sub_agent_target_allowed(context.request.profile, profile)?;
     ensure_sub_agent_review_is_ready(
         profile,
         context.request.profile,
@@ -6783,6 +6971,7 @@ fn run_sub_agent(
         .get("task")
         .and_then(Value::as_str)
         .context("sub_agent requires string argument: task")?;
+    context.run_budget.borrow_mut().reserve_advisory_call()?;
     let max_steps = arguments
         .get("max_steps")
         .and_then(Value::as_u64)
@@ -6796,7 +6985,7 @@ fn run_sub_agent(
         .review_completed_successfully
         .then(|| git_worktree_content_fingerprint(context.workspace_root))
         .transpose()?;
-    let isolated_review = if profile == AgentProfile::Review && !context.request.repository_less {
+    let isolated_review = if !context.request.repository_less {
         Some(prepare_isolated_review_workspace(context.workspace_root)?)
     } else {
         None
@@ -6911,6 +7100,7 @@ fn run_sub_agent(
         context.lsp_registry,
         context.policy_config,
         context.personal_memory_repo,
+        context.run_budget,
         context.request.sub_agent_depth + 1,
         sink,
     )?;
@@ -6932,7 +7122,7 @@ fn run_sub_agent(
     let review_mutated_workspace = if let Some(before) = review_fingerprint_before.as_ref() {
         git_workspace_fingerprint(sub_workspace_root).map_or(true, |after| &after != before)
     } else {
-        profile == AgentProfile::Review && workspace_changed
+        workspace_changed
     };
     let review_passed = profile == AgentProfile::Review
         && outcome.reached_final
@@ -6969,12 +7159,18 @@ fn run_sub_agent(
         });
     }
 
-    let result = if review_mutated_workspace {
-        "review sub-agent did not pass: it attempted to change its isolated workspace despite the read-only review contract; the source workspace was protected, so request another review"
-            .to_string()
+    let (status, detail) = if review_mutated_workspace {
+        (
+            "authority_violation",
+            "the advisory agent attempted to change its isolated workspace despite the read-only contract; the source workspace was protected"
+                .to_string(),
+        )
     } else if outcome.termination_reason == TerminationReason::ContractUnsatisfied {
-        "review sub-agent did not pass: its final response did not satisfy the named review evidence contract; request another review that reads the required paths and runs the required checks"
-            .to_string()
+        (
+            "contract_unsatisfied",
+            "the review did not satisfy the named evidence contract; request another review that reads the required paths and runs the required checks"
+                .to_string(),
+        )
     } else if profile == AgentProfile::Review && outcome.reached_final && !review_passed {
         let response = outcome
             .final_content
@@ -6982,19 +7178,31 @@ fn run_sub_agent(
             .map(str::trim)
             .filter(|content| !content.is_empty())
             .unwrap_or("(empty review response)");
-        format!(
-            "review sub-agent did not pass: its final response must begin with an exact REVIEW PASS verdict after all checks succeed; request another review after addressing failures. Reviewer response:\n{response}"
+        (
+            "review_failed",
+            format!(
+                "the review response must begin with an exact REVIEW PASS verdict after all checks succeed; request another review after addressing failures. Reviewer response:\n{response}"
+            ),
         )
     } else if outcome.reached_final {
-        match outcome.final_content {
-            Some(content) if !content.trim().is_empty() => {
-                format!("sub-agent completed successfully:\n{}", content.trim())
-            }
-            _ => "sub-agent completed successfully".to_string(),
-        }
+        (
+            "completed",
+            outcome
+                .final_content
+                .as_deref()
+                .map(str::trim)
+                .filter(|content| !content.is_empty())
+                .unwrap_or("advisory task completed without a textual result")
+                .to_string(),
+        )
     } else {
-        "sub-agent reached its step limit before finalizing. Ask Trinity (monitor) to audit progress for loops, blockers, and whether to re-delegate with more max_steps before deciding how to continue.".to_string()
+        (
+            "step_limit",
+            "the advisory agent reached its step limit before finalizing; use the partial evidence only if independently verified"
+                .to_string(),
+        )
     };
+    let result = bounded_sub_agent_result(profile, status, &detail);
 
     sink.emit(AgentEvent::SubAgentFinished {
         profile: profile.as_str().to_string(),
@@ -7003,6 +7211,26 @@ fn run_sub_agent(
         timestamp_ms: Some(now_millis()),
     });
     Ok(result)
+}
+
+fn ensure_sub_agent_target_allowed(parent: AgentProfile, target: AgentProfile) -> Result<()> {
+    if !target.is_advisory_target() {
+        bail!(
+            "the {} profile cannot delegate to the mutating {} profile; build and scout work must remain in the primary delivery stage",
+            parent.as_str(),
+            target.as_str()
+        );
+    }
+    Ok(())
+}
+
+fn bounded_sub_agent_result(profile: AgentProfile, status: &str, detail: &str) -> String {
+    let truncated = detail.chars().count() > MAX_SUB_AGENT_RESULT_CHARS;
+    let detail = truncate_chars(detail, MAX_SUB_AGENT_RESULT_CHARS);
+    format!(
+        "advisory_result\nprofile: {}\nstatus: {status}\ntruncated: {truncated}\ncontent:\n{detail}",
+        profile.as_str()
+    )
 }
 
 fn ensure_sub_agent_review_is_ready(
@@ -9019,6 +9247,196 @@ mod tests {
     }
 
     #[test]
+    fn read_only_parent_cannot_delegate_mutating_profiles() {
+        for parent in [
+            AgentProfile::Build,
+            AgentProfile::Scout,
+            AgentProfile::Review,
+            AgentProfile::Explore,
+            AgentProfile::Plan,
+            AgentProfile::Ask,
+            AgentProfile::Monitor,
+        ] {
+            for target in [AgentProfile::Build, AgentProfile::Scout] {
+                let error = ensure_sub_agent_target_allowed(parent, target)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("cannot delegate"), "error: {error}");
+                assert!(error.contains(target.as_str()), "error: {error}");
+            }
+            ensure_sub_agent_target_allowed(parent, AgentProfile::Explore).unwrap();
+            ensure_sub_agent_target_allowed(parent, AgentProfile::Research).unwrap();
+        }
+    }
+
+    #[test]
+    fn scripted_mutating_delegation_is_rejected_at_execution_boundary() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Explore, 256);
+        request.max_steps = 2;
+        let delegate = ScriptedCompletion {
+            content: serde_json::json!({
+                "type": "tool_call",
+                "tool": "sub_agent",
+                "arguments": {
+                    "profile": "build",
+                    "task": "write forbidden.txt",
+                    "max_steps": 1
+                }
+            })
+            .to_string(),
+            truncated: false,
+        };
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![delegate, scripted_final("delegation rejected")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert!(!tmp.path().join("forbidden.txt").exists());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, result, .. }
+                if tool == "sub_agent" && result.contains("cannot delegate")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::SubAgentStarted { .. }))
+        );
+    }
+
+    #[test]
+    fn read_only_root_mutation_cannot_finalize() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Explore, 256);
+        request.max_steps = 3;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap());
+        let mutate = ScriptedCompletion {
+            content: serde_json::json!({
+                "type": "tool_call",
+                "tool": "run_command",
+                "arguments": {"cmd": "touch unexpected.txt"}
+            })
+            .to_string(),
+            truncated: false,
+        };
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![mutate, scripted_final("done"), scripted_final("done")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(!outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::GateLoop);
+        assert!(tmp.path().join("unexpected.txt").exists());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { message, .. }
+                if message.contains("read-only explore profile changed")
+                    && message.contains("unexpected.txt")
+        )));
+    }
+
+    #[test]
+    fn handoff_classifier_reports_non_build_root_mutations_as_incomplete() {
+        let tmp = init_contract_test_repo();
+        let repository =
+            crate::workspace::RepositoryContext::capture(tmp.path(), tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("unexpected.txt"), "unexpected\n").unwrap();
+        let request = test_agent_request(AgentProfile::Explore, 256);
+        let outcome = StepRunOutcome {
+            reached_final: true,
+            contract_status: ContractStatus::Unspecified,
+            verified_completed: false,
+            termination_reason: TerminationReason::Final,
+            final_content: Some("done".to_string()),
+            metrics: RunMetrics::default(),
+            gate_state: GateState::default(),
+        };
+
+        assert_eq!(
+            classify_handoff_outcome(&request, &outcome, Some(&repository)).unwrap(),
+            Some(crate::events::HandoffOutcome::Incomplete)
+        );
+    }
+
+    #[test]
+    fn shared_run_budget_enforces_advisory_invocation_and_token_limits() {
+        let mut advisory = RunBudget::new(RunBudgetLimits {
+            advisory_calls: 2,
+            model_invocations: 10,
+            generated_tokens: 10,
+        });
+        advisory.reserve_advisory_call().unwrap();
+        advisory.reserve_advisory_call().unwrap();
+        assert!(
+            advisory
+                .reserve_advisory_call()
+                .unwrap_err()
+                .to_string()
+                .contains("advisory call limit")
+        );
+
+        let mut invocations = RunBudget::new(RunBudgetLimits {
+            advisory_calls: 1,
+            model_invocations: 1,
+            generated_tokens: 10,
+        });
+        assert_eq!(invocations.reserve_model_invocation(8).unwrap(), 8);
+        assert!(
+            invocations
+                .reserve_model_invocation(8)
+                .unwrap_err()
+                .to_string()
+                .contains("model invocation limit")
+        );
+
+        let mut tokens = RunBudget::new(RunBudgetLimits {
+            advisory_calls: 1,
+            model_invocations: 10,
+            generated_tokens: 3,
+        });
+        assert_eq!(tokens.reserve_model_invocation(8).unwrap(), 3);
+        tokens.record_generated_tokens(3);
+        assert!(
+            tokens
+                .reserve_model_invocation(8)
+                .unwrap_err()
+                .to_string()
+                .contains("generated token limit")
+        );
+    }
+
+    #[test]
+    fn advisory_results_are_structured_and_bounded() {
+        let detail = "x".repeat(MAX_SUB_AGENT_RESULT_CHARS + 20);
+        let result = bounded_sub_agent_result(AgentProfile::Explore, "completed", &detail);
+
+        assert!(result.starts_with("advisory_result\nprofile: explore\n"));
+        assert!(result.contains("status: completed"));
+        assert!(result.contains("truncated: true"));
+        let content = result.split_once("content:\n").unwrap().1;
+        assert_eq!(
+            content
+                .chars()
+                .filter(|character| *character == 'x')
+                .count(),
+            MAX_SUB_AGENT_RESULT_CHARS
+        );
+    }
+
+    #[test]
     fn build_final_with_no_delta_enters_no_change_handoff_without_forcing_an_edit() {
         let tmp = init_contract_test_repo();
         let mut request = test_agent_request(AgentProfile::Build, 256);
@@ -9669,6 +10087,14 @@ mod tests {
             termination_reason_for_runtime_error(&error),
             TerminationReason::ResourceLimit
         );
+        assert_eq!(
+            termination_reason_for_runtime_error(&anyhow!("model invocation limit reached (2)")),
+            TerminationReason::InvocationLimit
+        );
+        assert_eq!(
+            termination_reason_for_runtime_error(&anyhow!("generated token limit reached (10)")),
+            TerminationReason::TokenLimit
+        );
     }
 
     #[test]
@@ -10246,6 +10672,9 @@ mod tests {
         assert!(instructions.contains("sub_agent(profile,task,max_steps)"));
         assert!(instructions.contains("Dade=plan"));
         assert!(instructions.contains("Trinity=monitor"));
+        assert!(instructions.contains("Build and scout are not advisory targets"));
+        assert!(!instructions.contains("Kate=build"));
+        assert!(!instructions.contains("Ramon=scout"));
         assert!(instructions.contains("Use I when talking about what you have done and We when talking about what needs to happen next"));
         assert!(instructions.contains("edit_file(path,old_text,new_text)"));
         assert!(instructions.contains("call Eugene with sub_agent profile=\"review\""));
@@ -10529,6 +10958,15 @@ mod tests {
             json!(["path", "content"])
         );
         assert!(build_tools.iter().any(|tool| tool.name == "sub_agent"));
+        let sub_agent = build_tools
+            .iter()
+            .find(|tool| tool.name == "sub_agent")
+            .unwrap();
+        let targets = sub_agent.input_schema["properties"]["profile"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(!targets.contains(&json!("build")));
+        assert!(!targets.contains(&json!("scout")));
     }
 
     #[test]
