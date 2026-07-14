@@ -326,6 +326,7 @@ mod tests {
             task: "test task".to_string(),
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
+            workflow_stage: None,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: Some(workdir.to_path_buf()),
@@ -434,12 +435,19 @@ mod tests {
             .unwrap()
             .as_object_mut()
             .unwrap()
-            .remove("intent");
+            .retain(|field, _| {
+                !matches!(
+                    field.as_str(),
+                    "intent" | "workflow_policy" | "workflow_stage"
+                )
+            });
 
         let restored: PersistedSession = serde_json::from_value(value).unwrap();
         assert!(restored.workflow.is_none());
         assert!(restored.completed_workflows.is_empty());
         assert!(restored.request_template.intent.is_none());
+        assert!(restored.request_template.workflow_policy.is_none());
+        assert!(restored.request_template.workflow_stage.is_none());
     }
 
     #[test]

@@ -28,6 +28,7 @@ impl WorkflowCheckpoint {
         if self.run.policy.sha256 != self.run.policy_sha256 {
             bail!("workflow checkpoint policy hash does not match compiled policy");
         }
+        self.run.policy.validate()?;
         Ok(())
     }
 }

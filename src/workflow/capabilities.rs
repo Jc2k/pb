@@ -1,6 +1,12 @@
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::WorkflowStage;
+use crate::agent_core::AgentProfile;
+
+use super::{
+    ArtifactEnvelope, CodeReviewArtifact, ImplementationArtifact, PlanArtifact, PlanReviewArtifact,
+    WorkflowLimits, WorkflowStage,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -11,6 +17,88 @@ pub enum TerminalActionKind {
     SubmitImplementation,
     SubmitCodeReview,
     None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StageContract {
+    pub stage: WorkflowStage,
+    pub profile: AgentProfile,
+    pub capabilities: StageCapabilities,
+    pub max_steps: usize,
+    pub max_tokens_per_turn: i32,
+    pub terminal_action: TerminalActionKind,
+}
+
+impl StageContract {
+    pub fn strict(stage: WorkflowStage, limits: WorkflowLimits, max_tokens: i32) -> Result<Self> {
+        let profile = match stage {
+            WorkflowStage::Planning | WorkflowStage::PlanRevision => AgentProfile::Plan,
+            WorkflowStage::PlanReview | WorkflowStage::CodeReview => AgentProfile::Review,
+            WorkflowStage::Implementing | WorkflowStage::Repairing => AgentProfile::Build,
+            _ => bail!("stage {stage:?} is deterministic and cannot run a model stage"),
+        };
+        let capabilities = StageCapabilities::for_stage(stage);
+        let contract = Self {
+            stage,
+            profile,
+            capabilities,
+            max_steps: limits.stage_steps,
+            max_tokens_per_turn: max_tokens,
+            terminal_action: capabilities.terminal_action,
+        };
+        contract.validate(limits)?;
+        Ok(contract)
+    }
+
+    pub fn validate(&self, limits: WorkflowLimits) -> Result<()> {
+        if self.stage.is_terminal()
+            || matches!(
+                self.stage,
+                WorkflowStage::Checking | WorkflowStage::Committing
+            )
+        {
+            bail!("stage {:?} is not model-driven", self.stage);
+        }
+        let expected = StageCapabilities::for_stage(self.stage);
+        if self.capabilities != expected || self.terminal_action != expected.terminal_action {
+            bail!(
+                "stage contract capabilities must exactly match the harness policy for {:?}",
+                self.stage
+            );
+        }
+        if self.max_steps == 0 || self.max_steps > limits.stage_steps {
+            bail!(
+                "stage max_steps must be between 1 and {}",
+                limits.stage_steps
+            );
+        }
+        if self.max_tokens_per_turn <= 0
+            || self.max_tokens_per_turn as usize > limits.total_generated_tokens
+        {
+            bail!("stage max_tokens_per_turn must fit the remaining workflow token policy");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StageSubmission {
+    Plan {
+        plan: ArtifactEnvelope<PlanArtifact>,
+    },
+    PlanReview {
+        review: ArtifactEnvelope<PlanReviewArtifact>,
+    },
+    Implementation {
+        implementation: ArtifactEnvelope<ImplementationArtifact>,
+    },
+    Replan {
+        reason: String,
+    },
+    CodeReview {
+        review: ArtifactEnvelope<CodeReviewArtifact>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +192,11 @@ impl StageCapabilities {
             "read_file" | "glob" | "ripgrep" | "search" | "git_log" | "session_changes"
             | "memory_search" | "memory_read" => self.repository_read,
             "web_search" | "web_fetch" => self.public_research,
+            "attachments" | "vision_describe" | "session_title" => self.repository_read,
+            "ask_user" => {
+                matches!(self.terminal_action, TerminalActionKind::SubmitPlan)
+            }
+            "todo" => self.repository_mutation,
             "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm" => {
                 self.repository_mutation
             }
@@ -172,5 +265,18 @@ mod tests {
             assert!(!capabilities.repository_read);
             assert_eq!(capabilities.terminal_action, TerminalActionKind::None);
         }
+    }
+
+    #[test]
+    fn stage_contract_cannot_smuggle_extra_capabilities_or_budget() {
+        let limits = WorkflowLimits::default();
+        let mut contract = StageContract::strict(WorkflowStage::Planning, limits, 512).unwrap();
+        contract.capabilities.run_command = true;
+        assert!(contract.validate(limits).is_err());
+
+        let mut contract = StageContract::strict(WorkflowStage::Implementing, limits, 512).unwrap();
+        contract.max_steps = limits.stage_steps + 1;
+        assert!(contract.validate(limits).is_err());
+        assert!(StageContract::strict(WorkflowStage::Checking, limits, 512).is_err());
     }
 }

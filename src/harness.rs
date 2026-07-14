@@ -436,6 +436,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         task: args.task.clone(),
         intent: Some(crate::workflow::TurnIntent::Deliver),
         workflow_policy: None,
+        workflow_stage: None,
         model: args
             .model
             .clone()

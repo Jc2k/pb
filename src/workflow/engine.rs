@@ -105,6 +105,7 @@ impl WorkflowRun {
         let id = required("workflow id", id.into())?;
         let source_turn_id = required("source turn id", source_turn_id.into())?;
         let task = required("workflow task", task.into())?;
+        policy.validate()?;
         Ok(Self {
             version: policy.version,
             id,

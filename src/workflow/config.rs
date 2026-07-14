@@ -89,9 +89,7 @@ impl WorkflowConfigDocument {
             default_intent: self.default_intent,
             limits: self.limits,
         };
-        let bytes = serde_json::to_vec(&normalized)
-            .context("failed to serialize normalized workflow policy")?;
-        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let sha256 = normalized_policy_hash(&normalized)?;
         Ok(CompiledWorkflowPolicy {
             version: normalized.version,
             delivery: normalized.delivery,
@@ -220,6 +218,40 @@ pub struct CompiledWorkflowPolicy {
     pub sha256: String,
 }
 
+impl CompiledWorkflowPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != WORKFLOW_CONFIG_VERSION {
+            bail!(
+                "unsupported compiled workflow policy version {}; expected {}",
+                self.version,
+                WORKFLOW_CONFIG_VERSION
+            );
+        }
+        self.limits.validate()?;
+        let normalized = NormalizedWorkflowPolicy {
+            version: self.version,
+            delivery: self.delivery,
+            default_intent: self.default_intent,
+            limits: self.limits,
+        };
+        let expected = normalized_policy_hash(&normalized)?;
+        if self.sha256 != expected {
+            bail!(
+                "compiled workflow policy hash mismatch: expected {}, got {}",
+                expected,
+                self.sha256
+            );
+        }
+        Ok(())
+    }
+}
+
+fn normalized_policy_hash(policy: &NormalizedWorkflowPolicy) -> Result<String> {
+    let bytes =
+        serde_json::to_vec(policy).context("failed to serialize normalized workflow policy")?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +325,13 @@ mod tests {
         let loaded = WorkflowConfigDocument::load(dir.path()).unwrap().unwrap();
         assert_eq!(loaded, WorkflowConfigDocument::default());
         assert_eq!(loaded.clone().compile().unwrap(), loaded.compile().unwrap());
+    }
+
+    #[test]
+    fn compiled_policy_detects_hash_or_limit_tampering() {
+        let mut policy = WorkflowConfigDocument::default().compile().unwrap();
+        assert!(policy.validate().is_ok());
+        policy.limits.stage_steps += 1;
+        assert!(policy.validate().is_err());
     }
 }

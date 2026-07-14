@@ -480,6 +480,10 @@ pub struct AgentRequest {
     /// Ordinary project sessions load and snapshot `.pb/workflow.toml` when delivery starts.
     #[serde(default)]
     pub workflow_policy: Option<crate::workflow::CompiledWorkflowPolicy>,
+    /// Harness-owned active model stage. Capabilities are always derived from this value and the
+    /// snapshotted policy; callers cannot supply an arbitrary capability set.
+    #[serde(default)]
+    pub workflow_stage: Option<crate::workflow::WorkflowStage>,
     pub model: String,
     pub model_dir: Option<PathBuf>,
     pub workdir: Option<PathBuf>,
@@ -653,6 +657,15 @@ impl RunBudget {
 
     fn record_generated_tokens(&mut self, generated_tokens: usize) {
         self.generated_tokens = self.generated_tokens.saturating_add(generated_tokens);
+    }
+
+    #[allow(dead_code)] // Used by the staged workflow entry point before strict routing is enabled.
+    fn for_workflow(limits: crate::workflow::WorkflowLimits) -> Self {
+        Self::new(RunBudgetLimits {
+            advisory_calls: limits.advisory_calls,
+            model_invocations: limits.total_model_invocations,
+            generated_tokens: limits.total_generated_tokens,
+        })
     }
 }
 
@@ -2277,6 +2290,14 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
             ),
         ),
         builtin_tool(
+            "run_task",
+            "Run one trusted project-configured task by id in an isolated snapshot. Only declared output paths can be promoted and task success never counts as check evidence.",
+            object_schema(
+                [string_property("id", "Task id from .pb/workspace.toml.")],
+                ["id"],
+            ),
+        ),
+        builtin_tool(
             "run_check",
             "Run one trusted acceptance check by contract ID. Arbitrary commands are not accepted.",
             object_schema(
@@ -2615,7 +2636,48 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                 ["profile", "task"],
             ),
         ),
+        builtin_tool(
+            "submit_plan",
+            "Submit the complete structured plan and end this planning stage. Prose or final responses do not advance delivery.",
+            submission_schema("plan", "Validated plan artifact."),
+        ),
+        builtin_tool(
+            "submit_plan_review",
+            "Submit the structured critique of the exact accepted plan and end this review stage.",
+            submission_schema("review", "Plan review artifact."),
+        ),
+        builtin_tool(
+            "submit_implementation",
+            "Submit structured accounting for every accepted plan step and end this implementation or repair stage.",
+            submission_schema("implementation", "Implementation artifact."),
+        ),
+        builtin_tool(
+            "request_replan",
+            "Stop implementation and return to planning because the accepted plan needs a material change.",
+            object_schema(
+                [string_property(
+                    "reason",
+                    "Concrete reason the accepted plan is no longer applicable.",
+                )],
+                ["reason"],
+            ),
+        ),
+        builtin_tool(
+            "submit_code_review",
+            "Submit the structured critique of the exact checked content and end this code-review stage.",
+            submission_schema("review", "Code review artifact."),
+        ),
     ]
+}
+
+fn submission_schema(field: &'static str, description: &'static str) -> Value {
+    object_schema(
+        [
+            string_property("id", "Stable artifact id for this stage submission."),
+            object_property(field, description),
+        ],
+        ["id", field],
+    )
 }
 
 fn builtin_tool(
@@ -2675,6 +2737,13 @@ fn boolean_property(name: &'static str, description: &'static str) -> (&'static 
     (
         name,
         json!({ "type": "boolean", "description": description }),
+    )
+}
+
+fn object_property(name: &'static str, description: &'static str) -> (&'static str, Value) {
+    (
+        name,
+        json!({ "type": "object", "description": description }),
     )
 }
 
@@ -2835,6 +2904,8 @@ struct GateState {
     review_read_evidence_gathered: bool,
     review_command_evidence_gathered: bool,
     review_command_required: bool,
+    workflow_submission: Option<crate::workflow::StageSubmission>,
+    workflow_control_violation: Option<String>,
 }
 
 impl GateState {
@@ -2891,6 +2962,7 @@ fn run_agent_steps(
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
+    let stage_capabilities = active_stage_capabilities(args)?;
     let mut metrics = RunMetrics::default();
     let original_max_steps = args.max_steps;
     let mut effective_max_steps = args.max_steps;
@@ -2913,7 +2985,7 @@ fn run_agent_steps(
             args.prior_check_evidence.clone(),
         ))
     });
-    let available_tools = available_tool_specs_with_allowlist(
+    let mut available_tools = available_tool_specs_with_allowlist(
         args.profile,
         command_backend.map(CommandBackend::kind),
         args.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
@@ -2923,6 +2995,20 @@ fn run_agent_steps(
         mcp_registry,
         lsp_registry,
     );
+    if let Some(capabilities) = stage_capabilities {
+        for tool in all_builtin_tool_specs() {
+            if capabilities.allows_tool(&tool.name)
+                && !available_tools
+                    .iter()
+                    .any(|available| available.name == tool.name)
+            {
+                available_tools.push(tool);
+            }
+        }
+        available_tools.retain(|tool| {
+            workflow_tool_allowed(&tool.name, capabilities, mcp_registry, lsp_registry)
+        });
+    }
 
     while step <= effective_max_steps {
         sink.emit(AgentEvent::StepStarted {
@@ -3036,6 +3122,37 @@ fn run_agent_steps(
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
+                }
+                if let Some(stage) = args.workflow_stage {
+                    let required =
+                        crate::workflow::StageCapabilities::for_stage(stage).terminal_action;
+                    let feedback = format!(
+                        "workflow stage {stage:?} requires its named {required:?} tool; a prose/final response cannot advance delivery"
+                    );
+                    sink.emit(AgentEvent::Correction {
+                        message: feedback.clone(),
+                        summary: "Workflow stage submission required".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    if step >= effective_max_steps {
+                        return Ok(StepRunOutcome {
+                            reached_final: false,
+                            contract_status: incomplete_contract_status(args),
+                            verified_completed: false,
+                            termination_reason: TerminationReason::StepLimit,
+                            final_content: Some(content),
+                            metrics,
+                            gate_state: gate_state.into_inner(),
+                        });
+                    }
+                    messages.push(ChatMessage::text("assistant", output.clone()));
+                    messages.push(correction_chat_message(
+                        "Workflow stage submission required",
+                        &feedback,
+                    ));
+                    step += 1;
+                    continue;
                 }
                 let gate_feedback =
                     request_completion_gate_feedback(args, &gate_state.borrow(), workspace_root)?;
@@ -3382,6 +3499,29 @@ fn run_agent_steps(
                     sink,
                     &mut metrics,
                 )?;
+                let control_violation = gate_state.borrow().workflow_control_violation.clone();
+                if control_violation.is_some() {
+                    return Ok(StepRunOutcome {
+                        reached_final: false,
+                        contract_status: incomplete_contract_status(args),
+                        verified_completed: false,
+                        termination_reason: TerminationReason::CommitBlocked,
+                        final_content: control_violation,
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
+                if gate_state.borrow().workflow_submission.is_some() {
+                    return Ok(StepRunOutcome {
+                        reached_final: true,
+                        contract_status: ContractStatus::Unspecified,
+                        verified_completed: false,
+                        termination_reason: TerminationReason::Final,
+                        final_content: None,
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
                 if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
@@ -3455,6 +3595,29 @@ fn run_agent_steps(
                     sink,
                     &mut metrics,
                 )?;
+                let control_violation = gate_state.borrow().workflow_control_violation.clone();
+                if control_violation.is_some() {
+                    return Ok(StepRunOutcome {
+                        reached_final: false,
+                        contract_status: incomplete_contract_status(args),
+                        verified_completed: false,
+                        termination_reason: TerminationReason::CommitBlocked,
+                        final_content: control_violation,
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
+                if gate_state.borrow().workflow_submission.is_some() {
+                    return Ok(StepRunOutcome {
+                        reached_final: true,
+                        contract_status: ContractStatus::Unspecified,
+                        verified_completed: false,
+                        termination_reason: TerminationReason::Final,
+                        final_content: None,
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
                 if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
@@ -4112,6 +4275,21 @@ fn execute_tool_calls(
     sink: &mut dyn EventSink,
     metrics: &mut RunMetrics,
 ) -> Result<()> {
+    if env.args.workflow_stage.is_some()
+        && calls.len() != 1
+        && calls.iter().any(|call| {
+            matches!(
+                call.tool.as_str(),
+                "submit_plan"
+                    | "submit_plan_review"
+                    | "submit_implementation"
+                    | "request_replan"
+                    | "submit_code_review"
+            )
+        })
+    {
+        bail!("a workflow terminal submission must be the only tool call in its model action");
+    }
     if let Some(reasoning) = thinking {
         sink.emit(AgentEvent::Reasoning {
             content: reasoning,
@@ -4131,6 +4309,26 @@ fn execute_tool_calls(
             nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
+
+        if let Some(capabilities) = active_stage_capabilities(env.args)?
+            && !workflow_tool_allowed(&call.tool, capabilities, env.mcp_registry, env.lsp_registry)
+        {
+            let tool = call.tool.clone();
+            results.push((
+                call.id,
+                call.tool,
+                call.arguments,
+                format!(
+                    "tool '{tool}' is not available in workflow stage {:?}",
+                    env.args
+                        .workflow_stage
+                        .expect("capabilities require a stage")
+                ),
+                0,
+                None,
+            ));
+            continue;
+        }
 
         let decision = env
             .policy_config
@@ -4524,6 +4722,124 @@ trait CompletionEngine {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Constructed by strict delivery orchestration in the next workstream.
+pub(crate) struct StageContext {
+    pub system_prompt: String,
+    pub user_prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Returned by strict delivery orchestration in the next workstream.
+pub(crate) struct StageRunOutcome {
+    pub submission: Option<crate::workflow::StageSubmission>,
+    pub termination_reason: TerminationReason,
+    pub usage: crate::workflow::WorkflowUsage,
+    pub read_paths: Vec<String>,
+    pub control_violation: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Kept internal until explicit Build requests route through strict delivery.
+fn run_stage(
+    generator: &mut dyn CompletionEngine,
+    text_backend: TextBackendKind,
+    llamacpp: Option<&LlamaCppBackend>,
+    base_args: &AgentRequest,
+    contract: &crate::workflow::StageContract,
+    context: StageContext,
+    workspace_root: &Path,
+    models_root: &Path,
+    command_backend: Option<&CommandBackend>,
+    env_config: Option<&EnvironmentConfig>,
+    todo_memory: &RefCell<TodoMemory>,
+    mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
+    policy_config: &PolicyConfig,
+    personal_memory_repo: Option<&Path>,
+    run_budget: &RefCell<RunBudget>,
+    sink: &mut dyn EventSink,
+) -> Result<StageRunOutcome> {
+    let policy = base_args
+        .workflow_policy
+        .as_ref()
+        .context("stage runner requires a snapshotted workflow policy")?;
+    policy.validate()?;
+    contract.validate(policy.limits)?;
+
+    let mut args = base_args.clone();
+    args.profile = contract.profile;
+    args.infer_profile = false;
+    args.max_steps = contract.max_steps;
+    args.max_tokens = contract.max_tokens_per_turn;
+    args.turn_max_tokens_cap = Some(
+        args.turn_max_tokens_cap
+            .unwrap_or(contract.max_tokens_per_turn)
+            .min(contract.max_tokens_per_turn),
+    );
+    args.workflow_stage = Some(contract.stage);
+    // StageCapabilities is the authoritative allowlist. A legacy/direct-run allowlist must not
+    // accidentally remove the required typed terminal action or add authority to this stage.
+    args.tool_allowlist = None;
+
+    let mut messages = vec![
+        ChatMessage::text("system", context.system_prompt),
+        ChatMessage::text("user", context.user_prompt),
+    ];
+    let budget_before = {
+        let budget = run_budget.borrow();
+        (
+            budget.advisory_calls,
+            budget.model_invocations,
+            budget.generated_tokens,
+        )
+    };
+    let mut outcome = run_agent_steps(
+        generator,
+        text_backend,
+        llamacpp,
+        &args,
+        &mut messages,
+        workspace_root,
+        models_root,
+        command_backend,
+        env_config,
+        todo_memory,
+        mcp_registry,
+        lsp_registry,
+        policy_config,
+        personal_memory_repo,
+        run_budget,
+        0,
+        sink,
+    )?;
+    let budget_after = run_budget.borrow();
+    let usage = crate::workflow::WorkflowUsage {
+        stage_steps: outcome.metrics.llm_invocations,
+        model_invocations: budget_after
+            .model_invocations
+            .saturating_sub(budget_before.1),
+        generated_tokens: budget_after
+            .generated_tokens
+            .saturating_sub(budget_before.2),
+        advisory_calls: budget_after.advisory_calls.saturating_sub(budget_before.0),
+    };
+    drop(budget_after);
+    let mut read_paths = outcome
+        .gate_state
+        .read_paths
+        .into_iter()
+        .collect::<Vec<_>>();
+    read_paths.sort();
+    Ok(StageRunOutcome {
+        submission: outcome.gate_state.workflow_submission.take(),
+        termination_reason: outcome.termination_reason,
+        usage,
+        read_paths,
+        control_violation: outcome.gate_state.workflow_control_violation,
+    })
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ScriptedCompletion {
     pub content: String,
     pub truncated: bool,
@@ -4541,12 +4857,15 @@ pub(crate) struct ScriptedAgentOutcome {
     pub remaining_completions: usize,
     pub generation_tool_counts: Vec<usize>,
     pub generation_max_tokens: Vec<i32>,
+    pub generation_tool_names: Vec<Vec<String>>,
+    pub workflow_submission: Option<crate::workflow::StageSubmission>,
 }
 
 struct ScriptedCompletionEngine {
     completions: VecDeque<ScriptedCompletion>,
     generation_tool_counts: Vec<usize>,
     generation_max_tokens: Vec<i32>,
+    generation_tool_names: Vec<Vec<String>>,
 }
 
 impl CompletionEngine for ScriptedCompletionEngine {
@@ -4558,6 +4877,12 @@ impl CompletionEngine for ScriptedCompletionEngine {
     ) -> Result<CompletionOutput> {
         self.generation_tool_counts.push(tools.len());
         self.generation_max_tokens.push(args.max_tokens);
+        self.generation_tool_names.push(
+            tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+        );
         let completion = self
             .completions
             .pop_front()
@@ -4592,6 +4917,7 @@ pub(crate) fn run_scripted_agent_steps(
         completions: completions.into(),
         generation_tool_counts: Vec::new(),
         generation_max_tokens: Vec::new(),
+        generation_tool_names: Vec::new(),
     };
     let mut messages = vec![
         ChatMessage::text(
@@ -4638,6 +4964,132 @@ pub(crate) fn run_scripted_agent_steps(
         remaining_completions: generator.completions.len(),
         generation_tool_counts: generator.generation_tool_counts,
         generation_max_tokens: generator.generation_max_tokens,
+        generation_tool_names: generator.generation_tool_names,
+        workflow_submission: outcome.gate_state.workflow_submission,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Deterministic harness parity uses this after workflow fixtures land.
+pub(crate) struct ScriptedStageOutcome {
+    pub stage: StageRunOutcome,
+    pub remaining_completions: usize,
+    pub generation_tool_names: Vec<Vec<String>>,
+}
+
+#[allow(dead_code)] // Deterministic harness parity uses this after workflow fixtures land.
+pub(crate) fn run_scripted_stage(
+    args: &AgentRequest,
+    contract: &crate::workflow::StageContract,
+    context: StageContext,
+    completions: Vec<ScriptedCompletion>,
+    workspace_root: &Path,
+    sink: &mut dyn EventSink,
+) -> Result<ScriptedStageOutcome> {
+    let mut generator = ScriptedCompletionEngine {
+        completions: completions.into(),
+        generation_tool_counts: Vec::new(),
+        generation_max_tokens: Vec::new(),
+        generation_tool_names: Vec::new(),
+    };
+    let command_backend = CommandBackend::Local {
+        workspace_root: workspace_root.to_path_buf(),
+    };
+    let todo_memory = RefCell::new(TodoMemory::default());
+    let mcp_registry = McpToolRegistry::default();
+    let lsp_registry = LspToolRegistry::default();
+    let policy_config = PolicyConfig::default();
+    let policy = args
+        .workflow_policy
+        .as_ref()
+        .context("scripted stage requires workflow policy")?;
+    let run_budget = RefCell::new(RunBudget::for_workflow(policy.limits));
+    let stage = run_stage(
+        &mut generator,
+        TextBackendKind::LlamaCpp,
+        None,
+        args,
+        contract,
+        context,
+        workspace_root,
+        workspace_root,
+        Some(&command_backend),
+        None,
+        &todo_memory,
+        &mcp_registry,
+        &lsp_registry,
+        &policy_config,
+        None,
+        &run_budget,
+        sink,
+    )?;
+    Ok(ScriptedStageOutcome {
+        stage,
+        remaining_completions: generator.completions.len(),
+        generation_tool_names: generator.generation_tool_names,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Deterministic harness parity uses this after workflow fixtures land.
+pub(crate) struct ScriptedStageSequenceOutcome {
+    pub stages: Vec<StageRunOutcome>,
+    pub remaining_completions: usize,
+    pub generation_tool_names: Vec<Vec<String>>,
+}
+
+#[allow(dead_code)] // Deterministic harness parity uses this after workflow fixtures land.
+pub(crate) fn run_scripted_stage_sequence(
+    args: &AgentRequest,
+    stages: Vec<(crate::workflow::StageContract, StageContext)>,
+    completions: Vec<ScriptedCompletion>,
+    workspace_root: &Path,
+    sink: &mut dyn EventSink,
+) -> Result<ScriptedStageSequenceOutcome> {
+    let mut generator = ScriptedCompletionEngine {
+        completions: completions.into(),
+        generation_tool_counts: Vec::new(),
+        generation_max_tokens: Vec::new(),
+        generation_tool_names: Vec::new(),
+    };
+    let command_backend = CommandBackend::Local {
+        workspace_root: workspace_root.to_path_buf(),
+    };
+    let todo_memory = RefCell::new(TodoMemory::default());
+    let mcp_registry = McpToolRegistry::default();
+    let lsp_registry = LspToolRegistry::default();
+    let policy_config = PolicyConfig::default();
+    let policy = args
+        .workflow_policy
+        .as_ref()
+        .context("scripted stage sequence requires workflow policy")?;
+    let run_budget = RefCell::new(RunBudget::for_workflow(policy.limits));
+    let mut outcomes = Vec::with_capacity(stages.len());
+    for (contract, context) in stages {
+        outcomes.push(run_stage(
+            &mut generator,
+            TextBackendKind::LlamaCpp,
+            None,
+            args,
+            &contract,
+            context,
+            workspace_root,
+            workspace_root,
+            Some(&command_backend),
+            None,
+            &todo_memory,
+            &mcp_registry,
+            &lsp_registry,
+            &policy_config,
+            None,
+            &run_budget,
+            sink,
+        )?);
+    }
+    Ok(ScriptedStageSequenceOutcome {
+        stages: outcomes,
+        remaining_completions: generator.completions.len(),
+        generation_tool_names: generator.generation_tool_names,
     })
 }
 
@@ -5790,6 +6242,22 @@ fn run_tool(
     if !tool_is_in_request_allowlist(tool, context.request.tool_allowlist.as_deref()) {
         bail!("tool '{tool}' is not allowed for this bounded run");
     }
+    if let Some(capabilities) = active_stage_capabilities(context.request)?
+        && !workflow_tool_allowed(
+            tool,
+            capabilities,
+            context.mcp_registry,
+            context.lsp_registry,
+        )
+    {
+        bail!(
+            "tool '{tool}' is not available in workflow stage {:?}",
+            context
+                .request
+                .workflow_stage
+                .expect("capabilities require a stage")
+        );
+    }
     if context.mcp_registry.tool(tool).is_some() {
         return mcp::call_tool(context.mcp_registry, tool, arguments);
     }
@@ -5801,13 +6269,15 @@ fn run_tool(
             arguments,
         );
     }
-    if !tool_allowed(
-        tool,
-        context.request.profile,
-        context.command_backend.map(CommandBackend::kind),
-        context.request.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
-        context.request.repository_less,
-    ) {
+    if context.request.workflow_stage.is_none()
+        && !tool_allowed(
+            tool,
+            context.request.profile,
+            context.command_backend.map(CommandBackend::kind),
+            context.request.sub_agent_depth < MAX_SUB_AGENT_DEPTH,
+            context.request.repository_less,
+        )
+    {
         bail!(
             "tool '{tool}' is not available for the {} profile",
             context.request.profile.as_str()
@@ -6266,19 +6736,62 @@ fn run_tool(
         "sub_agent" => run_sub_agent(arguments, context, sink, metrics),
         "attachments" => Ok(serde_json::to_string_pretty(&context.request.attachments)?),
         "vision_describe" => run_vision_describe(arguments, context),
+        "submit_plan" => {
+            let plan = parse_submission_artifact(arguments, "plan")?;
+            accept_stage_submission(
+                context.gate_state,
+                crate::workflow::StageSubmission::Plan { plan },
+            )
+        }
+        "submit_plan_review" => {
+            let review = parse_submission_artifact(arguments, "review")?;
+            accept_stage_submission(
+                context.gate_state,
+                crate::workflow::StageSubmission::PlanReview { review },
+            )
+        }
+        "submit_implementation" => {
+            let implementation = parse_submission_artifact(arguments, "implementation")?;
+            accept_stage_submission(
+                context.gate_state,
+                crate::workflow::StageSubmission::Implementation { implementation },
+            )
+        }
+        "request_replan" => {
+            let reason = arguments
+                .get("reason")
+                .and_then(Value::as_str)
+                .context("request_replan requires string argument: reason")?
+                .trim();
+            if reason.is_empty() {
+                bail!("request_replan reason must not be empty");
+            }
+            accept_stage_submission(
+                context.gate_state,
+                crate::workflow::StageSubmission::Replan {
+                    reason: reason.to_string(),
+                },
+            )
+        }
+        "submit_code_review" => {
+            let review = parse_submission_artifact(arguments, "review")?;
+            accept_stage_submission(
+                context.gate_state,
+                crate::workflow::StageSubmission::CodeReview { review },
+            )
+        }
+        "run_task" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .context("run_task requires string argument: id")?;
+            run_workspace_task(id, context)
+        }
         "run_check" => {
             let id = arguments
                 .get("id")
                 .and_then(Value::as_str)
                 .context("run_check requires string argument: id")?;
-            let contract = context
-                .request
-                .contract
-                .as_ref()
-                .context("run_check is unavailable without a harness contract")?;
-            let check = contract
-                .check(id)
-                .with_context(|| format!("harness contract has no check named '{id}'"))?;
             if let (Some(runtime), Some(graph)) = (
                 context.workspace_checks,
                 context.request.workspace_graph.as_ref(),
@@ -6297,7 +6810,13 @@ fn run_tool(
                     context.request,
                     context.gate_state,
                 )?;
-                let forbidden = contract_forbidden_changed_paths(contract, workspace_root)?;
+                let forbidden = context
+                    .request
+                    .contract
+                    .as_ref()
+                    .map(|contract| contract_forbidden_changed_paths(contract, workspace_root))
+                    .transpose()?
+                    .unwrap_or_default();
                 if !forbidden.is_empty() {
                     bail!(
                         "named check '{id}' changed forbidden path(s): {}",
@@ -6320,6 +6839,12 @@ fn run_tool(
                 }
                 return Ok(serde_json::to_string(&summary)?);
             }
+            let contract = context.request.contract.as_ref().context(
+                "run_check is unavailable without a configured project or harness check",
+            )?;
+            let check = contract
+                .check(id)
+                .with_context(|| format!("harness contract has no check named '{id}'"))?;
             let backend = command_backend
                 .context("run_check is not available: no project environment is configured")?;
             run_named_contract_check(
@@ -6340,7 +6865,9 @@ fn run_tool(
                 .context("run_command requires string argument: cmd")?;
             let backend = command_backend
                 .context("run_command is not available: no project environment is configured")?;
-            let result = if let Some(check_id) = exact_workspace_check_id(context.request, cmd) {
+            let result = if context.request.workflow_stage.is_none()
+                && let Some(check_id) = exact_workspace_check_id(context.request, cmd)
+            {
                 let runtime = context.workspace_checks.with_context(|| {
                     format!(
                         "workspace check runtime is unavailable for declared check '{check_id}'"
@@ -6382,6 +6909,70 @@ fn run_tool(
         }
         _ => bail!("unknown tool: {tool}"),
     }
+}
+
+fn active_stage_capabilities(
+    request: &AgentRequest,
+) -> Result<Option<crate::workflow::StageCapabilities>> {
+    let Some(stage) = request.workflow_stage else {
+        return Ok(None);
+    };
+    let policy = request
+        .workflow_policy
+        .as_ref()
+        .context("workflow stage requires a snapshotted workflow policy")?;
+    policy.validate()?;
+    crate::workflow::StageContract::strict(stage, policy.limits, request.max_tokens)?
+        .validate(policy.limits)?;
+    Ok(Some(crate::workflow::StageCapabilities::for_stage(stage)))
+}
+
+fn parse_submission_artifact<T>(
+    arguments: &Value,
+    field: &str,
+) -> Result<crate::workflow::ArtifactEnvelope<T>>
+where
+    T: serde::de::DeserializeOwned + Serialize,
+{
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_str)
+        .with_context(|| format!("workflow submission requires string argument: id"))?;
+    let artifact = arguments
+        .get(field)
+        .cloned()
+        .with_context(|| format!("workflow submission requires object argument: {field}"))?;
+    let artifact = serde_json::from_value(artifact)
+        .with_context(|| format!("invalid structured {field} artifact"))?;
+    crate::workflow::ArtifactEnvelope::new(id, artifact)
+}
+
+fn accept_stage_submission(
+    gate_state: &RefCell<GateState>,
+    submission: crate::workflow::StageSubmission,
+) -> Result<String> {
+    let mut state = gate_state.borrow_mut();
+    if state.workflow_submission.is_some() {
+        bail!("workflow stage already accepted a terminal submission");
+    }
+    state.workflow_submission = Some(submission);
+    Ok("workflow stage submission accepted for deterministic validation".to_string())
+}
+
+fn workflow_tool_allowed(
+    tool: &str,
+    capabilities: crate::workflow::StageCapabilities,
+    mcp_registry: &McpToolRegistry,
+    lsp_registry: &LspToolRegistry,
+) -> bool {
+    if mcp_registry.tool(tool).is_some() {
+        // MCP tools do not yet carry a trustworthy read-vs-write classification.
+        return false;
+    }
+    if lsp_registry.tool(tool).is_some() {
+        return capabilities.repository_read;
+    }
+    capabilities.allows_tool(tool)
 }
 
 fn exact_workspace_check_id(request: &AgentRequest, command: &str) -> Option<String> {
@@ -6479,10 +7070,118 @@ fn run_command_and_record_workspace_change(
     request: &AgentRequest,
     gate_state: &RefCell<GateState>,
 ) -> Result<String> {
+    let control_before = request
+        .workflow_stage
+        .is_some()
+        .then(|| git_control_state(workspace_root))
+        .transpose()?;
     let before = workspace_change_observation(workspace_root, gate_state)?;
-    let result = backend.exec(cmd);
+    let result = backend
+        .exec(cmd)
+        .map(bound_workflow_command_output)
+        .map_err(|error| anyhow!(bound_workflow_command_output(format!("{error:#}"))));
     record_workspace_change_observation(before, workspace_root, request, gate_state)?;
+    if let Some(control_before) = control_before {
+        let control_after = git_control_state(workspace_root)?;
+        if control_before != control_after {
+            let detail = control_before.difference(&control_after);
+            gate_state.borrow_mut().workflow_control_violation = Some(format!(
+                "run_command changed harness-owned Git control state ({detail}); the workflow is blocked and this command receives no completion credit"
+            ));
+            bail!(
+                "run_command changed harness-owned Git control state ({detail}); workflow blocked"
+            );
+        }
+    }
     result
+}
+
+const MAX_WORKFLOW_COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
+
+fn bound_workflow_command_output(output: String) -> String {
+    if output.len() <= MAX_WORKFLOW_COMMAND_OUTPUT_BYTES {
+        return output;
+    }
+    let mut boundary = MAX_WORKFLOW_COMMAND_OUTPUT_BYTES;
+    while !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!(
+        "{}\n… output truncated by workflow journal at {} bytes",
+        &output[..boundary],
+        MAX_WORKFLOW_COMMAND_OUTPUT_BYTES
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitControlState {
+    head: String,
+    index_sha256: String,
+    refs_sha256: String,
+}
+
+impl GitControlState {
+    fn difference(&self, current: &Self) -> String {
+        let mut changed = Vec::new();
+        if self.head != current.head {
+            changed.push("HEAD");
+        }
+        if self.index_sha256 != current.index_sha256 {
+            changed.push("index");
+        }
+        if self.refs_sha256 != current.refs_sha256 {
+            changed.push("refs");
+        }
+        changed.join(", ")
+    }
+}
+
+fn git_control_state(workdir: &Path) -> Result<GitControlState> {
+    let head = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(workdir)
+        .output()
+        .context("failed to inspect workflow HEAD")?;
+    let head = if head.status.success() {
+        String::from_utf8_lossy(&head.stdout).trim().to_string()
+    } else {
+        "<unborn>".to_string()
+    };
+    let index = git_control_bytes(workdir, &["ls-files", "--stage", "-z"])?;
+    let refs = git_control_bytes(
+        workdir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00",
+            "refs",
+        ],
+    )?;
+    Ok(GitControlState {
+        head,
+        index_sha256: format!("{:x}", Sha256::digest(index)),
+        refs_sha256: format!("{:x}", Sha256::digest(refs)),
+    })
+}
+
+fn git_control_bytes(workdir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to inspect workflow Git state: git {}",
+                args.join(" ")
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "failed to inspect workflow Git state with git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
 }
 
 fn workspace_change_observation(
@@ -6966,6 +7665,20 @@ fn run_sub_agent(
     sink: &mut dyn EventSink,
     metrics: &mut RunMetrics,
 ) -> Result<String> {
+    const WORKFLOW_ADVISORY_TOOLS: &[&str] = &[
+        "read_file",
+        "glob",
+        "ripgrep",
+        "search",
+        "web_search",
+        "web_fetch",
+        "git_log",
+        "session_changes",
+        "attachments",
+        "vision_describe",
+        "memory_search",
+        "memory_read",
+    ];
     let profile_name = arguments
         .get("profile")
         .and_then(Value::as_str)
@@ -7035,6 +7748,15 @@ fn run_sub_agent(
         timestamp_ms: Some(now_millis()),
     });
 
+    let workflow_advisory_allowlist = context.request.workflow_stage.map(|_| {
+        WORKFLOW_ADVISORY_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect::<Vec<_>>()
+    });
+    let effective_tool_allowlist = workflow_advisory_allowlist
+        .as_deref()
+        .or(context.request.tool_allowlist.as_deref());
     let instructions = build_agent_instructions_with_tool_allowlist(
         sub_workspace_root,
         context.request.branch.as_deref().unwrap_or("sub-agent"),
@@ -7044,7 +7766,7 @@ fn run_sub_agent(
         profile,
         false,
         context.request.repository_less,
-        context.request.tool_allowlist.as_deref(),
+        effective_tool_allowlist,
         context.request.contract.as_ref(),
         context.mcp_registry,
         context.lsp_registry,
@@ -7061,6 +7783,12 @@ fn run_sub_agent(
     sub_request.sub_agent_depth = context.request.sub_agent_depth + 1;
     sub_request.repository_less = context.request.repository_less;
     sub_request.workdir = Some(sub_workspace_root.to_path_buf());
+    if context.request.workflow_stage.is_some() {
+        // The advisory invocation is fresh read-only context, not another workflow stage. It may
+        // return a bounded final result but cannot submit artifacts or inherit build authority.
+        sub_request.workflow_stage = None;
+        sub_request.tool_allowlist = workflow_advisory_allowlist;
+    }
     if profile != AgentProfile::Review {
         sub_request.contract = None;
     }
@@ -7872,6 +8600,153 @@ fn remove_snapshot_entry(path: &Path) -> Result<()> {
         std::fs::remove_file(path)
             .with_context(|| format!("failed to remove review file {}", path.display()))
     }
+}
+
+fn run_workspace_task(id: &str, context: &ToolContext<'_>) -> Result<String> {
+    let graph = context
+        .request
+        .workspace_graph
+        .as_ref()
+        .context("run_task is unavailable without a normalized workspace graph")?;
+    let task = graph
+        .tasks
+        .get(id)
+        .with_context(|| format!("workspace has no configured task named '{id}'"))?;
+    let executor = graph.executors.get(&task.executor).with_context(|| {
+        format!(
+            "task '{}' references unavailable executor '{}'",
+            task.id, task.executor
+        )
+    })?;
+    if executor.kind == crate::workspace::ExecutorKind::Container
+        || (executor.kind == crate::workspace::ExecutorKind::Project
+            && context
+                .env_config
+                .is_some_and(|config| config.backend == EnvironmentBackend::AppleContainers))
+    {
+        bail!(
+            "task '{}' requires a container executor, but bounded isolated task execution is not available for that executor yet",
+            task.id
+        );
+    }
+
+    let source_before = crate::workspace::ContentSnapshot::capture(context.workspace_root)?;
+    let isolated = prepare_isolated_review_workspace(context.workspace_root)?;
+    let isolated_before = crate::workspace::ContentSnapshot::capture(&isolated.root)?;
+    let control_before = git_control_state(&isolated.root)?;
+    let backend = CommandBackend::Local {
+        workspace_root: isolated.root.clone(),
+    };
+    let output = backend.exec_check(
+        &crate::harness_contract::AgentCheckContract {
+            id: format!("task:{}", task.id),
+            command: task.command.clone(),
+            cwd: task.cwd.clone(),
+            required: true,
+            timeout_seconds: task.timeout_seconds,
+        },
+        &isolated.root,
+    )?;
+    let control_after = git_control_state(&isolated.root)?;
+    if control_before != control_after {
+        bail!(
+            "task '{}' changed isolated Git control state ({}); no outputs were promoted",
+            task.id,
+            control_before.difference(&control_after)
+        );
+    }
+    let isolated_after = crate::workspace::ContentSnapshot::capture(&isolated.root)?;
+    let changed_paths = isolated_before.changed_paths(&isolated_after);
+    let forbidden = changed_paths
+        .iter()
+        .filter(|path| !task_path_allowed(path, &task.allowed_changes))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !forbidden.is_empty() {
+        bail!(
+            "task '{}' changed path(s) outside allowed_changes: {}; no outputs were promoted",
+            task.id,
+            forbidden.join(", ")
+        );
+    }
+    if output.timed_out || output.exit_status != 0 {
+        bail!(
+            "task '{}' failed{}: {}",
+            task.id,
+            if output.timed_out {
+                " after timing out"
+            } else {
+                ""
+            },
+            output.output
+        );
+    }
+    let source_current = crate::workspace::ContentSnapshot::capture(context.workspace_root)?;
+    if source_current.fingerprint != source_before.fingerprint {
+        bail!(
+            "source workspace changed while task '{}' ran; no outputs were promoted",
+            task.id
+        );
+    }
+    for path in &changed_paths {
+        promote_task_path(&isolated.root, context.workspace_root, path)?;
+    }
+    if !changed_paths.is_empty() {
+        context.gate_state.borrow_mut().record_content_mutation();
+    }
+    Ok(serde_json::to_string(&json!({
+        "task_id": task.id,
+        "success": true,
+        "changed_paths": changed_paths,
+        "output": output.output,
+        "output_truncated": output.truncated,
+        "duration_ms": output.duration_ms,
+        "check_credit": false,
+    }))?)
+}
+
+fn task_path_allowed(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .is_ok_and(|glob| glob.compile_matcher().is_match(path))
+    })
+}
+
+fn promote_task_path(source_root: &Path, destination_root: &Path, relative: &str) -> Result<()> {
+    let source = resolve_workspace_path(source_root, relative, false)?;
+    let destination = resolve_workspace_path(destination_root, relative, false)?;
+    let metadata = std::fs::symlink_metadata(&source);
+    remove_snapshot_entry(&destination)?;
+    match metadata {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let target = std::fs::read_link(&source)
+                .with_context(|| format!("failed to read task output symlink {relative}"))?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &destination)
+                .with_context(|| format!("failed to promote task output {relative}"))?;
+            #[cfg(not(unix))]
+            std::fs::copy(&source, &destination)
+                .with_context(|| format!("failed to promote task output {relative}"))?;
+        }
+        Ok(metadata) if metadata.is_file() => {
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source, &destination)
+                .with_context(|| format!("failed to promote task output {relative}"))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => bail!("task output '{relative}' is not a file or symlink"),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect task output {relative}"));
+        }
+    }
+    Ok(())
 }
 
 fn git_workspace_fingerprint(workdir: &Path) -> Result<String> {
@@ -9147,6 +10022,7 @@ mod tests {
             task: "test".to_string(),
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
+            workflow_stage: None,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: None,
@@ -9195,6 +10071,498 @@ mod tests {
             );
         }
         tmp
+    }
+
+    fn workflow_request(profile: AgentProfile, workspace: &Path) -> AgentRequest {
+        let mut request = test_agent_request(profile, 512);
+        request.workdir = Some(workspace.to_path_buf());
+        request.workflow_policy = Some(
+            crate::workflow::WorkflowConfigDocument::default()
+                .compile()
+                .unwrap(),
+        );
+        request.workspace_graph = Some(crate::workspace::WorkspaceGraph::legacy(&[]));
+        request
+    }
+
+    fn stage_context() -> StageContext {
+        StageContext {
+            system_prompt: "Follow the typed workflow stage contract.".to_string(),
+            user_prompt: "Complete this bounded stage.".to_string(),
+        }
+    }
+
+    fn plan_submission() -> String {
+        json!({
+            "type": "tool_call",
+            "tool": "submit_plan",
+            "arguments": {
+                "id": "plan-1",
+                "plan": {
+                    "summary": "Implement the requested change",
+                    "requirements": [{
+                        "id": "req-1",
+                        "description": "Make the requested change",
+                        "source": "turn-1"
+                    }],
+                    "steps": [{
+                        "id": "step-1",
+                        "requirement_ids": ["req-1"],
+                        "component_ids": [],
+                        "paths": [],
+                        "description": "Implement it"
+                    }],
+                    "acceptance": [{
+                        "id": "accept-1",
+                        "requirement_ids": ["req-1"],
+                        "check_ids": [],
+                        "description": "The request is satisfied"
+                    }]
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn stage_runner_rejects_prose_final_until_named_submission() {
+        let repo = init_contract_test_repo();
+        let request = workflow_request(AgentProfile::Plan, repo.path());
+        let contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Planning,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        let completions = vec![
+            ScriptedCompletion {
+                content: json!({"type":"final", "content":"Here is my plan in prose"}).to_string(),
+                truncated: false,
+            },
+            ScriptedCompletion {
+                content: plan_submission(),
+                truncated: false,
+            },
+        ];
+        let mut events = Vec::new();
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            completions,
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.stage.submission,
+            Some(crate::workflow::StageSubmission::Plan { .. })
+        ));
+        assert_eq!(outcome.stage.usage.model_invocations, 2);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { summary, .. }
+                if summary == "Workflow stage submission required"
+        )));
+    }
+
+    #[test]
+    fn stage_tool_surfaces_follow_capabilities_not_persona() {
+        let repo = init_contract_test_repo();
+        let request = workflow_request(AgentProfile::Ask, repo.path());
+        let limits = request.workflow_policy.as_ref().unwrap().limits;
+        let plan = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Planning,
+            limits,
+            512,
+        )
+        .unwrap();
+        let plan_outcome = run_scripted_stage(
+            &request,
+            &plan,
+            stage_context(),
+            vec![ScriptedCompletion {
+                content: plan_submission(),
+                truncated: false,
+            }],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let plan_tools = &plan_outcome.generation_tool_names[0];
+        assert!(plan_tools.contains(&"submit_plan".to_string()));
+        assert!(plan_tools.contains(&"read_file".to_string()));
+        assert!(!plan_tools.contains(&"run_command".to_string()));
+        assert!(!plan_tools.contains(&"write_file".to_string()));
+        assert!(!plan_tools.contains(&"git_commit".to_string()));
+
+        let implementation = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Implementing,
+            limits,
+            512,
+        )
+        .unwrap();
+        let implementation_outcome = run_scripted_stage(
+            &request,
+            &implementation,
+            stage_context(),
+            vec![ScriptedCompletion {
+                content: json!({
+                    "type":"tool_call",
+                    "tool":"request_replan",
+                    "arguments":{"reason":"A material dependency changed"}
+                })
+                .to_string(),
+                truncated: false,
+            }],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let implementation_tools = &implementation_outcome.generation_tool_names[0];
+        for expected in [
+            "run_command",
+            "run_task",
+            "run_check",
+            "write_file",
+            "submit_implementation",
+            "request_replan",
+        ] {
+            assert!(implementation_tools.contains(&expected.to_string()));
+        }
+        assert!(!implementation_tools.contains(&"git_commit".to_string()));
+    }
+
+    #[test]
+    fn hidden_stage_tool_is_rejected_again_at_execution_boundary() {
+        let repo = init_contract_test_repo();
+        let request = workflow_request(AgentProfile::Plan, repo.path());
+        let contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Planning,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        let completions = vec![
+            ScriptedCompletion {
+                content: json!({
+                    "type":"tool_call",
+                    "tool":"run_command",
+                    "arguments":{"cmd":"touch forbidden.txt"}
+                })
+                .to_string(),
+                truncated: false,
+            },
+            ScriptedCompletion {
+                content: plan_submission(),
+                truncated: false,
+            },
+        ];
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            completions,
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(outcome.stage.submission.is_some());
+        assert!(!repo.path().join("forbidden.txt").exists());
+    }
+
+    #[test]
+    fn implementation_run_command_blocks_detected_git_control_mutation() {
+        let repo = init_contract_test_repo();
+        let request = workflow_request(AgentProfile::Build, repo.path());
+        let contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Implementing,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        let completions = vec![
+            ScriptedCompletion {
+                content: json!({
+                    "type":"tool_call",
+                    "tool":"run_command",
+                    "arguments":{"cmd":"git commit --allow-empty -m 'feat: bypass harness'"}
+                })
+                .to_string(),
+                truncated: false,
+            },
+            ScriptedCompletion {
+                content: json!({
+                    "type":"tool_call",
+                    "tool":"request_replan",
+                    "arguments":{"reason":"should never run"}
+                })
+                .to_string(),
+                truncated: false,
+            },
+        ];
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            completions,
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(outcome.stage.submission.is_none());
+        assert!(outcome.stage.control_violation.is_some());
+        assert_eq!(outcome.remaining_completions, 1);
+        assert_eq!(
+            outcome.stage.termination_reason,
+            TerminationReason::CommitBlocked
+        );
+    }
+
+    #[test]
+    fn configured_task_promotes_only_declared_outputs_without_check_credit() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workspace_graph.as_mut().unwrap().tasks.insert(
+            "generate".to_string(),
+            crate::workspace::WorkspaceTask {
+                id: "generate".to_string(),
+                label: "Generate".to_string(),
+                command: "mkdir -p generated && printf ok > generated/out.txt".to_string(),
+                cwd: ".".to_string(),
+                executor: "project".to_string(),
+                allowed_changes: vec!["generated/**".to_string()],
+                timeout_seconds: 5,
+            },
+        );
+        let contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Implementing,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        let completions = vec![
+            ScriptedCompletion {
+                content: json!({
+                    "type":"tool_call",
+                    "tool":"run_task",
+                    "arguments":{"id":"generate"}
+                })
+                .to_string(),
+                truncated: false,
+            },
+            ScriptedCompletion {
+                content: json!({
+                    "type":"tool_call",
+                    "tool":"request_replan",
+                    "arguments":{"reason":"test terminal action"}
+                })
+                .to_string(),
+                truncated: false,
+            },
+        ];
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            completions,
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("generated/out.txt")).unwrap(),
+            "ok"
+        );
+        assert!(matches!(
+            outcome.stage.submission,
+            Some(crate::workflow::StageSubmission::Replan { .. })
+        ));
+    }
+
+    #[test]
+    fn configured_task_rejects_and_does_not_promote_undeclared_outputs() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workspace_graph.as_mut().unwrap().tasks.insert(
+            "escape".to_string(),
+            crate::workspace::WorkspaceTask {
+                id: "escape".to_string(),
+                label: "Escape".to_string(),
+                command: "printf nope > forbidden.txt".to_string(),
+                cwd: ".".to_string(),
+                executor: "project".to_string(),
+                allowed_changes: vec!["generated/**".to_string()],
+                timeout_seconds: 5,
+            },
+        );
+        let contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Implementing,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            vec![
+                ScriptedCompletion {
+                    content: json!({
+                        "type":"tool_call",
+                        "tool":"run_task",
+                        "arguments":{"id":"escape"}
+                    })
+                    .to_string(),
+                    truncated: false,
+                },
+                ScriptedCompletion {
+                    content: json!({
+                        "type":"tool_call",
+                        "tool":"request_replan",
+                        "arguments":{"reason":"finish fixture"}
+                    })
+                    .to_string(),
+                    truncated: false,
+                },
+            ],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(!repo.path().join("forbidden.txt").exists());
+        assert!(matches!(
+            outcome.stage.submission,
+            Some(crate::workflow::StageSubmission::Replan { .. })
+        ));
+    }
+
+    #[test]
+    fn implementation_run_command_mutation_still_requires_terminal_submission() {
+        let repo = init_contract_test_repo();
+        let request = workflow_request(AgentProfile::Build, repo.path());
+        let contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Implementing,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            vec![
+                ScriptedCompletion {
+                    content: json!({
+                        "type":"tool_call",
+                        "tool":"run_command",
+                        "arguments":{"cmd":"printf built > generated.txt"}
+                    })
+                    .to_string(),
+                    truncated: false,
+                },
+                ScriptedCompletion {
+                    content: json!({
+                        "type":"tool_call",
+                        "tool":"request_replan",
+                        "arguments":{"reason":"finish fixture"}
+                    })
+                    .to_string(),
+                    truncated: false,
+                },
+            ],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("generated.txt")).unwrap(),
+            "built"
+        );
+        assert!(outcome.stage.control_violation.is_none());
+        assert!(matches!(
+            outcome.stage.submission,
+            Some(crate::workflow::StageSubmission::Replan { .. })
+        ));
+    }
+
+    #[test]
+    fn sequential_stages_reuse_one_engine_and_share_global_budget() {
+        let repo = init_contract_test_repo();
+        let mut config = crate::workflow::WorkflowConfigDocument::default();
+        config.limits.total_model_invocations = 1;
+        config.limits.total_generated_tokens = 512;
+        let policy = config.compile().unwrap();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.workflow_policy = Some(policy.clone());
+        let stages = vec![
+            (
+                crate::workflow::StageContract::strict(
+                    crate::workflow::WorkflowStage::Planning,
+                    policy.limits,
+                    128,
+                )
+                .unwrap(),
+                stage_context(),
+            ),
+            (
+                crate::workflow::StageContract::strict(
+                    crate::workflow::WorkflowStage::PlanReview,
+                    policy.limits,
+                    128,
+                )
+                .unwrap(),
+                stage_context(),
+            ),
+        ];
+        let outcome = run_scripted_stage_sequence(
+            &request,
+            stages,
+            vec![
+                ScriptedCompletion {
+                    content: plan_submission(),
+                    truncated: false,
+                },
+                ScriptedCompletion {
+                    content: json!({
+                        "type":"tool_call",
+                        "tool":"submit_plan_review",
+                        "arguments":{
+                            "id":"review-1",
+                            "review":{
+                                "plan_id":"plan-1",
+                                "plan_sha256":"unused-in-runner",
+                                "assessments":[],
+                                "challenges":[],
+                                "verdict":"pass"
+                            }
+                        }
+                    })
+                    .to_string(),
+                    truncated: false,
+                },
+            ],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(outcome.stages[0].submission.is_some());
+        assert!(outcome.stages[1].submission.is_none());
+        assert_eq!(
+            outcome.stages[1].termination_reason,
+            TerminationReason::InvocationLimit
+        );
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(outcome.generation_tool_names[0].contains(&"submit_plan".to_string()));
+    }
+
+    #[test]
+    fn workflow_command_output_is_bounded_for_the_journal() {
+        let output = "é".repeat(MAX_WORKFLOW_COMMAND_OUTPUT_BYTES);
+        let bounded = bound_workflow_command_output(output);
+        assert!(bounded.len() < MAX_WORKFLOW_COMMAND_OUTPUT_BYTES + 100);
+        assert!(bounded.contains("output truncated"));
     }
 
     fn normalized_test_contract(command: &str) -> crate::harness_contract::AgentContract {
@@ -11913,6 +13281,7 @@ mod tests {
             task: "Fix login bug".to_string(),
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
+            workflow_stage: None,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: None,
@@ -11980,6 +13349,7 @@ mod tests {
             task: "Another task".to_string(),
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
+            workflow_stage: None,
             model: "model.gguf".to_string(),
             model_dir: None,
             workdir: Some(workdir.path().to_path_buf()),
