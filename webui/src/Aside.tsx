@@ -2,6 +2,43 @@ import { useEffect, useMemo, useState } from "react";
 import { NavLink } from "react-router-dom";
 import { initialsForName } from "./lib/user";
 
+export const primaryNavigation = [
+  { to: "/", label: "Home", icon: "bi bi-house-door", end: true },
+  {
+    to: "/projects",
+    label: "Projects",
+    icon: "bi bi-folder2-open",
+    end: false,
+  },
+  {
+    to: "/integrations",
+    label: "Integrations",
+    icon: "bi bi-plug",
+    end: false,
+  },
+] as const;
+
+export function PrimaryNavigationLinks(
+  { className = "nav-link" }: { className?: string },
+) {
+  return (
+    <>
+      {primaryNavigation.map((item) => (
+        <NavLink
+          key={item.to}
+          className={({ isActive }) =>
+            `${className}${isActive ? " active" : ""}`}
+          to={item.to}
+          end={item.end}
+        >
+          <i className={item.icon} aria-hidden="true"></i>
+          <span>{item.label}</span>
+        </NavLink>
+      ))}
+    </>
+  );
+}
+
 interface CurrentUser {
   username: string;
   real_name?: string | null;
@@ -40,25 +77,17 @@ export function Aside() {
   const initials = useMemo(() => initialsForName(displayName), [displayName]);
 
   return (
-    <aside className="sidebar d-none d-lg-flex flex-column">
+    <aside className="sidebar d-none d-xl-flex flex-column">
       <div className="brand d-flex align-items-center gap-2 px-3 py-3">
         <div className="brand-mark">&gt;_</div>
         <strong>LocalAgent</strong>
       </div>
 
-      <nav className="nav nav-pills flex-column gap-1 px-2">
-        <NavLink className="nav-link" to="/" end>
-          <i className="bi bi-house-door"></i> Home
-        </NavLink>
-        <NavLink className="nav-link" to="/projects">
-          <i className="bi bi-folder2-open"></i> Projects
-        </NavLink>
-        <NavLink className="nav-link" to="/integrations">
-          <i className="bi bi-plug"></i> Integrations
-        </NavLink>
-        <NavLink className="nav-link" to="/settings">
-          <i className="bi bi-gear"></i> Settings
-        </NavLink>
+      <nav
+        className="nav nav-pills flex-column gap-1 px-2"
+        aria-label="Primary navigation"
+      >
+        <PrimaryNavigationLinks />
       </nav>
 
       <div className="mt-auto user-menu p-3 d-flex align-items-center gap-2">

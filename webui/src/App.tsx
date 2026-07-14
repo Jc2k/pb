@@ -4,10 +4,12 @@ import { HomePage } from "./pages/HomePage";
 import { IntegrationsPage } from "./pages/IntegrationsPage";
 import { ProjectsPage, ProjectPage, ProjectSettingsPage } from "./pages/ProjectsPage";
 import { SessionPage } from "./pages/SessionPage";
+import { RouteReset } from "./components/RouteReset";
 
 export default function App() {
   return (
     <BrowserRouter>
+      <RouteReset />
       <Routes>
         <Route path="/" element={<HomePage />} />
         <Route path="/sessions/:sessionId" element={<SessionPage />} />

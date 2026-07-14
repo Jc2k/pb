@@ -197,6 +197,14 @@ export function SessionPage() {
               pb
             </span>
           </header>
+          <div className="session-loading" role="status" aria-live="polite">
+            <span
+              className="spinner-border spinner-border-sm"
+              aria-hidden="true"
+            >
+            </span>
+            <span>Loading session…</span>
+          </div>
         </section>
       </div>
     );
@@ -210,7 +218,7 @@ export function SessionPage() {
         <header className="session-header">
           <button
             type="button"
-            className="btn btn-link d-lg-none p-0 text-body"
+            className="btn btn-link d-xl-none p-0 text-body"
             onClick={() => navigate("/")}
           >
             <i className="bi bi-chevron-left fs-4"></i>

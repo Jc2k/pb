@@ -8,7 +8,16 @@ import {
   workflowProgressLabel,
   workflowStageLabel,
 } from "./SessionPage.tsx";
+
 import type { EventEnvelope } from "../types/index.ts";
+
+function cssRule(css: string, selector: string): string {
+  const start = css.indexOf(`${selector} {`);
+  ok(start >= 0, `missing CSS rule for ${selector}`);
+  const end = css.indexOf("}", start);
+  ok(end > start, `unterminated CSS rule for ${selector}`);
+  return css.slice(start, end);
+}
 
 Deno.test("delivery proposal remains conversational until an explicit Build turn", () => {
   const events: EventEnvelope[] = [
@@ -86,9 +95,15 @@ Deno.test("paused session composer keeps resume action at intrinsic width", asyn
 
   ok(markup.includes('className="composer paused-composer"'));
   ok(markup.includes('className="btn btn-warning composer-action"'));
-  ok(css.includes(".composer .btn.composer-action"));
-  ok(css.includes("width: auto;"));
-  ok(css.includes("white-space: nowrap;"));
+  const actionRule = cssRule(css, ".composer .btn.composer-action");
+  ok(actionRule.includes("flex: 0 0 auto;"));
+  ok(actionRule.includes("width: auto;"));
+  ok(actionRule.includes("min-width: max-content;"));
+  ok(actionRule.includes("margin-left: auto;"));
+  ok(actionRule.includes("white-space: nowrap;"));
+  const iconRule = cssRule(css, ".composer > .btn.rounded-circle");
+  ok(iconRule.includes("flex: 0 0 42px;"));
+  ok(!css.includes(".composer .btn {"));
 });
 
 Deno.test("session corrections render as centered plain notices", async () => {
@@ -127,7 +142,18 @@ Deno.test("session page respects iPhone safe areas and prevents horizontal overf
   ok(css.includes("env(safe-area-inset-right)"));
   ok(css.includes(".message-container"));
   ok(css.includes("overflow-wrap: anywhere;"));
+  const preRule = cssRule(css, ".bubble pre");
+  ok(preRule.includes("max-width: 100%;"));
+  ok(preRule.includes("overflow: auto;"));
+  const nestedMessageRule = cssRule(css, ".assistant-message");
+  ok(nestedMessageRule.includes("margin-left: 0 !important;"));
   ok(css.includes(".session-header .share-action,"));
+
+  const appCss = await Deno.readTextFile("webui/src/app.css");
+  ok(appCss.includes(".diff-block"));
+  ok(appCss.includes(".result-pre"));
+  ok(appCss.includes("overscroll-behavior-inline: contain;"));
+  ok(!appCss.includes("/* diff viewer */ /*"));
 });
 
 Deno.test("session metrics expose the canonical estimate and its measurement quality", async () => {
@@ -135,15 +161,27 @@ Deno.test("session metrics expose the canonical estimate and its measurement qua
   const types = await Deno.readTextFile("webui/src/types/index.ts");
 
   ok(types.includes("power_summary?: string"));
-  ok(component.includes("funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)"));
+  ok(
+    component.includes(
+      "funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)",
+    ),
+  );
   ok(component.includes("the energy a 10 W LED bulb uses in"));
   ok(component.includes('case "session_metrics"'));
   ok(component.includes('case "llm_invocation"'));
   ok(component.includes("Power-estimate details"));
   ok(component.includes("Measurement coverage"));
   ok(component.includes("Gross device energy"));
-  ok(component.includes('<article className="session-correction" aria-label="Session metrics">'));
-  ok(component.includes("{e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}"));
+  ok(
+    component.includes(
+      '<article className="session-correction" aria-label="Session metrics">',
+    ),
+  );
+  ok(
+    component.includes(
+      "{e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}",
+    ),
+  );
   ok(!component.includes("<strong>Power</strong>"));
   ok(!component.includes("{e.power_summary"));
   ok(!component.includes('<i className="bi bi-speedometer2"></i>'));
@@ -156,7 +194,11 @@ Deno.test("handoff feedback renders as a teammate with expandable evidence", asy
   const types = await Deno.readTextFile("webui/src/types/index.ts");
 
   ok(page.includes('session.status === "completed"'));
-  ok(types.includes('SessionStatus = "queued" | "running" | "paused" | "completed" | "failed"'));
+  ok(
+    types.includes(
+      'SessionStatus = "queued" | "running" | "paused" | "completed" | "failed"',
+    ),
+  );
   ok(types.includes('type: "team_message"'));
   ok(types.includes('type: "check_result"'));
   ok(types.includes('type: "handoff_summary"'));

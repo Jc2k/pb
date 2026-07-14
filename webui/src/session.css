@@ -17,6 +17,7 @@
 
 body {
     min-height: 100vh;
+    min-height: 100dvh;
     margin: 0;
     background:
         radial-gradient(
@@ -37,6 +38,7 @@ body {
     width: 100%;
     max-width: 100vw;
     min-height: 100vh;
+    min-height: 100dvh;
     overflow-x: hidden;
     display: grid;
     grid-template-columns: 270px minmax(0, 1fr);
@@ -119,9 +121,22 @@ body {
 }
 
 .session-panel {
+    min-width: 0;
     height: 100vh;
+    height: 100dvh;
     display: grid;
     grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.session-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.65rem;
+    min-height: 0;
+    color: var(--muted);
+    background: rgba(255, 255, 255, 0.42);
+    font-size: 0.9rem;
 }
 
 .session-header {
@@ -213,6 +228,7 @@ body {
 }
 
 .message-container {
+    flex: 1 1 auto;
     min-width: 0;
     max-width: 100%;
 }
@@ -355,6 +371,30 @@ article.user div.message-container {
     padding: 0.85rem 0.95rem 0.4rem;
     position: relative;
     box-shadow: 0 1px 1px rgba(15, 23, 42, 0.04);
+}
+
+.bubble details {
+    min-width: 0;
+    max-width: 100%;
+}
+
+.bubble pre {
+    min-width: 0;
+    max-width: 100%;
+    overflow: auto;
+    overscroll-behavior-inline: contain;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.bubble .diff-block,
+.bubble .rich-text-code {
+    overflow-wrap: normal;
+    white-space: pre;
+}
+
+.bubble code {
+    overflow-wrap: anywhere;
 }
 
 .bubble p {
@@ -709,7 +749,7 @@ article.user div.message-container {
     background: rgba(255, 255, 255, 0.92);
 }
 
-.composer .btn {
+.composer > .btn.rounded-circle {
     width: 42px;
     height: 42px;
     display: grid;
@@ -718,23 +758,27 @@ article.user div.message-container {
 }
 
 @media (max-width: 1199.98px) {
+    .app-shell {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .session-panel {
+        height: 100vh;
+        height: 100dvh;
+    }
+
     .session-layout {
         grid-template-columns: 1fr;
     }
-}
 
-@media (max-width: 991.98px) {
-    .app-shell {
-        grid-template-columns: 1fr;
-    }
-    .session-panel {
-        height: 100svh;
-    }
     .session-header {
         padding-inline:
             calc(0.9rem + env(safe-area-inset-left))
             calc(0.9rem + env(safe-area-inset-right));
     }
+}
+
+@media (max-width: 991.98px) {
     .chat-stream {
         padding:
             1rem
@@ -749,7 +793,7 @@ article.user div.message-container {
 }
 
 @media (max-width: 575.98px) {
-    body {
+    .session-panel {
         background: #fff;
     }
     .session-header {
@@ -808,6 +852,12 @@ article.user div.message-container {
     }
     .tool-strip .tool-names {
         display: none;
+    }
+    .assistant-message {
+        margin-left: 0 !important;
+    }
+    .assistant-message .message-container {
+        max-width: calc(100% - 60px);
     }
     .composer {
         padding-inline: 0.7rem;
@@ -967,8 +1017,11 @@ article.user div.message-container {
 }
 
 .composer .btn.composer-action {
+    flex: 0 0 auto;
     width: auto;
-    min-width: 0;
+    min-width: max-content;
+    min-height: 42px;
+    margin-left: auto;
     padding-inline: 1rem;
     white-space: nowrap;
 }
