@@ -75,14 +75,28 @@ pub fn render_event(event: &AgentEvent) {
         AgentEvent::ToolResult {
             result,
             duration_ms,
-            energy_kwh,
+            energy_joules,
+            average_power_watts,
+            energy_shared_calls,
             ..
         } => {
-            let label = match (duration_ms, energy_kwh) {
-                (Some(ms), Some(kwh)) => format!("tool result ({ms} ms, {kwh:.6e} kWh)"),
-                (Some(ms), None) => format!("tool result ({ms} ms)"),
-                (None, Some(kwh)) => format!("tool result ({kwh:.6e} kWh)"),
-                (None, None) => "tool result".to_string(),
+            let mut details = duration_ms
+                .map(|ms| format!("{ms} ms"))
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Some(joules) = energy_joules {
+                details.push(format_energy(*joules));
+            }
+            if let Some(watts) = average_power_watts {
+                details.push(format!("{watts:.1} W average"));
+            }
+            if let Some(calls) = energy_shared_calls.filter(|calls| *calls > 1) {
+                details.push(format!("shared across {calls} parallel calls"));
+            }
+            let label = if details.is_empty() {
+                "tool result".to_string()
+            } else {
+                format!("tool result ({})", details.join(", "))
             };
             print_block(&label, result);
         }
@@ -214,11 +228,17 @@ pub fn render_event(event: &AgentEvent) {
             duration_ms,
             prompt_tokens,
             generated_tokens,
-            energy_kwh,
+            energy_joules,
+            average_power_watts,
             ..
         } => {
-            let energy = energy_kwh
-                .map(|kwh| format!(", {kwh:.6e} kWh"))
+            let energy = energy_joules
+                .map(|joules| {
+                    let power = average_power_watts
+                        .map(|watts| format!(" at {watts:.1} W"))
+                        .unwrap_or_default();
+                    format!(", {}{power}", format_energy(joules))
+                })
                 .unwrap_or_default();
             print_header(
                 "llm",
@@ -234,22 +254,39 @@ pub fn render_event(event: &AgentEvent) {
             generated_tokens,
             tool_calls,
             tool_runtime_ms,
-            llm_energy_kwh,
-            tool_energy_kwh,
+            llm_energy_joules,
+            tool_energy_joules,
+            wall_runtime_ms,
+            total_energy_joules,
+            gross_energy_joules,
+            adjusted_energy_joules,
+            energy_coverage,
+            energy_source,
+            display_energy_excluded,
+            idle_baseline_applied,
             ..
         } => {
-            let energy = match (llm_energy_kwh, tool_energy_kwh) {
-                (Some(llm), Some(tool)) => {
-                    format!("; energy: llm {llm:.6e} kWh, tools {tool:.6e} kWh")
-                }
-                (Some(llm), None) => format!("; energy: llm {llm:.6e} kWh"),
-                (None, Some(tool)) => format!("; energy: tools {tool:.6e} kWh"),
-                (None, None) => String::new(),
-            };
+            let energy = total_energy_joules.map(|joules| {
+                let coverage = energy_coverage
+                    .map(|coverage| format!(", {:.0}% coverage", coverage * 100.0))
+                    .unwrap_or_default();
+                let source = energy_source
+                    .as_deref()
+                    .map(|source| format!(", source {source}"))
+                    .unwrap_or_default();
+                format!(
+                    "; estimated task energy: {} (gross {}, display-adjusted {}{coverage}{source}; display excluded: {display_energy_excluded}, idle baseline: {idle_baseline_applied}); diagnostic llm {}, tools {}",
+                    format_energy(joules),
+                    gross_energy_joules.map_or_else(|| "n/a".into(), |value| format_energy(value)),
+                    adjusted_energy_joules.map_or_else(|| "n/a".into(), |value| format_energy(value)),
+                    llm_energy_joules.map_or_else(|| "n/a".into(), |value| format_energy(value)),
+                    tool_energy_joules.map_or_else(|| "n/a".into(), |value| format_energy(value)),
+                )
+            }).unwrap_or_default();
             print_header(
                 "metrics",
                 &format!(
-                    "llm: {llm_invocations} calls, {llm_runtime_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens; tools: {tool_calls} calls, {tool_runtime_ms} ms{energy}"
+                    "wall: {wall_runtime_ms} ms; llm: {llm_invocations} calls, {llm_runtime_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens; tools: {tool_calls} calls, {tool_runtime_ms} ms{energy}"
                 ),
             );
         }
@@ -302,4 +339,14 @@ fn print_header(label: &str, value: &str) {
 
 fn print_block(label: &str, content: &str) {
     println!("\x1b[1;35m[{label}]\x1b[0m\n{content}");
+}
+
+fn format_energy(joules: f64) -> String {
+    if joules < 1_000.0 {
+        format!("{joules:.2} J")
+    } else if joules < 3_600_000.0 {
+        format!("{:.2} Wh", joules / 3_600.0)
+    } else {
+        format!("{:.3} kWh", joules / 3_600_000.0)
+    }
 }

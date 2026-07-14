@@ -60,6 +60,29 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
   ]);
 });
 
+Deno.test("buildToolSummaries shows joules, power, and parallel measurement scope", () => {
+  const events: EventEnvelope[] = [
+    { version: "1", event: { type: "tool_call", tool: "web_search", arguments: { query: "power" } } },
+    {
+      version: "1",
+      event: {
+        type: "tool_result",
+        tool: "web_search",
+        result: "done",
+        duration_ms: 1_500,
+        energy_joules: 42,
+        average_power_watts: 28,
+        energy_shared_calls: 3,
+      },
+    },
+  ];
+
+  equal(
+    buildToolSummaries(events)[0].items[0].detail,
+    "power · 1.5 s · 42.0 J at 28.0 W across 3 parallel calls",
+  );
+});
+
 Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicator", () => {
   const events: EventEnvelope[] = [
     {

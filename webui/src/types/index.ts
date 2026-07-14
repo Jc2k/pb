@@ -113,6 +113,7 @@ export type AgentEvent =
       energy_joules?: number;
       energy_kwh?: number;
       average_power_watts?: number;
+      energy_shared_calls?: number;
       nesting_depth?: number;
       timestamp_ms?: number;
     }
@@ -244,6 +245,21 @@ export type AgentEvent =
       llm_energy_kwh?: number;
       tool_energy_joules?: number;
       tool_energy_kwh?: number;
+      wall_runtime_ms?: number;
+      started_at_ms?: number;
+      ended_at_ms?: number;
+      total_energy_joules?: number;
+      total_energy_kwh?: number;
+      gross_energy_joules?: number;
+      adjusted_energy_joules?: number;
+      average_power_watts?: number;
+      energy_measured_ms?: number;
+      energy_coverage?: number;
+      energy_source?: string;
+      display_energy_excluded?: boolean;
+      idle_baseline_applied?: boolean;
+      energy_complete?: boolean;
+      energy_exclusive?: boolean;
       nesting_depth?: number;
       timestamp_ms?: number;
     }
@@ -322,6 +338,21 @@ export interface SessionMetricsSnapshot {
   llm_energy_kwh?: number;
   tool_energy_joules?: number;
   tool_energy_kwh?: number;
+  wall_runtime_ms?: number;
+  started_at_ms?: number;
+  ended_at_ms?: number;
+  total_energy_joules?: number;
+  total_energy_kwh?: number;
+  gross_energy_joules?: number;
+  adjusted_energy_joules?: number;
+  average_power_watts?: number;
+  energy_measured_ms?: number;
+  energy_coverage?: number;
+  energy_source?: string;
+  display_energy_excluded?: boolean;
+  idle_baseline_applied?: boolean;
+  energy_complete?: boolean;
+  energy_exclusive?: boolean;
 }
 
 export interface EventEnvelope {
@@ -394,6 +425,7 @@ export interface SessionItem {
   pending_question?: { question_id: string; question: string; choices?: string[] };
   updated_at_ms: number;
   metrics?: SessionMetricsSnapshot | null;
+  usage_records?: SessionMetricsSnapshot[];
   workflow_id?: string;
   workflow_stage?: WorkflowStage;
   workflow_outcome?: WorkflowOutcome;
@@ -415,6 +447,7 @@ export interface SessionDetails {
   events: EventEnvelope[];
   updated_at_ms: number;
   metrics?: SessionMetricsSnapshot | null;
+  usage_records?: SessionMetricsSnapshot[];
   workflow?: WorkflowSummary;
   strict_workflow?: boolean;
 }
@@ -431,6 +464,7 @@ export interface ProjectUsageStats {
   runtime_ms: number;
   tool_calls: number;
   energy_kwh?: number | null;
+  energy_joules?: number | null;
 }
 
 export type IntegrationKind = "mcp" | "lsp";

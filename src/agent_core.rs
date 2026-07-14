@@ -1283,6 +1283,9 @@ pub fn run_agent<S: EventSink>(
     models_root: &Path,
     mut sink: S,
 ) -> Result<AgentRunResult> {
+    let turn_energy_scope = energy::scope();
+    let turn_started_at_ms = now_millis();
+    let turn_started = Instant::now();
     let flashmoe_plan = crate::inference::flashmoe::plan(&args.model, models_root);
     let model_label = flashmoe_plan
         .as_ref()
@@ -1656,8 +1659,11 @@ pub fn run_agent<S: EventSink>(
         .metrics
         .prompt_tokens
         .saturating_add(outcome.metrics.generated_tokens);
-    let total_energy_kwh = outcome.metrics.llm_energy_kwh + outcome.metrics.tool_energy_kwh;
-    let power_summary = session_power_summary(total_tokens, total_energy_kwh);
+    let turn_energy = turn_energy_scope.finish();
+    let turn_ended_at_ms = now_millis();
+    let wall_runtime_ms = duration_millis(turn_started);
+    let power_summary =
+        session_power_summary(total_tokens, turn_energy.map(|estimate| estimate.joules));
 
     sink.emit(AgentEvent::SessionSummary {
         branch: branch.clone(),
@@ -1685,6 +1691,22 @@ pub fn run_agent<S: EventSink>(
         llm_energy_kwh: nonzero_f64(outcome.metrics.llm_energy_kwh),
         tool_energy_joules: nonzero_f64(outcome.metrics.tool_energy_joules),
         tool_energy_kwh: nonzero_f64(outcome.metrics.tool_energy_kwh),
+        wall_runtime_ms,
+        started_at_ms: Some(turn_started_at_ms),
+        ended_at_ms: Some(turn_ended_at_ms),
+        total_energy_joules: turn_energy.map(|estimate| estimate.joules),
+        total_energy_kwh: turn_energy.map(|estimate| estimate.kwh),
+        gross_energy_joules: turn_energy.map(|estimate| estimate.gross_joules),
+        adjusted_energy_joules: turn_energy.map(|estimate| estimate.adjusted_joules),
+        average_power_watts: turn_energy.map(|estimate| estimate.average_watts),
+        energy_measured_ms: turn_energy
+            .map(|estimate| (estimate.measured_seconds * 1_000.0).round().max(0.0) as u64),
+        energy_coverage: turn_energy.map(|estimate| estimate.coverage),
+        energy_source: turn_energy.map(|estimate| estimate.source.as_str().to_string()),
+        display_energy_excluded: turn_energy.is_some_and(|estimate| estimate.display_excluded),
+        idle_baseline_applied: turn_energy.is_some_and(|estimate| estimate.baseline_applied),
+        energy_complete: turn_energy.is_some_and(|estimate| estimate.complete),
+        energy_exclusive: turn_energy.is_some_and(|estimate| estimate.exclusive),
         nesting_depth: None,
         timestamp_ms: Some(now_millis()),
     });
@@ -4281,22 +4303,6 @@ fn run_agent_steps(
     let message = format!(
         "The agent reached the step limit ({effective_max_steps}) before producing a final response."
     );
-    if nesting_depth == 0 {
-        sink.emit(AgentEvent::SessionMetrics {
-            llm_invocations: metrics.llm_invocations,
-            llm_runtime_ms: metrics.llm_runtime_ms,
-            prompt_tokens: metrics.prompt_tokens,
-            generated_tokens: metrics.generated_tokens,
-            tool_calls: metrics.tool_calls,
-            tool_runtime_ms: metrics.tool_runtime_ms,
-            llm_energy_joules: nonzero_f64(metrics.llm_energy_joules),
-            llm_energy_kwh: nonzero_f64(metrics.llm_energy_kwh),
-            tool_energy_joules: nonzero_f64(metrics.tool_energy_joules),
-            tool_energy_kwh: nonzero_f64(metrics.tool_energy_kwh),
-            nesting_depth: None,
-            timestamp_ms: Some(now_millis()),
-        });
-    }
     sink.emit(AgentEvent::Error {
         summary: "Step limit reached".to_string(),
         message,
@@ -4991,19 +4997,20 @@ fn execute_tool_calls(
         && runnable
             .iter()
             .all(|call| env.mcp_registry.tool(&call.tool).is_some());
+    let mut parallel_batch_calls = 0;
     if all_mcp && runnable.len() > 1 {
+        parallel_batch_calls = runnable.len();
+        let batch_energy_start = energy::sample();
+        let batch_started = Instant::now();
         let registry = env.mcp_registry.clone();
         let handles = runnable
             .into_iter()
             .map(|call| {
                 let registry = registry.clone();
                 std::thread::spawn(move || {
-                    let energy_start = energy::sample();
                     let started = Instant::now();
                     let result = mcp::call_tool(&registry, &call.tool, &call.arguments)
                         .unwrap_or_else(|error| format_tool_error(&call.tool, &error));
-                    let energy = energy_start
-                        .and_then(|sample| sample.estimate_since(energy::sample(), started));
                     let duration_ms = duration_millis(started);
                     (
                         call.id,
@@ -5011,13 +5018,14 @@ fn execute_tool_calls(
                         call.arguments,
                         result,
                         duration_ms,
-                        energy,
+                        None,
                     )
                 })
             })
             .collect::<Vec<_>>();
+        let mut batch_results = Vec::with_capacity(parallel_batch_calls);
         for handle in handles {
-            results.push(handle.join().unwrap_or_else(|_| {
+            batch_results.push(handle.join().unwrap_or_else(|_| {
                 (
                     None,
                     "unknown".to_string(),
@@ -5028,9 +5036,16 @@ fn execute_tool_calls(
                 )
             }));
         }
+        let batch_energy = batch_energy_start
+            .and_then(|sample| sample.estimate_since(energy::sample(), batch_started));
+        if let Some(first) = batch_results.first_mut() {
+            first.5 = batch_energy;
+        }
+        results.extend(batch_results);
     } else {
         for call in runnable {
-            let energy_start = energy::sample();
+            let measure_tool = call.tool != "sub_agent";
+            let energy_start = measure_tool.then(energy::sample).flatten();
             let started = Instant::now();
             let result = match run_tool(&call.tool, &call.arguments, &tool_context, sink, metrics) {
                 Ok(result) => result,
@@ -5071,7 +5086,9 @@ fn execute_tool_calls(
     ));
     for (tool_call_id, tool, _arguments, result, duration_ms, energy) in results {
         metrics.tool_calls += 1;
-        metrics.tool_runtime_ms = metrics.tool_runtime_ms.saturating_add(duration_ms);
+        if tool != "sub_agent" {
+            metrics.tool_runtime_ms = metrics.tool_runtime_ms.saturating_add(duration_ms);
+        }
         add_energy(
             &mut metrics.tool_energy_joules,
             &mut metrics.tool_energy_kwh,
@@ -5084,6 +5101,8 @@ fn execute_tool_calls(
             energy_joules: energy.map(|estimate| estimate.joules),
             energy_kwh: energy.map(|estimate| estimate.kwh),
             average_power_watts: energy.map(|estimate| estimate.average_watts),
+            energy_shared_calls: (energy.is_some() && parallel_batch_calls > 1)
+                .then_some(parallel_batch_calls),
             nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
             timestamp_ms: Some(now_millis()),
         });

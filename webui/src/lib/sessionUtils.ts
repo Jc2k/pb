@@ -1,5 +1,6 @@
 import type { AgentEvent, EventEnvelope } from "../types";
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "./constants";
+import { formatEnergy, formatPower } from "./energy";
 
 export interface ToolSummaryItem {
   detail: string;
@@ -208,8 +209,18 @@ function addToolSummaryItem(summaries: Record<string, ToolSummary>, call: EventE
     : durationMs < 1000
       ? ` · ${durationMs} ms`
       : ` · ${(durationMs / 1000).toFixed(1)} s`;
-  const energyKwh = result?.event.type === "tool_result" ? result.event.energy_kwh : undefined;
-  const energy = energyKwh === undefined ? "" : ` · ${energyKwh.toExponential(3)} kWh`;
+  const energyJoules = result?.event.type === "tool_result" ? result.event.energy_joules : undefined;
+  const averagePower = result?.event.type === "tool_result"
+    ? result.event.average_power_watts
+    : undefined;
+  const sharedCalls = result?.event.type === "tool_result"
+    ? result.event.energy_shared_calls
+    : undefined;
+  const energy = energyJoules === undefined
+    ? ""
+    : ` · ${formatEnergy(energyJoules)}${averagePower === undefined ? "" : ` at ${formatPower(averagePower)}`}${
+      sharedCalls && sharedCalls > 1 ? ` across ${sharedCalls} parallel calls` : ""
+    }`;
   summaries[toolName].items.push({
     detail: `${detail}${duration}${energy}`,
     timestampMs: call.event.timestamp_ms,

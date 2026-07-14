@@ -164,6 +164,36 @@ pub struct SessionMetricsSnapshot {
     pub tool_energy_joules: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_energy_kwh: Option<f64>,
+    #[serde(default)]
+    pub wall_runtime_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_energy_joules: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_energy_kwh: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross_energy_joules: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjusted_energy_joules: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_power_watts: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_measured_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_coverage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_source: Option<String>,
+    #[serde(default)]
+    pub display_energy_excluded: bool,
+    #[serde(default)]
+    pub idle_baseline_applied: bool,
+    #[serde(default)]
+    pub energy_complete: bool,
+    #[serde(default)]
+    pub energy_exclusive: bool,
 }
 
 impl SessionMetricsSnapshot {
@@ -179,6 +209,21 @@ impl SessionMetricsSnapshot {
             llm_energy_kwh,
             tool_energy_joules,
             tool_energy_kwh,
+            wall_runtime_ms,
+            started_at_ms,
+            ended_at_ms,
+            total_energy_joules,
+            total_energy_kwh,
+            gross_energy_joules,
+            adjusted_energy_joules,
+            average_power_watts,
+            energy_measured_ms,
+            energy_coverage,
+            energy_source,
+            display_energy_excluded,
+            idle_baseline_applied,
+            energy_complete,
+            energy_exclusive,
             ..
         } = event
         {
@@ -193,10 +238,83 @@ impl SessionMetricsSnapshot {
                 llm_energy_kwh: *llm_energy_kwh,
                 tool_energy_joules: *tool_energy_joules,
                 tool_energy_kwh: *tool_energy_kwh,
+                wall_runtime_ms: *wall_runtime_ms,
+                started_at_ms: *started_at_ms,
+                ended_at_ms: *ended_at_ms,
+                total_energy_joules: *total_energy_joules,
+                total_energy_kwh: *total_energy_kwh,
+                gross_energy_joules: *gross_energy_joules,
+                adjusted_energy_joules: *adjusted_energy_joules,
+                average_power_watts: *average_power_watts,
+                energy_measured_ms: *energy_measured_ms,
+                energy_coverage: *energy_coverage,
+                energy_source: energy_source.clone(),
+                display_energy_excluded: *display_energy_excluded,
+                idle_baseline_applied: *idle_baseline_applied,
+                energy_complete: *energy_complete,
+                energy_exclusive: *energy_exclusive,
             })
         } else {
             None
         }
+    }
+
+    pub fn add_assign(&mut self, other: &Self) {
+        self.llm_invocations = self.llm_invocations.saturating_add(other.llm_invocations);
+        self.llm_runtime_ms = self.llm_runtime_ms.saturating_add(other.llm_runtime_ms);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.generated_tokens = self.generated_tokens.saturating_add(other.generated_tokens);
+        self.tool_calls = self.tool_calls.saturating_add(other.tool_calls);
+        self.tool_runtime_ms = self.tool_runtime_ms.saturating_add(other.tool_runtime_ms);
+        self.wall_runtime_ms = self.wall_runtime_ms.saturating_add(other.wall_runtime_ms);
+        self.started_at_ms = match (self.started_at_ms, other.started_at_ms) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        self.ended_at_ms = match (self.ended_at_ms, other.ended_at_ms) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        };
+        add_optional(&mut self.llm_energy_joules, other.llm_energy_joules);
+        add_optional(&mut self.llm_energy_kwh, other.llm_energy_kwh);
+        add_optional(&mut self.tool_energy_joules, other.tool_energy_joules);
+        add_optional(&mut self.tool_energy_kwh, other.tool_energy_kwh);
+        add_optional(&mut self.total_energy_joules, other.total_energy_joules);
+        add_optional(&mut self.total_energy_kwh, other.total_energy_kwh);
+        add_optional(&mut self.gross_energy_joules, other.gross_energy_joules);
+        add_optional(
+            &mut self.adjusted_energy_joules,
+            other.adjusted_energy_joules,
+        );
+        self.energy_measured_ms = match (self.energy_measured_ms, other.energy_measured_ms) {
+            (Some(left), Some(right)) => Some(left.saturating_add(right)),
+            (left, right) => left.or(right),
+        };
+        self.energy_source = match (&self.energy_source, &other.energy_source) {
+            (Some(left), Some(right)) if left != right => Some("mixed".to_string()),
+            (None, Some(right)) => Some(right.clone()),
+            (left, _) => left.clone(),
+        };
+        self.display_energy_excluded &= other.display_energy_excluded;
+        self.idle_baseline_applied &= other.idle_baseline_applied;
+        self.energy_complete &= other.energy_complete;
+        self.energy_exclusive &= other.energy_exclusive;
+        self.energy_coverage = self.energy_measured_ms.map(|measured| {
+            if self.wall_runtime_ms == 0 {
+                0.0
+            } else {
+                (measured as f64 / self.wall_runtime_ms as f64).clamp(0.0, 1.0)
+            }
+        });
+        self.average_power_watts = self.total_energy_joules.and_then(|joules| {
+            (self.wall_runtime_ms > 0).then_some(joules / (self.wall_runtime_ms as f64 / 1_000.0))
+        });
+    }
+}
+
+fn add_optional(target: &mut Option<f64>, value: Option<f64>) {
+    if let Some(value) = value {
+        *target = Some(target.unwrap_or(0.0) + value);
     }
 }
 
@@ -337,6 +455,10 @@ pub enum AgentEvent {
         energy_kwh: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         average_power_watts: Option<f64>,
+        /// Number of concurrently executed calls covered by this single
+        /// measurement. Present on one result in a parallel batch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        energy_shared_calls: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -518,6 +640,36 @@ pub enum AgentEvent {
         tool_energy_joules: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_energy_kwh: Option<f64>,
+        #[serde(default)]
+        wall_runtime_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended_at_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_energy_joules: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_energy_kwh: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gross_energy_joules: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adjusted_energy_joules: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        average_power_watts: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        energy_measured_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        energy_coverage: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        energy_source: Option<String>,
+        #[serde(default)]
+        display_energy_excluded: bool,
+        #[serde(default)]
+        idle_baseline_applied: bool,
+        #[serde(default)]
+        energy_complete: bool,
+        #[serde(default)]
+        energy_exclusive: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -814,6 +966,7 @@ impl EventEnvelope {
                 energy_joules,
                 energy_kwh,
                 average_power_watts,
+                energy_shared_calls,
                 nesting_depth,
                 ..
             } => Self {
@@ -825,6 +978,7 @@ impl EventEnvelope {
                     energy_joules,
                     energy_kwh,
                     average_power_watts,
+                    energy_shared_calls,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
@@ -1090,6 +1244,21 @@ impl EventEnvelope {
                 llm_energy_kwh,
                 tool_energy_joules,
                 tool_energy_kwh,
+                wall_runtime_ms,
+                started_at_ms,
+                ended_at_ms,
+                total_energy_joules,
+                total_energy_kwh,
+                gross_energy_joules,
+                adjusted_energy_joules,
+                average_power_watts,
+                energy_measured_ms,
+                energy_coverage,
+                energy_source,
+                display_energy_excluded,
+                idle_baseline_applied,
+                energy_complete,
+                energy_exclusive,
                 nesting_depth,
                 ..
             } => Self {
@@ -1105,6 +1274,21 @@ impl EventEnvelope {
                     llm_energy_kwh,
                     tool_energy_joules,
                     tool_energy_kwh,
+                    wall_runtime_ms,
+                    started_at_ms,
+                    ended_at_ms,
+                    total_energy_joules,
+                    total_energy_kwh,
+                    gross_energy_joules,
+                    adjusted_energy_joules,
+                    average_power_watts,
+                    energy_measured_ms,
+                    energy_coverage,
+                    energy_source,
+                    display_energy_excluded,
+                    idle_baseline_applied,
+                    energy_complete,
+                    energy_exclusive,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
@@ -1190,6 +1374,68 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn legacy_session_metrics_deserialize_without_claiming_measurement_quality() {
+        let json = r#"{
+            "version":"v1",
+            "event":{
+                "type":"session_metrics",
+                "llm_invocations":1,
+                "llm_runtime_ms":10,
+                "prompt_tokens":2,
+                "generated_tokens":3,
+                "tool_calls":0,
+                "tool_runtime_ms":0
+            }
+        }"#;
+        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
+        let metrics = SessionMetricsSnapshot::from_event(&envelope.event).unwrap();
+        assert_eq!(metrics.wall_runtime_ms, 0);
+        assert!(metrics.total_energy_joules.is_none());
+        assert!(!metrics.energy_complete);
+        assert!(!metrics.energy_exclusive);
+    }
+
+    #[test]
+    fn cumulative_metrics_use_authoritative_energy_and_wall_time() {
+        let mut total = SessionMetricsSnapshot {
+            prompt_tokens: 10,
+            wall_runtime_ms: 1_000,
+            total_energy_joules: Some(20.0),
+            total_energy_kwh: Some(20.0 / 3_600_000.0),
+            energy_measured_ms: Some(1_000),
+            energy_source: Some("smc_system_total".into()),
+            display_energy_excluded: true,
+            idle_baseline_applied: true,
+            energy_complete: true,
+            energy_exclusive: true,
+            ..Default::default()
+        };
+        total.add_assign(&SessionMetricsSnapshot {
+            generated_tokens: 5,
+            wall_runtime_ms: 2_000,
+            total_energy_joules: Some(30.0),
+            total_energy_kwh: Some(30.0 / 3_600_000.0),
+            energy_measured_ms: Some(1_000),
+            energy_source: Some("power_telemetry".into()),
+            display_energy_excluded: true,
+            idle_baseline_applied: false,
+            energy_complete: false,
+            energy_exclusive: true,
+            ..Default::default()
+        });
+
+        assert_eq!(total.prompt_tokens, 10);
+        assert_eq!(total.generated_tokens, 5);
+        assert_eq!(total.wall_runtime_ms, 3_000);
+        assert_eq!(total.total_energy_joules, Some(50.0));
+        assert_eq!(total.average_power_watts, Some(50.0 / 3.0));
+        assert_eq!(total.energy_coverage, Some(2.0 / 3.0));
+        assert_eq!(total.energy_source.as_deref(), Some("mixed"));
+        assert!(!total.idle_baseline_applied);
+        assert!(!total.energy_complete);
     }
 
     #[test]

@@ -134,6 +134,8 @@ pub struct SessionListItem {
     pub handoff_outcome: Option<HandoffOutcome>,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_records: Vec<SessionMetricsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +151,7 @@ pub struct ProjectUsageStats {
     pub runtime_ms: u64,
     pub tool_calls: usize,
     pub energy_kwh: Option<f64>,
+    pub energy_joules: Option<f64>,
 }
 
 impl ProjectUsageStats {
@@ -158,15 +161,18 @@ impl ProjectUsageStats {
                 .prompt_tokens
                 .saturating_add(metrics.generated_tokens),
         );
-        self.runtime_ms = self.runtime_ms.saturating_add(
+        let runtime = if metrics.wall_runtime_ms > 0 {
+            metrics.wall_runtime_ms
+        } else {
             metrics
                 .llm_runtime_ms
-                .saturating_add(metrics.tool_runtime_ms),
-        );
+                .saturating_add(metrics.tool_runtime_ms)
+        };
+        self.runtime_ms = self.runtime_ms.saturating_add(runtime);
         self.tool_calls = self.tool_calls.saturating_add(metrics.tool_calls);
-        let energy = metrics.llm_energy_kwh.unwrap_or(0.0) + metrics.tool_energy_kwh.unwrap_or(0.0);
-        if energy > 0.0 {
-            self.energy_kwh = Some(self.energy_kwh.unwrap_or(0.0) + energy);
+        if let Some(energy_joules) = metrics_energy_joules(metrics) {
+            self.energy_joules = Some(self.energy_joules.unwrap_or(0.0) + energy_joules);
+            self.energy_kwh = Some(self.energy_joules.unwrap_or(0.0) / 3_600_000.0);
         }
     }
 
@@ -176,17 +182,41 @@ impl ProjectUsageStats {
                 .prompt_tokens
                 .saturating_add(metrics.generated_tokens),
         );
-        self.runtime_ms = self.runtime_ms.saturating_sub(
+        let runtime = if metrics.wall_runtime_ms > 0 {
+            metrics.wall_runtime_ms
+        } else {
             metrics
                 .llm_runtime_ms
-                .saturating_add(metrics.tool_runtime_ms),
-        );
+                .saturating_add(metrics.tool_runtime_ms)
+        };
+        self.runtime_ms = self.runtime_ms.saturating_sub(runtime);
         self.tool_calls = self.tool_calls.saturating_sub(metrics.tool_calls);
-        let energy = metrics.llm_energy_kwh.unwrap_or(0.0) + metrics.tool_energy_kwh.unwrap_or(0.0);
-        if energy > 0.0 {
-            let remaining = self.energy_kwh.unwrap_or(0.0) - energy;
-            self.energy_kwh = (remaining > 0.0).then_some(remaining);
+        if let Some(energy) = metrics_energy_joules(metrics) {
+            let remaining = (self.energy_joules.unwrap_or(0.0) - energy).max(0.0);
+            self.energy_joules = (remaining > 0.0).then_some(remaining);
+            self.energy_kwh = self.energy_joules.map(|joules| joules / 3_600_000.0);
         }
+    }
+}
+
+fn metrics_energy_joules(metrics: &SessionMetricsSnapshot) -> Option<f64> {
+    if let Some(joules) = metrics.total_energy_joules {
+        return (joules.is_finite() && joules >= 0.0).then_some(joules);
+    }
+    if let Some(kwh) = metrics.total_energy_kwh {
+        return (kwh.is_finite() && kwh >= 0.0).then_some(kwh * 3_600_000.0);
+    }
+    if metrics.wall_runtime_ms > 0 {
+        return None;
+    }
+    let diagnostic_joules =
+        metrics.llm_energy_joules.unwrap_or(0.0) + metrics.tool_energy_joules.unwrap_or(0.0);
+    if diagnostic_joules.is_finite() && diagnostic_joules > 0.0 {
+        Some(diagnostic_joules)
+    } else {
+        let diagnostic_kwh =
+            metrics.llm_energy_kwh.unwrap_or(0.0) + metrics.tool_energy_kwh.unwrap_or(0.0);
+        (diagnostic_kwh.is_finite() && diagnostic_kwh > 0.0).then_some(diagnostic_kwh * 3_600_000.0)
     }
 }
 
@@ -208,6 +238,8 @@ pub struct SessionDetails {
     pub events: Vec<EventEnvelope>,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_records: Vec<SessionMetricsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<crate::workflow::WorkflowSummary>,
     pub strict_workflow: bool,
@@ -294,6 +326,7 @@ struct SessionState {
     sender: broadcast::Sender<EventEnvelope>,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
     metrics: Option<SessionMetricsSnapshot>,
+    usage_records: Arc<StdMutex<Vec<SessionMetricsSnapshot>>>,
     workflow: Option<crate::workflow::WorkflowCheckpoint>,
     completed_workflows: Vec<crate::workflow::WorkflowSummary>,
     cancel_token: Arc<AtomicBool>,
@@ -594,6 +627,7 @@ async fn start_session_inner(
         materialize_attachments(&session_id, request.workdir.as_deref(), req.attachments)?;
 
     let now = now_millis();
+    let usage_records = Arc::new(StdMutex::new(Vec::new()));
     let session = SessionState {
         task: request.task.clone(),
         title: None,
@@ -607,6 +641,7 @@ async fn start_session_inner(
         sender: sender.clone(),
         history: Arc::new(StdMutex::new(Vec::new())),
         metrics: None,
+        usage_records: Arc::clone(&usage_records),
         workflow: None,
         completed_workflows: Vec::new(),
         cancel_token: Arc::new(AtomicBool::new(false)),
@@ -626,6 +661,7 @@ async fn start_session_inner(
         request.workdir.clone(),
         SessionStatus::Queued,
         &empty_history,
+        &usage_records,
         None,
         Vec::new(),
     );
@@ -822,6 +858,7 @@ async fn continue_session(
     session.updated_at_ms = now_millis();
 
     let history = Arc::clone(&session.history);
+    let usage_records = Arc::clone(&session.usage_records);
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
     let completed_workflows = session.completed_workflows.clone();
@@ -833,6 +870,7 @@ async fn continue_session(
         workdir,
         SessionStatus::Queued,
         &history,
+        &usage_records,
         None,
         completed_workflows,
     );
@@ -895,6 +933,7 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
     let history = Arc::clone(&session.history);
+    let usage_records = Arc::clone(&session.usage_records);
     let workflow = session.workflow.clone();
     let completed_workflows = session.completed_workflows.clone();
     drop(sessions);
@@ -905,6 +944,7 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
         workdir,
         SessionStatus::Queued,
         &history,
+        &usage_records,
         workflow,
         completed_workflows,
     );
@@ -992,6 +1032,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
     let history = Arc::clone(&session.history);
+    let usage_records = Arc::clone(&session.usage_records);
     let workflow = session.workflow.clone();
     let completed_workflows = session.completed_workflows.clone();
     let status = session.status;
@@ -1003,6 +1044,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         workdir,
         status,
         &history,
+        &usage_records,
         workflow,
         completed_workflows,
     );
@@ -1068,6 +1110,7 @@ async fn answer_question_inner(
 
     let sender = session.sender.clone();
     let history = Arc::clone(&session.history);
+    let usage_records = Arc::clone(&session.usage_records);
     let request_template = session.request_template.clone();
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
@@ -1098,6 +1141,7 @@ async fn answer_question_inner(
         workdir,
         SessionStatus::Running,
         &history,
+        &usage_records,
         workflow,
         completed_workflows,
     );
@@ -1111,6 +1155,14 @@ fn effective_session_title(session: &SessionState) -> Option<String> {
         .ok()
         .and_then(|history| latest_session_title(&history))
         .or_else(|| session.title.clone())
+}
+
+fn session_usage_records(session: &SessionState) -> Vec<SessionMetricsSnapshot> {
+    session
+        .usage_records
+        .lock()
+        .map(|records| records.clone())
+        .unwrap_or_default()
 }
 
 fn latest_handoff_outcome(session: &SessionState) -> Option<HandoffOutcome> {
@@ -1163,6 +1215,7 @@ async fn list_sessions(
                 handoff_outcome: latest_handoff_outcome(session),
                 updated_at_ms: session.updated_at_ms,
                 metrics: session.metrics.clone(),
+                usage_records: session_usage_records(session),
                 workflow_id: workflow.as_ref().map(|workflow| workflow.id.clone()),
                 workflow_stage: workflow.as_ref().map(|workflow| workflow.stage),
                 workflow_outcome: workflow.as_ref().and_then(|workflow| workflow.outcome),
@@ -1207,6 +1260,7 @@ async fn get_session(
         events,
         updated_at_ms: session.updated_at_ms,
         metrics: session.metrics.clone(),
+        usage_records: session_usage_records(session),
         workflow,
         strict_workflow: strict_workflow_enabled(session),
     }))
@@ -1335,6 +1389,7 @@ struct WebEventSink {
     request_template: AgentRequest,
     sender: broadcast::Sender<EventEnvelope>,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
+    usage_records: Arc<StdMutex<Vec<SessionMetricsSnapshot>>>,
     persisted_branch: Option<String>,
     persisted_workdir: Option<PathBuf>,
     workflow: Option<crate::workflow::WorkflowCheckpoint>,
@@ -1356,8 +1411,11 @@ impl EventSink for WebEventSink {
             self.persisted_branch = Some(branch.clone());
         }
         if let Some(metrics) = SessionMetricsSnapshot::from_event(&event) {
+            if let Ok(mut records) = self.usage_records.lock() {
+                records.push(metrics.clone());
+            }
             tokio::runtime::Handle::current().block_on(async {
-                let (workdir, previous_metrics) = {
+                let workdir = {
                     let mut sessions = self.state.sessions.lock().await;
                     let Some(session) = sessions.get_mut(&self.session_id) else {
                         return;
@@ -1367,16 +1425,17 @@ impl EventSink for WebEventSink {
                         .as_ref()
                         .or(self.persisted_workdir.as_ref())
                         .map(|path| path.to_string_lossy().into_owned());
-                    let previous_metrics = session.metrics.replace(metrics.clone());
+                    if let Some(existing) = session.metrics.as_mut() {
+                        existing.add_assign(&metrics);
+                    } else {
+                        session.metrics = Some(metrics.clone());
+                    }
                     session.updated_at_ms = now_millis();
-                    (workdir, previous_metrics)
+                    workdir
                 };
                 if let Some(workdir) = workdir {
                     let mut usage = self.state.project_usage.lock().await;
                     let stats = usage.entry(workdir).or_default();
-                    if let Some(previous_metrics) = previous_metrics {
-                        stats.subtract_metrics(&previous_metrics);
-                    }
                     stats.add_metrics(&metrics);
                 }
             });
@@ -1401,6 +1460,7 @@ impl EventSink for WebEventSink {
             self.persisted_workdir.clone(),
             SessionStatus::Running,
             &self.history,
+            &self.usage_records,
             self.workflow.clone(),
             self.completed_workflows.clone(),
         );
@@ -1444,6 +1504,7 @@ impl EventSink for WebEventSink {
             self.persisted_workdir.clone(),
             SessionStatus::Running,
             &self.history,
+            &self.usage_records,
             self.workflow.clone(),
             self.completed_workflows.clone(),
         );
@@ -1495,6 +1556,7 @@ impl EventSink for WebEventSink {
                 session.workdir.clone(),
                 SessionStatus::Paused,
                 &session.history,
+                &session.usage_records,
                 session.workflow.clone(),
                 session.completed_workflows.clone(),
             );
@@ -1543,12 +1605,22 @@ fn dispatch_next_session(state: AppState) {
                 session.branch.clone(),
                 session.workdir.clone(),
                 Arc::clone(&session.history),
+                Arc::clone(&session.usage_records),
                 session.workflow.clone(),
                 session.completed_workflows.clone(),
             )
         };
 
-        let (session_id, request, branch, workdir, history, workflow, completed_workflows) = next;
+        let (
+            session_id,
+            request,
+            branch,
+            workdir,
+            history,
+            usage_records,
+            workflow,
+            completed_workflows,
+        ) = next;
         persist_session_snapshot(
             &session_id,
             &request,
@@ -1556,6 +1628,7 @@ fn dispatch_next_session(state: AppState) {
             workdir,
             SessionStatus::Running,
             &history,
+            &usage_records,
             workflow,
             completed_workflows,
         );
@@ -1565,7 +1638,15 @@ fn dispatch_next_session(state: AppState) {
 
 fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
     tokio::spawn(async move {
-        let (models_root, sender, history, workflow, completed_workflows, cancel_token) = {
+        let (
+            models_root,
+            sender,
+            history,
+            usage_records,
+            workflow,
+            completed_workflows,
+            cancel_token,
+        ) = {
             let sessions = state.sessions.lock().await;
             let Some(session) = sessions.get(&session_id) else {
                 return;
@@ -1577,6 +1658,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     .unwrap_or_else(crate::default_models_dir),
                 session.sender.clone(),
                 Arc::clone(&session.history),
+                Arc::clone(&session.usage_records),
                 session.workflow.clone(),
                 session.completed_workflows.clone(),
                 Arc::clone(&session.cancel_token),
@@ -1593,6 +1675,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 request_template: request_for_run.clone(),
                 sender,
                 history,
+                usage_records,
                 persisted_branch: request_for_run.branch.clone(),
                 persisted_workdir: request_for_run.workdir.clone(),
                 workflow,
@@ -1688,6 +1771,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 session.workdir.clone(),
                 final_status,
                 &session.history,
+                &session.usage_records,
                 session.workflow.clone(),
                 session.completed_workflows.clone(),
             );
@@ -2026,6 +2110,19 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
     let (sender, _) = broadcast::channel(256);
     let session_id = persisted.session_id.clone();
     let title = latest_session_title(&persisted.events).or(persisted.title);
+    let usage_records = if persisted.usage_records.is_empty() {
+        persisted
+            .events
+            .iter()
+            .filter_map(|envelope| SessionMetricsSnapshot::from_event(&envelope.event))
+            .collect::<Vec<_>>()
+    } else {
+        persisted.usage_records.clone()
+    };
+    let metrics = persisted
+        .metrics
+        .clone()
+        .or_else(|| combined_metrics(&usage_records));
     let history = Arc::new(StdMutex::new(persisted.events));
     let interrupted = persisted.running || persisted.status == Some(SessionStatus::Running);
     let status = if interrupted {
@@ -2049,7 +2146,8 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
             pending_question: None,
             sender,
             history,
-            metrics: persisted.metrics,
+            metrics,
+            usage_records: Arc::new(StdMutex::new(usage_records)),
             workflow: persisted.workflow,
             completed_workflows: persisted.completed_workflows,
             cancel_token: Arc::new(AtomicBool::new(false)),
@@ -2073,12 +2171,17 @@ fn persist_session_snapshot(
     workdir: Option<PathBuf>,
     status: SessionStatus,
     history: &StdMutex<Vec<EventEnvelope>>,
+    usage_records: &StdMutex<Vec<SessionMetricsSnapshot>>,
     workflow: Option<crate::workflow::WorkflowCheckpoint>,
     completed_workflows: Vec<crate::workflow::WorkflowSummary>,
 ) {
     let events = history
         .lock()
         .map(|history| history.clone())
+        .unwrap_or_default();
+    let records = usage_records
+        .lock()
+        .map(|records| records.clone())
         .unwrap_or_default();
     let mut persisted = PersistedSession::from_parts(
         session_id.to_string(),
@@ -2089,11 +2192,27 @@ fn persist_session_snapshot(
         status,
         events,
     );
+    if !records.is_empty() {
+        persisted.metrics = combined_metrics(&records);
+        persisted.usage_records = records;
+    }
     persisted.workflow = workflow;
     persisted.completed_workflows = completed_workflows;
     if let Err(err) = session_store::save_session(&persisted) {
         eprintln!("failed to persist pb session {session_id}: {err:#}");
     }
+}
+
+fn combined_metrics(records: &[SessionMetricsSnapshot]) -> Option<SessionMetricsSnapshot> {
+    let mut combined: Option<SessionMetricsSnapshot> = None;
+    for metrics in records {
+        if let Some(existing) = combined.as_mut() {
+            existing.add_assign(metrics);
+        } else {
+            combined = Some(metrics.clone());
+        }
+    }
+    combined
 }
 
 async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
@@ -2118,6 +2237,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
                 handoff_outcome: latest_handoff_outcome(session),
                 updated_at_ms: session.updated_at_ms,
                 metrics: session.metrics.clone(),
+                usage_records: session_usage_records(session),
                 workflow_id: workflow.as_ref().map(|workflow| workflow.id.clone()),
                 workflow_stage: workflow.as_ref().map(|workflow| workflow.stage),
                 workflow_outcome: workflow.as_ref().and_then(|workflow| workflow.outcome),
@@ -2170,6 +2290,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         events,
         updated_at_ms: session.updated_at_ms,
         metrics: session.metrics.clone(),
+        usage_records: session_usage_records(session),
         workflow,
         strict_workflow: strict_workflow_enabled(session),
     })
@@ -2372,6 +2493,38 @@ mod workflow_tests {
             attachments: Vec::new(),
             contract: None,
         }
+    }
+
+    #[test]
+    fn project_usage_uses_authoritative_task_energy_and_wall_time_once() {
+        let mut usage = ProjectUsageStats::default();
+        usage.add_metrics(&SessionMetricsSnapshot {
+            llm_runtime_ms: 8_000,
+            tool_runtime_ms: 9_000,
+            wall_runtime_ms: 10_000,
+            llm_energy_joules: Some(80.0),
+            tool_energy_joules: Some(70.0),
+            total_energy_joules: Some(100.0),
+            ..Default::default()
+        });
+        assert_eq!(usage.runtime_ms, 10_000);
+        assert_eq!(usage.energy_joules, Some(100.0));
+
+        usage.add_metrics(&SessionMetricsSnapshot {
+            wall_runtime_ms: 1_000,
+            llm_energy_joules: Some(20.0),
+            tool_energy_joules: Some(20.0),
+            ..Default::default()
+        });
+        assert_eq!(usage.energy_joules, Some(100.0));
+
+        let mut measured_zero = ProjectUsageStats::default();
+        measured_zero.add_metrics(&SessionMetricsSnapshot {
+            wall_runtime_ms: 1_000,
+            total_energy_joules: Some(0.0),
+            ..Default::default()
+        });
+        assert_eq!(measured_zero.energy_joules, Some(0.0));
     }
 
     #[tokio::test]

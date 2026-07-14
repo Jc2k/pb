@@ -130,18 +130,22 @@ Deno.test("session page respects iPhone safe areas and prevents horizontal overf
   ok(css.includes(".session-header .share-action,"));
 });
 
-Deno.test("session metrics show a concise human summary after session summary", async () => {
+Deno.test("session metrics expose the canonical estimate and its measurement quality", async () => {
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
   const types = await Deno.readTextFile("webui/src/types/index.ts");
 
   ok(types.includes("power_summary?: string"));
-  ok(component.includes("funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyKwh)"));
-  ok(component.includes("used enough electricity to power an LED bulb"));
+  ok(component.includes("funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)"));
+  ok(component.includes("the energy a 10 W LED bulb uses in"));
   ok(component.includes('case "session_metrics"'));
+  ok(component.includes('case "llm_invocation"'));
+  ok(component.includes("Power-estimate details"));
+  ok(component.includes("Measurement coverage"));
+  ok(component.includes("Gross device energy"));
   ok(component.includes('<article className="session-correction" aria-label="Session metrics">'));
   ok(component.includes("{e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}"));
   ok(!component.includes("<strong>Power</strong>"));
-  ok(!component.includes("e.power_summary"));
+  ok(!component.includes("{e.power_summary"));
   ok(!component.includes('<i className="bi bi-speedometer2"></i>'));
 });
 

@@ -6,6 +6,7 @@ import { formatEventTime, getAvatarForProfile, projectName, relativeTime, sessio
 import { TODO_STATUS_LABELS, errorSummary, getToolDetail, profileJobTitle, profileName } from "../lib/sessionUtils";
 import type { TodoTask, ToolSummary } from "../lib/sessionUtils";
 import { parseRichText } from "../lib/richText";
+import { formatEnergy, formatPower, ledEquivalent, metricEnergyJoules, metricRuntimeMs } from "../lib/energy";
 
 function formatHumanDurationMs(ms?: number): string {
   if (ms === undefined) return "an unknown amount of time";
@@ -24,71 +25,23 @@ function formatHumanDurationMs(ms?: number): string {
   return `${seconds}s`;
 }
 
-const FUN_ENERGY_UNITS = [
-  {
-    singular: "second",
-    plural: "seconds",
-    kwh: 0.01 / 3600,
-    minAmount: 1,
-  },
-  {
-    singular: "minute",
-    plural: "minutes",
-    kwh: 0.01 / 60,
-    minAmount: 1,
-  },
-  {
-    singular: "hour",
-    plural: "hours",
-    kwh: 0.01,
-    minAmount: 0.1,
-  },
-  { singular: "phone charge", plural: "phone charges", kwh: 0.015, minAmount: 0.1 },
-  { singular: "slice of toast", plural: "slices of toast", kwh: 0.02, minAmount: 0.1 },
-  { singular: "cup of tea", plural: "cups of tea", kwh: 0.03, minAmount: 0.1 },
-  {
-    singular: "bag of microwave popcorn",
-    plural: "bags of microwave popcorn",
-    kwh: 0.05,
-    minAmount: 0.1,
-  },
-];
-
 function formatNumber(value: number): string {
   return Math.trunc(value).toLocaleString("en-US");
-}
-
-function formatFunAmount(amount: number): string {
-  if (amount >= 10) return amount.toFixed(0);
-  if (amount >= 1) {
-    const rounded = Math.round(amount * 10) / 10;
-    return Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1);
-  }
-  return amount.toFixed(1);
 }
 
 function funEnergySummary(
   runtimeMs: number,
   tokens: number,
-  energyKwh: number,
+  energyJoules?: number,
 ): string {
   const prefix = `This session ran for ${formatHumanDurationMs(runtimeMs)}, used ${formatNumber(tokens)} tokens`;
-  if (energyKwh <= 0 || !Number.isFinite(energyKwh)) {
+  if (energyJoules === undefined || energyJoules < 0 || !Number.isFinite(energyJoules)) {
     return `${prefix}.`;
   }
-
-  const unit = FUN_ENERGY_UNITS
-    .map((candidate) => {
-      const amount = energyKwh / candidate.kwh;
-      const score = amount < candidate.minAmount
-        ? Number.POSITIVE_INFINITY
-        : Math.abs(amount - (amount < 1 ? 1 : Math.round(amount)));
-      return { ...candidate, score };
-    })
-    .sort((left, right) => left.score - right.score)[0];
-  const amountLabel = formatFunAmount(energyKwh / unit.kwh);
-  const noun = amountLabel === "1" ? unit.singular : unit.plural;
-  return `${prefix} and used enough electricity to power an LED bulb for ${amountLabel} ${noun}.`;
+  const equivalent = ledEquivalent(energyJoules);
+  return `${prefix}, and used an estimated ${formatEnergy(energyJoules)}${
+    equivalent ? `—the energy a 10 W LED bulb uses in ${equivalent}` : ""
+  }.`;
 }
 
 function RichText({ content }: { content: string }) {
@@ -792,7 +745,16 @@ export function MessageBubble({
       );
 
     case "llm_invocation":
-      return null;
+      return (
+        <article className="session-correction" aria-label={`Model inference step ${e.step}`}>
+          <span>
+            Model inference {e.step} · {formatHumanDurationMs(e.duration_ms)} · {formatNumber(e.prompt_tokens + e.generated_tokens)} tokens
+            {e.energy_joules !== undefined ? ` · ${formatEnergy(e.energy_joules)}` : ""}
+            {e.average_power_watts !== undefined ? ` at ${formatPower(e.average_power_watts)}` : ""}
+          </span>
+          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
+        </article>
+      );
 
     case "executor_started":
     case "workflow_started":
@@ -809,11 +771,45 @@ export function MessageBubble({
 
     case "session_metrics": {
       const totalTokens = e.prompt_tokens + e.generated_tokens;
-      const totalEnergyKwh = (e.llm_energy_kwh ?? 0) + (e.tool_energy_kwh ?? 0);
-      const totalRuntimeMs = e.llm_runtime_ms + e.tool_runtime_ms;
+      const totalEnergyJoules = metricEnergyJoules(e);
+      const totalRuntimeMs = metricRuntimeMs(e);
+      const coverage = e.energy_coverage === undefined
+        ? undefined
+        : `${Math.round(e.energy_coverage * 100)}%`;
+      const hasMeasurementMetadata = (e.wall_runtime_ms ?? 0) > 0 ||
+        e.total_energy_joules !== undefined || e.energy_source !== undefined;
       return (
         <article className="session-correction" aria-label="Session metrics">
-          <span>{funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyKwh)}</span>
+          <span>
+            {funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)}
+            {totalEnergyJoules !== undefined ? (
+              <details>
+                <summary>Power-estimate details</summary>
+                <div>Average incremental power: {formatPower(e.average_power_watts)}</div>
+                {hasMeasurementMetadata ? (
+                  <>
+                    <div>Gross device energy: {formatEnergy(e.gross_energy_joules)}</div>
+                    <div>After display adjustment: {formatEnergy(e.adjusted_energy_joules)}</div>
+                    <div>Measurement coverage: {coverage ?? "Unknown"}</div>
+                    <div>Source: {e.energy_source?.replaceAll("_", " ") ?? "Unknown"}</div>
+                    <div>
+                      Exclusions: {[
+                        e.display_energy_excluded ? "measured display" : null,
+                        e.idle_baseline_applied ? "idle device baseline" : null,
+                      ].filter(Boolean).join(", ") || "none available"}
+                    </div>
+                  </>
+                ) : null}
+                <div>Model inference: {formatEnergy(e.llm_energy_joules)}</div>
+                <div>Tools: {formatEnergy(e.tool_energy_joules)}</div>
+                {hasMeasurementMetadata && e.energy_complete === false ? <div>Estimate is partial or changed source during the task.</div> : null}
+                {hasMeasurementMetadata && e.energy_exclusive === false ? <div>Another pb process held the system meter; task attribution is unavailable.</div> : null}
+              </details>
+            ) : null}
+            {totalEnergyJoules === undefined && e.energy_exclusive === false
+              ? " Power estimate unavailable: the system meter is unsupported or already in use."
+              : null}
+          </span>
           {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
         </article>
       );

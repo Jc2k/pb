@@ -118,3 +118,33 @@ Deno.test("usageStatsForToday sums metrics for sessions updated today", () => {
   equal(stats.tool_calls, 2);
   equal(stats.energy_kwh, 0.003);
 });
+
+Deno.test("usageStatsForToday uses per-turn windows and apportions midnight overlap", () => {
+  const record = {
+    llm_invocations: 1,
+    llm_runtime_ms: 120_000,
+    prompt_tokens: 80,
+    generated_tokens: 20,
+    tool_calls: 4,
+    tool_runtime_ms: 0,
+    wall_runtime_ms: 120_000,
+    started_at_ms: new Date("2026-06-25T23:59:00").getTime(),
+    ended_at_ms: new Date("2026-06-26T00:01:00").getTime(),
+    total_energy_joules: 120,
+  };
+  const stats = usageStatsForToday([{
+    session_id: "midnight",
+    task: "Cross midnight",
+    running: false,
+    paused: false,
+    status: "completed",
+    updated_at_ms: record.ended_at_ms,
+    metrics: record,
+    usage_records: [record],
+  }], new Date("2026-06-26T12:00:00"));
+
+  equal(stats.tokens, 50);
+  equal(stats.runtime_ms, 60_000);
+  equal(stats.tool_calls, 2);
+  equal(stats.energy_joules, 60);
+});

@@ -4,6 +4,7 @@ import type {
   SessionItem,
 } from "../types";
 import { projectName, relativeTime, sessionTitle } from "../lib/helpers";
+import { formatEnergy } from "../lib/energy";
 
 export type SessionFilter = "all" | SessionItem["status"];
 
@@ -86,18 +87,17 @@ export function UsageMetrics(
           <i className="bi bi-lightning-charge"></i>
         </span>
         <span>
-          <small>Energy (estimated)</small>
-          <strong>
-            {usage.energy_kwh
-              ? `~${usage.energy_kwh.toFixed(3)} kWh`
-              : "Not available"}
-          </strong>
+          <small>Estimated task energy</small>
+          <strong>{formatEnergy(
+            usage.energy_joules ?? (usage.energy_kwh == null ? undefined : usage.energy_kwh * 3_600_000),
+          )}</strong>
           <em className="today-usage">
-            Today: {todaysUsage.energy_kwh
-              ? `~${todaysUsage.energy_kwh.toFixed(3)} kWh`
-              : "Not available"}
+            Today: {formatEnergy(
+              todaysUsage.energy_joules ??
+                (todaysUsage.energy_kwh == null ? undefined : todaysUsage.energy_kwh * 3_600_000),
+            )}
           </em>
-          <em>Local model telemetry</em>
+          <em>Whole-device estimate; display and idle baseline excluded when measured</em>
         </span>
       </div>
       <div className="metric-row">
@@ -110,7 +110,7 @@ export function UsageMetrics(
           <em className="today-usage">
             Today: {formatRuntime(todaysUsage.runtime_ms)}
           </em>
-          <em>LLM and tool runtime</em>
+          <em>Task wall time</em>
         </span>
       </div>
       <div className="metric-row">

@@ -39,6 +39,8 @@ pub struct PersistedSession {
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<SessionMetricsSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_records: Vec<SessionMetricsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<crate::workflow::WorkflowCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -56,6 +58,10 @@ impl PersistedSession {
         status: SessionStatus,
         events: Vec<EventEnvelope>,
     ) -> Self {
+        let usage_records = events
+            .iter()
+            .filter_map(|envelope| SessionMetricsSnapshot::from_event(&envelope.event))
+            .collect::<Vec<_>>();
         Self {
             session_id,
             task: request_template.task.clone(),
@@ -67,6 +73,7 @@ impl PersistedSession {
             status: Some(status),
             updated_at_ms: now_millis(),
             metrics: latest_session_metrics(&events),
+            usage_records,
             workflow: None,
             completed_workflows: Vec::new(),
             events: trim_events(events),
@@ -198,10 +205,18 @@ fn parse_session(payload: &str) -> Result<PersistedSession> {
 }
 
 fn latest_session_metrics(events: &[EventEnvelope]) -> Option<SessionMetricsSnapshot> {
-    events
+    let mut total: Option<SessionMetricsSnapshot> = None;
+    for metrics in events
         .iter()
-        .rev()
-        .find_map(|envelope| SessionMetricsSnapshot::from_event(&envelope.event))
+        .filter_map(|envelope| SessionMetricsSnapshot::from_event(&envelope.event))
+    {
+        if let Some(existing) = total.as_mut() {
+            existing.add_assign(&metrics);
+        } else {
+            total = Some(metrics);
+        }
+    }
+    total
 }
 
 pub fn latest_session_title(events: &[EventEnvelope]) -> Option<String> {
@@ -380,10 +395,78 @@ mod tests {
         dir
     }
 
+    fn metrics_event(tokens: usize, joules: f64, started_at_ms: u64) -> EventEnvelope {
+        EventEnvelope::new(AgentEvent::SessionMetrics {
+            llm_invocations: 1,
+            llm_runtime_ms: 1_000,
+            prompt_tokens: tokens,
+            generated_tokens: 0,
+            tool_calls: 0,
+            tool_runtime_ms: 0,
+            llm_energy_joules: None,
+            llm_energy_kwh: None,
+            tool_energy_joules: None,
+            tool_energy_kwh: None,
+            wall_runtime_ms: 1_000,
+            started_at_ms: Some(started_at_ms),
+            ended_at_ms: Some(started_at_ms + 1_000),
+            total_energy_joules: Some(joules),
+            total_energy_kwh: Some(joules / 3_600_000.0),
+            gross_energy_joules: Some(joules + 2.0),
+            adjusted_energy_joules: Some(joules + 1.0),
+            average_power_watts: Some(joules),
+            energy_measured_ms: Some(1_000),
+            energy_coverage: Some(1.0),
+            energy_source: Some("smc_system_total".to_string()),
+            display_energy_excluded: true,
+            idle_baseline_applied: true,
+            energy_complete: true,
+            energy_exclusive: true,
+            nesting_depth: None,
+            timestamp_ms: Some(started_at_ms + 1_000),
+        })
+    }
+
     #[test]
     fn session_note_ref_rejects_path_separators() {
         assert!(session_note_ref("session-123").is_ok());
         assert!(session_note_ref("../bad").is_err());
+    }
+
+    #[test]
+    fn continued_turn_metrics_are_persisted_cumulatively() {
+        let metrics = latest_session_metrics(&[
+            metrics_event(10, 20.0, 1_000),
+            metrics_event(15, 30.0, 3_000),
+        ])
+        .unwrap();
+
+        assert_eq!(metrics.prompt_tokens, 25);
+        assert_eq!(metrics.wall_runtime_ms, 2_000);
+        assert_eq!(metrics.total_energy_joules, Some(50.0));
+        assert_eq!(metrics.started_at_ms, Some(1_000));
+        assert_eq!(metrics.ended_at_ms, Some(4_000));
+    }
+
+    #[test]
+    fn usage_records_outlive_the_trimmed_chat_history() {
+        let dir = init_repo();
+        let events = (0..1_005)
+            .map(|index| metrics_event(1, 1.0, index * 2_000))
+            .collect::<Vec<_>>();
+        let session = PersistedSession::from_parts(
+            "long-session".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            events,
+        );
+
+        assert_eq!(session.events.len(), MAX_RESTORED_HISTORY_EVENTS);
+        assert_eq!(session.usage_records.len(), 1_005);
+        assert_eq!(session.metrics.unwrap().prompt_tokens, 1_005);
     }
 
     #[test]

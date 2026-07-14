@@ -14,6 +14,7 @@ import {
 import type { ProjectUsageStats, SessionAttachment, TurnIntent } from "../types";
 import { relativeTime, usageStatsForToday } from "../lib/helpers";
 import { useProjectSessionData } from "../lib/hooks";
+import { metricEnergyJoules, metricRuntimeMs } from "../lib/energy";
 
 export function HomePage() {
   const [task, setTask] = useState("");
@@ -34,12 +35,13 @@ export function HomePage() {
         if (!session.metrics) return totals;
         totals.tokens += session.metrics.prompt_tokens +
           session.metrics.generated_tokens;
-        totals.runtime_ms += session.metrics.llm_runtime_ms +
-          session.metrics.tool_runtime_ms;
+        totals.runtime_ms += metricRuntimeMs(session.metrics);
         totals.tool_calls += session.metrics.tool_calls;
-        const energy = (session.metrics.llm_energy_kwh ?? 0) +
-          (session.metrics.tool_energy_kwh ?? 0);
-        if (energy > 0) totals.energy_kwh = (totals.energy_kwh ?? 0) + energy;
+        const energy = metricEnergyJoules(session.metrics);
+        if (energy !== undefined) {
+          totals.energy_joules = (totals.energy_joules ?? 0) + energy;
+          totals.energy_kwh = totals.energy_joules / 3_600_000;
+        }
         return totals;
       }, { tokens: 0, runtime_ms: 0, tool_calls: 0 }),
     [sessions],

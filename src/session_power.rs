@@ -1,110 +1,83 @@
-#[derive(Debug, Clone, Copy)]
-pub struct FunEnergyUnit {
-    pub singular: &'static str,
-    pub plural: &'static str,
-    pub kwh: f64,
-    pub min_amount: f64,
-}
+const LED_WATTS: f64 = 10.0;
 
-// Add new deliberately-non-metric session summary units here. Values are rough,
-// memorable approximations intended for playful scale rather than measurement.
-const FUN_ENERGY_UNITS: &[FunEnergyUnit] = &[
-    FunEnergyUnit {
-        singular: "cup of tea",
-        plural: "cups of tea",
-        kwh: 0.03,
-        min_amount: 0.1,
-    },
-    FunEnergyUnit {
-        singular: "phone charge",
-        plural: "phone charges",
-        kwh: 0.015,
-        min_amount: 0.1,
-    },
-    FunEnergyUnit {
-        singular: "second of a cozy LED bulb",
-        plural: "seconds of a cozy LED bulb",
-        kwh: 0.01 / 3600.0,
-        min_amount: 1.0,
-    },
-    FunEnergyUnit {
-        singular: "minute of a cozy LED bulb",
-        plural: "minutes of a cozy LED bulb",
-        kwh: 0.01 / 60.0,
-        min_amount: 1.0,
-    },
-    FunEnergyUnit {
-        singular: "hour of a cozy LED bulb",
-        plural: "hours of a cozy LED bulb",
-        kwh: 0.01,
-        min_amount: 0.1,
-    },
-    FunEnergyUnit {
-        singular: "slice of toast",
-        plural: "slices of toast",
-        kwh: 0.02,
-        min_amount: 0.1,
-    },
-    FunEnergyUnit {
-        singular: "bag of microwave popcorn",
-        plural: "bags of microwave popcorn",
-        kwh: 0.05,
-        min_amount: 0.1,
-    },
-];
-
-pub fn session_power_summary(tokens: usize, energy_kwh: f64) -> String {
+pub fn session_power_summary(tokens: usize, energy_joules: Option<f64>) -> String {
     let token_label = format_number(tokens);
-    if energy_kwh <= 0.0 || !energy_kwh.is_finite() {
+    let Some(energy_joules) = energy_joules.filter(|value| value.is_finite() && *value >= 0.0)
+    else {
         return format!("This session used {token_label} tokens.");
-    }
+    };
 
-    let unit = choose_fun_unit(energy_kwh);
-    let amount = energy_kwh / unit.kwh;
-    let amount_label = format_amount(amount);
-    let noun = if amount_label == "1" {
-        unit.singular
+    let energy_label = format_energy(energy_joules);
+    if energy_joules == 0.0 {
+        return format!("This session used {token_label} tokens and an estimated {energy_label}.");
+    }
+    let seconds = energy_joules / LED_WATTS;
+    let (amount, singular, plural) = if seconds < 90.0 {
+        (seconds, "second", "seconds")
+    } else if seconds < 90.0 * 60.0 {
+        (seconds / 60.0, "minute", "minutes")
     } else {
-        unit.plural
+        (seconds / 3_600.0, "hour", "hours")
+    };
+    let amount_label = format_amount(amount);
+    let noun = if (amount - 1.0).abs() < 0.05 {
+        singular
+    } else {
+        plural
     };
     format!(
-        "This session used {token_label} tokens and enough electricity for {amount_label} {noun}."
+        "This session used {token_label} tokens and an estimated {energy_label}—the energy a 10 W LED bulb uses in {amount_label} {noun}."
     )
 }
 
-fn choose_fun_unit(energy_kwh: f64) -> FunEnergyUnit {
-    FUN_ENERGY_UNITS
-        .iter()
-        .copied()
-        .min_by(|left, right| {
-            let left_score = unit_score(energy_kwh, *left);
-            let right_score = unit_score(energy_kwh, *right);
-            left_score.total_cmp(&right_score)
-        })
-        .expect("fun energy units should not be empty")
-}
-
-fn unit_score(energy_kwh: f64, unit: FunEnergyUnit) -> f64 {
-    let amount = energy_kwh / unit.kwh;
-    if amount < unit.min_amount {
-        return f64::INFINITY;
+fn format_energy(joules: f64) -> String {
+    if joules < 1.0 {
+        format!("{joules:.2} J")
+    } else if joules < 10.0 {
+        format!("{joules:.2} J")
+    } else if joules < 100.0 {
+        format!("{joules:.1} J")
+    } else if joules < 1_000.0 {
+        format!("{joules:.0} J")
+    } else if joules < 3_600_000.0 {
+        let watt_hours = joules / 3_600.0;
+        format!(
+            "{watt_hours:.precision$} Wh",
+            precision = if watt_hours < 10.0 {
+                2
+            } else if watt_hours < 100.0 {
+                1
+            } else {
+                0
+            }
+        )
+    } else {
+        let kwh = joules / 3_600_000.0;
+        format!(
+            "{kwh:.precision$} kWh",
+            precision = if kwh < 10.0 {
+                3
+            } else if kwh < 100.0 {
+                2
+            } else {
+                1
+            }
+        )
     }
-    let nearest_fun_amount = if amount < 1.0 { 1.0 } else { amount.round() };
-    (amount - nearest_fun_amount).abs()
 }
 
 fn format_amount(amount: f64) -> String {
     if amount >= 10.0 {
-        format!("{:.0}", amount)
+        format!("{amount:.0}")
     } else if amount >= 1.0 {
         let rounded = (amount * 10.0).round() / 10.0;
-        if (rounded.fract()).abs() < f64::EPSILON {
+        if rounded.fract().abs() < f64::EPSILON {
             format!("{rounded:.0}")
         } else {
             format!("{rounded:.1}")
         }
     } else {
-        format!("{amount:.1}")
+        format!("{amount:.2}")
     }
 }
 
@@ -125,26 +98,34 @@ mod tests {
     use super::session_power_summary;
 
     #[test]
-    fn formats_tokens_and_fun_energy_unit() {
+    fn uses_a_fixed_explicit_led_comparison() {
         assert_eq!(
-            session_power_summary(13_567, 0.06),
-            "This session used 13,567 tokens and enough electricity for 2 cups of tea."
+            session_power_summary(13_567, Some(216_000.0)),
+            "This session used 13,567 tokens and an estimated 60.0 Wh—the energy a 10 W LED bulb uses in 6 hours."
         );
     }
 
     #[test]
-    fn formats_tiny_energy_as_nonzero_fun_unit() {
+    fn formats_tiny_energy_without_rounding_to_zero() {
         assert_eq!(
-            session_power_summary(460_502, 0.00001052),
-            "This session used 460,502 tokens and enough electricity for 3.8 seconds of a cozy LED bulb."
+            session_power_summary(460_502, Some(37.872)),
+            "This session used 460,502 tokens and an estimated 37.9 J—the energy a 10 W LED bulb uses in 3.8 seconds."
         );
     }
 
     #[test]
     fn falls_back_to_token_only_summary_without_energy() {
         assert_eq!(
-            session_power_summary(999, 0.0),
+            session_power_summary(999, None),
             "This session used 999 tokens."
+        );
+    }
+
+    #[test]
+    fn preserves_a_measured_zero_energy_estimate() {
+        assert_eq!(
+            session_power_summary(999, Some(0.0)),
+            "This session used 999 tokens and an estimated 0.00 J."
         );
     }
 }

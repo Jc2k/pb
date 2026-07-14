@@ -230,6 +230,25 @@ body {
     overflow-wrap: anywhere;
 }
 
+.session-correction details {
+    margin-top: 0.45rem;
+    padding: 0.4rem 0.55rem;
+    border: 1px solid var(--line);
+    border-radius: 0.5rem;
+    background: var(--panel);
+    text-align: left;
+}
+
+.session-correction details summary {
+    cursor: pointer;
+    text-align: center;
+    font-weight: 600;
+}
+
+.session-correction details div {
+    margin-top: 0.25rem;
+}
+
 .session-correction time {
     display: block;
     margin-top: 0.15rem;

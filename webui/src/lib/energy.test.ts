@@ -1,0 +1,67 @@
+import { equal } from "node:assert/strict";
+import {
+  formatEnergy,
+  ledEquivalent,
+  metricEnergyJoules,
+  metricRuntimeMs,
+} from "./energy.ts";
+
+Deno.test("formatEnergy keeps ordinary task estimates visible without zero kWh", () => {
+  equal(formatEnergy(0), "0.00 J");
+  equal(formatEnergy(0.42), "0.42 J");
+  equal(formatEnergy(42), "42.0 J");
+  equal(formatEnergy(36_000), "10.0 Wh");
+  equal(formatEnergy(3_600_000), "1.000 kWh");
+});
+
+Deno.test("LED comparison uses one explicit 10 W appliance and sane time units", () => {
+  equal(ledEquivalent(38), "3.8 seconds");
+  equal(ledEquivalent(600), "60 seconds");
+  equal(ledEquivalent(36_000), "60 minutes");
+  equal(ledEquivalent(216_000), "6 hours");
+});
+
+Deno.test("canonical task totals override overlapping diagnostic breakdowns", () => {
+  const metrics = {
+    llm_invocations: 2,
+    llm_runtime_ms: 8_000,
+    prompt_tokens: 10,
+    generated_tokens: 5,
+    tool_calls: 2,
+    tool_runtime_ms: 9_000,
+    wall_runtime_ms: 10_000,
+    total_energy_joules: 100,
+    llm_energy_joules: 80,
+    tool_energy_joules: 70,
+  };
+  equal(metricEnergyJoules(metrics), 100);
+  equal(metricRuntimeMs(metrics), 10_000);
+});
+
+Deno.test("legacy kWh-only snapshots remain readable", () => {
+  const metrics = {
+    llm_invocations: 1,
+    llm_runtime_ms: 1,
+    prompt_tokens: 1,
+    generated_tokens: 1,
+    tool_calls: 0,
+    tool_runtime_ms: 0,
+    llm_energy_kwh: 0.001,
+  };
+  equal(metricEnergyJoules(metrics), 3_600);
+});
+
+Deno.test("current snapshots never promote diagnostic spans when task attribution is unavailable", () => {
+  const metrics = {
+    llm_invocations: 1,
+    llm_runtime_ms: 1_000,
+    prompt_tokens: 1,
+    generated_tokens: 1,
+    tool_calls: 1,
+    tool_runtime_ms: 1_000,
+    wall_runtime_ms: 1_500,
+    llm_energy_joules: 20,
+    tool_energy_joules: 20,
+  };
+  equal(metricEnergyJoules(metrics), undefined);
+});
