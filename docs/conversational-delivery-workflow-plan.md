@@ -1,6 +1,6 @@
 # Conversational sessions and enforced delivery workflow plan
 
-Status: implemented through W8; W9 publication-seam verification remains
+Status: implemented through W9
 
 ## Decision summary
 
@@ -1067,11 +1067,13 @@ Commit: `refactor: retire prompt-owned delivery control`
 
 ### W9 — Publication seam verification (P2)
 
-- Produce the `ReadyEvidenceBundle` from successful local delivery.
+- Produce the `ReadyEvidenceBundle` from successful local delivery. Implemented:
+  current runs persist it atomically with the `Ready` transition and legacy
+  checkpoints cannot falsely claim the new evidence contract.
 - Add a no-op/mock publisher interface and idempotency tests without network
   mutation.
 - Document the separate follow-on goal for push, CI, and PR/MR feedback
-  automation.
+  automation in `docs/external-publication-workflow-follow-on.md`.
 
 Commit: `feat: expose reviewed delivery evidence`
 

@@ -63,6 +63,8 @@ impl WorkflowCounters {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowRun {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ready_evidence_schema: u32,
     pub id: String,
     pub source_turn_id: String,
     pub task: String,
@@ -97,6 +99,8 @@ pub struct WorkflowRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<HandoffCommitSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_evidence: Option<super::ReadyEvidenceBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<WorkflowOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
@@ -116,6 +120,7 @@ impl WorkflowRun {
         policy.validate()?;
         Ok(Self {
             version: policy.version,
+            ready_evidence_schema: super::READY_EVIDENCE_SCHEMA_VERSION,
             id,
             source_turn_id,
             task,
@@ -136,6 +141,7 @@ impl WorkflowRun {
             code_review: None,
             counters: WorkflowCounters::default(),
             commit: None,
+            ready_evidence: None,
             outcome: None,
             blocked_reason: None,
         })
@@ -193,6 +199,8 @@ pub enum WorkflowEvent {
     CommitCompleted {
         content_fingerprint: String,
         commit: HandoffCommitSummary,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_remote: Option<String>,
     },
     Blocked {
         outcome: WorkflowOutcome,
@@ -271,6 +279,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.content_fingerprint = None;
             run.code_review = None;
             run.commit = None;
+            run.ready_evidence = None;
             run.stage = WorkflowStage::PlanReview;
         }
         WorkflowEvent::PlanReviewSubmitted { review } => {
@@ -318,6 +327,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.content_fingerprint = None;
             run.code_review = None;
             run.commit = None;
+            run.ready_evidence = None;
             run.stage = WorkflowStage::Planning;
         }
         WorkflowEvent::ImplementationSubmitted { implementation } => {
@@ -337,6 +347,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.checks = CheckEvidenceLedger::default();
             run.code_review = None;
             run.commit = None;
+            run.ready_evidence = None;
             run.stage = WorkflowStage::Checking;
         }
         WorkflowEvent::ChecksPassed {
@@ -348,6 +359,16 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             require_fingerprint(&run, &content_fingerprint, "check evidence")?;
             selected_checks.sort();
             selected_checks.dedup();
+            for check_id in &selected_checks {
+                let check = evidence.get(check_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "passing check batch has no evidence for selected check '{check_id}'"
+                    )
+                })?;
+                if !check.success || check.timed_out {
+                    bail!("passing check batch contains unsuccessful check '{check_id}'");
+                }
+            }
             run.selected_checks = selected_checks;
             run.checks = evidence;
             if run
@@ -357,6 +378,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             {
                 run.stage = WorkflowStage::Ready;
                 run.outcome = Some(WorkflowOutcome::NoChange);
+                run.ready_evidence = None;
             } else {
                 run.stage = WorkflowStage::CodeReview;
             }
@@ -422,6 +444,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.checks = CheckEvidenceLedger::default();
             run.code_review = None;
             run.commit = None;
+            run.ready_evidence = None;
             if matches!(
                 run.stage,
                 WorkflowStage::Checking | WorkflowStage::CodeReview | WorkflowStage::Committing
@@ -432,6 +455,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
         WorkflowEvent::CommitCompleted {
             content_fingerprint,
             commit,
+            repository_remote,
         } => {
             require_stage(run.stage, &[WorkflowStage::Committing], "complete commit")?;
             require_fingerprint(&run, &content_fingerprint, "commit")?;
@@ -446,6 +470,11 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.commit = Some(commit);
             run.stage = WorkflowStage::Ready;
             run.outcome = Some(WorkflowOutcome::Ready);
+            run.ready_evidence_schema = super::READY_EVIDENCE_SCHEMA_VERSION;
+            run.ready_evidence = Some(super::ReadyEvidenceBundle::from_run(
+                &run,
+                repository_remote,
+            )?);
         }
         WorkflowEvent::Blocked { outcome, reason } => {
             if !matches!(
@@ -526,13 +555,17 @@ fn required(field: &str, value: String) -> Result<String> {
     Ok(value)
 }
 
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workflow::{
         AssessmentStatus, CodeAssessment, CodeAssessmentKind, PlanAcceptance, PlanAssessment,
         PlanAssessmentKind, PlanPath, PlanRequirement, PlanStep, PlannedChange,
-        REQUIRED_CODE_ASSESSMENTS, REQUIRED_PLAN_ASSESSMENTS, ReviewSeverity,
+        REQUIRED_CODE_ASSESSMENTS, REQUIRED_PLAN_ASSESSMENTS, ReviewSeverity, WorkflowCheckpoint,
         WorkflowConfigDocument,
     };
 
@@ -681,10 +714,27 @@ mod tests {
             implementation: implementation(&plan),
         })
         .unwrap();
+        let mut check_evidence = CheckEvidenceLedger::default();
+        check_evidence.record(crate::checks::CheckEvidence {
+            check_id: "test".to_string(),
+            command: "cargo test".to_string(),
+            cwd: ".".to_string(),
+            command_fingerprint: "command-sha".to_string(),
+            input_fingerprint: "input-sha".to_string(),
+            dependency_outputs: BTreeMap::new(),
+            output_fingerprint: None,
+            exit_status: 0,
+            success: true,
+            timed_out: false,
+            duration_ms: 1,
+            output: String::new(),
+            executor: "local".to_string(),
+            source: crate::checks::EvidenceSource::Handoff,
+        });
         run.apply(WorkflowEvent::ChecksPassed {
             content_fingerprint: "content-1".to_string(),
-            selected_checks: Vec::new(),
-            evidence: CheckEvidenceLedger::default(),
+            selected_checks: vec!["test".to_string()],
+            evidence: check_evidence,
         })
         .unwrap();
         assert_eq!(run.stage, WorkflowStage::CodeReview);
@@ -699,10 +749,42 @@ mod tests {
                 oid: "abc123".to_string(),
                 subject: "feat: add file".to_string(),
             },
+            repository_remote: Some("git@example.test:team/project.git".to_string()),
         })
         .unwrap();
         assert_eq!(run.stage, WorkflowStage::Ready);
         assert_eq!(run.outcome, Some(WorkflowOutcome::Ready));
+        let evidence = run.ready_evidence.as_ref().unwrap();
+        assert_eq!(evidence.workflow_id, "workflow-1");
+        assert_eq!(evidence.commit_oid, "abc123");
+        assert_eq!(evidence.plan_sha256, plan.sha256);
+        assert_eq!(
+            evidence.review_sha256,
+            run.code_review.as_ref().unwrap().sha256
+        );
+        assert_eq!(evidence.check_evidence_ids, vec!["check:test"]);
+        assert_eq!(
+            evidence.repository_remote.as_deref(),
+            Some("git@example.test:team/project.git")
+        );
+        assert_eq!(
+            super::super::WorkflowSummary::from(&run)
+                .ready_evidence
+                .as_ref(),
+            Some(evidence)
+        );
+        WorkflowCheckpoint::new(run.clone())
+            .unwrap()
+            .validate()
+            .unwrap();
+        let mut tampered = run;
+        tampered.ready_evidence.as_mut().unwrap().review_sha256 = "tampered".to_string();
+        assert!(
+            WorkflowCheckpoint::new(tampered)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

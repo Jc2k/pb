@@ -3,12 +3,14 @@ mod capabilities;
 mod config;
 mod engine;
 mod persistence;
+mod publication;
 
 pub use artifacts::*;
 pub use capabilities::*;
 pub use config::*;
 pub use engine::*;
 pub use persistence::*;
+pub use publication::*;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};

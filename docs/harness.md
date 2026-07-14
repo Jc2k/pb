@@ -116,7 +116,10 @@ appended to `adoptions.jsonl`.
 Finished journals and run-index records include the handoff outcome, both baseline identifiers,
 workspace-config provenance, affected components, planned/executed/reused/failed/skipped checks,
 output fingerprints, executor starts, repair turns, team feedback evidence, no-change
-classification, and commit disposition/hash. Raw process output stays in event JSONL. A valid
+classification, commit disposition/hash, and the publication-ready evidence digest and sanitized
+repository remote. The full evidence bundle remains in the durable workflow checkpoint and binds
+the commit to its accepted plan, fresh code review, and selected check evidence. No publisher or
+network operation is invoked by the harness. Raw process output stays in event JSONL. A valid
 no-change run does not produce the old misleading no-commit observation.
 
 The workspace starts on `main` with one empty baseline commit. The agent receives the same

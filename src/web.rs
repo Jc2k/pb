@@ -977,6 +977,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
                     workflow_id: checkpoint.run.id,
                     outcome: crate::workflow::WorkflowOutcome::Cancelled,
                     checkpoint_sha256: checkpoint.sha256,
+                    ready_evidence_sha256: None,
                     timestamp_ms: Some(now_millis()),
                 },
             );

@@ -122,6 +122,10 @@ struct HarnessRunAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_checkpoint_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    ready_evidence_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_review_sha256: Option<String>,
@@ -325,17 +329,19 @@ impl EventSink for HarnessEventSink {
                 workflow_id,
                 outcome,
                 checkpoint_sha256,
+                ready_evidence_sha256,
                 ..
             } => {
                 state.audit.strict_workflow = true;
                 state.audit.workflow_id = Some(workflow_id.clone());
                 state.audit.workflow_outcome = Some(*outcome);
                 state.audit.workflow_checkpoint_sha256 = Some(checkpoint_sha256.clone());
-                state.audit.strict_workflow_satisfied = matches!(
-                    outcome,
-                    crate::workflow::WorkflowOutcome::Ready
-                        | crate::workflow::WorkflowOutcome::NoChange
-                );
+                state.audit.ready_evidence_sha256 = ready_evidence_sha256.clone();
+                state.audit.strict_workflow_satisfied = match outcome {
+                    crate::workflow::WorkflowOutcome::Ready => ready_evidence_sha256.is_some(),
+                    crate::workflow::WorkflowOutcome::NoChange => true,
+                    _ => false,
+                };
             }
             AgentEvent::SessionSummary {
                 branch,
@@ -476,6 +482,15 @@ impl EventSink for HarnessEventSink {
             state.audit.workflow_id = Some(run.id.clone());
             state.audit.workflow_outcome = run.outcome;
             state.audit.workflow_checkpoint_sha256 = Some(checkpoint.sha256.clone());
+            state.audit.ready_evidence_sha256 = run
+                .ready_evidence
+                .as_ref()
+                .map(crate::workflow::ReadyEvidenceBundle::sha256)
+                .transpose()?;
+            state.audit.repository_remote = run
+                .ready_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.repository_remote.clone());
             state.audit.plan_sha256 = run.plan.as_ref().map(|plan| plan.sha256.clone());
             state.audit.plan_review_sha256 =
                 run.plan_review.as_ref().map(|review| review.sha256.clone());
@@ -1430,7 +1445,7 @@ fn write_journal(
     ));
     journal.push_str("\n## Workflow audit\n\n");
     journal.push_str(&format!(
-        "- Strict workflow enabled/satisfied: `{}` / `{}`\n- Workflow ID: `{}`\n- Outcome: `{}`\n- Stage sequence: `{}`\n- Plan / plan review / code review SHA-256: `{}` / `{}` / `{}`\n- Plan / repair cycles: `{}` / `{}`\n- Model invocations / generated tokens / advisory calls: `{}` / `{}` / `{}`\n- Stage steps: `{}`\n- Rejected workflow actions: `{}`\n- Evidence invalidations: `{}`\n- Checkpoint SHA-256: `{}`\n",
+        "- Strict workflow enabled/satisfied: `{}` / `{}`\n- Workflow ID: `{}`\n- Outcome: `{}`\n- Stage sequence: `{}`\n- Plan / plan review / code review SHA-256: `{}` / `{}` / `{}`\n- Plan / repair cycles: `{}` / `{}`\n- Model invocations / generated tokens / advisory calls: `{}` / `{}` / `{}`\n- Stage steps: `{}`\n- Rejected workflow actions: `{}`\n- Evidence invalidations: `{}`\n- Checkpoint SHA-256: `{}`\n- Ready evidence SHA-256: `{}`\n- Repository remote: `{}`\n",
         audit.strict_workflow,
         audit.strict_workflow_satisfied,
         audit.workflow_id.as_deref().unwrap_or("none"),
@@ -1460,6 +1475,8 @@ fn write_journal(
             .workflow_checkpoint_sha256
             .as_deref()
             .unwrap_or("none"),
+        audit.ready_evidence_sha256.as_deref().unwrap_or("none"),
+        audit.repository_remote.as_deref().unwrap_or("none"),
     ));
     journal.push_str("\n## Handoff audit\n\n");
     journal.push_str(&format!(
@@ -2007,6 +2024,17 @@ mod tests {
         run.content_fingerprint = Some("content-audit".to_string());
         run.stage = crate::workflow::WorkflowStage::Ready;
         run.outcome = Some(crate::workflow::WorkflowOutcome::Ready);
+        run.commit = Some(crate::events::HandoffCommitSummary {
+            oid: "audit-commit".to_string(),
+            subject: "feat: audited delivery".to_string(),
+        });
+        run.ready_evidence = Some(
+            crate::workflow::ReadyEvidenceBundle::from_run(
+                &run,
+                Some("git@example.test:team/project.git".to_string()),
+            )
+            .unwrap(),
+        );
         run.counters.plan_cycles = 1;
         run.counters.repair_cycles = 2;
         run.counters.model_invocations = 9;
@@ -2068,6 +2096,21 @@ mod tests {
         assert_eq!(
             audit.workflow_checkpoint_sha256.as_deref(),
             Some(checkpoint.sha256.as_str())
+        );
+        assert_eq!(
+            audit.ready_evidence_sha256.as_deref(),
+            Some(
+                run.ready_evidence
+                    .as_ref()
+                    .unwrap()
+                    .sha256()
+                    .unwrap()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            audit.repository_remote.as_deref(),
+            Some("git@example.test:team/project.git")
         );
         assert_eq!(audit.plan_sha256.as_deref(), Some(plan.sha256.as_str()));
         assert_eq!(

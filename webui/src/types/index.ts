@@ -69,6 +69,7 @@ export type AgentEvent =
       workflow_id: string;
       outcome: WorkflowOutcome;
       checkpoint_sha256: string;
+      ready_evidence_sha256?: string;
       timestamp_ms?: number;
     }
   | {
@@ -359,6 +360,15 @@ export type WorkflowOutcome =
   | "engine_error"
   | "cancelled";
 
+export interface ReadyEvidenceBundle {
+  workflow_id: string;
+  commit_oid: string;
+  plan_sha256: string;
+  review_sha256: string;
+  check_evidence_ids: string[];
+  repository_remote?: string;
+}
+
 export interface WorkflowSummary {
   id: string;
   source_turn_id: string;
@@ -367,6 +377,7 @@ export interface WorkflowSummary {
   outcome?: WorkflowOutcome;
   policy_sha256: string;
   commit_oid?: string;
+  ready_evidence?: ReadyEvidenceBundle;
 }
 
 export interface SessionItem {

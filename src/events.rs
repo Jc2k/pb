@@ -290,6 +290,8 @@ pub enum AgentEvent {
         workflow_id: String,
         outcome: crate::workflow::WorkflowOutcome,
         checkpoint_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_evidence_sha256: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -739,6 +741,7 @@ impl EventEnvelope {
                 workflow_id,
                 outcome,
                 checkpoint_sha256,
+                ready_evidence_sha256,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
@@ -746,6 +749,7 @@ impl EventEnvelope {
                     workflow_id,
                     outcome,
                     checkpoint_sha256,
+                    ready_evidence_sha256,
                     timestamp_ms: Some(now),
                 },
             },
@@ -1206,6 +1210,27 @@ mod tests {
             envelope.event,
             AgentEvent::Started {
                 focus_root: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_workflow_completion_has_no_publication_evidence_claim() {
+        let json = r#"{
+            "version":"v1",
+            "event":{
+                "type":"workflow_completed",
+                "workflow_id":"legacy-workflow",
+                "outcome":"ready",
+                "checkpoint_sha256":"legacy-checkpoint"
+            }
+        }"#;
+        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::WorkflowCompleted {
+                ready_evidence_sha256: None,
                 ..
             }
         ));

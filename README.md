@@ -40,6 +40,14 @@ after Ready, No change, or a failed/blocked workflow without silently starting a
 Read-only advisory profiles may compact investigation context, but build and scout cannot be
 delegated and no advisory call can advance a workflow stage.
 
+A successful delta-bearing Build exposes a durable evidence bundle that binds the managed commit
+OID to the accepted plan, fresh code review, and selected check evidence. The web UI identifies the
+reviewed commit as ready to publish, and `pb harness agent` records the bundle digest in its audit.
+This is evidence only: pb does not push, open a PR/MR, wait for CI, or process provider feedback as
+part of local delivery. Those operations require the separate approval-bearing publication
+workflow described in
+[`docs/external-publication-workflow-follow-on.md`](docs/external-publication-workflow-follow-on.md).
+
 ## MCP server tools
 
 Global MCP servers live in `~/.config/pb/config.toml` under `[mcp.servers.<name>]`. Repository-specific servers live in `.pb/mcp.toml` with the same table shape; repo entries override global entries with the same name, and `disabled = true` removes a global server for that repo.

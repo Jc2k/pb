@@ -6724,6 +6724,7 @@ fn run_delivery_commit(
     run.apply(crate::workflow::WorkflowEvent::CommitCompleted {
         content_fingerprint: current.fingerprint,
         commit,
+        repository_remote: repository_remote_for_evidence(workspace_root),
     })?;
     sink.emit(AgentEvent::WorkflowStageCompleted {
         workflow_id: run.id.clone(),
@@ -6979,6 +6980,13 @@ fn delivery_terminal_outcome(
         .clone()
         .unwrap_or_else(|| format!("delivery ended with {outcome:?}"));
     let checkpoint = crate::workflow::WorkflowCheckpoint::new(run)?;
+    checkpoint.validate()?;
+    let ready_evidence_sha256 = checkpoint
+        .run
+        .ready_evidence
+        .as_ref()
+        .map(crate::workflow::ReadyEvidenceBundle::sha256)
+        .transpose()?;
     if !matches!(
         outcome,
         crate::workflow::WorkflowOutcome::Ready | crate::workflow::WorkflowOutcome::NoChange
@@ -6994,6 +7002,7 @@ fn delivery_terminal_outcome(
         workflow_id: checkpoint.run.id.clone(),
         outcome,
         checkpoint_sha256: checkpoint.sha256.clone(),
+        ready_evidence_sha256,
         timestamp_ms: Some(now_millis()),
     });
     sink.checkpoint_workflow(&checkpoint)?;
@@ -9509,6 +9518,39 @@ fn git_control_state(workdir: &Path) -> Result<GitControlState> {
         index_sha256: format!("{:x}", Sha256::digest(index)),
         refs_sha256: format!("{:x}", Sha256::digest(refs)),
     })
+}
+
+fn repository_remote_for_evidence(workdir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(workdir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    sanitize_repository_remote(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+fn sanitize_repository_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    if remote.is_empty() {
+        return None;
+    }
+    if let Ok(mut parsed) = url::Url::parse(remote) {
+        if parsed.has_host() {
+            parsed.set_password(None).ok()?;
+            parsed.set_username("").ok()?;
+            return Some(parsed.to_string());
+        }
+    }
+    if remote.contains("://") {
+        return None;
+    }
+    if let Some((user, location)) = remote.split_once('@') {
+        return (user == "git" && location.contains(':')).then(|| remote.to_string());
+    }
+    Some(remote.to_string())
 }
 
 fn git_control_bytes(workdir: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -13358,6 +13400,7 @@ mod tests {
             resumed.checkpoint.run.outcome,
             Some(crate::workflow::WorkflowOutcome::Ready)
         );
+        assert!(resumed.checkpoint.run.ready_evidence.is_some());
         assert!(resumed_generator.generation_tool_names.is_empty());
         assert!(resumed_sink.events.iter().any(|event| matches!(
             event,
@@ -13431,8 +13474,30 @@ mod tests {
             events
         );
         assert!(outcome.step.verified_completed);
-        assert_eq!(outcome.checkpoint.run.selected_checks, vec![check_id]);
+        assert_eq!(
+            outcome.checkpoint.run.selected_checks,
+            vec![check_id.clone()]
+        );
         assert!(outcome.checkpoint.run.commit.is_some());
+        let ready_evidence = outcome.checkpoint.run.ready_evidence.as_ref().unwrap();
+        assert_eq!(
+            ready_evidence.commit_oid,
+            outcome.checkpoint.run.commit.as_ref().unwrap().oid
+        );
+        assert_eq!(
+            ready_evidence.plan_sha256,
+            outcome.checkpoint.run.plan.as_ref().unwrap().sha256
+        );
+        assert_eq!(
+            ready_evidence.review_sha256,
+            outcome.checkpoint.run.code_review.as_ref().unwrap().sha256
+        );
+        assert_eq!(
+            ready_evidence.check_evidence_ids,
+            vec![format!("check:{check_id}")]
+        );
+        assert!(ready_evidence.repository_remote.is_none());
+        let ready_evidence_sha256 = ready_evidence.sha256().unwrap();
         assert!(generator.completions.is_empty());
         assert_eq!(
             git_run(&["log", "-1", "--pretty=%s"], repo.path())
@@ -13472,8 +13537,9 @@ mod tests {
             event,
             AgentEvent::WorkflowCompleted {
                 outcome: crate::workflow::WorkflowOutcome::Ready,
+                ready_evidence_sha256: Some(actual),
                 ..
-            }
+            } if actual == &ready_evidence_sha256
         )));
     }
 
@@ -13510,6 +13576,15 @@ mod tests {
         assert!(!outcome.step.verified_completed);
         assert!(outcome.checkpoint.run.code_review.is_none());
         assert!(outcome.checkpoint.run.commit.is_none());
+        assert!(outcome.checkpoint.run.ready_evidence.is_none());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowCompleted {
+                outcome: crate::workflow::WorkflowOutcome::NoChange,
+                ready_evidence_sha256: None,
+                ..
+            }
+        )));
         assert!(generator.completions.is_empty());
         assert_eq!(
             git_run(&["rev-parse", "HEAD"], repo.path()).unwrap(),
@@ -13921,6 +13996,21 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn publication_remote_metadata_strips_url_credentials_and_rejects_ambiguous_users() {
+        assert_eq!(
+            sanitize_repository_remote("https://token:secret@example.test/team/project.git")
+                .as_deref(),
+            Some("https://example.test/team/project.git")
+        );
+        assert_eq!(
+            sanitize_repository_remote("git@example.test:team/project.git").as_deref(),
+            Some("git@example.test:team/project.git")
+        );
+        assert!(sanitize_repository_remote("secret@example.test:team/project.git").is_none());
+        assert!(sanitize_repository_remote("https://[malformed").is_none());
     }
 
     #[test]

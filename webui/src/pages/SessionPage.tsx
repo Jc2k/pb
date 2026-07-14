@@ -356,7 +356,11 @@ export function SessionPage() {
           <div className="workflow-progress" role="status" aria-live="polite">
             <i className="bi bi-diagram-3"></i>
             <strong>{workflowStageLabel(session.workflow.stage)}</strong>
-            <span>{workflowOutcomeLabel(session.workflow.outcome)}</span>
+            <span>
+              {session.workflow.ready_evidence
+                ? readyEvidenceLabel(session.workflow.ready_evidence.commit_oid)
+                : workflowOutcomeLabel(session.workflow.outcome)}
+            </span>
           </div>
         ) : null}
 
@@ -507,6 +511,10 @@ export function workflowOutcomeLabel(outcome?: string): string {
 
 export function workflowProgressLabel(stage: string, outcome?: string): string {
   return outcome ? workflowOutcomeLabel(outcome) : workflowStageLabel(stage);
+}
+
+export function readyEvidenceLabel(commitOid: string): string {
+  return `Reviewed commit ${commitOid.slice(0, 12)} is ready to publish`;
 }
 
 export function latestPendingDeliveryProposal(

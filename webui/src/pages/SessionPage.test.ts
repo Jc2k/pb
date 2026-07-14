@@ -3,6 +3,7 @@ import { ok } from "node:assert/strict";
 import { equal } from "node:assert/strict";
 import {
   latestPendingDeliveryProposal,
+  readyEvidenceLabel,
   workflowOutcomeLabel,
   workflowProgressLabel,
   workflowStageLabel,
@@ -57,6 +58,10 @@ Deno.test("strict workflow stages and outcomes use compact truthful labels", () 
   equal(workflowOutcomeLabel("commit_blocked"), "Needs help");
   equal(workflowOutcomeLabel("cancelled"), "Cancelled — work preserved");
   equal(workflowProgressLabel("ready", "ready"), "Ready");
+  equal(
+    readyEvidenceLabel("0123456789abcdef"),
+    "Reviewed commit 0123456789ab is ready to publish",
+  );
 });
 
 Deno.test("workflow controls preserve work and restore conversation after terminal outcomes", async () => {
