@@ -227,8 +227,15 @@ pub struct StructuredGenerationRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ChatTool>,
     pub add_generation_prompt: bool,
+    /// Whether the tokenizer chat template should permit emitted reasoning.
+    /// Structured harness recovery turns disable this so their bounded budget
+    /// is available for the required native tool call.
+    pub enable_thinking: bool,
     pub raw_prompt: bool,
     pub trace_candidates: bool,
+    /// Maximum combined prompt and generated-token capacity for this request.
+    /// `None` retains the model/runtime default used by direct FlashMoe tools.
+    pub context_size: Option<usize>,
     pub max_tokens: i32,
     pub temperature: f32,
     pub top_k: i32,
@@ -241,8 +248,10 @@ impl StructuredGenerationRequest {
             messages: vec![ChatMessage::text(ChatRole::User, request.prompt.clone())],
             tools: Vec::new(),
             add_generation_prompt: true,
+            enable_thinking: true,
             raw_prompt: false,
             trace_candidates: false,
+            context_size: None,
             max_tokens: request.max_tokens,
             temperature: request.temperature,
             top_k: request.top_k,
@@ -251,10 +260,18 @@ impl StructuredGenerationRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationFinishReason {
+    EndOfGeneration,
+    MaxTokens,
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerationOutput {
     pub content: String,
     pub tool_calls: Vec<ChatToolCall>,
+    pub finish_reason: GenerationFinishReason,
+    pub prompt_tokens: usize,
     pub generated_tokens: usize,
 }
 

@@ -277,6 +277,36 @@ fn nonzero_usize(value: usize) -> Option<usize> {
     (value > 0).then_some(value)
 }
 
+fn validate_context_capacity(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    context_size: Option<usize>,
+) -> Result<()> {
+    let Some(context_size) = context_size else {
+        return Ok(());
+    };
+    if context_size == 0 {
+        bail!("FlashMoe context size must be at least one token");
+    }
+    let required_tokens = prompt_tokens
+        .checked_add(max_tokens)
+        .context("FlashMoe context token count overflow")?;
+    if required_tokens > context_size {
+        bail!(
+            "FlashMoe context limit exceeded before KV allocation: prompt_tokens={prompt_tokens} max_tokens={max_tokens} required_tokens={required_tokens} ctx_size={context_size}"
+        );
+    }
+    Ok(())
+}
+
+fn generation_finish_reason(generated_tokens: usize, max_tokens: usize) -> GenerationFinishReason {
+    if generated_tokens < max_tokens {
+        GenerationFinishReason::EndOfGeneration
+    } else {
+        GenerationFinishReason::MaxTokens
+    }
+}
+
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
@@ -297,6 +327,30 @@ mod ownership_tests {
             "{error:#}"
         );
         assert!(!error.to_string().contains("Metal executor"), "{error:#}");
+    }
+
+    #[test]
+    fn context_capacity_rejects_oversized_requests_before_runtime_allocation() {
+        validate_context_capacity(3_900, 256, Some(4_096)).unwrap_err();
+        validate_context_capacity(3_840, 256, Some(4_096)).unwrap();
+        validate_context_capacity(usize::MAX, 1, Some(usize::MAX)).unwrap_err();
+        validate_context_capacity(usize::MAX, 1, None).unwrap();
+    }
+
+    #[test]
+    fn generation_finish_reason_distinguishes_eos_from_the_token_cap() {
+        assert_eq!(
+            generation_finish_reason(19, 24),
+            GenerationFinishReason::EndOfGeneration
+        );
+        assert_eq!(
+            generation_finish_reason(24, 24),
+            GenerationFinishReason::MaxTokens
+        );
+        assert_eq!(
+            generation_finish_reason(0, 0),
+            GenerationFinishReason::MaxTokens
+        );
     }
 }
 
@@ -1680,16 +1734,20 @@ impl FlashMoeEngine {
                 _ => bail!("raw Flash-MoE generation requires exactly one text prompt"),
             }
         } else {
-            self.tokenizer.apply_chat_template_to_messages(
-                &request.messages,
-                &request.tools,
-                request.add_generation_prompt,
-            )?
+            self.tokenizer
+                .apply_chat_template_to_messages_with_thinking(
+                    &request.messages,
+                    &request.tools,
+                    request.add_generation_prompt,
+                    request.enable_thinking,
+                )?
         };
         let render_elapsed = render_started.elapsed();
         let encode_started = Instant::now();
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let encode_elapsed = encode_started.elapsed();
+        let max_tokens = request.max_tokens.max(0) as usize;
+        validate_context_capacity(prompt_tokens.len(), max_tokens, request.context_size)?;
         let generation_span = trace_span!(
             target: "flashmoe::perf",
             "generation",
@@ -1718,7 +1776,6 @@ impl FlashMoeEngine {
             request.tools.len(),
             session_id.unwrap_or("<none>")
         );
-        let max_tokens = request.max_tokens.max(0) as usize;
         let mut generation = self.session_cache.begin_generation(
             session_id,
             prompt_tokens,
@@ -1910,10 +1967,16 @@ impl FlashMoeEngine {
 
         let generated = generation.into_generated();
         let decoded = self.tokenizer.decode(&generated)?;
-        let (content, tool_calls) = parse_qwen_tool_call_output(&decoded)?;
+        let finish_reason = generation_finish_reason(generated.len(), max_tokens);
+        let (content, tool_calls) = parse_qwen_tool_call_output_with_incomplete(
+            &decoded,
+            finish_reason == GenerationFinishReason::MaxTokens,
+        )?;
         let output = GenerationOutput {
             content,
             tool_calls,
+            finish_reason,
+            prompt_tokens: prompt_len,
             generated_tokens: generated.len(),
         };
         let total_wall = generation_started.elapsed();
@@ -2229,10 +2292,16 @@ impl FlashMoeEngine {
         }
 
         let decoded = self.tokenizer.decode(&generated)?;
-        let (content, tool_calls) = parse_qwen_tool_call_output(&decoded)?;
+        let finish_reason = generation_finish_reason(generated.len(), max_tokens);
+        let (content, tool_calls) = parse_qwen_tool_call_output_with_incomplete(
+            &decoded,
+            finish_reason == GenerationFinishReason::MaxTokens,
+        )?;
         Ok(GenerationOutput {
             content,
             tool_calls,
+            finish_reason,
+            prompt_tokens: runtime_inputs.prompt_tokens().len(),
             generated_tokens: generated.len(),
         })
     }

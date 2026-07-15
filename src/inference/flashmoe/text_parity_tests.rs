@@ -347,6 +347,29 @@ fn qwen_structured_renderer_formats_single_user_prompt() {
 }
 
 #[test]
+fn qwen_structured_renderer_can_disable_emitted_thinking() {
+    let config = test_tokenizer_config_json_with_template(
+        r#"{% for message in messages %}{{ '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% if enable_thinking is false %}{{ '<think>\n\n</think>\n\n' }}{% endif %}{% endif %}"#,
+    );
+    let tokenizer =
+        QwenTokenizer::from_json_bytes_with_config(test_tokenizer_json(), Some(&config)).unwrap();
+
+    let rendered = tokenizer
+        .apply_chat_template_to_messages_with_thinking(
+            &[ChatMessage::text(ChatRole::User, "hi")],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+
+    assert!(
+        rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        "{rendered:?}"
+    );
+}
+
+#[test]
 fn qwen_structured_renderer_falls_back_to_chatml_without_tokenizer_template() {
     let tokenizer = QwenTokenizer::from_json_bytes(test_tokenizer_json()).unwrap();
     let rendered = tokenizer
@@ -355,6 +378,29 @@ fn qwen_structured_renderer_falls_back_to_chatml_without_tokenizer_template() {
     assert_eq!(
         rendered,
         "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+    );
+}
+
+#[test]
+fn qwen_chatml_fallback_can_disable_emitted_thinking() {
+    let config = br#"{
+        "eos_token":"<|im_end|>",
+        "add_bos_token":false,
+        "split_special_tokens":false
+    }"#;
+    let tokenizer =
+        QwenTokenizer::from_json_bytes_with_config(test_tokenizer_json(), Some(config)).unwrap();
+    let rendered = tokenizer
+        .apply_chat_template_to_messages_with_thinking(
+            &[ChatMessage::text(ChatRole::User, "hi")],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+    assert!(
+        rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        "{rendered:?}"
     );
 }
 
@@ -691,6 +737,18 @@ fn qwen_tool_call_output_parser_extracts_calls_and_content() {
             arguments: serde_json::json!({"city": "London"}),
         }]
     );
+}
+
+#[test]
+fn qwen_tool_call_output_parser_rejects_incomplete_calls_unless_generation_was_capped() {
+    let output = "checking\n<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{";
+
+    let error = parse_qwen_tool_call_output(output).unwrap_err();
+    assert!(error.to_string().contains("missing </tool_call>"));
+
+    let (content, calls) = parse_qwen_tool_call_output_with_incomplete(output, true).unwrap();
+    assert_eq!(content, output);
+    assert!(calls.is_empty());
 }
 
 #[test]

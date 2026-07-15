@@ -3713,6 +3713,8 @@ mod tests {
             output: crate::inference::flashmoe::GenerationOutput {
                 content: "ok".to_string(),
                 tool_calls: Vec::new(),
+                finish_reason: crate::inference::flashmoe::GenerationFinishReason::EndOfGeneration,
+                prompt_tokens: 1,
                 generated_tokens: 1,
             },
             timing: crate::inference::flashmoe::FlashMoeGenerationTiming {
@@ -3792,6 +3794,8 @@ mod tests {
             output: crate::inference::flashmoe::GenerationOutput {
                 content: "ok".to_string(),
                 tool_calls: Vec::new(),
+                finish_reason: crate::inference::flashmoe::GenerationFinishReason::EndOfGeneration,
+                prompt_tokens: 1,
                 generated_tokens: 3,
             },
             timing: crate::inference::flashmoe::FlashMoeGenerationTiming {

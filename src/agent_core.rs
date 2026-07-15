@@ -76,6 +76,7 @@ const MAX_CHECK_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_PATCH_DIAGNOSTIC_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PATCH_DIAGNOSTIC_OUTPUT_CHARS: usize = 3_500;
 const MAX_PATCH_DIAGNOSTIC_LINE_CHARS: usize = 200;
+const MAX_REJECTED_COMPLETION_CHARS: usize = 2_000;
 const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
 const MAX_TOKEN_RETRY_CAP: i32 = 8192;
@@ -3383,6 +3384,7 @@ fn termination_reason_for_runtime_error(error: &anyhow::Error) -> TerminationRea
     } else if message.contains("resource limit")
         || message.contains("resource budget")
         || message.contains("working-set limit")
+        || message.contains("context limit")
         || message.contains("out of memory")
     {
         TerminationReason::ResourceLimit
@@ -3503,6 +3505,7 @@ fn run_agent_steps(
     let mut deterministic_failures = DeterministicFailureTracker::default();
     let mut tool_loop_guard = ToolLoopGuard::default();
     let mut terminal_submission_only = false;
+    let mut suppress_thinking = false;
     let gate_state = RefCell::new(initial_gate_state(
         args,
         workspace_root,
@@ -3605,6 +3608,7 @@ fn run_agent_steps(
             args,
             messages,
             generation_tools,
+            workflow_completion_enable_thinking(suppress_thinking, terminal_submission_only),
             step,
             &mut metrics,
             sink,
@@ -3633,17 +3637,33 @@ fn run_agent_steps(
         };
         let (output, action) = match generated {
             Ok(parsed) => parsed,
-            Err(ParseFailure { output, error }) => {
+            Err(ParseFailure {
+                output,
+                error,
+                finish_reason,
+            }) => {
+                suppress_thinking |= finish_reason == CompletionFinishReason::MaxTokens;
+                let attempted_terminal_submission =
+                    attempted_workflow_terminal_submission(args, &output, finish_reason);
+                terminal_submission_only |= attempted_terminal_submission;
                 consecutive_parse_failures = consecutive_parse_failures.saturating_add(1);
                 let signature = parse_failure_signature(&output, &error.to_string());
                 let repeated_parse_failures =
                     deterministic_failures.record(DeterministicFailureKind::Parse, signature);
 
                 let parse_summary = format!(
-                    "Invalid pb JSON action on step {step}/{max_steps}",
+                    "{} on step {step}/{max_steps}",
+                    if args.workflow_stage.is_some() {
+                        "Invalid structured workflow action"
+                    } else {
+                        "Invalid pb JSON action"
+                    },
                     max_steps = effective_max_steps
                 );
-                let parse_message = format!("{parse_summary}: {error}\n\nModel output:\n{output}",);
+                let parse_message = format!(
+                    "{parse_summary}: {error}\n\n{}",
+                    rejected_completion_diagnostic(&output, finish_reason),
+                );
                 sink.emit(AgentEvent::Error {
                     message: parse_message,
                     summary: parse_summary.clone(),
@@ -3652,12 +3672,32 @@ fn run_agent_steps(
                 });
                 messages.push(ChatMessage::text("assistant", output.clone()));
 
-                let error_msg = parse_failure_feedback(
-                    &error.to_string(),
-                    consecutive_parse_failures,
-                    repeated_parse_failures,
-                    MAX_CONSECUTIVE_PARSE_FAILURES,
-                );
+                let mut error_msg = if let Some(required) =
+                    args.workflow_stage.and_then(workflow_terminal_tool_name)
+                {
+                    workflow_parse_failure_feedback(
+                        &error.to_string(),
+                        consecutive_parse_failures,
+                        repeated_parse_failures,
+                        MAX_CONSECUTIVE_PARSE_FAILURES,
+                        required,
+                    )
+                } else {
+                    parse_failure_feedback(
+                        &error.to_string(),
+                        consecutive_parse_failures,
+                        repeated_parse_failures,
+                        MAX_CONSECUTIVE_PARSE_FAILURES,
+                    )
+                };
+                if attempted_terminal_submission
+                    && let Some(required) =
+                        args.workflow_stage.and_then(workflow_terminal_tool_name)
+                {
+                    error_msg.push_str(&format!(
+                        "\n\nYour capped output already attempted {required}. On the next turn, call only the provided {required} function with the smallest structurally valid, minified argument object. Consolidate related requirements, steps, assessments, and evidence instead of repeating them. Emit no reasoning or prose."
+                    ));
+                }
                 sink.emit(AgentEvent::Correction {
                     message: error_msg.clone(),
                     summary: parse_summary.clone(),
@@ -3671,7 +3711,7 @@ fn run_agent_steps(
                 {
                     sink.emit(AgentEvent::Error {
                         message: format!(
-                            "model produced {consecutive_parse_failures} consecutive unparsable pb JSON actions; stopping to avoid an infinite retry loop. Last parse error: {error}"
+                            "model produced {consecutive_parse_failures} consecutive unparsable structured actions; stopping to avoid an infinite retry loop. Last parse error: {error}"
                         ),
                         summary: "Parse retry limit reached".to_string(),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
@@ -3712,6 +3752,11 @@ fn run_agent_steps(
                         "workflow stage {stage:?} requires its named {required:?} tool; a prose/final response cannot advance delivery\n\n{}",
                         workflow_terminal_submission_guidance(stage),
                     );
+                    feedback.push_str("\n\n");
+                    feedback.push_str(&rejected_completion_diagnostic(
+                        &output,
+                        CompletionFinishReason::EndOfGeneration,
+                    ));
                     if let Some(precondition) = workflow_terminal_precondition_feedback(
                         args,
                         &gate_state.borrow(),
@@ -4374,7 +4419,7 @@ fn run_final_grace(
     };
     grace_args.turn_max_tokens_cap = Some(FINAL_GRACE_MAX_TOKENS);
     sink.workflow_model_invocation_started(nesting_depth)?;
-    let completion = match generator.generate(&grace_args, messages, &[]) {
+    let completion = match generator.generate(&grace_args, messages, &[], true) {
         Ok(completion) => completion,
         Err(error) => {
             let termination_reason = termination_reason_for_runtime_error(&error);
@@ -5173,6 +5218,7 @@ fn render_prompt(messages: &[ChatMessage]) -> String {
 struct ParseFailure {
     output: String,
     error: anyhow::Error,
+    finish_reason: CompletionFinishReason,
 }
 
 fn parse_failure_signature(output: &str, error: &str) -> u64 {
@@ -5194,7 +5240,6 @@ fn parse_failure_feedback(
     repeated_failures: usize,
     max_failures: usize,
 ) -> String {
-    let remaining = max_failures.saturating_sub(consecutive_failures);
     let mut feedback = format!(
         "JSON parsing error after attempt {consecutive_failures}/{max_failures}: {error}\n\n\
          Your previous response was not accepted as a pb action. The next response must be exactly one JSON object, with no markdown fences or prose.\n\
@@ -5206,6 +5251,42 @@ fn parse_failure_feedback(
         tool_calls = r#"{"type":"tool_calls","calls":[{"tool":"read_file","arguments":{"path":"Cargo.toml"}}],"thinking":"why this batch is useful"}"#,
         final_action = r#"{"type":"final","content":"summary of completed work","thinking":"why the task is complete"}"#,
     );
+    append_parse_failure_retry_feedback(
+        &mut feedback,
+        consecutive_failures,
+        repeated_failures,
+        max_failures,
+    );
+    feedback
+}
+
+fn workflow_parse_failure_feedback(
+    error: &str,
+    consecutive_failures: usize,
+    repeated_failures: usize,
+    max_failures: usize,
+    required_terminal_tool: &str,
+) -> String {
+    let mut feedback = format!(
+        "Structured action parsing error after attempt {consecutive_failures}/{max_failures}: {error}\n\n\
+         Your previous response was not accepted as a workflow action. Use only the native function-call interface described by the system tool schema; do not emit a pb compatibility {{\"type\":\"tool_call\",...}} object, markdown, or prose. Call an allowed evidence tool if more inspection is required. Otherwise call the provided {required_terminal_tool} function with its declared argument schema.\n",
+    );
+    append_parse_failure_retry_feedback(
+        &mut feedback,
+        consecutive_failures,
+        repeated_failures,
+        max_failures,
+    );
+    feedback
+}
+
+fn append_parse_failure_retry_feedback(
+    feedback: &mut String,
+    consecutive_failures: usize,
+    repeated_failures: usize,
+    max_failures: usize,
+) {
+    let remaining = max_failures.saturating_sub(consecutive_failures);
     if repeated_failures > 1 {
         feedback.push_str(&format!(
             "\nThis appears to be the same parse failure repeated {repeated_failures} times. Change strategy: use a simpler action, remove any unsupported fields, or provide a final response if blocked.\n",
@@ -5220,7 +5301,6 @@ fn parse_failure_feedback(
             "\n{remaining} parse-retry step(s) remain before pb stops this run to avoid an infinite loop.\n",
         ));
     }
-    feedback
 }
 
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_ACTIONS: usize = 2;
@@ -5361,12 +5441,63 @@ enum CompletionFinishReason {
     MaxTokens,
 }
 
+fn completion_finish_reason_label(finish_reason: CompletionFinishReason) -> &'static str {
+    match finish_reason {
+        CompletionFinishReason::EndOfGeneration => "end_of_generation",
+        CompletionFinishReason::MaxTokens => "max_tokens",
+    }
+}
+
+fn workflow_completion_enable_thinking(
+    suppress_thinking: bool,
+    terminal_submission_only: bool,
+) -> bool {
+    !suppress_thinking && !terminal_submission_only
+}
+
+fn attempted_workflow_terminal_submission(
+    args: &AgentRequest,
+    output: &str,
+    finish_reason: CompletionFinishReason,
+) -> bool {
+    if finish_reason != CompletionFinishReason::MaxTokens {
+        return false;
+    }
+    let Some(required) = args.workflow_stage.and_then(workflow_terminal_tool_name) else {
+        return false;
+    };
+    if output.contains("<tool_call>") && output.contains(required) {
+        return true;
+    }
+    let compact = output
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    compact.contains(&format!("\"tool\":\"{required}\""))
+        || compact.contains(&format!("\"name\":\"{required}\""))
+}
+
+fn rejected_completion_diagnostic(output: &str, finish_reason: CompletionFinishReason) -> String {
+    let output = output.trim();
+    let truncated = output.chars().count() > MAX_REJECTED_COMPLETION_CHARS;
+    let mut excerpt = truncate_chars(output, MAX_REJECTED_COMPLETION_CHARS);
+    if truncated {
+        excerpt.push_str("\n[completion excerpt truncated]");
+    }
+    format!(
+        "Rejected completion diagnostics:\nfinish_reason={}\nmodel_output_excerpt:\n{}",
+        completion_finish_reason_label(finish_reason),
+        excerpt
+    )
+}
+
 trait CompletionEngine {
     fn generate(
         &mut self,
         args: &AgentRequest,
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
     ) -> Result<CompletionOutput>;
 }
 
@@ -6755,25 +6886,25 @@ fn run_delivery_commit(
 }
 
 const PLAN_SUBMISSION_GUIDANCE: &str = r#"
-Required terminal action: return exactly one pb tool-call JSON object shaped as:
-{"type":"tool_call","tool":"submit_plan","arguments":{"id":"plan-1","plan":{"summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"component_ids":["real-component-id"],"paths":[{"path":"repo/relative/path","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["real-check-id"],"description":"..."}],"risks":[],"assumptions":[],"open_questions":[],"resolved_challenge_ids":[]}}}
-Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. Use [] for component_ids or check_ids only when the normalized graph genuinely has none. Do not return this as prose or a final action."#;
+Required terminal action: call the provided submit_plan function exactly once with arguments shaped as:
+{"id":"plan-1","plan":{"summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"component_ids":["real-component-id"],"paths":[{"path":"repo/relative/path","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["real-check-id"],"description":"..."}],"risks":[],"assumptions":[],"open_questions":[],"resolved_challenge_ids":[]}}
+Use the native function-call interface described by the system tool schema; do not wrap these arguments in a pb compatibility {"type":"tool_call",...} object. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. Use [] for component_ids or check_ids only when the normalized graph genuinely has none. Do not return the arguments as prose or a final action."#;
 
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
-Required terminal action: return exactly one pb tool-call JSON object shaped as:
-{"type":"tool_call","tool":"submit_plan_review","arguments":{"id":"plan-review-1","review":{"plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","assessments":[{"kind":"requirement_coverage","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"component_impact","status":"pass","evidence":[],"explanation":"..."},{"kind":"test_strategy","status":"pass","evidence":[],"explanation":"..."},{"kind":"failure_modes","status":"pass","evidence":[],"explanation":"..."},{"kind":"assumptions","status":"pass","evidence":[],"explanation":"..."}],"challenges":[],"verdict":"pass"}}}
-For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]} and set verdict to revise. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, include no p0/p1 challenge. Do not return prose or a final action."#;
+Required terminal action: call the provided submit_plan_review function exactly once with arguments shaped as:
+{"id":"plan-review-1","review":{"plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","assessments":[{"kind":"requirement_coverage","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"component_impact","status":"pass","evidence":[],"explanation":"..."},{"kind":"test_strategy","status":"pass","evidence":[],"explanation":"..."},{"kind":"failure_modes","status":"pass","evidence":[],"explanation":"..."},{"kind":"assumptions","status":"pass","evidence":[],"explanation":"..."}],"challenges":[],"verdict":"pass"}}
+Use the native function-call interface described by the system tool schema; do not wrap these arguments in a pb compatibility {"type":"tool_call",...} object. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]} and set verdict to revise. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, include no p0/p1 challenge. Do not return prose or a final action."#;
 
 const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
-When the plan creates a file, first return a tool call such as {"type":"tool_call","tool":"write_file","arguments":{"path":"repo/relative/path","content":"exact contents"}}. For an existing file, use read_file followed by replace_file, edit_file, or apply_patch. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
-After the last build-stage tool result, copy its exact "Harness current content fingerprint" into content_fingerprint. Required terminal action: return exactly one pb tool-call JSON object shaped as:
-{"type":"tool_call","tool":"submit_implementation","arguments":{"id":"implementation-1","implementation":{"plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","content_fingerprint":"<exact latest harness fingerprint>","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","touched_paths":["repo/relative/path"],"summary":"..."}],"summary":"...","no_change":false,"semantic_commit_subject":"feat: concise semantic subject"}}}
-For a genuine no-change result, use status no_change, empty touched_paths, no_change true, and an empty semantic_commit_subject. Do not return prose or a final action."#;
+When the plan creates a file, first call the provided write_file function with arguments such as {"path":"repo/relative/path","content":"exact contents"}. For an existing file, use read_file followed by replace_file, edit_file, or apply_patch. Use the native function-call interface described by the system tool schema. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
+After the last build-stage tool result, copy its exact "Harness current content fingerprint" into content_fingerprint. Required terminal action: call the provided submit_implementation function exactly once with arguments shaped as:
+{"id":"implementation-1","implementation":{"plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","content_fingerprint":"<exact latest harness fingerprint>","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","touched_paths":["repo/relative/path"],"summary":"..."}],"summary":"...","no_change":false,"semantic_commit_subject":"feat: concise semantic subject"}}
+Do not wrap these arguments in a pb compatibility {"type":"tool_call",...} object. For a genuine no-change result, use status no_change, empty touched_paths, no_change true, and an empty semantic_commit_subject. Do not return prose or a final action."#;
 
 const CODE_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
-Required terminal action: return exactly one pb tool-call JSON object shaped as:
-{"type":"tool_call","tool":"submit_code_review","arguments":{"id":"code-review-1","review":{"content_fingerprint":"<exact checked fingerprint>","assessments":[{"kind":"correctness","status":"pass","evidence":[],"explanation":"..."},{"kind":"requirements","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"tests","status":"pass","evidence":[],"explanation":"..."},{"kind":"regressions","status":"pass","evidence":[],"explanation":"..."},{"kind":"maintainability","status":"pass","evidence":[],"explanation":"..."}],"findings":[],"verdict":"pass"}}}
-For revise, use a finding shaped exactly as {"id":"finding-1","severity":"p1","path":"repo/relative/path","line":1,"requirement_ids":["r1"],"plan_step_ids":["s1"],"evidence":[{"path":"repo/relative/path","line":1,"description":"..."}],"explanation":"..."} and set verdict to revise. The field is severity with lowercase p1, not kind. For pass, include no p0/p1 finding. Do not return prose or a final action."#;
+Required terminal action: call the provided submit_code_review function exactly once with arguments shaped as:
+{"id":"code-review-1","review":{"content_fingerprint":"<exact checked fingerprint>","assessments":[{"kind":"correctness","status":"pass","evidence":[],"explanation":"..."},{"kind":"requirements","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"tests","status":"pass","evidence":[],"explanation":"..."},{"kind":"regressions","status":"pass","evidence":[],"explanation":"..."},{"kind":"maintainability","status":"pass","evidence":[],"explanation":"..."}],"findings":[],"verdict":"pass"}}
+Use the native function-call interface described by the system tool schema; do not wrap these arguments in a pb compatibility {"type":"tool_call",...} object. For revise, use a finding shaped exactly as {"id":"finding-1","severity":"p1","path":"repo/relative/path","line":1,"requirement_ids":["r1"],"plan_step_ids":["s1"],"evidence":[{"path":"repo/relative/path","line":1,"description":"..."}],"explanation":"..."} and set verdict to revise. The field is severity with lowercase p1, not kind. For pass, include no p0/p1 finding. Do not return prose or a final action."#;
 
 fn workflow_terminal_submission_guidance(stage: crate::workflow::WorkflowStage) -> &'static str {
     match stage {
@@ -7076,6 +7207,7 @@ impl CompletionEngine for ScriptedCompletionEngine {
         args: &AgentRequest,
         _messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
+        _enable_thinking: bool,
     ) -> Result<CompletionOutput> {
         self.generation_tool_counts.push(tools.len());
         self.generation_max_tokens.push(args.max_tokens);
@@ -7509,6 +7641,7 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         args: &AgentRequest,
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
+        _enable_thinking: bool,
     ) -> Result<CompletionOutput> {
         let request = LlamaCppChatRequest {
             messages: model_messages_value(messages)?,
@@ -7549,8 +7682,9 @@ impl CompletionEngine for FlashMoeCompletionEngine {
         args: &AgentRequest,
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
     ) -> Result<CompletionOutput> {
-        generate_flashmoe_completion(&mut self.engine, args, messages, tools)
+        generate_flashmoe_completion(&mut self.engine, args, messages, tools, enable_thinking)
     }
 }
 
@@ -7564,8 +7698,9 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
         args: &AgentRequest,
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
     ) -> Result<CompletionOutput> {
-        generate_flashmoe_completion(self.engine, args, messages, tools)
+        generate_flashmoe_completion(self.engine, args, messages, tools, enable_thinking)
     }
 }
 
@@ -7574,6 +7709,7 @@ fn generate_flashmoe_completion(
     args: &AgentRequest,
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
 ) -> Result<CompletionOutput> {
     let energy_start = energy::sample();
     let started = Instant::now();
@@ -7583,8 +7719,10 @@ fn generate_flashmoe_completion(
             messages: to_model_messages(messages)?,
             tools: to_model_tools(tools),
             add_generation_prompt: true,
+            enable_thinking,
             raw_prompt: false,
             trace_candidates: false,
+            context_size: Some(args.ctx_size as usize),
             max_tokens: args.max_tokens,
             temperature: args.temperature,
             top_k: args.top_k,
@@ -7599,8 +7737,15 @@ fn generate_flashmoe_completion(
             .into_iter()
             .map(AgentToolCall::from_model)
             .collect(),
-        finish_reason: CompletionFinishReason::EndOfGeneration,
-        prompt_tokens: messages.iter().map(|message| message.content.len()).sum(),
+        finish_reason: match output.finish_reason {
+            crate::inference::flashmoe::GenerationFinishReason::EndOfGeneration => {
+                CompletionFinishReason::EndOfGeneration
+            }
+            crate::inference::flashmoe::GenerationFinishReason::MaxTokens => {
+                CompletionFinishReason::MaxTokens
+            }
+        },
+        prompt_tokens: output.prompt_tokens,
         generated_tokens: output.generated_tokens,
         duration_ms: duration_millis(started),
         energy,
@@ -7612,6 +7757,7 @@ fn generate_and_parse_action_with_retries(
     args: &AgentRequest,
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
     step: usize,
     metrics: &mut RunMetrics,
     sink: &mut dyn EventSink,
@@ -7626,12 +7772,16 @@ fn generate_and_parse_action_with_retries(
             .borrow_mut()
             .reserve_model_invocation(max_tokens)?;
         sink.workflow_model_invocation_started(nesting_depth)?;
-        let completion = generator.generate(&request, messages, tools)?;
+        // Durable workflow accounting records an invocation before entering the
+        // backend. Mirror that attempted step even when model setup/generation
+        // returns an error, otherwise the stage runner replaces the actionable
+        // engine/resource failure with a usage-divergence error.
+        metrics.llm_invocations = metrics.llm_invocations.saturating_add(1);
+        let completion = generator.generate(&request, messages, tools, enable_thinking)?;
         run_budget
             .borrow_mut()
             .record_generated_tokens(completion.generated_tokens);
         sink.workflow_generated_tokens(completion.generated_tokens)?;
-        metrics.llm_invocations += 1;
         metrics.llm_runtime_ms = metrics
             .llm_runtime_ms
             .saturating_add(completion.duration_ms);
@@ -7683,6 +7833,7 @@ fn generate_and_parse_action_with_retries(
                 let failure = ParseFailure {
                     output: completion.content,
                     error,
+                    finish_reason: completion.finish_reason,
                 };
                 if !ran_out_of_tokens {
                     return Ok(Err(failure));
@@ -12576,6 +12727,15 @@ mod tests {
         assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("submit_plan_review"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Harness current content fingerprint"));
         assert!(CODE_REVIEW_SUBMISSION_GUIDANCE.contains("submit_code_review"));
+        for guidance in [
+            PLAN_SUBMISSION_GUIDANCE,
+            PLAN_REVIEW_SUBMISSION_GUIDANCE,
+            IMPLEMENTATION_SUBMISSION_GUIDANCE,
+            CODE_REVIEW_SUBMISSION_GUIDANCE,
+        ] {
+            assert!(guidance.contains("native function-call interface"));
+            assert!(!guidance.contains("return exactly one pb tool-call JSON object"));
+        }
     }
 
     #[test]
@@ -14284,8 +14444,61 @@ mod tests {
         assert_eq!(outcome.stage.usage.model_invocations, 2);
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::Correction { summary, .. }
-                if summary == "Workflow stage submission required"
+            AgentEvent::Correction {
+                summary, message, ..
+            } if summary == "Workflow stage submission required"
+                && message.contains("finish_reason=end_of_generation")
+                && message.contains("Here is my plan in prose")
+        )));
+    }
+
+    #[test]
+    fn capped_terminal_submission_recovery_exposes_only_the_required_tool() {
+        let repo = init_contract_test_repo();
+        let request = workflow_request(AgentProfile::Plan, repo.path());
+        let contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Planning,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        let completions = vec![
+            ScriptedCompletion {
+                content:
+                    "native call cut off: <tool_call>\n{\"name\":\"submit_plan\",\"arguments\":"
+                        .to_string(),
+                truncated: true,
+            },
+            ScriptedCompletion {
+                content: plan_submission(),
+                truncated: false,
+            },
+        ];
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            completions,
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.stage.submission,
+            Some(crate::workflow::StageSubmission::Plan { .. })
+        ));
+        assert!(outcome.generation_tool_names[0].contains(&"read_file".to_string()));
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["submit_plan".to_string()]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { message, .. }
+                if message.contains("smallest structurally valid, minified argument object")
         )));
     }
 
@@ -15576,6 +15789,7 @@ mod tests {
 
         assert!(!outcome.reached_final);
         assert_eq!(outcome.termination_reason, TerminationReason::EngineError);
+        assert_eq!(outcome.llm_invocations, 1);
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::Error { summary, .. }
@@ -15588,6 +15802,12 @@ mod tests {
         let error = anyhow!("Metal resource budget exceeded working-set limit");
         assert_eq!(
             termination_reason_for_runtime_error(&error),
+            TerminationReason::ResourceLimit
+        );
+        assert_eq!(
+            termination_reason_for_runtime_error(&anyhow!(
+                "FlashMoe context limit exceeded before KV allocation"
+            )),
             TerminationReason::ResourceLimit
         );
         assert_eq!(
@@ -15633,6 +15853,7 @@ mod tests {
             content: "{not-json".to_string(),
             truncated: true,
         };
+        let mut events = Vec::new();
         let outcome = run_scripted_agent_steps(
             &request,
             vec![
@@ -15642,7 +15863,7 @@ mod tests {
                 scripted_final("must not run"),
             ],
             tmp.path(),
-            &mut |_| {},
+            &mut |event| events.push(event),
         )
         .unwrap();
 
@@ -15650,6 +15871,12 @@ mod tests {
         assert_eq!(outcome.termination_reason, TerminationReason::ParseLoop);
         assert_eq!(outcome.llm_invocations, MAX_CONSECUTIVE_PARSE_FAILURES);
         assert_eq!(outcome.remaining_completions, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { message, .. }
+                if message.contains("finish_reason=max_tokens")
+                    && message.contains("{not-json")
+        )));
     }
 
     #[test]
@@ -16038,6 +16265,16 @@ mod tests {
     }
 
     #[test]
+    fn workflow_parse_failure_feedback_uses_only_the_native_tool_dialect() {
+        let feedback = workflow_parse_failure_feedback("cut off", 1, 1, 3, "submit_plan");
+
+        assert!(feedback.contains("native function-call interface"));
+        assert!(feedback.contains("provided submit_plan function"));
+        assert!(feedback.contains("do not emit a pb compatibility"));
+        assert!(!feedback.contains("Valid forms:"));
+    }
+
+    #[test]
     fn correction_chat_message_is_not_rendered_as_tool_result() {
         let message = correction_chat_message(
             "Invalid pb JSON action on step 2/8",
@@ -16184,6 +16421,24 @@ mod tests {
 
         assert_eq!(boosted_max_tokens(&args), 256);
         assert_eq!(next_retry_max_tokens(256, args.turn_max_tokens_cap), 256);
+    }
+
+    #[test]
+    fn workflow_recovery_suppresses_thinking_after_truncation_or_for_terminal_only_turns() {
+        assert!(workflow_completion_enable_thinking(false, false));
+        assert!(!workflow_completion_enable_thinking(true, false));
+        assert!(!workflow_completion_enable_thinking(false, true));
+        assert!(!workflow_completion_enable_thinking(true, true));
+    }
+
+    #[test]
+    fn rejected_completion_diagnostics_are_bounded_and_include_the_finish_reason() {
+        let output = "x".repeat(MAX_REJECTED_COMPLETION_CHARS + 100);
+        let diagnostic = rejected_completion_diagnostic(&output, CompletionFinishReason::MaxTokens);
+
+        assert!(diagnostic.contains("finish_reason=max_tokens"));
+        assert!(diagnostic.contains("[completion excerpt truncated]"));
+        assert!(diagnostic.len() < MAX_REJECTED_COMPLETION_CHARS + 200);
     }
 
     #[test]

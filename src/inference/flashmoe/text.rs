@@ -245,6 +245,7 @@ impl QwenTokenizer {
                 &[ChatMessage::text(ChatRole::User, prompt)],
                 &[],
                 true,
+                true,
             )
             .unwrap_or_else(|_| prompt.to_string());
         }
@@ -266,6 +267,21 @@ impl QwenTokenizer {
         tools: &[ChatTool],
         add_generation_prompt: bool,
     ) -> Result<String> {
+        self.apply_chat_template_to_messages_with_thinking(
+            messages,
+            tools,
+            add_generation_prompt,
+            true,
+        )
+    }
+
+    pub(super) fn apply_chat_template_to_messages_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> Result<String> {
         if messages.len() == 1
             && tools.is_empty()
             && let ChatMessageContent::Text(prompt) = &messages[0].content
@@ -279,10 +295,15 @@ impl QwenTokenizer {
                 messages,
                 tools,
                 add_generation_prompt,
+                enable_thinking,
             );
         }
         if self.im_start.is_some() && self.im_end.is_some() {
-            return render_qwen_chatml(messages, tools, add_generation_prompt);
+            let mut rendered = render_qwen_chatml(messages, tools, add_generation_prompt)?;
+            if add_generation_prompt && !enable_thinking {
+                rendered.push_str("<think>\n\n</think>\n\n");
+            }
+            return Ok(rendered);
         }
         bail!(
             "tokenizer_config.json is missing chat_template and tokenizer.json is missing Qwen chat special tokens; Flash-MoE chat generation requires one of them"
@@ -457,6 +478,7 @@ fn render_tokenizer_chat_template(
     messages: &[ChatMessage],
     tools: &[ChatTool],
     add_generation_prompt: bool,
+    enable_thinking: bool,
 ) -> Result<String> {
     let tools: Vec<Value> = tools.iter().map(qwen_tool_schema_value).collect();
     template.render(
@@ -464,6 +486,7 @@ fn render_tokenizer_chat_template(
         &tools,
         ChatTemplateOptions {
             add_generation_prompt,
+            enable_thinking,
             ..ChatTemplateOptions::default()
         },
     )
@@ -738,7 +761,15 @@ fn render_qwen_tool_call_json(tool_call: &ChatToolCall) -> Result<String> {
     Ok(format!("{{\"name\": {name}, \"arguments\": {arguments}}}"))
 }
 
+#[cfg(test)]
 pub(super) fn parse_qwen_tool_call_output(content: &str) -> Result<(String, Vec<ChatToolCall>)> {
+    parse_qwen_tool_call_output_with_incomplete(content, false)
+}
+
+pub(super) fn parse_qwen_tool_call_output_with_incomplete(
+    content: &str,
+    allow_incomplete: bool,
+) -> Result<(String, Vec<ChatToolCall>)> {
     let mut remaining = content;
     let mut text = String::new();
     let mut tool_calls = Vec::new();
@@ -746,8 +777,11 @@ pub(super) fn parse_qwen_tool_call_output(content: &str) -> Result<(String, Vec<
         text.push_str(&remaining[..start]);
         let block_start = start + "<tool_call>".len();
         let Some(relative_end) = remaining[block_start..].find("</tool_call>") else {
-            text.push_str(&remaining[start..]);
-            return Ok((text.trim().to_string(), tool_calls));
+            if allow_incomplete {
+                text.push_str(&remaining[start..]);
+                return Ok((text.trim().to_string(), tool_calls));
+            }
+            bail!("Qwen tool call is missing </tool_call>");
         };
         let block_end = block_start + relative_end;
         let block = remaining[block_start..block_end].trim();

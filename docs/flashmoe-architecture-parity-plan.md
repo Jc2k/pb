@@ -266,6 +266,20 @@ Baseline reviewed on 2026-07-11:
   ordinary release left one 2,654,208-byte IOAccelerator mapping per expert projection binding; the
   explicit purge removes those mappings at the layer boundary while general phase buffers remain
   reusable.
+  The session cache removes a non-prefix-matching entry before allocating the replacement KV cache.
+  Harness workflow stages intentionally share a logical session id while changing their system
+  prompts, so stale planning/review state cannot remain resident throughout a fresh stage prefill
+  and transiently double CPU KV memory. Structured agent requests also enforce their declared
+  `ctx_size` against prompt plus generation capacity before allocating KV state.
+  Structured FlashMoe output carries the actual rendered prompt-token count and distinguishes EOS
+  from exhaustion of the requested generation cap. Capped, unparsable workflow turns therefore
+  enter bounded retry/recovery instead of being misreported as prose finals. Recovery and
+  terminal-submission-only turns disable emitted Qwen reasoning so their budget remains available
+  for the required native function call. Workflow prompts use that single native tool-call dialect;
+  unterminated Qwen tool-call envelopes are accepted only while a capped completion is being
+  surfaced for retry, and rejected as malformed on a claimed end-of-generation result. If a capped
+  output already attempted the stage's terminal function, the next recovery turn exposes only that
+  function and requests the smallest valid minified artifact instead of regenerating a verbose plan.
   If a new allocation still fails, the pool releases all currently idle buffers and retries once,
   reporting the requested and released byte counts plus Metal's current and recommended working-set
   sizes on failure. The target runtime also owns a `MetalResourceLedger` beside the reusable pool.

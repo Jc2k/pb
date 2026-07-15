@@ -1668,13 +1668,16 @@ impl FlashMoeSessionCache {
         layers: usize,
     ) -> FlashMoeGenerationState {
         let capacity = prompt_tokens.len() + max_tokens;
-        let cached = session_id.and_then(|id| {
-            let prefix_len = self
-                .entries
-                .get(id)
-                .and_then(|state| reusable_session_prefix_len(&state.cpu.tokens, &prompt_tokens))?;
-            self.entries.remove(id).map(|state| (prefix_len, state))
-        });
+        // A harness workflow keeps one logical session id while moving between
+        // fresh stage prompts. Once the new prompt diverges, the cached state
+        // cannot contribute to this generation and must not remain resident
+        // beside the replacement KV cache for the duration of a long prefill.
+        let cached = session_id
+            .and_then(|id| self.entries.remove(id))
+            .and_then(|state| {
+                reusable_session_prefix_len(&state.cpu.tokens, &prompt_tokens)
+                    .map(|prefix_len| (prefix_len, state))
+            });
         let (kv_cache, prefill_start, cached_last_hidden, cached_recurrent) =
             if let Some((prefix_len, state)) = cached {
                 let FlashMoeSessionState {
@@ -1957,6 +1960,22 @@ mod tests {
         );
         assert_eq!(reused.kv_cache.keys_values(1, 0).unwrap().len(), 2);
         assert!(reused.generated.is_empty());
+    }
+
+    #[test]
+    fn generation_lifecycle_evicts_a_nonmatching_session_before_fresh_prefill() {
+        let mut sessions = FlashMoeSessionCache::default();
+        let mut generation = sessions.begin_generation(Some("chat"), vec![10, 20], 1, 1);
+        generation.capture_prompt_cache(vec![9.0, 9.5], recurrent_session_snapshot());
+        sessions.commit_generation(&mut generation).unwrap();
+        assert_eq!(sessions.entries.len(), 1);
+
+        let fresh = sessions.begin_generation(Some("chat"), vec![30, 40], 1, 1);
+
+        assert_eq!(fresh.prefill_start(), 0);
+        assert!(fresh.cached_last_hidden.is_none());
+        assert!(fresh.cached_recurrent.is_none());
+        assert!(sessions.entries.is_empty());
     }
 
     #[test]

@@ -174,8 +174,6 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
             energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
         Ok(flashmoe_output_to_backend(
             output,
-            BackendFinishReason::EndOfGeneration,
-            0,
             duration_millis(started),
             energy,
         ))
@@ -188,8 +186,10 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
             messages: request.messages.clone(),
             tools: request.tools.clone(),
             add_generation_prompt: request.add_generation_prompt,
+            enable_thinking: true,
             raw_prompt: false,
             trace_candidates: false,
+            context_size: request.options.ctx_size.map(|size| size as usize),
             max_tokens: request.options.max_tokens,
             temperature: request.options.temperature,
             top_k: request.options.top_k,
@@ -204,12 +204,6 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
             energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
         Ok(flashmoe_output_to_backend(
             output,
-            BackendFinishReason::EndOfGeneration,
-            request
-                .messages
-                .iter()
-                .map(|message| format!("{:?}", message.content).len())
-                .sum(),
             duration_millis(started),
             energy,
         ))
@@ -231,8 +225,6 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
             energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
         Ok(flashmoe_output_to_backend(
             output,
-            BackendFinishReason::EndOfGeneration,
-            0,
             duration_millis(started),
             energy,
         ))
@@ -241,18 +233,47 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
 
 fn flashmoe_output_to_backend(
     output: crate::inference::flashmoe::GenerationOutput,
-    finish_reason: BackendFinishReason,
-    prompt_tokens: usize,
     duration_ms: u64,
     energy: Option<EnergyEstimate>,
 ) -> BackendOutput {
     BackendOutput {
         content: output.content,
         tool_calls: output.tool_calls,
-        finish_reason,
-        prompt_tokens,
+        finish_reason: match output.finish_reason {
+            crate::inference::flashmoe::GenerationFinishReason::EndOfGeneration => {
+                BackendFinishReason::EndOfGeneration
+            }
+            crate::inference::flashmoe::GenerationFinishReason::MaxTokens => {
+                BackendFinishReason::MaxTokens
+            }
+        },
+        prompt_tokens: output.prompt_tokens,
         generated_tokens: output.generated_tokens,
         duration_ms,
         energy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flashmoe_backend_preserves_finish_reason_and_rendered_prompt_tokens() {
+        let output = flashmoe_output_to_backend(
+            crate::inference::flashmoe::GenerationOutput {
+                content: "partial".to_string(),
+                tool_calls: Vec::new(),
+                finish_reason: crate::inference::flashmoe::GenerationFinishReason::MaxTokens,
+                prompt_tokens: 321,
+                generated_tokens: 24,
+            },
+            10,
+            None,
+        );
+
+        assert_eq!(output.finish_reason, BackendFinishReason::MaxTokens);
+        assert_eq!(output.prompt_tokens, 321);
+        assert_eq!(output.generated_tokens, 24);
     }
 }
