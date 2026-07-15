@@ -227,6 +227,21 @@ export type AgentEvent =
       duration_ms: number;
       prompt_tokens: number;
       generated_tokens: number;
+      context?: {
+        context_capacity: number;
+        reserved_generation_tokens: number;
+        usable_prompt_capacity: number;
+        prompt_utilization_bps: number;
+        message_chars: number;
+        tool_count: number;
+        tool_schema_chars: number;
+        tool_schema_tokens?: number;
+        thinking_enabled?: boolean;
+        compacted_messages: number;
+        omitted_tool_result_chars: number;
+        read_cache_hits: number;
+        closure_checkpoints: number;
+      };
       energy_joules?: number;
       energy_kwh?: number;
       average_power_watts?: number;

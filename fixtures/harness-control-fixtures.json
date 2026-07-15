@@ -368,6 +368,12 @@
       "observe_paths": ["web/dist/bundle.txt"]
     }
   ],
+  "small_model_fixtures": [
+    "false_final_after_inspection",
+    "repeated_blocked_action",
+    "final_at_step_limit",
+    "review_missing_check"
+  ],
   "workflow_fixtures": [
     {"id":"workflow_discussion_no_branch","hypothesis":"Discussion answers without creating or switching a task branch.","assertion":"discussion_no_branch"},
     {"id":"workflow_discussion_no_mutation","hypothesis":"Discussion cannot mutate through built-in tools or a mutating teammate.","assertion":"discussion_no_mutation"},

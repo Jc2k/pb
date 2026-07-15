@@ -40,7 +40,9 @@ use crate::checks::{
 use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
-use crate::events::{AgentEvent, ContractStatus, FinalGraceStatus, TerminationReason};
+use crate::events::{
+    AgentContextUsage, AgentEvent, ContractStatus, FinalGraceStatus, TerminationReason,
+};
 use crate::handoff::{HandoffAttempt, ManagedCommitOutcome, managed_commit, run_handoff};
 use crate::lsp::{self, LspToolRegistry};
 use crate::mcp::{self, McpToolRegistry};
@@ -4454,7 +4456,17 @@ fn run_final_grace(
         .borrow_mut()
         .record_generated_tokens(completion.generated_tokens);
     sink.workflow_generated_tokens(completion.generated_tokens)?;
-    record_completion_metrics(&completion, grace_step, nesting_depth, &mut metrics, sink);
+    record_completion_metrics(
+        &completion,
+        &grace_args,
+        messages,
+        &[],
+        true,
+        grace_step,
+        nesting_depth,
+        &mut metrics,
+        sink,
+    );
 
     let action = if completion.finish_reason == CompletionFinishReason::EndOfGeneration
         && completion.tool_calls.is_empty()
@@ -4678,6 +4690,10 @@ fn run_final_grace(
 
 fn record_completion_metrics(
     completion: &CompletionOutput,
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
     step: usize,
     nesting_depth: usize,
     metrics: &mut RunMetrics,
@@ -4703,12 +4719,65 @@ fn record_completion_metrics(
         duration_ms: completion.duration_ms,
         prompt_tokens: completion.prompt_tokens,
         generated_tokens: completion.generated_tokens,
+        context: Some(completion_context_usage(
+            args,
+            messages,
+            tools,
+            enable_thinking,
+            completion.prompt_tokens,
+        )),
         energy_joules: completion.energy.map(|estimate| estimate.joules),
         energy_kwh: completion.energy.map(|estimate| estimate.kwh),
         average_power_watts: completion.energy.map(|estimate| estimate.average_watts),
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
+}
+
+fn completion_context_usage(
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
+    prompt_tokens: usize,
+) -> AgentContextUsage {
+    let context_capacity = args.ctx_size as usize;
+    let reserved_generation_tokens = usize::try_from(args.max_tokens.max(1)).unwrap_or(usize::MAX);
+    let usable_prompt_capacity = context_capacity.saturating_sub(reserved_generation_tokens);
+    let prompt_utilization_bps = if usable_prompt_capacity == 0 {
+        u32::MAX
+    } else {
+        u32::try_from(
+            prompt_tokens
+                .saturating_mul(10_000)
+                .div_ceil(usable_prompt_capacity),
+        )
+        .unwrap_or(u32::MAX)
+    };
+    AgentContextUsage {
+        context_capacity,
+        reserved_generation_tokens,
+        usable_prompt_capacity,
+        prompt_utilization_bps,
+        message_chars: messages.iter().fold(0usize, |total, message| {
+            let tool_chars = message.tool_calls.iter().fold(0usize, |tool_total, call| {
+                tool_total
+                    .saturating_add(call.tool.chars().count())
+                    .saturating_add(call.arguments.to_string().chars().count())
+            });
+            total
+                .saturating_add(message.content.chars().count())
+                .saturating_add(tool_chars)
+        }),
+        tool_count: tools.len(),
+        tool_schema_chars: model_tools_value(tools).to_string().chars().count(),
+        tool_schema_tokens: None,
+        thinking_enabled: Some(enable_thinking),
+        compacted_messages: 0,
+        omitted_tool_result_chars: 0,
+        read_cache_hits: 0,
+        closure_checkpoints: 0,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7801,6 +7870,13 @@ fn generate_and_parse_action_with_retries(
             duration_ms: completion.duration_ms,
             prompt_tokens: completion.prompt_tokens,
             generated_tokens: completion.generated_tokens,
+            context: Some(completion_context_usage(
+                &request,
+                messages,
+                tools,
+                enable_thinking,
+                completion.prompt_tokens,
+            )),
             energy_joules: completion.energy.map(|estimate| estimate.joules),
             energy_kwh: completion.energy.map(|estimate| estimate.kwh),
             average_power_watts: completion.energy.map(|estimate| estimate.average_watts),

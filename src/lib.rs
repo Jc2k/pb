@@ -356,6 +356,10 @@ pub enum HarnessCommand {
 
 #[derive(Args, Debug, Clone)]
 pub struct HarnessEvalArgs {
+    /// Fixture suite to run
+    #[arg(long, value_enum, default_value_t = HarnessEvalSuite::Control)]
+    pub suite: HarnessEvalSuite,
+
     /// Explicit local model identifier; omit for the deterministic scripted CI suite
     #[arg(long)]
     pub model: Option<String>,
@@ -399,6 +403,15 @@ pub struct HarnessEvalArgs {
     /// RNG seed for reproducible real-model evaluation
     #[arg(long, default_value_t = 0)]
     pub seed: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum HarnessEvalSuite {
+    /// Complete deterministic control corpus
+    #[default]
+    Control,
+    /// Stable subset used for small-model reliability comparisons
+    SmallModel,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -3679,12 +3692,15 @@ mod tests {
             panic!("expected harness eval command");
         };
         assert!(scripted.model.is_none());
+        assert_eq!(scripted.suite, HarnessEvalSuite::Control);
         assert_eq!(scripted.seed, 0);
 
         let model = Cli::try_parse_from([
             "pb",
             "harness",
             "eval",
+            "--suite",
+            "small-model",
             "--model",
             "model.gguf",
             "--jsonl",
@@ -3702,6 +3718,7 @@ mod tests {
             panic!("expected harness eval command");
         };
         assert_eq!(model.model.as_deref(), Some("model.gguf"));
+        assert_eq!(model.suite, HarnessEvalSuite::SmallModel);
         assert_eq!(model.jsonl, Some(PathBuf::from("report.jsonl")));
         assert_eq!(model.max_tokens, 768);
         assert_eq!(model.seed, 42);

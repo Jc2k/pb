@@ -16,7 +16,7 @@ use crate::agent_core::{
     run_scripted_delivery_workflow, run_scripted_stage,
 };
 use crate::events::{AgentEvent, ContractStatus};
-use crate::{HarnessEvalArgs, config::UserConfig};
+use crate::{HarnessEvalArgs, HarnessEvalSuite, config::UserConfig};
 
 const CONTROL_FIXTURES: &str = include_str!("../fixtures/harness-control-fixtures.json");
 const HARNESS_EVAL_SCHEMA_VERSION: u32 = 3;
@@ -26,6 +26,8 @@ const HARNESS_EVAL_SCHEMA_VERSION: u32 = 3;
 pub struct ControlFixtureCorpus {
     pub version: u32,
     pub fixtures: Vec<ControlFixture>,
+    #[serde(default)]
+    pub small_model_fixtures: Vec<String>,
     pub workflow_fixtures: Vec<WorkflowControlFixture>,
 }
 
@@ -125,6 +127,8 @@ pub struct ControlFixtureExpectation {
 pub struct HarnessEvalConfiguration {
     pub mode: String,
     pub backend: String,
+    #[serde(default)]
+    pub suite: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,6 +166,42 @@ pub struct ControlFixtureTurn {
     pub content: String,
     #[serde(default)]
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContextEvalMetrics {
+    #[serde(default)]
+    pub invocations_observed: usize,
+    #[serde(default)]
+    pub context_capacity: usize,
+    #[serde(default)]
+    pub reserved_generation_tokens_high_water: usize,
+    #[serde(default)]
+    pub usable_prompt_capacity_low_water: usize,
+    #[serde(default)]
+    pub prompt_tokens_high_water: usize,
+    #[serde(default)]
+    pub prompt_utilization_bps_high_water: u32,
+    #[serde(default)]
+    pub message_chars_high_water: usize,
+    #[serde(default)]
+    pub tool_count_high_water: usize,
+    #[serde(default)]
+    pub tool_schema_chars_high_water: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_schema_tokens_high_water: Option<usize>,
+    #[serde(default)]
+    pub thinking_enabled_invocations: usize,
+    #[serde(default)]
+    pub thinking_disabled_invocations: usize,
+    #[serde(default)]
+    pub compacted_messages: usize,
+    #[serde(default)]
+    pub omitted_tool_result_chars: usize,
+    #[serde(default)]
+    pub read_cache_hits: usize,
+    #[serde(default)]
+    pub closure_checkpoints: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -247,12 +287,16 @@ pub struct ControlFixtureResult {
     pub prompt_tokens: usize,
     #[serde(default)]
     pub generated_tokens: usize,
+    #[serde(default)]
+    pub context: ContextEvalMetrics,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy_kwh: Option<f64>,
     pub remaining_completions: usize,
     pub observed_paths: BTreeMap<String, bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_quality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_diagnostic: Option<String>,
 }
 
 pub fn control_fixture_corpus() -> Result<ControlFixtureCorpus> {
@@ -301,6 +345,18 @@ fn parse_control_fixture_corpus(contents: &str) -> Result<ControlFixtureCorpus> 
         }
         if !ids.insert(fixture.id.as_str()) {
             bail!("duplicate harness control fixture id '{}'", fixture.id);
+        }
+    }
+    if corpus.small_model_fixtures.is_empty() {
+        bail!("harness small-model fixture group must not be empty");
+    }
+    let mut grouped = HashSet::new();
+    for id in &corpus.small_model_fixtures {
+        if !grouped.insert(id.as_str()) {
+            bail!("duplicate harness small-model fixture id '{id}'");
+        }
+        if !corpus.fixtures.iter().any(|fixture| fixture.id == *id) {
+            bail!("unknown harness small-model fixture id '{id}'");
         }
     }
     Ok(corpus)
@@ -1554,24 +1610,30 @@ pub fn run_control_fixture_corpus() -> Result<Vec<ControlFixtureResult>> {
 
 pub fn run_eval_command(args: HarnessEvalArgs) -> Result<()> {
     let corpus = control_fixture_corpus()?;
+    let fixtures = selected_control_fixtures(&corpus, args.suite);
+    let workflow_fixtures = selected_workflow_fixtures(&corpus, args.suite);
     let (configuration, results) = match args.model.as_deref() {
-        Some(model) => run_real_model_corpus(&args, model, &corpus)?,
+        Some(model) => run_real_model_corpus(&args, model, &fixtures, &workflow_fixtures)?,
         None => (
-            scripted_configuration(),
-            corpus
-                .fixtures
+            scripted_configuration(args.suite),
+            fixtures
                 .iter()
-                .map(run_control_fixture)
+                .map(|fixture| run_control_fixture(fixture))
                 .chain(
-                    corpus
-                        .workflow_fixtures
+                    workflow_fixtures
                         .iter()
-                        .map(run_workflow_control_fixture),
+                        .map(|fixture| run_workflow_control_fixture(fixture)),
                 )
                 .collect::<Result<Vec<_>>>()?,
         ),
     };
-    let records = build_eval_records(&corpus, configuration, results)?;
+    let records = build_selected_eval_records(
+        corpus.version,
+        &fixtures,
+        &workflow_fixtures,
+        configuration,
+        results,
+    )?;
     write_eval_jsonl(args.jsonl.as_deref(), &records)?;
     let table = render_eval_table(&records);
     if args.jsonl.is_some() {
@@ -1590,10 +1652,41 @@ pub fn run_eval_command(args: HarnessEvalArgs) -> Result<()> {
     Ok(())
 }
 
-fn scripted_configuration() -> HarnessEvalConfiguration {
+fn selected_control_fixtures(
+    corpus: &ControlFixtureCorpus,
+    suite: HarnessEvalSuite,
+) -> Vec<&ControlFixture> {
+    match suite {
+        HarnessEvalSuite::Control => corpus.fixtures.iter().collect(),
+        HarnessEvalSuite::SmallModel => corpus
+            .small_model_fixtures
+            .iter()
+            .map(|id| {
+                corpus
+                    .fixtures
+                    .iter()
+                    .find(|fixture| fixture.id == *id)
+                    .expect("validated small-model fixture id must resolve")
+            })
+            .collect(),
+    }
+}
+
+fn selected_workflow_fixtures(
+    corpus: &ControlFixtureCorpus,
+    suite: HarnessEvalSuite,
+) -> Vec<&WorkflowControlFixture> {
+    match suite {
+        HarnessEvalSuite::Control => corpus.workflow_fixtures.iter().collect(),
+        HarnessEvalSuite::SmallModel => Vec::new(),
+    }
+}
+
+fn scripted_configuration(suite: HarnessEvalSuite) -> HarnessEvalConfiguration {
     HarnessEvalConfiguration {
         mode: "scripted".to_string(),
         backend: "scripted".to_string(),
+        suite: harness_eval_suite_name(suite).to_string(),
         model: None,
         model_dir: None,
         max_tokens: 256,
@@ -1614,7 +1707,8 @@ fn scripted_configuration() -> HarnessEvalConfiguration {
 fn run_real_model_corpus(
     args: &HarnessEvalArgs,
     model: &str,
-    corpus: &ControlFixtureCorpus,
+    fixtures: &[&ControlFixture],
+    workflow_fixtures: &[&WorkflowControlFixture],
 ) -> Result<(HarnessEvalConfiguration, Vec<ControlFixtureResult>)> {
     let user_config = UserConfig::load()?;
     let models_root = args
@@ -1630,6 +1724,7 @@ fn run_real_model_corpus(
     let configuration = HarnessEvalConfiguration {
         mode: "local_model".to_string(),
         backend: engine.backend_name().to_string(),
+        suite: harness_eval_suite_name(args.suite).to_string(),
         model: Some(model.to_string()),
         model_dir: Some(
             models_root
@@ -1651,18 +1746,25 @@ fn run_real_model_corpus(
         workspace_config_sha256: None,
         executor_policy: Vec::new(),
     };
-    let mut results = Vec::with_capacity(corpus.fixtures.len() + corpus.workflow_fixtures.len());
-    for fixture in &corpus.fixtures {
+    let mut results = Vec::with_capacity(fixtures.len() + workflow_fixtures.len());
+    for fixture in fixtures {
         results.push(run_real_model_fixture(
             fixture,
             &configuration,
             &mut engine,
         )?);
     }
-    for fixture in &corpus.workflow_fixtures {
+    for fixture in workflow_fixtures {
         results.push(run_workflow_control_fixture(fixture)?);
     }
     Ok((configuration, results))
+}
+
+const fn harness_eval_suite_name(suite: HarnessEvalSuite) -> &'static str {
+    match suite {
+        HarnessEvalSuite::Control => "control",
+        HarnessEvalSuite::SmallModel => "small_model",
+    }
 }
 
 fn ensure_flashmoe_eval_policy(backend: &str, policy_version: u32) -> Result<()> {
@@ -1730,12 +1832,31 @@ fn run_real_model_fixture(
     summarize_fixture(fixture, scratch.path(), outcome.into(), &events, true)
 }
 
+#[cfg(test)]
 fn build_eval_records(
     corpus: &ControlFixtureCorpus,
     configuration: HarnessEvalConfiguration,
     results: Vec<ControlFixtureResult>,
 ) -> Result<Vec<HarnessEvalRecord>> {
-    let expected_count = corpus.fixtures.len() + corpus.workflow_fixtures.len();
+    let fixtures = corpus.fixtures.iter().collect::<Vec<_>>();
+    let workflow_fixtures = corpus.workflow_fixtures.iter().collect::<Vec<_>>();
+    build_selected_eval_records(
+        corpus.version,
+        &fixtures,
+        &workflow_fixtures,
+        configuration,
+        results,
+    )
+}
+
+fn build_selected_eval_records(
+    fixture_version: u32,
+    fixtures: &[&ControlFixture],
+    workflow_fixtures: &[&WorkflowControlFixture],
+    configuration: HarnessEvalConfiguration,
+    results: Vec<ControlFixtureResult>,
+) -> Result<Vec<HarnessEvalRecord>> {
+    let expected_count = fixtures.len() + workflow_fixtures.len();
     if results.len() != expected_count {
         bail!(
             "harness evaluation produced {} results for {} fixtures",
@@ -1745,7 +1866,7 @@ fn build_eval_records(
     }
     let mut records = Vec::with_capacity(expected_count);
     let mut results = results.into_iter();
-    for fixture in &corpus.fixtures {
+    for fixture in fixtures {
         let result = results.next().context("missing legacy fixture result")?;
         if fixture.id != result.id {
             bail!(
@@ -1762,14 +1883,14 @@ fn build_eval_records(
         }
         records.push(HarnessEvalRecord {
             schema_version: HARNESS_EVAL_SCHEMA_VERSION,
-            fixture_version: corpus.version,
+            fixture_version,
             configuration: record_configuration,
             protocol_pass: protocol_failures.is_empty(),
             protocol_failures,
             result,
         });
     }
-    for fixture in &corpus.workflow_fixtures {
+    for fixture in workflow_fixtures {
         let result = results.next().context("missing workflow fixture result")?;
         if fixture.id != result.id {
             bail!(
@@ -1791,7 +1912,7 @@ fn build_eval_records(
         };
         records.push(HarnessEvalRecord {
             schema_version: HARNESS_EVAL_SCHEMA_VERSION,
-            fixture_version: corpus.version,
+            fixture_version,
             configuration: configuration.clone(),
             protocol_pass: protocol_failures.is_empty(),
             protocol_failures,
@@ -1942,7 +2063,7 @@ fn write_eval_jsonl(path: Option<&Path>, records: &[HarnessEvalRecord]) -> Resul
 
 fn render_eval_table(records: &[HarnessEvalRecord]) -> String {
     let mut table = String::from(
-        "fixture                         pass handoff          checks reuse execs commit      valid named false loop turns latency_ms tokens energy_kwh termination\n",
+        "fixture                         pass handoff          checks reuse execs commit      valid named false loop turns ctx_hi schema_ch latency_ms tokens energy_kwh termination\n",
     );
     for record in records {
         let result = &record.result;
@@ -1964,7 +2085,7 @@ fn render_eval_table(records: &[HarnessEvalRecord]) -> String {
             .map(|outcome| format!("{outcome:?}").to_ascii_lowercase())
             .unwrap_or_else(|| "-".to_string());
         table.push_str(&format!(
-            "{:<31} {:<4} {:<16} {:<6} {:<5} {:<5} {:<11} {:<5} {:<5} {:<5} {:<4} {:<5} {:<10} {:<6} {:<10} {}\n",
+            "{:<31} {:<4} {:<16} {:<6} {:<5} {:<5} {:<11} {:<5} {:<5} {:<5} {:<4} {:<5} {:<6.1} {:<9} {:<10} {:<6} {:<10} {}\n",
             result.id,
             if record.protocol_pass { "yes" } else { "no" },
             handoff,
@@ -1977,6 +2098,8 @@ fn render_eval_table(records: &[HarnessEvalRecord]) -> String {
             if result.false_completion { "yes" } else { "no" },
             if result.recovery_loop { "yes" } else { "no" },
             result.llm_invocations,
+            result.context.prompt_utilization_bps_high_water as f64 / 100.0,
+            result.context.tool_schema_chars_high_water,
             result.latency_ms,
             result.prompt_tokens.saturating_add(result.generated_tokens),
             energy,
@@ -2225,6 +2348,7 @@ fn summarize_fixture(
             _ => (latency, prompt, generated, energy),
         },
     );
+    let context = summarize_context_metrics(events);
     let required_check_ids = fixture
         .contract
         .as_ref()
@@ -2252,6 +2376,17 @@ fn summarize_fixture(
         let path = fixture_path(workspace, relative)?;
         observed_paths.insert(relative.clone(), path.exists());
     }
+    let runtime_diagnostic = matches!(
+        outcome.termination_reason.as_str(),
+        "engine_error" | "resource_limit"
+    )
+    .then(|| {
+        events.iter().rev().find_map(|event| match event {
+            AgentEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+    })
+    .flatten();
 
     Ok(ControlFixtureResult {
         id: fixture.id.clone(),
@@ -2311,11 +2446,81 @@ fn summarize_fixture(
         latency_ms,
         prompt_tokens,
         generated_tokens,
+        context,
         energy_kwh: (energy_kwh > 0.0).then_some(energy_kwh),
         remaining_completions: outcome.remaining_completions,
         observed_paths,
         artifact_quality: None,
+        runtime_diagnostic,
     })
+}
+
+fn summarize_context_metrics(events: &[AgentEvent]) -> ContextEvalMetrics {
+    let mut summary = ContextEvalMetrics::default();
+    for event in events {
+        let AgentEvent::LlmInvocation {
+            prompt_tokens,
+            context: Some(context),
+            ..
+        } = event
+        else {
+            continue;
+        };
+        summary.invocations_observed = summary.invocations_observed.saturating_add(1);
+        summary.context_capacity = summary.context_capacity.max(context.context_capacity);
+        summary.reserved_generation_tokens_high_water = summary
+            .reserved_generation_tokens_high_water
+            .max(context.reserved_generation_tokens);
+        summary.usable_prompt_capacity_low_water = if summary.usable_prompt_capacity_low_water == 0
+        {
+            context.usable_prompt_capacity
+        } else {
+            summary
+                .usable_prompt_capacity_low_water
+                .min(context.usable_prompt_capacity)
+        };
+        summary.prompt_tokens_high_water = summary.prompt_tokens_high_water.max(*prompt_tokens);
+        summary.prompt_utilization_bps_high_water = summary
+            .prompt_utilization_bps_high_water
+            .max(context.prompt_utilization_bps);
+        summary.message_chars_high_water =
+            summary.message_chars_high_water.max(context.message_chars);
+        summary.tool_count_high_water = summary.tool_count_high_water.max(context.tool_count);
+        summary.tool_schema_chars_high_water = summary
+            .tool_schema_chars_high_water
+            .max(context.tool_schema_chars);
+        summary.tool_schema_tokens_high_water = match (
+            summary.tool_schema_tokens_high_water,
+            context.tool_schema_tokens,
+        ) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        };
+        match context.thinking_enabled {
+            Some(true) => {
+                summary.thinking_enabled_invocations =
+                    summary.thinking_enabled_invocations.saturating_add(1);
+            }
+            Some(false) => {
+                summary.thinking_disabled_invocations =
+                    summary.thinking_disabled_invocations.saturating_add(1);
+            }
+            None => {}
+        }
+        summary.compacted_messages = summary
+            .compacted_messages
+            .saturating_add(context.compacted_messages);
+        summary.omitted_tool_result_chars = summary
+            .omitted_tool_result_chars
+            .saturating_add(context.omitted_tool_result_chars);
+        summary.read_cache_hits = summary
+            .read_cache_hits
+            .saturating_add(context.read_cache_hits);
+        summary.closure_checkpoints = summary
+            .closure_checkpoints
+            .saturating_add(context.closure_checkpoints);
+    }
+    summary
 }
 
 fn initialize_fixture_workspace(root: &Path, files: &BTreeMap<String, String>) -> Result<()> {
@@ -2453,7 +2658,18 @@ mod tests {
             assert!(!observation.evidence.trim().is_empty());
         }
         assert_eq!(baseline.results.len(), actual.len());
-        assert_eq!(baseline.results, actual);
+        let protocol_actual = actual
+            .iter()
+            .cloned()
+            .map(|mut result| {
+                // The v3 control baseline predates additive S0 context observations. Keep its
+                // protocol comparison stable; the dedicated small-model baseline owns these
+                // measurements.
+                result.context = ContextEvalMetrics::default();
+                result
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(baseline.results, protocol_actual);
         for id in ["irrelevant_review_evidence", "check_then_mutation"] {
             let result = actual.iter().find(|result| result.id == id).unwrap();
             assert!(result.reached_final, "{id} emitted a final action");
@@ -2564,7 +2780,7 @@ mod tests {
         let corpus = control_fixture_corpus().unwrap();
         let mut record = build_eval_records(
             &corpus,
-            scripted_configuration(),
+            scripted_configuration(HarnessEvalSuite::Control),
             run_control_fixture_corpus().unwrap(),
         )
         .unwrap()
@@ -2580,7 +2796,7 @@ mod tests {
         let build = || {
             build_eval_records(
                 &corpus,
-                scripted_configuration(),
+                scripted_configuration(HarnessEvalSuite::Control),
                 run_control_fixture_corpus().unwrap(),
             )
             .unwrap()
@@ -2630,6 +2846,54 @@ mod tests {
     }
 
     #[test]
+    fn small_model_fixture_group_is_stable_and_reports_context_observations() {
+        let corpus = control_fixture_corpus().unwrap();
+        assert_eq!(
+            corpus.small_model_fixtures,
+            vec![
+                "false_final_after_inspection",
+                "repeated_blocked_action",
+                "final_at_step_limit",
+                "review_missing_check",
+            ]
+        );
+        let fixtures = selected_control_fixtures(&corpus, HarnessEvalSuite::SmallModel);
+        let workflows = selected_workflow_fixtures(&corpus, HarnessEvalSuite::SmallModel);
+        assert!(workflows.is_empty());
+        let results = fixtures
+            .iter()
+            .map(|fixture| run_control_fixture(fixture))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let records = build_selected_eval_records(
+            corpus.version,
+            &fixtures,
+            &workflows,
+            scripted_configuration(HarnessEvalSuite::SmallModel),
+            results,
+        )
+        .unwrap();
+        assert_eq!(records.len(), corpus.small_model_fixtures.len());
+        assert!(records.iter().all(|record| record.protocol_pass));
+        for record in records {
+            let context = &record.result.context;
+            assert_eq!(context.invocations_observed, record.result.llm_invocations);
+            assert_eq!(context.context_capacity, 1024);
+            assert_eq!(context.reserved_generation_tokens_high_water, 256);
+            assert_eq!(context.usable_prompt_capacity_low_water, 768);
+            assert_eq!(context.prompt_tokens_high_water, 1);
+            assert_eq!(context.prompt_utilization_bps_high_water, 14);
+            assert!(context.message_chars_high_water > 0);
+            assert!(context.tool_count_high_water > 0);
+            assert!(context.tool_schema_chars_high_water > 0);
+            assert_eq!(context.compacted_messages, 0);
+            assert_eq!(context.omitted_tool_result_chars, 0);
+            assert_eq!(context.read_cache_hits, 0);
+            assert_eq!(context.closure_checkpoints, 0);
+        }
+    }
+
+    #[test]
     fn protocol_scoring_ignores_artifact_quality_but_detects_control_regressions() {
         let corpus = control_fixture_corpus().unwrap();
         let fixture = &corpus.fixtures[0];
@@ -2651,7 +2915,7 @@ mod tests {
         let corpus = control_fixture_corpus().unwrap();
         let records = build_eval_records(
             &corpus,
-            scripted_configuration(),
+            scripted_configuration(HarnessEvalSuite::Control),
             run_control_fixture_corpus().unwrap(),
         )
         .unwrap();
@@ -2667,6 +2931,8 @@ mod tests {
             "false",
             "loop",
             "turns",
+            "ctx_hi",
+            "schema_ch",
             "latency_ms",
             "tokens",
             "energy_kwh",
@@ -2694,6 +2960,7 @@ mod tests {
         let configuration = HarnessEvalConfiguration {
             mode: "local_model".to_string(),
             backend: "llama_cpp".to_string(),
+            suite: "small_model".to_string(),
             model: Some("model.gguf".to_string()),
             model_dir: Some("/models".to_string()),
             max_tokens: 512,
@@ -2712,6 +2979,7 @@ mod tests {
         for field in [
             "mode",
             "backend",
+            "suite",
             "model",
             "model_dir",
             "max_tokens",

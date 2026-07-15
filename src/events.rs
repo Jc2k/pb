@@ -312,6 +312,35 @@ impl SessionMetricsSnapshot {
     }
 }
 
+/// Observed prompt/context facts for one model invocation.
+///
+/// S0 records post-generation measurements without changing prompt construction. Later
+/// small-model reliability milestones fill the compaction/cache/closure counters from their
+/// deterministic control paths. Keeping this nested and optional on `LlmInvocation` preserves
+/// compatibility with stored v1 events.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextUsage {
+    pub context_capacity: usize,
+    pub reserved_generation_tokens: usize,
+    pub usable_prompt_capacity: usize,
+    pub prompt_utilization_bps: u32,
+    pub message_chars: usize,
+    pub tool_count: usize,
+    pub tool_schema_chars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_schema_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_enabled: Option<bool>,
+    #[serde(default)]
+    pub compacted_messages: usize,
+    #[serde(default)]
+    pub omitted_tool_result_chars: usize,
+    #[serde(default)]
+    pub read_cache_hits: usize,
+    #[serde(default)]
+    pub closure_checkpoints: usize,
+}
+
 fn add_optional(target: &mut Option<f64>, value: Option<f64>) {
     if let Some(value) = value {
         *target = Some(target.unwrap_or(0.0) + value);
@@ -614,6 +643,8 @@ pub enum AgentEvent {
         duration_ms: u64,
         prompt_tokens: usize,
         generated_tokens: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<AgentContextUsage>,
         #[serde(skip_serializing_if = "Option::is_none")]
         energy_joules: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1214,6 +1245,7 @@ impl EventEnvelope {
                 duration_ms,
                 prompt_tokens,
                 generated_tokens,
+                context,
                 energy_joules,
                 energy_kwh,
                 average_power_watts,
@@ -1226,6 +1258,7 @@ impl EventEnvelope {
                     duration_ms,
                     prompt_tokens,
                     generated_tokens,
+                    context,
                     energy_joules,
                     energy_kwh,
                     average_power_watts,
@@ -1504,6 +1537,65 @@ mod tests {
         assert_eq!(value["event"]["verified_completed"], false);
         assert_eq!(value["event"]["termination_reason"], "final");
         assert_eq!(value["event"]["handoff_outcome"], "ready");
+    }
+
+    #[test]
+    fn legacy_llm_invocation_without_context_usage_remains_readable() {
+        let json = r#"{
+            "version":"v1",
+            "event":{
+                "type":"llm_invocation",
+                "step":1,
+                "duration_ms":10,
+                "prompt_tokens":20,
+                "generated_tokens":3
+            }
+        }"#;
+        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::LlmInvocation { context: None, .. }
+        ));
+    }
+
+    #[test]
+    fn llm_invocation_context_usage_round_trips() {
+        let context = AgentContextUsage {
+            context_capacity: 8192,
+            reserved_generation_tokens: 256,
+            usable_prompt_capacity: 7936,
+            prompt_utilization_bps: 6250,
+            message_chars: 4096,
+            tool_count: 3,
+            tool_schema_chars: 900,
+            tool_schema_tokens: Some(225),
+            thinking_enabled: Some(true),
+            compacted_messages: 2,
+            omitted_tool_result_chars: 5000,
+            read_cache_hits: 1,
+            closure_checkpoints: 1,
+        };
+        let envelope = EventEnvelope::new(AgentEvent::LlmInvocation {
+            step: 2,
+            duration_ms: 10,
+            prompt_tokens: 4960,
+            generated_tokens: 3,
+            context: Some(context.clone()),
+            energy_joules: None,
+            energy_kwh: None,
+            average_power_watts: None,
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        let json = serde_json::to_string(&envelope).unwrap();
+        let restored: EventEnvelope = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            restored.event,
+            AgentEvent::LlmInvocation {
+                context: Some(restored),
+                ..
+            } if restored == context
+        ));
     }
 
     #[test]

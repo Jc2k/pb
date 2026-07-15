@@ -179,6 +179,14 @@ pb harness eval --model model.gguf --model-dir /path/to/models \
   --jsonl model-eval.jsonl
 ```
 
+Use `--suite small-model` to run the stable subset used by
+[the small-model reliability plan](small-model-agent-reliability-plan.md) and its checked
+[S0 baseline](benchmarks/small-model-agent-baseline.md). Each model-invocation record includes an
+optional backward-compatible context snapshot covering capacity, generation reserve, prompt
+high-water utilization, message/schema size, thinking mode, and the compaction/cache/closure
+counters introduced by later milestones. Runtime setup failures are reported separately from
+artifact quality so a backend experiment error is not scored as model reasoning.
+
 Every real-model record repeats the backend, model, resolved model directory, token/context/thread/
 GPU settings, sampling values, seed, FlashMoe resource-policy version, normalized workspace-config
 hash, and executor policy. One loaded engine is reused across the corpus. FlashMoe evaluation
