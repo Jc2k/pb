@@ -14,6 +14,7 @@ import {
   DrawerPanel,
   InitialUserMessage,
   MessageBubble,
+  SessionActivity,
   TodoDrawer,
   ToolDrawerSummary,
   ToolGroupBubble,
@@ -182,7 +183,7 @@ export function SessionPage() {
 
   if (!session) {
     return (
-      <div className="app-shell">
+      <div className="app-shell session-shell">
         <Aside />
         <section className="session-panel">
           <header className="session-header">
@@ -211,7 +212,7 @@ export function SessionPage() {
   }
 
   return (
-    <div className="app-shell">
+    <div className="app-shell session-shell">
       <Aside />
 
       <section className="session-panel">
@@ -223,14 +224,11 @@ export function SessionPage() {
           >
             <i className="bi bi-chevron-left fs-4"></i>
           </button>
-          <div className="session-icon d-none d-sm-grid">
-            <i className="bi bi-terminal"></i>
-          </div>
-          <div className="min-w-0 flex-grow-1">
+          <div className="session-header-copy min-w-0 flex-grow-1">
             <h1>{sessionTitle(session)}</h1>
             <div className="status-line">
               {isRunning && <span className="live-dot" />}
-              <span>
+              <span className="session-state-label">
                 {session.strict_workflow && session.workflow
                   ? workflowProgressLabel(session.workflow.stage, session.workflow.outcome)
                   : session.status === "running"
@@ -260,12 +258,11 @@ export function SessionPage() {
           <div className="share-action">
             <button
               type="button"
-              className="btn btn-light rounded-pill d-inline-flex align-items-center"
+              className="btn session-header-action"
               onClick={shareSession}
               aria-label="Share this session"
             >
-              <i className="bi bi-box-arrow-up me-sm-2"></i>
-              <span className="d-none d-sm-inline">Share</span>
+              <i className="bi bi-box-arrow-up"></i>
             </button>
             {shareMessage && (
               <span className="share-status small text-body-secondary" role="status">
@@ -274,11 +271,12 @@ export function SessionPage() {
             )}
           </div>
           <button
-            className="btn btn-danger rounded-pill"
+            className="btn session-header-action stop-action"
             onClick={() => void cancelSession()}
             disabled={!isRunning && session.status !== "paused"}
+            aria-label="Stop session"
           >
-            <i className="bi bi-stop-fill me-1"></i>Stop
+            <i className="bi bi-stop-fill"></i>
           </button>
         </header>
 
@@ -316,6 +314,13 @@ export function SessionPage() {
           </main>
 
           <aside className="tool-drawer d-none d-xl-block">
+            <div className="tool-drawer-heading">
+              <div>
+                <span>Workspace</span>
+                <h2>Session details</h2>
+              </div>
+              <i className="bi bi-layout-sidebar-inset-reverse" aria-hidden="true"></i>
+            </div>
             <DrawerPanel
               title="Tools"
               icon="bi bi-tools"
@@ -350,12 +355,19 @@ export function SessionPage() {
             </DrawerPanel>
 
             <DrawerPanel
-              title="Tasks"
+              title="Plan"
               icon="bi bi-check2-square"
               count={buildTodoTasks(events).length}
-              defaultOpen={false}
             >
               <TodoDrawer tasks={buildTodoTasks(events)} />
+            </DrawerPanel>
+
+            <DrawerPanel
+              title="Activity"
+              icon="bi bi-clock-history"
+              count={events.length}
+            >
+              <SessionActivity events={events} />
             </DrawerPanel>
           </aside>
         </div>

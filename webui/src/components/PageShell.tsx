@@ -29,7 +29,7 @@ export function PageShell(
             <PrimaryNavigationLinks className="tablet-nav-link" />
           </nav>
         </header>
-        <main className={`content-wrap ${contentClassName}`.trim()}>
+        <main className={`content-wrap workspace-wrap ${contentClassName}`.trim()}>
           {children}
         </main>
         <nav

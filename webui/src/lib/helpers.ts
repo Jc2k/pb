@@ -39,11 +39,12 @@ export function getAvatarForProfile(profile: string): string {
     "plan",
     "ask",
     "research",
+    "monitor",
   ];
   if (validProfiles.includes(profile)) {
-    return `/avatar-${profile}.png`;
+    return `/static/images/avatar-${profile}.png`;
   }
-  return "/avatar.png";
+  return "/static/images/avatar.png";
 }
 
 /* ─── helpers ────────────────────────────────────────────────── */

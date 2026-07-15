@@ -389,7 +389,7 @@ function AssistantMessageRow({
 }: AssistantMessageRowProps) {
   return (
     <article
-      className={`bot message-row assistant-message${
+      className={`bot message-row assistant-message assistant-transcript${
         compact ? " compact" : ""
       }`}
       style={{ marginLeft: `${nestingDepth}rem` }}
@@ -463,7 +463,7 @@ function TeamMessageBubble({
   return (
     <article className={`bot message-row assistant-message team-message tone-${event.tone}`}>
       <div className="bot-avatar team-avatar">
-        <img src="/avatar-monitor.png" alt="Trinity Walker" />
+        <img src={getAvatarForProfile("monitor")} alt="Trinity Walker" />
       </div>
       <div className="message-container">
         <div className="author-line">
@@ -548,8 +548,8 @@ export function MessageBubble({
         <article className="user message-row user-message">
           <div className="message-container">
             <div className="author-line">
-              <strong>{profileName(e.profile)}</strong>
-              <span>{profileJobTitle(e.profile)}</span>
+              <strong>You</strong>
+              <span>Session request</span>
               <time>{formatEventTime(e.timestamp_ms)}</time>
             </div>
             <div className="bubble user-bubble">
@@ -600,28 +600,16 @@ export function MessageBubble({
 
     case "user_question":
       return (
-        <article className="user message-row user-message">
-          <div className="message-container">
-            <div className="author-line">
-              <strong>{profileName(e.profile)}</strong>
-              <span>{profileJobTitle(e.profile)}</span>
-              <time>{formatEventTime(e.timestamp_ms)}</time>
-            </div>
-            <div className="bubble user-bubble">
-              <p>{e.question}</p>
-              {e.choices?.length ? (
-                <div className="d-flex gap-2 flex-wrap mt-2">
-                  {e.choices.map((choice) => (
-                    <span className="badge text-bg-warning" key={choice}>{choice}</span>
-                  ))}
-                </div>
-              ) : null}
-            </div>
+        <AssistantMessageRow profile={e.profile} timestampMs={e.timestamp_ms}>
+          <div className="assistant-question">
+            <p>{e.question}</p>
+            {e.choices?.length ? (
+              <div className="question-choices">
+                {e.choices.map((choice) => <span key={choice}>{choice}</span>)}
+              </div>
+            ) : null}
           </div>
-          <div className="user-avatar">
-            <img src="/api/current-user.png" alt="Current user" />
-          </div>
-        </article>
+        </AssistantMessageRow>
       );
 
     case "workflow_challenge_raised":
@@ -658,13 +646,16 @@ export function MessageBubble({
 
     case "user_answer":
       return (
-        <article className="bot message-row assistant-message compact">
-          <div className="bot-avatar">
-            <i className="bi bi-stars"></i>
-          </div>
-          <div className="bubble thought-bubble">
-            <p>Your answer:</p>
-            <pre className="mb-0 small">{e.answer}</pre>
+        <article className="user message-row user-message compact">
+          <div className="message-container">
+            <div className="author-line">
+              <strong>You</strong>
+              <span>Answer</span>
+              <time>{formatEventTime(e.timestamp_ms)}</time>
+            </div>
+            <div className="bubble user-bubble">
+              <p>{e.answer}</p>
+            </div>
           </div>
         </article>
       );
@@ -710,7 +701,7 @@ export function MessageBubble({
       const dd = e.nesting_depth || 0;
       return (
         <article
-          className="message-row assistant-message"
+          className="message-row assistant-message diff-message"
           style={{ marginLeft: `${dd}rem` }}
         >
           <div className="bot-avatar">
@@ -721,11 +712,11 @@ export function MessageBubble({
             <p>
               <code>{e.path}</code> changed
             </p>
-            <details open className="card border-info mb-0">
-              <summary className="card-header py-1 small d-flex align-items-center gap-2">
-                <span className="badge bg-info text-dark">diff view</span>
+            <details open className="transcript-diff">
+              <summary className="transcript-diff-header">
+                <span>Diff</span>
               </summary>
-              <div className="card-body p-0 overflow-auto">
+              <div className="transcript-diff-body">
                 <DiffView diff={e.diff} />
               </div>
             </details>
@@ -848,11 +839,11 @@ export function MessageBubble({
               </>
             ) : null}
             {e.diff?.trim() ? (
-              <details className="card border-info mb-0">
-                <summary className="card-header py-1 small d-flex align-items-center gap-2">
-                  <span className="badge bg-info text-dark">diff from main</span>
+              <details className="transcript-diff">
+                <summary className="transcript-diff-header">
+                  <span>Diff from main</span>
                 </summary>
-                <div className="card-body p-0 overflow-auto">
+                <div className="transcript-diff-body">
                   <DiffView diff={e.diff} />
                 </div>
               </details>
@@ -869,6 +860,56 @@ export function MessageBubble({
   }
 }
 
+
+function activityLabel(envelope: EventEnvelope): string | undefined {
+  const event = envelope.event;
+  switch (event.type) {
+    case "started": return "Session started";
+    case "tool_call":
+      return `${TOOL_FRIENDLY_NAMES[event.tool] || event.tool} started`;
+    case "tool_result": return "Tool result received";
+    case "user_question": return "Waiting for an answer";
+    case "user_answer": return "Answer received";
+    case "final": return "Response completed";
+    case "session_summary": return "Session completed";
+    case "error": return "Error reported";
+    default: return undefined;
+  }
+}
+
+export function SessionActivity({ events }: { events: EventEnvelope[] }) {
+  const items = events
+    .map((envelope) => ({
+      label: activityLabel(envelope),
+      timestampMs: "timestamp_ms" in envelope.event
+        ? envelope.event.timestamp_ms
+        : undefined,
+    }))
+    .filter(
+      (item): item is { label: string; timestampMs: number | undefined } =>
+        Boolean(item.label),
+    )
+    .slice(-8);
+
+  if (items.length === 0) {
+    return (
+      <p className="drawer-empty-copy">
+        Activity will appear as the session progresses.
+      </p>
+    );
+  }
+
+  return (
+    <ol className="session-activity-list">
+      {items.map((item, index) => (
+        <li key={`${item.label}-${index}`}>
+          <span>{item.label}</span>
+          {item.timestampMs ? <time>{formatEventTime(item.timestampMs)}</time> : null}
+        </li>
+      ))}
+    </ol>
+  );
+}
 
 export function SessionCard({
   session,

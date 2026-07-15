@@ -58,7 +58,7 @@ export function ProjectsPage() {
   useProjectFinishNotifications(sessions, projects);
 
   return (
-    <PageShell>
+    <PageShell contentClassName="projects-index-wrap">
       <section className="hero-section">
         <h1>Projects</h1>
         <p className="text-secondary mb-3">

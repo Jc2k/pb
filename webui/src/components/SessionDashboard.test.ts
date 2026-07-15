@@ -1,4 +1,4 @@
-import { equal } from "node:assert/strict";
+import { equal, ok } from "node:assert/strict";
 import {
   formatRuntime,
   formatUsageValue,
@@ -42,4 +42,17 @@ Deno.test("usage formatters match dashboard display units", () => {
   equal(formatUsageValue(1_240_000), "1.2m");
   equal(formatUsageValue(1284), "1k");
   equal(formatRuntime(8_040_000), "2h 14m");
+});
+
+Deno.test("home workspace keeps primary actions focused across breakpoints", async () => {
+  const page = await Deno.readTextFile("webui/src/pages/HomePage.tsx");
+  const css = await Deno.readTextFile("webui/src/app.css");
+
+  ok(page.includes("counts.all > 0"));
+  ok(page.includes('className="quick-action-row"'));
+  ok(page.includes('className="quick-action-row secondary-quick-actions"'));
+  ok(page.includes('placeholder="Describe the work…"'));
+  ok(css.includes(".home-composer-card .secondary-quick-actions"));
+  ok(css.includes(".sidebar .nav-pills .nav-link.active"));
+  ok(css.includes("background: rgba(0, 122, 255, 0.09);"));
 });

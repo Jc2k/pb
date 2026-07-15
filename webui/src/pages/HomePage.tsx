@@ -99,46 +99,51 @@ export function HomePage() {
                 value={task}
                 onChange={(e) => setTask(e.target.value)}
                 rows={4}
-                placeholder="Describe the work..."
+                placeholder="Describe the work…"
+                aria-label="Describe the work"
               />
               <ImageAttachments images={images} setImages={setImages} />
               <div className="composer-actions">
                 <div className="quick-actions">
-                  <IntentControl intent={intent} onChange={setIntent} disabled={isSubmitting} />
-                  <button
-                    className="btn btn-light"
-                    type="button"
-                    onClick={() => {
-                      setIntent("discuss");
-                      setTask("Research ");
-                    }}
-                  >
-                    <i className="bi bi-search"></i> Research
-                  </button>
-                  <button
-                    className="btn btn-light"
-                    type="button"
-                    onClick={() => {
-                      setIntent("deliver");
-                      setTask("Create a new repo called ");
-                    }}
-                  >
-                    <i className="bi bi-chat-square-plus"></i> Create repo
-                  </button>
-                  <button
-                    className="btn btn-light"
-                    type="button"
-                    onClick={() => {
-                      setIntent("deliver");
-                      setTask("Fix error ");
-                    }}
-                  >
-                    <i className="bi bi-tools"></i> Fix error
-                  </button>
-                  <button className="btn btn-light" type="button">
-                    <span>More</span>
-                    <i className="bi bi-chevron-down"></i>
-                  </button>
+                  <div className="quick-action-row">
+                    <IntentControl intent={intent} onChange={setIntent} disabled={isSubmitting} />
+                    <button
+                      className="btn btn-light"
+                      type="button"
+                      onClick={() => {
+                        setIntent("discuss");
+                        setTask("Research ");
+                      }}
+                    >
+                      <i className="bi bi-search"></i> Research
+                    </button>
+                  </div>
+                  <div className="quick-action-row secondary-quick-actions">
+                    <button
+                      className="btn btn-light optional-action"
+                      type="button"
+                      onClick={() => {
+                        setIntent("deliver");
+                        setTask("Create a new repo called ");
+                      }}
+                    >
+                      <i className="bi bi-chat-square-plus"></i> Create repo
+                    </button>
+                    <button
+                      className="btn btn-light optional-action"
+                      type="button"
+                      onClick={() => {
+                        setIntent("deliver");
+                        setTask("Fix error ");
+                      }}
+                    >
+                      <i className="bi bi-tools"></i> Fix error
+                    </button>
+                    <button className="btn btn-light optional-action" type="button">
+                      <span>More</span>
+                      <i className="bi bi-chevron-down"></i>
+                    </button>
+                  </div>
                 </div>
                 <div className="chat-submit-actions">
                   <AttachmentButton setImages={setImages} images={images} />
@@ -156,12 +161,17 @@ export function HomePage() {
           </form>
 
           <section className="sessions-section project-sessions-panel">
-            <h2>Recent sessions</h2>
-            <SessionFilters
-              filter={filter}
-              counts={counts}
-              onFilterChange={setFilter}
-            />
+            <div className="recent-sessions-heading">
+              <h2>Recent sessions</h2>
+              <span>{counts.all} total</span>
+            </div>
+            {counts.all > 0 ? (
+              <SessionFilters
+                filter={filter}
+                counts={counts}
+                onFilterChange={setFilter}
+              />
+            ) : null}
             <SessionRows
               sessions={visibleSessions}
               emptyText="No sessions match this filter."
@@ -175,7 +185,7 @@ export function HomePage() {
           <section className="card soft-card aside-card">
             <div className="card-body">
               <div className="card-title-row">
-                <h2>Home usage</h2>
+                <h2>Usage</h2>
                 <i className="bi bi-info-circle"></i>
               </div>
               <div className="info-list usage-list">
@@ -189,7 +199,7 @@ export function HomePage() {
           </section>
           <section className="card soft-card aside-card">
             <div className="card-body">
-              <h2>Home overview</h2>
+              <h2>Overview</h2>
               <div className="info-list key-value-list">
                 <div>
                   <span>Current session</span>

@@ -81,9 +81,10 @@ Deno.test("workflow controls preserve work and restore conversation after termin
   ok(page.includes('session.workflow?.stage === "blocked"'));
   ok(page.includes("resume from the preserved stage"));
   ok(page.includes('setIntent("discuss")'));
+  ok(page.includes(": !isRunning &&"));
   ok(
     page.includes(
-      '!isRunning && (session.status === "completed" || session.status === "failed")',
+      '(session.status === "completed" || session.status === "failed")',
     ),
   );
   ok(page.includes("<IntentControl intent={intent} onChange={setIntent} />"));
@@ -128,6 +129,12 @@ Deno.test("final assistant messages use profile avatars", async () => {
       "<img src={getAvatarForProfile(profile)} alt={profileName(profile)} />",
     ),
   );
+  ok(
+    component.includes(
+      '<img src={getAvatarForProfile("monitor")} alt="Trinity Walker" />',
+    ),
+  );
+  ok(!component.includes("/avatar-monitor.png"));
   ok(component.includes('case "final"'));
   ok(!component.includes('case "final":\n      const ffd'));
 });
@@ -178,13 +185,35 @@ Deno.test("session metrics expose the canonical estimate and its measurement qua
     ),
   );
   ok(
-    component.includes(
-      "{e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}",
-    ),
+    component.includes("? <time>{formatEventTime(e.timestamp_ms)}</time>"),
   );
   ok(!component.includes("<strong>Power</strong>"));
   ok(!component.includes("{e.power_summary"));
   ok(!component.includes('<i className="bi bi-speedometer2"></i>'));
+});
+
+Deno.test("session workspace separates user chat from assistant transcript content", async () => {
+  const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+  const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+  const css = await Deno.readTextFile("webui/src/session.css");
+
+  ok(page.includes('className="app-shell session-shell"'));
+  ok(page.includes("Session details"));
+  ok(page.includes('title="Plan"'));
+  ok(page.includes('title="Activity"'));
+  ok(page.includes("<SessionActivity events={events} />"));
+  ok(component.includes("assistant-message assistant-transcript"));
+  ok(component.includes("<strong>You</strong>"));
+  ok(component.includes("function activityLabel"));
+  ok(component.includes('className="transcript-diff"'));
+  ok(
+    css.includes(
+      ".assistant-transcript > .message-container > .thought-bubble",
+    ),
+  );
+  ok(css.includes(".transcript-diff-body"));
+  ok(css.includes(".tool-drawer-heading"));
+  ok(css.includes(".session-activity-list"));
 });
 
 Deno.test("handoff feedback renders as a teammate with expandable evidence", async () => {

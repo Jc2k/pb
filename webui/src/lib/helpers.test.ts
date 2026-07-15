@@ -47,8 +47,29 @@ Deno.test("projectName extracts the final path segment across platforms", () => 
 });
 
 Deno.test("getAvatarForProfile returns profile avatars only for known profiles", () => {
-  equal(getAvatarForProfile("build"), "/avatar-build.png");
-  equal(getAvatarForProfile("unknown"), "/avatar.png");
+  equal(getAvatarForProfile("build"), "/static/images/avatar-build.png");
+  equal(getAvatarForProfile("monitor"), "/static/images/avatar-monitor.png");
+  equal(getAvatarForProfile("unknown"), "/static/images/avatar.png");
+});
+
+Deno.test("every named agent profile has a packaged avatar", async () => {
+  for (
+    const profile of [
+      "build",
+      "scout",
+      "review",
+      "explore",
+      "plan",
+      "ask",
+      "research",
+      "monitor",
+    ]
+  ) {
+    const avatar = await Deno.stat(
+      `public/static/images/avatar-${profile}.png`,
+    );
+    equal(avatar.isFile, true);
+  }
 });
 
 Deno.test("groupToolEvents groups contiguous tool calls with their results", () => {

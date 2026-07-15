@@ -2,13 +2,13 @@
 @import "bootstrap-icons/font/bootstrap-icons.css";
 
 :root {
-    --app-bg: #f6f8fb;
+    --app-bg: #f2f2f7;
     --panel-bg: #ffffff;
-    --line: #e6ebf1;
-    --line-soft: #eef2f6;
+    --line: rgba(60, 60, 67, 0.16);
+    --line-soft: rgba(60, 60, 67, 0.09);
     --text-soft: #667085;
-    --blue: #0d6efd;
-    --shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
+    --blue: #007aff;
+    --shadow: 0 4px 16px rgba(15, 23, 42, 0.045);
 }
 
 * {
@@ -19,12 +19,7 @@ body {
     min-height: 100vh;
     min-height: 100dvh;
     margin: 0;
-    background: radial-gradient(
-        circle at top right,
-        #ffffff 0,
-        var(--app-bg) 45%,
-        #f2f5f9 100%
-    );
+    background: var(--app-bg);
     color: #111827;
 }
 
@@ -35,7 +30,8 @@ body {
 }
 
 .sidebar {
-    width: 270px;
+    width: 240px;
+    flex: 0 0 240px;
     background: rgba(255, 255, 255, 0.78);
     border-right: 1px solid var(--line);
     backdrop-filter: blur(18px);
@@ -79,6 +75,12 @@ body {
 .nav-link.active {
     color: var(--blue);
     background: #eef5ff;
+}
+
+.sidebar .nav-pills .nav-link.active {
+  color: var(--blue);
+  background: rgba(0, 122, 255, 0.09);
+  box-shadow: none;
 }
 
 .nav-icon {
@@ -577,27 +579,16 @@ details[open] > summary::before {
 /* Visual polish layer */
 :root {
   --ink: #0f172a;
-  --blue-2: #2563eb;
-  --violet: #7c3aed;
-  --ring: rgba(37, 99, 235, 0.22);
-  --shadow-lg: 0 24px 70px rgba(15, 23, 42, 0.12);
+  --blue-2: #007aff;
+  --violet: #007aff;
+  --ring: rgba(0, 122, 255, 0.2);
+  --shadow-lg: 0 5px 20px rgba(15, 23, 42, 0.055);
 }
 
 body {
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", sans-serif;
-  background:
-    radial-gradient(
-      circle at 12% 10%,
-      rgba(124, 58, 237, 0.13),
-      transparent 28%
-    ),
-    radial-gradient(
-      circle at 82% 0%,
-      rgba(37, 99, 235, 0.16),
-      transparent 30%
-    ),
-    linear-gradient(135deg, #f8fbff 0%, #f3f6fb 48%, #eef4ff 100%);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    sans-serif;
+  background: var(--app-bg);
   color: var(--ink);
 }
 
@@ -611,8 +602,9 @@ body {
     calc(12px + env(safe-area-inset-right))
     calc(14px + env(safe-area-inset-bottom))
     calc(12px + env(safe-area-inset-left));
-  background: rgba(255, 255, 255, 0.72);
-  box-shadow: inset -1px 0 0 rgba(148, 163, 184, 0.18);
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: inset -1px 0 0 var(--line);
+  backdrop-filter: blur(12px);
 }
 
 .brand {
@@ -621,9 +613,9 @@ body {
 }
 
 .brand-mark {
-  border-radius: 13px;
-  background: linear-gradient(135deg, #111827, #1d4ed8 60%, #7c3aed);
-  box-shadow: 0 14px 30px rgba(37, 99, 235, 0.24);
+  border-radius: 11px;
+  background: #0b0b0c;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.14);
 }
 
 .nav-link {
@@ -648,13 +640,9 @@ body {
 
 .nav-link:hover,
 .nav-link.active {
-  color: #1d4ed8;
-  background: linear-gradient(
-    135deg,
-    rgba(219, 234, 254, 0.92),
-    rgba(237, 233, 254, 0.78)
-  );
-  box-shadow: 0 8px 24px rgba(37, 99, 235, 0.08);
+  color: var(--blue);
+  background: rgba(0, 122, 255, 0.09);
+  box-shadow: none;
 }
 
 .nav-link:hover i,
@@ -669,19 +657,19 @@ body {
   place-items: center;
   overflow: hidden;
   border: 2px solid #fff;
-  border-radius: 14px;
-  background: linear-gradient(135deg, #e0f2fe, #ede9fe);
+  border-radius: 50%;
+  background: #eef2f7;
   color: #1e3a8a;
   font-size: 0.8rem;
   font-weight: 800;
-  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.1);
+  box-shadow: none;
 }
 
 .user-menu {
   margin-top: auto;
   border: 1px solid rgba(226, 232, 240, 0.85);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.72);
+  border-radius: 14px;
+  background: #fff;
 }
 
 .content-wrap {
@@ -699,15 +687,15 @@ body {
   height: 190px;
   pointer-events: none;
   content: "";
-  background: radial-gradient(circle, rgba(37, 99, 235, 0.14), transparent 68%);
-  filter: blur(3px);
+  display: none;
 }
 
 .hero-section h1 {
   margin-bottom: 0.35rem;
   color: #0b1220;
-  font-size: clamp(2rem, 4vw, 3.2rem);
-  line-height: 0.95;
+  font-size: clamp(2rem, 4vw, 2.7rem);
+  font-weight: 700;
+  line-height: 1.03;
 }
 
 .hero-stats {
@@ -737,9 +725,9 @@ body {
 .start-card,
 .session-list {
   border-color: rgba(203, 213, 225, 0.72);
-  background: rgba(255, 255, 255, 0.86);
+  background: #fff;
   box-shadow: var(--shadow-lg);
-  backdrop-filter: blur(18px);
+  backdrop-filter: none;
 }
 
 .task-editor textarea {
@@ -779,8 +767,8 @@ body {
 
 .start-button {
   border: 0;
-  background: linear-gradient(135deg, #2563eb, #7c3aed);
-  box-shadow: 0 16px 32px rgba(37, 99, 235, 0.25);
+  background: var(--blue);
+  box-shadow: 0 8px 20px rgba(0, 122, 255, 0.2);
 }
 
 .start-button:hover:not(:disabled) {
@@ -1188,8 +1176,12 @@ body {
 .state-pill.running { color: #047857; background: #dcfce7; border-color: #b8f4cf; }
 
 .empty-session-row {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
   padding: 1rem;
   color: var(--text-soft);
+  font-size: 0.9rem;
 }
 
 .card-title-row,
@@ -1331,7 +1323,6 @@ body {
   .tab-nav .nav-link.active { background: #fff; color: var(--blue); box-shadow: inset 0 0 0 1px var(--blue); }
   .quick-actions { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
   .quick-actions .btn { flex: 0 0 auto; }
-  .quick-actions .optional-action:nth-child(even) { display: none; }
   .status-filter { margin-inline: -1rem; padding-inline: 1rem; }
   .project-session-row { grid-template-columns: 44px minmax(0, 1fr) auto 14px; gap: 0.65rem; }
   .project-session-row .state-pill { grid-column: 3; grid-row: 1 / span 2; align-self: center; }
@@ -1363,7 +1354,7 @@ body {
 /* Calmer project page matching the supplied mockups */
 .project-detail-shell.main-panel,
 .project-detail-shell .mobile-topbar {
-  background: #f8fafc;
+  background: var(--app-bg);
 }
 
 .project-detail-wrap {
@@ -1398,7 +1389,7 @@ body {
 
 .title-row h1 {
   font-size: clamp(2.25rem, 4.4vw, 3.25rem);
-  font-weight: 640;
+  font-weight: 700;
   letter-spacing: -0.055em;
 }
 
@@ -1425,7 +1416,7 @@ body {
   border-color: #dfe5ed;
   border-radius: 14px;
   background: #fff;
-  box-shadow: 0 4px 18px rgba(15, 23, 42, 0.035);
+  box-shadow: var(--shadow);
   backdrop-filter: none;
 }
 
@@ -1482,13 +1473,16 @@ body {
   color: #111827;
   font-size: 0.88rem;
   font-weight: 600;
-  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.025);
+  box-shadow: none;
 }
 
 .send-btn {
   width: 46px;
   height: 46px;
   border-radius: 11px;
+  border: 0;
+  background: var(--blue);
+  box-shadow: 0 6px 16px rgba(0, 122, 255, 0.2);
 }
 
 .project-sessions-panel h2 {
@@ -1504,11 +1498,11 @@ body {
   min-height: 36px;
   padding: 0.42rem 0.72rem;
   border-color: #dbe3ee;
-  border-radius: 9px;
+  border-radius: 10px;
   background: #fff;
   font-size: 0.83rem;
   font-weight: 600;
-  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.025);
+  box-shadow: none;
 }
 
 .filter-chip span {
@@ -1521,6 +1515,7 @@ body {
   grid-template-columns: 40px minmax(0, 1fr) auto minmax(88px, auto) 14px;
   min-height: 62px;
   padding: 0.72rem 0.95rem;
+  background: #fff;
 }
 
 .project-session-row .session-icon {
@@ -2115,15 +2110,25 @@ body {
     height: 46px;
     border-radius: 11px;
   }
+
+  .home-composer-card .secondary-quick-actions {
+    display: none;
+  }
+
+  .home-composer-card .quick-actions {
+    overflow: visible;
+  }
 }
 
 /* Home detail refresh */
 .home-detail-wrap {
-  max-width: 1480px;
+  max-width: 1360px;
 }
 
 .home-layout {
   align-items: start;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 1.5rem;
 }
 
 .home-hero {
@@ -2133,24 +2138,39 @@ body {
 .home-hero h1 {
   margin: 0 0 0.45rem;
   color: #071125;
-  font-size: clamp(2rem, 4vw, 3rem);
-  font-weight: 850;
-  letter-spacing: -0.055em;
+  font-size: clamp(2rem, 4vw, 2.65rem);
+  font-weight: 700;
+  letter-spacing: -0.045em;
 }
 
 .home-hero p {
   margin: 0;
   color: #536078;
   font-size: 1.02rem;
-  font-weight: 500;
+  font-weight: 450;
 }
 
 .home-composer-card {
   margin-bottom: 1.7rem;
+  border-color: rgba(60, 60, 67, 0.16);
+  box-shadow: 0 5px 20px rgba(15, 23, 42, 0.055);
 }
 
 .home-composer-card .composer-input {
   min-height: 7.75rem;
+}
+
+.home-composer-card .quick-actions {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 0.55rem;
+}
+
+.quick-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .home-aside .aside-card + .aside-card {
@@ -2162,7 +2182,24 @@ body {
   margin: 0;
   color: #111827;
   font-size: 1.1rem;
-  font-weight: 850;
+  font-weight: 650;
+}
+
+.recent-sessions-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.7rem;
+}
+
+.recent-sessions-heading h2 {
+  margin: 0;
+}
+
+.recent-sessions-heading span {
+  color: var(--text-soft);
+  font-size: 0.78rem;
 }
 
 @media (max-width: 991px) {
@@ -2249,6 +2286,11 @@ textarea {
   border-radius: 12px;
 }
 
+.sidebar .brand-mark {
+  width: 40px;
+  height: 40px;
+}
+
 .mobile-topbar .brand {
   padding: 0;
 }
@@ -2318,7 +2360,19 @@ textarea {
 
 .mobile-nav-link.active {
   color: #1d4ed8;
-  background: linear-gradient(135deg, #eff6ff, #f5f3ff);
+  background: rgba(0, 122, 255, 0.09);
+}
+
+/* Keep standard routes anchored to one frame as navigation changes. */
+.workspace-wrap {
+  width: min(100%, 1360px);
+  margin-inline: auto;
+  padding: 1.65rem 2rem 2.5rem;
+}
+
+.projects-index-wrap > .hero-section,
+.projects-index-wrap > .sessions-section {
+  width: min(100%, 960px);
 }
 
 @media (min-width: 1200px) {
@@ -2328,13 +2382,7 @@ textarea {
 }
 
 @media (max-width: 1199.98px) {
-  .content-wrap {
-    padding: 2rem max(1.5rem, env(safe-area-inset-right))
-      calc(3rem + env(safe-area-inset-bottom))
-      max(1.5rem, env(safe-area-inset-left));
-  }
-
-  .project-detail-wrap {
+  .workspace-wrap {
     padding: 1.5rem max(1.5rem, env(safe-area-inset-right))
       calc(3rem + env(safe-area-inset-bottom))
       max(1.5rem, env(safe-area-inset-left));
@@ -2342,13 +2390,7 @@ textarea {
 }
 
 @media (max-width: 767.98px) {
-  .content-wrap {
-    padding: 1.75rem max(1rem, env(safe-area-inset-right))
-      calc(5.5rem + env(safe-area-inset-bottom))
-      max(1rem, env(safe-area-inset-left));
-  }
-
-  .project-detail-wrap {
+  .workspace-wrap {
     padding: 1rem max(0.9rem, env(safe-area-inset-right))
       calc(5.5rem + env(safe-area-inset-bottom))
       max(0.9rem, env(safe-area-inset-left));

@@ -15,6 +15,7 @@ Deno.test("PageShell exposes consistent tablet and phone navigation", () => {
 
   ok(html.includes("tablet-nav"));
   ok(html.includes("mobile-nav"));
+  ok(html.includes("content-wrap workspace-wrap"));
   ok(html.includes('aria-label="Primary navigation"'));
   ok(html.includes('href="/projects"'));
   ok(!html.includes('href="/settings"'));
@@ -30,6 +31,8 @@ Deno.test("responsive shell accounts for device safe areas and stable route chan
   ok(css.includes("env(safe-area-inset-bottom)"));
   ok(css.includes("env(safe-area-inset-left)"));
   ok(css.includes("scrollbar-gutter: stable"));
+  ok(css.includes(".workspace-wrap"));
+  ok(css.includes(".projects-index-wrap > .hero-section"));
   ok(css.includes(".mobile-nav"));
   ok(sessionCss.includes("height: 100dvh"));
   ok(app.includes("<RouteReset />"));
