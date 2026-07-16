@@ -33,6 +33,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::agent_context::{self, ContextLimitError, PreparedPrompt, PromptMeasurement};
+use crate::agent_progress::{
+    ProgressDecision, ProgressGuard, ProgressObservation, ProgressState, outcome_identity,
+    tool_family,
+};
 use crate::agent_repository::{self, ChangeManifest, RepositoryBrief};
 use crate::browser_tools;
 use crate::checks::{
@@ -624,6 +628,7 @@ struct RunMetrics {
     llm_energy_kwh: f64,
     tool_energy_joules: f64,
     tool_energy_kwh: f64,
+    pending_read_cache_hits: usize,
 }
 
 impl RunMetrics {
@@ -3504,6 +3509,7 @@ struct ToolExecutionEnv<'a> {
     personal_memory_repo: Option<&'a Path>,
     run_budget: &'a RefCell<RunBudget>,
     gate_state: &'a RefCell<GateState>,
+    read_cache: &'a RefCell<DeterministicReadCache>,
     workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
     nesting_depth: usize,
 }
@@ -3518,6 +3524,88 @@ struct LegacyReviewContractEvidence {
     fingerprint: String,
     read_paths: HashSet<String>,
     check_ids: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CachedEvidenceEffects {
+    read_paths: Vec<String>,
+    contract_read_evidence: BTreeMap<String, String>,
+    legacy_review_read_evidence_gathered: bool,
+}
+
+impl CachedEvidenceEffects {
+    fn between(before: &GateState, after: &GateState) -> Self {
+        let mut read_paths = after
+            .read_paths
+            .difference(&before.read_paths)
+            .cloned()
+            .collect::<Vec<_>>();
+        read_paths.sort();
+        let contract_read_evidence = after
+            .contract_read_evidence
+            .iter()
+            .filter(|(path, fingerprint)| {
+                before.contract_read_evidence.get(*path) != Some(*fingerprint)
+            })
+            .map(|(path, fingerprint)| (path.clone(), fingerprint.clone()))
+            .collect();
+        Self {
+            read_paths,
+            contract_read_evidence,
+            legacy_review_read_evidence_gathered: !before.legacy_review_read_evidence_gathered
+                && after.legacy_review_read_evidence_gathered,
+        }
+    }
+
+    fn apply(&self, state: &mut GateState) {
+        state.read_paths.extend(self.read_paths.iter().cloned());
+        state
+            .contract_read_evidence
+            .extend(self.contract_read_evidence.clone());
+        state.legacy_review_read_evidence_gathered |= self.legacy_review_read_evidence_gathered;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReadCacheKey {
+    tool: String,
+    arguments_sha256: String,
+    repository_fingerprint: String,
+    policy_scope_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReadCacheEntry {
+    result: String,
+    evidence_effects: CachedEvidenceEffects,
+}
+
+#[derive(Debug, Default)]
+struct DeterministicReadCache {
+    entries: HashMap<ReadCacheKey, ReadCacheEntry>,
+    order: VecDeque<ReadCacheKey>,
+}
+
+impl DeterministicReadCache {
+    const MAX_ENTRIES: usize = 64;
+
+    fn get(&self, key: &ReadCacheKey) -> Option<ReadCacheEntry> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: ReadCacheKey, entry: ReadCacheEntry) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key, entry);
+            return;
+        }
+        while self.order.len() >= Self::MAX_ENTRIES {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, entry);
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -3549,6 +3637,222 @@ impl GateState {
             self.legacy_review_contract_evidence = None;
         }
     }
+}
+
+fn gate_evidence_fingerprint(state: &GateState) -> Result<String> {
+    let mut read_paths = state.read_paths.iter().cloned().collect::<Vec<_>>();
+    read_paths.sort();
+    let contract_reads = state
+        .contract_read_evidence
+        .iter()
+        .map(|(path, fingerprint)| (path.clone(), fingerprint.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let named_checks = state
+        .named_check_evidence
+        .iter()
+        .map(|(id, evidence)| (id.clone(), evidence.fingerprint.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let legacy_review = state
+        .legacy_review_contract_evidence
+        .as_ref()
+        .map(|evidence| {
+            let mut paths = evidence.read_paths.iter().cloned().collect::<Vec<_>>();
+            let mut checks = evidence.check_ids.iter().cloned().collect::<Vec<_>>();
+            paths.sort();
+            checks.sort();
+            json!({
+                "fingerprint": evidence.fingerprint,
+                "read_paths": paths,
+                "check_ids": checks,
+            })
+        });
+    let value = json!({
+        "read_paths": read_paths,
+        "contract_reads": contract_reads,
+        "named_checks": named_checks,
+        "legacy_review": legacy_review,
+        "legacy_review_completed": state.legacy_review_completed_successfully,
+        "legacy_review_read": state.legacy_review_read_evidence_gathered,
+        "legacy_review_command": state.legacy_review_command_evidence_gathered,
+        "wrote_file": state.wrote_file,
+    });
+    let encoded = serde_json::to_vec(&value).context("failed to encode agent evidence state")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn progress_state(workspace_root: &Path, gate_state: &RefCell<GateState>) -> Result<ProgressState> {
+    Ok(ProgressState {
+        workspace_fingerprint: agent_workspace_content_fingerprint(workspace_root)?,
+        evidence_fingerprint: gate_evidence_fingerprint(&gate_state.borrow())?,
+    })
+}
+
+fn agent_workspace_content_fingerprint(workspace_root: &Path) -> Result<String> {
+    match crate::workspace::ContentSnapshot::capture(workspace_root) {
+        Ok(snapshot) => Ok(snapshot.fingerprint),
+        Err(error) if find_git_root(workspace_root).is_none() => {
+            fallback_filesystem_content_fingerprint(workspace_root).with_context(|| {
+                format!(
+                    "failed to fingerprint non-Git agent workspace after repository snapshot was unavailable: {error:#}"
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn fallback_filesystem_content_fingerprint(workspace_root: &Path) -> Result<String> {
+    let mut paths = Vec::new();
+    for entry in WalkBuilder::new(workspace_root)
+        .hidden(false)
+        .follow_links(false)
+        .build()
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to walk non-Git agent workspace {}",
+                workspace_root.display()
+            )
+        })?;
+        let path = entry.path();
+        if path == workspace_root {
+            continue;
+        }
+        let relative = path.strip_prefix(workspace_root).with_context(|| {
+            format!(
+                "workspace path {} escaped root {}",
+                path.display(),
+                workspace_root.display()
+            )
+        })?;
+        if relative.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name) if name == ".git" || name == ".pb")
+        }) {
+            continue;
+        }
+        paths.push(PathBuf::from(relative));
+    }
+    paths.sort();
+    let mut digest = Sha256::new();
+    for relative in paths {
+        let absolute = workspace_root.join(&relative);
+        let metadata = std::fs::symlink_metadata(&absolute).with_context(|| {
+            format!(
+                "failed to inspect non-Git workspace path {}",
+                absolute.display()
+            )
+        })?;
+        let normalized = relative
+            .to_str()
+            .context("non-Git agent workspace contains a non-UTF-8 path")?
+            .replace('\\', "/");
+        digest.update((normalized.len() as u64).to_le_bytes());
+        digest.update(normalized.as_bytes());
+        if metadata.file_type().is_symlink() {
+            digest.update(b"symlink\0");
+            let target = std::fs::read_link(&absolute)
+                .with_context(|| format!("failed to read symlink {}", absolute.display()))?;
+            let target = target
+                .to_str()
+                .context("non-Git agent workspace contains a non-UTF-8 symlink target")?;
+            digest.update((target.len() as u64).to_le_bytes());
+            digest.update(target.as_bytes());
+        } else if metadata.is_file() {
+            digest.update(b"file\0");
+            let bytes = std::fs::read(&absolute).with_context(|| {
+                format!(
+                    "failed to read non-Git workspace file {}",
+                    absolute.display()
+                )
+            })?;
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        } else if metadata.is_dir() {
+            digest.update(b"directory\0");
+        } else {
+            digest.update(b"other\0");
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn deterministic_read_cacheable(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file" | "glob" | "ripgrep" | "search" | "git_log"
+    )
+}
+
+fn read_cache_policy_scope(request: &AgentRequest) -> Result<String> {
+    let value = json!({
+        "profile": request.profile.as_str(),
+        "intent": request.intent.map(|intent| format!("{intent:?}")),
+        "workflow_stage": request.workflow_stage.map(|stage| format!("{stage:?}")),
+        "workflow_policy": request.workflow_policy.as_ref().map(|policy| policy.sha256.as_str()),
+        "contract": request.contract,
+        "tool_allowlist": request.tool_allowlist,
+        "repository_less": request.repository_less,
+        "ctx_size": request.ctx_size,
+        "max_tokens": boosted_max_tokens(request),
+    });
+    let encoded = serde_json::to_vec(&value).context("failed to encode read-cache policy scope")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn repository_cache_fingerprint(workspace_root: &Path) -> Result<String> {
+    let content = agent_workspace_content_fingerprint(workspace_root)?;
+    let control = git_completion_marker(workspace_root).unwrap_or_else(|| "<no-git>".to_string());
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(format!("{content}\n{control}").as_bytes())
+    ))
+}
+
+fn read_cache_dependency_fingerprint(
+    tool: &str,
+    arguments: &Value,
+    workspace_root: &Path,
+) -> String {
+    if tool != "read_file" {
+        return "<repository-scoped>".to_string();
+    }
+    let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+        return "<invalid-read-path>".to_string();
+    };
+    let Ok(resolved) = resolve_workspace_path(workspace_root, path, true) else {
+        return format!(
+            "unresolved:{}",
+            agent_context::normalized_arguments_sha256(arguments)
+        );
+    };
+    match std::fs::read(&resolved) {
+        Ok(bytes) => format!("{:x}", Sha256::digest(bytes)),
+        Err(_) => format!(
+            "unreadable:{}",
+            agent_context::normalized_arguments_sha256(arguments)
+        ),
+    }
+}
+
+fn read_cache_key(
+    tool: &str,
+    arguments: &Value,
+    context: &ToolContext<'_>,
+) -> Result<ReadCacheKey> {
+    let repository_fingerprint = repository_cache_fingerprint(context.workspace_root)?;
+    let dependency_fingerprint =
+        read_cache_dependency_fingerprint(tool, arguments, context.workspace_root);
+    Ok(ReadCacheKey {
+        tool: tool.to_string(),
+        arguments_sha256: agent_context::normalized_arguments_sha256(arguments),
+        repository_fingerprint: format!(
+            "{:x}",
+            Sha256::digest(
+                format!("{repository_fingerprint}\n{dependency_fingerprint}").as_bytes()
+            )
+        ),
+        policy_scope_sha256: read_cache_policy_scope(context.request)?,
+    })
 }
 
 fn initial_gate_state(
@@ -3600,6 +3904,7 @@ fn run_agent_steps(
     let mut consecutive_parse_failures = 0usize;
     let mut deterministic_failures = DeterministicFailureTracker::default();
     let mut tool_loop_guard = ToolLoopGuard::default();
+    let mut progress_guard = ProgressGuard::default();
     let mut terminal_submission_only = false;
     let mut suppress_thinking = false;
     let gate_state = RefCell::new(initial_gate_state(
@@ -3607,6 +3912,7 @@ fn run_agent_steps(
         workspace_root,
         command_backend.is_some(),
     ));
+    let read_cache = RefCell::new(DeterministicReadCache::default());
     let workspace_checks = args.workspace_graph.as_ref().map(|graph| {
         RefCell::new(WorkspaceCheckRuntime::new(
             workspace_root,
@@ -4212,7 +4518,31 @@ fn run_agent_steps(
                     step += 1;
                     continue;
                 }
-                execute_tool_calls(
+                if let Some(feedback) = preflight_tool_progress(
+                    &mut progress_guard,
+                    &calls,
+                    workspace_root,
+                    &gate_state,
+                )? {
+                    messages.push(ChatMessage::text("assistant", output.clone()));
+                    record_progress_warning(&feedback, nesting_depth, messages, sink);
+                    sink.emit(AgentEvent::Error {
+                        message: feedback,
+                        summary: "No-progress tool loop".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    return Ok(StepRunOutcome {
+                        reached_final: false,
+                        contract_status: incomplete_contract_status(args),
+                        verified_completed: false,
+                        termination_reason: TerminationReason::GateLoop,
+                        final_content: None,
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
+                let progress_outcomes = execute_tool_calls(
                     calls,
                     thinking,
                     assistant_content_for_tool_action(&output),
@@ -4231,12 +4561,19 @@ fn run_agent_steps(
                         personal_memory_repo,
                         run_budget,
                         gate_state: &gate_state,
+                        read_cache: &read_cache,
                         workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
                     },
                     messages,
                     sink,
                     &mut metrics,
+                )?;
+                let progress_decision = record_tool_progress(
+                    &mut progress_guard,
+                    &progress_outcomes,
+                    workspace_root,
+                    &gate_state,
                 )?;
                 let control_violation = gate_state.borrow().workflow_control_violation.clone();
                 if control_violation.is_some() {
@@ -4263,6 +4600,24 @@ fn run_agent_steps(
                         gate_state: gate_state.into_inner(),
                     });
                 }
+                if let ProgressDecision::Block(feedback) = &progress_decision {
+                    record_progress_warning(feedback, nesting_depth, messages, sink);
+                    sink.emit(AgentEvent::Error {
+                        message: feedback.clone(),
+                        summary: "No-progress tool loop".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    return Ok(StepRunOutcome {
+                        reached_final: false,
+                        contract_status: incomplete_contract_status(args),
+                        verified_completed: false,
+                        termination_reason: TerminationReason::GateLoop,
+                        final_content: None,
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
                 if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
@@ -4274,6 +4629,8 @@ fn run_agent_steps(
                         "Repeated tool call detected",
                         &feedback,
                     ));
+                } else if let ProgressDecision::Warn(feedback) = progress_decision {
+                    record_progress_warning(&feedback, nesting_depth, messages, sink);
                 }
             }
             AgentAction::ToolCalls { calls, thinking } => {
@@ -4310,7 +4667,31 @@ fn run_agent_steps(
                     step += 1;
                     continue;
                 }
-                execute_tool_calls(
+                if let Some(feedback) = preflight_tool_progress(
+                    &mut progress_guard,
+                    &calls,
+                    workspace_root,
+                    &gate_state,
+                )? {
+                    messages.push(ChatMessage::text("assistant", output.clone()));
+                    record_progress_warning(&feedback, nesting_depth, messages, sink);
+                    sink.emit(AgentEvent::Error {
+                        message: feedback,
+                        summary: "No-progress tool loop".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    return Ok(StepRunOutcome {
+                        reached_final: false,
+                        contract_status: incomplete_contract_status(args),
+                        verified_completed: false,
+                        termination_reason: TerminationReason::GateLoop,
+                        final_content: None,
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
+                let progress_outcomes = execute_tool_calls(
                     calls,
                     thinking,
                     assistant_content_for_tool_action(&output),
@@ -4329,12 +4710,19 @@ fn run_agent_steps(
                         personal_memory_repo,
                         run_budget,
                         gate_state: &gate_state,
+                        read_cache: &read_cache,
                         workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
                     },
                     messages,
                     sink,
                     &mut metrics,
+                )?;
+                let progress_decision = record_tool_progress(
+                    &mut progress_guard,
+                    &progress_outcomes,
+                    workspace_root,
+                    &gate_state,
                 )?;
                 let control_violation = gate_state.borrow().workflow_control_violation.clone();
                 if control_violation.is_some() {
@@ -4361,6 +4749,24 @@ fn run_agent_steps(
                         gate_state: gate_state.into_inner(),
                     });
                 }
+                if let ProgressDecision::Block(feedback) = &progress_decision {
+                    record_progress_warning(feedback, nesting_depth, messages, sink);
+                    sink.emit(AgentEvent::Error {
+                        message: feedback.clone(),
+                        summary: "No-progress tool loop".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    return Ok(StepRunOutcome {
+                        reached_final: false,
+                        contract_status: incomplete_contract_status(args),
+                        verified_completed: false,
+                        termination_reason: TerminationReason::GateLoop,
+                        final_content: None,
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
                 if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
@@ -4372,6 +4778,8 @@ fn run_agent_steps(
                         "Repeated tool call detected",
                         &feedback,
                     ));
+                } else if let ProgressDecision::Warn(feedback) = progress_decision {
+                    record_progress_warning(&feedback, nesting_depth, messages, sink);
                 }
             }
         }
@@ -4864,6 +5272,7 @@ fn record_completion_metrics(
         &mut metrics.llm_energy_kwh,
         completion.energy,
     );
+    let read_cache_hits = std::mem::take(&mut metrics.pending_read_cache_hits);
     sink.emit(AgentEvent::LlmInvocation {
         step,
         duration_ms: completion.duration_ms,
@@ -4874,6 +5283,7 @@ fn record_completion_metrics(
             tools,
             enable_thinking,
             completion.prompt_tokens,
+            read_cache_hits,
         )),
         energy_joules: completion.energy.map(|estimate| estimate.joules),
         energy_kwh: completion.energy.map(|estimate| estimate.kwh),
@@ -4888,6 +5298,7 @@ fn completion_context_usage(
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
     prompt_tokens: usize,
+    read_cache_hits: usize,
 ) -> AgentContextUsage {
     let context_capacity = prepared.context_capacity;
     let reserved_generation_tokens = prepared.reserved_generation_tokens;
@@ -4925,7 +5336,7 @@ fn completion_context_usage(
         thinking_enabled: Some(enable_thinking),
         compacted_messages: prepared.compacted_messages,
         omitted_tool_result_chars: prepared.omitted_tool_result_chars,
-        read_cache_hits: 0,
+        read_cache_hits,
         closure_checkpoints: 0,
     }
 }
@@ -5129,6 +5540,46 @@ struct ExecutedToolResult {
     energy: Option<EnergyEstimate>,
 }
 
+#[derive(Debug, Clone)]
+struct ToolOutcomeSummary {
+    tool: String,
+    call_fingerprint: String,
+    result: String,
+    success: bool,
+}
+
+fn tool_outcome_succeeded(tool: &str, transport_success: bool, result: &str) -> bool {
+    if !transport_success {
+        return false;
+    }
+    if matches!(tool, "run_check" | "run_command") {
+        let result = semantic_tool_result_payload(result);
+        if let Ok(summary) = serde_json::from_str::<crate::checks::CheckRunSummary>(result) {
+            return summary.all_succeeded();
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(result)
+            && let Some(success) = value.get("success").and_then(Value::as_bool)
+        {
+            return success;
+        }
+    }
+    true
+}
+
+fn semantic_tool_result_payload(result: &str) -> &str {
+    let Some((payload, fingerprint)) =
+        result.rsplit_once("\n\nHarness current content fingerprint: ")
+    else {
+        return result;
+    };
+    let fingerprint = fingerprint.trim();
+    if fingerprint.len() == 64 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        payload
+    } else {
+        result
+    }
+}
+
 fn execute_tool_calls(
     calls: Vec<AgentToolCall>,
     thinking: Option<String>,
@@ -5137,7 +5588,7 @@ fn execute_tool_calls(
     messages: &mut Vec<ChatMessage>,
     sink: &mut dyn EventSink,
     metrics: &mut RunMetrics,
-) -> Result<()> {
+) -> Result<Vec<ToolOutcomeSummary>> {
     if (env.args.workflow_stage.is_some()
         || env.args.intent == Some(crate::workflow::TurnIntent::Auto))
         && calls.len() != 1
@@ -5334,6 +5785,30 @@ fn execute_tool_calls(
         results.extend(batch_results);
     } else {
         for call in runnable {
+            let cache_key = deterministic_read_cacheable(&call.tool)
+                .then(|| read_cache_key(&call.tool, &call.arguments, &tool_context))
+                .transpose()?;
+            if let Some(entry) = cache_key
+                .as_ref()
+                .and_then(|key| env.read_cache.borrow().get(key))
+            {
+                entry
+                    .evidence_effects
+                    .apply(&mut env.gate_state.borrow_mut());
+                metrics.pending_read_cache_hits = metrics.pending_read_cache_hits.saturating_add(1);
+                results.push(ExecutedToolResult {
+                    tool_call_id: call.id,
+                    tool: call.tool,
+                    arguments: call.arguments,
+                    result: entry.result,
+                    success: true,
+                    duration_ms: 0,
+                    energy: None,
+                });
+                continue;
+            }
+
+            let evidence_before = cache_key.as_ref().map(|_| env.gate_state.borrow().clone());
             let measure_tool = call.tool != "sub_agent";
             let energy_start = measure_tool.then(energy::sample).flatten();
             let started = Instant::now();
@@ -5357,6 +5832,17 @@ fn execute_tool_calls(
                 env.workspace_root,
                 result,
             )?;
+            if success && let (Some(key), Some(before)) = (cache_key, evidence_before) {
+                let evidence_effects =
+                    CachedEvidenceEffects::between(&before, &env.gate_state.borrow());
+                env.read_cache.borrow_mut().insert(
+                    key,
+                    ReadCacheEntry {
+                        result: result.clone(),
+                        evidence_effects,
+                    },
+                );
+            }
             let energy =
                 energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
             let duration_ms = duration_millis(started);
@@ -5376,6 +5862,7 @@ fn execute_tool_calls(
         assistant_output.to_string(),
         calls_for_transcript,
     ));
+    let mut progress_outcomes = Vec::new();
     for ExecutedToolResult {
         tool_call_id,
         tool,
@@ -5386,6 +5873,16 @@ fn execute_tool_calls(
         energy,
     } in results
     {
+        progress_outcomes.push(ToolOutcomeSummary {
+            tool: tool.clone(),
+            call_fingerprint: format!(
+                "{}:{}",
+                tool,
+                agent_context::normalized_arguments_sha256(&arguments)
+            ),
+            result: result.clone(),
+            success: tool_outcome_succeeded(&tool, success, &result),
+        });
         metrics.tool_calls += 1;
         if tool != "sub_agent" {
             metrics.tool_runtime_ms = metrics.tool_runtime_ms.saturating_add(duration_ms);
@@ -5430,7 +5927,7 @@ fn execute_tool_calls(
             metadata,
         ));
     }
-    Ok(())
+    Ok(progress_outcomes)
 }
 
 fn result_workspace_fingerprint(result: &str) -> Option<&str> {
@@ -5684,6 +6181,74 @@ struct ToolLoopCheck {
     feedback: Option<String>,
     blocked: bool,
     signature: Option<u64>,
+}
+
+fn preflight_tool_progress(
+    guard: &mut ProgressGuard,
+    calls: &[AgentToolCall],
+    workspace_root: &Path,
+    gate_state: &RefCell<GateState>,
+) -> Result<Option<String>> {
+    let state = progress_state(workspace_root, gate_state)?;
+    for call in calls {
+        let call_fingerprint = format!(
+            "{}:{}",
+            call.tool,
+            agent_context::normalized_arguments_sha256(&call.arguments)
+        );
+        if let Some(feedback) =
+            guard.preflight(&tool_family(&call.tool), &call_fingerprint, state.clone())
+        {
+            return Ok(Some(feedback));
+        }
+    }
+    Ok(None)
+}
+
+fn record_tool_progress(
+    guard: &mut ProgressGuard,
+    outcomes: &[ToolOutcomeSummary],
+    workspace_root: &Path,
+    gate_state: &RefCell<GateState>,
+) -> Result<ProgressDecision> {
+    let state = progress_state(workspace_root, gate_state)?;
+    let mut decision = ProgressDecision::Continue;
+    for outcome in outcomes {
+        let (outcome_fingerprint, outcome_summary) =
+            outcome_identity(&outcome.tool, outcome.success, &outcome.result);
+        let observed = guard.record(ProgressObservation {
+            tool_family: tool_family(&outcome.tool),
+            call_fingerprint: outcome.call_fingerprint.clone(),
+            outcome_fingerprint,
+            outcome_summary,
+            success: outcome.success,
+            state: state.clone(),
+        });
+        match observed {
+            ProgressDecision::Block(_) => return Ok(observed),
+            ProgressDecision::Warn(_) => decision = observed,
+            ProgressDecision::Continue => {}
+        }
+    }
+    Ok(decision)
+}
+
+fn record_progress_warning(
+    feedback: &str,
+    nesting_depth: usize,
+    messages: &mut Vec<ChatMessage>,
+    sink: &mut dyn EventSink,
+) {
+    sink.emit(AgentEvent::Correction {
+        message: feedback.to_string(),
+        summary: "No-progress tool outcome detected".to_string(),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
+    messages.push(correction_chat_message(
+        "No-progress tool outcome detected",
+        feedback,
+    ));
 }
 
 fn record_blocked_tool_loop(
@@ -8286,6 +8851,7 @@ fn generate_and_parse_action_with_retries(
             &mut metrics.llm_energy_kwh,
             completion.energy,
         );
+        let read_cache_hits = std::mem::take(&mut metrics.pending_read_cache_hits);
         sink.emit(AgentEvent::LlmInvocation {
             step,
             duration_ms: completion.duration_ms,
@@ -8296,6 +8862,7 @@ fn generate_and_parse_action_with_retries(
                 tools,
                 enable_thinking,
                 completion.prompt_tokens,
+                read_cache_hits,
             )),
             energy_joules: completion.energy.map(|estimate| estimate.joules),
             energy_kwh: completion.energy.map(|estimate| estimate.kwh),
@@ -9066,7 +9633,9 @@ fn tool_result_limit(arguments: &Value, tool: &str, default_limit: usize) -> Res
 
 fn workspace_walk(root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
-    builder.hidden(false).filter_entry(|entry| {
+    builder.hidden(false);
+    builder.sort_by_file_path(|left, right| left.cmp(right));
+    builder.filter_entry(|entry| {
         !SEARCH_EXCLUDED_DIRS
             .iter()
             .any(|excluded| entry.file_name() == std::ffi::OsStr::new(excluded))
@@ -17196,6 +17765,290 @@ mod tests {
     }
 
     #[test]
+    fn pg1_third_exact_call_is_blocked_without_tool_runtime_or_mutation() {
+        let repo = init_contract_test_repo();
+        let before = crate::workspace::ContentSnapshot::capture(repo.path())
+            .unwrap()
+            .fingerprint;
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 5;
+        let repeated = tool_completion("read_file", json!({"path": "missing.txt"}));
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                repeated.clone(),
+                repeated.clone(),
+                repeated,
+                scripted_final("must not run"),
+            ],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::GateLoop);
+        assert_eq!(outcome.llm_invocations, 3);
+        assert_eq!(outcome.tool_calls, 2);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert_eq!(
+            crate::workspace::ContentSnapshot::capture(repo.path())
+                .unwrap()
+                .fingerprint,
+            before
+        );
+    }
+
+    #[test]
+    fn workflow_fingerprint_suffix_preserves_failed_command_semantics() {
+        let fingerprint = "a".repeat(64);
+        let failed =
+            format!("{{\"success\":false}}\n\nHarness current content fingerprint: {fingerprint}");
+        let passed =
+            format!("{{\"success\":true}}\n\nHarness current content fingerprint: {fingerprint}");
+
+        assert!(!tool_outcome_succeeded("run_check", true, &failed));
+        assert!(tool_outcome_succeeded("run_command", true, &passed));
+        assert!(!tool_outcome_succeeded("run_command", false, &passed));
+    }
+
+    #[test]
+    fn pg2_unchanged_a_b_a_failures_stop_without_a_fourth_model_retry() {
+        let repo = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 5;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({"path": "missing.txt"})),
+                tool_completion("ripgrep", json!({"pattern": "[", "path": "."})),
+                tool_completion("read_file", json!({"path": "missing.txt"})),
+                scripted_final("must not run"),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::GateLoop);
+        assert_eq!(outcome.llm_invocations, 3);
+        assert_eq!(outcome.tool_calls, 2);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { summary, .. }
+                if summary == "No-progress tool outcome detected"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { summary, .. } if summary == "No-progress tool loop"
+        )));
+    }
+
+    #[test]
+    fn pg3_evidence_transition_allows_the_same_failed_operation_again() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("evidence.txt"), "evidence\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 4;
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({"path": "missing.txt"})),
+                tool_completion("read_file", json!({"path": "evidence.txt"})),
+                tool_completion("read_file", json!({"path": "missing.txt"})),
+                scripted_final("reported after gathering new evidence"),
+            ],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert_eq!(outcome.llm_invocations, 4);
+        assert_eq!(outcome.tool_calls, 3);
+    }
+
+    #[test]
+    fn pg4_varied_stale_patches_form_one_unchanged_failure_sequence() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("notes.txt"), "current\n").unwrap();
+        let before = crate::workspace::ContentSnapshot::capture(repo.path())
+            .unwrap()
+            .fingerprint;
+        let patch = |old: &str, new: &str| {
+            format!(
+                "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-{old}\n+{new}\n"
+            )
+        };
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 6;
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({"path": "notes.txt"})),
+                tool_completion(
+                    "apply_patch",
+                    json!({"patch": patch("stale one", "replacement one")}),
+                ),
+                tool_completion(
+                    "apply_patch",
+                    json!({"patch": patch("stale two", "replacement two")}),
+                ),
+                tool_completion(
+                    "apply_patch",
+                    json!({"patch": patch("stale three", "replacement three")}),
+                ),
+                scripted_final("must not run"),
+            ],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::GateLoop);
+        assert_eq!(outcome.llm_invocations, 4);
+        assert_eq!(outcome.tool_calls, 3);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert_eq!(
+            crate::workspace::ContentSnapshot::capture(repo.path())
+                .unwrap()
+                .fingerprint,
+            before
+        );
+    }
+
+    #[test]
+    fn pg5_cached_read_replays_exact_result_and_only_original_evidence_effects() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("probe.txt"), "probe\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 3;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({"path": "probe.txt"})),
+                tool_completion("read_file", json!({"path": "probe.txt"})),
+                scripted_final("used cached deterministic evidence"),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        let results = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolResult { tool, result, .. } if tool == "read_file" => {
+                    Some(result.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], results[1]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::LlmInvocation {
+                context: Some(context),
+                ..
+            } if context.read_cache_hits == 1
+        )));
+
+        let before = GateState::default();
+        let mut after = before.clone();
+        after.read_paths.insert("probe.txt".to_string());
+        after
+            .contract_read_evidence
+            .insert("probe.txt".to_string(), "fingerprint".to_string());
+        after.legacy_review_read_evidence_gathered = true;
+        after.named_check_evidence.insert(
+            "must-not-replay".to_string(),
+            NamedCheckEvidence {
+                fingerprint: "check".to_string(),
+            },
+        );
+        let effects = CachedEvidenceEffects::between(&before, &after);
+        let mut replay = GateState::default();
+        replay.read_paths.insert("existing.txt".to_string());
+        effects.apply(&mut replay);
+        assert_eq!(
+            replay.read_paths,
+            HashSet::from(["existing.txt".to_string(), "probe.txt".to_string()])
+        );
+        assert_eq!(
+            replay.contract_read_evidence.get("probe.txt"),
+            Some(&"fingerprint".to_string())
+        );
+        assert!(replay.legacy_review_read_evidence_gathered);
+        assert!(replay.named_check_evidence.is_empty());
+        assert!(!replay.wrote_file);
+    }
+
+    #[test]
+    fn pg5_read_cache_invalidates_on_content_or_authority_scope_change() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join(".gitignore"), "probe.txt\n").unwrap();
+        std::fs::write(repo.path().join("probe.txt"), "before\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 4;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({"path": "probe.txt"})),
+                tool_completion(
+                    "edit_file",
+                    json!({"path": "probe.txt", "old_text": "before", "new_text": "after"}),
+                ),
+                tool_completion("read_file", json!({"path": "probe.txt"})),
+                scripted_final("content-scoped read complete"),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.tool_calls, 3);
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            AgentEvent::LlmInvocation {
+                context: Some(context),
+                ..
+            } if context.read_cache_hits > 0
+        )));
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("probe.txt")).unwrap(),
+            "after\n"
+        );
+
+        let mut other_scope = request.clone();
+        other_scope.profile = AgentProfile::Review;
+        assert_ne!(
+            read_cache_policy_scope(&request).unwrap(),
+            read_cache_policy_scope(&other_scope).unwrap()
+        );
+        assert!(deterministic_read_cacheable("read_file"));
+        assert!(deterministic_read_cacheable("git_log"));
+        for excluded in [
+            "run_command",
+            "run_check",
+            "web_fetch",
+            "mcp_server_tool",
+            "lsp_diagnostics",
+            "memory_read",
+            "edit_file",
+            "inspect_change",
+            "session_changes",
+        ] {
+            assert!(!deterministic_read_cacheable(excluded), "{excluded}");
+        }
+    }
+
+    #[test]
     fn monitor_recommendation_parser_grants_only_healthy_extra_steps() {
         assert!(monitor_recommends_more_steps(
             "status: needs_more_steps\nevidence: on_track\ngrant more steps: yes"
@@ -19141,6 +19994,20 @@ mod tests {
 
         let result = run_ripgrep("needle", None, 1, root).unwrap();
         assert_eq!(result.lines().count(), 1);
+    }
+
+    #[test]
+    fn cached_search_candidates_are_ordered_before_applying_limits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("z-last.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("a-first.txt"), "needle\n").unwrap();
+
+        assert_eq!(run_glob("*.txt", None, 1, root).unwrap(), "a-first.txt");
+        assert_eq!(
+            run_ripgrep("needle", None, 1, root).unwrap(),
+            "a-first.txt:1:needle"
+        );
     }
 
     #[test]

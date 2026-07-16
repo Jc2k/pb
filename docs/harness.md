@@ -132,6 +132,31 @@ inspection representation; `limits.review_paths` continues to bound the complete
 set. Full checked content remains bound by workspace and commit fingerprints and available in the
 isolated review workspace and resulting managed commit.
 
+### Outcome-aware progress and deterministic read reuse
+
+The existing exact-call guard still blocks a third consecutive identical tool action before it can
+run. A bounded post-result progress guard additionally fingerprints the tool family, normalized
+call and outcome, repository content, and harness evidence state. Two failed outcomes without a
+content or evidence transition produce one correction with a concrete alternative. An unchanged
+A-B-A call cycle is blocked before the proposed third call; two equivalent stale workspace edits
+also prevent another edit until the model gathers different evidence. Other third equivalent
+failures terminate the sequence before another model turn. A real content or evidence transition
+clears the relevant failure window.
+
+Successful deterministic built-in reads use a 64-entry run-local cache. The initial cacheable set
+is `read_file`, `glob`, `ripgrep`/`search`, and `git_log`; only successful results enter it. Keys bind
+normalized arguments to current tracked/untracked repository content, Git control state, active
+request/contract/tool policy, context-dependent result bounds, and the exact target bytes for
+`read_file` (including explicitly read ignored files). Non-Git temporary workspaces use a
+deterministic filesystem fingerprint that excludes `.git` and `.pb` control state.
+
+A hit replays the exact original result and only the original read-path, contract-read, and legacy
+review-read effects. It cannot replay check, write, workflow-transition, or broader review
+authority. Commands, status that includes external session state, network, MCP, LSP, memory,
+focused review inspection, and every mutation-capable tool remain uncached. Cache hits consume zero
+tool runtime/energy and are counted in the context snapshot for the model invocation that receives
+the replayed result.
+
 Deterministic recovery is bounded. Repeated parse, artifact validation, identical-tool, plan-cycle,
 repair-cycle, invocation, token, stage-step, and advisory failures stop with explicit outcomes
 before another model turn can reinterpret the same fact. Strict workflow stages never use the old
@@ -239,6 +264,8 @@ Use `--suite small-model` to run the stable subset used by
 [S0 baseline](benchmarks/small-model-agent-baseline.md) and
 [S1 prompt-budget checkpoint](benchmarks/small-model-agent-s1.md). S2's deterministic prompt
 reduction is recorded in the [focused-evidence checkpoint](benchmarks/small-model-agent-s2.md).
+S3's no-progress and read-cache boundaries are recorded in the
+[progress-recovery checkpoint](benchmarks/small-model-agent-s3.md).
 Each model-invocation record
 includes an optional backward-compatible context snapshot covering capacity, generation reserve,
 prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,

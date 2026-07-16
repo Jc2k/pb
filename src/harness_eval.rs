@@ -2917,7 +2917,10 @@ mod tests {
             assert!(context.tool_schema_chars_high_water > 0);
             assert_eq!(context.compacted_messages, 0);
             assert_eq!(context.omitted_tool_result_chars, 0);
-            assert_eq!(context.read_cache_hits, 0);
+            assert_eq!(
+                context.read_cache_hits,
+                usize::from(record.result.id == "repeated_blocked_action")
+            );
             assert_eq!(context.closure_checkpoints, 0);
         }
     }
