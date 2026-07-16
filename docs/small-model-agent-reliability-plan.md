@@ -1,6 +1,6 @@
 # Small-model agent reliability plan
 
-Status: active; implementation not started
+Status: active; S0-S1 complete, S2 not started
 
 This document is the tracking source for improving the quality and completion rate of small local
 models in pb's agent and enforced-delivery workflows. Update the milestone table, evidence log, and
@@ -455,7 +455,7 @@ only when its production path, deterministic proof, documentation, and semantic 
 | ID | Priority | Depends on | Status | Required proof | Evidence/commit |
 | --- | --- | --- | --- | --- | --- |
 | S0 | P0 | — | complete | deterministic metrics, fixture group, checked baseline | `test: baseline small-model agent control` |
-| S1 | P0 | S0 | not started | exact preflight, receipts, bounded reads, CB1-CB4 | — |
+| S1 | P0 | S0 | complete | exact preflight, receipts, bounded reads, CB1-CB4 | `feat: budget agent prompt context`; [S1 checkpoint](benchmarks/small-model-agent-s1.md) |
 | S2 | P0 | S0, S1 | not started | brief, focused review, RV1-RV3, RB1, ≥40% reduction | — |
 | S3 | P1 | S0, S1 | not started | progress guard/cache, PG1-PG5 | — |
 | S4 | P1 | S0, S1 | not started | error envelopes/retry policy, AR1-AR4 | — |
@@ -510,6 +510,7 @@ them rather than pasting them here.
 | --- | --- | --- | --- | --- | --- |
 | 2026-07-15 | Plan | uncommitted document | architecture cross-check and `git diff --check` passed | implementation not started | baseline and numeric rollout decisions require S0 evidence |
 | 2026-07-15 | S0 | `test: baseline small-model agent control` | `cargo fmt --check`; `cargo test --all-targets` (912 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals passed | scripted subset 4/4; Qwen2.5-Coder-7B exact protocol 0/4; maximum context 6.10%; no overflow | S1 context-pressure fixtures must prove budgeting and compaction |
+| 2026-07-16 | S1 | `feat: budget agent prompt context` | `cargo fmt --check`; `cargo test --all-targets` (922 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; CB1-CB4; FlashMoe and fixed llama.cpp preflight parity | scripted corpus 41/41 and subset 4/4; Qwen2.5-Coder-7B exact protocol remains 0/4; maximum context 6.80%; zero overflow | S2 must remove duplicate planning/review material without changing gates |
 
 After each checkpoint, report:
 

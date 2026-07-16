@@ -1562,6 +1562,55 @@ impl FlashMoeEngine {
         Ok(self.generate_structured_inner(request, None, false)?.output)
     }
 
+    /// Render and tokenize the exact prompt used by structured generation.
+    pub fn measure_structured_prompt(
+        &self,
+        request: &StructuredGenerationRequest,
+    ) -> Result<usize> {
+        Ok(self.structured_prompt_tokens(request)?.1.len())
+    }
+
+    fn structured_prompt_tokens(
+        &self,
+        request: &StructuredGenerationRequest,
+    ) -> Result<(String, Vec<u32>)> {
+        if !request.raw_prompt {
+            return self.tokenizer.render_and_encode_chat_prompt(
+                &request.messages,
+                &request.tools,
+                request.add_generation_prompt,
+                request.enable_thinking,
+            );
+        }
+        let prompt = self.render_structured_prompt(request)?;
+        let prompt_tokens = self.tokenizer.encode(&prompt)?;
+        Ok((prompt, prompt_tokens))
+    }
+
+    fn render_structured_prompt(&self, request: &StructuredGenerationRequest) -> Result<String> {
+        if request.raw_prompt {
+            if !request.tools.is_empty() {
+                bail!("raw Flash-MoE generation does not support tools");
+            }
+            return match request.messages.as_slice() {
+                [
+                    ChatMessage {
+                        content: ChatMessageContent::Text(prompt),
+                        ..
+                    },
+                ] => Ok(prompt.clone()),
+                _ => bail!("raw Flash-MoE generation requires exactly one text prompt"),
+            };
+        }
+        self.tokenizer
+            .apply_chat_template_to_messages_with_thinking(
+                &request.messages,
+                &request.tools,
+                request.add_generation_prompt,
+                request.enable_thinking,
+            )
+    }
+
     pub fn generate_in_session(
         &mut self,
         session_id: &str,
@@ -1720,28 +1769,7 @@ impl FlashMoeEngine {
     ) -> Result<TimedGenerationOutput> {
         let generation_started = Instant::now();
         let render_started = Instant::now();
-        let prompt = if request.raw_prompt {
-            if !request.tools.is_empty() {
-                bail!("raw Flash-MoE generation does not support tools");
-            }
-            match request.messages.as_slice() {
-                [
-                    ChatMessage {
-                        content: ChatMessageContent::Text(prompt),
-                        ..
-                    },
-                ] => prompt.clone(),
-                _ => bail!("raw Flash-MoE generation requires exactly one text prompt"),
-            }
-        } else {
-            self.tokenizer
-                .apply_chat_template_to_messages_with_thinking(
-                    &request.messages,
-                    &request.tools,
-                    request.add_generation_prompt,
-                    request.enable_thinking,
-                )?
-        };
+        let prompt = self.render_structured_prompt(request)?;
         let render_elapsed = render_started.elapsed();
         let encode_started = Instant::now();
         let prompt_tokens = self.tokenizer.encode(&prompt)?;

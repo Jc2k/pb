@@ -347,6 +347,28 @@ fn qwen_structured_renderer_formats_single_user_prompt() {
 }
 
 #[test]
+fn flashmoe_prompt_preflight_uses_the_generation_template_and_tokenizer() {
+    let tokenizer = QwenTokenizer::from_json_bytes_with_config(
+        test_tokenizer_json(),
+        Some(test_tokenizer_config_json()),
+    )
+    .unwrap();
+    let messages = [ChatMessage::text(ChatRole::User, "hi")];
+    let (rendered, measured) = tokenizer
+        .render_and_encode_chat_prompt(&messages, &[], true, true)
+        .unwrap();
+
+    assert_eq!(
+        rendered,
+        tokenizer
+            .apply_chat_template_to_messages_with_thinking(&messages, &[], true, true)
+            .unwrap()
+    );
+    assert_eq!(measured, tokenizer.encode(&rendered).unwrap());
+    assert_eq!(measured.len(), 6);
+}
+
+#[test]
 fn qwen_structured_renderer_can_disable_emitted_thinking() {
     let config = test_tokenizer_config_json_with_template(
         r#"{% for message in messages %}{{ '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% if enable_thinking is false %}{{ '<think>\n\n</think>\n\n' }}{% endif %}{% endif %}"#,

@@ -32,6 +32,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::agent_context::{self, ContextLimitError, PreparedPrompt, PromptMeasurement};
 use crate::browser_tools;
 use crate::checks::{
     CheckEvidenceLedger, EvidenceSource, WorkspaceCheckRuntime, check_evidence_is_current,
@@ -41,7 +42,8 @@ use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::{
-    AgentContextUsage, AgentEvent, ContractStatus, FinalGraceStatus, TerminationReason,
+    AgentContextUsage, AgentEvent, ContextSectionUsage, ContractStatus, FinalGraceStatus,
+    TerminationReason,
 };
 use crate::handoff::{HandoffAttempt, ManagedCommitOutcome, managed_commit, run_handoff};
 use crate::lsp::{self, LspToolRegistry};
@@ -690,7 +692,7 @@ impl RunBudget {
         Ok(())
     }
 
-    fn reserve_model_invocation(&mut self, requested_max_tokens: i32) -> Result<i32> {
+    fn next_model_max_tokens(&self, requested_max_tokens: i32) -> Result<i32> {
         if self.model_invocations >= self.limits.model_invocations {
             bail!(
                 "model invocation limit reached ({})",
@@ -710,6 +712,11 @@ impl RunBudget {
             .saturating_sub(self.generated_tokens)
             .min(i32::MAX as usize) as i32;
         let max_tokens = requested_max_tokens.max(1).min(remaining_tokens.max(1));
+        Ok(max_tokens)
+    }
+
+    fn reserve_model_invocation(&mut self, requested_max_tokens: i32) -> Result<i32> {
+        let max_tokens = self.next_model_max_tokens(requested_max_tokens)?;
         self.model_invocations = self.model_invocations.saturating_add(1);
         Ok(max_tokens)
     }
@@ -727,30 +734,46 @@ impl RunBudget {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PromptToolResultMetadata {
+    pub(crate) arguments_sha256: String,
+    pub(crate) success: bool,
+    pub(crate) raw_bytes: usize,
+    pub(crate) raw_lines: usize,
+    pub(crate) omitted_chars: usize,
+    pub(crate) omitted_bytes: usize,
+    pub(crate) omitted_lines: usize,
+    pub(crate) workspace_fingerprint: Option<String>,
+    pub(crate) evidence_effects: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
-struct ChatMessage {
-    role: &'static str,
-    content: String,
+pub(crate) struct ChatMessage {
+    pub(crate) role: &'static str,
+    pub(crate) content: String,
     #[serde(default)]
-    tool_calls: Vec<AgentToolCall>,
+    pub(crate) tool_calls: Vec<AgentToolCall>,
     #[serde(default)]
-    tool_call_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
+    #[serde(skip)]
+    pub(crate) prompt_tool_result: Option<PromptToolResultMetadata>,
 }
 
 impl ChatMessage {
-    fn text(role: &'static str, content: impl Into<String>) -> Self {
+    pub(crate) fn text(role: &'static str, content: impl Into<String>) -> Self {
         Self {
             role,
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
             name: None,
+            prompt_tool_result: None,
         }
     }
 
-    fn assistant_with_tool_calls(
+    pub(crate) fn assistant_with_tool_calls(
         content: impl Into<String>,
         tool_calls: Vec<AgentToolCall>,
     ) -> Self {
@@ -760,16 +783,46 @@ impl ChatMessage {
             tool_calls,
             tool_call_id: None,
             name: None,
+            prompt_tool_result: None,
         }
     }
 
-    fn tool_result(tool: String, tool_call_id: Option<String>, content: String) -> Self {
+    #[cfg(test)]
+    pub(crate) fn tool_result(tool: String, tool_call_id: Option<String>, content: String) -> Self {
         Self {
             role: "tool",
             content,
             tool_calls: Vec::new(),
             tool_call_id,
             name: Some(tool),
+            prompt_tool_result: None,
+        }
+    }
+
+    pub(crate) fn tool_result_with_metadata(
+        tool: String,
+        tool_call_id: Option<String>,
+        content: String,
+        metadata: PromptToolResultMetadata,
+    ) -> Self {
+        Self {
+            role: "tool",
+            content,
+            tool_calls: Vec::new(),
+            tool_call_id,
+            name: Some(tool),
+            prompt_tool_result: Some(metadata),
+        }
+    }
+
+    pub(crate) fn context_receipt(content: String, metadata: PromptToolResultMetadata) -> Self {
+        Self {
+            role: "user",
+            content,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            prompt_tool_result: Some(metadata),
         }
     }
 }
@@ -789,16 +842,17 @@ fn correction_chat_message(summary: &str, message: &str) -> ChatMessage {
         tool_calls: Vec::new(),
         tool_call_id: None,
         name: None,
+        prompt_tool_result: None,
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct AgentToolCall {
+pub(crate) struct AgentToolCall {
     #[serde(default)]
-    id: Option<String>,
-    tool: String,
+    pub(crate) id: Option<String>,
+    pub(crate) tool: String,
     #[serde(default)]
-    arguments: Value,
+    pub(crate) arguments: Value,
 }
 
 impl AgentToolCall {
@@ -3378,21 +3432,48 @@ fn incomplete_contract_status(args: &AgentRequest) -> ContractStatus {
 }
 
 fn termination_reason_for_runtime_error(error: &anyhow::Error) -> TerminationReason {
+    if error.downcast_ref::<ContextLimitError>().is_some() {
+        return TerminationReason::ContextLimit;
+    }
     let message = format!("{error:#}").to_ascii_lowercase();
     if message.contains("model invocation limit") {
         TerminationReason::InvocationLimit
     } else if message.contains("generated token limit") {
         TerminationReason::TokenLimit
+    } else if message.contains("context limit") {
+        TerminationReason::ContextLimit
     } else if message.contains("resource limit")
         || message.contains("resource budget")
         || message.contains("working-set limit")
-        || message.contains("context limit")
         || message.contains("out of memory")
     {
         TerminationReason::ResourceLimit
     } else {
         TerminationReason::EngineError
     }
+}
+
+fn emit_context_limit_event(error: &anyhow::Error, nesting_depth: usize, sink: &mut dyn EventSink) {
+    let Some(limit) = error.downcast_ref::<ContextLimitError>() else {
+        return;
+    };
+    sink.emit(AgentEvent::ContextLimit {
+        context_capacity: limit.context_capacity,
+        reserved_generation_tokens: limit.reserved_generation_tokens,
+        safety_margin_tokens: limit.safety_margin_tokens,
+        usable_prompt_capacity: limit.usable_prompt_capacity,
+        measured_prompt_tokens: limit.measured_prompt_tokens,
+        largest_sections: limit
+            .largest_sections
+            .iter()
+            .map(|(label, chars)| ContextSectionUsage {
+                label: label.clone(),
+                chars: *chars,
+            })
+            .collect(),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
 }
 
 struct ToolExecutionEnv<'a> {
@@ -3620,6 +3701,7 @@ fn run_agent_steps(
             Ok(generated) => generated,
             Err(error) => {
                 let termination_reason = termination_reason_for_runtime_error(&error);
+                emit_context_limit_event(&error, nesting_depth, sink);
                 sink.emit(AgentEvent::Error {
                     message: format!("{error:#}"),
                     summary: format!("Agent terminated: {termination_reason}"),
@@ -4396,8 +4478,8 @@ fn run_final_grace(
     ));
     let mut grace_args = args.clone();
     grace_args.max_tokens = match run_budget
-        .borrow_mut()
-        .reserve_model_invocation(FINAL_GRACE_MAX_TOKENS)
+        .borrow()
+        .next_model_max_tokens(FINAL_GRACE_MAX_TOKENS)
     {
         Ok(max_tokens) => max_tokens,
         Err(error) => {
@@ -4420,8 +4502,38 @@ fn run_final_grace(
         }
     };
     grace_args.turn_max_tokens_cap = Some(FINAL_GRACE_MAX_TOKENS);
+    let prepared = match prepare_generation_prompt(generator, &grace_args, messages, &[], true) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let termination_reason = termination_reason_for_runtime_error(&error);
+            emit_context_limit_event(&error, nesting_depth, sink);
+            sink.emit(AgentEvent::FinalGrace {
+                status: FinalGraceStatus::Rejected,
+                detail: format!("final-only generation was blocked by preflight: {error:#}"),
+                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            return Ok(StepRunOutcome {
+                reached_final: false,
+                contract_status: if args.contract.is_some() {
+                    ContractStatus::Satisfied
+                } else {
+                    ContractStatus::Unspecified
+                },
+                verified_completed: false,
+                termination_reason,
+                final_content: None,
+                metrics,
+                gate_state,
+            });
+        }
+    };
+    let reserved_max_tokens = run_budget
+        .borrow_mut()
+        .reserve_model_invocation(FINAL_GRACE_MAX_TOKENS)?;
+    debug_assert_eq!(grace_args.max_tokens, reserved_max_tokens);
     sink.workflow_model_invocation_started(nesting_depth)?;
-    let completion = match generator.generate(&grace_args, messages, &[], true) {
+    let completion = match generator.generate(&grace_args, &prepared.messages, &[], true) {
         Ok(completion) => completion,
         Err(error) => {
             let termination_reason = termination_reason_for_runtime_error(&error);
@@ -4458,8 +4570,7 @@ fn run_final_grace(
     sink.workflow_generated_tokens(completion.generated_tokens)?;
     record_completion_metrics(
         &completion,
-        &grace_args,
-        messages,
+        &prepared,
         &[],
         true,
         grace_step,
@@ -4467,6 +4578,33 @@ fn run_final_grace(
         &mut metrics,
         sink,
     );
+    if completion.prompt_tokens != prepared.measurement.prompt_tokens {
+        let error = anyhow!(
+            "backend prompt measurement diverged from generation: preflight measured {} tokens but backend reported {}",
+            prepared.measurement.prompt_tokens,
+            completion.prompt_tokens
+        );
+        let termination_reason = termination_reason_for_runtime_error(&error);
+        sink.emit(AgentEvent::FinalGrace {
+            status: FinalGraceStatus::Rejected,
+            detail: format!("final-only generation accounting failed: {error:#}"),
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+        return Ok(StepRunOutcome {
+            reached_final: false,
+            contract_status: if args.contract.is_some() {
+                ContractStatus::Satisfied
+            } else {
+                ContractStatus::Unspecified
+            },
+            verified_completed: false,
+            termination_reason,
+            final_content: None,
+            metrics,
+            gate_state,
+        });
+    }
 
     let action = if completion.finish_reason == CompletionFinishReason::EndOfGeneration
         && completion.tool_calls.is_empty()
@@ -4690,8 +4828,7 @@ fn run_final_grace(
 
 fn record_completion_metrics(
     completion: &CompletionOutput,
-    args: &AgentRequest,
-    messages: &[ChatMessage],
+    prepared: &PreparedPrompt,
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
     step: usize,
@@ -4720,8 +4857,7 @@ fn record_completion_metrics(
         prompt_tokens: completion.prompt_tokens,
         generated_tokens: completion.generated_tokens,
         context: Some(completion_context_usage(
-            args,
-            messages,
+            prepared,
             tools,
             enable_thinking,
             completion.prompt_tokens,
@@ -4735,15 +4871,14 @@ fn record_completion_metrics(
 }
 
 fn completion_context_usage(
-    args: &AgentRequest,
-    messages: &[ChatMessage],
+    prepared: &PreparedPrompt,
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
     prompt_tokens: usize,
 ) -> AgentContextUsage {
-    let context_capacity = args.ctx_size as usize;
-    let reserved_generation_tokens = usize::try_from(args.max_tokens.max(1)).unwrap_or(usize::MAX);
-    let usable_prompt_capacity = context_capacity.saturating_sub(reserved_generation_tokens);
+    let context_capacity = prepared.context_capacity;
+    let reserved_generation_tokens = prepared.reserved_generation_tokens;
+    let usable_prompt_capacity = prepared.usable_prompt_capacity;
     let prompt_utilization_bps = if usable_prompt_capacity == 0 {
         u32::MAX
     } else {
@@ -4757,9 +4892,11 @@ fn completion_context_usage(
     AgentContextUsage {
         context_capacity,
         reserved_generation_tokens,
+        safety_margin_tokens: prepared.safety_margin_tokens,
         usable_prompt_capacity,
+        preflight_prompt_tokens: prepared.measurement.prompt_tokens,
         prompt_utilization_bps,
-        message_chars: messages.iter().fold(0usize, |total, message| {
+        message_chars: prepared.messages.iter().fold(0usize, |total, message| {
             let tool_chars = message.tool_calls.iter().fold(0usize, |tool_total, call| {
                 tool_total
                     .saturating_add(call.tool.chars().count())
@@ -4771,10 +4908,10 @@ fn completion_context_usage(
         }),
         tool_count: tools.len(),
         tool_schema_chars: model_tools_value(tools).to_string().chars().count(),
-        tool_schema_tokens: None,
+        tool_schema_tokens: Some(prepared.measurement.tool_schema_tokens),
         thinking_enabled: Some(enable_thinking),
-        compacted_messages: 0,
-        omitted_tool_result_chars: 0,
+        compacted_messages: prepared.compacted_messages,
+        omitted_tool_result_chars: prepared.omitted_tool_result_chars,
         read_cache_hits: 0,
         closure_checkpoints: 0,
     }
@@ -4969,6 +5106,16 @@ fn monitor_recommends_more_steps(audit: &str) -> bool {
     positive_recommendation && !negative_recommendation
 }
 
+struct ExecutedToolResult {
+    tool_call_id: Option<String>,
+    tool: String,
+    arguments: Value,
+    result: String,
+    success: bool,
+    duration_ms: u64,
+    energy: Option<EnergyEstimate>,
+}
+
 fn execute_tool_calls(
     calls: Vec<AgentToolCall>,
     thinking: Option<String>,
@@ -5022,7 +5169,15 @@ fn execute_tool_calls(
                 env.workspace_root,
             )?
         {
-            results.push((call.id, call.tool, call.arguments, feedback, 0, None));
+            results.push(ExecutedToolResult {
+                tool_call_id: call.id,
+                tool: call.tool,
+                arguments: call.arguments,
+                result: feedback,
+                success: false,
+                duration_ms: 0,
+                energy: None,
+            });
             continue;
         }
 
@@ -5030,17 +5185,18 @@ fn execute_tool_calls(
             && !workflow_tool_allowed(&call.tool, capabilities, env.mcp_registry, env.lsp_registry)
         {
             let tool = call.tool.clone();
-            results.push((
-                call.id,
-                call.tool,
-                call.arguments,
-                format!(
+            results.push(ExecutedToolResult {
+                tool_call_id: call.id,
+                tool: call.tool,
+                arguments: call.arguments,
+                result: format!(
                     "tool '{tool}' is not available in {}",
                     capability_scope(env.args)
                 ),
-                0,
-                None,
-            ));
+                success: false,
+                duration_ms: 0,
+                energy: None,
+            });
             continue;
         }
 
@@ -5051,14 +5207,15 @@ fn execute_tool_calls(
             PolicyOutcome::Allow => runnable.push(call),
             PolicyOutcome::Deny => {
                 let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
-                results.push((
-                    call.id,
-                    call.tool,
-                    call.arguments,
-                    format!("tool denied by policy rule '{rule}'"),
-                    0,
-                    None,
-                ));
+                results.push(ExecutedToolResult {
+                    tool_call_id: call.id,
+                    tool: call.tool,
+                    arguments: call.arguments,
+                    result: format!("tool denied by policy rule '{rule}'"),
+                    success: false,
+                    duration_ms: 0,
+                    energy: None,
+                });
             }
             PolicyOutcome::Ask => {
                 let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
@@ -5076,14 +5233,17 @@ fn execute_tool_calls(
                 if answer == "allow" {
                     runnable.push(call);
                 } else {
-                    results.push((
-                        call.id,
-                        call.tool,
-                        call.arguments,
-                        format!("tool was not approved by the user for policy rule '{rule}'"),
-                        0,
-                        None,
-                    ));
+                    results.push(ExecutedToolResult {
+                        tool_call_id: call.id,
+                        tool: call.tool,
+                        arguments: call.arguments,
+                        result: format!(
+                            "tool was not approved by the user for policy rule '{rule}'"
+                        ),
+                        success: false,
+                        duration_ms: 0,
+                        energy: None,
+                    });
                 }
             }
         }
@@ -5123,37 +5283,40 @@ fn execute_tool_calls(
                 let registry = registry.clone();
                 std::thread::spawn(move || {
                     let started = Instant::now();
-                    let result = mcp::call_tool(&registry, &call.tool, &call.arguments)
-                        .unwrap_or_else(|error| format_tool_error(&call.tool, &error));
+                    let (result, success) =
+                        match mcp::call_tool(&registry, &call.tool, &call.arguments) {
+                            Ok(result) => (result, true),
+                            Err(error) => (format_tool_error(&call.tool, &error), false),
+                        };
                     let duration_ms = duration_millis(started);
-                    (
-                        call.id,
-                        call.tool,
-                        call.arguments,
+                    ExecutedToolResult {
+                        tool_call_id: call.id,
+                        tool: call.tool,
+                        arguments: call.arguments,
                         result,
+                        success,
                         duration_ms,
-                        None,
-                    )
+                        energy: None,
+                    }
                 })
             })
             .collect::<Vec<_>>();
         let mut batch_results = Vec::with_capacity(parallel_batch_calls);
         for handle in handles {
-            batch_results.push(handle.join().unwrap_or_else(|_| {
-                (
-                    None,
-                    "unknown".to_string(),
-                    Value::Null,
-                    "tool thread panicked".to_string(),
-                    0,
-                    None,
-                )
+            batch_results.push(handle.join().unwrap_or_else(|_| ExecutedToolResult {
+                tool_call_id: None,
+                tool: "unknown".to_string(),
+                arguments: Value::Null,
+                result: "tool thread panicked".to_string(),
+                success: false,
+                duration_ms: 0,
+                energy: None,
             }));
         }
         let batch_energy = batch_energy_start
             .and_then(|sample| sample.estimate_since(energy::sample(), batch_started));
         if let Some(first) = batch_results.first_mut() {
-            first.5 = batch_energy;
+            first.energy = batch_energy;
         }
         results.extend(batch_results);
     } else {
@@ -5161,19 +5324,20 @@ fn execute_tool_calls(
             let measure_tool = call.tool != "sub_agent";
             let energy_start = measure_tool.then(energy::sample).flatten();
             let started = Instant::now();
-            let result = match run_tool(&call.tool, &call.arguments, &tool_context, sink, metrics) {
-                Ok(result) => result,
-                Err(error) => {
-                    let result = format_tool_error(&call.tool, &error);
-                    sink.emit(AgentEvent::Correction {
-                        message: result.clone(),
-                        summary: format!("{} tool call needs corrected arguments", call.tool),
-                        nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
-                        timestamp_ms: Some(now_millis()),
-                    });
-                    result
-                }
-            };
+            let (result, success) =
+                match run_tool(&call.tool, &call.arguments, &tool_context, sink, metrics) {
+                    Ok(result) => (result, true),
+                    Err(error) => {
+                        let result = format_tool_error(&call.tool, &error);
+                        sink.emit(AgentEvent::Correction {
+                            message: result.clone(),
+                            summary: format!("{} tool call needs corrected arguments", call.tool),
+                            nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        (result, false)
+                    }
+                };
             let result = append_workflow_content_fingerprint(
                 env.args,
                 &call.tool,
@@ -5183,14 +5347,15 @@ fn execute_tool_calls(
             let energy =
                 energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
             let duration_ms = duration_millis(started);
-            results.push((
-                call.id,
-                call.tool,
-                call.arguments,
+            results.push(ExecutedToolResult {
+                tool_call_id: call.id,
+                tool: call.tool,
+                arguments: call.arguments,
                 result,
+                success,
                 duration_ms,
                 energy,
-            ));
+            });
         }
     }
 
@@ -5198,7 +5363,16 @@ fn execute_tool_calls(
         assistant_output.to_string(),
         calls_for_transcript,
     ));
-    for (tool_call_id, tool, _arguments, result, duration_ms, energy) in results {
+    for ExecutedToolResult {
+        tool_call_id,
+        tool,
+        arguments,
+        result,
+        success,
+        duration_ms,
+        energy,
+    } in results
+    {
         metrics.tool_calls += 1;
         if tool != "sub_agent" {
             metrics.tool_runtime_ms = metrics.tool_runtime_ms.saturating_add(duration_ms);
@@ -5220,9 +5394,55 @@ fn execute_tool_calls(
             nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
-        messages.push(ChatMessage::tool_result(tool, tool_call_id, result));
+        let result_budget = agent_context::tool_result_char_budget(
+            env.args.ctx_size as usize,
+            usize::try_from(boosted_max_tokens(env.args).max(1)).unwrap_or(usize::MAX),
+        );
+        let prompt_result = agent_context::bound_tool_result_for_prompt(&result, result_budget);
+        let metadata = PromptToolResultMetadata {
+            arguments_sha256: agent_context::normalized_arguments_sha256(&arguments),
+            success,
+            raw_bytes: result.len(),
+            raw_lines: result.lines().count(),
+            omitted_chars: prompt_result.omitted_chars,
+            omitted_bytes: prompt_result.omitted_bytes,
+            omitted_lines: prompt_result.omitted_lines,
+            workspace_fingerprint: result_workspace_fingerprint(&result).map(str::to_string),
+            evidence_effects: tool_evidence_effects(&tool, &arguments),
+        };
+        messages.push(ChatMessage::tool_result_with_metadata(
+            tool,
+            tool_call_id,
+            prompt_result.content,
+            metadata,
+        ));
     }
     Ok(())
+}
+
+fn result_workspace_fingerprint(result: &str) -> Option<&str> {
+    result
+        .rsplit_once("Harness current content fingerprint: ")
+        .map(|(_, fingerprint)| fingerprint.lines().next().unwrap_or_default().trim())
+        .filter(|fingerprint| !fingerprint.is_empty())
+}
+
+fn tool_evidence_effects(tool: &str, arguments: &Value) -> String {
+    match tool {
+        "read_file" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| format!("read_path:{path}")),
+        "run_check" => arguments
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| format!("named_check:{id}")),
+        "write_file" | "replace_file" | "edit_file" | "apply_patch" | "rm" => {
+            Some("workspace_mutation".to_string())
+        }
+        _ => None,
+    }
+    .unwrap_or_else(|| "none".to_string())
 }
 
 fn append_workflow_content_fingerprint(
@@ -5561,6 +5781,14 @@ fn rejected_completion_diagnostic(output: &str, finish_reason: CompletionFinishR
 }
 
 trait CompletionEngine {
+    fn measure_prompt(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
+    ) -> Result<PromptMeasurement>;
+
     fn generate(
         &mut self,
         args: &AgentRequest,
@@ -5568,6 +5796,26 @@ trait CompletionEngine {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
     ) -> Result<CompletionOutput>;
+}
+
+fn prepare_generation_prompt(
+    generator: &mut dyn CompletionEngine,
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
+) -> Result<PreparedPrompt> {
+    let context_capacity = args.ctx_size as usize;
+    let reserved_generation_tokens = usize::try_from(args.max_tokens.max(1)).unwrap_or(usize::MAX);
+    agent_context::prepare_prompt(
+        messages,
+        context_capacity,
+        reserved_generation_tokens,
+        model_tools_value(tools).to_string().chars().count(),
+        |prepared_messages| {
+            generator.measure_prompt(args, prepared_messages, tools, enable_thinking)
+        },
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -7151,6 +7399,7 @@ fn workflow_outcome_for_termination(reason: TerminationReason) -> crate::workflo
         | TerminationReason::GateLoop
         | TerminationReason::ParseLoop => crate::workflow::WorkflowOutcome::StepLimit,
         TerminationReason::InvocationLimit => crate::workflow::WorkflowOutcome::InvocationLimit,
+        TerminationReason::ContextLimit => crate::workflow::WorkflowOutcome::ContextLimit,
         TerminationReason::TokenLimit | TerminationReason::ResourceLimit => {
             crate::workflow::WorkflowOutcome::TokenLimit
         }
@@ -7175,6 +7424,7 @@ fn delivery_terminal_outcome(
         crate::workflow::WorkflowOutcome::StepLimit => TerminationReason::StepLimit,
         crate::workflow::WorkflowOutcome::InvocationLimit => TerminationReason::InvocationLimit,
         crate::workflow::WorkflowOutcome::TokenLimit => TerminationReason::TokenLimit,
+        crate::workflow::WorkflowOutcome::ContextLimit => TerminationReason::ContextLimit,
         crate::workflow::WorkflowOutcome::ExecutorUnavailable => {
             TerminationReason::ExecutorUnavailable
         }
@@ -7271,12 +7521,26 @@ struct ScriptedCompletionEngine {
 }
 
 impl CompletionEngine for ScriptedCompletionEngine {
+    fn measure_prompt(
+        &mut self,
+        _args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
+    ) -> Result<PromptMeasurement> {
+        Ok(scripted_prompt_measurement(
+            messages,
+            tools,
+            enable_thinking,
+        ))
+    }
+
     fn generate(
         &mut self,
         args: &AgentRequest,
-        _messages: &[ChatMessage],
+        messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
-        _enable_thinking: bool,
+        enable_thinking: bool,
     ) -> Result<CompletionOutput> {
         self.generation_tool_counts.push(tools.len());
         self.generation_max_tokens.push(args.max_tokens);
@@ -7298,11 +7562,32 @@ impl CompletionEngine for ScriptedCompletionEngine {
             } else {
                 CompletionFinishReason::EndOfGeneration
             },
-            prompt_tokens: 1,
+            prompt_tokens: scripted_prompt_measurement(messages, tools, enable_thinking)
+                .prompt_tokens,
             generated_tokens: 1,
             duration_ms: 0,
             energy: None,
         })
+    }
+}
+
+fn scripted_prompt_measurement(
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
+) -> PromptMeasurement {
+    let message_chars = model_messages_value(messages)
+        .map(|messages| messages.to_string().chars().count())
+        .unwrap_or(0);
+    let tool_chars = model_tools_value(tools).to_string().chars().count();
+    let thinking_chars = if enable_thinking { 8 } else { 0 };
+    PromptMeasurement {
+        prompt_tokens: message_chars
+            .saturating_add(tool_chars)
+            .saturating_add(thinking_chars)
+            .div_ceil(4)
+            .max(1),
+        tool_schema_tokens: tool_chars.div_ceil(4),
     }
 }
 
@@ -7705,6 +7990,27 @@ struct LlamaCompletionEngine<'a> {
 }
 
 impl CompletionEngine for LlamaCompletionEngine<'_> {
+    fn measure_prompt(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        _enable_thinking: bool,
+    ) -> Result<PromptMeasurement> {
+        let request = llama_chat_request(args, messages, tools)?;
+        let prompt_tokens = self.llamacpp.measure_chat_prompt(&request)?;
+        let tool_schema_tokens = if tools.is_empty() {
+            0
+        } else {
+            let without_tools = llama_chat_request(args, messages, &[])?;
+            prompt_tokens.saturating_sub(self.llamacpp.measure_chat_prompt(&without_tools)?)
+        };
+        Ok(PromptMeasurement {
+            prompt_tokens,
+            tool_schema_tokens,
+        })
+    }
+
     fn generate(
         &mut self,
         args: &AgentRequest,
@@ -7712,18 +8018,7 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         tools: &[BuiltInToolSchema],
         _enable_thinking: bool,
     ) -> Result<CompletionOutput> {
-        let request = LlamaCppChatRequest {
-            messages: model_messages_value(messages)?,
-            tools: model_tools_value(tools),
-            ctx_size: args.ctx_size,
-            threads: args.threads,
-            threads_batch: args.threads_batch,
-            gpu_layers: args.gpu_layers,
-            max_tokens: args.max_tokens,
-            top_k: args.top_k,
-            temperature: args.temperature,
-            seed: args.seed,
-        };
+        let request = llama_chat_request(args, messages, tools)?;
         let mut output = self.llamacpp.generate_chat(&request)?;
         let tool_calls = parse_model_tool_call_output(&mut output.content)?;
         Ok(CompletionOutput {
@@ -7741,11 +8036,40 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
     }
 }
 
+fn llama_chat_request(
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+) -> Result<LlamaCppChatRequest> {
+    Ok(LlamaCppChatRequest {
+        messages: model_messages_value(messages)?,
+        tools: model_tools_value(tools),
+        ctx_size: args.ctx_size,
+        threads: args.threads,
+        threads_batch: args.threads_batch,
+        gpu_layers: args.gpu_layers,
+        max_tokens: args.max_tokens,
+        top_k: args.top_k,
+        temperature: args.temperature,
+        seed: args.seed,
+    })
+}
+
 struct FlashMoeCompletionEngine {
     engine: crate::inference::flashmoe::FlashMoeEngine,
 }
 
 impl CompletionEngine for FlashMoeCompletionEngine {
+    fn measure_prompt(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
+    ) -> Result<PromptMeasurement> {
+        measure_flashmoe_prompt(&self.engine, args, messages, tools, enable_thinking)
+    }
+
     fn generate(
         &mut self,
         args: &AgentRequest,
@@ -7762,6 +8086,16 @@ struct BorrowedFlashMoeCompletionEngine<'a> {
 }
 
 impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
+    fn measure_prompt(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
+    ) -> Result<PromptMeasurement> {
+        measure_flashmoe_prompt(self.engine, args, messages, tools, enable_thinking)
+    }
+
     fn generate(
         &mut self,
         args: &AgentRequest,
@@ -7784,19 +8118,7 @@ fn generate_flashmoe_completion(
     let started = Instant::now();
     let output = engine.generate_structured_in_session(
         &args.session_id,
-        &StructuredGenerationRequest {
-            messages: to_model_messages(messages)?,
-            tools: to_model_tools(tools),
-            add_generation_prompt: true,
-            enable_thinking,
-            raw_prompt: false,
-            trace_candidates: false,
-            context_size: Some(args.ctx_size as usize),
-            max_tokens: args.max_tokens,
-            temperature: args.temperature,
-            top_k: args.top_k,
-            seed: args.seed,
-        },
+        &flashmoe_structured_request(args, messages, tools, enable_thinking)?,
     )?;
     let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
     Ok(CompletionOutput {
@@ -7821,6 +8143,48 @@ fn generate_flashmoe_completion(
     })
 }
 
+fn measure_flashmoe_prompt(
+    engine: &crate::inference::flashmoe::FlashMoeEngine,
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
+) -> Result<PromptMeasurement> {
+    let request = flashmoe_structured_request(args, messages, tools, enable_thinking)?;
+    let prompt_tokens = engine.measure_structured_prompt(&request)?;
+    let tool_schema_tokens = if tools.is_empty() {
+        0
+    } else {
+        let without_tools = flashmoe_structured_request(args, messages, &[], enable_thinking)?;
+        prompt_tokens.saturating_sub(engine.measure_structured_prompt(&without_tools)?)
+    };
+    Ok(PromptMeasurement {
+        prompt_tokens,
+        tool_schema_tokens,
+    })
+}
+
+fn flashmoe_structured_request(
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
+) -> Result<StructuredGenerationRequest> {
+    Ok(StructuredGenerationRequest {
+        messages: to_model_messages(messages)?,
+        tools: to_model_tools(tools),
+        add_generation_prompt: true,
+        enable_thinking,
+        raw_prompt: false,
+        trace_candidates: false,
+        context_size: Some(args.ctx_size as usize),
+        max_tokens: args.max_tokens,
+        temperature: args.temperature,
+        top_k: args.top_k,
+        seed: args.seed,
+    })
+}
+
 fn generate_and_parse_action_with_retries(
     generator: &mut dyn CompletionEngine,
     args: &AgentRequest,
@@ -7837,16 +8201,21 @@ fn generate_and_parse_action_with_retries(
 
     loop {
         let mut request = args.clone();
-        request.max_tokens = run_budget
+        request.max_tokens = run_budget.borrow().next_model_max_tokens(max_tokens)?;
+        let prepared =
+            prepare_generation_prompt(generator, &request, messages, tools, enable_thinking)?;
+        let reserved_max_tokens = run_budget
             .borrow_mut()
             .reserve_model_invocation(max_tokens)?;
+        debug_assert_eq!(request.max_tokens, reserved_max_tokens);
         sink.workflow_model_invocation_started(nesting_depth)?;
         // Durable workflow accounting records an invocation before entering the
         // backend. Mirror that attempted step even when model setup/generation
         // returns an error, otherwise the stage runner replaces the actionable
         // engine/resource failure with a usage-divergence error.
         metrics.llm_invocations = metrics.llm_invocations.saturating_add(1);
-        let completion = generator.generate(&request, messages, tools, enable_thinking)?;
+        let completion =
+            generator.generate(&request, &prepared.messages, tools, enable_thinking)?;
         run_budget
             .borrow_mut()
             .record_generated_tokens(completion.generated_tokens);
@@ -7871,8 +8240,7 @@ fn generate_and_parse_action_with_retries(
             prompt_tokens: completion.prompt_tokens,
             generated_tokens: completion.generated_tokens,
             context: Some(completion_context_usage(
-                &request,
-                messages,
+                &prepared,
                 tools,
                 enable_thinking,
                 completion.prompt_tokens,
@@ -7883,6 +8251,13 @@ fn generate_and_parse_action_with_retries(
             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
+        if completion.prompt_tokens != prepared.measurement.prompt_tokens {
+            bail!(
+                "backend prompt measurement diverged from generation: preflight measured {} tokens but backend reported {}",
+                prepared.measurement.prompt_tokens,
+                completion.prompt_tokens
+            );
+        }
         if !completion.tool_calls.is_empty() {
             return Ok(Ok((
                 completion.content.clone(),
@@ -8750,6 +9125,63 @@ fn run_ripgrep(
     }
 }
 
+fn render_bounded_read_file(
+    path: &str,
+    text: &str,
+    start: usize,
+    requested_end: Option<usize>,
+    max_chars: usize,
+) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = start.max(1);
+    let end_line = requested_end.unwrap_or(lines.len()).min(lines.len());
+    if start > end_line || start > lines.len() {
+        return "(no content in requested range)".to_string();
+    }
+
+    let continuation_reserve = 480usize.saturating_add(path.chars().count());
+    let content_budget = max_chars.saturating_sub(continuation_reserve).max(64);
+    let mut output = String::new();
+    let mut next_line = start;
+    for (index, line) in lines
+        .iter()
+        .enumerate()
+        .take(end_line)
+        .skip(start.saturating_sub(1))
+    {
+        let rendered = format!("{}: {}\n", index + 1, line);
+        if output
+            .chars()
+            .count()
+            .saturating_add(rendered.chars().count())
+            > content_budget
+        {
+            break;
+        }
+        output.push_str(&rendered);
+        next_line = index + 2;
+    }
+
+    if next_line <= end_line {
+        let suggested_end = requested_end
+            .unwrap_or_else(|| next_line.saturating_add(199))
+            .min(end_line);
+        let omitted_lines = end_line.saturating_sub(next_line).saturating_add(1);
+        if output.is_empty() {
+            output.push_str("(no complete line fits the current read-result budget)\n");
+        }
+        output.push_str(&format!(
+            "\n[read_file continuation]\nreturned_start={start}\nnext_line={next_line}\nomitted_lines={omitted_lines}\nnext_call={}\nsearch_hint={}\n",
+            json!({"path": path, "start": next_line, "end": suggested_end}),
+            json!({"tool": "ripgrep", "arguments": {"query": "<target text>", "path": path}}),
+        ));
+    }
+    if output.is_empty() {
+        output.push_str("(no content in requested range)");
+    }
+    output
+}
+
 fn run_tool(
     tool: &str,
     arguments: &Value,
@@ -8838,26 +9270,22 @@ fn run_tool(
             }
             drop(gate_state);
 
-            let lines: Vec<_> = text.lines().collect();
             if let Some(end) = end
                 && (end as usize) < start
             {
                 return Ok("(no content in requested range)".to_string());
             }
-            let end_line = end.map_or(lines.len(), |v| v as usize).max(start);
-            let mut out = String::new();
-            for (idx, line) in lines
-                .iter()
-                .enumerate()
-                .take(lines.len().min(end_line))
-                .skip(start.saturating_sub(1))
-            {
-                out.push_str(&format!("{}: {}\n", idx + 1, line));
-            }
-            if out.is_empty() {
-                out.push_str("(no content in requested range)");
-            }
-            Ok(out)
+            let result_budget = agent_context::tool_result_char_budget(
+                context.request.ctx_size as usize,
+                usize::try_from(boosted_max_tokens(context.request).max(1)).unwrap_or(usize::MAX),
+            );
+            Ok(render_bounded_read_file(
+                path,
+                &text,
+                start,
+                end.map(|value| value as usize),
+                result_budget,
+            ))
         }
         "glob" => {
             let pattern = arguments
@@ -12692,7 +13120,7 @@ mod tests {
             turn_max_tokens_cap: None,
             tool_allowlist: None,
             accept_existing_workspace_changes: false,
-            ctx_size: 4096,
+            ctx_size: 8192,
             threads: None,
             threads_batch: None,
             gpu_layers: 0,
@@ -12735,6 +13163,7 @@ mod tests {
 
     fn workflow_request(profile: AgentProfile, workspace: &Path) -> AgentRequest {
         let mut request = test_agent_request(profile, 512);
+        request.ctx_size = 8_192;
         request.intent = Some(crate::workflow::TurnIntent::Deliver);
         request.legacy_prompt_owned_delivery = false;
         request.workdir = Some(workspace.to_path_buf());
@@ -15884,7 +16313,7 @@ mod tests {
             termination_reason_for_runtime_error(&anyhow!(
                 "FlashMoe context limit exceeded before KV allocation"
             )),
-            TerminationReason::ResourceLimit
+            TerminationReason::ContextLimit
         );
         assert_eq!(
             termination_reason_for_runtime_error(&anyhow!("model invocation limit reached (2)")),
@@ -15894,6 +16323,79 @@ mod tests {
             termination_reason_for_runtime_error(&anyhow!("generated token limit reached (10)")),
             TerminationReason::TokenLimit
         );
+    }
+
+    #[test]
+    fn cb4_context_limit_stops_before_scripted_generation() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Ask, 128);
+        request.task = "authoritative task anchor ".repeat(500);
+        request.ctx_size = 512;
+        request.turn_max_tokens_cap = Some(128);
+        request.max_steps = 1;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![scripted_final("must remain unused")],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::ContextLimit);
+        assert_eq!(outcome.llm_invocations, 0);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ContextLimit {
+                measured_prompt_tokens,
+                usable_prompt_capacity,
+                ..
+            } if measured_prompt_tokens > usable_prompt_capacity
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::LlmInvocation { .. }))
+        );
+    }
+
+    #[test]
+    fn cb2_prompt_shortening_preserves_the_durable_tool_result() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 2;
+        request.turn_max_tokens_cap = Some(256);
+        request.ctx_size = 8_192;
+        let completions = vec![
+            tool_completion("run_command", json!({"cmd": "seq 1 4000"})),
+            scripted_final("inspected bounded command evidence"),
+        ];
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(&request, completions, tmp.path(), &mut |event| {
+            events.push(event)
+        })
+        .unwrap();
+
+        assert_eq!(outcome.llm_invocations, 2);
+        let durable = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { tool, result, .. } if tool == "run_command" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(durable.chars().count() > 10_000);
+        assert!(durable.contains("3000"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::LlmInvocation {
+                context: Some(context),
+                ..
+            } if context.omitted_tool_result_chars > 0
+        )));
     }
 
     #[test]
@@ -18359,6 +18861,28 @@ mod tests {
 
         let result = run_ripgrep("needle", None, 1, root).unwrap();
         assert_eq!(result.lines().count(), 1);
+    }
+
+    #[test]
+    fn cb1_large_read_is_bounded_on_whole_lines_with_exact_continuation() {
+        let text = (1..=5_000)
+            .map(|line| format!("line {line}: deterministic fixture content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = render_bounded_read_file("large.txt", &text, 1, None, 4_000);
+        assert!(result.chars().count() <= 4_000);
+        assert!(result.starts_with("1: line 1: deterministic fixture content\n"));
+        assert!(result.contains("[read_file continuation]"));
+        let next_line = result
+            .lines()
+            .find_map(|line| line.strip_prefix("next_line="))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!(next_line > 1 && next_line < 5_000);
+        assert!(result.contains(&format!(r#""start":{next_line}"#)));
+        assert!(!result.contains(&format!("{}: line {}:", next_line, next_line)));
+        assert!(result.contains("\"tool\":\"ripgrep\""));
     }
 
     #[test]

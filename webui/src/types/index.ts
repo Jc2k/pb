@@ -222,6 +222,17 @@ export type AgentEvent =
       timestamp_ms?: number;
     }
   | {
+      type: "context_limit";
+      context_capacity: number;
+      reserved_generation_tokens: number;
+      safety_margin_tokens: number;
+      usable_prompt_capacity: number;
+      measured_prompt_tokens: number;
+      largest_sections: Array<{ label: string; chars: number }>;
+      nesting_depth?: number;
+      timestamp_ms?: number;
+    }
+  | {
       type: "llm_invocation";
       step: number;
       duration_ms: number;
@@ -230,7 +241,9 @@ export type AgentEvent =
       context?: {
         context_capacity: number;
         reserved_generation_tokens: number;
+        safety_margin_tokens: number;
         usable_prompt_capacity: number;
+        preflight_prompt_tokens: number;
         prompt_utilization_bps: number;
         message_chars: number;
         tool_count: number;
@@ -403,6 +416,7 @@ export type WorkflowOutcome =
   | "step_limit"
   | "invocation_limit"
   | "token_limit"
+  | "context_limit"
   | "engine_error"
   | "cancelled";
 

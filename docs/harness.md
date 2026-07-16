@@ -74,8 +74,36 @@ zero with `verified_completed=true`. Required mutation with no delta becomes
 `contract_unsatisfied`; persistent check failure, missing executor, repeated repair failure, and an
 unsafe required commit remain distinct nonzero `checks_failed`, `executor_unavailable`,
 `repair_exhausted`, and `commit_blocked` outcomes. Step, parse, runtime-engine, and resource-limit
-exits keep their existing structured reasons. Older stored summaries without these additive fields
-remain readable with conservative defaults.
+exits keep their existing structured reasons. A prompt whose authoritative anchors and exposed
+schemas cannot fit is rejected before inference with the distinct `context_limit` reason. Older
+stored summaries without these additive fields remain readable with conservative defaults.
+
+### Prompt budget and bounded results
+
+Every model call is rendered and tokenized before it is charged to the invocation budget. The
+llama.cpp and FlashMoe paths use the same chat-template and tokenizer path for preflight as for
+generation; the scripted engine uses a deterministic counter. The usable prompt capacity is the
+declared context minus the current generation reserve and a fixed 32-token safety margin. pb begins
+compacting completed assistant/tool exchanges above 70% of that usable capacity and targets 60%.
+The task, current stage/contract material, accepted workflow artifacts, fingerprints, checks, and
+terminal requirements remain authoritative anchors and are not summarized away.
+
+Compacted exchanges become deterministic context receipts containing the tool name, canonical
+argument hash, success state, bounded excerpt, exact omission counts, workspace fingerprint, and
+evidence effects. A receipt grants no authority of its own. Full tool results are emitted to the
+durable event stream before their prompt representation is shortened, so prompt budgeting never
+removes audit evidence. The `llm_invocation.context` snapshot records preflight and backend prompt
+tokens, usable capacity, safety margin, schema tokens, compacted messages, and omitted result
+content. Runtime parity checks reject any disagreement between preflight and the backend-reported
+prompt count.
+
+Built-in `read_file` results are whole-line bounded against the active context and generation
+reserve. An omitted or oversized range ends with a machine-generated continuation containing the
+exact next line and `next_call` JSON, plus a targeted `ripgrep` suggestion. Other oversized prompt
+results use a deterministic prefix/suffix representation with a raw SHA-256 and exact omitted
+character, byte, and line counts. If compaction cannot make the prompt fit without altering anchors,
+pb emits `context_limit` with the measured token count and largest prompt sections; no model
+invocation or generation budget is consumed.
 
 Deterministic recovery is bounded. Repeated parse, artifact validation, identical-tool, plan-cycle,
 repair-cycle, invocation, token, stage-step, and advisory failures stop with explicit outcomes
@@ -181,11 +209,13 @@ pb harness eval --model model.gguf --model-dir /path/to/models \
 
 Use `--suite small-model` to run the stable subset used by
 [the small-model reliability plan](small-model-agent-reliability-plan.md) and its checked
-[S0 baseline](benchmarks/small-model-agent-baseline.md). Each model-invocation record includes an
-optional backward-compatible context snapshot covering capacity, generation reserve, prompt
-high-water utilization, message/schema size, thinking mode, and the compaction/cache/closure
-counters introduced by later milestones. Runtime setup failures are reported separately from
-artifact quality so a backend experiment error is not scored as model reasoning.
+[S0 baseline](benchmarks/small-model-agent-baseline.md) and
+[S1 prompt-budget checkpoint](benchmarks/small-model-agent-s1.md). Each model-invocation record
+includes an optional backward-compatible context snapshot covering capacity, generation reserve,
+prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,
+thinking mode, and the compaction/cache/closure counters introduced by later milestones. Runtime
+setup failures are reported separately from artifact quality so a backend experiment error is not
+scored as model reasoning.
 
 Every real-model record repeats the backend, model, resolved model directory, token/context/thread/
 GPU settings, sampling values, seed, FlashMoe resource-policy version, normalized workspace-config

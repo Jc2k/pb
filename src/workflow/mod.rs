@@ -65,6 +65,7 @@ pub enum WorkflowOutcome {
     StepLimit,
     InvocationLimit,
     TokenLimit,
+    ContextLimit,
     EngineError,
     Cancelled,
 }

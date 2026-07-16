@@ -310,6 +310,23 @@ impl QwenTokenizer {
         )
     }
 
+    pub(super) fn render_and_encode_chat_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> Result<(String, Vec<u32>)> {
+        let prompt = self.apply_chat_template_to_messages_with_thinking(
+            messages,
+            tools,
+            add_generation_prompt,
+            enable_thinking,
+        )?;
+        let tokens = self.encode(&prompt)?;
+        Ok((prompt, tokens))
+    }
+
     pub(super) fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .tokenizer

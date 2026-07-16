@@ -18,6 +18,7 @@ use crate::integrations::{IntegrationInstallRequest, IntegrationKind};
 use crate::mcp::{McpServerConfig, ProjectMcpConfig};
 use base64::Engine as _;
 
+mod agent_context;
 pub mod agent_core;
 pub mod browser_tools;
 pub mod checks;

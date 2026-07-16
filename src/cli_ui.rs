@@ -100,6 +100,24 @@ pub fn render_event(event: &AgentEvent) {
             };
             print_block(&label, result);
         }
+        AgentEvent::ContextLimit {
+            measured_prompt_tokens,
+            usable_prompt_capacity,
+            largest_sections,
+            ..
+        } => {
+            let sections = largest_sections
+                .iter()
+                .map(|section| format!("{}={} chars", section.label, section.chars))
+                .collect::<Vec<_>>()
+                .join(", ");
+            print_header(
+                "context limit",
+                &format!(
+                    "measured {measured_prompt_tokens} prompt tokens; usable {usable_prompt_capacity}; largest sections: {sections}"
+                ),
+            );
+        }
         AgentEvent::ExecutorStarted {
             executor_id,
             kind,

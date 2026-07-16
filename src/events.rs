@@ -40,6 +40,7 @@ pub enum TerminationReason {
     GateLoop,
     ParseLoop,
     ContractUnsatisfied,
+    ContextLimit,
     ResourceLimit,
     InvocationLimit,
     TokenLimit,
@@ -129,6 +130,7 @@ impl TerminationReason {
             Self::GateLoop => "gate_loop",
             Self::ParseLoop => "parse_loop",
             Self::ContractUnsatisfied => "contract_unsatisfied",
+            Self::ContextLimit => "context_limit",
             Self::ResourceLimit => "resource_limit",
             Self::InvocationLimit => "invocation_limit",
             Self::TokenLimit => "token_limit",
@@ -322,7 +324,11 @@ impl SessionMetricsSnapshot {
 pub struct AgentContextUsage {
     pub context_capacity: usize,
     pub reserved_generation_tokens: usize,
+    #[serde(default)]
+    pub safety_margin_tokens: usize,
     pub usable_prompt_capacity: usize,
+    #[serde(default)]
+    pub preflight_prompt_tokens: usize,
     pub prompt_utilization_bps: u32,
     pub message_chars: usize,
     pub tool_count: usize,
@@ -339,6 +345,12 @@ pub struct AgentContextUsage {
     pub read_cache_hits: usize,
     #[serde(default)]
     pub closure_checkpoints: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSectionUsage {
+    pub label: String,
+    pub chars: usize,
 }
 
 fn add_optional(target: &mut Option<f64>, value: Option<f64>) {
@@ -488,6 +500,19 @@ pub enum AgentEvent {
         /// measurement. Present on one result in a parallel batch.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         energy_shared_calls: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    ContextLimit {
+        context_capacity: usize,
+        reserved_generation_tokens: usize,
+        safety_margin_tokens: usize,
+        usable_prompt_capacity: usize,
+        measured_prompt_tokens: usize,
+        #[serde(default)]
+        largest_sections: Vec<ContextSectionUsage>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1010,6 +1035,28 @@ impl EventEnvelope {
                     energy_kwh,
                     average_power_watts,
                     energy_shared_calls,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::ContextLimit {
+                context_capacity,
+                reserved_generation_tokens,
+                safety_margin_tokens,
+                usable_prompt_capacity,
+                measured_prompt_tokens,
+                largest_sections,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::ContextLimit {
+                    context_capacity,
+                    reserved_generation_tokens,
+                    safety_margin_tokens,
+                    usable_prompt_capacity,
+                    measured_prompt_tokens,
+                    largest_sections,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
@@ -1563,7 +1610,9 @@ mod tests {
         let context = AgentContextUsage {
             context_capacity: 8192,
             reserved_generation_tokens: 256,
+            safety_margin_tokens: 32,
             usable_prompt_capacity: 7936,
+            preflight_prompt_tokens: 4960,
             prompt_utilization_bps: 6250,
             message_chars: 4096,
             tool_count: 3,
@@ -1596,6 +1645,34 @@ mod tests {
                 ..
             } if restored == context
         ));
+    }
+
+    #[test]
+    fn context_limit_event_round_trips_with_largest_sections() {
+        let envelope = EventEnvelope::new(AgentEvent::ContextLimit {
+            context_capacity: 512,
+            reserved_generation_tokens: 128,
+            safety_margin_tokens: 32,
+            usable_prompt_capacity: 352,
+            measured_prompt_tokens: 900,
+            largest_sections: vec![ContextSectionUsage {
+                label: "task_stage_anchor".to_string(),
+                chars: 3_000,
+            }],
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        let json = serde_json::to_string(&envelope).unwrap();
+        let restored: EventEnvelope = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            restored.event,
+            AgentEvent::ContextLimit {
+                measured_prompt_tokens: 900,
+                largest_sections,
+                ..
+            } if largest_sections[0].label == "task_stage_anchor"
+        ));
+        assert_eq!(TerminationReason::ContextLimit.as_str(), "context_limit");
     }
 
     #[test]

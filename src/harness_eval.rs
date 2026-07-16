@@ -20,6 +20,7 @@ use crate::{HarnessEvalArgs, HarnessEvalSuite, config::UserConfig};
 
 const CONTROL_FIXTURES: &str = include_str!("../fixtures/harness-control-fixtures.json");
 const HARNESS_EVAL_SCHEMA_VERSION: u32 = 3;
+const SCRIPTED_EVAL_CONTEXT_SIZE: u32 = 8_192;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -177,7 +178,11 @@ pub struct ContextEvalMetrics {
     #[serde(default)]
     pub reserved_generation_tokens_high_water: usize,
     #[serde(default)]
+    pub safety_margin_tokens_high_water: usize,
+    #[serde(default)]
     pub usable_prompt_capacity_low_water: usize,
+    #[serde(default)]
+    pub preflight_prompt_tokens_high_water: usize,
     #[serde(default)]
     pub prompt_tokens_high_water: usize,
     #[serde(default)]
@@ -388,7 +393,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         turn_max_tokens_cap: Some(256),
         tool_allowlist: Some(fixture.tool_allowlist.clone()),
         accept_existing_workspace_changes: false,
-        ctx_size: 1024,
+        ctx_size: SCRIPTED_EVAL_CONTEXT_SIZE,
         threads: None,
         threads_batch: None,
         gpu_layers: 0,
@@ -455,7 +460,7 @@ fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
             "sub_agent".to_string(),
         ]),
         accept_existing_workspace_changes: false,
-        ctx_size: 1024,
+        ctx_size: SCRIPTED_EVAL_CONTEXT_SIZE,
         threads: None,
         threads_batch: None,
         gpu_layers: 0,
@@ -1690,7 +1695,7 @@ fn scripted_configuration(suite: HarnessEvalSuite) -> HarnessEvalConfiguration {
         model: None,
         model_dir: None,
         max_tokens: 256,
-        ctx_size: 1024,
+        ctx_size: SCRIPTED_EVAL_CONTEXT_SIZE,
         threads: None,
         threads_batch: None,
         gpu_layers: 0,
@@ -2378,7 +2383,7 @@ fn summarize_fixture(
     }
     let runtime_diagnostic = matches!(
         outcome.termination_reason.as_str(),
-        "engine_error" | "resource_limit"
+        "engine_error" | "resource_limit" | "context_limit"
     )
     .then(|| {
         events.iter().rev().find_map(|event| match event {
@@ -2471,6 +2476,9 @@ fn summarize_context_metrics(events: &[AgentEvent]) -> ContextEvalMetrics {
         summary.reserved_generation_tokens_high_water = summary
             .reserved_generation_tokens_high_water
             .max(context.reserved_generation_tokens);
+        summary.safety_margin_tokens_high_water = summary
+            .safety_margin_tokens_high_water
+            .max(context.safety_margin_tokens);
         summary.usable_prompt_capacity_low_water = if summary.usable_prompt_capacity_low_water == 0
         {
             context.usable_prompt_capacity
@@ -2480,6 +2488,9 @@ fn summarize_context_metrics(events: &[AgentEvent]) -> ContextEvalMetrics {
                 .min(context.usable_prompt_capacity)
         };
         summary.prompt_tokens_high_water = summary.prompt_tokens_high_water.max(*prompt_tokens);
+        summary.preflight_prompt_tokens_high_water = summary
+            .preflight_prompt_tokens_high_water
+            .max(context.preflight_prompt_tokens);
         summary.prompt_utilization_bps_high_water = summary
             .prompt_utilization_bps_high_water
             .max(context.prompt_utilization_bps);
@@ -2663,13 +2674,23 @@ mod tests {
             .cloned()
             .map(|mut result| {
                 // The v3 control baseline predates additive S0 context observations. Keep its
-                // protocol comparison stable; the dedicated small-model baseline owns these
-                // measurements.
+                // protocol comparison stable; the dedicated small-model baseline owns prompt
+                // measurements. Scripted S1 preflight reports its deterministic rendered count
+                // instead of the legacy one-token sentinel.
                 result.context = ContextEvalMetrics::default();
+                if !result.strict_workflow {
+                    result.prompt_tokens = result.llm_invocations;
+                }
                 result
             })
             .collect::<Vec<_>>();
-        assert_eq!(baseline.results, protocol_actual);
+        for (expected, observed) in baseline.results.iter().zip(&protocol_actual) {
+            assert_eq!(
+                expected, observed,
+                "control baseline mismatch for {}",
+                expected.id
+            );
+        }
         for id in ["irrelevant_review_evidence", "check_then_mutation"] {
             let result = actual.iter().find(|result| result.id == id).unwrap();
             assert!(result.reached_final, "{id} emitted a final action");
@@ -2878,11 +2899,19 @@ mod tests {
         for record in records {
             let context = &record.result.context;
             assert_eq!(context.invocations_observed, record.result.llm_invocations);
-            assert_eq!(context.context_capacity, 1024);
+            assert_eq!(
+                context.context_capacity,
+                SCRIPTED_EVAL_CONTEXT_SIZE as usize
+            );
             assert_eq!(context.reserved_generation_tokens_high_water, 256);
-            assert_eq!(context.usable_prompt_capacity_low_water, 768);
-            assert_eq!(context.prompt_tokens_high_water, 1);
-            assert_eq!(context.prompt_utilization_bps_high_water, 14);
+            assert_eq!(context.safety_margin_tokens_high_water, 32);
+            assert_eq!(context.usable_prompt_capacity_low_water, 7_904);
+            assert!(context.prompt_tokens_high_water > 1);
+            assert_eq!(
+                context.preflight_prompt_tokens_high_water,
+                context.prompt_tokens_high_water
+            );
+            assert!(context.prompt_utilization_bps_high_water < 1_000);
             assert!(context.message_chars_high_water > 0);
             assert!(context.tool_count_high_water > 0);
             assert!(context.tool_schema_chars_high_water > 0);

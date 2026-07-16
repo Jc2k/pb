@@ -156,6 +156,16 @@ impl LlamaCppBackend {
         )
     }
 
+    /// Render and tokenize the exact structured chat prompt used by [`Self::generate_chat`].
+    pub fn measure_chat_prompt(&self, request: &LlamaCppChatRequest) -> Result<usize> {
+        let (prompt, add_bos) = self.render_chat_prompt(&request.messages, &request.tools)?;
+        Ok(self
+            .model
+            .str_to_token(&prompt, add_bos)
+            .context("failed to tokenize chat prompt for preflight")?
+            .len())
+    }
+
     fn generate_rendered(
         &self,
         prompt: &str,
