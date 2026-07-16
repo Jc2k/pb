@@ -57,7 +57,22 @@ impl ProgressGuard {
             return None;
         }
         if self.failures.len() < 2 {
-            return None;
+            let repeated_known_empty_read = self.failures.back().is_some_and(|previous| {
+                tool_family == "repository_read"
+                    && known_empty_read_path(call_fingerprint).is_some_and(|path| {
+                        prior_empty_read_path(&previous.call_fingerprint) == Some(path)
+                    })
+            });
+            return repeated_known_empty_read.then(|| {
+                format!(
+                    "No-progress guard blocked a repeated read range already known to be empty on the unchanged file. Previous outcome: {}. The blocked call consumed no tool runtime and earned no new evidence. {}",
+                    self.failures
+                        .back()
+                        .map(|failure| failure.summary.as_str())
+                        .unwrap_or("the requested range contained no content"),
+                    alternatives_for_family(tool_family),
+                )
+            });
         }
         let previous = &self.failures[self.failures.len() - 1];
         let before_previous = &self.failures[self.failures.len() - 2];
@@ -138,6 +153,15 @@ impl ProgressGuard {
         }
         ProgressDecision::Continue
     }
+}
+
+fn known_empty_read_path(fingerprint: &str) -> Option<&str> {
+    fingerprint.strip_prefix("read_file:known_empty:")
+}
+
+fn prior_empty_read_path(fingerprint: &str) -> Option<&str> {
+    known_empty_read_path(fingerprint)
+        .or_else(|| fingerprint.strip_prefix("read_file:cache_replay:"))
 }
 
 pub(crate) fn tool_family(tool: &str) -> String {
@@ -334,6 +358,23 @@ mod tests {
                 },
             ),
             None
+        );
+    }
+
+    #[test]
+    fn known_empty_read_range_is_blocked_after_one_unchanged_empty_result() {
+        let state = ProgressState {
+            workspace_fingerprint: "state-1".to_string(),
+            evidence_fingerprint: "state-1".to_string(),
+        };
+        let mut guard = ProgressGuard::default();
+        let mut observation = failed("repository_read", "empty", "state-1");
+        observation.call_fingerprint = "read_file:known_empty:path-hash".to_string();
+        assert_eq!(guard.record(observation), ProgressDecision::Continue);
+        assert!(
+            guard
+                .preflight("repository_read", "read_file:known_empty:path-hash", state,)
+                .is_some()
         );
     }
 

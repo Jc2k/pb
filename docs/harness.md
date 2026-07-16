@@ -269,7 +269,9 @@ S3's no-progress and read-cache boundaries are recorded in the
 S4's structured tool failures and bounded truncation retry are recorded in the
 [action-recovery checkpoint](benchmarks/small-model-agent-s4.md).
 S5's deterministic closure checkpoint and conservative schema pruning are recorded in the
-[workflow-closure checkpoint](benchmarks/small-model-agent-s5.md).
+[workflow-closure checkpoint](benchmarks/small-model-agent-s5.md). The repeated 8K/16K rollout
+decision and final local-model comparison are recorded in the
+[S6 report](benchmarks/small-model-agent-s6.md).
 Each model-invocation record
 includes an optional backward-compatible context snapshot covering capacity, generation reserve,
 prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,
@@ -278,6 +280,11 @@ milestones. Evaluation summaries count `thinking_off_truncation_retries` and
 `larger_cap_truncation_retries` separately. Runtime
 setup failures are reported separately from artifact quality so a backend experiment error is not
 scored as model reasoning.
+
+Real-model records also include a bounded `tool_trace` for diagnosis. Each entry stores a tool name
+capped at 120 characters plus the normalized argument SHA-256, a 600-character JSON preview, and a
+truncation flag. Full write contents or patch arguments therefore cannot make the evaluation record
+unbounded.
 
 Every real-model record repeats the backend, model, resolved model directory, token/context/thread/
 GPU settings, sampling values, seed, FlashMoe resource-policy version, normalized workspace-config
@@ -319,3 +326,20 @@ targeted reads/search. If the final turn has no missing precondition, only the e
 is exposed. Missing path reads, stale fingerprints, or a direct request allowlist keep the terminal
 hidden, and the execution boundary repeats the same deterministic check if a model hallucinates the
 call anyway. Implementation and repair schemas are not pruned by this policy.
+
+Direct bounded runs now derive every instruction from the actual allowlist. A restricted prompt
+never orders an unexposed setup, command, review, or commit tool. When those general discovery
+tools are absent, the prompt includes at most 32 sorted top-level repository paths, each capped at
+120 characters; `.git` and `.pb` are excluded. The path hint is orientation only and earns no read
+or review evidence.
+
+A `read_file` request beyond EOF remains a non-mutating result, but the progress guard records that
+range as known-empty. If unchanged content is followed by another known-empty request on the same
+path—either after an empty result or an exact deterministic cache replay—the next request is
+blocked before tool execution. Valid continuation ranges, different paths, and state transitions
+remain available.
+
+S6 does not add a model-family control override: 8K and 16K had identical protocol outcomes, no
+overflow, low schema/prompt utilization, and no result compaction pressure. Existing context,
+result, thinking, and truncation defaults remain authoritative. There is no automatic stronger
+local-model or cloud escalation; selecting another local model is an explicit `--model` choice.

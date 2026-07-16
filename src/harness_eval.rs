@@ -21,6 +21,8 @@ use crate::{HarnessEvalArgs, HarnessEvalSuite, config::UserConfig};
 const CONTROL_FIXTURES: &str = include_str!("../fixtures/harness-control-fixtures.json");
 const HARNESS_EVAL_SCHEMA_VERSION: u32 = 3;
 const SCRIPTED_EVAL_CONTEXT_SIZE: u32 = 8_192;
+const MAX_TOOL_TRACE_NAME_CHARS: usize = 120;
+const MAX_TOOL_TRACE_ARGUMENT_CHARS: usize = 600;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -213,6 +215,14 @@ pub struct ContextEvalMetrics {
     pub closure_checkpoints: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessEvalToolCall {
+    pub tool: String,
+    pub arguments_sha256: String,
+    pub arguments_preview: String,
+    pub arguments_truncated: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ControlFixtureResult {
     pub id: String,
@@ -296,6 +306,8 @@ pub struct ControlFixtureResult {
     pub prompt_tokens: usize,
     #[serde(default)]
     pub generated_tokens: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_trace: Vec<HarnessEvalToolCall>,
     #[serde(default)]
     pub context: ContextEvalMetrics,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2364,6 +2376,7 @@ fn summarize_fixture(
         },
     );
     let context = summarize_context_metrics(events);
+    let tool_trace = summarize_tool_trace(events);
     let required_check_ids = fixture
         .contract
         .as_ref()
@@ -2461,6 +2474,7 @@ fn summarize_fixture(
         latency_ms,
         prompt_tokens,
         generated_tokens,
+        tool_trace,
         context,
         energy_kwh: (energy_kwh > 0.0).then_some(energy_kwh),
         remaining_completions: outcome.remaining_completions,
@@ -2468,6 +2482,31 @@ fn summarize_fixture(
         artifact_quality: None,
         runtime_diagnostic,
     })
+}
+
+fn summarize_tool_trace(events: &[AgentEvent]) -> Vec<HarnessEvalToolCall> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolCall {
+                tool, arguments, ..
+            } => {
+                let encoded = serde_json::to_string(arguments)
+                    .unwrap_or_else(|_| "<arguments could not be encoded>".to_string());
+                let preview = encoded
+                    .chars()
+                    .take(MAX_TOOL_TRACE_ARGUMENT_CHARS)
+                    .collect::<String>();
+                Some(HarnessEvalToolCall {
+                    tool: tool.chars().take(MAX_TOOL_TRACE_NAME_CHARS).collect(),
+                    arguments_sha256: crate::agent_context::normalized_arguments_sha256(arguments),
+                    arguments_preview: preview,
+                    arguments_truncated: encoded.chars().count() > MAX_TOOL_TRACE_ARGUMENT_CHARS,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn summarize_context_metrics(events: &[AgentEvent]) -> ContextEvalMetrics {
@@ -2702,6 +2741,7 @@ mod tests {
                 if !result.strict_workflow {
                     result.prompt_tokens = result.llm_invocations;
                 }
+                result.tool_trace.clear();
                 result
             })
             .collect::<Vec<_>>();
@@ -2993,6 +3033,30 @@ mod tests {
         ] {
             assert!(table.contains(heading), "missing {heading}: {table}");
         }
+    }
+
+    #[test]
+    fn real_model_tool_trace_hashes_and_bounds_arguments() {
+        let arguments = serde_json::json!({"content": "x".repeat(10_000), "path": "result.txt"});
+        let trace = summarize_tool_trace(&[AgentEvent::ToolCall {
+            tool: "write_file".repeat(20),
+            arguments: arguments.clone(),
+            nesting_depth: None,
+            timestamp_ms: None,
+        }]);
+
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].tool.chars().count(), MAX_TOOL_TRACE_NAME_CHARS);
+        assert_eq!(trace[0].arguments_sha256.len(), 64);
+        assert_eq!(
+            trace[0].arguments_sha256,
+            crate::agent_context::normalized_arguments_sha256(&arguments)
+        );
+        assert_eq!(
+            trace[0].arguments_preview.chars().count(),
+            MAX_TOOL_TRACE_ARGUMENT_CHARS
+        );
+        assert!(trace[0].arguments_truncated);
     }
 
     #[test]

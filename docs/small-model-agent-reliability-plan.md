@@ -1,6 +1,6 @@
 # Small-model agent reliability plan
 
-Status: active; S0-S5 complete
+Status: complete; S0-S6 complete
 
 This document is the tracking source for improving the quality and completion rate of small local
 models in pb's agent and enforced-delivery workflows. Update the milestone table, evidence log, and
@@ -460,7 +460,7 @@ only when its production path, deterministic proof, documentation, and semantic 
 | S3 | P1 | S0, S1 | complete | progress guard/cache, PG1-PG5 | `fix: stop no-progress agent tool loops`; [S3 checkpoint](benchmarks/small-model-agent-s3.md) |
 | S4 | P1 | S0, S1 | complete | error envelopes/retry policy, AR1-AR4 | `fix: guide truncated agent actions`; [S4 checkpoint](benchmarks/small-model-agent-s4.md) |
 | S5 | P1 | S0, S3, S4 | complete | closure/schema rules, CL1-CL3, SE1 | `feat: add deterministic workflow closure`; [S5 checkpoint](benchmarks/small-model-agent-s5.md) |
-| S6 | P2 | S1-S5 | not started | before/after matrix, justified defaults, rollout docs | — |
+| S6 | P2 | S1-S5 | complete | before/after matrix, justified defaults, rollout docs | `fix: improve bounded agent action control`; [S6 report](benchmarks/small-model-agent-s6.md) |
 
 S2, S3, and S4 may proceed independently after their dependencies are complete. S5 must integrate
 the recovery state from S3/S4. Do not begin S6 rollout until all deterministic milestones pass.
@@ -475,7 +475,7 @@ Use one reviewable semantic commit per milestone. Suggested commit shapes are:
 - `fix: stop no-progress agent tool loops`
 - `fix: guide truncated agent actions`
 - `feat: add deterministic workflow closure`
-- `docs: record small-model reliability rollout`
+- `fix: improve bounded agent action control`
 
 For each milestone:
 
@@ -515,6 +515,7 @@ them rather than pasting them here.
 | 2026-07-16 | S3 | `fix: stop no-progress agent tool loops` | `cargo fmt --check`; `cargo test --all-targets` (939 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; PG1-PG5 | scripted corpus 41/41 and subset 4/4; A-B-A and varied stale edits pre-blocked with no fourth model retry; one scoped read-cache hit in the repeated-read fixture | S4 must make ordinary tool/schema and truncation failures cheaper for a small model to correct |
 | 2026-07-16 | S4 | `fix: guide truncated agent actions` | `cargo fmt --check`; `cargo test --all-targets` (945 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; AR1-AR4 | scripted corpus 41/41 and subset 4/4; typo and argument failures are non-executing structured envelopes; same-cap thinking-off recovery succeeds and global retry budgets stop deterministically | S5 must add closure help without exposing terminal actions before every current precondition is satisfied |
 | 2026-07-16 | S5 | `feat: add deterministic workflow closure` | `cargo fmt --check`; `cargo test --all-targets` (953 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; CL1-CL3 and SE1-SE2 | scripted corpus 41/41 and subset 4/4; two-turn review narrows from focused evidence to one terminal schema; missing reads, stale fingerprints, and direct allowlists keep submission hidden | S6 must measure the fixed real-model matrix before selecting or rejecting model-specific rollout defaults |
+| 2026-07-16 | S6 | `fix: improve bounded agent action control` | `deno task build:web`; `cargo fmt --check`; `cargo test --all-targets` (957 passed, 8 ignored); `deno task test:web` (47 passed); release build; full and small-model scripted evals; repeated 8K/16K local-model matrix | scripted corpus 41/41 and subset 4/4; Qwen2.5-Coder-7B exact protocol improves from 0/12 to 6/12 at both contexts; zero false completion/overflow; 8K prompt tokens fall 66.4% and latency 63.7%; no model-family override justified | two non-passing real-model fixtures remain safely gated model/task limitations; no plan acceptance criterion remains |
 
 After each checkpoint, report:
 
@@ -613,22 +614,22 @@ not combine milestones merely because later work looks adjacent.
 
 ## Completion audit
 
-- [ ] S0-S6 are complete with semantic commit and verification evidence.
-- [ ] Existing harness protocol fixtures have no outcome regressions.
-- [ ] Authoritative prompt anchors cannot be compacted or silently truncated.
-- [ ] Backend-aware preflight prevents context overflow while preserving generation reserve.
-- [ ] Large reads provide exact bounded continuation and preserve raw audit evidence.
-- [ ] Planning uses a bounded repository brief tied to the complete graph hash.
-- [ ] Code review no longer receives duplicate full diff and full file contents.
-- [ ] Every changed text path must still earn fresh fingerprint-bound review-read evidence.
-- [ ] Exact, alternating, and same-outcome no-progress loops are bounded.
-- [ ] Read-cache hits cannot earn stale or broader evidence.
-- [ ] Tool correction never auto-executes guessed prose, tools, or mutation arguments.
-- [ ] Truncated reasoning recovery is bounded and fully charged to global budgets.
-- [ ] Near-cap closure cannot bypass a missing or stale precondition.
-- [ ] Exposed tools are always a deterministic subset of existing authority.
-- [ ] S0/S6 reports are reproducible and separate protocol from artifact quality.
-- [ ] `deno task build:web`, `cargo test --all-targets`, `deno task test:web`, release build, and
+- [x] S0-S6 are complete with semantic commit and verification evidence.
+- [x] Existing harness protocol fixtures have no outcome regressions.
+- [x] Authoritative prompt anchors cannot be compacted or silently truncated.
+- [x] Backend-aware preflight prevents context overflow while preserving generation reserve.
+- [x] Large reads provide exact bounded continuation and preserve raw audit evidence.
+- [x] Planning uses a bounded repository brief tied to the complete graph hash.
+- [x] Code review no longer receives duplicate full diff and full file contents.
+- [x] Every changed text path must still earn fresh fingerprint-bound review-read evidence.
+- [x] Exact, alternating, and same-outcome no-progress loops are bounded.
+- [x] Read-cache hits cannot earn stale or broader evidence.
+- [x] Tool correction never auto-executes guessed prose, tools, or mutation arguments.
+- [x] Truncated reasoning recovery is bounded and fully charged to global budgets.
+- [x] Near-cap closure cannot bypass a missing or stale precondition.
+- [x] Exposed tools are always a deterministic subset of existing authority.
+- [x] S0/S6 reports are reproducible and separate protocol from artifact quality.
+- [x] `deno task build:web`, `cargo test --all-targets`, `deno task test:web`, release build, and
   required harness evaluations pass.
-- [ ] Documentation describes shipped behavior and the tracker status matches the repository.
-- [ ] `.pb/` user state was not read, changed, or used as scratch.
+- [x] Documentation describes shipped behavior and the tracker status matches the repository.
+- [x] `.pb/` user state was not read, changed, or used as scratch.

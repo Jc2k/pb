@@ -2108,6 +2108,18 @@ fn build_direct_harness_instructions(
     mcp_registry: &McpToolRegistry,
     lsp_registry: &LspToolRegistry,
 ) -> String {
+    let exposes = |name: &str| tool_allowlist.iter().any(|tool| tool == name);
+    let exposes_all = |names: &[&str]| names.iter().all(|name| exposes(name));
+    let exposes_mutation = [
+        "write_file",
+        "replace_file",
+        "edit_file",
+        "apply_patch",
+        "mv",
+        "rm",
+    ]
+    .into_iter()
+    .any(exposes);
     let signatures = available_tool_signatures(
         profile,
         command_backend_kind,
@@ -2119,14 +2131,41 @@ fn build_direct_harness_instructions(
         lsp_registry,
     );
     let role = match profile {
-        AgentProfile::Build if legacy_prompt_owned_delivery => {
+        AgentProfile::Build
+            if legacy_prompt_owned_delivery
+                && exposes_all(&[
+                    "read_file",
+                    "write_file",
+                    "replace_file",
+                    "edit_file",
+                    "apply_patch",
+                    "rm",
+                    "run_command",
+                    "sub_agent",
+                    "git_commit",
+                ]) =>
+        {
             "Build the requested artifact autonomously. Inspect existing files with read_file, then create new files with write_file, replace whole files with replace_file, replace exact content with edit_file, use apply_patch for structured diffs, and remove unwanted paths with rm. If the repository is empty, create the initial files immediately and never repeat an inspection whose result was empty. Test with run_command. Before finishing, ask a review sub_agent only to inspect and report. After the review returns, address valid findings yourself, rerun tests yourself, and git_commit the completed work with a semantic message."
         }
-        AgentProfile::Build => {
+        AgentProfile::Build if legacy_prompt_owned_delivery => {
+            "Complete the assigned bounded repository task using only the tools named in Available tools. Use repository evidence before changing an existing path. If an exposed mutation tool is needed, make the smallest requested change before finalizing."
+        }
+        AgentProfile::Build if exposes("run_command") => {
             "Perform only the implementation or repair work assigned by the harness. Use the exposed edit tools before reporting actual touched paths. run_command is a journaled escape hatch when available. Planning, checks, review transitions, and commit are harness-owned and cannot be satisfied by a teammate or prose."
         }
-        AgentProfile::Review if legacy_prompt_owned_delivery => {
+        AgentProfile::Build => {
+            "Perform only the implementation or repair work assigned by the harness. Use the exposed edit tools before reporting actual touched paths. Planning, checks, review transitions, and commit are harness-owned and cannot be satisfied by a teammate or prose."
+        }
+        AgentProfile::Review
+            if legacy_prompt_owned_delivery && exposes("read_file") && exposes("run_command") =>
+        {
             "Review the current implementation without editing it. Inspect files and run relevant tests with run_command. Begin the final response with exactly REVIEW PASS when every requested check succeeds and no findings remain. Otherwise begin it with exactly REVIEW FAIL and report prioritized concrete findings or failed checks."
+        }
+        AgentProfile::Review if legacy_prompt_owned_delivery && exposes("read_file") => {
+            "Review the current implementation without editing it. Inspect relevant files with the exposed read tool. Begin the final response with exactly REVIEW PASS when no findings remain. Otherwise begin it with exactly REVIEW FAIL and report prioritized concrete findings."
+        }
+        AgentProfile::Review if legacy_prompt_owned_delivery => {
+            "Review the current implementation without editing it, using only the exposed read-only evidence. Begin the final response with exactly REVIEW PASS when no findings remain. Otherwise begin it with exactly REVIEW FAIL and report prioritized concrete findings."
         }
         AgentProfile::Review => {
             "Inspect the exact repository evidence assigned by the harness without editing it. Return findings through the named structured submission tool from the stage prompt. Prose and literal pass phrases do not advance delivery."
@@ -2137,14 +2176,30 @@ fn build_direct_harness_instructions(
         _ => "Complete the assigned bounded task using only the available native tools.",
     };
     let action_contract = match profile {
-        AgentProfile::Build | AgentProfile::Scout if legacy_prompt_owned_delivery => {
+        AgentProfile::Build | AgentProfile::Scout
+            if legacy_prompt_owned_delivery
+                && exposes("session_title")
+                && exposes("run_command")
+                && exposes_mutation =>
+        {
             "Your first response must call session_title and run_command to inspect the repository immediately. run_command starts in the workspace: use relative paths and never invent a scratch path. Do not return prose-only planning or a final response before a tool result and repository mutation."
+        }
+        AgentProfile::Build | AgentProfile::Scout if legacy_prompt_owned_delivery => {
+            "Call only a tool named in Available tools. Start with the exposed action that directly advances the objective; never invent or name an unavailable tool. Do not return prose-only planning. After one useful result, either take a materially different needed action or finalize instead of repeating discovery."
         }
         AgentProfile::Build | AgentProfile::Scout => {
             "Use only capabilities exposed for the current stage. A prose final cannot replace the named structured terminal submission."
         }
-        AgentProfile::Review if legacy_prompt_owned_delivery => {
+        AgentProfile::Review
+            if legacy_prompt_owned_delivery && exposes("read_file") && exposes("run_command") =>
+        {
             "Inspect at least one relevant implementation file with read_file and, when run_command is available, run at least one relevant read-only check; a final response before both required evidence types succeed will be rejected. Inspect each result before deciding the verdict. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Return a final review after gathering concrete evidence. The first non-empty line must be exactly REVIEW PASS or REVIEW FAIL. Never use REVIEW PASS when a requested check failed, could not run, or findings remain."
+        }
+        AgentProfile::Review if legacy_prompt_owned_delivery && exposes("read_file") => {
+            "Inspect at least one relevant implementation file with read_file before deciding the verdict. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Return a final review after gathering the exposed evidence. The first non-empty line must be exactly REVIEW PASS or REVIEW FAIL. Never use REVIEW PASS when findings remain."
+        }
+        AgentProfile::Review if legacy_prompt_owned_delivery => {
+            "Gather the available read-only evidence before deciding the verdict. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Return a final review whose first non-empty line is exactly REVIEW PASS or REVIEW FAIL. Never use REVIEW PASS when a requested check failed, could not run, or findings remain."
         }
         AgentProfile::Review => {
             "Read the required changed paths and supplied check evidence. Do not edit, stage, commit, reset, clean, or otherwise mutate the repository. Finish only through the named structured review submission."
@@ -2162,8 +2217,13 @@ fn build_direct_harness_instructions(
             contract.prompt_summary()
         )
     });
+    let repository_paths = if exposes("session_title") && exposes("run_command") {
+        String::new()
+    } else {
+        direct_repository_path_hint(workspace_root, repository_less)
+    };
     format!(
-        "You are pb, working {continuation} in `{workspace}` on branch `{branch}`. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text using either {{\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{{...}}}} or {{\"type\":\"final\",\"content\":\"...\"}}. {action_contract} {role}{contract_instructions} Do not claim completion until the assigned role is complete. Finish with a concise summary. Available tools: {tools}.",
+        "You are pb, working {continuation} in `{workspace}` on branch `{branch}`. Use native tool calls when available. Otherwise emit exactly one JSON object with no surrounding text using either {{\"type\":\"tool_call\",\"tool\":\"...\",\"arguments\":{{...}}}} or {{\"type\":\"final\",\"content\":\"...\"}}. {action_contract} {role}{contract_instructions} {repository_paths} Do not claim completion until the assigned role is complete. Finish with a concise summary. Available tools: {tools}.",
         continuation = if continuing {
             "on a continuing task"
         } else {
@@ -2172,6 +2232,35 @@ fn build_direct_harness_instructions(
         workspace = workspace_root.display(),
         tools = signatures.join(", "),
     )
+}
+
+fn direct_repository_path_hint(workspace_root: &Path, repository_less: bool) -> String {
+    const MAX_PATHS: usize = 32;
+    const MAX_PATH_CHARS: usize = 120;
+
+    if repository_less {
+        return "This task has no repository paths.".to_string();
+    }
+    let Ok(entries) = std::fs::read_dir(workspace_root) else {
+        return "Initial repository paths could not be listed; use an exposed discovery tool."
+            .to_string();
+    };
+    let mut paths = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name != ".git" && name != ".pb")
+        .map(|name| truncate_chars(&name, MAX_PATH_CHARS))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let omitted = paths.len().saturating_sub(MAX_PATHS);
+    paths.truncate(MAX_PATHS);
+    if paths.is_empty() {
+        return "Initial repository paths: (empty).".to_string();
+    }
+    let omitted = (omitted > 0)
+        .then(|| format!("; {omitted} additional top-level path(s) omitted"))
+        .unwrap_or_default();
+    format!("Initial repository paths: {}{omitted}.", paths.join(", "))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -5625,6 +5714,7 @@ struct ExecutedToolResult {
     arguments: Value,
     result: String,
     success: bool,
+    cache_hit: bool,
     duration_ms: u64,
     energy: Option<EnergyEstimate>,
 }
@@ -5652,7 +5742,66 @@ fn tool_outcome_succeeded(tool: &str, transport_success: bool, result: &str) -> 
             return success;
         }
     }
-    true
+    !(tool == "read_file" && result.trim() == "(no content in requested range)")
+}
+
+fn progress_call_fingerprint(
+    tool: &str,
+    arguments: &Value,
+    result: Option<&str>,
+    workspace_root: &Path,
+    cache_hit: bool,
+) -> String {
+    if tool == "read_file"
+        && cache_hit
+        && let Some(path) = arguments.get("path").and_then(Value::as_str)
+    {
+        return format!(
+            "read_file:cache_replay:{:x}",
+            Sha256::digest(path.as_bytes())
+        );
+    }
+    if tool == "read_file"
+        && read_call_is_known_empty(arguments, result, workspace_root)
+        && let Some(path) = arguments.get("path").and_then(Value::as_str)
+    {
+        return format!(
+            "read_file:known_empty:{:x}",
+            Sha256::digest(path.as_bytes())
+        );
+    }
+    format!(
+        "{}:{}",
+        tool,
+        agent_context::normalized_arguments_sha256(arguments)
+    )
+}
+
+fn read_call_is_known_empty(
+    arguments: &Value,
+    result: Option<&str>,
+    workspace_root: &Path,
+) -> bool {
+    if result.is_some_and(|result| result.trim() == "(no content in requested range)") {
+        return true;
+    }
+    let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+        return false;
+    };
+    let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
+    if arguments
+        .get("end")
+        .and_then(Value::as_u64)
+        .is_some_and(|end| (end as usize) < start)
+    {
+        return true;
+    }
+    let Ok(resolved) = resolve_workspace_path(workspace_root, path, true) else {
+        return false;
+    };
+    std::fs::read_to_string(resolved)
+        .map(|text| start.max(1) > text.lines().count())
+        .unwrap_or(false)
 }
 
 fn semantic_tool_result_payload(result: &str) -> &str {
@@ -5782,6 +5931,7 @@ fn execute_tool_calls(
                 arguments: call.arguments,
                 result,
                 success: false,
+                cache_hit: false,
                 duration_ms: 0,
                 energy: None,
             });
@@ -5822,6 +5972,7 @@ fn execute_tool_calls(
                 arguments: call.arguments,
                 result,
                 success: false,
+                cache_hit: false,
                 duration_ms: 0,
                 energy: None,
             });
@@ -5846,6 +5997,7 @@ fn execute_tool_calls(
                 arguments: call.arguments,
                 result,
                 success: false,
+                cache_hit: false,
                 duration_ms: 0,
                 energy: None,
             });
@@ -5875,6 +6027,7 @@ fn execute_tool_calls(
                 arguments: call.arguments,
                 result,
                 success: false,
+                cache_hit: false,
                 duration_ms: 0,
                 energy: None,
             });
@@ -5904,6 +6057,7 @@ fn execute_tool_calls(
                     arguments: call.arguments,
                     result,
                     success: false,
+                    cache_hit: false,
                     duration_ms: 0,
                     energy: None,
                 });
@@ -5941,6 +6095,7 @@ fn execute_tool_calls(
                         arguments: call.arguments,
                         result,
                         success: false,
+                        cache_hit: false,
                         duration_ms: 0,
                         energy: None,
                     });
@@ -5995,6 +6150,7 @@ fn execute_tool_calls(
                         arguments: call.arguments,
                         result,
                         success,
+                        cache_hit: false,
                         duration_ms,
                         energy: None,
                     }
@@ -6009,6 +6165,7 @@ fn execute_tool_calls(
                 arguments: Value::Null,
                 result: "tool thread panicked".to_string(),
                 success: false,
+                cache_hit: false,
                 duration_ms: 0,
                 energy: None,
             }));
@@ -6038,6 +6195,7 @@ fn execute_tool_calls(
                     arguments: call.arguments,
                     result: entry.result,
                     success: true,
+                    cache_hit: true,
                     duration_ms: 0,
                     energy: None,
                 });
@@ -6079,6 +6237,7 @@ fn execute_tool_calls(
                 arguments: call.arguments,
                 result,
                 success,
+                cache_hit: false,
                 duration_ms,
                 energy,
             });
@@ -6096,6 +6255,7 @@ fn execute_tool_calls(
         arguments,
         mut result,
         success,
+        cache_hit,
         duration_ms,
         energy,
     } in results
@@ -6125,13 +6285,19 @@ fn execute_tool_calls(
         }
         progress_outcomes.push(ToolOutcomeSummary {
             tool: tool.clone(),
-            call_fingerprint: format!(
-                "{}:{}",
-                tool,
-                agent_context::normalized_arguments_sha256(&arguments)
+            call_fingerprint: progress_call_fingerprint(
+                &tool,
+                &arguments,
+                Some(&result),
+                env.workspace_root,
+                cache_hit,
             ),
-            result: result.clone(),
-            success: tool_outcome_succeeded(&tool, success, &result),
+            result: if cache_hit {
+                "deterministic read cache replay returned no new evidence".to_string()
+            } else {
+                result.clone()
+            },
+            success: !cache_hit && tool_outcome_succeeded(&tool, success, &result),
         });
         metrics.tool_calls += 1;
         if tool != "sub_agent" {
@@ -6441,11 +6607,8 @@ fn preflight_tool_progress(
 ) -> Result<Option<String>> {
     let state = progress_state(workspace_root, gate_state)?;
     for call in calls {
-        let call_fingerprint = format!(
-            "{}:{}",
-            call.tool,
-            agent_context::normalized_arguments_sha256(&call.arguments)
-        );
+        let call_fingerprint =
+            progress_call_fingerprint(&call.tool, &call.arguments, None, workspace_root, false);
         if let Some(feedback) =
             guard.preflight(&tool_family(&call.tool), &call_fingerprint, state.clone())
         {
@@ -18789,6 +18952,47 @@ mod tests {
     }
 
     #[test]
+    fn s6_repeated_known_empty_read_range_is_blocked_before_execution() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("target.txt"), "before\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 5;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion(
+                    "read_file",
+                    json!({"path": "target.txt", "start": 1, "end": 10}),
+                ),
+                tool_completion(
+                    "read_file",
+                    json!({"path": "target.txt", "start": 1, "end": 10}),
+                ),
+                tool_completion(
+                    "read_file",
+                    json!({"path": "target.txt", "start": 10, "end": 20}),
+                ),
+                scripted_final("must not run"),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::GateLoop);
+        assert_eq!(outcome.llm_invocations, 3);
+        assert_eq!(outcome.tool_calls, 2);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { summary, message, .. }
+                if summary == "No-progress tool loop"
+                    && message.contains("known to be empty")
+        )));
+    }
+
+    #[test]
     fn workflow_fingerprint_suffix_preserves_failed_command_semantics() {
         let fingerprint = "a".repeat(64);
         let failed =
@@ -19315,8 +19519,12 @@ mod tests {
         let allowlist = vec![
             "session_title".to_string(),
             "run_command".to_string(),
+            "read_file".to_string(),
             "write_file".to_string(),
+            "replace_file".to_string(),
+            "edit_file".to_string(),
             "apply_patch".to_string(),
+            "rm".to_string(),
             "git_commit".to_string(),
             "sub_agent".to_string(),
         ];
@@ -19337,7 +19545,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(instructions.len() < 1_500, "instructions: {instructions}");
+        assert!(instructions.len() < 1_700, "instructions: {instructions}");
         assert!(instructions.contains("review sub_agent"));
         assert!(instructions.contains("never repeat an inspection whose result was empty"));
         assert!(instructions.contains("write_file(path,content)"));
@@ -19352,6 +19560,57 @@ mod tests {
         assert!(!instructions.contains("Ballmer peak"));
         assert!(!instructions.contains("memory_search"));
         assert!(!instructions.contains("web_search"));
+    }
+
+    #[test]
+    fn direct_allowlist_prompt_never_orders_unexposed_tools_and_names_bounded_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("target.txt"), "before\n").expect("fixture file");
+        let allowlist = vec!["read_file".to_string()];
+        let instructions = build_agent_instructions_with_tool_allowlist(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Build,
+            false,
+            false,
+            true,
+            Some(&allowlist),
+            None,
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+
+        assert!(instructions.contains("Initial repository paths: target.txt"));
+        assert!(instructions.contains("Available tools: read_file(path,start,end)"));
+        for unavailable in ["session_title", "run_command", "sub_agent", "git_commit"] {
+            assert!(
+                !instructions.contains(unavailable),
+                "prompt named unexposed {unavailable}: {instructions}"
+            );
+        }
+
+        let review = build_agent_instructions_with_tool_allowlist(
+            tmp.path(),
+            "test-branch",
+            false,
+            Some(CommandBackendKind::Local),
+            None,
+            AgentProfile::Review,
+            false,
+            false,
+            true,
+            Some(&allowlist),
+            None,
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        )
+        .unwrap();
+        assert!(review.contains("read_file"));
+        assert!(!review.contains("run_command"));
     }
 
     #[test]
