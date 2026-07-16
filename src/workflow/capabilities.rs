@@ -191,6 +191,9 @@ impl StageCapabilities {
         match tool {
             "read_file" | "glob" | "ripgrep" | "search" | "git_log" | "session_changes"
             | "memory_search" | "memory_read" => self.repository_read,
+            "inspect_change" => {
+                self.repository_read && self.terminal_action == TerminalActionKind::SubmitCodeReview
+            }
             "web_search" | "web_fetch" => self.public_research,
             "attachments" | "vision_describe" | "session_title" => self.repository_read,
             "ask_user" => {
@@ -246,11 +249,13 @@ mod tests {
     fn read_only_stages_have_distinct_terminal_actions_and_no_shell() {
         let plan = StageCapabilities::for_stage(WorkflowStage::Planning);
         assert!(plan.allows_tool("read_file"));
+        assert!(!plan.allows_tool("inspect_change"));
         assert!(plan.allows_tool("submit_plan"));
         assert!(!plan.allows_tool("run_command"));
         assert!(!plan.allows_tool("apply_patch"));
 
         let review = StageCapabilities::for_stage(WorkflowStage::CodeReview);
+        assert!(review.allows_tool("inspect_change"));
         assert!(review.allows_tool("submit_code_review"));
         assert!(!review.allows_tool("submit_plan"));
         assert!(!review.allows_tool("run_command"));

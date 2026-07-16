@@ -20,6 +20,7 @@ use base64::Engine as _;
 
 mod agent_context;
 pub mod agent_core;
+mod agent_repository;
 pub mod browser_tools;
 pub mod checks;
 pub mod cli_ui;

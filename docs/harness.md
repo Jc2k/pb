@@ -105,6 +105,33 @@ character, byte, and line counts. If compaction cannot make the prompt fit witho
 pb emits `context_limit` with the measured token count and largest prompt sections; no model
 invocation or generation budget is consumed.
 
+### Focused planning and review evidence
+
+Planning and fresh plan review receive a deterministic `RepositoryBrief` rather than the complete
+normalized workspace graph. The brief is capped at 16,000 characters and includes the focus root,
+component/executor/check/task identifiers while space permits, manifests, likely entry points,
+bounded project-instruction excerpts, top-level paths, and task-dirty paths. It always carries the
+SHA-256 of the complete normalized graph and explicit omitted counts. The complete graph—not the
+brief—continues to validate component and check IDs in submitted plans. Repository instructions in
+the brief are labeled evidence-only and cannot add user authority.
+
+Fresh code review receives a changed-path manifest capped at 16,000 characters, selected check IDs, and bounded check
+evidence instead of a complete diff followed by duplicate complete current files. Each manifest
+entry states added, modified, deleted, or renamed status; prior path when applicable; text, binary,
+symlink, or other content kind; and whether focused inspection is required. Reviewers call
+`inspect_change(path)` for each current reviewable text path. The tool returns bounded relevant diff
+hunks, numbered current context around those hunks, the exact checked content fingerprint, and
+path-relevant current check summaries. New files use bounded current context when Git has no index
+diff; deleted and binary paths report that text is unavailable rather than claiming it was read.
+
+A successful text `inspect_change` earns the same fresh, invocation-local path evidence as
+`read_file`. `submit_code_review` remains hidden until every current changed text path has earned
+that evidence, and final artifact validation rechecks the complete trusted graph, selected check
+ledger, changed-path set, and checked fingerprint. `limits.review_diff_bytes` now caps each focused
+inspection representation; `limits.review_paths` continues to bound the complete task-delta path
+set. Full checked content remains bound by workspace and commit fingerprints and available in the
+isolated review workspace and resulting managed commit.
+
 Deterministic recovery is bounded. Repeated parse, artifact validation, identical-tool, plan-cycle,
 repair-cycle, invocation, token, stage-step, and advisory failures stop with explicit outcomes
 before another model turn can reinterpret the same fact. Strict workflow stages never use the old
@@ -210,7 +237,9 @@ pb harness eval --model model.gguf --model-dir /path/to/models \
 Use `--suite small-model` to run the stable subset used by
 [the small-model reliability plan](small-model-agent-reliability-plan.md) and its checked
 [S0 baseline](benchmarks/small-model-agent-baseline.md) and
-[S1 prompt-budget checkpoint](benchmarks/small-model-agent-s1.md). Each model-invocation record
+[S1 prompt-budget checkpoint](benchmarks/small-model-agent-s1.md). S2's deterministic prompt
+reduction is recorded in the [focused-evidence checkpoint](benchmarks/small-model-agent-s2.md).
+Each model-invocation record
 includes an optional backward-compatible context snapshot covering capacity, generation reserve,
 prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,
 thinking mode, and the compaction/cache/closure counters introduced by later milestones. Runtime
