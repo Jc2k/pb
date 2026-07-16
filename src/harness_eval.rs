@@ -385,6 +385,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         intent: Some(crate::workflow::TurnIntent::Deliver),
         workflow_policy: None,
         workflow_stage: None,
+        workflow_expected_content_fingerprint: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: true,
@@ -447,6 +448,7 @@ fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
         intent: Some(crate::workflow::TurnIntent::Deliver),
         workflow_policy: Some(crate::workflow::WorkflowConfigDocument::default().compile()?),
         workflow_stage: None,
+        workflow_expected_content_fingerprint: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: false,
@@ -841,6 +843,7 @@ fn execute_workflow_assertion(
                 StageContext {
                     system_prompt: "plan".to_string(),
                     user_prompt: "plan".to_string(),
+                    expected_content_fingerprint: None,
                 },
                 vec![
                     ScriptedCompletion {
@@ -898,6 +901,7 @@ fn execute_workflow_assertion(
                 StageContext {
                     system_prompt: "plan".to_string(),
                     user_prompt: "plan".to_string(),
+                    expected_content_fingerprint: None,
                 },
                 vec![
                     ScriptedCompletion {
@@ -1049,6 +1053,7 @@ fn execute_workflow_assertion(
                 StageContext {
                     system_prompt: "implement".to_string(),
                     user_prompt: "implement".to_string(),
+                    expected_content_fingerprint: None,
                 },
                 vec![
                     ScriptedCompletion {
@@ -1803,6 +1808,7 @@ fn run_real_model_fixture(
         intent: Some(crate::workflow::TurnIntent::Deliver),
         workflow_policy: None,
         workflow_stage: None,
+        workflow_expected_content_fingerprint: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: true,

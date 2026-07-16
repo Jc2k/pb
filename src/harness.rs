@@ -605,6 +605,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         intent: Some(args.intent),
         workflow_policy: Some(workflow_policy),
         workflow_stage: None,
+        workflow_expected_content_fingerprint: None,
         workflow_checkpoint: resumed_workflow,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: false,

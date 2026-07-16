@@ -268,6 +268,8 @@ S3's no-progress and read-cache boundaries are recorded in the
 [progress-recovery checkpoint](benchmarks/small-model-agent-s3.md).
 S4's structured tool failures and bounded truncation retry are recorded in the
 [action-recovery checkpoint](benchmarks/small-model-agent-s4.md).
+S5's deterministic closure checkpoint and conservative schema pruning are recorded in the
+[workflow-closure checkpoint](benchmarks/small-model-agent-s5.md).
 Each model-invocation record
 includes an optional backward-compatible context snapshot covering capacity, generation reserve,
 prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,
@@ -302,3 +304,18 @@ call keeps the existing terminal-only schema on that retry. If the result is sti
 may grow the cap once within the request limit; existing parse-loop thresholds remain authoritative.
 Every attempt reserves an invocation and records generated tokens before another retry is allowed,
 so the global invocation and token budgets cannot be bypassed by recovery.
+
+On each of the final two ordinary turns of planning, plan review, plan revision, or code review, pb
+adds a bounded JSON `workflow_closure_checkpoint` derived from harness state. It reports ordinary
+steps remaining, the current and harness-expected content fingerprints, the exact schema-derived
+terminal signature, whether that terminal is eligible or hidden, and the missing deterministic
+facts. The checkpoint is refreshed for each invocation instead of becoming durable authority in
+the transcript. Its invocation context increments `closure_checkpoints`; the existing `tool_count`,
+`tool_schema_chars`, and `tool_schema_tokens` fields record the narrowed schema surface.
+
+`ToolExposureState` only filters an already authorized set. During those closure turns, planning
+and plan review retain focused repository evidence tools; code review retains `inspect_change` and
+targeted reads/search. If the final turn has no missing precondition, only the exact terminal tool
+is exposed. Missing path reads, stale fingerprints, or a direct request allowlist keep the terminal
+hidden, and the execution boundary repeats the same deterministic check if a model hallucinates the
+call anyway. Implementation and repair schemas are not pruned by this policy.

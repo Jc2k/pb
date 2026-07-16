@@ -1,6 +1,6 @@
 # Small-model agent reliability plan
 
-Status: active; S0-S4 complete
+Status: active; S0-S5 complete
 
 This document is the tracking source for improving the quality and completion rate of small local
 models in pb's agent and enforced-delivery workflows. Update the milestone table, evidence log, and
@@ -459,7 +459,7 @@ only when its production path, deterministic proof, documentation, and semantic 
 | S2 | P0 | S0, S1 | complete | brief, focused review, RV1-RV3, RB1, ≥40% reduction | `feat: focus workflow repository evidence`; [S2 checkpoint](benchmarks/small-model-agent-s2.md) |
 | S3 | P1 | S0, S1 | complete | progress guard/cache, PG1-PG5 | `fix: stop no-progress agent tool loops`; [S3 checkpoint](benchmarks/small-model-agent-s3.md) |
 | S4 | P1 | S0, S1 | complete | error envelopes/retry policy, AR1-AR4 | `fix: guide truncated agent actions`; [S4 checkpoint](benchmarks/small-model-agent-s4.md) |
-| S5 | P1 | S0, S3, S4 | not started | closure/schema rules, CL1-CL3, SE1 | — |
+| S5 | P1 | S0, S3, S4 | complete | closure/schema rules, CL1-CL3, SE1 | `feat: add deterministic workflow closure`; [S5 checkpoint](benchmarks/small-model-agent-s5.md) |
 | S6 | P2 | S1-S5 | not started | before/after matrix, justified defaults, rollout docs | — |
 
 S2, S3, and S4 may proceed independently after their dependencies are complete. S5 must integrate
@@ -514,6 +514,7 @@ them rather than pasting them here.
 | 2026-07-16 | S2 | `feat: focus workflow repository evidence` | `cargo fmt --check`; `cargo test --all-targets` (927 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; RV1-RV3 and RB1 | scripted corpus 41/41 and subset 4/4; constructed large-review prompt reduction ≥40%; 16,000-character brief/manifest and byte-exact focused inspection bounds | S3 must detect outcome-equivalent no-progress cycles and cache only deterministic reads |
 | 2026-07-16 | S3 | `fix: stop no-progress agent tool loops` | `cargo fmt --check`; `cargo test --all-targets` (939 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; PG1-PG5 | scripted corpus 41/41 and subset 4/4; A-B-A and varied stale edits pre-blocked with no fourth model retry; one scoped read-cache hit in the repeated-read fixture | S4 must make ordinary tool/schema and truncation failures cheaper for a small model to correct |
 | 2026-07-16 | S4 | `fix: guide truncated agent actions` | `cargo fmt --check`; `cargo test --all-targets` (945 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; AR1-AR4 | scripted corpus 41/41 and subset 4/4; typo and argument failures are non-executing structured envelopes; same-cap thinking-off recovery succeeds and global retry budgets stop deterministically | S5 must add closure help without exposing terminal actions before every current precondition is satisfied |
+| 2026-07-16 | S5 | `feat: add deterministic workflow closure` | `cargo fmt --check`; `cargo test --all-targets` (953 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; CL1-CL3 and SE1-SE2 | scripted corpus 41/41 and subset 4/4; two-turn review narrows from focused evidence to one terminal schema; missing reads, stale fingerprints, and direct allowlists keep submission hidden | S6 must measure the fixed real-model matrix before selecting or rejecting model-specific rollout defaults |
 
 After each checkpoint, report:
 

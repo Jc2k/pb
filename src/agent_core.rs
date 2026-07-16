@@ -32,6 +32,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::agent_closure::{ClosureCheckpoint, ToolExposureState};
 use crate::agent_context::{self, ContextLimitError, PreparedPrompt, PromptMeasurement};
 use crate::agent_progress::{
     ProgressDecision, ProgressGuard, ProgressObservation, ProgressState, outcome_identity,
@@ -535,6 +536,10 @@ pub struct AgentRequest {
     /// snapshotted policy; callers cannot supply an arbitrary capability set.
     #[serde(default)]
     pub workflow_stage: Option<crate::workflow::WorkflowStage>,
+    /// Harness-owned content authority for the active strict stage. The stage runner sets this in
+    /// memory; persisted and direct requests cannot use it to manufacture terminal eligibility.
+    #[serde(skip)]
+    pub(crate) workflow_expected_content_fingerprint: Option<String>,
     /// Durable harness-owned checkpoint used only to resume an existing delivery workflow. A
     /// caller cannot use this to grant capabilities: the digest, policy, repository, Git control
     /// state, and stage are reconciled before another model invocation.
@@ -3938,6 +3943,10 @@ fn run_agent_steps(
         for tool in all_builtin_tool_specs() {
             if capabilities.allows_tool(&tool.name)
                 && capability_tool_available_in_context(&tool.name, args)
+                && args
+                    .tool_allowlist
+                    .as_ref()
+                    .is_none_or(|allowlist| allowlist.contains(&tool.name))
                 && !available_tools
                     .iter()
                     .any(|available| available.name == tool.name)
@@ -3980,14 +3989,32 @@ fn run_agent_steps(
             timestamp_ms: Some(now_millis()),
         });
 
-        let terminal_precondition =
-            workflow_terminal_precondition_feedback(args, &gate_state.borrow(), workspace_root)?;
+        let terminal_tool = args.workflow_stage.and_then(workflow_terminal_tool_name);
+        let readiness = workflow_terminal_readiness(args, &gate_state.borrow(), workspace_root)?;
+        let terminal_precondition = readiness
+            .as_ref()
+            .and_then(|state| terminal_tool.and_then(|tool| state.feedback(tool)));
+        if terminal_submission_only && terminal_precondition.is_some() {
+            terminal_submission_only = false;
+        }
         let mut scoped_tools = available_tools.clone();
         if terminal_precondition.is_some()
-            && let Some(required) = args.workflow_stage.and_then(workflow_terminal_tool_name)
+            && let Some(required) = terminal_tool
         {
             scoped_tools.retain(|tool| tool.name != required);
         }
+        let ordinary_steps_remaining = if step <= original_max_steps {
+            original_max_steps.saturating_sub(step).saturating_add(1)
+        } else {
+            usize::MAX
+        };
+        let exposure_state = ToolExposureState::for_turn(
+            args.workflow_stage,
+            ordinary_steps_remaining,
+            terminal_tool,
+            terminal_precondition.is_none(),
+        );
+        scoped_tools.retain(|tool| exposure_state.allows(&tool.name));
         let terminal_tools = terminal_submission_only
             .then(|| {
                 args.workflow_stage
@@ -4007,17 +4034,70 @@ fn run_agent_steps(
         } else {
             scoped_tools.as_slice()
         };
+        let closure_checkpoint = if exposure_state.is_closing() {
+            readiness
+                .as_ref()
+                .zip(terminal_tool)
+                .map(|(state, terminal_tool)| {
+                    let terminal_schema = available_tools
+                        .iter()
+                        .find(|tool| tool.name == terminal_tool)
+                        .cloned()
+                        .or_else(|| {
+                            all_builtin_tool_specs()
+                                .into_iter()
+                                .find(|tool| tool.name == terminal_tool)
+                        })
+                        .with_context(|| {
+                            format!("no schema exists for terminal tool '{terminal_tool}'")
+                        })?;
+                    Ok::<_, anyhow::Error>(ClosureCheckpoint::render(
+                        args.workflow_stage
+                            .expect("closing state requires a workflow stage"),
+                        ordinary_steps_remaining,
+                        &state.current_content_fingerprint,
+                        state.expected_content_fingerprint.as_deref(),
+                        terminal_tool,
+                        &agent_tool_errors::schema_signature(
+                            &terminal_schema.name,
+                            &terminal_schema.input_schema,
+                        ),
+                        &state.missing,
+                    ))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let closure_messages = closure_checkpoint.as_ref().map(|checkpoint| {
+            sink.emit(AgentEvent::Correction {
+                message: checkpoint.clone(),
+                summary: "Workflow closure checkpoint".to_string(),
+                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+            let mut closure_messages = messages.clone();
+            closure_messages.push(correction_chat_message(
+                "Workflow closure checkpoint",
+                checkpoint,
+            ));
+            closure_messages
+        });
+        let generation_messages = closure_messages.as_deref().unwrap_or(messages);
+        let terminal_only_turn = terminal_submission_only
+            || matches!(exposure_state, ToolExposureState::TerminalOnly { .. });
         let generated = match generate_and_parse_action_with_retries(
             generator,
             args,
-            messages,
+            generation_messages,
             generation_tools,
-            workflow_completion_enable_thinking(suppress_thinking, terminal_submission_only),
+            workflow_completion_enable_thinking(suppress_thinking, terminal_only_turn),
             step,
             &mut metrics,
             sink,
             nesting_depth,
             run_budget,
+            usize::from(closure_checkpoint.is_some()),
         ) {
             Ok(generated) => generated,
             Err(error) => {
@@ -5288,6 +5368,7 @@ fn record_completion_metrics(
             enable_thinking,
             completion.prompt_tokens,
             read_cache_hits,
+            0,
             None,
         )),
         energy_joules: completion.energy.map(|estimate| estimate.joules),
@@ -5304,6 +5385,7 @@ fn completion_context_usage(
     enable_thinking: bool,
     prompt_tokens: usize,
     read_cache_hits: usize,
+    closure_checkpoints: usize,
     retry_reason: Option<AgentRetryReason>,
 ) -> AgentContextUsage {
     let context_capacity = prepared.context_capacity;
@@ -5344,7 +5426,7 @@ fn completion_context_usage(
         compacted_messages: prepared.compacted_messages,
         omitted_tool_result_chars: prepared.omitted_tool_result_chars,
         read_cache_hits,
-        closure_checkpoints: 0,
+        closure_checkpoints,
     }
 }
 
@@ -6572,6 +6654,7 @@ fn prepare_generation_prompt(
 pub(crate) struct StageContext {
     pub system_prompt: String,
     pub user_prompt: String,
+    pub expected_content_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -6622,6 +6705,7 @@ fn run_stage(
             .min(contract.max_tokens_per_turn),
     );
     args.workflow_stage = Some(contract.stage);
+    args.workflow_expected_content_fingerprint = context.expected_content_fingerprint.clone();
     // StageCapabilities is the authoritative allowlist. A legacy/direct-run allowlist must not
     // accidentally remove the required typed terminal action or add authority to this stage.
     args.tool_allowlist = None;
@@ -8011,38 +8095,109 @@ fn args_workflow_terminal_tool(args: &AgentRequest, tool: &str) -> bool {
         .is_some_and(|required| required == tool)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkflowTerminalReadiness {
+    current_content_fingerprint: String,
+    expected_content_fingerprint: Option<String>,
+    missing: Vec<String>,
+}
+
+impl WorkflowTerminalReadiness {
+    fn feedback(&self, terminal_tool: &str) -> Option<String> {
+        if self.missing.is_empty() {
+            return None;
+        }
+        let mut displayed = self.missing.iter().take(12).cloned().collect::<Vec<_>>();
+        let omitted = self.missing.len().saturating_sub(displayed.len());
+        if omitted > 0 {
+            displayed.push(format!("{omitted} additional precondition(s) omitted"));
+        }
+        Some(format!(
+            "{terminal_tool} is unavailable until deterministic terminal preconditions are current. Missing: {}",
+            displayed.join(", ")
+        ))
+    }
+}
+
+fn workflow_terminal_readiness(
+    args: &AgentRequest,
+    gate_state: &GateState,
+    workspace_root: &Path,
+) -> Result<Option<WorkflowTerminalReadiness>> {
+    let Some(stage) = args.workflow_stage else {
+        return Ok(None);
+    };
+    if !matches!(
+        stage,
+        crate::workflow::WorkflowStage::Planning
+            | crate::workflow::WorkflowStage::PlanRevision
+            | crate::workflow::WorkflowStage::PlanReview
+            | crate::workflow::WorkflowStage::CodeReview
+    ) {
+        return Ok(None);
+    }
+    let current_content_fingerprint =
+        crate::workspace::ContentSnapshot::capture(workspace_root)?.fingerprint;
+    let expected_content_fingerprint = args.workflow_expected_content_fingerprint.clone();
+    let mut missing = Vec::new();
+    let terminal_tool =
+        workflow_terminal_tool_name(stage).context("model workflow stage has no terminal tool")?;
+    if args
+        .tool_allowlist
+        .as_ref()
+        .is_some_and(|allowlist| !allowlist.iter().any(|tool| tool == terminal_tool))
+    {
+        missing.push(format!(
+            "terminal tool '{terminal_tool}' is excluded by the request tool allowlist"
+        ));
+    }
+    if let Some(expected) = expected_content_fingerprint.as_deref()
+        && expected != current_content_fingerprint
+    {
+        missing.push(format!(
+            "stage content fingerprint is stale: expected {expected}, current {current_content_fingerprint}"
+        ));
+    }
+    if stage == crate::workflow::WorkflowStage::CodeReview {
+        let repository = args
+            .repository_context
+            .as_ref()
+            .context("code-review stage requires a repository baseline")?;
+        let mut missing_paths = repository
+            .task_changed_paths()?
+            .into_iter()
+            .map(|path| {
+                reviewable_current_path(workspace_root, &path).map(|reviewable| (path, reviewable))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(path, reviewable)| {
+                (reviewable && !gate_state.read_paths.contains(&path)).then_some(path)
+            })
+            .collect::<Vec<_>>();
+        missing_paths.sort();
+        missing.extend(missing_paths);
+    }
+    Ok(Some(WorkflowTerminalReadiness {
+        current_content_fingerprint,
+        expected_content_fingerprint,
+        missing,
+    }))
+}
+
 fn workflow_terminal_precondition_feedback(
     args: &AgentRequest,
     gate_state: &GateState,
     workspace_root: &Path,
 ) -> Result<Option<String>> {
-    if args.workflow_stage != Some(crate::workflow::WorkflowStage::CodeReview) {
+    let Some(readiness) = workflow_terminal_readiness(args, gate_state, workspace_root)? else {
         return Ok(None);
-    }
-    let repository = args
-        .repository_context
-        .as_ref()
-        .context("code-review stage requires a repository baseline")?;
-    let missing = repository
-        .task_changed_paths()?
-        .into_iter()
-        .map(|path| {
-            reviewable_current_path(workspace_root, &path).map(|reviewable| (path, reviewable))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(|(path, reviewable)| {
-            (reviewable && !gate_state.read_paths.contains(&path)).then_some(path)
-        })
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(format!(
-            "submit_code_review is unavailable until this fresh reviewer calls inspect_change or read_file for every changed text path. Missing: {}",
-            missing.join(", ")
-        )))
-    }
+    };
+    let terminal_tool = args
+        .workflow_stage
+        .and_then(workflow_terminal_tool_name)
+        .context("model workflow stage has no terminal tool")?;
+    Ok(readiness.feedback(terminal_tool))
 }
 
 fn delivery_stage_context(
@@ -8077,6 +8232,7 @@ fn delivery_stage_context(
                     run.task,
                     run.planning_content().fingerprint,
                 ),
+                expected_content_fingerprint: Some(run.planning_content().fingerprint.clone()),
             })
         }
         crate::workflow::WorkflowStage::PlanReview => {
@@ -8093,6 +8249,7 @@ fn delivery_stage_context(
                     run.task,
                     run.planning_content().fingerprint,
                 ),
+                expected_content_fingerprint: Some(run.planning_content().fingerprint.clone()),
             })
         }
         crate::workflow::WorkflowStage::Implementing
@@ -8120,6 +8277,7 @@ fn delivery_stage_context(
                     "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nPassing plan critique:\n{review_json}\n\nCurrent harness content fingerprint: {}\n\nBlocking code findings from the prior review:\n{findings}\n\n{handoff_note}\n\n{IMPLEMENTATION_SUBMISSION_GUIDANCE}{repair_note}{correction}",
                     run.task, current.fingerprint,
                 ),
+                expected_content_fingerprint: None,
             })
         }
         crate::workflow::WorkflowStage::CodeReview => {
@@ -8157,6 +8315,7 @@ fn delivery_stage_context(
                     run.task,
                     checked_fingerprint,
                 ),
+                expected_content_fingerprint: Some(checked_fingerprint.to_string()),
             })
         }
         stage => bail!("cannot build planning context for {stage:?}"),
@@ -8993,6 +9152,7 @@ fn generate_and_parse_action_with_retries(
     sink: &mut dyn EventSink,
     nesting_depth: usize,
     run_budget: &RefCell<RunBudget>,
+    closure_checkpoints: usize,
 ) -> Result<std::result::Result<(String, AgentAction), ParseFailure>> {
     let mut max_tokens = boosted_max_tokens(args);
     let mut attempt_enable_thinking = enable_thinking;
@@ -9059,6 +9219,7 @@ fn generate_and_parse_action_with_retries(
                 attempt_enable_thinking,
                 completion.prompt_tokens,
                 read_cache_hits,
+                closure_checkpoints,
                 retry_reason,
             )),
             energy_joules: completion.energy.map(|estimate| estimate.joules),
@@ -14043,6 +14204,7 @@ mod tests {
             intent: None,
             workflow_policy: None,
             workflow_stage: None,
+            workflow_expected_content_fingerprint: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
             legacy_prompt_owned_delivery: true,
@@ -14115,6 +14277,7 @@ mod tests {
         StageContext {
             system_prompt: "Follow the typed workflow stage contract.".to_string(),
             user_prompt: "Complete this bounded stage.".to_string(),
+            expected_content_fingerprint: None,
         }
     }
 
@@ -16018,6 +16181,126 @@ mod tests {
     }
 
     #[test]
+    fn se1_closure_exposure_is_an_authorized_allowlisted_subset_for_every_target_stage() {
+        for (stage, terminal_tool) in [
+            (crate::workflow::WorkflowStage::Planning, "submit_plan"),
+            (crate::workflow::WorkflowStage::PlanRevision, "submit_plan"),
+            (
+                crate::workflow::WorkflowStage::PlanReview,
+                "submit_plan_review",
+            ),
+            (
+                crate::workflow::WorkflowStage::CodeReview,
+                "submit_code_review",
+            ),
+        ] {
+            let capabilities = crate::workflow::StageCapabilities::for_stage(stage);
+            let authorized = all_builtin_tool_specs()
+                .into_iter()
+                .filter(|tool| capabilities.allows_tool(&tool.name))
+                .collect::<Vec<_>>();
+            assert!(authorized.iter().any(|tool| tool.name == terminal_tool));
+
+            for ordinary_steps_remaining in [1, 2] {
+                for terminal_ready in [false, true] {
+                    let exposure = ToolExposureState::for_turn(
+                        Some(stage),
+                        ordinary_steps_remaining,
+                        Some(terminal_tool),
+                        terminal_ready,
+                    );
+                    let exposed = authorized
+                        .iter()
+                        .filter(|tool| exposure.allows(&tool.name))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        exposed
+                            .iter()
+                            .all(|tool| capabilities.allows_tool(&tool.name))
+                    );
+                    if !terminal_ready {
+                        assert!(exposed.iter().all(|tool| tool.name != terminal_tool));
+                    }
+                    if terminal_ready && ordinary_steps_remaining == 1 {
+                        assert_eq!(
+                            exposed
+                                .iter()
+                                .map(|tool| tool.name.as_str())
+                                .collect::<Vec<_>>(),
+                            vec![terminal_tool]
+                        );
+                    }
+
+                    let request_allowlist = ["read_file", terminal_tool];
+                    let allowlisted = exposed
+                        .iter()
+                        .filter(|tool| request_allowlist.contains(&tool.name.as_str()))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        allowlisted
+                            .iter()
+                            .all(|tool| request_allowlist.contains(&tool.name.as_str()))
+                    );
+                    assert!(
+                        allowlisted
+                            .iter()
+                            .all(|tool| capabilities.allows_tool(&tool.name))
+                    );
+                }
+            }
+        }
+
+        for stage in [
+            crate::workflow::WorkflowStage::Implementing,
+            crate::workflow::WorkflowStage::Repairing,
+        ] {
+            assert_eq!(
+                ToolExposureState::for_turn(Some(stage), 1, Some("submit_implementation"), true,),
+                ToolExposureState::Authorized
+            );
+        }
+    }
+
+    #[test]
+    fn se1_workflow_exposure_does_not_broaden_a_direct_request_allowlist() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.max_steps = 1;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Planning);
+        request.tool_allowlist = Some(vec!["read_file".to_string()]);
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![ScriptedCompletion {
+                content: plan_submission(),
+                truncated: false,
+            }],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert!(outcome.workflow_submission.is_none());
+        assert_eq!(
+            outcome.generation_tool_names,
+            vec![vec!["read_file".to_string()]]
+        );
+        let checkpoint = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::Correction {
+                    summary, message, ..
+                } if summary == "Workflow closure checkpoint" => Some(message),
+                _ => None,
+            })
+            .expect("allowlist closure checkpoint");
+        assert!(checkpoint.contains("excluded by the request tool allowlist"));
+        assert!(checkpoint.contains("\"terminal_status\":\"hidden\""));
+    }
+
+    #[test]
     fn hidden_stage_tool_is_rejected_again_at_execution_boundary() {
         let repo = init_contract_test_repo();
         let request = workflow_request(AgentProfile::Plan, repo.path());
@@ -17760,6 +18043,230 @@ mod tests {
             AgentEvent::ToolResult { tool, result, .. }
                 if tool == "submit_code_review" && result.contains("Missing: changed.txt")
         )));
+    }
+
+    #[test]
+    fn cl1_two_step_checkpoint_focuses_evidence_then_terminal_only_submission() {
+        let repo = init_contract_test_repo();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("changed.txt"), "review me\n").unwrap();
+        let fingerprint = crate::workspace::ContentSnapshot::capture(repo.path())
+            .unwrap()
+            .fingerprint;
+        let mut request = workflow_request(AgentProfile::Review, repo.path());
+        request.max_steps = 2;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::CodeReview);
+        request.workflow_expected_content_fingerprint = Some(fingerprint.clone());
+        request.repository_context = Some(repository);
+        let submission =
+            code_review_submission(&fingerprint, crate::workflow::ReviewVerdict::Pass, None);
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("inspect_change", json!({"path": "changed.txt"})),
+                ScriptedCompletion {
+                    content: submission,
+                    truncated: false,
+                },
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.workflow_submission,
+            Some(crate::workflow::StageSubmission::CodeReview { .. })
+        ));
+        assert!(outcome.generation_tool_names[0].contains(&"inspect_change".to_string()));
+        assert!(!outcome.generation_tool_names[0].contains(&"submit_code_review".to_string()));
+        assert!(!outcome.generation_tool_names[0].contains(&"sub_agent".to_string()));
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["submit_code_review".to_string()]
+        );
+
+        let checkpoints = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Correction {
+                    summary, message, ..
+                } if summary == "Workflow closure checkpoint" => {
+                    Some(serde_json::from_str::<Value>(message).unwrap())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0]["terminal_status"], "hidden");
+        assert_eq!(checkpoints[1]["terminal_status"], "eligible");
+        assert_eq!(checkpoints[1]["current_content_fingerprint"], fingerprint);
+        assert!(
+            checkpoints[1]["terminal_signature"]
+                .as_str()
+                .unwrap()
+                .starts_with("submit_code_review(")
+        );
+
+        let invocation_contexts = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::LlmInvocation {
+                    context: Some(context),
+                    ..
+                } => Some(context),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(invocation_contexts.len(), 2);
+        assert!(
+            invocation_contexts
+                .iter()
+                .all(|context| context.closure_checkpoints == 1)
+        );
+        assert_eq!(invocation_contexts[1].tool_count, 1);
+        assert!(
+            invocation_contexts[1]
+                .tool_schema_tokens
+                .is_some_and(|tokens| tokens > 0)
+        );
+    }
+
+    #[test]
+    fn cl2_last_step_does_not_bypass_a_missing_review_read() {
+        let repo = init_contract_test_repo();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("changed.txt"), "review me\n").unwrap();
+        let fingerprint = crate::workspace::ContentSnapshot::capture(repo.path())
+            .unwrap()
+            .fingerprint;
+        let mut request = workflow_request(AgentProfile::Review, repo.path());
+        request.max_steps = 2;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::CodeReview);
+        request.workflow_expected_content_fingerprint = Some(fingerprint.clone());
+        request.repository_context = Some(repository);
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("ripgrep", json!({"pattern": "review me"})),
+                ScriptedCompletion {
+                    content: code_review_submission(
+                        &fingerprint,
+                        crate::workflow::ReviewVerdict::Pass,
+                        None,
+                    ),
+                    truncated: false,
+                },
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert!(outcome.workflow_submission.is_none());
+        assert!(
+            outcome
+                .generation_tool_names
+                .iter()
+                .all(|tools| !tools.contains(&"submit_code_review".to_string()))
+        );
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { tool, result, .. } if tool == "submit_code_review" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .expect("blocked terminal result");
+        let envelope: agent_tool_errors::ToolFailureEnvelope =
+            serde_json::from_str(result).unwrap();
+        assert_eq!(
+            envelope.reason_code,
+            agent_tool_errors::ToolFailureReason::PreconditionUnmet
+        );
+        assert!(envelope.message.contains("changed.txt"));
+    }
+
+    #[test]
+    fn cl3_stale_fingerprint_is_named_and_keeps_terminal_submission_hidden() {
+        let repo = init_contract_test_repo();
+        let expected = crate::workspace::ContentSnapshot::capture(repo.path())
+            .unwrap()
+            .fingerprint;
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        std::fs::write(repo.path().join("changed.txt"), "changed after checks\n").unwrap();
+        let current = crate::workspace::ContentSnapshot::capture(repo.path())
+            .unwrap()
+            .fingerprint;
+        let mut request = workflow_request(AgentProfile::Review, repo.path());
+        request.max_steps = 2;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::CodeReview);
+        request.workflow_expected_content_fingerprint = Some(expected.clone());
+        request.repository_context = Some(repository);
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("inspect_change", json!({"path": "changed.txt"})),
+                ScriptedCompletion {
+                    content: code_review_submission(
+                        &current,
+                        crate::workflow::ReviewVerdict::Pass,
+                        None,
+                    ),
+                    truncated: false,
+                },
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert!(outcome.workflow_submission.is_none());
+        assert!(
+            outcome
+                .generation_tool_names
+                .iter()
+                .all(|tools| !tools.contains(&"submit_code_review".to_string()))
+        );
+        let checkpoint = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::Correction {
+                    summary, message, ..
+                } if summary == "Workflow closure checkpoint" => {
+                    Some(serde_json::from_str::<Value>(message).unwrap())
+                }
+                _ => None,
+            })
+            .expect("stale closure checkpoint");
+        assert_eq!(checkpoint["terminal_status"], "hidden");
+        assert_eq!(checkpoint["expected_content_fingerprint"], expected);
+        assert_eq!(checkpoint["current_content_fingerprint"], current);
+        assert!(
+            checkpoint["missing_terminal_preconditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|fact| fact.as_str().unwrap().contains("fingerprint is stale"))
+        );
+        assert!(
+            checkpoint["terminal_signature"]
+                .as_str()
+                .unwrap()
+                .starts_with("submit_code_review(")
+        );
     }
 
     #[test]
@@ -20089,6 +20596,7 @@ mod tests {
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
             workflow_stage: None,
+            workflow_expected_content_fingerprint: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
             legacy_prompt_owned_delivery: false,
@@ -20161,6 +20669,7 @@ mod tests {
             intent: Some(crate::workflow::TurnIntent::Discuss),
             workflow_policy: None,
             workflow_stage: None,
+            workflow_expected_content_fingerprint: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
             legacy_prompt_owned_delivery: false,

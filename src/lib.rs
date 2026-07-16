@@ -18,6 +18,7 @@ use crate::integrations::{IntegrationInstallRequest, IntegrationKind};
 use crate::mcp::{McpServerConfig, ProjectMcpConfig};
 use base64::Engine as _;
 
+mod agent_closure;
 mod agent_context;
 pub mod agent_core;
 mod agent_progress;
@@ -939,6 +940,7 @@ async fn run_serve() -> Result<()> {
         intent: Some(crate::workflow::TurnIntent::Discuss),
         workflow_policy: None,
         workflow_stage: None,
+        workflow_expected_content_fingerprint: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: false,
