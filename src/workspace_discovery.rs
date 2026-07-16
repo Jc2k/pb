@@ -1147,12 +1147,18 @@ mod tests {
         );
         std::fs::create_dir_all(repo.path().join("webui")).unwrap();
         let environment = EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Local,
             backend: EnvironmentBackend::Local,
             image: "local".to_string(),
             init_commands: Vec::new(),
             setup_commands: Vec::new(),
             session_commands: Vec::new(),
+            env: Default::default(),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: Vec::new(),
             guard_commands: vec![
                 "deno task build:web".to_string(),
                 "cargo test --all-targets".to_string(),

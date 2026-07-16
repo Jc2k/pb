@@ -1232,12 +1232,18 @@ fn require_git_success(workspace: &Path, args: &[&str]) -> Result<String> {
 
 fn harness_environment() -> EnvironmentConfig {
     EnvironmentConfig {
+        version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
         mode: EnvironmentMode::Local,
         backend: EnvironmentBackend::Local,
         image: "local".to_string(),
         init_commands: Vec::new(),
         setup_commands: Vec::new(),
         session_commands: Vec::new(),
+        env: Default::default(),
+        bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+        runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+        resources: Default::default(),
+        caches: Vec::new(),
         guard_commands: Vec::new(),
         prepared_image: None,
         source: Some("pb harness scratch workspace".to_string()),

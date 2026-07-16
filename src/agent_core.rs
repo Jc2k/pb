@@ -29,6 +29,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -47,7 +48,9 @@ use crate::checks::{
 };
 use crate::container;
 use crate::energy::{self, EnergyEstimate};
-use crate::environment::{EnvironmentBackend, EnvironmentConfig};
+use crate::environment::{
+    EnvironmentBackend, EnvironmentConfig, EnvironmentMode, EnvironmentNetworkMode,
+};
 use crate::events::{
     AgentContextUsage, AgentEvent, AgentRetryReason, ContextSectionUsage, ContractStatus,
     FinalGraceStatus, TerminationReason,
@@ -943,33 +946,69 @@ pub(crate) struct CheckCommandOutput {
 
 impl CommandBackend {
     pub(crate) fn start(config: &EnvironmentConfig, workspace_root: &Path) -> Result<Self> {
+        Self::start_for_session(config, workspace_root, "executor", "command")
+    }
+
+    pub(crate) fn start_for_session(
+        config: &EnvironmentConfig,
+        workspace_root: &Path,
+        session_id: &str,
+        role: &str,
+    ) -> Result<Self> {
+        config.validate()?;
         match config.backend {
             EnvironmentBackend::AppleContainers => {
                 let runtime = container::detect_runtime().context(
                     "no container runtime found; install docker, podman, or apple/container",
                 )?;
-                let image = prepare_container_image(config, workspace_root, runtime.as_ref())?;
-                let container_id = runtime
-                    .create(&image, workspace_root)
-                    .or_else(|create_err| {
-                        if config.prepared_image.is_some() {
-                            let rebuilt = rebuild_container_image(config, workspace_root, runtime.as_ref())?;
-                            runtime.create(&rebuilt, workspace_root).with_context(|| {
-                                format!(
-                                    "failed to create task container after rebuilding environment; original error: {create_err:#}"
-                                )
-                            })
-                        } else {
-                            Err(create_err).context("failed to create task container")
+                let runtime_info = runtime.info()?;
+                prepare_immutable_environment_image(config, workspace_root, runtime.as_ref())?;
+                let identity = ContainerSessionIdentity::new(workspace_root, session_id, role);
+                let cache_mounts =
+                    ensure_environment_caches(config, workspace_root, &identity, runtime.as_ref())?;
+                run_environment_bootstrap(
+                    config,
+                    workspace_root,
+                    &identity,
+                    &cache_mounts,
+                    runtime.as_ref(),
+                )?;
+                let network = create_environment_network(
+                    config.runtime_network,
+                    &identity,
+                    "runtime",
+                    runtime.as_ref(),
+                )?;
+                let launch = environment_launch_spec(
+                    config,
+                    workspace_root,
+                    &identity,
+                    "runtime",
+                    network.clone(),
+                    &cache_mounts,
+                );
+                let container_id = match runtime.create(&launch) {
+                    Ok(container_id) => container_id,
+                    Err(error) => {
+                        if let Some(network) = &network {
+                            let _ = runtime.remove_network(network);
                         }
-                    })?;
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to create {} {} container",
+                                runtime_info.binary, role
+                            )
+                        });
+                    }
+                };
                 let handle = container::ContainerHandle {
                     runtime,
                     container_id,
+                    network,
                 };
                 for cmd in config.session_commands() {
                     handle
-                        .exec(cmd)
+                        .exec(&format!("cd /workspace && {cmd}"))
                         .with_context(|| format!("container session command failed: {cmd}"))?;
                 }
                 Ok(CommandBackend::Container(handle))
@@ -1070,6 +1109,536 @@ impl CommandBackend {
             },
             workspace_root,
         )
+    }
+}
+
+static CONTAINER_RESOURCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn prepare_immutable_environment_image(
+    config: &EnvironmentConfig,
+    workspace_root: &Path,
+    runtime: &dyn container::ContainerRuntime,
+) -> Result<()> {
+    match config.mode {
+        EnvironmentMode::Pull => {
+            if !runtime.image_exists(&config.image)? {
+                runtime.pull(&config.image).with_context(|| {
+                    format!("failed to pull environment image {}", config.image)
+                })?;
+            }
+        }
+        EnvironmentMode::Build => {
+            let dockerfile = config
+                .dockerfile
+                .as_deref()
+                .context("build environment is missing dockerfile")?;
+            let dockerfile = workspace_root
+                .join(dockerfile)
+                .canonicalize()
+                .with_context(|| {
+                    format!(
+                        "failed to resolve environment Dockerfile {}",
+                        workspace_root.join(dockerfile).display()
+                    )
+                })?;
+            let canonical_root = workspace_root.canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve workspace root {}",
+                    workspace_root.display()
+                )
+            })?;
+            if !dockerfile.starts_with(&canonical_root) || !dockerfile.is_file() {
+                bail!(
+                    "environment Dockerfile must be a file inside the workspace: {}",
+                    dockerfile.display()
+                );
+            }
+            // Rebuild on every new lease. Both Apple container and OCI builders reuse their
+            // content-addressed layer caches, while this avoids trusting a stale mutable tag.
+            runtime
+                .build(&dockerfile, &config.image)
+                .with_context(|| format!("failed to build environment image {}", config.image))?;
+        }
+        EnvironmentMode::Local => bail!(
+            "container backend cannot use environment mode=local; set backend=local explicitly"
+        ),
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ContainerSessionIdentity {
+    project: String,
+    session: String,
+    role: String,
+    nonce: String,
+}
+
+impl ContainerSessionIdentity {
+    fn new(workspace_root: &Path, session_id: &str, role: &str) -> Self {
+        let project = short_sha256(workspace_root.to_string_lossy().as_bytes());
+        let session = if session_id.trim().is_empty() {
+            "anonymous".to_string()
+        } else {
+            short_sha256(session_id.as_bytes())
+        };
+        let role = sanitize_container_resource_part(role);
+        let sequence = CONTAINER_RESOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let nonce =
+            short_sha256(format!("{}:{sequence}:{timestamp}", std::process::id()).as_bytes());
+        Self {
+            project,
+            session,
+            role,
+            nonce,
+        }
+    }
+
+    fn resource_name(&self, kind: &str) -> String {
+        format!(
+            "pb-{}-{}-{}-{}",
+            sanitize_container_resource_part(kind),
+            self.project,
+            self.session,
+            self.nonce
+        )
+    }
+
+    fn labels(&self, resource_role: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("dev.pb.managed".to_string(), "true".to_string()),
+            ("dev.pb.project".to_string(), self.project.clone()),
+            ("dev.pb.session".to_string(), self.session.clone()),
+            (
+                "dev.pb.role".to_string(),
+                format!("{}-{resource_role}", self.role),
+            ),
+        ])
+    }
+}
+
+fn short_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))[..12].to_string()
+}
+
+fn sanitize_container_resource_part(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "resource".to_string()
+    } else {
+        sanitized.chars().take(24).collect()
+    }
+}
+
+fn environment_launch_spec(
+    config: &EnvironmentConfig,
+    workspace_root: &Path,
+    identity: &ContainerSessionIdentity,
+    phase: &str,
+    network: Option<String>,
+    cache_mounts: &[container::ContainerMount],
+) -> container::ContainerLaunchSpec {
+    let mut mounts = vec![container::ContainerMount::bind(
+        workspace_root,
+        "/workspace",
+        false,
+    )];
+    mounts.extend(cache_mounts.iter().cloned());
+    container::ContainerLaunchSpec {
+        name: identity.resource_name(phase),
+        image: config.image.clone(),
+        workdir: "/workspace".to_string(),
+        mounts,
+        labels: identity.labels(phase),
+        env: config.env.clone(),
+        network,
+        resources: container::ContainerResources {
+            cpus: config.resources.cpus,
+            memory_mb: config.resources.memory_mb,
+        },
+        tmpfs: vec![
+            "/tmp".to_string(),
+            "/var/tmp".to_string(),
+            "/run".to_string(),
+        ],
+        read_only_root: true,
+    }
+}
+
+fn create_environment_network(
+    mode: EnvironmentNetworkMode,
+    identity: &ContainerSessionIdentity,
+    phase: &str,
+    runtime: &dyn container::ContainerRuntime,
+) -> Result<Option<String>> {
+    if mode == EnvironmentNetworkMode::Egress {
+        return Ok(None);
+    }
+    let name = identity.resource_name(&format!("{phase}-net"));
+    runtime
+        .create_internal_network(&container::NetworkSpec {
+            name: name.clone(),
+            labels: identity.labels(&format!("{phase}-network")),
+        })
+        .with_context(|| format!("failed to create isolated container network {name}"))?;
+    Ok(Some(name))
+}
+
+fn run_environment_bootstrap(
+    config: &EnvironmentConfig,
+    workspace_root: &Path,
+    identity: &ContainerSessionIdentity,
+    cache_mounts: &[container::ContainerMount],
+    runtime: &dyn container::ContainerRuntime,
+) -> Result<()> {
+    let commands = config.setup_commands();
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let network =
+        create_environment_network(config.bootstrap_network, identity, "bootstrap", runtime)?;
+    let launch = environment_launch_spec(
+        config,
+        workspace_root,
+        identity,
+        "bootstrap",
+        network.clone(),
+        cache_mounts,
+    );
+    let container_id = match runtime.create(&launch) {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            if let Some(network) = &network {
+                let _ = runtime.remove_network(network);
+            }
+            return Err(error).context("failed to create dependency bootstrap container");
+        }
+    };
+    let result = (|| -> Result<()> {
+        for command in commands {
+            runtime
+                .exec(&container_id, &format!("cd /workspace && {command}"))
+                .with_context(|| format!("container bootstrap command failed: {command}"))?;
+        }
+        Ok(())
+    })();
+    let remove_result = runtime
+        .remove(&container_id)
+        .context("failed to remove dependency bootstrap container");
+    let network_result = network
+        .as_deref()
+        .map(|network| {
+            runtime
+                .remove_network(network)
+                .with_context(|| format!("failed to remove bootstrap network {network}"))
+        })
+        .transpose();
+    result?;
+    remove_result?;
+    network_result?;
+    Ok(())
+}
+
+fn ensure_environment_caches(
+    config: &EnvironmentConfig,
+    workspace_root: &Path,
+    identity: &ContainerSessionIdentity,
+    runtime: &dyn container::ContainerRuntime,
+) -> Result<Vec<container::ContainerMount>> {
+    let mut mounts = Vec::new();
+    let image_fingerprint = if config.caches.is_empty() {
+        None
+    } else {
+        Some(runtime.image_fingerprint(&config.image)?)
+    };
+    for cache in &config.caches {
+        let mut digest = Sha256::new();
+        digest.update(identity.project.as_bytes());
+        digest.update([0]);
+        digest.update(image_fingerprint.as_deref().unwrap_or_default().as_bytes());
+        digest.update([0]);
+        for command in config.setup_commands() {
+            digest.update(command.as_bytes());
+            digest.update([0]);
+        }
+        digest.update(cache.id.as_bytes());
+        digest.update([0]);
+        digest.update(cache.target.to_string_lossy().as_bytes());
+        for key_file in &cache.key_files {
+            digest.update([0]);
+            digest.update(key_file.to_string_lossy().as_bytes());
+            let path = workspace_root.join(key_file);
+            match std::fs::read(&path) {
+                Ok(contents) => digest.update(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    digest.update(b"<missing>")
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to fingerprint cache input {}", path.display())
+                    });
+                }
+            }
+        }
+        let fingerprint = format!("{:x}", digest.finalize());
+        let volume_name = format!(
+            "pb-cache-{}-{}-{}",
+            identity.project,
+            sanitize_container_resource_part(&cache.id),
+            &fingerprint[..12]
+        );
+        runtime
+            .ensure_volume(&container::VolumeSpec {
+                name: volume_name.clone(),
+                labels: BTreeMap::from([
+                    ("dev.pb.managed".to_string(), "true".to_string()),
+                    ("dev.pb.project".to_string(), identity.project.clone()),
+                    ("dev.pb.role".to_string(), "cache".to_string()),
+                    ("dev.pb.cache".to_string(), cache.id.clone()),
+                    ("dev.pb.fingerprint".to_string(), fingerprint),
+                ]),
+            })
+            .with_context(|| format!("failed to prepare cache volume for '{}'", cache.id))?;
+        mounts.push(container::ContainerMount::volume(
+            volume_name,
+            cache.target.to_string_lossy(),
+        ));
+    }
+    Ok(mounts)
+}
+
+#[cfg(test)]
+mod environment_runtime_tests {
+    use super::*;
+    use crate::environment::{EnvironmentCache, EnvironmentResources};
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        events: Mutex<Vec<String>>,
+        launches: Mutex<Vec<container::ContainerLaunchSpec>>,
+        image_exists: bool,
+    }
+
+    impl RecordingRuntime {
+        fn with_image(image_exists: bool) -> Self {
+            Self {
+                image_exists,
+                ..Self::default()
+            }
+        }
+
+        fn record(&self, event: impl Into<String>) {
+            self.events.lock().unwrap().push(event.into());
+        }
+    }
+
+    impl container::ContainerRuntime for RecordingRuntime {
+        fn info(&self) -> Result<container::RuntimeInfo> {
+            Ok(container::RuntimeInfo {
+                kind: container::RuntimeKind::Apple,
+                binary: "recording".to_string(),
+                version: "1.0.0".to_string(),
+                capabilities: container::RuntimeCapabilities {
+                    internal_networks: true,
+                    named_volumes: true,
+                    labels: true,
+                    resource_limits: true,
+                },
+            })
+        }
+
+        fn pull(&self, image: &str) -> Result<()> {
+            self.record(format!("pull {image}"));
+            Ok(())
+        }
+
+        fn build(&self, dockerfile: &Path, tag: &str) -> Result<()> {
+            self.record(format!("build {} {tag}", dockerfile.display()));
+            Ok(())
+        }
+
+        fn image_exists(&self, image: &str) -> Result<bool> {
+            self.record(format!("inspect {image}"));
+            Ok(self.image_exists)
+        }
+
+        fn image_fingerprint(&self, image: &str) -> Result<String> {
+            self.record(format!("fingerprint {image}"));
+            Ok(format!("resolved:{image}"))
+        }
+
+        fn create(&self, spec: &container::ContainerLaunchSpec) -> Result<String> {
+            self.record(format!("create {}", spec.name));
+            self.launches.lock().unwrap().push(spec.clone());
+            Ok(spec.name.clone())
+        }
+
+        fn exec(&self, container_id: &str, command: &str) -> Result<String> {
+            self.record(format!("exec {container_id} {command}"));
+            Ok(String::new())
+        }
+
+        fn remove(&self, container_id: &str) -> Result<()> {
+            self.record(format!("remove {container_id}"));
+            Ok(())
+        }
+
+        fn create_internal_network(&self, spec: &container::NetworkSpec) -> Result<()> {
+            self.record(format!("network create {}", spec.name));
+            Ok(())
+        }
+
+        fn remove_network(&self, network: &str) -> Result<()> {
+            self.record(format!("network remove {network}"));
+            Ok(())
+        }
+
+        fn ensure_volume(&self, spec: &container::VolumeSpec) -> Result<()> {
+            self.record(format!("volume {}", spec.name));
+            Ok(())
+        }
+    }
+
+    fn config(mode: EnvironmentMode) -> EnvironmentConfig {
+        EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
+            mode,
+            backend: EnvironmentBackend::AppleContainers,
+            image: "example/dev:latest".to_string(),
+            init_commands: vec![],
+            setup_commands: vec![],
+            session_commands: vec![],
+            env: BTreeMap::from([("CI".to_string(), "true".to_string())]),
+            bootstrap_network: EnvironmentNetworkMode::Egress,
+            runtime_network: EnvironmentNetworkMode::Isolated,
+            resources: EnvironmentResources {
+                cpus: 2,
+                memory_mb: 2048,
+            },
+            caches: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
+            dockerfile: None,
+        }
+    }
+
+    #[test]
+    fn immutable_pull_reuses_present_image_and_pulls_missing_image() {
+        let workspace = TempDir::new().unwrap();
+        let present = RecordingRuntime::with_image(true);
+        prepare_immutable_environment_image(
+            &config(EnvironmentMode::Pull),
+            workspace.path(),
+            &present,
+        )
+        .unwrap();
+        assert_eq!(
+            *present.events.lock().unwrap(),
+            vec!["inspect example/dev:latest"]
+        );
+
+        let missing = RecordingRuntime::with_image(false);
+        prepare_immutable_environment_image(
+            &config(EnvironmentMode::Pull),
+            workspace.path(),
+            &missing,
+        )
+        .unwrap();
+        assert_eq!(
+            *missing.events.lock().unwrap(),
+            vec!["inspect example/dev:latest", "pull example/dev:latest"]
+        );
+    }
+
+    #[test]
+    fn immutable_build_rebuilds_inside_workspace() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let mut environment = config(EnvironmentMode::Build);
+        environment.dockerfile = Some(PathBuf::from("Dockerfile"));
+        let runtime = RecordingRuntime::default();
+
+        prepare_immutable_environment_image(&environment, workspace.path(), &runtime).unwrap();
+
+        let events = runtime.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].starts_with("build "));
+        assert!(events[0].ends_with("/Dockerfile example/dev:latest"));
+    }
+
+    #[test]
+    fn bootstrap_is_separate_labelled_and_always_cleaned_up() {
+        let workspace = TempDir::new().unwrap();
+        let mut environment = config(EnvironmentMode::Pull);
+        environment.setup_commands = vec!["cargo fetch --locked".to_string()];
+        environment.bootstrap_network = EnvironmentNetworkMode::Isolated;
+        let identity = ContainerSessionIdentity::new(workspace.path(), "session-a", "agent");
+        let runtime = RecordingRuntime::default();
+
+        run_environment_bootstrap(&environment, workspace.path(), &identity, &[], &runtime)
+            .unwrap();
+
+        let launches = runtime.launches.lock().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].workdir, "/workspace");
+        assert_eq!(launches[0].env.get("CI").map(String::as_str), Some("true"));
+        assert!(launches[0].network.is_some());
+        assert_eq!(
+            launches[0].labels.get("dev.pb.managed").map(String::as_str),
+            Some("true")
+        );
+        drop(launches);
+
+        let events = runtime.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.contains("cd /workspace && cargo fetch --locked") })
+        );
+        assert!(events[events.len() - 2].starts_with("remove pb-bootstrap-"));
+        assert!(events[events.len() - 1].starts_with("network remove pb-bootstrap-net-"));
+    }
+
+    #[test]
+    fn cache_volume_name_changes_with_declared_key_contents() {
+        let workspace = TempDir::new().unwrap();
+        let lockfile = workspace.path().join("Cargo.lock");
+        std::fs::write(&lockfile, "version = 3\n").unwrap();
+        let mut environment = config(EnvironmentMode::Pull);
+        environment.setup_commands = vec!["cargo fetch --locked".to_string()];
+        environment.caches = vec![EnvironmentCache {
+            id: "cargo-registry".to_string(),
+            target: PathBuf::from("/usr/local/cargo/registry"),
+            key_files: vec![PathBuf::from("Cargo.lock")],
+        }];
+        let identity = ContainerSessionIdentity::new(workspace.path(), "session-a", "agent");
+        let runtime = RecordingRuntime::default();
+
+        let first =
+            ensure_environment_caches(&environment, workspace.path(), &identity, &runtime).unwrap();
+        std::fs::write(&lockfile, "version = 4\n").unwrap();
+        let second =
+            ensure_environment_caches(&environment, workspace.path(), &identity, &runtime).unwrap();
+
+        assert_ne!(first[0].source, second[0].source);
+        assert_eq!(first[0].target, "/usr/local/cargo/registry");
     }
 }
 
@@ -1190,56 +1759,6 @@ fn format_check_output(stdout: &[u8], stderr: &[u8]) -> String {
         ("", stderr) => format!("stderr:\n{stderr}"),
         (stdout, stderr) => format!("stdout:\n{stdout}\n\nstderr:\n{stderr}"),
     }
-}
-
-fn prepare_container_image(
-    config: &EnvironmentConfig,
-    workspace_root: &Path,
-    runtime: &dyn container::ContainerRuntime,
-) -> Result<String> {
-    if let Some(image) = &config.prepared_image {
-        if runtime.image_exists(image)? {
-            return Ok(image.clone());
-        }
-        return rebuild_container_image(config, workspace_root, runtime);
-    }
-    Ok(config.image.clone())
-}
-
-fn rebuild_container_image(
-    config: &EnvironmentConfig,
-    workspace_root: &Path,
-    runtime: &dyn container::ContainerRuntime,
-) -> Result<String> {
-    let image = config
-        .prepared_image
-        .clone()
-        .unwrap_or_else(|| scouted_image_tag(workspace_root, config));
-    let container_id = runtime
-        .create(&config.image, workspace_root)
-        .with_context(|| format!("failed to create setup container from {}", config.image))?;
-    let setup_result = (|| -> Result<()> {
-        for cmd in config.setup_commands() {
-            runtime
-                .exec(&container_id, &cmd)
-                .with_context(|| format!("container setup command failed: {cmd}"))?;
-        }
-        runtime
-            .commit(&container_id, &image)
-            .with_context(|| format!("failed to tag prepared environment as {image}"))?;
-        Ok(())
-    })();
-    let _ = runtime.remove(&container_id);
-    setup_result?;
-    Ok(image)
-}
-
-fn scouted_image_tag(workspace_root: &Path, config: &EnvironmentConfig) -> String {
-    let mut hasher = DefaultHasher::new();
-    workspace_root.to_string_lossy().hash(&mut hasher);
-    config.image.hash(&mut hasher);
-    config.setup_commands().hash(&mut hasher);
-    format!("pb-scout:{:016x}", hasher.finish())
 }
 
 fn run_local_shell_command(cmd: &str, workdir: &Path) -> Result<String> {
@@ -1512,18 +2031,15 @@ pub fn run_agent<S: EventSink>(
         args.infer_profile = false;
     }
 
-    // Load environment config (explicit arg takes precedence over file on disk).
-    let env_config = args.environment.clone().or_else(|| {
-        if args.repository_less {
-            None
-        } else if args.profile == AgentProfile::Scout {
-            crate::init::scout_environment(&workspace_root)
-                .ok()
-                .flatten()
-        } else {
-            EnvironmentConfig::load(&workspace_root).ok().flatten()
-        }
-    });
+    // Load only an explicit or persisted environment. Discovery can propose a plan through
+    // `pb init`, but it never silently grants host execution to an agent session.
+    let env_config = if let Some(environment) = args.environment.clone() {
+        Some(environment)
+    } else if args.repository_less {
+        None
+    } else {
+        EnvironmentConfig::load(&workspace_root)?
+    };
     let workspace_graph = if args.repository_less {
         None
     } else if let Some(graph) = args.workspace_graph.clone() {
@@ -1542,11 +2058,12 @@ pub fn run_agent<S: EventSink>(
 
     // If an environment is configured, prepare the requested command backend for this task.
     let command_backend = if let Some(ref config) = env_config {
-        Some(CommandBackend::start(config, &workspace_root)?)
-    } else if workspace_graph.is_some() {
-        Some(CommandBackend::Local {
-            workspace_root: workspace_root.clone(),
-        })
+        Some(CommandBackend::start_for_session(
+            config,
+            &workspace_root,
+            &args.session_id,
+            "agent",
+        )?)
     } else {
         None
     };
@@ -15048,6 +15565,24 @@ mod tests {
         let mcp = McpToolRegistry::default();
         let lsp = LspToolRegistry::default();
         let policy = PolicyConfig::default();
+        let environment = EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
+            mode: EnvironmentMode::Local,
+            backend: EnvironmentBackend::Local,
+            image: "local".to_string(),
+            init_commands: vec![],
+            setup_commands: vec![],
+            session_commands: vec![],
+            env: BTreeMap::new(),
+            bootstrap_network: EnvironmentNetworkMode::Egress,
+            runtime_network: EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: Some("explicit local test executor".to_string()),
+            dockerfile: None,
+        };
         let mut events = Vec::new();
         let outcome = run_delivery_workflow(
             &mut generator,
@@ -15057,7 +15592,7 @@ mod tests {
             workspace,
             workspace,
             None,
-            None,
+            Some(&environment),
             &todo,
             &mcp,
             &lsp,

@@ -9,13 +9,45 @@
 //! prints a summary of what it found and what it configured.
 
 use anyhow::Result;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
+use crate::environment::{
+    EnvironmentBackend, EnvironmentCache, EnvironmentConfig, EnvironmentMode,
+};
 
 // ── detection results ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRequirement {
+    XcodeProject,
+    XcodeWorkspace,
+    AppleSwiftPackage,
+    AppleFrameworkSource,
+    XcodeToolchain,
+    AppleSdkTarget,
+    Simulator,
+    CodeSigning,
+    Metal,
+    MacosCi,
+}
+
+impl HostRequirement {
+    fn label(self) -> &'static str {
+        match self {
+            Self::XcodeProject => "Xcode project",
+            Self::XcodeWorkspace => "Xcode workspace",
+            Self::AppleSwiftPackage => "Apple-platform Swift package",
+            Self::AppleFrameworkSource => "Apple framework source import",
+            Self::XcodeToolchain => "Xcode toolchain command",
+            Self::AppleSdkTarget => "Apple SDK target",
+            Self::Simulator => "Apple simulator",
+            Self::CodeSigning => "Apple code signing/notarization",
+            Self::Metal => "Metal",
+            Self::MacosCi => "macOS CI runner",
+        }
+    }
+}
 
 /// Everything we learn from inspecting the project root.
 #[derive(Debug, Default)]
@@ -35,6 +67,7 @@ pub struct ProjectInspection {
     pub has_package_json: bool,
     pub has_deno_lock: bool,
     pub has_go_mod: bool,
+    pub has_package_swift: bool,
 
     // Existing agent docs
     pub existing_agent_docs: Vec<PathBuf>,
@@ -55,6 +88,8 @@ pub struct ProjectInspection {
     pub documented_guard_commands: Vec<String>,
     pub prefers_local_backend: bool,
     pub prefers_container_backend: bool,
+    pub host_requirements: Vec<HostRequirement>,
+    pub dependency_key_files: Vec<PathBuf>,
     pub scout_sources: Vec<PathBuf>,
 }
 
@@ -168,6 +203,14 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
+            if name.ends_with(".xcodeproj") {
+                record_host_requirement(info, HostRequirement::XcodeProject);
+                continue;
+            }
+            if name.ends_with(".xcworkspace") {
+                record_host_requirement(info, HostRequirement::XcodeWorkspace);
+                continue;
+            }
             if matches!(
                 name.as_ref(),
                 ".git" | "target" | "node_modules" | "dist" | "build"
@@ -182,32 +225,56 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
         match name.as_ref() {
             "Cargo.toml" => {
                 info.has_cargo_toml = true;
+                record_dependency_key_file(root, &path, info);
+                info.setup_commands.push(command(
+                    "if test -f Cargo.lock; then cargo fetch --locked; else cargo fetch; fi",
+                ));
                 info.guard_commands.push(command("cargo test"));
             }
             "pyproject.toml" => {
                 info.has_pyproject_toml = true;
+                record_dependency_key_file(root, &path, info);
                 info.setup_commands.push(command("pip install -e ."));
             }
             "requirements.txt" => {
                 info.has_requirements_txt = true;
+                record_dependency_key_file(root, &path, info);
                 info.setup_commands
                     .push(command("pip install -r requirements.txt"));
             }
             "package.json" => {
                 info.has_package_json = true;
+                record_dependency_key_file(root, &path, info);
                 info.setup_commands.push(command("npm ci"));
             }
             "deno.lock" => {
                 info.has_deno_lock = true;
+                record_dependency_key_file(root, &path, info);
                 info.setup_commands.push(command("deno install"));
             }
             "go.mod" => {
                 info.has_go_mod = true;
+                record_dependency_key_file(root, &path, info);
                 info.setup_commands.push(command("go mod download"));
+            }
+            "Package.swift" => {
+                info.has_package_swift = true;
+                record_dependency_key_file(root, &path, info);
+                info.setup_commands.push(command("swift package resolve"));
+                info.guard_commands.push(command("swift test"));
+                if let Ok(text) = std::fs::read_to_string(&path)
+                    && contains_apple_swift_package_signal(&text)
+                {
+                    record_host_requirement(info, HostRequirement::AppleSwiftPackage);
+                }
             }
             "Dockerfile" => {
                 info.has_dockerfile = info.has_dockerfile || path == root.join("Dockerfile");
                 info.prefers_container_backend = true;
+            }
+            "Cargo.lock" | "uv.lock" | "poetry.lock" | "package-lock.json" | "pnpm-lock.yaml"
+            | "yarn.lock" | "go.sum" | "Package.resolved" => {
+                record_dependency_key_file(root, &path, info);
             }
             n if matches!(
                 std::path::Path::new(n).extension().and_then(|e| e.to_str()),
@@ -216,7 +283,67 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
             {
                 info.has_image_assets = true;
             }
+            n if std::path::Path::new(n).extension().and_then(|e| e.to_str())
+                == Some("entitlements") =>
+            {
+                record_host_requirement(info, HostRequirement::CodeSigning);
+            }
+            n if std::path::Path::new(n).extension().and_then(|e| e.to_str()) == Some("metal") => {
+                record_host_requirement(info, HostRequirement::Metal);
+            }
+            n if std::path::Path::new(n).extension().and_then(|e| e.to_str()) == Some("swift") => {
+                if let Ok(text) = std::fs::read_to_string(&path)
+                    && contains_apple_framework_import(&text)
+                {
+                    record_host_requirement(info, HostRequirement::AppleFrameworkSource);
+                }
+            }
             _ => {}
+        }
+    }
+}
+
+fn contains_apple_swift_package_signal(text: &str) -> bool {
+    let compact = text.split_whitespace().collect::<String>();
+    [
+        ".macOS(",
+        ".iOS(",
+        ".tvOS(",
+        ".watchOS(",
+        ".visionOS(",
+        ".linkedFramework(",
+    ]
+    .iter()
+    .any(|signal| compact.contains(signal))
+}
+
+fn contains_apple_framework_import(text: &str) -> bool {
+    text.lines().any(|line| {
+        matches!(
+            line.trim(),
+            "import AppKit"
+                | "import UIKit"
+                | "import SwiftUI"
+                | "import Metal"
+                | "import MetalKit"
+                | "import RealityKit"
+                | "import VisionKit"
+        )
+    })
+}
+
+fn record_host_requirement(info: &mut ProjectInspection, requirement: HostRequirement) {
+    if !info.host_requirements.contains(&requirement) {
+        info.host_requirements.push(requirement);
+    }
+    info.prefers_local_backend = true;
+}
+
+fn record_dependency_key_file(root: &Path, path: &Path, info: &mut ProjectInspection) {
+    if let Ok(relative) = path.strip_prefix(root) {
+        let relative = relative.to_path_buf();
+        if !info.dependency_key_files.contains(&relative) {
+            info.dependency_key_files.push(relative);
         }
     }
 }
@@ -229,12 +356,20 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     // 1. devcontainer takes highest priority
     if let Some(image) = &info.devcontainer_image {
         return Some(EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Pull,
             backend: EnvironmentBackend::AppleContainers,
             image: image.clone(),
-            init_commands: info.devcontainer_init_commands.clone(),
+            init_commands: persistent_container_setup_commands(
+                info.devcontainer_init_commands.clone(),
+            ),
             setup_commands: vec![],
             session_commands: vec![],
+            env: discovered_container_env(info),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: discovered_container_caches(info),
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -245,12 +380,18 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     // 2. Dockerfile in project root
     if info.has_dockerfile {
         return Some(EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Build,
             backend: EnvironmentBackend::AppleContainers,
             image: "pb-dev:latest".to_string(),
             init_commands: vec![],
             setup_commands: vec![],
             session_commands: vec![],
+            env: discovered_container_env(info),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: discovered_container_caches(info),
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -260,14 +401,20 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
 
     // 3. GitLab CI image
     if let Some(image) = &info.gitlab_ci_image {
-        let init_commands = language_init_commands(info);
+        let init_commands = persistent_container_setup_commands(language_init_commands(info));
         return Some(EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Pull,
             backend: EnvironmentBackend::AppleContainers,
             image: image.clone(),
             init_commands,
             setup_commands: vec![],
             session_commands: vec![],
+            env: discovered_container_env(info),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: discovered_container_caches(info),
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -278,12 +425,21 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     // 4. Language-based well-known images
     if info.has_cargo_toml {
         return Some(EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Pull,
             backend: EnvironmentBackend::AppleContainers,
             image: "rust:latest".to_string(),
-            init_commands: vec![],
+            init_commands: vec![
+                "if test -f Cargo.lock; then cargo fetch --locked; else cargo fetch; fi"
+                    .to_string(),
+            ],
             setup_commands: vec![],
             session_commands: vec![],
+            env: discovered_container_env(info),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: discovered_container_caches(info),
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -296,13 +452,20 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
         } else {
             vec!["pip install -r requirements.txt".to_string()]
         };
+        let init_commands = persistent_container_setup_commands(init_commands);
         return Some(EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Pull,
             backend: EnvironmentBackend::AppleContainers,
             image: "python:3-slim".to_string(),
             init_commands,
             setup_commands: vec![],
             session_commands: vec![],
+            env: discovered_container_env(info),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: discovered_container_caches(info),
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -311,12 +474,18 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     }
     if info.has_deno_lock {
         return Some(EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Pull,
             backend: EnvironmentBackend::AppleContainers,
             image: "denoland/deno:latest".to_string(),
             init_commands: vec!["deno install".to_string()],
             setup_commands: vec![],
             session_commands: vec![],
+            env: discovered_container_env(info),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: discovered_container_caches(info),
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -325,12 +494,18 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     }
     if info.has_package_json {
         return Some(EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Pull,
             backend: EnvironmentBackend::AppleContainers,
             image: "node:lts-slim".to_string(),
             init_commands: vec!["npm ci".to_string()],
             setup_commands: vec![],
             session_commands: vec![],
+            env: discovered_container_env(info),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: discovered_container_caches(info),
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -339,12 +514,38 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
     }
     if info.has_go_mod {
         return Some(EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Pull,
             backend: EnvironmentBackend::AppleContainers,
             image: "golang:latest".to_string(),
             init_commands: vec!["go mod download".to_string()],
             setup_commands: vec![],
             session_commands: vec![],
+            env: discovered_container_env(info),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: discovered_container_caches(info),
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
+            dockerfile: None,
+        });
+    }
+    if info.has_package_swift {
+        return Some(EnvironmentConfig {
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
+            mode: EnvironmentMode::Pull,
+            backend: EnvironmentBackend::AppleContainers,
+            image: "swift:latest".to_string(),
+            init_commands: vec!["swift package resolve".to_string()],
+            setup_commands: vec![],
+            session_commands: vec![],
+            env: discovered_container_env(info),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: discovered_container_caches(info),
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -359,6 +560,11 @@ pub fn suggest_environment(info: &ProjectInspection) -> Option<EnvironmentConfig
 /// from CI or devcontainer but we still need to install dependencies).
 fn language_init_commands(info: &ProjectInspection) -> Vec<String> {
     let mut cmds = Vec::new();
+    if info.has_cargo_toml {
+        cmds.push(
+            "if test -f Cargo.lock; then cargo fetch --locked; else cargo fetch; fi".to_string(),
+        );
+    }
     if info.has_pyproject_toml {
         cmds.push("pip install -e .".to_string());
     } else if info.has_requirements_txt {
@@ -372,17 +578,90 @@ fn language_init_commands(info: &ProjectInspection) -> Vec<String> {
     if info.has_go_mod {
         cmds.push("go mod download".to_string());
     }
+    if info.has_package_swift {
+        cmds.push("swift package resolve".to_string());
+    }
     cmds
+}
+
+fn persistent_container_setup_commands(commands: Vec<String>) -> Vec<String> {
+    let uses_python = commands
+        .iter()
+        .any(|command| command.contains("pip install"));
+    let mut persistent = Vec::new();
+    if uses_python {
+        persistent
+            .push("test -x /opt/pb-venv/bin/python || python -m venv /opt/pb-venv".to_string());
+    }
+    persistent.extend(
+        commands.into_iter().map(|command| {
+            command.replace("pip install", "/opt/pb-venv/bin/python -m pip install")
+        }),
+    );
+    persistent
+}
+
+fn discovered_container_env(info: &ProjectInspection) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    if info.has_pyproject_toml || info.has_requirements_txt {
+        env.insert("VIRTUAL_ENV".to_string(), "/opt/pb-venv".to_string());
+        env.insert(
+            "PATH".to_string(),
+            "/opt/pb-venv/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        );
+    }
+    if info.has_deno_lock {
+        env.insert("DENO_DIR".to_string(), "/deno-dir".to_string());
+    }
+    env
+}
+
+fn discovered_container_caches(info: &ProjectInspection) -> Vec<EnvironmentCache> {
+    let key_files = info.dependency_key_files.clone();
+    let mut caches = Vec::new();
+    let mut push = |id: &str, target: &str| {
+        caches.push(EnvironmentCache {
+            id: id.to_string(),
+            target: PathBuf::from(target),
+            key_files: key_files.clone(),
+        });
+    };
+    if info.has_cargo_toml {
+        push("cargo-registry", "/usr/local/cargo/registry");
+        push("cargo-git", "/usr/local/cargo/git");
+    }
+    if info.has_pyproject_toml || info.has_requirements_txt {
+        push("python-venv", "/opt/pb-venv");
+    }
+    if info.has_package_json {
+        push("npm-cache", "/root/.npm");
+    }
+    if info.has_deno_lock {
+        push("deno-cache", "/deno-dir");
+    }
+    if info.has_go_mod {
+        push("go-modules", "/go/pkg/mod");
+    }
+    if info.has_package_swift {
+        push("swiftpm-cache", "/root/.cache/org.swift.swiftpm");
+    }
+    caches
 }
 
 pub fn local_environment(info: &ProjectInspection) -> EnvironmentConfig {
     EnvironmentConfig {
+        version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
         mode: EnvironmentMode::Local,
         backend: EnvironmentBackend::Local,
         image: "local".to_string(),
         init_commands: language_init_commands(info),
         setup_commands: vec![],
         session_commands: vec![],
+        env: Default::default(),
+        bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+        runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+        resources: Default::default(),
+        caches: vec![],
         guard_commands: vec![],
         prepared_image: None,
         source: None,
@@ -563,6 +842,9 @@ fn print_detection_summary(info: &ProjectInspection) {
     }
     if info.prefers_local_backend {
         println!("  scout backend signal: local (macOS-specific)");
+        for requirement in &info.host_requirements {
+            println!("    host requirement: {}", requirement.label());
+        }
     }
     if info.prefers_container_backend {
         println!("  scout backend signal: containers (Linux/deployment)");
@@ -587,6 +869,9 @@ fn print_detection_summary(info: &ProjectInspection) {
     if info.has_go_mod {
         langs.push("Go (go.mod)");
     }
+    if info.has_package_swift {
+        langs.push("Swift (Package.swift)");
+    }
     if langs.is_empty() {
         println!("  languages: (none detected)");
     } else {
@@ -607,17 +892,39 @@ pub fn scout_environment(root: &Path) -> Result<Option<EnvironmentConfig>> {
 }
 
 pub fn suggest_scout_environment(
-    root: &Path,
+    _root: &Path,
     info: &ProjectInspection,
 ) -> Option<EnvironmentConfig> {
     let base = suggest_environment(info).or_else(|| {
+        if !info.prefers_container_backend && !info.prefers_local_backend {
+            return None;
+        }
+        let container = info.prefers_container_backend;
         Some(EnvironmentConfig {
-            mode: EnvironmentMode::Local,
-            backend: EnvironmentBackend::Local,
-            image: "local".to_string(),
+            version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
+            mode: if container {
+                EnvironmentMode::Pull
+            } else {
+                EnvironmentMode::Local
+            },
+            backend: if container {
+                EnvironmentBackend::AppleContainers
+            } else {
+                EnvironmentBackend::Local
+            },
+            image: if container {
+                "ubuntu:24.04".to_string()
+            } else {
+                "local".to_string()
+            },
             init_commands: vec![],
             setup_commands: vec![],
             session_commands: vec![],
+            env: Default::default(),
+            bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+            runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+            resources: Default::default(),
+            caches: vec![],
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -630,6 +937,9 @@ pub fn suggest_scout_environment(
     if setup_commands.is_empty() {
         setup_commands = language_init_commands(info);
     }
+    if backend == EnvironmentBackend::AppleContainers {
+        setup_commands = persistent_container_setup_commands(setup_commands);
+    }
     let guard_commands = unique_commands(info.guard_commands.clone());
     let source = scout_source_summary(info, backend);
 
@@ -638,14 +948,8 @@ pub fn suggest_scout_environment(
     } else {
         base.image.clone()
     };
-    let prepared_image =
-        if backend == EnvironmentBackend::AppleContainers && !setup_commands.is_empty() {
-            Some(scouted_image_tag(root, &image, &setup_commands))
-        } else {
-            None
-        };
-
     Some(EnvironmentConfig {
+        version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
         mode: if backend == EnvironmentBackend::Local {
             EnvironmentMode::Local
         } else {
@@ -656,8 +960,21 @@ pub fn suggest_scout_environment(
         init_commands: vec![],
         setup_commands,
         session_commands: unique_commands(info.session_commands.clone()),
+        env: if backend == EnvironmentBackend::AppleContainers {
+            discovered_container_env(info)
+        } else {
+            Default::default()
+        },
+        bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+        runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+        resources: Default::default(),
+        caches: if backend == EnvironmentBackend::AppleContainers {
+            discovered_container_caches(info)
+        } else {
+            vec![]
+        },
         guard_commands,
-        prepared_image,
+        prepared_image: None,
         source: Some(source),
         dockerfile: if backend == EnvironmentBackend::Local {
             None
@@ -668,31 +985,20 @@ pub fn suggest_scout_environment(
 }
 
 fn choose_backend(base: &EnvironmentConfig, info: &ProjectInspection) -> EnvironmentBackend {
-    if info.prefers_local_backend && !info.prefers_container_backend {
+    // Host requirements are capabilities a Linux VM cannot provide. They always take precedence
+    // over Dockerfiles, Linux CI jobs, or deployment manifests for this whole-project resolver.
+    if info.prefers_local_backend {
         return EnvironmentBackend::Local;
     }
     if info.prefers_container_backend
         || info.has_dockerfile
         || info.devcontainer_image.is_some()
         || info.gitlab_ci_image.is_some()
-        || info.has_github_workflows
         || info.has_kubernetes_config
     {
         return EnvironmentBackend::AppleContainers;
     }
-    if info.prefers_local_backend {
-        EnvironmentBackend::Local
-    } else {
-        base.backend
-    }
-}
-
-fn scouted_image_tag(root: &Path, base_image: &str, setup_commands: &[String]) -> String {
-    let mut hasher = DefaultHasher::new();
-    root.to_string_lossy().hash(&mut hasher);
-    base_image.hash(&mut hasher);
-    setup_commands.hash(&mut hasher);
-    format!("pb-scout:{:016x}", hasher.finish())
+    base.backend
 }
 
 fn scout_source_summary(info: &ProjectInspection, backend: EnvironmentBackend) -> String {
@@ -704,6 +1010,16 @@ fn scout_source_summary(info: &ProjectInspection, backend: EnvironmentBackend) -
     parts.push(format!("scout selected {backend_name}"));
     if info.prefers_local_backend {
         parts.push("macOS-specific signals found".to_string());
+        if !info.host_requirements.is_empty() {
+            parts.push(format!(
+                "host requirements: {}",
+                info.host_requirements
+                    .iter()
+                    .map(|requirement| requirement.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
     if info.prefers_container_backend {
         parts.push("Linux/container/deployment signals found".to_string());
@@ -725,14 +1041,30 @@ fn inspect_scout_text(root: &Path, path: &Path, text: &str, info: &mut ProjectIn
         info.scout_sources.push(path.to_path_buf());
     }
     let lower = text.to_ascii_lowercase();
-    if lower.contains("macos-latest")
-        || lower.contains("xcodebuild")
-        || lower.contains("swift build")
-        || lower.contains("aarch64-apple-darwin")
-        || lower.contains("launchd")
+    if lower.contains("macos-latest") || lower.contains("macos-") {
+        record_host_requirement(info, HostRequirement::MacosCi);
+    }
+    if lower.contains("xcodebuild") || lower.contains("xcrun") || lower.contains("launchd") {
+        record_host_requirement(info, HostRequirement::XcodeToolchain);
+    }
+    if lower.contains("simctl") || lower.contains("ios simulator") {
+        record_host_requirement(info, HostRequirement::Simulator);
+    }
+    if lower.contains("codesign")
+        || lower.contains("notarytool")
         || lower.contains("cocoapods")
+        || lower.contains("security find-identity")
     {
-        info.prefers_local_backend = true;
+        record_host_requirement(info, HostRequirement::CodeSigning);
+    }
+    if lower.contains("aarch64-apple-darwin")
+        || lower.contains("apple sdk")
+        || lower.contains("sdkroot")
+    {
+        record_host_requirement(info, HostRequirement::AppleSdkTarget);
+    }
+    if contains_scout_token(&lower, "metal") || contains_scout_token(&lower, "metalkit") {
+        record_host_requirement(info, HostRequirement::Metal);
     }
     if lower.contains("dockerfile")
         || lower.contains("docker build")
@@ -764,6 +1096,11 @@ fn inspect_scout_text(root: &Path, path: &Path, text: &str, info: &mut ProjectIn
             }
         }
     }
+}
+
+fn contains_scout_token(text: &str, expected: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|token| token == expected)
 }
 
 fn extract_documented_command(line: &str) -> Option<String> {
@@ -1222,7 +1559,18 @@ mod tests {
         };
         let env = suggest_environment(&info).unwrap();
         assert_eq!(env.image, "python:3-slim");
-        assert_eq!(env.init_commands, vec!["pip install -e ."]);
+        assert_eq!(
+            env.init_commands,
+            vec![
+                "test -x /opt/pb-venv/bin/python || python -m venv /opt/pb-venv",
+                "/opt/pb-venv/bin/python -m pip install -e .",
+            ]
+        );
+        assert_eq!(
+            env.env.get("VIRTUAL_ENV").map(String::as_str),
+            Some("/opt/pb-venv")
+        );
+        assert_eq!(env.caches[0].id, "python-venv");
     }
 
     #[test]
@@ -1233,7 +1581,14 @@ mod tests {
         };
         let env = suggest_environment(&info).unwrap();
         assert_eq!(env.image, "python:3-slim");
-        assert_eq!(env.init_commands, vec!["pip install -r requirements.txt"]);
+        assert_eq!(
+            env.init_commands,
+            vec![
+                "test -x /opt/pb-venv/bin/python || python -m venv /opt/pb-venv",
+                "/opt/pb-venv/bin/python -m pip install -r requirements.txt",
+            ]
+        );
+        assert_eq!(env.caches[0].target, PathBuf::from("/opt/pb-venv"));
     }
 
     #[test]
@@ -1324,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn scout_prefers_containers_and_prepares_reusable_image() {
+    fn scout_prefers_containers_without_mutable_prepared_image() {
         let dir = TempDir::new().unwrap();
         write(dir.path(), "Dockerfile", "FROM node:lts\n");
         write(
@@ -1336,13 +1691,104 @@ Run `npm test` before commit.",
         let info = inspect(dir.path()).unwrap();
         let env = suggest_scout_environment(dir.path(), &info).unwrap();
         assert_eq!(env.backend, EnvironmentBackend::AppleContainers);
-        assert!(
-            env.prepared_image
-                .as_deref()
-                .is_some_and(|tag| tag.starts_with("pb-scout:"))
-        );
+        assert!(env.prepared_image.is_none());
         assert_eq!(env.setup_commands, vec!["npm ci"]);
         assert_eq!(env.guard_commands, vec!["npm test"]);
+    }
+
+    #[test]
+    fn xcode_project_overrides_container_and_ci_signals() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "Dockerfile", "FROM swift:latest\n");
+        write(
+            dir.path(),
+            ".github/workflows/build.yml",
+            "jobs:\n  build:\n    runs-on: ubuntu-latest\n",
+        );
+        write(
+            dir.path(),
+            "Example.xcodeproj/project.pbxproj",
+            "// !$*UTF8*$!\n",
+        );
+
+        let info = inspect(dir.path()).unwrap();
+        let env = suggest_scout_environment(dir.path(), &info).unwrap();
+
+        assert!(
+            info.host_requirements
+                .contains(&HostRequirement::XcodeProject)
+        );
+        assert_eq!(env.backend, EnvironmentBackend::Local);
+        assert_eq!(env.image, "local");
+    }
+
+    #[test]
+    fn generic_github_workflow_is_not_a_host_or_container_requirement() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            ".github/workflows/checks.yml",
+            "name: checks\non: push\njobs: {}\n",
+        );
+
+        let info = inspect(dir.path()).unwrap();
+        assert!(info.has_github_workflows);
+        assert!(!info.prefers_container_backend);
+        assert!(!info.prefers_local_backend);
+        assert!(suggest_scout_environment(dir.path(), &info).is_none());
+    }
+
+    #[test]
+    fn metadata_prose_does_not_require_metal_or_host_execution() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "README.md",
+            "The generated metadata is checked into the repository.\n",
+        );
+
+        let info = inspect(dir.path()).unwrap();
+
+        assert!(!info.host_requirements.contains(&HostRequirement::Metal));
+        assert!(!info.prefers_local_backend);
+        assert!(suggest_scout_environment(dir.path(), &info).is_none());
+    }
+
+    #[test]
+    fn plain_swift_package_can_use_linux_container() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "Package.swift",
+            "// swift-tools-version: 6.0\nimport PackageDescription\n",
+        );
+
+        let info = inspect(dir.path()).unwrap();
+        let env = suggest_scout_environment(dir.path(), &info).unwrap();
+
+        assert!(info.has_package_swift);
+        assert!(info.host_requirements.is_empty());
+        assert_eq!(env.backend, EnvironmentBackend::AppleContainers);
+        assert_eq!(env.image, "swift:latest");
+    }
+
+    #[test]
+    fn apple_platform_swift_package_requires_host() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "Package.swift",
+            "// swift-tools-version: 6.0\nimport PackageDescription\nlet package = Package(platforms: [.macOS(.v15)])\n",
+        );
+
+        let info = inspect(dir.path()).unwrap();
+        let env = suggest_scout_environment(dir.path(), &info).unwrap();
+
+        assert!(
+            info.host_requirements
+                .contains(&HostRequirement::AppleSwiftPackage)
+        );
+        assert_eq!(env.backend, EnvironmentBackend::Local);
     }
 
     #[test]

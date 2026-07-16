@@ -1,7 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+pub const ENVIRONMENT_CONFIG_VERSION: u32 = 2;
+
+fn current_environment_version() -> u32 {
+    ENVIRONMENT_CONFIG_VERSION
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,9 +32,54 @@ pub enum EnvironmentBackend {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum EnvironmentNetworkMode {
+    /// Attach the container to a pb-owned host-only internal network.
+    #[default]
+    Isolated,
+    /// Use the runtime's default network with external egress.
+    Egress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvironmentResources {
+    pub cpus: u32,
+    pub memory_mb: u64,
+}
+
+impl Default for EnvironmentResources {
+    fn default() -> Self {
+        Self {
+            cpus: 4,
+            memory_mb: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentCache {
+    /// Stable logical cache identifier within this project environment.
+    pub id: String,
+    /// Absolute mount target inside the container.
+    pub target: PathBuf,
+    /// Project-relative files whose contents invalidate the cache.
+    #[serde(default)]
+    pub key_files: Vec<PathBuf>,
+}
+
 /// Project environment configuration stored at `.pb/environment.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
+    /// Schema version. Older files without the field are interpreted as the current compatible
+    /// version; explicit future versions fail closed.
+    #[serde(default = "current_environment_version")]
+    pub version: u32,
+
     /// Whether the image was pulled from a registry (`pull`), built locally (`build`), or run on the host (`local`).
     #[serde(default)]
     pub mode: EnvironmentMode,
@@ -44,9 +96,8 @@ pub struct EnvironmentConfig {
     #[serde(default)]
     pub init_commands: Vec<String>,
 
-    /// Commands that prepare a reusable development environment image.
-    /// Container backends run these once, commit the result, and reuse the tagged image.
-    /// Local backends only run them when the agent determines an environment refresh is needed.
+    /// Commands that populate the workspace and declared cache volumes in a disposable bootstrap
+    /// container. They must not rely on mutations to the container root filesystem persisting.
     #[serde(default)]
     pub setup_commands: Vec<String>,
 
@@ -54,11 +105,33 @@ pub struct EnvironmentConfig {
     #[serde(default)]
     pub session_commands: Vec<String>,
 
+    /// Non-secret environment variables passed to bootstrap and runtime containers. Secrets must
+    /// use a future secret-reference mechanism rather than being stored in project TOML.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
+    /// Network granted to the dependency bootstrap container.
+    #[serde(default = "bootstrap_network_default")]
+    pub bootstrap_network: EnvironmentNetworkMode,
+
+    /// Network granted to the long-running agent command container.
+    #[serde(default)]
+    pub runtime_network: EnvironmentNetworkMode,
+
+    /// Explicit VM/container resource bounds.
+    #[serde(default)]
+    pub resources: EnvironmentResources,
+
+    /// Persistent project-scoped cache volumes.
+    #[serde(default)]
+    pub caches: Vec<EnvironmentCache>,
+
     /// Commands that should pass before committing changes.
     #[serde(default)]
     pub guard_commands: Vec<String>,
 
-    /// Image tag used for a prepared scout environment.
+    /// Deprecated legacy tag from the removed mutable-container commit flow. It is read only for
+    /// compatibility and ignored by current runtimes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prepared_image: Option<String>,
 
@@ -69,6 +142,10 @@ pub struct EnvironmentConfig {
     /// Path to the Dockerfile used for `build` mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<PathBuf>,
+}
+
+fn bootstrap_network_default() -> EnvironmentNetworkMode {
+    EnvironmentNetworkMode::Egress
 }
 
 impl EnvironmentConfig {
@@ -82,6 +159,113 @@ impl EnvironmentConfig {
     /// Commands that should run for every fresh agent session.
     pub fn session_commands(&self) -> &[String] {
         &self.session_commands
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version == 0 || self.version > ENVIRONMENT_CONFIG_VERSION {
+            bail!(
+                "unsupported environment config version {}; supported versions are 1 through {}",
+                self.version,
+                ENVIRONMENT_CONFIG_VERSION
+            );
+        }
+        if self.resources.cpus == 0 || self.resources.cpus > 64 {
+            bail!("environment resources.cpus must be between 1 and 64");
+        }
+        if !(256..=262_144).contains(&self.resources.memory_mb) {
+            bail!("environment resources.memory_mb must be between 256 and 262144");
+        }
+        if self.image.trim().is_empty() {
+            bail!("environment image cannot be empty");
+        }
+        for (key, value) in &self.env {
+            let mut chars = key.chars();
+            if !chars
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                bail!("environment variable name '{key}' is invalid");
+            }
+            if value.contains('\0') {
+                bail!("environment variable '{key}' contains a NUL byte");
+            }
+        }
+        match (self.backend, &self.mode) {
+            (EnvironmentBackend::Local, EnvironmentMode::Local) => {}
+            (EnvironmentBackend::Local, _) => {
+                bail!("local environment backend requires mode=local")
+            }
+            (EnvironmentBackend::AppleContainers, EnvironmentMode::Local) => {
+                bail!("container environment backend cannot use mode=local")
+            }
+            (EnvironmentBackend::AppleContainers, EnvironmentMode::Build)
+                if self.dockerfile.is_none() =>
+            {
+                bail!("build environment requires a dockerfile")
+            }
+            (EnvironmentBackend::AppleContainers, _) => {}
+        }
+        let mut cache_ids = BTreeSet::new();
+        let mut cache_targets = BTreeSet::new();
+        for cache in &self.caches {
+            if cache.id.is_empty()
+                || !cache
+                    .id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            {
+                bail!(
+                    "environment cache id '{}' must contain only ASCII letters, numbers, '-' or '_'",
+                    cache.id
+                );
+            }
+            if !cache_ids.insert(cache.id.as_str()) {
+                bail!("duplicate environment cache id '{}'", cache.id);
+            }
+            if !cache.target.is_absolute()
+                || cache
+                    .target
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+            {
+                bail!(
+                    "environment cache '{}' target must be an absolute non-escaping container path",
+                    cache.id
+                );
+            }
+            if matches!(cache.target.to_str(), Some("/") | Some("/workspace")) {
+                bail!(
+                    "environment cache '{}' cannot replace the container root or workspace root",
+                    cache.id
+                );
+            }
+            if !cache_targets.insert(cache.target.as_path()) {
+                bail!(
+                    "multiple environment caches target {}",
+                    cache.target.display()
+                );
+            }
+            for key_file in &cache.key_files {
+                if key_file.is_absolute()
+                    || key_file.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    bail!(
+                        "environment cache '{}' key file must stay within the project: {}",
+                        cache.id,
+                        key_file.display()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -99,11 +283,18 @@ impl EnvironmentConfig {
     pub fn load_path(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+        let config: Self =
+            toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        config
+            .validate()
+            .with_context(|| format!("invalid environment configuration in {}", path.display()))?;
+        Ok(config)
     }
 
     /// Persist the config to `<workspace_root>/.pb/environment.toml`, creating directories as needed.
     pub fn save(&self, workspace_root: &Path) -> Result<()> {
+        self.validate()
+            .context("invalid environment configuration")?;
         let dir = workspace_root.join(".pb");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create directory {}", dir.display()))?;
@@ -125,12 +316,18 @@ mod tests {
     fn round_trip_pull_config() {
         let dir = TempDir::new().unwrap();
         let config = EnvironmentConfig {
+            version: ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Pull,
             backend: EnvironmentBackend::AppleContainers,
             image: "ghcr.io/example/dev:latest".to_string(),
             init_commands: vec!["npm ci".to_string()],
             setup_commands: vec![],
             session_commands: vec![],
+            env: BTreeMap::new(),
+            bootstrap_network: EnvironmentNetworkMode::Egress,
+            runtime_network: EnvironmentNetworkMode::Isolated,
+            resources: EnvironmentResources::default(),
+            caches: vec![],
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -148,12 +345,18 @@ mod tests {
     fn round_trip_build_config() {
         let dir = TempDir::new().unwrap();
         let config = EnvironmentConfig {
+            version: ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Build,
             backend: EnvironmentBackend::AppleContainers,
             image: "pb-dev:latest".to_string(),
             init_commands: vec![],
             setup_commands: vec![],
             session_commands: vec![],
+            env: BTreeMap::new(),
+            bootstrap_network: EnvironmentNetworkMode::Egress,
+            runtime_network: EnvironmentNetworkMode::Isolated,
+            resources: EnvironmentResources::default(),
+            caches: vec![],
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -169,12 +372,18 @@ mod tests {
     fn round_trip_local_backend_config() {
         let dir = TempDir::new().unwrap();
         let config = EnvironmentConfig {
+            version: ENVIRONMENT_CONFIG_VERSION,
             mode: EnvironmentMode::Local,
             backend: EnvironmentBackend::Local,
             image: "local".to_string(),
             init_commands: vec!["cargo check".to_string()],
             setup_commands: vec![],
             session_commands: vec![],
+            env: BTreeMap::new(),
+            bootstrap_network: EnvironmentNetworkMode::Egress,
+            runtime_network: EnvironmentNetworkMode::Isolated,
+            resources: EnvironmentResources::default(),
+            caches: vec![],
             guard_commands: vec![],
             prepared_image: None,
             source: None,
@@ -192,5 +401,59 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let result = EnvironmentConfig::load(dir.path()).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn rejects_future_versions_and_unknown_fields() {
+        let future = r#"
+version = 999
+mode = "pull"
+backend = "apple_containers"
+image = "rust:latest"
+"#;
+        let config: EnvironmentConfig = toml::from_str(future).unwrap();
+        assert!(config.validate().is_err());
+
+        let unknown = r#"
+version = 2
+mode = "pull"
+backend = "apple_containers"
+image = "rust:latest"
+network = "host"
+"#;
+        assert!(toml::from_str::<EnvironmentConfig>(unknown).is_err());
+    }
+
+    #[test]
+    fn rejects_backend_mode_mismatch_and_workspace_replacement_cache() {
+        let config = EnvironmentConfig {
+            version: ENVIRONMENT_CONFIG_VERSION,
+            mode: EnvironmentMode::Local,
+            backend: EnvironmentBackend::AppleContainers,
+            image: "local".to_string(),
+            init_commands: vec![],
+            setup_commands: vec![],
+            session_commands: vec![],
+            env: BTreeMap::new(),
+            bootstrap_network: EnvironmentNetworkMode::Egress,
+            runtime_network: EnvironmentNetworkMode::Isolated,
+            resources: EnvironmentResources::default(),
+            caches: vec![],
+            guard_commands: vec![],
+            prepared_image: None,
+            source: None,
+            dockerfile: None,
+        };
+        assert!(config.validate().is_err());
+
+        let mut config = config;
+        config.mode = EnvironmentMode::Pull;
+        config.image = "rust:latest".to_string();
+        config.caches.push(EnvironmentCache {
+            id: "workspace".to_string(),
+            target: PathBuf::from("/workspace"),
+            key_files: vec![],
+        });
+        assert!(config.validate().is_err());
     }
 }

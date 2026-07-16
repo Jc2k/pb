@@ -226,9 +226,9 @@ pub struct IntegrationsAddArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Container runtime command used to run the integration
-    #[arg(long, default_value = "docker")]
-    pub runtime: String,
+    /// Container runtime command; defaults to Apple container, Docker, or Podman in that order
+    #[arg(long)]
+    pub runtime: Option<String>,
 
     /// Do not overwrite an existing integration with the same name
     #[arg(long)]
@@ -264,9 +264,9 @@ pub struct McpSetupGithubArgs {
     #[arg(long, default_value = "github")]
     pub server_name: String,
 
-    /// Container runtime command used to run ghcr.io/github/github-mcp-server
-    #[arg(long, default_value = "docker")]
-    pub runtime: String,
+    /// Container runtime command; defaults to Apple container, Docker, or Podman in that order
+    #[arg(long)]
+    pub runtime: Option<String>,
 
     /// Print the GitHub authorization URL instead of opening a browser
     #[arg(long)]
@@ -1105,7 +1105,7 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
                 kind,
                 container_image: args.container_image,
                 name: args.name,
-                runtime: Some(args.runtime),
+                runtime: args.runtime,
                 env: Default::default(),
                 no_overwrite: args.no_overwrite,
             };
@@ -1154,6 +1154,8 @@ async fn mcp_setup_github(args: McpSetupGithubArgs) -> Result<()> {
     if args.server_name.trim().is_empty() {
         bail!("--server-name cannot be empty");
     }
+    let runtime = args.runtime.as_deref();
+    let runtime = container::resolve_runtime_binary(runtime)?;
 
     let client_id = non_empty_baked_value(BAKED_GITHUB_CLIENT_ID).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1215,7 +1217,7 @@ async fn mcp_setup_github(args: McpSetupGithubArgs) -> Result<()> {
 
     config.servers.insert(
         args.server_name.clone(),
-        github_mcp_server_config(&args.runtime, &token_path),
+        github_mcp_server_config(&runtime, &token_path),
     );
     config.save(&root)?;
 
@@ -2447,15 +2449,26 @@ fn env_pull(args: EnvPullArgs) -> Result<()> {
     let root = resolve_env_root(args.workdir)?;
     let runtime = container::detect_runtime()
         .context("no container runtime found; install docker, podman, or apple/container")?;
+    let runtime_info = runtime.info()?;
+    println!(
+        "Using {} {} for the project environment.",
+        runtime_info.binary, runtime_info.version
+    );
     println!("Pulling image {}…", args.image);
     runtime.pull(&args.image)?;
     let config = EnvironmentConfig {
+        version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
         mode: EnvironmentMode::Pull,
         backend: EnvironmentBackend::AppleContainers,
         image: args.image.clone(),
         init_commands: args.init_commands,
         setup_commands: vec![],
         session_commands: vec![],
+        env: Default::default(),
+        bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+        runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+        resources: Default::default(),
+        caches: vec![],
         guard_commands: vec![],
         prepared_image: None,
         source: None,
@@ -2481,15 +2494,26 @@ fn env_build(args: EnvBuildArgs) -> Result<()> {
     }
     let runtime = container::detect_runtime()
         .context("no container runtime found; install docker, podman, or apple/container")?;
+    let runtime_info = runtime.info()?;
+    println!(
+        "Using {} {} for the project environment.",
+        runtime_info.binary, runtime_info.version
+    );
     println!("Building image {} from {}…", args.tag, dockerfile.display());
     runtime.build(&dockerfile, &args.tag)?;
     let config = EnvironmentConfig {
+        version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
         mode: EnvironmentMode::Build,
         backend: EnvironmentBackend::AppleContainers,
         image: args.tag.clone(),
         init_commands: args.init_commands,
         setup_commands: vec![],
         session_commands: vec![],
+        env: Default::default(),
+        bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+        runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+        resources: Default::default(),
+        caches: vec![],
         guard_commands: vec![],
         prepared_image: None,
         source: None,
@@ -2506,12 +2530,18 @@ fn env_build(args: EnvBuildArgs) -> Result<()> {
 fn env_local(args: EnvLocalArgs) -> Result<()> {
     let root = resolve_env_root(args.workdir)?;
     let config = EnvironmentConfig {
+        version: crate::environment::ENVIRONMENT_CONFIG_VERSION,
         mode: EnvironmentMode::Local,
         backend: EnvironmentBackend::Local,
         image: "local".to_string(),
         init_commands: args.init_commands,
         setup_commands: vec![],
         session_commands: vec![],
+        env: Default::default(),
+        bootstrap_network: crate::environment::EnvironmentNetworkMode::Egress,
+        runtime_network: crate::environment::EnvironmentNetworkMode::Isolated,
+        resources: Default::default(),
+        caches: vec![],
         guard_commands: vec![],
         prepared_image: None,
         source: None,
@@ -2531,28 +2561,18 @@ fn env_start(args: EnvWorkdirArgs) -> Result<()> {
         .context("no environment configured; run `pb env pull` or `pb env build` first")?;
     match config.backend {
         EnvironmentBackend::AppleContainers => {
-            let runtime = container::detect_runtime().context(
-                "no container runtime found; install docker, podman, or apple/container",
+            println!(
+                "Verifying isolated container environment from {}…",
+                config.image
+            );
+            let backend = agent_core::CommandBackend::start_for_session(
+                &config,
+                &root,
+                "env-verification",
+                "verify",
             )?;
-            println!("Creating test container from {}…", config.image);
-            let container_id = runtime.create(&config.image, &root)?;
-            println!("Container {} started", container_id);
-            for cmd in config.setup_commands() {
-                println!("Running setup command: {cmd}");
-                let output = runtime.exec(&container_id, &cmd)?;
-                if !output.is_empty() {
-                    println!("{output}");
-                }
-            }
-            for cmd in config.session_commands() {
-                println!("Running session command: {cmd}");
-                let output = runtime.exec(&container_id, cmd)?;
-                if !output.is_empty() {
-                    println!("{output}");
-                }
-            }
-            println!("Removing test container…");
-            runtime.remove(&container_id)?;
+            backend.exec("true")?;
+            drop(backend);
         }
         EnvironmentBackend::Local => {
             println!("Verifying local environment at {}…", root.display());

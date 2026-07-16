@@ -472,7 +472,7 @@ pub fn install_project(
     if name.trim().is_empty() || name.contains(['\n', '\r']) {
         bail!("integration name cannot be empty or contain newlines");
     }
-    let runtime = request.runtime.unwrap_or_else(|| "docker".to_string());
+    let runtime = crate::container::resolve_runtime_binary(request.runtime.as_deref())?;
     match request.kind {
         IntegrationKind::Mcp => {
             let mut config = ProjectMcpConfig::load(workspace_root)?.unwrap_or_default();
@@ -574,7 +574,7 @@ pub fn install_global_lsp(
     if name.trim().is_empty() || name.contains(['\n', '\r']) {
         bail!("integration name cannot be empty or contain newlines");
     }
-    let runtime = request.runtime.unwrap_or_else(|| "docker".to_string());
+    let runtime = crate::container::resolve_runtime_binary(request.runtime.as_deref())?;
     let mut user_config = UserConfig::load()?;
     if request.no_overwrite && user_config.lsp.servers.contains_key(&name) {
         bail!("LSP integration '{name}' is already installed");

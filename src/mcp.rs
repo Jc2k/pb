@@ -511,11 +511,8 @@ fn stdio_command(server_name: &str, config: &McpServerConfig) -> Result<(String,
         .as_deref()
         .filter(|i| !i.trim().is_empty())
     {
-        let runtime = config
-            .container_runtime
-            .as_deref()
-            .filter(|r| !r.trim().is_empty())
-            .unwrap_or("docker");
+        let runtime =
+            crate::container::resolve_runtime_binary(config.container_runtime.as_deref())?;
         let mut args = vec!["run".to_string(), "-i".to_string(), "--rm".to_string()];
         for key in config.env.keys() {
             args.push("-e".to_string());
@@ -523,7 +520,7 @@ fn stdio_command(server_name: &str, config: &McpServerConfig) -> Result<(String,
         }
         args.push(image.trim().to_string());
         args.extend(config.args.clone());
-        return Ok((runtime.to_string(), args));
+        return Ok((runtime, args));
     }
 
     let command = config.command.as_deref().with_context(|| {

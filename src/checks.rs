@@ -620,9 +620,9 @@ impl<'a> ExecutorRegistry<'a> {
                 if let Some(environment) = self.project_environment {
                     CommandBackend::start(environment, self.repo_root).map(Some)
                 } else {
-                    Ok(Some(CommandBackend::Local {
-                        workspace_root: self.repo_root.to_path_buf(),
-                    }))
+                    Err(anyhow::anyhow!(
+                        "executor '{executor_id}' uses the project environment, but no environment is configured; run `pb init` or declare an explicit local executor"
+                    ))
                 }
             }
             ExecutorKind::Local => Ok(Some(CommandBackend::Local {
@@ -1436,5 +1436,39 @@ mod tests {
         let plan = plan_checks(&graph(), &repository).unwrap();
         assert!(plan.checks.contains(&"shared-test".to_string()));
         assert!(plan.checks.contains(&"api-test".to_string()));
+    }
+
+    #[test]
+    fn project_executor_without_environment_fails_closed() {
+        let repo = init_repo();
+        let graph = WorkspaceGraph::legacy(&["true".to_string()]);
+        let check_id = graph.checks.keys().next().unwrap().clone();
+        let plan = CheckPlan {
+            changed_paths: vec![],
+            affected_components: vec!["repository".to_string()],
+            checks: vec![check_id],
+            reasons: BTreeMap::new(),
+        };
+        let mut runtime = WorkspaceCheckRuntime::new(
+            repo.path(),
+            &graph,
+            None,
+            None,
+            CheckEvidenceLedger::default(),
+        );
+        let mut events = Vec::new();
+
+        let error = runtime
+            .run_plan(&plan, EvidenceSource::Handoff, 0, &mut |event| {
+                events.push(event)
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no environment is configured"));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ExecutorStarted { success: false, .. }))
+        );
     }
 }
