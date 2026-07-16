@@ -1,0 +1,37 @@
+[book]
+title = "pb documentation"
+authors = ["pb contributors"]
+description = "User guide and architecture of pb, a local coding agent with harness-owned workflows."
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "site"
+create-missing = false
+
+[output.html]
+theme = "docs/theme"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["docs/theme/pb.css"]
+git-repository-url = "https://github.com/Jc2k/pb"
+git-repository-icon = "fab-github"
+edit-url-template = "https://github.com/Jc2k/pb/edit/main/{path}"
+site-url = "/pb/"
+sidebar-header-nav = true
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 24
+use-boolean-and = true
+
+[output.html.print]
+enable = true
+page-break = true
+
+[output.html.playground]
+runnable = false

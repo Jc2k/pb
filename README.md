@@ -2,6 +2,10 @@
 
 A local coding agent CLI with an optional web front end.
 
+The user guide and architecture documentation are published at
+[jc2k.github.io/pb](https://jc2k.github.io/pb/). The site explores pb's workflows, security model,
+local privacy boundaries, and contracts with the user; its Markdown source lives in [`docs/`](docs/README.md).
+
 ## Commands
 
 - `pb self install` - move the current binary to `~/.local/bin/pb`, install launchd agents for `pb serve` and the menu bar item, and start them after confirmation.
@@ -83,13 +87,16 @@ When a session starts, pb initializes each enabled stdio MCP server, calls `tool
 
 ```bash
 deno task build:web
+deno task test:docs
 cargo test --all-targets
 cargo build --release
 ```
 
 ## CI
 
-GitHub Actions workflow (`.github/workflows/ci-release.yml`) builds the web UI assets, runs unit tests, performs semantic release tagging, and then produces an optimized macOS arm64 binary asset.
+GitHub Actions workflow (`.github/workflows/ci-release.yml`) builds the web UI assets, runs unit and
+documentation tests, performs semantic release tagging, deploys the static documentation to GitHub
+Pages from `main`, and produces an optimized macOS arm64 binary asset for new releases.
 
 ### macOS code signing without a paid Apple Developer account
 
