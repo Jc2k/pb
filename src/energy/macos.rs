@@ -4,6 +4,7 @@ use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::os::raw::{c_char, c_void};
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -56,6 +57,10 @@ pub(super) fn end_scope() {
 fn acquire_measurement_lock() -> Option<MeasurementOwnership> {
     let user_id = unsafe { libc::geteuid() };
     let path = std::env::temp_dir().join(format!("pb-system-energy-{user_id}.lock"));
+    acquire_measurement_lock_at(&path)
+}
+
+fn acquire_measurement_lock_at(path: &Path) -> Option<MeasurementOwnership> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1070,11 +1075,33 @@ mod tests {
 
     #[test]
     fn system_meter_has_one_cross_process_owner() {
-        let first = acquire_measurement_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join("system-energy.lock");
+        let first = acquire_measurement_lock_at(&lock_path);
         assert!(first.is_some());
-        assert!(acquire_measurement_lock().is_none());
+        assert!(acquire_measurement_lock_at(&lock_path).is_none());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("energy::macos::tests::measurement_lock_child_probe")
+            .env("PB_TEST_SYSTEM_ENERGY_LOCK_PATH", &lock_path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "child ownership probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
         drop(first);
-        assert!(acquire_measurement_lock().is_some());
+        assert!(acquire_measurement_lock_at(&lock_path).is_some());
+    }
+
+    #[test]
+    fn measurement_lock_child_probe() {
+        let Some(path) = std::env::var_os("PB_TEST_SYSTEM_ENERGY_LOCK_PATH") else {
+            return;
+        };
+        assert!(acquire_measurement_lock_at(Path::new(&path)).is_none());
     }
 
     #[test]

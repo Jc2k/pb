@@ -297,7 +297,39 @@ pub fn spawn_managed_service(
         runtime.remove(&spec.name)?;
     }
     let args = service_run_args(spec);
-    let process = ManagedProcess::spawn_with_env(runtime_binary, &args, &spec.env)?;
+    let mut process = ManagedProcess::spawn_with_env(runtime_binary, &args, &spec.env)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if runtime.container_exists(&spec.name)? {
+            let owned = runtime
+                .list_managed_containers()?
+                .iter()
+                .any(|resource| managed_resource_matches(resource, &spec.name, &spec.labels));
+            if !owned {
+                let _ = process.shutdown(Duration::from_secs(1));
+                bail!(
+                    "managed service '{}' started without the requested ownership labels",
+                    spec.name
+                );
+            }
+            break;
+        }
+        if let Some(status) = process.try_wait()? {
+            bail!(
+                "managed service '{}' exited with status {status} before its container was created",
+                spec.name
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = process.shutdown(Duration::from_secs(1));
+            let _ = runtime.remove(&spec.name);
+            bail!(
+                "timed out waiting for managed service '{}' to become observable",
+                spec.name
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
     Ok(ManagedServiceProcess {
         process,
         runtime,
@@ -312,10 +344,6 @@ fn managed_resource_matches(
 ) -> bool {
     if resource.name != expected_name {
         return false;
-    }
-    if resource.labels.is_empty() {
-        // OCI inventory is already filtered by dev.pb.managed=true but may expose names only.
-        return true;
     }
     ["dev.pb.managed", "dev.pb.project", "dev.pb.session"]
         .into_iter()
@@ -675,6 +703,15 @@ impl ContainerRuntime for AppleContainerRuntime {
                 spec.name.clone(),
             ],
         )? {
+            validate_volume_labels(
+                spec,
+                &apple_volume_labels(&spec.name)?.with_context(|| {
+                    format!(
+                        "Apple volume {} has no readable ownership labels",
+                        spec.name
+                    )
+                })?,
+            )?;
             return Ok(());
         }
         match run_silent("container", &apple_volume_create_args(spec)) {
@@ -689,7 +726,15 @@ impl ContainerRuntime for AppleContainerRuntime {
                     ],
                 )? =>
             {
-                Ok(())
+                validate_volume_labels(
+                    spec,
+                    &apple_volume_labels(&spec.name)?.with_context(|| {
+                        format!(
+                            "Apple volume {} has no readable ownership labels",
+                            spec.name
+                        )
+                    })?,
+                )
             }
             Err(create_error) => Err(create_error),
         }
@@ -869,7 +914,28 @@ impl ContainerRuntime for OciRuntime {
                 "{{.Names}}".to_string(),
             ],
         )?;
-        Ok(lines_as_managed_resources(&output))
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                let labels = run_capture(
+                    &self.binary,
+                    &[
+                        "inspect".to_string(),
+                        "--format".to_string(),
+                        "{{json .Config.Labels}}".to_string(),
+                        name.to_string(),
+                    ],
+                )?;
+                Ok(ManagedResource {
+                    name: name.to_string(),
+                    labels: parse_oci_labels(&labels).with_context(|| {
+                        format!("failed to inspect ownership labels for container {name}")
+                    })?,
+                })
+            })
+            .collect()
     }
 
     fn list_managed_networks(&self) -> Result<Vec<ManagedResource>> {
@@ -884,7 +950,29 @@ impl ContainerRuntime for OciRuntime {
                 "{{.Name}}".to_string(),
             ],
         )?;
-        Ok(lines_as_managed_resources(&output))
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                let labels = run_capture(
+                    &self.binary,
+                    &[
+                        "network".to_string(),
+                        "inspect".to_string(),
+                        "--format".to_string(),
+                        "{{json .Labels}}".to_string(),
+                        name.to_string(),
+                    ],
+                )?;
+                Ok(ManagedResource {
+                    name: name.to_string(),
+                    labels: parse_oci_labels(&labels).with_context(|| {
+                        format!("failed to inspect ownership labels for network {name}")
+                    })?,
+                })
+            })
+            .collect()
     }
 
     fn remove(&self, container_id: &str) -> Result<()> {
@@ -914,6 +1002,17 @@ impl ContainerRuntime for OciRuntime {
                 spec.name.clone(),
             ],
         )? {
+            let labels = run_capture(
+                &self.binary,
+                &[
+                    "volume".to_string(),
+                    "inspect".to_string(),
+                    "--format".to_string(),
+                    "{{json .Labels}}".to_string(),
+                    spec.name.clone(),
+                ],
+            )?;
+            validate_volume_labels(spec, &parse_oci_labels(&labels)?)?;
             return Ok(());
         }
         match run_silent(&self.binary, &oci_volume_create_args(spec)) {
@@ -928,7 +1027,17 @@ impl ContainerRuntime for OciRuntime {
                     ],
                 )? =>
             {
-                Ok(())
+                let labels = run_capture(
+                    &self.binary,
+                    &[
+                        "volume".to_string(),
+                        "inspect".to_string(),
+                        "--format".to_string(),
+                        "{{json .Labels}}".to_string(),
+                        spec.name.clone(),
+                    ],
+                )?;
+                validate_volume_labels(spec, &parse_oci_labels(&labels)?)
             }
             Err(create_error) => Err(create_error),
         }
@@ -1305,16 +1414,37 @@ fn drain_bounded_stream(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>,
     Ok((captured, truncated))
 }
 
-fn lines_as_managed_resources(output: &str) -> Vec<ManagedResource> {
-    output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|name| ManagedResource {
-            name: name.to_string(),
-            labels: BTreeMap::from([("dev.pb.managed".to_string(), "true".to_string())]),
-        })
-        .collect()
+fn parse_oci_labels(output: &str) -> Result<BTreeMap<String, String>> {
+    serde_json::from_str(output.trim()).context("runtime returned invalid JSON labels")
+}
+
+fn apple_volume_labels(name: &str) -> Result<Option<BTreeMap<String, String>>> {
+    let output = run_capture(
+        "container",
+        &[
+            "volume".to_string(),
+            "inspect".to_string(),
+            name.to_string(),
+        ],
+    )?;
+    Ok(parse_apple_managed_resources(&output, "configuration")
+        .into_iter()
+        .find(|resource| resource.name == name)
+        .map(|resource| resource.labels))
+}
+
+fn validate_volume_labels(spec: &VolumeSpec, actual: &BTreeMap<String, String>) -> Result<()> {
+    if spec
+        .labels
+        .iter()
+        .all(|(key, expected)| actual.get(key) == Some(expected))
+    {
+        return Ok(());
+    }
+    bail!(
+        "refusing to reuse volume '{}' because its ownership labels do not match the requested cache",
+        spec.name
+    )
 }
 
 fn parse_apple_managed_resources(output: &str, nested: &str) -> Vec<ManagedResource> {
@@ -1698,6 +1828,14 @@ mod tests {
             labels: expected.clone(),
         };
         assert!(managed_resource_matches(&owned, "pb-svc-one", &expected));
+        assert!(!managed_resource_matches(
+            &ManagedResource {
+                name: "pb-svc-one".to_string(),
+                labels: BTreeMap::new(),
+            },
+            "pb-svc-one",
+            &expected
+        ));
 
         let mut foreign = owned;
         foreign
@@ -1753,6 +1891,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oci_inventory_labels_preserve_complete_ownership() {
+        let labels = parse_oci_labels(
+            r#"{"dev.pb.managed":"true","dev.pb.project":"p1","dev.pb.session":"s1"}"#,
+        )
+        .unwrap();
+        assert_eq!(labels.get("dev.pb.project").map(String::as_str), Some("p1"));
+        assert!(parse_oci_labels("managed=true").is_err());
+    }
+
+    #[test]
+    fn existing_cache_volume_requires_its_complete_provenance_labels() {
+        let spec = VolumeSpec {
+            name: "pb-cache-one".to_string(),
+            labels: BTreeMap::from([
+                ("dev.pb.managed".to_string(), "true".to_string()),
+                ("dev.pb.project".to_string(), "project-a".to_string()),
+                ("dev.pb.fingerprint".to_string(), "lock-a".to_string()),
+            ]),
+        };
+        assert!(validate_volume_labels(&spec, &spec.labels).is_ok());
+        let mut foreign = spec.labels.clone();
+        foreign.insert("dev.pb.fingerprint".to_string(), "lock-b".to_string());
+        assert!(validate_volume_labels(&spec, &foreign).is_err());
+        assert!(validate_volume_labels(&spec, &BTreeMap::new()).is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires an installed and running Apple container runtime plus registry access"]
@@ -1768,6 +1933,7 @@ mod tests {
         let network = format!("{name}-network");
         let labels = BTreeMap::from([
             ("dev.pb.managed".to_string(), "true".to_string()),
+            ("dev.pb.project".to_string(), "conformance".to_string()),
             ("dev.pb.session".to_string(), name.clone()),
             ("dev.pb.role".to_string(), "conformance".to_string()),
         ]);

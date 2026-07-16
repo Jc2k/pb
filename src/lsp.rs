@@ -441,7 +441,7 @@ impl LspClient {
                 .envs(&config.env)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .with_context(|| format!("failed to start LSP server {server_name}: {command}"))?;
             let stdin = child
@@ -452,7 +452,11 @@ impl LspClient {
                 .stdout
                 .take()
                 .context("failed to open LSP server stdout")?;
-            (LspProcess::Host(child), stdin, stdout, None)
+            let stderr = child
+                .stderr
+                .take()
+                .context("failed to open LSP server stderr")?;
+            (LspProcess::Host(child), stdin, stdout, Some(stderr))
         };
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
         let stderr_thread = stderr.map(|stderr| drain_stderr(stderr, Arc::clone(&stderr_tail)));
@@ -767,7 +771,12 @@ fn resolve_workspace_path(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(full)
 }
 fn path_to_uri(path: &Path) -> Result<String> {
-    Ok(format!("file://{}", path.canonicalize()?.to_string_lossy()))
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve LSP URI path {}", path.display()))?;
+    url::Url::from_file_path(&canonical)
+        .map(|url| url.to_string())
+        .map_err(|()| anyhow!("failed to encode LSP file URI for {}", canonical.display()))
 }
 fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
     args.get(name)
@@ -830,5 +839,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("active session environment lease"));
+    }
+
+    #[test]
+    fn file_uris_encode_worktree_and_source_path_delimiters() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source #1.rs");
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+
+        let uri = path_to_uri(&source).unwrap();
+        assert!(uri.starts_with("file:///"));
+        assert!(uri.ends_with("source%20%231.rs"));
+        assert!(!uri.contains(' '));
     }
 }

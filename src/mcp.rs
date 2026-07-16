@@ -74,6 +74,7 @@ pub struct McpToolRegistry {
     pub tools: BTreeMap<String, McpToolSpec>,
     sessions: BTreeMap<String, Arc<Mutex<McpClient>>>,
     lease: Option<Arc<crate::session_environment::SessionEnvironmentLease>>,
+    workspace_root: PathBuf,
 }
 
 impl McpToolRegistry {
@@ -144,8 +145,11 @@ pub fn effective_servers(
         .collect()
 }
 
-pub fn discover_tools(servers: BTreeMap<String, McpServerConfig>) -> McpToolRegistry {
-    discover_tools_inner(servers, None)
+pub fn discover_tools(
+    servers: BTreeMap<String, McpServerConfig>,
+    workspace_root: &Path,
+) -> McpToolRegistry {
+    discover_tools_inner(servers, workspace_root, None)
 }
 
 struct CachedMcpRegistry {
@@ -159,10 +163,12 @@ static SESSION_MCP_REGISTRIES: OnceLock<Mutex<HashMap<String, CachedMcpRegistry>
 pub fn discover_tools_for_session(
     session_id: &str,
     servers: BTreeMap<String, McpServerConfig>,
+    workspace_root: &Path,
     lease: Arc<crate::session_environment::SessionEnvironmentLease>,
 ) -> McpToolRegistry {
-    let fingerprint =
-        crate::environment_lock::sha256(&serde_json::to_vec(&servers).unwrap_or_default());
+    let fingerprint = crate::environment_lock::sha256(
+        &serde_json::to_vec(&(workspace_root, &servers)).unwrap_or_default(),
+    );
     let registries = SESSION_MCP_REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut registries) = registries.lock() {
         if let Some(cached) = registries.get(session_id)
@@ -170,7 +176,7 @@ pub fn discover_tools_for_session(
         {
             return cached.registry.clone();
         }
-        let registry = discover_tools_inner(servers, Some(lease));
+        let registry = discover_tools_inner(servers, workspace_root, Some(lease));
         registries.insert(
             session_id.to_string(),
             CachedMcpRegistry {
@@ -193,6 +199,7 @@ pub fn shutdown_session_services(session_id: &str) {
 
 fn discover_tools_inner(
     servers: BTreeMap<String, McpServerConfig>,
+    workspace_root: &Path,
     lease: Option<Arc<crate::session_environment::SessionEnvironmentLease>>,
 ) -> McpToolRegistry {
     let mut registry = McpToolRegistry {
@@ -200,14 +207,14 @@ fn discover_tools_inner(
         tools: BTreeMap::new(),
         sessions: BTreeMap::new(),
         lease: lease.clone(),
+        workspace_root: workspace_root.to_path_buf(),
     };
     for (server_name, server_config) in servers {
-        match McpClient::connect(&server_name, &server_config, lease.as_ref()).and_then(
-            |mut client| {
+        match McpClient::connect(&server_name, &server_config, workspace_root, lease.as_ref())
+            .and_then(|mut client| {
                 let tools = client.list_tools()?;
                 Ok((client, tools))
-            },
-        ) {
+            }) {
             Ok((client, server_tools)) => {
                 registry
                     .sessions
@@ -273,6 +280,7 @@ pub fn call_tool(registry: &McpToolRegistry, tool_name: &str, arguments: &Value)
                 *client = McpClient::connect(
                     &spec.server_name,
                     server,
+                    &registry.workspace_root,
                     registry.lease.as_ref(),
                 )
                 .with_context(|| {
@@ -284,7 +292,7 @@ pub fn call_tool(registry: &McpToolRegistry, tool_name: &str, arguments: &Value)
             }
         }
     }
-    let mut client = McpClient::connect(&spec.server_name, server, None)?;
+    let mut client = McpClient::connect(&spec.server_name, server, &registry.workspace_root, None)?;
     client.call_tool(&spec.server_tool_name, arguments)
 }
 
@@ -340,6 +348,7 @@ impl McpClient {
     fn connect(
         server_name: &str,
         config: &McpServerConfig,
+        workspace_root: &Path,
         lease: Option<&Arc<crate::session_environment::SessionEnvironmentLease>>,
     ) -> Result<Self> {
         if let Some(url) = config.url.as_deref().filter(|u| !u.trim().is_empty()) {
@@ -354,7 +363,12 @@ impl McpClient {
             );
         }
 
-        let mut client = Self::Stdio(StdioMcpClient::spawn(server_name, config, lease)?);
+        let mut client = Self::Stdio(StdioMcpClient::spawn(
+            server_name,
+            config,
+            workspace_root,
+            lease,
+        )?);
         client.initialize(server_name)?;
         Ok(client)
     }
@@ -482,6 +496,7 @@ impl StdioMcpClient {
     fn spawn(
         server_name: &str,
         config: &McpServerConfig,
+        workspace_root: &Path,
         lease: Option<&Arc<crate::session_environment::SessionEnvironmentLease>>,
     ) -> Result<Self> {
         let (process, stdin, stdout, stderr) = if let Some(lease) = lease {
@@ -526,16 +541,14 @@ impl StdioMcpClient {
             }
         } else {
             let (command, args) = stdio_command(server_name, config)?;
+            let cwd = resolve_host_workdir(workspace_root, config.working_directory.as_deref())?;
             let mut command_builder = Command::new(&command);
-            command_builder.args(&args);
-            if let Some(cwd) = &config.working_directory {
-                command_builder.current_dir(cwd);
-            }
+            command_builder.args(&args).current_dir(cwd);
             command_builder.envs(&config.env);
             command_builder
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null());
+                .stderr(Stdio::piped());
             let mut child = command_builder
                 .spawn()
                 .with_context(|| format!("failed to start MCP server {server_name}: {command}"))?;
@@ -547,7 +560,11 @@ impl StdioMcpClient {
                 .stdout
                 .take()
                 .context("failed to open MCP server stdout")?;
-            (McpProcess::Host(child), stdin, stdout, None)
+            let stderr = child
+                .stderr
+                .take()
+                .context("failed to open MCP server stderr")?;
+            (McpProcess::Host(child), stdin, stdout, Some(stderr))
         };
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
         let stderr_thread = stderr.map(|stderr| drain_stderr(stderr, Arc::clone(&stderr_tail)));
@@ -687,6 +704,42 @@ fn stdio_command(server_name: &str, config: &McpServerConfig) -> Result<(String,
         format!("MCP server {server_name} has no command, url, or container_image")
     })?;
     Ok((command.to_string(), config.args.clone()))
+}
+
+fn resolve_host_workdir(workspace_root: &Path, configured: Option<&Path>) -> Result<PathBuf> {
+    let canonical_root = workspace_root.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve MCP workspace {}",
+            workspace_root.display()
+        )
+    })?;
+    if let Some(path) = configured
+        && (path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)))
+    {
+        bail!(
+            "MCP working directory must be a workspace-relative path without parent traversal: {}",
+            path.display()
+        );
+    }
+    let candidate =
+        configured.map_or_else(|| canonical_root.clone(), |path| canonical_root.join(path));
+    let candidate = candidate.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve MCP working directory {}",
+            candidate.display()
+        )
+    })?;
+    if !candidate.starts_with(&canonical_root) {
+        bail!(
+            "MCP working directory {} escapes workspace {}",
+            candidate.display(),
+            canonical_root.display()
+        );
+    }
+    Ok(candidate)
 }
 
 fn format_tool_result(result: &Value) -> String {
@@ -854,7 +907,8 @@ done
             args: vec!["-c".to_string(), script.to_string()],
             ..Default::default()
         };
-        let mut client = McpClient::connect("fixture", &config, None).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut client = McpClient::connect("fixture", &config, workspace.path(), None).unwrap();
         let tools = client.list_tools().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name, "fixture_tool");
@@ -871,11 +925,40 @@ done
             },
             ..Default::default()
         };
-        let error = McpClient::connect("remote", &config, None)
+        let workspace = tempfile::tempdir().unwrap();
+        let error = McpClient::connect("remote", &config, workspace.path(), None)
             .err()
             .unwrap()
             .to_string();
         assert!(error.contains("not supported by the production session control plane"));
+    }
+
+    #[test]
+    fn host_mcp_working_directory_is_confined_to_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let tools = workspace.join("tools");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert_eq!(
+            resolve_host_workdir(&workspace, Some(Path::new("tools"))).unwrap(),
+            tools.canonicalize().unwrap()
+        );
+        let error = resolve_host_workdir(&workspace, Some(Path::new("../outside")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("workspace-relative"));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+            let error = resolve_host_workdir(&workspace, Some(Path::new("escape")))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("escapes workspace"));
+        }
     }
 
     #[test]

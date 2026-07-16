@@ -26,7 +26,8 @@ propose requirements, but it cannot grant host command authority.
    invalidates its lock and executable caches.
 3. The daemon, not an individual agent turn, owns session resources.
 4. Every runtime resource is discoverable by deterministic name and `dev.pb.*` ownership labels;
-   worktrees and attachments have atomic ownership records.
+   worktrees and attachments have atomic ownership records. Adoption requires the complete managed,
+   project, and session label set; name-only inventory never grants ownership.
 5. Desired state is persisted outside the repository before a resource transition is acknowledged.
 6. Startup reconciliation adopts valid resources and removes expired or orphaned resources.
 7. Cleanup is idempotent. `Drop` is only a best-effort backstop.
@@ -85,11 +86,19 @@ container signals, and host capabilities. Deterministic inspection covers at lea
 - Rust, Python, Node, Deno, Go, and Swift manifests and lockfiles;
 - CI platform matrices and documented setup/guard commands;
 - Xcode projects/workspaces, Apple-platform Swift packages, Apple framework imports, SDK commands,
-  simulators, signing, entitlements, Metal, and macOS CI.
+  simulators, signing, entitlements, Metal, and macOS CI. Source inspection covers Swift imports
+  (including declaration-qualified imports) and Objective-C/C/C++ framework imports, including
+  Virtualization, Containerization, Security, UI, media, hardware, and platform service frameworks.
 
 Resolution is component-aware. A repository containing a Linux service and an Xcode client may use
 a container executor for the former and an explicit local executor for the latter. When component
 boundaries are ambiguous, positive host evidence conservatively applies to the repository.
+Automatic `pb init` writes the conservative repository plan to `.pb/environment.toml` and missing
+top-level component suggestions to `.pb/environments/<component>.toml`. A run focused beneath that
+component loads its scoped plan before authority validation; repository-root work uses the
+repository plan, and an explicitly supplied run configuration keeps precedence. Scoped plans are
+never allowed to override positive host evidence, and initialization never overwrites an existing
+scoped plan.
 
 Every primary, workflow-stage, monitor, and sub-agent model invocation receives a runtime-owned
 summary of the selected component, resolved backend, host capabilities, dependency inputs,
@@ -125,7 +134,9 @@ resolution may strengthen the identity when the backend exposes it, but local id
 is mandatory on every acquisition. Pull/build/inspect/container-create is serialized by a
 kernel-backed lock keyed by runtime and configured image reference, so two sessions cannot mutate a
 shared tag between inspection and launch. Candidate resolution is non-persisting; the project lock
-is replaced only after preparation succeeds.
+is replaced only after preparation succeeds. Attached LSP/MCP launch keeps the same image lock until
+the named container is observable with the expected project/session labels; spawning the runtime CLI
+process alone is not treated as successful creation.
 
 ## Workspace strategy
 
@@ -156,8 +167,8 @@ Apple `container` 1.0.0 with `alpine:3.20`, two iterations, 2,000 generated Rust
 
 | strategy | samples | checksum |
 | --- | --- | --- |
-| `worktree_bind` | 1012 ms, 1190 ms | `1843554495 69780` |
-| `container_volume` | 292 ms, 283 ms | `1843554495 69780` |
+| `worktree_bind` | 978 ms, 1128 ms | `1843554495 69780` |
+| `container_volume` | 286 ms, 265 ms | `1843554495 69780` |
 
 The named volume was about 3.8x faster in this deliberately metadata-heavy sample. The selected
 strategy remains `worktree_bind`: pb does not yet have the transactional synchronization protocol
@@ -254,7 +265,13 @@ Caches have trust classes:
 Metadata records cache identity, volume, trust class, provenance hash, size estimate, last use,
 active attachment count, and preparing owner. Preparation uses an exclusive lock. Attach/detach is
 leased and crash-reconciled. GC enforces age and size budgets and never deletes an attached or
-preparing cache.
+preparing cache. Discovery never mounts an empty cache volume over an image-owned language
+toolchain directory: Apple documents persistence and sharing for named mounts but does not promise
+Docker-style population from the underlying image. Toolchains baked into the image therefore remain
+part of the locked image identity; declared download, dependency, build-output, and LSP caches are
+mounted only at paths they own. An existing runtime volume is reusable only when its complete pb
+project, role, trust, and provenance labels match the durable cache record; a matching name alone
+is never ownership evidence.
 
 ## LSP supervision
 
@@ -263,7 +280,9 @@ toolchain/cache parity. Image-configured LSPs run as named, labelled session sid
 task-owned worktree mounted at the same absolute path used in `file://` URIs. Sidecar workspace,
 network, and cache access are explicit configuration. A configured service working directory must
 exist beneath the task worktree after canonical path resolution; absolute, `..`, and symlink
-escapes are rejected.
+escapes are rejected. Canonical paths are converted with standards-compliant file-URL encoding, so
+macOS state paths such as `Application Support` and project filenames containing URI delimiters are
+represented correctly.
 
 The daemon session registry owns LSP clients and tool registries across turns. The client implements
 initialize/initialized, didOpen/didChange/didClose, configuration/workspace server requests,
@@ -288,6 +307,8 @@ secret_env = { TOKEN = "EXAMPLE_TOKEN" }
 Container MCP is required for container-backed sessions; host-command MCP configuration is refused
 there because its capabilities cannot be isolated. STDIO services are named, labelled container
 processes and never use `run --rm`. Workspace mounting follows the declared access exactly. The
+explicit local-host fallback resolves its MCP working directory against the canonical project
+workspace and rejects absolute, parent, or symlink escapes. The
 client negotiates MCP through the current `2025-11-25` revision (while accepting the three prior
 compatible revisions), uses the specification's bounded newline-delimited stdio transport, and
 enforces real request deadlines. Remote HTTP MCP fails closed until authenticated Streamable HTTP
@@ -338,6 +359,21 @@ The real Apple conformance gate currently covers:
 LSP turn reuse and MCP capability behavior are deterministic unit/integration gates; adding
 fixture images for an end-to-end real-runtime protocol matrix remains hardening work, not a reason
 to weaken the enforced ownership/capability model.
+
+## Session requirements audit — 2026-07-16
+
+| Session requirement | Enforced production baseline |
+| --- | --- |
+| Capture how to build a development environment | Deterministic component evidence, human-owned plans, immutable image preparation, setup/guard commands, and an identity lock are generated and supplied to every model invocation. |
+| Know when containers are invalid | Apple-only projects, sources, SDK commands, signing, simulation, Metal, UI, and hardware evidence force an audited local executor; mixed repositories use scoped plans and repository-root work is conservative. |
+| Reuse images but not session containers | Inspected image identities and provenance-labelled caches persist; primary, bootstrap, LSP, MCP, network, process, and workspace resources are session-owned, reconciled, and terminally cleaned. |
+| Default to no agent network while still bootstrapping | Only the declared bootstrap phase receives egress by default. Agent commands and service containers use isolated networks unless explicit service capability policy grants more. |
+| Choose bind mount versus container-local copy | The measured named-volume path remains ineligible despite its speed advantage because transactional source synchronization and lossless diff promotion do not yet exist; a task-owned worktree bind is the correctness boundary. |
+| Give LSP and MCP services code plus reusable caches | Command LSPs share the primary container; image LSPs and MCP servers are named session sidecars with explicit worktree/capability mounts and provenance-keyed persistent cache attachments. |
+| Survive concurrency, crashes, and stale state safely | Kernel-backed session/image/cache locks, desired/observed ledgers, complete ownership-label validation, startup reconciliation, bounded process shutdown, and fail-safe cleanup prevent name-only adoption or deletion. |
+
+The production baseline is complete only while the deterministic suite, the real Apple lifecycle
+gate, the bind-versus-volume correctness benchmark, and the post-run zero-leak inventory all pass.
 
 ## Delivery milestones
 

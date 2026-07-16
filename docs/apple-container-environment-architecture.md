@@ -220,7 +220,9 @@ fail closed until the daemon owns a complete authenticated Streamable HTTP lifec
 ## Configuration version two
 
 The migration extends the existing compatible TOML rather than introducing a second environment
-file. Omitted new fields receive safe defaults.
+schema. `.pb/environment.toml` is the conservative repository plan, while optional generated or
+human-owned `.pb/environments/<component>.toml` files use the same schema for focused components.
+Omitted new fields receive safe defaults.
 
 ```toml
 version = 2

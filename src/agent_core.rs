@@ -2082,6 +2082,7 @@ fn run_agent_inner<S: EventSink>(
     );
     // Load the environment before preparing a task worktree. The configuration is project-owned,
     // while all subsequent agent filesystem and container access must use the task-owned worktree.
+    let request_environment_supplied = args.environment.is_some();
     let mut env_config = if let Some(environment) = args.environment.clone() {
         Some(environment)
     } else if args.repository_less {
@@ -2102,6 +2103,12 @@ fn run_agent_inner<S: EventSink>(
             })
             .filter(|name| !name.is_empty())
             .unwrap_or("repository");
+        if !request_environment_supplied
+            && let Some(component_environment) =
+                load_component_environment(&workspace_root, component)?
+        {
+            env_config = Some(component_environment);
+        }
         let authority = crate::environment_lock::resolve_component_authority(
             component,
             &inspection.environment_evidence,
@@ -2359,9 +2366,14 @@ fn run_agent_inner<S: EventSink>(
     let mcp_registry = if args.repository_less {
         McpToolRegistry::default()
     } else if let Some(lease) = session_lease.as_ref() {
-        mcp::discover_tools_for_session(&args.session_id, mcp_servers, Arc::clone(lease))
+        mcp::discover_tools_for_session(
+            &args.session_id,
+            mcp_servers,
+            &workspace_root,
+            Arc::clone(lease),
+        )
     } else {
-        mcp::discover_tools(mcp_servers)
+        mcp::discover_tools(mcp_servers, &workspace_root)
     };
     let project_lsp_config = if args.repository_less {
         None
@@ -2602,6 +2614,26 @@ fn run_agent_inner<S: EventSink>(
         delivery_proposal,
         requested_delivery,
     })
+}
+
+fn load_component_environment(
+    workspace_root: &Path,
+    component: &str,
+) -> Result<Option<EnvironmentConfig>> {
+    if component == "repository"
+        || component.is_empty()
+        || component.contains(['/', '\\', '\0', '\n', '\r'])
+    {
+        return Ok(None);
+    }
+    let path = workspace_root
+        .join(".pb")
+        .join("environments")
+        .join(format!("{component}.toml"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    EnvironmentConfig::load_path(&path).map(Some)
 }
 
 fn classify_handoff_outcome(
@@ -20509,6 +20541,34 @@ mod tests {
         assert!(serialized.get("environment_evidence_context").is_none());
         let restored: AgentRequest = serde_json::from_value(serialized).unwrap();
         assert!(restored.environment_evidence_context.is_none());
+    }
+
+    #[test]
+    fn focused_component_loads_its_scoped_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let environments = directory.path().join(".pb").join("environments");
+        std::fs::create_dir_all(&environments).unwrap();
+        std::fs::write(
+            environments.join("server.toml"),
+            "version = 2\nmode = \"pull\"\nbackend = \"apple_containers\"\nimage = \"rust:latest\"\n",
+        )
+        .unwrap();
+
+        let environment = load_component_environment(directory.path(), "server")
+            .unwrap()
+            .unwrap();
+        assert_eq!(environment.backend, EnvironmentBackend::AppleContainers);
+        assert_eq!(environment.image, "rust:latest");
+        assert!(
+            load_component_environment(directory.path(), "repository")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_component_environment(directory.path(), "../server")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

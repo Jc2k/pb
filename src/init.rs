@@ -9,7 +9,7 @@
 //! prints a summary of what it found and what it configured.
 
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::environment::{
@@ -198,7 +198,7 @@ fn is_regular_project_directory(path: &Path) -> bool {
 }
 
 fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut ProjectInspection) {
-    if depth > 4 {
+    if depth > 8 {
         return;
     }
     let entries = match std::fs::read_dir(dir) {
@@ -226,7 +226,17 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
             }
             if matches!(
                 name.as_ref(),
-                ".git" | "target" | "node_modules" | "dist" | "build"
+                ".git"
+                    | ".pb"
+                    | ".build"
+                    | ".venv"
+                    | "venv"
+                    | "target"
+                    | "node_modules"
+                    | "dist"
+                    | "build"
+                    | "Pods"
+                    | "DerivedData"
             ) {
                 continue;
             }
@@ -337,7 +347,11 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
             n if std::path::Path::new(n).extension().and_then(|e| e.to_str()) == Some("metal") => {
                 record_host_requirement(root, &path, info, HostRequirement::Metal);
             }
-            n if std::path::Path::new(n).extension().and_then(|e| e.to_str()) == Some("swift") => {
+            n if matches!(
+                std::path::Path::new(n).extension().and_then(|e| e.to_str()),
+                Some("swift" | "m" | "mm" | "h" | "hpp" | "c" | "cc" | "cpp" | "pch")
+            ) =>
+            {
                 if let Ok(text) = std::fs::read_to_string(&path)
                     && contains_apple_framework_import(&text)
                 {
@@ -369,17 +383,83 @@ fn contains_apple_swift_package_signal(text: &str) -> bool {
 }
 
 fn contains_apple_framework_import(text: &str) -> bool {
+    const APPLE_ONLY_MODULES: &[&str] = &[
+        "AppKit",
+        "ARKit",
+        "AuthenticationServices",
+        "AVFoundation",
+        "CloudKit",
+        "Combine",
+        "Contacts",
+        "Containerization",
+        "CoreBluetooth",
+        "CoreData",
+        "CoreGraphics",
+        "CoreLocation",
+        "CoreML",
+        "CryptoTokenKit",
+        "Darwin",
+        "DriverKit",
+        "EndpointSecurity",
+        "IOKit",
+        "LocalAuthentication",
+        "MapKit",
+        "Metal",
+        "MetalKit",
+        "NetworkExtension",
+        "Photos",
+        "QuartzCore",
+        "RealityKit",
+        "Security",
+        "StoreKit",
+        "SwiftUI",
+        "UIKit",
+        "UserNotifications",
+        "Virtualization",
+        "VisionKit",
+        "WebKit",
+    ];
+    const SWIFT_DECLARATION_IMPORTS: &[&str] = &[
+        "typealias",
+        "struct",
+        "class",
+        "enum",
+        "protocol",
+        "let",
+        "var",
+        "func",
+    ];
+
     text.lines().any(|line| {
-        matches!(
-            line.trim(),
-            "import AppKit"
-                | "import UIKit"
-                | "import SwiftUI"
-                | "import Metal"
-                | "import MetalKit"
-                | "import RealityKit"
-                | "import VisionKit"
-        )
+        let trimmed = line.trim();
+        let compact = trimmed.split_whitespace().collect::<String>();
+        if APPLE_ONLY_MODULES.iter().any(|module| {
+            compact.contains(&format!("<{module}/"))
+                || compact.contains(&format!("\"{module}/"))
+                || compact.contains(&format!("@import{module};"))
+        }) {
+            return true;
+        }
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        let Some(import_index) = tokens.iter().position(|token| *token == "import") else {
+            return false;
+        };
+        let mut module_index = import_index + 1;
+        if tokens
+            .get(module_index)
+            .is_some_and(|token| SWIFT_DECLARATION_IMPORTS.contains(token))
+        {
+            module_index += 1;
+        }
+        let Some(module) = tokens.get(module_index) else {
+            return false;
+        };
+        let module = module
+            .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .split('.')
+            .next()
+            .unwrap_or_default();
+        APPLE_ONLY_MODULES.contains(&module)
     })
 }
 
@@ -817,11 +897,6 @@ fn discovered_container_caches(info: &ProjectInspection) -> Vec<EnvironmentCache
     };
     if info.has_cargo_toml {
         push(
-            "rustup-toolchains",
-            "/usr/local/rustup",
-            crate::environment::CacheTrustClass::Toolchain,
-        );
-        push(
             "cargo-registry",
             "/usr/local/cargo/registry",
             crate::environment::CacheTrustClass::Download,
@@ -977,6 +1052,10 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
         }
     }
 
+    if backend.is_none() {
+        write_component_environment_configs(&root, &info)?;
+    }
+
     println!();
     if info.has_pb_workspace {
         println!(
@@ -1018,6 +1097,38 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
         );
     }
 
+    Ok(())
+}
+
+fn write_component_environment_configs(root: &Path, info: &ProjectInspection) -> Result<()> {
+    let components = info
+        .environment_evidence
+        .iter()
+        .map(|evidence| evidence.component.as_str())
+        .filter(|component| *component != "repository")
+        .collect::<BTreeSet<_>>();
+    for component in components {
+        let component_root = root.join(component);
+        if !is_regular_project_directory(&component_root) {
+            continue;
+        }
+        let component_info = inspect(&component_root)?;
+        let Some(environment) = suggest_scout_environment(&component_root, &component_info) else {
+            continue;
+        };
+        let path = root
+            .join(".pb")
+            .join("environments")
+            .join(format!("{component}.toml"));
+        if path.exists() {
+            continue;
+        }
+        environment.save_path(&path)?;
+        println!(
+            "Component environment for '{component}' written to {}.",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1861,6 +1972,35 @@ mod tests {
         assert_eq!(policy.delivery, crate::workflow::DeliveryPolicy::Strict);
     }
 
+    #[test]
+    fn init_writes_scoped_environments_for_mixed_apple_and_linux_components() {
+        let directory = TempDir::new().unwrap();
+        write(
+            directory.path(),
+            "client/App.xcodeproj/project.pbxproj",
+            "// !$*UTF8*$!\n",
+        );
+        write(
+            directory.path(),
+            "server/Cargo.toml",
+            "[package]\nname = \"server\"\nversion = \"0.1.0\"\n",
+        );
+
+        run_init(Some(directory.path().to_path_buf()), None).unwrap();
+
+        let repository = EnvironmentConfig::load(directory.path()).unwrap().unwrap();
+        assert_eq!(repository.backend, EnvironmentBackend::Local);
+        let client =
+            EnvironmentConfig::load_path(&directory.path().join(".pb/environments/client.toml"))
+                .unwrap();
+        let server =
+            EnvironmentConfig::load_path(&directory.path().join(".pb/environments/server.toml"))
+                .unwrap();
+        assert_eq!(client.backend, EnvironmentBackend::Local);
+        assert_eq!(server.backend, EnvironmentBackend::AppleContainers);
+        assert_eq!(server.image, "rust:latest");
+    }
+
     // ── suggest_environment ──
 
     #[test]
@@ -1872,6 +2012,17 @@ mod tests {
         let env = suggest_environment(&info).unwrap();
         assert_eq!(env.image, "rust:latest");
         assert!(matches!(env.mode, EnvironmentMode::Pull));
+        assert!(
+            env.caches
+                .iter()
+                .any(|cache| cache.target == Path::new("/workspace/target"))
+        );
+        assert!(
+            env.caches
+                .iter()
+                .all(|cache| cache.target != Path::new("/usr/local/rustup")),
+            "an empty Apple named volume must not hide an image-owned Rust toolchain"
+        );
     }
 
     #[test]
@@ -2112,6 +2263,46 @@ Run `npm test` before commit.",
                 .contains(&HostRequirement::AppleSwiftPackage)
         );
         assert_eq!(env.backend, EnvironmentBackend::Local);
+    }
+
+    #[test]
+    fn apple_only_framework_sources_require_host_without_an_xcode_project() {
+        let swift = TempDir::new().unwrap();
+        write(
+            swift.path(),
+            "Package.swift",
+            "// swift-tools-version: 6.0\nimport PackageDescription\n",
+        );
+        write(
+            swift.path(),
+            "Sources/VM/Runner.swift",
+            "@preconcurrency import Virtualization\n",
+        );
+        let swift_info = inspect(swift.path()).unwrap();
+        assert!(
+            swift_info
+                .host_requirements
+                .contains(&HostRequirement::AppleFrameworkSource)
+        );
+        assert_eq!(
+            suggest_scout_environment(swift.path(), &swift_info)
+                .unwrap()
+                .backend,
+            EnvironmentBackend::Local
+        );
+
+        let objc = TempDir::new().unwrap();
+        write(
+            objc.path(),
+            "client/main.m",
+            "#import <AppKit/AppKit.h>\nint main(void) { return 0; }\n",
+        );
+        let objc_info = inspect(objc.path()).unwrap();
+        assert!(
+            objc_info
+                .host_requirements
+                .contains(&HostRequirement::AppleFrameworkSource)
+        );
     }
 
     #[test]

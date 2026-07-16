@@ -71,6 +71,8 @@ pub fn run(
     let volume_name = format!("pb-bench-volume-{nonce}");
     let labels = BTreeMap::from([
         ("dev.pb.managed".to_string(), "true".to_string()),
+        ("dev.pb.project".to_string(), "benchmark".to_string()),
+        ("dev.pb.session".to_string(), nonce.to_string()),
         (
             "dev.pb.role".to_string(),
             "filesystem-benchmark".to_string(),
@@ -80,12 +82,18 @@ pub fn run(
         name: network_name.clone(),
         labels: labels.clone(),
     })?;
-    if let Err(error) = runtime.ensure_volume(&VolumeSpec {
+    let volume_spec = VolumeSpec {
         name: volume_name.clone(),
         labels: labels.clone(),
-    }) {
+    };
+    if let Err(error) = runtime.ensure_volume(&volume_spec) {
         let _ = runtime.remove_network(&network_name);
         return Err(error).context("failed to create filesystem benchmark volume");
+    }
+    if let Err(error) = runtime.ensure_volume(&volume_spec) {
+        let _ = runtime.remove_volume(&volume_name);
+        let _ = runtime.remove_network(&network_name);
+        return Err(error).context("failed to validate filesystem benchmark volume ownership");
     }
     let bind_root = tempfile::tempdir().context("failed to create bind benchmark directory")?;
     let mut samples = Vec::new();

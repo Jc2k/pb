@@ -332,15 +332,19 @@ impl EnvironmentConfig {
 
     /// Persist the config to `<workspace_root>/.pb/environment.toml`, creating directories as needed.
     pub fn save(&self, workspace_root: &Path) -> Result<()> {
+        self.save_path(&workspace_root.join(".pb").join("environment.toml"))
+    }
+
+    /// Persist a named component/executor environment configuration.
+    pub fn save_path(&self, path: &Path) -> Result<()> {
         self.validate()
             .context("invalid environment configuration")?;
-        let dir = workspace_root.join(".pb");
-        std::fs::create_dir_all(&dir)
+        let dir = path.parent().context("environment config has no parent")?;
+        std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create directory {}", dir.display()))?;
-        let path = dir.join("environment.toml");
         let text =
             toml::to_string_pretty(self).context("failed to serialize environment config")?;
-        std::fs::write(&path, text)
+        std::fs::write(path, text)
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }

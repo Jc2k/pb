@@ -464,22 +464,95 @@ impl SessionEnvironmentLease {
             .take();
         let mut stop_error = None;
         if let Some(mut handle) = handle {
-            if let Err(error) =
-                cleanup_recorded_service_resources(&self.record()?, handle.runtime.as_ref())
+            let record = self.record()?;
+            if let Err(error) = cleanup_recorded_service_resources(&record, handle.runtime.as_ref())
             {
                 stop_error = Some(error);
             }
-            if let Err(error) = handle.shutdown(Duration::from_secs(5))
-                && stop_error.is_none()
-            {
-                stop_error = Some(error);
+            match managed_container_matches(
+                handle.runtime.as_ref(),
+                &handle.container_id,
+                &record.project_id,
+                &record.session_id,
+            ) {
+                Ok(true) => {
+                    if let Err(error) = handle.shutdown(Duration::from_secs(5))
+                        && stop_error.is_none()
+                    {
+                        stop_error = Some(error);
+                    }
+                    if let Err(error) = handle.runtime.remove(&handle.container_id) {
+                        if stop_error.is_none() {
+                            stop_error = Some(error);
+                        }
+                    } else {
+                        handle.container_id.clear();
+                    }
+                }
+                Ok(false) => {
+                    match handle.runtime.container_exists(&handle.container_id) {
+                        Ok(true) if stop_error.is_none() => {
+                            stop_error = Some(anyhow::anyhow!(
+                                "refusing to stop recorded primary container '{}' without matching project/session labels",
+                                handle.container_id
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(error) if stop_error.is_none() => stop_error = Some(error),
+                        Err(_) => {}
+                    }
+                    // Never let the Drop backstop remove a resource whose ownership was not verified.
+                    handle.container_id.clear();
+                }
+                Err(error) => {
+                    if stop_error.is_none() {
+                        stop_error = Some(error);
+                    }
+                    handle.container_id.clear();
+                }
             }
-            if let Err(error) = handle.cleanup()
-                && stop_error.is_none()
-            {
-                stop_error = Some(error);
+            if let Some(network) = handle.network.clone() {
+                match managed_network_matches(
+                    handle.runtime.as_ref(),
+                    &network,
+                    &record.project_id,
+                    &record.session_id,
+                ) {
+                    Ok(true) => {
+                        if let Err(error) = handle.runtime.remove_network(&network) {
+                            if stop_error.is_none() {
+                                stop_error = Some(error);
+                            }
+                        } else {
+                            handle.network = None;
+                        }
+                    }
+                    Ok(false) => {
+                        match handle.runtime.list_managed_networks() {
+                            Ok(networks)
+                                if networks.iter().any(|resource| resource.name == network)
+                                    && stop_error.is_none() =>
+                            {
+                                stop_error = Some(anyhow::anyhow!(
+                                    "refusing to remove recorded network '{network}' without matching project/session labels"
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(error) if stop_error.is_none() => stop_error = Some(error),
+                            Err(_) => {}
+                        }
+                        handle.network = None;
+                    }
+                    Err(error) => {
+                        if stop_error.is_none() {
+                            stop_error = Some(error);
+                        }
+                        handle.network = None;
+                    }
+                }
             }
-            // ContainerHandle::drop retries any forced deletion that failed above.
+            // ContainerHandle::drop retries only failures for resources whose ownership was
+            // verified above; foreign identifiers have already been cleared.
             drop(handle);
         }
         self.cache_attachments
@@ -789,22 +862,7 @@ impl EnvironmentSupervisor {
             // Stdio protocol connections cannot survive a daemon restart. Their named resources
             // remain recoverable in the ledger, so reconciliation removes them deterministically
             // and leaves the task container available for lazy service restart.
-            for resource in record.resources.iter().filter(|resource| {
-                matches!(
-                    resource.kind,
-                    LeaseResourceKind::LspProcess | LeaseResourceKind::McpService
-                )
-            }) {
-                if runtime.container_exists(&resource.name).unwrap_or(false) {
-                    let _ = runtime.stop(&resource.name, Duration::from_secs(2));
-                    let _ = runtime.remove(&resource.name);
-                }
-            }
-            for resource in record.resources.iter().filter(|resource| {
-                resource.kind == LeaseResourceKind::Network && resource.role.starts_with("service:")
-            }) {
-                let _ = runtime.remove_network(&resource.name);
-            }
+            cleanup_recorded_service_resources(&record, runtime.as_ref())?;
             record.resources.retain(|resource| {
                 !(matches!(
                     resource.kind,
@@ -870,12 +928,16 @@ impl EnvironmentSupervisor {
 
         if let Some(runtime) = container::detect_runtime() {
             for resource in runtime.list_managed_containers()? {
-                if !active_containers.contains(&resource.name) {
+                if !active_containers.contains(&resource.name)
+                    && has_complete_session_ownership_labels(&resource.labels)
+                {
                     let _ = runtime.remove(&resource.name);
                 }
             }
             for resource in runtime.list_managed_networks()? {
-                if !active_networks.contains(&resource.name) {
+                if !active_networks.contains(&resource.name)
+                    && has_complete_session_ownership_labels(&resource.labels)
+                {
                     let _ = runtime.remove_network(&resource.name);
                 }
             }
@@ -998,6 +1060,26 @@ fn managed_container_matches(
     ))
 }
 
+fn managed_network_matches(
+    runtime: &dyn ContainerRuntime,
+    name: &str,
+    project_id: &str,
+    session_id: &str,
+) -> Result<bool> {
+    let Some(resource) = runtime
+        .list_managed_networks()?
+        .into_iter()
+        .find(|resource| resource.name == name)
+    else {
+        return Ok(false);
+    };
+    Ok(managed_resource_labels_match(
+        &resource.labels,
+        project_id,
+        session_id,
+    ))
+}
+
 fn resolve_service_workdir(workspace_root: &Path, configured: Option<&Path>) -> Result<String> {
     let canonical_root = workspace_root.canonicalize().with_context(|| {
         format!(
@@ -1068,25 +1150,30 @@ fn managed_resource_labels_match(
     project_id: &str,
     session_id: &str,
 ) -> bool {
-    if labels.is_empty() {
-        // Runtime adapters own the inventory filter. Some OCI output modes expose only names.
-        return true;
-    }
     if labels.get("dev.pb.managed").map(String::as_str) != Some("true") {
         return false;
     }
-    if let Some(project) = labels.get("dev.pb.project")
-        && project != project_id
-    {
+    if labels.get("dev.pb.project").map(String::as_str) != Some(project_id) {
         return false;
     }
-    if let Some(session) = labels.get("dev.pb.session") {
-        let session_hash = crate::environment_lock::sha256(session_id.as_bytes());
-        if session != session_id && session != &session_hash[..12] {
-            return false;
-        }
+    let Some(session) = labels.get("dev.pb.session") else {
+        return false;
+    };
+    let session_hash = crate::environment_lock::sha256(session_id.as_bytes());
+    if session != session_id && session != &session_hash[..12] {
+        return false;
     }
     true
+}
+
+fn has_complete_session_ownership_labels(labels: &BTreeMap<String, String>) -> bool {
+    labels.get("dev.pb.managed").map(String::as_str) == Some("true")
+        && labels
+            .get("dev.pb.project")
+            .is_some_and(|value| !value.trim().is_empty())
+        && labels
+            .get("dev.pb.session")
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn seed_resources(seed: &SessionLeaseSeed, cache_names: &[String]) -> Vec<LeaseResourceRecord> {
@@ -1133,6 +1220,7 @@ fn cleanup_recorded_resources(
     record: &SessionLeaseRecord,
     runtime: &dyn ContainerRuntime,
 ) -> Result<()> {
+    let mut first_error = None;
     for resource in record.resources.iter().filter(|resource| {
         matches!(
             resource.kind,
@@ -1141,9 +1229,23 @@ fn cleanup_recorded_resources(
                 | LeaseResourceKind::McpService
         )
     }) {
-        if runtime.container_exists(&resource.name)? {
+        if managed_container_matches(
+            runtime,
+            &resource.name,
+            &record.project_id,
+            &record.session_id,
+        )? {
             let _ = runtime.stop(&resource.name, Duration::from_secs(5));
-            runtime.remove(&resource.name)?;
+            if let Err(error) = runtime.remove(&resource.name)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        } else if runtime.container_exists(&resource.name)? && first_error.is_none() {
+            first_error = Some(anyhow::anyhow!(
+                "refusing to remove recorded container '{}' without matching project/session labels",
+                resource.name
+            ));
         }
     }
     for resource in record
@@ -1151,9 +1253,31 @@ fn cleanup_recorded_resources(
         .iter()
         .filter(|resource| resource.kind == LeaseResourceKind::Network)
     {
-        let _ = runtime.remove_network(&resource.name);
+        let owned = managed_network_matches(
+            runtime,
+            &resource.name,
+            &record.project_id,
+            &record.session_id,
+        )?;
+        if owned {
+            if let Err(error) = runtime.remove_network(&resource.name)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        } else if runtime
+            .list_managed_networks()?
+            .iter()
+            .any(|network| network.name == resource.name)
+            && first_error.is_none()
+        {
+            first_error = Some(anyhow::anyhow!(
+                "refusing to remove recorded network '{}' without matching project/session labels",
+                resource.name
+            ));
+        }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 fn cleanup_recorded_service_resources(
@@ -1161,18 +1285,18 @@ fn cleanup_recorded_service_resources(
     runtime: &dyn ContainerRuntime,
 ) -> Result<()> {
     let mut first_error = None;
-    let managed_networks = runtime
-        .list_managed_networks()?
-        .into_iter()
-        .map(|resource| resource.name)
-        .collect::<BTreeSet<_>>();
     for resource in record.resources.iter().filter(|resource| {
         matches!(
             resource.kind,
             LeaseResourceKind::LspProcess | LeaseResourceKind::McpService
         )
     }) {
-        match runtime.container_exists(&resource.name) {
+        match managed_container_matches(
+            runtime,
+            &resource.name,
+            &record.project_id,
+            &record.session_id,
+        ) {
             Ok(true) => {
                 let _ = runtime.stop(&resource.name, Duration::from_secs(2));
                 if let Err(error) = runtime.remove(&resource.name)
@@ -1181,7 +1305,17 @@ fn cleanup_recorded_service_resources(
                     first_error = Some(error);
                 }
             }
-            Ok(false) => {}
+            Ok(false) => match runtime.container_exists(&resource.name) {
+                Ok(true) if first_error.is_none() => {
+                    first_error = Some(anyhow::anyhow!(
+                        "refusing to remove recorded service '{}' without matching project/session labels",
+                        resource.name
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            },
             Err(error) if first_error.is_none() => first_error = Some(error),
             Err(_) => {}
         }
@@ -1189,11 +1323,28 @@ fn cleanup_recorded_service_resources(
     for resource in record.resources.iter().filter(|resource| {
         resource.kind == LeaseResourceKind::Network && resource.role.starts_with("service:")
     }) {
-        if managed_networks.contains(&resource.name)
-            && let Err(error) = runtime.remove_network(&resource.name)
+        let owned = managed_network_matches(
+            runtime,
+            &resource.name,
+            &record.project_id,
+            &record.session_id,
+        )?;
+        if owned {
+            if let Err(error) = runtime.remove_network(&resource.name)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        } else if runtime
+            .list_managed_networks()?
+            .iter()
+            .any(|network| network.name == resource.name)
             && first_error.is_none()
         {
-            first_error = Some(error);
+            first_error = Some(anyhow::anyhow!(
+                "refusing to remove recorded service network '{}' without matching project/session labels",
+                resource.name
+            ));
         }
     }
     first_error.map_or(Ok(()), Err)
@@ -1245,12 +1396,14 @@ mod tests {
         VolumeSpec,
     };
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     struct RuntimeState {
         events: Mutex<Vec<String>>,
         containers: Mutex<BTreeSet<String>>,
         networks: Mutex<BTreeSet<String>>,
+        fail_inventory: AtomicBool,
     }
 
     #[derive(Clone)]
@@ -1311,6 +1464,9 @@ mod tests {
             Ok(self.state.containers.lock().unwrap().contains(container_id))
         }
         fn list_managed_containers(&self) -> Result<Vec<ManagedResource>> {
+            if self.state.fail_inventory.load(Ordering::Acquire) {
+                bail!("injected container inventory failure");
+            }
             Ok(self
                 .state
                 .containers
@@ -1319,11 +1475,18 @@ mod tests {
                 .iter()
                 .map(|name| ManagedResource {
                     name: name.clone(),
-                    labels: BTreeMap::new(),
+                    labels: BTreeMap::from([
+                        ("dev.pb.managed".to_string(), "true".to_string()),
+                        ("dev.pb.project".to_string(), "p1".to_string()),
+                        ("dev.pb.session".to_string(), "s1".to_string()),
+                    ]),
                 })
                 .collect())
         }
         fn list_managed_networks(&self) -> Result<Vec<ManagedResource>> {
+            if self.state.fail_inventory.load(Ordering::Acquire) {
+                bail!("injected network inventory failure");
+            }
             Ok(self
                 .state
                 .networks
@@ -1332,7 +1495,11 @@ mod tests {
                 .iter()
                 .map(|name| ManagedResource {
                     name: name.clone(),
-                    labels: BTreeMap::new(),
+                    labels: BTreeMap::from([
+                        ("dev.pb.managed".to_string(), "true".to_string()),
+                        ("dev.pb.project".to_string(), "p1".to_string()),
+                        ("dev.pb.session".to_string(), "s1".to_string()),
+                    ]),
                 })
                 .collect())
         }
@@ -1377,6 +1544,7 @@ mod tests {
             events: Mutex::new(Vec::new()),
             containers: Mutex::new(BTreeSet::new()),
             networks: Mutex::new(BTreeSet::new()),
+            fail_inventory: AtomicBool::new(false),
         })
     }
 
@@ -1596,6 +1764,53 @@ mod tests {
     }
 
     #[test]
+    fn teardown_inventory_failure_never_deletes_unverified_names_via_drop() {
+        let dir = TempDir::new().unwrap();
+        let supervisor = Box::leak(Box::new(EnvironmentSupervisor::new(
+            dir.path().to_path_buf(),
+        )));
+        let state = state();
+        let handle = supervisor
+            .acquire(
+                seed(dir.path()),
+                Box::new(FakeRuntime {
+                    state: Arc::clone(&state),
+                }),
+                Vec::new(),
+                true,
+                {
+                    let state = Arc::clone(&state);
+                    move |runtime| {
+                        state
+                            .containers
+                            .lock()
+                            .unwrap()
+                            .insert("pb-task-s1".to_string());
+                        state
+                            .networks
+                            .lock()
+                            .unwrap()
+                            .insert("pb-net-s1".to_string());
+                        Ok(ContainerHandle {
+                            runtime,
+                            container_id: "pb-task-s1".to_string(),
+                            network: Some("pb-net-s1".to_string()),
+                        })
+                    }
+                },
+            )
+            .unwrap();
+        drop(handle);
+        state.fail_inventory.store(true, Ordering::Release);
+
+        let error = format!("{:#}", supervisor.terminate("s1").unwrap_err());
+        assert!(error.contains("inventory failure"));
+        assert!(state.containers.lock().unwrap().contains("pb-task-s1"));
+        assert!(state.networks.lock().unwrap().contains("pb-net-s1"));
+        assert!(state.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn durable_adoption_rejects_foreign_ownership_labels() {
         let session_id = "session-owned";
         let session_hash = crate::environment_lock::sha256(session_id.as_bytes());
@@ -1625,6 +1840,19 @@ mod tests {
             "project-a",
             session_id
         ));
+
+        let incomplete = BTreeMap::from([("dev.pb.managed".to_string(), "true".to_string())]);
+        assert!(!managed_resource_labels_match(
+            &incomplete,
+            "project-a",
+            session_id
+        ));
+        assert!(!has_complete_session_ownership_labels(&incomplete));
+        assert!(has_complete_session_ownership_labels(&BTreeMap::from([
+            ("dev.pb.managed".to_string(), "true".to_string()),
+            ("dev.pb.project".to_string(), "project-a".to_string()),
+            ("dev.pb.session".to_string(), "session-a".to_string()),
+        ])));
     }
 
     #[test]
