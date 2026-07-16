@@ -18,3 +18,13 @@ The web app is a PWA that supports "Add to Home Screen". When working on the web
 - The viewport meta tag must include `viewport-fit=cover` so the app renders correctly on devices with notches, Dynamic Island, and rounded corners (e.g. iPhones).
 - The CSS must use `env(safe-area-inset-top/right/bottom/left)` to ensure content is not obscured by device hardware or the system status bar.
 - Do not remove the `<meta name="apple-mobile-web-app-capable">` or `<link rel="manifest">` tags; they are required for standalone (no browser chrome) behaviour when installed to the home screen.
+
+## Documentation
+
+The mdBook site is configured by `book.toml`, with navigation in `docs/SUMMARY.md`. Keep its curated documentation in parity with the implementation:
+
+- Update the relevant `docs/architecture/` chapter in the same commit when changing workflows, user contracts, capabilities, policy, security boundaries, persistence, privacy, network behavior, integrations, or external side effects.
+- Update the matching `docs/user/` chapter for user-visible commands, configuration, defaults, setup, data locations, and cleanup behavior.
+- Keep detailed plans and benchmark records as design history; do not use them as a substitute for current architecture documentation or describe planned work as shipped protection.
+- Add new chapters to `docs/SUMMARY.md`, use document-relative links, and run `deno task test:docs` before committing.
+- Never commit the generated `site/` directory.

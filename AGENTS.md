@@ -5,6 +5,7 @@
 - `deno task build:web` - Build web UI assets (required before `cargo build`)
 - `cargo test --all-targets` - Run Rust tests
 - `deno task test:web` - Run web UI tests
+- `deno task test:docs` - Build the mdBook site and validate rendered links, assets, fragments, and PWA metadata
 - `cargo build --release --target aarch64-apple-darwin` - Build release binary for macOS arm64
 
 ## Architecture
@@ -13,6 +14,7 @@
 - **CLI commands** defined in `src/lib.rs`: `serve`, `queue`, `self`, `tray`, `projects`, `env`, `service`, `init`; the hidden `harness` surface is documented in `docs/harness.md`
 - **Web UI**: React app in `webui/` served by Rust backend; builds to `webui/dist/`
 - **Agent profiles**: `build|scout|review|explore|plan|ask|research` - see `src/agent_core.rs`
+- **Documentation**: mdBook configured by `book.toml`; navigation and inclusion are defined in `docs/SUMMARY.md`
 
 ## Platform-specific behavior
 
@@ -25,7 +27,19 @@
 2. **Update `src/init.rs`** when adding new per-project configuration fields
 3. **Web UI requirements**: Must include `viewport-fit=cover`, `env(safe-area-inset-*)` CSS, and PWA meta tags
 4. **Web UI tests**: Add or update `webui/src/**/*.test.ts` tests for web UI behavior changes, and run `deno task test:web` before committing
-5. **FlashMoe architecture**: When changing FlashMoe data flow, scheduling, expert I/O, Metal kernels, or model-family behavior, keep `docs/flashmoe-architecture-parity-plan.md` aligned with the target architecture and current migration status.
+5. **Documentation parity**: When changing user-visible behavior or architectural guarantees, update the relevant curated chapter under `docs/user/` or `docs/architecture/` in the same commit and run `deno task test:docs`
+6. **FlashMoe architecture**: When changing FlashMoe data flow, scheduling, expert I/O, Metal kernels, or model-family behavior, keep `docs/flashmoe-architecture-parity-plan.md` aligned with the target architecture and current migration status.
+
+## Documentation guidance
+
+- Treat `docs/architecture/` as the current, curated description of shipped pb behavior. Detailed top-level plans and benchmark records preserve design history and evidence; they do not replace an update to the curated architecture.
+- Update `docs/architecture/workflows.md` and `docs/architecture/user-contracts.md` when changing intent handling, workflow stages, tool authority, checks, review, commit ownership, terminal outcomes, or external publication boundaries.
+- Update `docs/architecture/security.md` when changing capabilities, delegation, policy, workspace isolation, execution environments, credentials, service access, or trust boundaries.
+- Update `docs/architecture/local-privacy.md` when changing inference placement, persistence, data ownership, network access, integrations, or any path by which data can leave the machine.
+- Update the matching chapter under `docs/user/` when a command, configuration field, default, setup flow, integration, data location, or cleanup behavior changes.
+- Preserve the site's status language: distinguish **Shipped**, **Configurable**, and **Design record** behavior. Never present a planned hardening item as an enforced guarantee.
+- Add new chapters to `docs/SUMMARY.md`; keep links document-relative so the `/pb/` GitHub Pages base path continues to work.
+- Do not commit the generated `site/` directory.
 
 ## FlashMoe guidance
 
