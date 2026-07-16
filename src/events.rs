@@ -320,6 +320,13 @@ impl SessionMetricsSnapshot {
 /// small-model reliability milestones fill the compaction/cache/closure counters from their
 /// deterministic control paths. Keeping this nested and optional on `LlmInvocation` preserves
 /// compatibility with stored v1 events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRetryReason {
+    ThinkingOffAfterTruncation,
+    LargerTokenCapAfterTruncation,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentContextUsage {
     pub context_capacity: usize,
@@ -337,6 +344,8 @@ pub struct AgentContextUsage {
     pub tool_schema_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_reason: Option<AgentRetryReason>,
     #[serde(default)]
     pub compacted_messages: usize,
     #[serde(default)]
@@ -1619,6 +1628,7 @@ mod tests {
             tool_schema_chars: 900,
             tool_schema_tokens: Some(225),
             thinking_enabled: Some(true),
+            retry_reason: Some(AgentRetryReason::ThinkingOffAfterTruncation),
             compacted_messages: 2,
             omitted_tool_result_chars: 5000,
             read_cache_hits: 1,

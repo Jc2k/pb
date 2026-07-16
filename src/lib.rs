@@ -22,6 +22,7 @@ mod agent_context;
 pub mod agent_core;
 mod agent_progress;
 mod agent_repository;
+mod agent_tool_errors;
 pub mod browser_tools;
 pub mod checks;
 pub mod cli_ui;

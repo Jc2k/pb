@@ -1,6 +1,6 @@
 # Small-model agent reliability plan
 
-Status: active; S0-S3 complete
+Status: active; S0-S4 complete
 
 This document is the tracking source for improving the quality and completion rate of small local
 models in pb's agent and enforced-delivery workflows. Update the milestone table, evidence log, and
@@ -458,7 +458,7 @@ only when its production path, deterministic proof, documentation, and semantic 
 | S1 | P0 | S0 | complete | exact preflight, receipts, bounded reads, CB1-CB4 | `feat: budget agent prompt context`; [S1 checkpoint](benchmarks/small-model-agent-s1.md) |
 | S2 | P0 | S0, S1 | complete | brief, focused review, RV1-RV3, RB1, ≥40% reduction | `feat: focus workflow repository evidence`; [S2 checkpoint](benchmarks/small-model-agent-s2.md) |
 | S3 | P1 | S0, S1 | complete | progress guard/cache, PG1-PG5 | `fix: stop no-progress agent tool loops`; [S3 checkpoint](benchmarks/small-model-agent-s3.md) |
-| S4 | P1 | S0, S1 | not started | error envelopes/retry policy, AR1-AR4 | — |
+| S4 | P1 | S0, S1 | complete | error envelopes/retry policy, AR1-AR4 | `fix: guide truncated agent actions`; [S4 checkpoint](benchmarks/small-model-agent-s4.md) |
 | S5 | P1 | S0, S3, S4 | not started | closure/schema rules, CL1-CL3, SE1 | — |
 | S6 | P2 | S1-S5 | not started | before/after matrix, justified defaults, rollout docs | — |
 
@@ -513,6 +513,7 @@ them rather than pasting them here.
 | 2026-07-16 | S1 | `feat: budget agent prompt context` | `cargo fmt --check`; `cargo test --all-targets` (922 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; CB1-CB4; FlashMoe and fixed llama.cpp preflight parity | scripted corpus 41/41 and subset 4/4; Qwen2.5-Coder-7B exact protocol remains 0/4; maximum context 6.80%; zero overflow | S2 must remove duplicate planning/review material without changing gates |
 | 2026-07-16 | S2 | `feat: focus workflow repository evidence` | `cargo fmt --check`; `cargo test --all-targets` (927 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; RV1-RV3 and RB1 | scripted corpus 41/41 and subset 4/4; constructed large-review prompt reduction ≥40%; 16,000-character brief/manifest and byte-exact focused inspection bounds | S3 must detect outcome-equivalent no-progress cycles and cache only deterministic reads |
 | 2026-07-16 | S3 | `fix: stop no-progress agent tool loops` | `cargo fmt --check`; `cargo test --all-targets` (939 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; PG1-PG5 | scripted corpus 41/41 and subset 4/4; A-B-A and varied stale edits pre-blocked with no fourth model retry; one scoped read-cache hit in the repeated-read fixture | S4 must make ordinary tool/schema and truncation failures cheaper for a small model to correct |
+| 2026-07-16 | S4 | `fix: guide truncated agent actions` | `cargo fmt --check`; `cargo test --all-targets` (945 passed, 8 ignored); `deno task test:web` (47 passed); full and small-model scripted evals; AR1-AR4 | scripted corpus 41/41 and subset 4/4; typo and argument failures are non-executing structured envelopes; same-cap thinking-off recovery succeeds and global retry budgets stop deterministically | S5 must add closure help without exposing terminal actions before every current precondition is satisfied |
 
 After each checkpoint, report:
 

@@ -266,10 +266,14 @@ Use `--suite small-model` to run the stable subset used by
 reduction is recorded in the [focused-evidence checkpoint](benchmarks/small-model-agent-s2.md).
 S3's no-progress and read-cache boundaries are recorded in the
 [progress-recovery checkpoint](benchmarks/small-model-agent-s3.md).
+S4's structured tool failures and bounded truncation retry are recorded in the
+[action-recovery checkpoint](benchmarks/small-model-agent-s4.md).
 Each model-invocation record
 includes an optional backward-compatible context snapshot covering capacity, generation reserve,
 prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,
-thinking mode, and the compaction/cache/closure counters introduced by later milestones. Runtime
+thinking mode, retry reason, and the compaction/cache/closure counters introduced by later
+milestones. Evaluation summaries count `thinking_off_truncation_retries` and
+`larger_cap_truncation_retries` separately. Runtime
 setup failures are reported separately from artifact quality so a backend experiment error is not
 scored as model reasoning.
 
@@ -283,3 +287,18 @@ hunk line, a few old-side patch lines, and numbered current content around that 
 lines and the full diagnostic are capped; binary targets are identified without dumping bytes. The
 check path never mutates the file, and the correction recommends `edit_file` for exact current text
 or `replace_file` when the target has drifted substantially.
+
+Built-in tool failures are returned to the model as JSON `tool_failure` envelopes capped at 2,400
+characters. Each envelope has a stable `reason_code`, the requested tool, a bounded message,
+`retryable`, the exact `valid_signature` when that tool was exposed, and a
+`suggested_next_action`. A close miss may include `suggested_tool`, selected only from the tools
+exposed for that invocation; pb never rewrites or executes the misspelled call. Missing, unknown,
+or wrongly typed top-level arguments are rejected against the exposed JSON schema before policy or
+runtime execution, and pb does not guess, coerce, or add values.
+
+When a generation reaches its token cap without a valid action, pb first retries once at the same
+cap with thinking disabled and an action-only correction. A visibly truncated workflow terminal
+call keeps the existing terminal-only schema on that retry. If the result is still truncated, pb
+may grow the cap once within the request limit; existing parse-loop thresholds remain authoritative.
+Every attempt reserves an invocation and records generated tokens before another retry is allowed,
+so the global invocation and token budgets cannot be bypassed by recovery.

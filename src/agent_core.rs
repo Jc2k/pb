@@ -38,6 +38,7 @@ use crate::agent_progress::{
     tool_family,
 };
 use crate::agent_repository::{self, ChangeManifest, RepositoryBrief};
+use crate::agent_tool_errors::{self, ToolFailureReason};
 use crate::browser_tools;
 use crate::checks::{
     CheckEvidenceLedger, EvidenceSource, WorkspaceCheckRuntime, check_evidence_is_current,
@@ -47,8 +48,8 @@ use crate::container;
 use crate::energy::{self, EnergyEstimate};
 use crate::environment::{EnvironmentBackend, EnvironmentConfig};
 use crate::events::{
-    AgentContextUsage, AgentEvent, ContextSectionUsage, ContractStatus, FinalGraceStatus,
-    TerminationReason,
+    AgentContextUsage, AgentEvent, AgentRetryReason, ContextSectionUsage, ContractStatus,
+    FinalGraceStatus, TerminationReason,
 };
 use crate::handoff::{HandoffAttempt, ManagedCommitOutcome, managed_commit, run_handoff};
 use crate::lsp::{self, LspToolRegistry};
@@ -3510,6 +3511,7 @@ struct ToolExecutionEnv<'a> {
     run_budget: &'a RefCell<RunBudget>,
     gate_state: &'a RefCell<GateState>,
     read_cache: &'a RefCell<DeterministicReadCache>,
+    exposed_tools: Vec<BuiltInToolSchema>,
     workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
     nesting_depth: usize,
 }
@@ -4562,6 +4564,7 @@ fn run_agent_steps(
                         run_budget,
                         gate_state: &gate_state,
                         read_cache: &read_cache,
+                        exposed_tools: generation_tools.to_vec(),
                         workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
                     },
@@ -4711,6 +4714,7 @@ fn run_agent_steps(
                         run_budget,
                         gate_state: &gate_state,
                         read_cache: &read_cache,
+                        exposed_tools: generation_tools.to_vec(),
                         workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
                     },
@@ -5284,6 +5288,7 @@ fn record_completion_metrics(
             enable_thinking,
             completion.prompt_tokens,
             read_cache_hits,
+            None,
         )),
         energy_joules: completion.energy.map(|estimate| estimate.joules),
         energy_kwh: completion.energy.map(|estimate| estimate.kwh),
@@ -5299,6 +5304,7 @@ fn completion_context_usage(
     enable_thinking: bool,
     prompt_tokens: usize,
     read_cache_hits: usize,
+    retry_reason: Option<AgentRetryReason>,
 ) -> AgentContextUsage {
     let context_capacity = prepared.context_capacity;
     let reserved_generation_tokens = prepared.reserved_generation_tokens;
@@ -5334,6 +5340,7 @@ fn completion_context_usage(
         tool_schema_chars: model_tools_value(tools).to_string().chars().count(),
         tool_schema_tokens: Some(prepared.measurement.tool_schema_tokens),
         thinking_enabled: Some(enable_thinking),
+        retry_reason,
         compacted_messages: prepared.compacted_messages,
         omitted_tool_result_chars: prepared.omitted_tool_result_chars,
         read_cache_hits,
@@ -5580,6 +5587,51 @@ fn semantic_tool_result_payload(result: &str) -> &str {
     }
 }
 
+fn render_call_failure(
+    env: &ToolExecutionEnv<'_>,
+    tool: &str,
+    reason: ToolFailureReason,
+    message: &str,
+    retryable: bool,
+    suggested_next_action: &str,
+    suggest_nearest: bool,
+) -> String {
+    let exposed_schema = env.exposed_tools.iter().find(|schema| schema.name == tool);
+    let valid_signature = exposed_schema
+        .map(|schema| agent_tool_errors::schema_signature(&schema.name, &schema.input_schema));
+    let exposed_names = env
+        .exposed_tools
+        .iter()
+        .map(|schema| schema.name.as_str())
+        .collect::<Vec<_>>();
+    let suggested_tool = suggest_nearest
+        .then(|| agent_tool_errors::nearest_tool(tool, &exposed_names))
+        .flatten();
+    let suggested_next_action = suggested_tool.map_or_else(
+        || suggested_next_action.to_string(),
+        |suggested| {
+            format!(
+                "Call '{suggested}' only if it matches your intended action, using its exposed schema. pb did not execute or reinterpret '{tool}'."
+            )
+        },
+    );
+    agent_tool_errors::render_tool_failure(
+        reason,
+        tool,
+        message,
+        retryable,
+        valid_signature.as_deref(),
+        suggested_tool,
+        &suggested_next_action,
+    )
+}
+
+fn tool_known_to_runtime(tool: &str, env: &ToolExecutionEnv<'_>) -> bool {
+    is_builtin_tool_name(tool)
+        || env.mcp_registry.tool(tool).is_some()
+        || env.lsp_registry.tool(tool).is_some()
+}
+
 fn execute_tool_calls(
     calls: Vec<AgentToolCall>,
     thinking: Option<String>,
@@ -5633,11 +5685,84 @@ fn execute_tool_calls(
                 env.workspace_root,
             )?
         {
+            let result = render_call_failure(
+                &env,
+                &call.tool,
+                ToolFailureReason::PreconditionUnmet,
+                &feedback,
+                true,
+                "Satisfy the listed deterministic preconditions, then call the terminal tool with its exposed schema.",
+                false,
+            );
             results.push(ExecutedToolResult {
                 tool_call_id: call.id,
                 tool: call.tool,
                 arguments: call.arguments,
-                result: feedback,
+                result,
+                success: false,
+                duration_ms: 0,
+                energy: None,
+            });
+            continue;
+        }
+
+        let Some(exposed_schema) = env
+            .exposed_tools
+            .iter()
+            .find(|schema| schema.name == call.tool)
+        else {
+            let known = tool_known_to_runtime(&call.tool, &env);
+            let reason = if known {
+                ToolFailureReason::ToolNotExposed
+            } else {
+                ToolFailureReason::UnknownTool
+            };
+            let message = if known {
+                format!(
+                    "tool '{}' is not exposed for this model turn and was not executed",
+                    call.tool
+                )
+            } else {
+                format!("unknown tool '{}' was not executed", call.tool)
+            };
+            let result = render_call_failure(
+                &env,
+                &call.tool,
+                reason,
+                &message,
+                true,
+                "Choose one of the tools exposed for this turn; pb did not execute the requested name.",
+                true,
+            );
+            results.push(ExecutedToolResult {
+                tool_call_id: call.id,
+                tool: call.tool,
+                arguments: call.arguments,
+                result,
+                success: false,
+                duration_ms: 0,
+                energy: None,
+            });
+            continue;
+        };
+
+        if let Some(issue) =
+            agent_tool_errors::validate_arguments(&exposed_schema.input_schema, &call.arguments)
+        {
+            let result = render_call_failure(
+                &env,
+                &call.tool,
+                issue.reason,
+                &issue.message,
+                true,
+                &issue.suggested_next_action,
+                false,
+            );
+            results.push(ExecutedToolResult {
+                tool_call_id: call.id,
+                tool: call.tool,
+                arguments: call.arguments,
+                result,
                 success: false,
                 duration_ms: 0,
                 energy: None,
@@ -5649,14 +5774,24 @@ fn execute_tool_calls(
             && !workflow_tool_allowed(&call.tool, capabilities, env.mcp_registry, env.lsp_registry)
         {
             let tool = call.tool.clone();
+            let message = format!(
+                "tool '{tool}' is not available in {}",
+                capability_scope(env.args)
+            );
+            let result = render_call_failure(
+                &env,
+                &tool,
+                ToolFailureReason::ToolNotExposed,
+                &message,
+                true,
+                "Choose an exposed tool allowed by the current workflow stage.",
+                true,
+            );
             results.push(ExecutedToolResult {
                 tool_call_id: call.id,
                 tool: call.tool,
                 arguments: call.arguments,
-                result: format!(
-                    "tool '{tool}' is not available in {}",
-                    capability_scope(env.args)
-                ),
+                result,
                 success: false,
                 duration_ms: 0,
                 energy: None,
@@ -5671,11 +5806,21 @@ fn execute_tool_calls(
             PolicyOutcome::Allow => runnable.push(call),
             PolicyOutcome::Deny => {
                 let rule = decision.rule_name.as_deref().unwrap_or("unnamed rule");
+                let message = format!("tool denied by policy rule '{rule}'");
+                let result = render_call_failure(
+                    &env,
+                    &call.tool,
+                    ToolFailureReason::PolicyDenied,
+                    &message,
+                    false,
+                    "Choose a different exposed action that complies with policy or report the blocker.",
+                    false,
+                );
                 results.push(ExecutedToolResult {
                     tool_call_id: call.id,
                     tool: call.tool,
                     arguments: call.arguments,
-                    result: format!("tool denied by policy rule '{rule}'"),
+                    result,
                     success: false,
                     duration_ms: 0,
                     energy: None,
@@ -5697,13 +5842,22 @@ fn execute_tool_calls(
                 if answer == "allow" {
                     runnable.push(call);
                 } else {
+                    let message =
+                        format!("tool was not approved by the user for policy rule '{rule}'");
+                    let result = render_call_failure(
+                        &env,
+                        &call.tool,
+                        ToolFailureReason::ApprovalDenied,
+                        &message,
+                        false,
+                        "Do not retry the denied call unchanged; choose another exposed action or report the blocker.",
+                        false,
+                    );
                     results.push(ExecutedToolResult {
                         tool_call_id: call.id,
                         tool: call.tool,
                         arguments: call.arguments,
-                        result: format!(
-                            "tool was not approved by the user for policy rule '{rule}'"
-                        ),
+                        result,
                         success: false,
                         duration_ms: 0,
                         energy: None,
@@ -5750,7 +5904,7 @@ fn execute_tool_calls(
                     let (result, success) =
                         match mcp::call_tool(&registry, &call.tool, &call.arguments) {
                             Ok(result) => (result, true),
-                            Err(error) => (format_tool_error(&call.tool, &error), false),
+                            Err(error) => (format!("{error:#}"), false),
                         };
                     let duration_ms = duration_millis(started);
                     ExecutedToolResult {
@@ -5815,16 +5969,7 @@ fn execute_tool_calls(
             let (result, success) =
                 match run_tool(&call.tool, &call.arguments, &tool_context, sink, metrics) {
                     Ok(result) => (result, true),
-                    Err(error) => {
-                        let result = format_tool_error(&call.tool, &error);
-                        sink.emit(AgentEvent::Correction {
-                            message: result.clone(),
-                            summary: format!("{} tool call needs corrected arguments", call.tool),
-                            nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
-                            timestamp_ms: Some(now_millis()),
-                        });
-                        (result, false)
-                    }
+                    Err(error) => (format!("{error:#}"), false),
                 };
             let result = append_workflow_content_fingerprint(
                 env.args,
@@ -5867,12 +6012,35 @@ fn execute_tool_calls(
         tool_call_id,
         tool,
         arguments,
-        result,
+        mut result,
         success,
         duration_ms,
         energy,
     } in results
     {
+        if !success && !agent_tool_errors::is_tool_failure_envelope(&result) {
+            let reason = agent_tool_errors::classify_error(&result);
+            result = render_call_failure(
+                &env,
+                &tool,
+                reason,
+                &result,
+                !matches!(
+                    reason,
+                    ToolFailureReason::PolicyDenied | ToolFailureReason::ApprovalDenied
+                ),
+                "Use the valid signature to correct the call, choose a different exposed action, or report the blocker truthfully.",
+                false,
+            );
+        }
+        if !success {
+            sink.emit(AgentEvent::Correction {
+                message: result.clone(),
+                summary: format!("{} tool call was not executed successfully", tool),
+                nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
+                timestamp_ms: Some(now_millis()),
+            });
+        }
         progress_outcomes.push(ToolOutcomeSummary {
             tool: tool.clone(),
             call_fingerprint: format!(
@@ -8120,6 +8288,7 @@ pub(crate) struct ScriptedAgentOutcome {
     pub termination_reason: TerminationReason,
     pub final_content: Option<String>,
     pub llm_invocations: usize,
+    pub generated_tokens: usize,
     pub tool_calls: usize,
     pub remaining_completions: usize,
     pub generation_tool_counts: Vec<usize>,
@@ -8218,6 +8387,17 @@ pub(crate) fn run_scripted_agent_steps(
     workspace_root: &Path,
     sink: &mut dyn EventSink,
 ) -> Result<ScriptedAgentOutcome> {
+    let run_budget = RefCell::new(RunBudget::default());
+    run_scripted_agent_steps_with_budget(args, completions, workspace_root, &run_budget, sink)
+}
+
+fn run_scripted_agent_steps_with_budget(
+    args: &AgentRequest,
+    completions: Vec<ScriptedCompletion>,
+    workspace_root: &Path,
+    run_budget: &RefCell<RunBudget>,
+    sink: &mut dyn EventSink,
+) -> Result<ScriptedAgentOutcome> {
     let mut generator = ScriptedCompletionEngine {
         completions: completions.into(),
         generation_tool_counts: Vec::new(),
@@ -8238,7 +8418,6 @@ pub(crate) fn run_scripted_agent_steps(
     let mcp_registry = McpToolRegistry::default();
     let lsp_registry = LspToolRegistry::default();
     let policy_config = PolicyConfig::default();
-    let run_budget = RefCell::new(RunBudget::default());
     let outcome = run_agent_steps(
         &mut generator,
         TextBackendKind::LlamaCpp,
@@ -8254,7 +8433,7 @@ pub(crate) fn run_scripted_agent_steps(
         &lsp_registry,
         &policy_config,
         None,
-        &run_budget,
+        run_budget,
         0,
         sink,
     )?;
@@ -8265,6 +8444,7 @@ pub(crate) fn run_scripted_agent_steps(
         termination_reason: outcome.termination_reason,
         final_content: outcome.final_content,
         llm_invocations: outcome.metrics.llm_invocations,
+        generated_tokens: outcome.metrics.generated_tokens,
         tool_calls: outcome.metrics.tool_calls,
         remaining_completions: generator.completions.len(),
         generation_tool_counts: generator.generation_tool_counts,
@@ -8815,12 +8995,24 @@ fn generate_and_parse_action_with_retries(
     run_budget: &RefCell<RunBudget>,
 ) -> Result<std::result::Result<(String, AgentAction), ParseFailure>> {
     let mut max_tokens = boosted_max_tokens(args);
+    let mut attempt_enable_thinking = enable_thinking;
+    let mut retry_reason = None;
+    let mut retry_messages = None;
+    let mut retry_tools: Option<Vec<BuiltInToolSchema>> = None;
+    let mut cap_growth_used = false;
 
     loop {
         let mut request = args.clone();
         request.max_tokens = run_budget.borrow().next_model_max_tokens(max_tokens)?;
-        let prepared =
-            prepare_generation_prompt(generator, &request, messages, tools, enable_thinking)?;
+        let prompt_messages = retry_messages.as_deref().unwrap_or(messages);
+        let attempt_tools = retry_tools.as_deref().unwrap_or(tools);
+        let prepared = prepare_generation_prompt(
+            generator,
+            &request,
+            prompt_messages,
+            attempt_tools,
+            attempt_enable_thinking,
+        )?;
         let reserved_max_tokens = run_budget
             .borrow_mut()
             .reserve_model_invocation(max_tokens)?;
@@ -8831,8 +9023,12 @@ fn generate_and_parse_action_with_retries(
         // returns an error, otherwise the stage runner replaces the actionable
         // engine/resource failure with a usage-divergence error.
         metrics.llm_invocations = metrics.llm_invocations.saturating_add(1);
-        let completion =
-            generator.generate(&request, &prepared.messages, tools, enable_thinking)?;
+        let completion = generator.generate(
+            &request,
+            &prepared.messages,
+            attempt_tools,
+            attempt_enable_thinking,
+        )?;
         run_budget
             .borrow_mut()
             .record_generated_tokens(completion.generated_tokens);
@@ -8859,10 +9055,11 @@ fn generate_and_parse_action_with_retries(
             generated_tokens: completion.generated_tokens,
             context: Some(completion_context_usage(
                 &prepared,
-                tools,
-                enable_thinking,
+                attempt_tools,
+                attempt_enable_thinking,
                 completion.prompt_tokens,
                 read_cache_hits,
+                retry_reason,
             )),
             energy_joules: completion.energy.map(|estimate| estimate.joules),
             energy_kwh: completion.energy.map(|estimate| estimate.kwh),
@@ -8898,19 +9095,52 @@ fn generate_and_parse_action_with_retries(
                         },
                     )));
                 }
-                let ran_out_of_tokens =
-                    completion.finish_reason == CompletionFinishReason::MaxTokens;
                 let failure = ParseFailure {
                     output: completion.content,
                     error,
                     finish_reason: completion.finish_reason,
                 };
-                if !ran_out_of_tokens {
-                    return Ok(Err(failure));
+
+                if attempt_enable_thinking {
+                    tracing::warn!(
+                        step,
+                        max_tokens,
+                        "retrying truncated model turn at the same token cap with thinking disabled"
+                    );
+                    attempt_enable_thinking = false;
+                    retry_reason = Some(AgentRetryReason::ThinkingOffAfterTruncation);
+                    if attempted_workflow_terminal_submission(
+                        args,
+                        &failure.output,
+                        failure.finish_reason,
+                    ) && let Some(required) =
+                        args.workflow_stage.and_then(workflow_terminal_tool_name)
+                    {
+                        retry_tools = Some(
+                            tools
+                                .iter()
+                                .filter(|tool| tool.name == required)
+                                .cloned()
+                                .collect(),
+                        );
+                    }
+                    let retry_scope = retry_tools.as_deref().unwrap_or(tools);
+                    sink.emit(AgentEvent::Correction {
+                        message: truncation_action_retry_instruction(args, retry_scope),
+                        summary: "Retrying truncated action with thinking disabled".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    retry_messages = Some(truncation_action_retry_messages(
+                        args,
+                        messages,
+                        retry_scope,
+                    ));
+                    continue;
                 }
 
                 let next_max_tokens = next_retry_max_tokens(max_tokens, args.turn_max_tokens_cap);
-                if next_max_tokens <= max_tokens {
+                if cap_growth_used || next_max_tokens <= max_tokens {
                     return Ok(Err(failure));
                 }
                 tracing::warn!(
@@ -8919,9 +9149,49 @@ fn generate_and_parse_action_with_retries(
                     next_max_tokens,
                     "retrying model turn with a larger max token cap after truncated unparsable output"
                 );
+                cap_growth_used = true;
                 max_tokens = next_max_tokens;
+                retry_reason = Some(AgentRetryReason::LargerTokenCapAfterTruncation);
+                retry_messages.get_or_insert_with(|| {
+                    truncation_action_retry_messages(
+                        args,
+                        messages,
+                        retry_tools.as_deref().unwrap_or(tools),
+                    )
+                });
             }
         }
+    }
+}
+
+fn truncation_action_retry_messages(
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+) -> Vec<ChatMessage> {
+    let mut retry_messages = messages.to_vec();
+    let instruction = truncation_action_retry_instruction(args, tools);
+    retry_messages.push(correction_chat_message(
+        "Action-only truncation recovery",
+        &truncate_chars(&instruction, 1_200),
+    ));
+    retry_messages
+}
+
+fn truncation_action_retry_instruction(args: &AgentRequest, tools: &[BuiltInToolSchema]) -> String {
+    let exposed = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if args.workflow_stage.is_some() {
+        format!(
+            "The previous generation reached its token cap without a valid action. Thinking is disabled for this bounded recovery. Call exactly one exposed native function now, with the smallest structurally valid, minified argument object and no reasoning or prose. Exposed functions: {exposed}."
+        )
+    } else {
+        format!(
+            "The previous generation reached its token cap without a valid action. Thinking is disabled for this bounded recovery. Return exactly one exposed tool call now (or one final action if the task is truly complete), with no reasoning, markdown, or surrounding prose. Exposed tools: {exposed}."
+        )
     }
 }
 
@@ -11127,10 +11397,6 @@ fn question_choices(arguments: &Value) -> Result<Vec<String>> {
             Ok(choice)
         })
         .collect()
-}
-
-fn format_tool_error(tool: &str, error: &anyhow::Error) -> String {
-    format!("tool '{tool}' failed: {error:#}")
 }
 
 fn gate_path_key(workspace_root: &Path, resolved: &Path) -> String {
@@ -13993,11 +14259,19 @@ mod tests {
         }
         assert!(outcome.reached_final);
         assert!(!workspace.path().join("forbidden.txt").exists());
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::ToolResult { tool, result, .. }
-                if tool == "write_file" && result.contains("not available")
-        )));
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { tool, result, .. } if tool == "write_file" => Some(result),
+                _ => None,
+            })
+            .expect("discussion write rejection");
+        let envelope: agent_tool_errors::ToolFailureEnvelope =
+            serde_json::from_str(result).unwrap();
+        assert_eq!(
+            envelope.reason_code,
+            agent_tool_errors::ToolFailureReason::ToolNotExposed
+        );
     }
 
     #[test]
@@ -17100,23 +17374,20 @@ mod tests {
             content: "{not-json".to_string(),
             truncated: true,
         };
+        // The first structured failure uses the same-cap thinking-off retry. That failure then
+        // suppresses thinking, so each remaining threshold attempt costs one turn.
+        let expected_invocations = MAX_CONSECUTIVE_PARSE_FAILURES + 1;
+        let mut completions = vec![invalid; expected_invocations];
+        completions.push(scripted_final("must not run"));
         let mut events = Vec::new();
-        let outcome = run_scripted_agent_steps(
-            &request,
-            vec![
-                invalid.clone(),
-                invalid.clone(),
-                invalid,
-                scripted_final("must not run"),
-            ],
-            tmp.path(),
-            &mut |event| events.push(event),
-        )
+        let outcome = run_scripted_agent_steps(&request, completions, tmp.path(), &mut |event| {
+            events.push(event)
+        })
         .unwrap();
 
         assert!(!outcome.reached_final);
         assert_eq!(outcome.termination_reason, TerminationReason::ParseLoop);
-        assert_eq!(outcome.llm_invocations, MAX_CONSECUTIVE_PARSE_FAILURES);
+        assert_eq!(outcome.llm_invocations, expected_invocations);
         assert_eq!(outcome.remaining_completions, 1);
         assert!(events.iter().any(|event| matches!(
             event,
@@ -17124,6 +17395,218 @@ mod tests {
                 if message.contains("finish_reason=max_tokens")
                     && message.contains("{not-json")
         )));
+    }
+
+    #[test]
+    fn ar1_unknown_tool_suggests_one_exposed_correction_without_executing_it() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("probe.txt"), "probe evidence\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 3;
+        let completions = vec![
+            tool_completion("read_fil", json!({"path": "probe.txt"})),
+            tool_completion("read_file", json!({"path": "probe.txt"})),
+            scripted_final("used the corrected read result"),
+        ];
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(&request, completions, tmp.path(), &mut |event| {
+            events.push(event)
+        })
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(outcome.tool_calls, 2);
+        let (result, duration_ms) = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult {
+                    tool,
+                    result,
+                    duration_ms,
+                    ..
+                } if tool == "read_fil" => Some((result, duration_ms)),
+                _ => None,
+            })
+            .expect("unknown tool result");
+        let envelope: agent_tool_errors::ToolFailureEnvelope =
+            serde_json::from_str(result).unwrap();
+        assert_eq!(
+            envelope.reason_code,
+            agent_tool_errors::ToolFailureReason::UnknownTool
+        );
+        assert_eq!(envelope.suggested_tool.as_deref(), Some("read_file"));
+        assert_eq!(*duration_ms, Some(0));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::Correction { summary, .. }
+                        if summary == "read_fil tool call was not executed successfully"
+                ))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, result, .. }
+                if tool == "read_file" && result.contains("probe evidence")
+        )));
+    }
+
+    #[test]
+    fn ar2_missing_argument_returns_schema_signature_without_guessing_a_write() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 2;
+        let target = tmp.path().join("must-not-exist.txt");
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("write_file", json!({"path": "must-not-exist.txt"})),
+                scripted_final("reported the invalid call without inventing content"),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert!(!target.exists());
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { tool, result, .. } if tool == "write_file" => Some(result),
+                _ => None,
+            })
+            .expect("invalid write result");
+        let envelope: agent_tool_errors::ToolFailureEnvelope =
+            serde_json::from_str(result).unwrap();
+        assert_eq!(
+            envelope.reason_code,
+            agent_tool_errors::ToolFailureReason::MissingArgument
+        );
+        assert_eq!(
+            envelope.valid_signature.as_deref(),
+            Some("write_file(path: string, content: string)")
+        );
+        assert_eq!(envelope.suggested_tool, None);
+        assert!(envelope.suggested_next_action.contains("did not invent"));
+    }
+
+    #[test]
+    fn ar3_truncated_action_retries_once_at_the_same_cap_with_thinking_off() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("probe.txt"), "probe evidence\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 2;
+        request.turn_max_tokens_cap = Some(256);
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                ScriptedCompletion {
+                    content: "I should inspect the repository before choosing".to_string(),
+                    truncated: true,
+                },
+                tool_completion("read_file", json!({"path": "probe.txt"})),
+                scripted_final("completed after the bounded retry"),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(outcome.llm_invocations, 3);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(
+            &outcome.generation_max_tokens[..2],
+            &[request.max_tokens, request.max_tokens]
+        );
+        let contexts = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::LlmInvocation {
+                    context: Some(context),
+                    ..
+                } => Some(context),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contexts[0].thinking_enabled, Some(true));
+        assert_eq!(contexts[0].retry_reason, None);
+        assert_eq!(contexts[1].thinking_enabled, Some(false));
+        assert_eq!(
+            contexts[1].retry_reason,
+            Some(AgentRetryReason::ThinkingOffAfterTruncation)
+        );
+    }
+
+    #[test]
+    fn ar4_truncation_retries_charge_invocation_and_generated_token_budgets() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Ask, 256);
+        request.max_steps = 1;
+        let truncated = ScriptedCompletion {
+            content: "unfinished action".to_string(),
+            truncated: true,
+        };
+
+        let invocation_budget = RefCell::new(RunBudget::new(RunBudgetLimits {
+            advisory_calls: 1,
+            model_invocations: 2,
+            generated_tokens: 10,
+        }));
+        let mut invocation_events = Vec::new();
+        let invocation_outcome = run_scripted_agent_steps_with_budget(
+            &request,
+            vec![
+                truncated.clone(),
+                truncated.clone(),
+                scripted_final("must remain unused"),
+            ],
+            tmp.path(),
+            &invocation_budget,
+            &mut |event| invocation_events.push(event),
+        )
+        .unwrap();
+        assert_eq!(
+            invocation_outcome.termination_reason,
+            TerminationReason::InvocationLimit
+        );
+        assert_eq!(invocation_outcome.llm_invocations, 2);
+        assert_eq!(invocation_outcome.generated_tokens, 2);
+        assert_eq!(invocation_outcome.remaining_completions, 1);
+        assert_eq!(
+            invocation_events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::LlmInvocation { .. }))
+                .count(),
+            2
+        );
+
+        let token_budget = RefCell::new(RunBudget::new(RunBudgetLimits {
+            advisory_calls: 1,
+            model_invocations: 10,
+            generated_tokens: 1,
+        }));
+        let token_outcome = run_scripted_agent_steps_with_budget(
+            &request,
+            vec![truncated, scripted_final("must remain unused")],
+            tmp.path(),
+            &token_budget,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            token_outcome.termination_reason,
+            TerminationReason::TokenLimit
+        );
+        assert_eq!(token_outcome.llm_invocations, 1);
+        assert_eq!(token_outcome.generated_tokens, 1);
+        assert_eq!(token_outcome.remaining_completions, 1);
     }
 
     #[test]
@@ -18881,16 +19364,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("parent todo id 99 was not found"));
-    }
-
-    #[test]
-    fn format_tool_error_includes_tool_name_and_error_chain() {
-        let err = anyhow!("missing thing").context("failed to run");
-        let formatted = format_tool_error("read_file", &err);
-
-        assert!(formatted.contains("tool 'read_file' failed"));
-        assert!(formatted.contains("failed to run"));
-        assert!(formatted.contains("missing thing"));
     }
 
     #[test]
