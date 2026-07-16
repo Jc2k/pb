@@ -15,39 +15,13 @@ use std::path::{Path, PathBuf};
 use crate::environment::{
     EnvironmentBackend, EnvironmentCache, EnvironmentConfig, EnvironmentMode,
 };
+use crate::environment_lock::{
+    EnvironmentEvidence, EnvironmentEvidenceDocument, EnvironmentRequirement, HostCapability,
+};
+
+pub use crate::environment_lock::HostCapability as HostRequirement;
 
 // ── detection results ────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostRequirement {
-    XcodeProject,
-    XcodeWorkspace,
-    AppleSwiftPackage,
-    AppleFrameworkSource,
-    XcodeToolchain,
-    AppleSdkTarget,
-    Simulator,
-    CodeSigning,
-    Metal,
-    MacosCi,
-}
-
-impl HostRequirement {
-    fn label(self) -> &'static str {
-        match self {
-            Self::XcodeProject => "Xcode project",
-            Self::XcodeWorkspace => "Xcode workspace",
-            Self::AppleSwiftPackage => "Apple-platform Swift package",
-            Self::AppleFrameworkSource => "Apple framework source import",
-            Self::XcodeToolchain => "Xcode toolchain command",
-            Self::AppleSdkTarget => "Apple SDK target",
-            Self::Simulator => "Apple simulator",
-            Self::CodeSigning => "Apple code signing/notarization",
-            Self::Metal => "Metal",
-            Self::MacosCi => "macOS CI runner",
-        }
-    }
-}
 
 /// Everything we learn from inspecting the project root.
 #[derive(Debug, Default)]
@@ -89,6 +63,7 @@ pub struct ProjectInspection {
     pub prefers_local_backend: bool,
     pub prefers_container_backend: bool,
     pub host_requirements: Vec<HostRequirement>,
+    pub environment_evidence: Vec<EnvironmentEvidence>,
     pub dependency_key_files: Vec<PathBuf>,
     pub scout_sources: Vec<PathBuf>,
 }
@@ -101,7 +76,8 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     let dc_json = root.join(".devcontainer").join("devcontainer.json");
     let dc_json_top = root.join("devcontainer.json");
     for dc_path in [&dc_json, &dc_json_top] {
-        if dc_path.exists() {
+        if is_regular_project_file(dc_path) {
+            record_container_signal(root, dc_path, &mut info, "devcontainer configuration");
             if let Ok(text) = std::fs::read_to_string(dc_path)
                 && let Some((image, inits)) = parse_devcontainer_json(&text)
             {
@@ -113,13 +89,19 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     }
 
     // --- Dockerfile ---
-    if root.join("Dockerfile").exists() {
+    if is_regular_project_file(&root.join("Dockerfile")) {
         info.has_dockerfile = true;
+        record_container_signal(
+            root,
+            &root.join("Dockerfile"),
+            &mut info,
+            "Dockerfile build environment",
+        );
     }
 
     // --- GitLab CI ---
     let gitlab_ci = root.join(".gitlab-ci.yml");
-    if gitlab_ci.exists()
+    if is_regular_project_file(&gitlab_ci)
         && let Ok(text) = std::fs::read_to_string(&gitlab_ci)
     {
         info.gitlab_ci_image = parse_gitlab_ci_image(&text);
@@ -131,10 +113,12 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     if let Ok(entries) = std::fs::read_dir(&workflow_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("yml" | "yaml")
-            ) {
+            if entry.file_type().is_ok_and(|file_type| file_type.is_file())
+                && matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("yml" | "yaml")
+                )
+            {
                 info.has_github_workflows = true;
                 if let Ok(text) = std::fs::read_to_string(&path) {
                     inspect_scout_text(root, &path, &text, &mut info);
@@ -143,9 +127,15 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
         }
     }
     for rel in ["k8s", "kubernetes", "helm", "charts"] {
-        if root.join(rel).exists() {
+        if is_regular_project_directory(&root.join(rel)) {
             info.has_kubernetes_config = true;
             info.prefers_container_backend = true;
+            record_container_signal(
+                root,
+                &root.join(rel),
+                &mut info,
+                "container deployment configuration",
+            );
         }
     }
 
@@ -167,7 +157,7 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     ];
     for rel in &agent_doc_candidates {
         let p = root.join(rel);
-        if p.exists() {
+        if is_regular_project_file(&p) {
             info.existing_agent_docs.push(p.clone());
             if let Ok(text) = std::fs::read_to_string(&p) {
                 inspect_scout_text(root, &p, &text, &mut info);
@@ -176,7 +166,7 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     }
 
     let dockerfile = root.join("Dockerfile");
-    if dockerfile.exists()
+    if is_regular_project_file(&dockerfile)
         && let Ok(text) = std::fs::read_to_string(&dockerfile)
     {
         inspect_scout_text(root, &dockerfile, &text, &mut info);
@@ -187,7 +177,24 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     info.has_pb_workspace = root.join(".pb").join("workspace.toml").exists();
     info.has_pb_workflow = root.join(".pb").join("workflow.toml").exists();
 
+    info.environment_evidence.sort_by(|left, right| {
+        left.component
+            .cmp(&right.component)
+            .then(left.source_path.cmp(&right.source_path))
+            .then(left.detail.cmp(&right.detail))
+    });
+
     Ok(info)
+}
+
+fn is_regular_project_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && !metadata.file_type().is_symlink())
+}
+
+fn is_regular_project_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
 }
 
 fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut ProjectInspection) {
@@ -202,13 +209,19 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             if name.ends_with(".xcodeproj") {
-                record_host_requirement(info, HostRequirement::XcodeProject);
+                record_host_requirement(root, &path, info, HostRequirement::XcodeProject);
                 continue;
             }
             if name.ends_with(".xcworkspace") {
-                record_host_requirement(info, HostRequirement::XcodeWorkspace);
+                record_host_requirement(root, &path, info, HostRequirement::XcodeWorkspace);
                 continue;
             }
             if matches!(
@@ -220,61 +233,94 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
             inspect_language_manifests(root, &path, depth + 1, info);
             continue;
         }
-        let rel_parent = path.parent().unwrap_or(root);
-        let command = |cmd: &str| normalize_command(root, &rel_parent.join("README.md"), cmd);
+        let command = |cmd: &str| normalize_command(root, &path, cmd);
         match name.as_ref() {
             "Cargo.toml" => {
                 info.has_cargo_toml = true;
                 record_dependency_key_file(root, &path, info);
-                info.setup_commands.push(command(
-                    "if test -f Cargo.lock; then cargo fetch --locked; else cargo fetch; fi",
-                ));
-                info.guard_commands.push(command("cargo test"));
+                record_setup_command(
+                    root,
+                    &path,
+                    &command(
+                        "if test -f Cargo.lock; then cargo fetch --locked; else cargo fetch; fi",
+                    ),
+                    info,
+                );
+                record_guard_command(root, &path, &command("cargo test"), info);
             }
             "pyproject.toml" => {
                 info.has_pyproject_toml = true;
                 record_dependency_key_file(root, &path, info);
-                info.setup_commands.push(command("pip install -e ."));
+                record_setup_command(root, &path, &command("pip install -e ."), info);
             }
             "requirements.txt" => {
                 info.has_requirements_txt = true;
                 record_dependency_key_file(root, &path, info);
-                info.setup_commands
-                    .push(command("pip install -r requirements.txt"));
+                record_setup_command(
+                    root,
+                    &path,
+                    &command("pip install -r requirements.txt"),
+                    info,
+                );
             }
             "package.json" => {
                 info.has_package_json = true;
                 record_dependency_key_file(root, &path, info);
-                info.setup_commands.push(command("npm ci"));
+                record_setup_command(root, &path, &command("npm ci"), info);
             }
             "deno.lock" => {
                 info.has_deno_lock = true;
                 record_dependency_key_file(root, &path, info);
-                info.setup_commands.push(command("deno install"));
+                record_setup_command(root, &path, &command("deno install"), info);
             }
             "go.mod" => {
                 info.has_go_mod = true;
                 record_dependency_key_file(root, &path, info);
-                info.setup_commands.push(command("go mod download"));
+                record_setup_command(root, &path, &command("go mod download"), info);
             }
             "Package.swift" => {
                 info.has_package_swift = true;
                 record_dependency_key_file(root, &path, info);
-                info.setup_commands.push(command("swift package resolve"));
-                info.guard_commands.push(command("swift test"));
+                record_setup_command(root, &path, &command("swift package resolve"), info);
+                record_guard_command(root, &path, &command("swift test"), info);
                 if let Ok(text) = std::fs::read_to_string(&path)
                     && contains_apple_swift_package_signal(&text)
                 {
-                    record_host_requirement(info, HostRequirement::AppleSwiftPackage);
+                    record_host_requirement(root, &path, info, HostRequirement::AppleSwiftPackage);
                 }
             }
             "Dockerfile" => {
                 info.has_dockerfile = info.has_dockerfile || path == root.join("Dockerfile");
                 info.prefers_container_backend = true;
+                record_container_signal(root, &path, info, "Dockerfile build environment");
             }
             "Cargo.lock" | "uv.lock" | "poetry.lock" | "package-lock.json" | "pnpm-lock.yaml"
             | "yarn.lock" | "go.sum" | "Package.resolved" => {
                 record_dependency_key_file(root, &path, info);
+            }
+            "flake.nix" | "flake.lock" | "shell.nix" | "default.nix" => {
+                record_dependency_key_file(root, &path, info);
+                record_toolchain_evidence(root, &path, info, "nix");
+            }
+            "mise.toml" | ".mise.toml" => {
+                record_dependency_key_file(root, &path, info);
+                record_toolchain_evidence(root, &path, info, "mise");
+            }
+            ".tool-versions" => {
+                record_dependency_key_file(root, &path, info);
+                record_toolchain_evidence(root, &path, info, "asdf");
+            }
+            "rust-toolchain" | "rust-toolchain.toml" => {
+                record_dependency_key_file(root, &path, info);
+                record_toolchain_evidence(root, &path, info, "rust");
+            }
+            ".nvmrc" | ".node-version" => {
+                record_dependency_key_file(root, &path, info);
+                record_toolchain_evidence(root, &path, info, "node");
+            }
+            ".python-version" => {
+                record_dependency_key_file(root, &path, info);
+                record_toolchain_evidence(root, &path, info, "python");
             }
             n if matches!(
                 std::path::Path::new(n).extension().and_then(|e| e.to_str()),
@@ -286,16 +332,21 @@ fn inspect_language_manifests(root: &Path, dir: &Path, depth: usize, info: &mut 
             n if std::path::Path::new(n).extension().and_then(|e| e.to_str())
                 == Some("entitlements") =>
             {
-                record_host_requirement(info, HostRequirement::CodeSigning);
+                record_host_requirement(root, &path, info, HostRequirement::CodeSigning);
             }
             n if std::path::Path::new(n).extension().and_then(|e| e.to_str()) == Some("metal") => {
-                record_host_requirement(info, HostRequirement::Metal);
+                record_host_requirement(root, &path, info, HostRequirement::Metal);
             }
             n if std::path::Path::new(n).extension().and_then(|e| e.to_str()) == Some("swift") => {
                 if let Ok(text) = std::fs::read_to_string(&path)
                     && contains_apple_framework_import(&text)
                 {
-                    record_host_requirement(info, HostRequirement::AppleFrameworkSource);
+                    record_host_requirement(
+                        root,
+                        &path,
+                        info,
+                        HostRequirement::AppleFrameworkSource,
+                    );
                 }
             }
             _ => {}
@@ -332,9 +383,26 @@ fn contains_apple_framework_import(text: &str) -> bool {
     })
 }
 
-fn record_host_requirement(info: &mut ProjectInspection, requirement: HostRequirement) {
+fn record_host_requirement(
+    root: &Path,
+    source: &Path,
+    info: &mut ProjectInspection,
+    requirement: HostCapability,
+) {
     if !info.host_requirements.contains(&requirement) {
         info.host_requirements.push(requirement);
+    }
+    let relative = source.strip_prefix(root).unwrap_or(source).to_path_buf();
+    let evidence = EnvironmentEvidence {
+        source_path: relative,
+        component: component_for_path(root, source),
+        requirement: EnvironmentRequirement::HostCapability {
+            capability: requirement,
+        },
+        detail: requirement.label().to_string(),
+    };
+    if !info.environment_evidence.contains(&evidence) {
+        info.environment_evidence.push(evidence);
     }
     info.prefers_local_backend = true;
 }
@@ -343,9 +411,128 @@ fn record_dependency_key_file(root: &Path, path: &Path, info: &mut ProjectInspec
     if let Ok(relative) = path.strip_prefix(root) {
         let relative = relative.to_path_buf();
         if !info.dependency_key_files.contains(&relative) {
-            info.dependency_key_files.push(relative);
+            info.dependency_key_files.push(relative.clone());
+        }
+        let evidence = EnvironmentEvidence {
+            source_path: relative.clone(),
+            component: component_for_path(root, path),
+            requirement: EnvironmentRequirement::DependencyInput {
+                path: relative.clone(),
+            },
+            detail: format!("dependency input {}", relative.display()),
+        };
+        if !info.environment_evidence.contains(&evidence) {
+            info.environment_evidence.push(evidence);
         }
     }
+}
+
+fn record_toolchain_evidence(root: &Path, path: &Path, info: &mut ProjectInspection, name: &str) {
+    let relative = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    let constraint = std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .split_whitespace()
+        .take(32)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let evidence = EnvironmentEvidence {
+        source_path: relative,
+        component: component_for_path(root, path),
+        requirement: EnvironmentRequirement::Toolchain {
+            name: name.to_string(),
+            constraint: constraint.clone(),
+        },
+        detail: if constraint.is_empty() {
+            format!("{name} toolchain declaration")
+        } else {
+            format!("{name} toolchain: {constraint}")
+        },
+    };
+    if !info.environment_evidence.contains(&evidence) {
+        info.environment_evidence.push(evidence);
+    }
+}
+
+fn record_setup_command(root: &Path, source: &Path, command: &str, info: &mut ProjectInspection) {
+    if !info
+        .setup_commands
+        .iter()
+        .any(|existing| existing == command)
+    {
+        info.setup_commands.push(command.to_string());
+    }
+    record_environment_requirement(
+        root,
+        source,
+        EnvironmentRequirement::SetupCommand {
+            command: command.to_string(),
+        },
+        format!("bootstrap command {command}"),
+        info,
+    );
+}
+
+fn record_guard_command(root: &Path, source: &Path, command: &str, info: &mut ProjectInspection) {
+    if !info
+        .guard_commands
+        .iter()
+        .any(|existing| existing == command)
+    {
+        info.guard_commands.push(command.to_string());
+    }
+    record_environment_requirement(
+        root,
+        source,
+        EnvironmentRequirement::GuardCommand {
+            command: command.to_string(),
+        },
+        format!("validation command {command}"),
+        info,
+    );
+}
+
+fn record_container_signal(root: &Path, source: &Path, info: &mut ProjectInspection, detail: &str) {
+    info.prefers_container_backend = true;
+    record_environment_requirement(
+        root,
+        source,
+        EnvironmentRequirement::ContainerSignal {
+            detail: detail.to_string(),
+        },
+        detail.to_string(),
+        info,
+    );
+}
+
+fn record_environment_requirement(
+    root: &Path,
+    source: &Path,
+    requirement: EnvironmentRequirement,
+    detail: String,
+    info: &mut ProjectInspection,
+) {
+    let evidence = EnvironmentEvidence {
+        source_path: source.strip_prefix(root).unwrap_or(source).to_path_buf(),
+        component: component_for_path(root, source),
+        requirement,
+        detail,
+    };
+    if !info.environment_evidence.contains(&evidence) {
+        info.environment_evidence.push(evidence);
+    }
+}
+
+fn component_for_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .filter(|name| !name.contains('.'))
+        .unwrap_or("repository")
+        .to_string()
 }
 
 // ── environment suggestion ────────────────────────────────────────────────────
@@ -619,31 +806,90 @@ fn discovered_container_env(info: &ProjectInspection) -> BTreeMap<String, String
 fn discovered_container_caches(info: &ProjectInspection) -> Vec<EnvironmentCache> {
     let key_files = info.dependency_key_files.clone();
     let mut caches = Vec::new();
-    let mut push = |id: &str, target: &str| {
+    let mut push = |id: &str, target: &str, trust| {
         caches.push(EnvironmentCache {
             id: id.to_string(),
             target: PathBuf::from(target),
             key_files: key_files.clone(),
+            trust,
+            max_bytes: None,
         });
     };
     if info.has_cargo_toml {
-        push("cargo-registry", "/usr/local/cargo/registry");
-        push("cargo-git", "/usr/local/cargo/git");
+        push(
+            "rustup-toolchains",
+            "/usr/local/rustup",
+            crate::environment::CacheTrustClass::Toolchain,
+        );
+        push(
+            "cargo-registry",
+            "/usr/local/cargo/registry",
+            crate::environment::CacheTrustClass::Download,
+        );
+        push(
+            "cargo-git",
+            "/usr/local/cargo/git",
+            crate::environment::CacheTrustClass::Download,
+        );
+        push(
+            "cargo-target",
+            "/workspace/target",
+            crate::environment::CacheTrustClass::ProjectExecutable,
+        );
     }
     if info.has_pyproject_toml || info.has_requirements_txt {
-        push("python-venv", "/opt/pb-venv");
+        push(
+            "python-venv",
+            "/opt/pb-venv",
+            crate::environment::CacheTrustClass::ProjectExecutable,
+        );
     }
     if info.has_package_json {
-        push("npm-cache", "/root/.npm");
+        push(
+            "npm-cache",
+            "/root/.npm",
+            crate::environment::CacheTrustClass::Download,
+        );
+        push(
+            "node-modules",
+            "/workspace/node_modules",
+            crate::environment::CacheTrustClass::ProjectExecutable,
+        );
     }
     if info.has_deno_lock {
-        push("deno-cache", "/deno-dir");
+        push(
+            "deno-cache",
+            "/deno-dir",
+            crate::environment::CacheTrustClass::ProjectExecutable,
+        );
     }
     if info.has_go_mod {
-        push("go-modules", "/go/pkg/mod");
+        push(
+            "go-modules",
+            "/go/pkg/mod",
+            crate::environment::CacheTrustClass::Download,
+        );
     }
     if info.has_package_swift {
-        push("swiftpm-cache", "/root/.cache/org.swift.swiftpm");
+        push(
+            "swiftpm-cache",
+            "/root/.cache/org.swift.swiftpm",
+            crate::environment::CacheTrustClass::Download,
+        );
+    }
+    if info.has_cargo_toml
+        || info.has_pyproject_toml
+        || info.has_requirements_txt
+        || info.has_package_json
+        || info.has_deno_lock
+        || info.has_go_mod
+        || info.has_package_swift
+    {
+        push(
+            "lsp-index",
+            "/var/cache/pb/lsp",
+            crate::environment::CacheTrustClass::LspIndex,
+        );
     }
     caches
 }
@@ -677,6 +923,11 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
     println!("Inspecting project at {}…", root.display());
 
     let info = inspect(&root)?;
+    EnvironmentEvidenceDocument {
+        version: crate::environment_lock::ENVIRONMENT_EVIDENCE_VERSION,
+        evidence: info.environment_evidence.clone(),
+    }
+    .save_atomic(&root)?;
 
     // Print what was detected
     print_detection_summary(&info);
@@ -1042,29 +1293,29 @@ fn inspect_scout_text(root: &Path, path: &Path, text: &str, info: &mut ProjectIn
     }
     let lower = text.to_ascii_lowercase();
     if lower.contains("macos-latest") || lower.contains("macos-") {
-        record_host_requirement(info, HostRequirement::MacosCi);
+        record_host_requirement(root, path, info, HostRequirement::MacosCi);
     }
     if lower.contains("xcodebuild") || lower.contains("xcrun") || lower.contains("launchd") {
-        record_host_requirement(info, HostRequirement::XcodeToolchain);
+        record_host_requirement(root, path, info, HostRequirement::XcodeToolchain);
     }
     if lower.contains("simctl") || lower.contains("ios simulator") {
-        record_host_requirement(info, HostRequirement::Simulator);
+        record_host_requirement(root, path, info, HostRequirement::Simulator);
     }
     if lower.contains("codesign")
         || lower.contains("notarytool")
         || lower.contains("cocoapods")
         || lower.contains("security find-identity")
     {
-        record_host_requirement(info, HostRequirement::CodeSigning);
+        record_host_requirement(root, path, info, HostRequirement::CodeSigning);
     }
     if lower.contains("aarch64-apple-darwin")
         || lower.contains("apple sdk")
         || lower.contains("sdkroot")
     {
-        record_host_requirement(info, HostRequirement::AppleSdkTarget);
+        record_host_requirement(root, path, info, HostRequirement::AppleSdkTarget);
     }
     if contains_scout_token(&lower, "metal") || contains_scout_token(&lower, "metalkit") {
-        record_host_requirement(info, HostRequirement::Metal);
+        record_host_requirement(root, path, info, HostRequirement::Metal);
     }
     if lower.contains("dockerfile")
         || lower.contains("docker build")
@@ -1077,7 +1328,12 @@ fn inspect_scout_text(root: &Path, path: &Path, text: &str, info: &mut ProjectIn
         || lower.contains("helm")
         || lower.contains("linux")
     {
-        info.prefers_container_backend = true;
+        record_container_signal(
+            root,
+            path,
+            info,
+            "documented Linux/container/deployment workflow",
+        );
     }
     for line in text.lines() {
         let command = extract_documented_command(line);
@@ -1085,14 +1341,20 @@ fn inspect_scout_text(root: &Path, path: &Path, text: &str, info: &mut ProjectIn
             let normalized = normalize_command(root, path, &command);
             let cmd_lower = normalized.to_ascii_lowercase();
             if is_setup_command(&cmd_lower) {
-                info.setup_commands.push(normalized.clone());
+                record_setup_command(root, path, &normalized, info);
             }
             if is_session_refresh_command(&cmd_lower, line) {
                 info.session_commands.push(normalized.clone());
             }
             if is_guard_command(&cmd_lower, line) {
-                info.documented_guard_commands.push(normalized.clone());
-                info.guard_commands.push(normalized);
+                if !info
+                    .documented_guard_commands
+                    .iter()
+                    .any(|existing| existing == &normalized)
+                {
+                    info.documented_guard_commands.push(normalized.clone());
+                }
+                record_guard_command(root, path, &normalized, info);
             }
         }
     }
@@ -1430,6 +1692,47 @@ mod tests {
         let info = inspect(dir.path()).unwrap();
         assert!(info.has_cargo_toml);
         assert!(!info.has_pyproject_toml);
+        assert!(info.environment_evidence.iter().any(|evidence| matches!(
+            &evidence.requirement,
+            EnvironmentRequirement::SetupCommand { command }
+                if command.contains("cargo fetch")
+        )));
+        assert!(info.environment_evidence.iter().any(|evidence| matches!(
+            &evidence.requirement,
+            EnvironmentRequirement::GuardCommand { command } if command == "cargo test"
+        )));
+    }
+
+    #[test]
+    fn inspect_records_toolchain_managers_as_typed_lock_inputs() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "flake.nix", "{ outputs = inputs: {}; }");
+        write(
+            dir.path(),
+            ".tool-versions",
+            "nodejs 22.3.0\npython 3.12.4\n",
+        );
+        write(
+            dir.path(),
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.88\"\n",
+        );
+        let info = inspect(dir.path()).unwrap();
+        for path in ["flake.nix", ".tool-versions", "rust-toolchain.toml"] {
+            assert!(info.dependency_key_files.contains(&PathBuf::from(path)));
+        }
+        assert!(info.environment_evidence.iter().any(|evidence| matches!(
+            &evidence.requirement,
+            EnvironmentRequirement::Toolchain { name, .. } if name == "nix"
+        )));
+        assert!(info.environment_evidence.iter().any(|evidence| matches!(
+            &evidence.requirement,
+            EnvironmentRequirement::Toolchain { name, .. } if name == "asdf"
+        )));
+        assert!(info.environment_evidence.iter().any(|evidence| matches!(
+            &evidence.requirement,
+            EnvironmentRequirement::Toolchain { name, .. } if name == "rust"
+        )));
     }
 
     #[test]
@@ -1451,6 +1754,21 @@ mod tests {
         assert!(info.has_package_json);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn inspect_does_not_follow_repository_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write(outside.path(), "package.json", "{}");
+        symlink(outside.path(), dir.path().join("linked-outside")).unwrap();
+
+        let info = inspect(dir.path()).unwrap();
+        assert!(!info.has_package_json);
+        assert!(info.environment_evidence.is_empty());
+    }
+
     #[test]
     fn inspect_devcontainer() {
         let dir = TempDir::new().unwrap();
@@ -1464,6 +1782,11 @@ mod tests {
             info.devcontainer_image,
             Some("mcr.microsoft.com/devcontainers/rust:latest".to_string())
         );
+        assert!(info.environment_evidence.iter().any(|evidence| matches!(
+            &evidence.requirement,
+            EnvironmentRequirement::ContainerSignal { detail }
+                if detail == "devcontainer configuration"
+        )));
     }
 
     #[test]

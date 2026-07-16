@@ -1,9 +1,14 @@
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 const KEEPALIVE_SCRIPT: &str = "trap 'exit 0' TERM INT; while :; do sleep 86400; done";
+const MAX_RUNTIME_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RUNTIME_STDERR_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeKind {
@@ -101,6 +106,235 @@ pub struct VolumeSpec {
     pub labels: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedResource {
+    pub name: String,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceLaunchSpec {
+    pub name: String,
+    pub image: String,
+    pub args: Vec<String>,
+    pub workdir: String,
+    pub mounts: Vec<ContainerMount>,
+    pub labels: BTreeMap<String, String>,
+    /// Values are injected into the runtime client environment and only keys appear in argv.
+    pub env: BTreeMap<String, String>,
+    pub network: Option<String>,
+    pub resources: ContainerResources,
+    pub tmpfs: Vec<String>,
+    pub read_only_root: bool,
+}
+
+/// A streaming host-side client process used for long-lived container exec protocols.
+pub struct ManagedProcess {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    command: String,
+}
+
+impl ManagedProcess {
+    pub(crate) fn spawn(binary: &str, args: &[String]) -> Result<Self> {
+        Self::spawn_with_env(binary, args, &BTreeMap::new())
+    }
+
+    pub(crate) fn spawn_with_env(
+        binary: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        validate_process_env(env)?;
+        let mut child = Command::new(binary)
+            .args(args)
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to spawn managed process {binary}"))?;
+        Ok(Self {
+            stdin: child.stdin.take(),
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+            child,
+            command: format!("{binary} {}", args.join(" ")),
+        })
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn take_stdin(&mut self) -> Result<ChildStdin> {
+        self.stdin
+            .take()
+            .with_context(|| format!("{} stdin was already taken", self.command))
+    }
+
+    pub fn take_stdout(&mut self) -> Result<ChildStdout> {
+        self.stdout
+            .take()
+            .with_context(|| format!("{} stdout was already taken", self.command))
+    }
+
+    pub fn take_stderr(&mut self) -> Result<ChildStderr> {
+        self.stderr
+            .take()
+            .with_context(|| format!("{} stderr was already taken", self.command))
+    }
+
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        self.child
+            .try_wait()
+            .with_context(|| format!("failed to poll {}", self.command))
+    }
+
+    pub fn wait(&mut self) -> Result<ExitStatus> {
+        self.child
+            .wait()
+            .with_context(|| format!("failed to wait for {}", self.command))
+    }
+
+    pub fn shutdown(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        self.stdin.take();
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                self.child
+                    .kill()
+                    .with_context(|| format!("failed to kill {}", self.command))?;
+                return self.wait();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+pub(crate) fn validate_process_env(env: &BTreeMap<String, String>) -> Result<()> {
+    for (key, value) in env {
+        let mut characters = key.chars();
+        if !characters
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+            || !characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            bail!("managed process environment variable name '{key}' is invalid");
+        }
+        if value.contains('\0') {
+            bail!("managed process environment variable '{key}' contains a NUL byte");
+        }
+    }
+    Ok(())
+}
+
+/// A named service container plus its attached stdio client. Dropping it always removes the
+/// container; no service relies on `--rm` or an untracked host child.
+pub struct ManagedServiceProcess {
+    process: ManagedProcess,
+    runtime: Box<dyn ContainerRuntime>,
+    container_name: String,
+}
+
+impl ManagedServiceProcess {
+    pub fn take_stdin(&mut self) -> Result<ChildStdin> {
+        self.process.take_stdin()
+    }
+
+    pub fn take_stdout(&mut self) -> Result<ChildStdout> {
+        self.process.take_stdout()
+    }
+
+    pub fn take_stderr(&mut self) -> Result<ChildStderr> {
+        self.process.take_stderr()
+    }
+
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        self.process.try_wait()
+    }
+
+    pub fn shutdown(&mut self, timeout: Duration) -> Result<()> {
+        let process_result = self.process.shutdown(timeout).map(|_| ());
+        let remove_result = self.runtime.remove(&self.container_name);
+        process_result.and(remove_result)
+    }
+
+    pub fn container_name(&self) -> &str {
+        &self.container_name
+    }
+}
+
+impl Drop for ManagedServiceProcess {
+    fn drop(&mut self) {
+        let _ = self.process.shutdown(Duration::from_secs(2));
+        let _ = self.runtime.remove(&self.container_name);
+    }
+}
+
+pub fn spawn_managed_service(
+    runtime_binary: &str,
+    spec: &ServiceLaunchSpec,
+) -> Result<ManagedServiceProcess> {
+    let runtime = runtime_for_binary(runtime_binary)?;
+    if runtime.container_exists(&spec.name)? {
+        let owned = runtime
+            .list_managed_containers()?
+            .iter()
+            .any(|resource| managed_resource_matches(resource, &spec.name, &spec.labels));
+        if !owned {
+            bail!(
+                "refusing to replace existing container '{}' without pb ownership labels",
+                spec.name
+            );
+        }
+        runtime.remove(&spec.name)?;
+    }
+    let args = service_run_args(spec);
+    let process = ManagedProcess::spawn_with_env(runtime_binary, &args, &spec.env)?;
+    Ok(ManagedServiceProcess {
+        process,
+        runtime,
+        container_name: spec.name.clone(),
+    })
+}
+
+fn managed_resource_matches(
+    resource: &ManagedResource,
+    expected_name: &str,
+    expected_labels: &BTreeMap<String, String>,
+) -> bool {
+    if resource.name != expected_name {
+        return false;
+    }
+    if resource.labels.is_empty() {
+        // OCI inventory is already filtered by dev.pb.managed=true but may expose names only.
+        return true;
+    }
+    ["dev.pb.managed", "dev.pb.project", "dev.pb.session"]
+        .into_iter()
+        .all(|key| {
+            expected_labels
+                .get(key)
+                .is_none_or(|expected| resource.labels.get(key) == Some(expected))
+        })
+}
+
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// Capability-oriented abstraction over Apple Container, Docker, and Podman CLIs.
 /// All methods are synchronous and block until the underlying CLI completes.
 pub trait ContainerRuntime: Send + Sync {
@@ -125,6 +359,43 @@ pub trait ContainerRuntime: Send + Sync {
     /// Execute a shell command inside a running container.
     fn exec(&self, container_id: &str, cmd: &str) -> Result<String>;
 
+    /// Spawn a streaming command inside a running container.
+    fn spawn_exec(&self, _container_id: &str, _argv: &[String]) -> Result<ManagedProcess> {
+        bail!("container runtime does not implement streaming exec")
+    }
+
+    fn spawn_exec_with_env(
+        &self,
+        container_id: &str,
+        argv: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<ManagedProcess> {
+        if !env.is_empty() {
+            bail!("container runtime does not implement secure streaming exec environment");
+        }
+        self.spawn_exec(container_id, argv)
+    }
+
+    /// Gracefully stop a running container before deletion.
+    fn stop(&self, container_id: &str, _timeout: Duration) -> Result<()> {
+        self.remove(container_id)
+    }
+
+    /// Return whether a named container exists in any state.
+    fn container_exists(&self, _container_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// List containers owned by pb according to runtime labels.
+    fn list_managed_containers(&self) -> Result<Vec<ManagedResource>> {
+        Ok(Vec::new())
+    }
+
+    /// List networks owned by pb according to runtime labels.
+    fn list_managed_networks(&self) -> Result<Vec<ManagedResource>> {
+        Ok(Vec::new())
+    }
+
     /// Forcibly remove a container (equivalent to `docker rm -f`).
     fn remove(&self, container_id: &str) -> Result<()>;
 
@@ -136,6 +407,11 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Create a persistent named volume if it does not already exist.
     fn ensure_volume(&self, spec: &VolumeSpec) -> Result<()>;
+
+    /// Remove an unattached persistent named volume.
+    fn remove_volume(&self, _volume: &str) -> Result<()> {
+        bail!("container runtime does not implement volume deletion")
+    }
 }
 
 /// A running container and its ephemeral network. Persistent cache volumes are deliberately not
@@ -151,11 +427,50 @@ impl ContainerHandle {
     pub fn exec(&self, cmd: &str) -> Result<String> {
         self.runtime.exec(&self.container_id, cmd)
     }
+
+    pub fn spawn_exec(&self, argv: &[String]) -> Result<ManagedProcess> {
+        self.runtime.spawn_exec(&self.container_id, argv)
+    }
+
+    pub fn spawn_exec_with_env(
+        &self,
+        argv: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<ManagedProcess> {
+        self.runtime
+            .spawn_exec_with_env(&self.container_id, argv, env)
+    }
+
+    pub fn shutdown(&self, timeout: Duration) -> Result<()> {
+        self.runtime.stop(&self.container_id, timeout)
+    }
+
+    /// Force removal and report cleanup failures. Successfully removed identifiers are cleared so
+    /// the Drop guard does not issue duplicate runtime operations.
+    pub fn cleanup(&mut self) -> Result<()> {
+        let mut first_error = None;
+        if !self.container_id.is_empty() {
+            match self.runtime.remove(&self.container_id) {
+                Ok(()) => self.container_id.clear(),
+                Err(error) => first_error = Some(error),
+            }
+        }
+        if let Some(network) = self.network.clone() {
+            match self.runtime.remove_network(&network) {
+                Ok(()) => self.network = None,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
 }
 
 impl Drop for ContainerHandle {
     fn drop(&mut self) {
-        let _ = self.runtime.remove(&self.container_id);
+        if !self.container_id.is_empty() {
+            let _ = self.runtime.remove(&self.container_id);
+        }
         if let Some(network) = &self.network {
             let _ = self.runtime.remove_network(network);
         }
@@ -241,7 +556,7 @@ impl ContainerRuntime for AppleContainerRuntime {
     }
 
     fn create(&self, spec: &ContainerLaunchSpec) -> Result<String> {
-        run_silent("container", &apple_run_args(spec))?;
+        run_silent_with_env("container", &apple_run_args(spec), &spec.env)?;
         Ok(spec.name.clone())
     }
 
@@ -256,6 +571,77 @@ impl ContainerRuntime for AppleContainerRuntime {
                 cmd.to_string(),
             ],
         )
+    }
+
+    fn spawn_exec(&self, container_id: &str, argv: &[String]) -> Result<ManagedProcess> {
+        let mut args = vec![
+            "exec".to_string(),
+            "-i".to_string(),
+            container_id.to_string(),
+        ];
+        args.extend(argv.iter().cloned());
+        ManagedProcess::spawn("container", &args)
+    }
+
+    fn spawn_exec_with_env(
+        &self,
+        container_id: &str,
+        argv: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<ManagedProcess> {
+        let mut args = vec!["exec".to_string(), "-i".to_string()];
+        for key in env.keys() {
+            args.push("--env".to_string());
+            args.push(key.clone());
+        }
+        args.push(container_id.to_string());
+        args.extend(argv.iter().cloned());
+        ManagedProcess::spawn_with_env("container", &args, env)
+    }
+
+    fn stop(&self, container_id: &str, timeout: Duration) -> Result<()> {
+        run_silent(
+            "container",
+            &[
+                "stop".to_string(),
+                "--time".to_string(),
+                timeout.as_secs().to_string(),
+                container_id.to_string(),
+            ],
+        )
+    }
+
+    fn container_exists(&self, container_id: &str) -> Result<bool> {
+        run_status(
+            "container",
+            &["inspect".to_string(), container_id.to_string()],
+        )
+    }
+
+    fn list_managed_containers(&self) -> Result<Vec<ManagedResource>> {
+        let output = run_capture(
+            "container",
+            &[
+                "list".to_string(),
+                "--all".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        )?;
+        Ok(parse_apple_managed_resources(&output, "configuration"))
+    }
+
+    fn list_managed_networks(&self) -> Result<Vec<ManagedResource>> {
+        let output = run_capture(
+            "container",
+            &[
+                "network".to_string(),
+                "list".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        )?;
+        Ok(parse_apple_managed_resources(&output, "configuration"))
     }
 
     fn remove(&self, container_id: &str) -> Result<()> {
@@ -307,6 +693,17 @@ impl ContainerRuntime for AppleContainerRuntime {
             }
             Err(create_error) => Err(create_error),
         }
+    }
+
+    fn remove_volume(&self, volume: &str) -> Result<()> {
+        run_silent(
+            "container",
+            &[
+                "volume".to_string(),
+                "delete".to_string(),
+                volume.to_string(),
+            ],
+        )
     }
 }
 
@@ -398,7 +795,7 @@ impl ContainerRuntime for OciRuntime {
     }
 
     fn create(&self, spec: &ContainerLaunchSpec) -> Result<String> {
-        run_silent(&self.binary, &oci_run_args(spec))?;
+        run_silent_with_env(&self.binary, &oci_run_args(spec), &spec.env)?;
         Ok(spec.name.clone())
     }
 
@@ -413,6 +810,81 @@ impl ContainerRuntime for OciRuntime {
                 cmd.to_string(),
             ],
         )
+    }
+
+    fn spawn_exec(&self, container_id: &str, argv: &[String]) -> Result<ManagedProcess> {
+        let mut args = vec![
+            "exec".to_string(),
+            "-i".to_string(),
+            container_id.to_string(),
+        ];
+        args.extend(argv.iter().cloned());
+        ManagedProcess::spawn(&self.binary, &args)
+    }
+
+    fn spawn_exec_with_env(
+        &self,
+        container_id: &str,
+        argv: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<ManagedProcess> {
+        let mut args = vec!["exec".to_string(), "-i".to_string()];
+        for key in env.keys() {
+            args.push("--env".to_string());
+            args.push(key.clone());
+        }
+        args.push(container_id.to_string());
+        args.extend(argv.iter().cloned());
+        ManagedProcess::spawn_with_env(&self.binary, &args, env)
+    }
+
+    fn stop(&self, container_id: &str, timeout: Duration) -> Result<()> {
+        run_silent(
+            &self.binary,
+            &[
+                "stop".to_string(),
+                "--time".to_string(),
+                timeout.as_secs().to_string(),
+                container_id.to_string(),
+            ],
+        )
+    }
+
+    fn container_exists(&self, container_id: &str) -> Result<bool> {
+        run_status(
+            &self.binary,
+            &["inspect".to_string(), container_id.to_string()],
+        )
+    }
+
+    fn list_managed_containers(&self) -> Result<Vec<ManagedResource>> {
+        let output = run_capture(
+            &self.binary,
+            &[
+                "ps".to_string(),
+                "--all".to_string(),
+                "--filter".to_string(),
+                "label=dev.pb.managed=true".to_string(),
+                "--format".to_string(),
+                "{{.Names}}".to_string(),
+            ],
+        )?;
+        Ok(lines_as_managed_resources(&output))
+    }
+
+    fn list_managed_networks(&self) -> Result<Vec<ManagedResource>> {
+        let output = run_capture(
+            &self.binary,
+            &[
+                "network".to_string(),
+                "ls".to_string(),
+                "--filter".to_string(),
+                "label=dev.pb.managed=true".to_string(),
+                "--format".to_string(),
+                "{{.Name}}".to_string(),
+            ],
+        )?;
+        Ok(lines_as_managed_resources(&output))
     }
 
     fn remove(&self, container_id: &str) -> Result<()> {
@@ -461,6 +933,13 @@ impl ContainerRuntime for OciRuntime {
             Err(create_error) => Err(create_error),
         }
     }
+
+    fn remove_volume(&self, volume: &str) -> Result<()> {
+        run_silent(
+            &self.binary,
+            &["volume".to_string(), "rm".to_string(), volume.to_string()],
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +963,42 @@ pub fn detect_runtime() -> Option<Box<dyn ContainerRuntime>> {
     }
 
     None
+}
+
+/// Reconstruct a runtime adapter recorded in a durable local lease.
+pub fn runtime_for_binary(binary: &str) -> Result<Box<dyn ContainerRuntime>> {
+    if binary.trim().is_empty() || binary.contains(['\n', '\r', '\0']) {
+        bail!("invalid container runtime binary in session lease");
+    }
+    if binary == "container" {
+        return Ok(Box::new(AppleContainerRuntime));
+    }
+    Ok(Box::new(OciRuntime {
+        binary: binary.to_string(),
+    }))
+}
+
+/// Serialize pull/build/inspect/launch for a mutable runtime image reference across daemon and CLI
+/// processes. The guard must remain live until the container has been created from the inspected
+/// identity, closing the tag mutation race.
+pub(crate) fn acquire_image_operation_lock(
+    runtime_binary: &str,
+    image: &str,
+) -> Result<crate::state_lock::StateFileLock> {
+    if runtime_binary.trim().is_empty()
+        || runtime_binary.contains(['\n', '\r', '\0'])
+        || image.trim().is_empty()
+        || image.contains(['\n', '\r', '\0'])
+    {
+        bail!("invalid runtime/image identity for image operation lock");
+    }
+    let key = crate::environment_lock::sha256(format!("{runtime_binary}\0{image}").as_bytes());
+    let root = crate::session_workspace::default_state_root()
+        .unwrap_or_else(|_| std::path::PathBuf::from(".pb/state"));
+    crate::state_lock::StateFileLock::acquire(
+        root.join("image-locks").join(format!("{key}.lock")),
+        Duration::from_secs(15 * 60),
+    )
 }
 
 /// Return the preferred runtime command for container-backed LSP/MCP integrations.
@@ -529,9 +1044,9 @@ fn run_args(spec: &ContainerLaunchSpec) -> Vec<String> {
         args.push("--label".to_string());
         args.push(format!("{key}={value}"));
     }
-    for (key, value) in &spec.env {
+    for key in spec.env.keys() {
         args.push("--env".to_string());
-        args.push(format!("{key}={value}"));
+        args.push(key.clone());
     }
     for mount in &spec.mounts {
         args.push("--volume".to_string());
@@ -559,6 +1074,44 @@ fn run_args(spec: &ContainerLaunchSpec) -> Vec<String> {
     args.push(spec.image.clone());
     args.push("-c".to_string());
     args.push(KEEPALIVE_SCRIPT.to_string());
+    args
+}
+
+fn service_run_args(spec: &ServiceLaunchSpec) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "-i".to_string(),
+        "--name".to_string(),
+        spec.name.clone(),
+    ];
+    append_labels(&mut args, &spec.labels);
+    for key in spec.env.keys() {
+        args.push("--env".to_string());
+        args.push(key.clone());
+    }
+    for mount in &spec.mounts {
+        args.push("--volume".to_string());
+        args.push(mount.cli_value());
+    }
+    args.push("--workdir".to_string());
+    args.push(spec.workdir.clone());
+    if let Some(network) = &spec.network {
+        args.push("--network".to_string());
+        args.push(network.clone());
+    }
+    args.push("--cpus".to_string());
+    args.push(spec.resources.cpus.to_string());
+    args.push("--memory".to_string());
+    args.push(format!("{}M", spec.resources.memory_mb));
+    for target in &spec.tmpfs {
+        args.push("--tmpfs".to_string());
+        args.push(target.clone());
+    }
+    if spec.read_only_root {
+        args.push("--read-only".to_string());
+    }
+    args.push(spec.image.clone());
+    args.extend(spec.args.iter().cloned());
     args
 }
 
@@ -617,19 +1170,27 @@ fn which_exists(binary: &str) -> bool {
 
 /// Run a command and return whether it exited successfully.
 fn run_status(binary: &str, args: &[String]) -> Result<bool> {
-    let output = Command::new(binary)
+    let status = Command::new(binary)
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
         .with_context(|| format!("failed to spawn {binary}"))?;
-    Ok(output.status.success())
+    Ok(status.success())
 }
 
 /// Run a command, failing on non-zero exit with bounded subprocess output.
 fn run_silent(binary: &str, args: &[String]) -> Result<()> {
-    let output = Command::new(binary)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to spawn {binary}"))?;
+    run_silent_with_env(binary, args, &BTreeMap::new())
+}
+
+fn run_silent_with_env(
+    binary: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
+    let output = run_bounded_with_env(binary, args, env)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -649,15 +1210,163 @@ fn run_silent(binary: &str, args: &[String]) -> Result<()> {
 
 /// Run a command and return its trimmed stdout, failing on non-zero exit.
 fn run_capture(binary: &str, args: &[String]) -> Result<String> {
-    let output = Command::new(binary)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to spawn {binary}"))?;
+    let output = run_bounded(binary, args)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("{binary} failed: {stderr}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "{binary} exited with status {}: {}{}",
+            output.status,
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\nstdout: {}", stdout.trim())
+            }
+        );
+    }
+    if output.stdout_truncated {
+        bail!(
+            "{binary} output exceeded the {} byte capture limit",
+            MAX_RUNTIME_STDOUT_BYTES
+        );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+}
+
+fn run_bounded(binary: &str, args: &[String]) -> Result<BoundedCommandOutput> {
+    run_bounded_with_env(binary, args, &BTreeMap::new())
+}
+
+fn run_bounded_with_env(
+    binary: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> Result<BoundedCommandOutput> {
+    validate_process_env(env)?;
+    let mut child = Command::new(binary)
+        .args(args)
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {binary}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("runtime stdout was unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("runtime stderr was unavailable")?;
+    let stdout_reader =
+        std::thread::spawn(move || drain_bounded_stream(stdout, MAX_RUNTIME_STDOUT_BYTES));
+    let stderr_reader =
+        std::thread::spawn(move || drain_bounded_stream(stderr, MAX_RUNTIME_STDERR_BYTES));
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for {binary}"))?;
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("runtime stdout reader panicked"))??;
+    let (stderr, _) = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("runtime stderr reader panicked"))??;
+    Ok(BoundedCommandOutput {
+        status,
+        stdout,
+        stderr,
+        stdout_truncated,
+    })
+}
+
+fn drain_bounded_stream(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool)> {
+    let mut captured = Vec::with_capacity(limit.min(8 * 1024));
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(captured.len());
+        let keep = remaining.min(read);
+        captured.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    Ok((captured, truncated))
+}
+
+fn lines_as_managed_resources(output: &str) -> Vec<ManagedResource> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|name| ManagedResource {
+            name: name.to_string(),
+            labels: BTreeMap::from([("dev.pb.managed".to_string(), "true".to_string())]),
+        })
+        .collect()
+}
+
+fn parse_apple_managed_resources(output: &str, nested: &str) -> Vec<ManagedResource> {
+    let values = serde_json::Deserializer::from_str(output)
+        .into_iter::<serde_json::Value>()
+        .filter_map(Result::ok)
+        .flat_map(|value| match value {
+            serde_json::Value::Array(values) => values,
+            value => vec![value],
+        });
+    values
+        .filter_map(|value| {
+            let labels = find_string_map(&value, "labels").unwrap_or_default();
+            if labels.get("dev.pb.managed").map(String::as_str) != Some("true") {
+                return None;
+            }
+            let name = value
+                .get(nested)
+                .and_then(|value| value.get("id").or_else(|| value.get("name")))
+                .or_else(|| value.get("id"))
+                .or_else(|| value.get("name"))
+                .and_then(serde_json::Value::as_str)?;
+            Some(ManagedResource {
+                name: name.to_string(),
+                labels,
+            })
+        })
+        .collect()
+}
+
+fn find_string_map(value: &serde_json::Value, key: &str) -> Option<BTreeMap<String, String>> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::Object(labels)) = object.get(key) {
+                return Some(
+                    labels
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_string()))
+                        })
+                        .collect(),
+                );
+            }
+            object
+                .values()
+                .find_map(|value| find_string_map(value, key))
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| find_string_map(value, key))
+        }
+        _ => None,
+    }
 }
 
 fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
@@ -692,6 +1401,7 @@ fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
 
     struct MockRuntime {
@@ -879,7 +1589,7 @@ mod tests {
                 "--label",
                 "pb.session=session-1",
                 "--env",
-                "CI=true",
+                "CI",
                 "--volume",
                 "/tmp/repo:/workspace",
                 "--volume",
@@ -902,6 +1612,7 @@ mod tests {
                 KEEPALIVE_SCRIPT,
             ]
         );
+        assert!(!apple_run_args(&spec).iter().any(|arg| arg == "true"));
     }
 
     #[test]
@@ -943,6 +1654,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn managed_service_is_named_labelled_and_never_uses_auto_remove() {
+        let args = service_run_args(&ServiceLaunchSpec {
+            name: "pb-svc-one".to_string(),
+            image: "example/mcp:locked".to_string(),
+            args: vec!["serve".to_string()],
+            workdir: "/workspace".to_string(),
+            mounts: vec![ContainerMount::bind(
+                Path::new("/task/worktree"),
+                "/workspace",
+                true,
+            )],
+            labels: BTreeMap::from([
+                ("dev.pb.managed".to_string(), "true".to_string()),
+                ("dev.pb.session".to_string(), "s1".to_string()),
+            ]),
+            env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
+            network: Some("pb-svcnet-one".to_string()),
+            resources: ContainerResources {
+                cpus: 1,
+                memory_mb: 512,
+            },
+            tmpfs: vec!["/tmp".to_string()],
+            read_only_root: true,
+        });
+        assert!(args.windows(2).any(|pair| pair == ["--name", "pb-svc-one"]));
+        assert!(args.iter().any(|arg| arg == "dev.pb.managed=true"));
+        assert!(args.windows(2).any(|pair| pair == ["--env", "TOKEN"]));
+        assert!(!args.iter().any(|arg| arg == "secret"));
+        assert!(!args.iter().any(|arg| arg == "--rm"));
+    }
+
+    #[test]
+    fn managed_service_replacement_requires_matching_exposed_ownership_labels() {
+        let expected = BTreeMap::from([
+            ("dev.pb.managed".to_string(), "true".to_string()),
+            ("dev.pb.project".to_string(), "project-a".to_string()),
+            ("dev.pb.session".to_string(), "session-a".to_string()),
+        ]);
+        let owned = ManagedResource {
+            name: "pb-svc-one".to_string(),
+            labels: expected.clone(),
+        };
+        assert!(managed_resource_matches(&owned, "pb-svc-one", &expected));
+
+        let mut foreign = owned;
+        foreign
+            .labels
+            .insert("dev.pb.session".to_string(), "session-b".to_string());
+        assert!(!managed_resource_matches(&foreign, "pb-svc-one", &expected));
+    }
+
+    #[test]
+    fn managed_process_streams_and_shuts_down_after_stdin_closes() {
+        let mut process =
+            ManagedProcess::spawn("sh", &["-c".to_string(), "cat".to_string()]).unwrap();
+        let mut stdin = process.take_stdin().unwrap();
+        let mut stdout = process.take_stdout().unwrap();
+        stdin.write_all(b"hello\n").unwrap();
+        drop(stdin);
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).unwrap();
+        assert_eq!(output, "hello\n");
+        assert!(process.shutdown(Duration::from_secs(1)).unwrap().success());
+    }
+
+    #[test]
+    fn managed_process_environment_rejects_invalid_keys_and_nul_values() {
+        assert!(
+            validate_process_env(&BTreeMap::from([("BAD-NAME".to_string(), "x".to_string())]))
+                .is_err()
+        );
+        assert!(
+            validate_process_env(&BTreeMap::from([(
+                "GOOD".to_string(),
+                "bad\0value".to_string()
+            )]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn apple_inventory_parser_requires_pb_ownership_labels() {
+        let output = r#"
+{"status":"running","configuration":{"id":"pb-one","labels":{"dev.pb.managed":"true","dev.pb.session":"s1"}}}
+{"status":"running","configuration":{"id":"foreign","labels":{"owner":"other"}}}
+"#;
+        assert_eq!(
+            parse_apple_managed_resources(output, "configuration"),
+            vec![ManagedResource {
+                name: "pb-one".to_string(),
+                labels: BTreeMap::from([
+                    ("dev.pb.managed".to_string(), "true".to_string()),
+                    ("dev.pb.session".to_string(), "s1".to_string()),
+                ]),
+            }]
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires an installed and running Apple container runtime plus registry access"]
@@ -956,7 +1766,11 @@ mod tests {
         let suffix = format!("{}-{}", std::process::id(), workspace.path().display());
         let name = format!("pb-conformance-{}", sanitize_test_name(&suffix));
         let network = format!("{name}-network");
-        let labels = BTreeMap::from([("pb.owner".to_string(), "pb-test".to_string())]);
+        let labels = BTreeMap::from([
+            ("dev.pb.managed".to_string(), "true".to_string()),
+            ("dev.pb.session".to_string(), name.clone()),
+            ("dev.pb.role".to_string(), "conformance".to_string()),
+        ]);
         runtime.create_internal_network(&NetworkSpec {
             name: network.clone(),
             labels: labels.clone(),
@@ -977,13 +1791,17 @@ mod tests {
             read_only_root: true,
         };
         let container_id = runtime.create(&spec)?;
-        let handle = ContainerHandle {
+        let mut handle = ContainerHandle {
             runtime,
             container_id,
             network: Some(network),
         };
-        handle.exec("test -d /workspace && test ! -e /definitely-not-present")?;
-        handle.exec("touch /tmp/pb-conformance && rm /tmp/pb-conformance")?;
+        handle
+            .exec("test -d /workspace && test ! -e /definitely-not-present")
+            .context("workspace bind probe failed")?;
+        handle
+            .exec("touch /tmp/pb-conformance && rm /tmp/pb-conformance")
+            .context("tmpfs write probe failed")?;
         assert!(
             handle.exec("touch /pb-conformance-must-not-exist").is_err(),
             "Apple read-only root unexpectedly accepted a write"
@@ -993,6 +1811,87 @@ mod tests {
                 .exec("wget -q -T 3 -O /dev/null http://example.com")
                 .is_err(),
             "Apple internal network unexpectedly allowed external HTTP egress"
+        );
+        assert!(
+            handle
+                .exec("wget -q -T 3 -O /dev/null http://host.container.internal:9")
+                .is_err(),
+            "Apple internal network unexpectedly reached the standard host-service alias"
+        );
+        assert!(handle.runtime.container_exists(&handle.container_id)?);
+        assert!(
+            handle
+                .runtime
+                .list_managed_containers()?
+                .iter()
+                .any(|resource| resource.name == handle.container_id)
+        );
+        let mut process =
+            handle.spawn_exec(&["sh".to_string(), "-lc".to_string(), "cat".to_string()])?;
+        let mut stdin = process.take_stdin()?;
+        let mut stdout = process.take_stdout()?;
+        stdin.write_all(b"streaming-conformance\n")?;
+        drop(stdin);
+        let mut output = String::new();
+        stdout.read_to_string(&mut output)?;
+        assert_eq!(output, "streaming-conformance\n");
+        assert!(process.shutdown(Duration::from_secs(2))?.success());
+
+        let service_name = format!("{name}-service");
+        let mut service = spawn_managed_service(
+            "container",
+            &ServiceLaunchSpec {
+                name: service_name.clone(),
+                image: "docker.io/library/alpine:3.20".to_string(),
+                args: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "IFS= read -r line; printf 'service:%s\\n' \"$line\"".to_string(),
+                ],
+                workdir: "/tmp".to_string(),
+                mounts: Vec::new(),
+                labels: BTreeMap::from([
+                    ("dev.pb.managed".to_string(), "true".to_string()),
+                    ("dev.pb.project".to_string(), "conformance".to_string()),
+                    ("dev.pb.session".to_string(), name.clone()),
+                    ("dev.pb.role".to_string(), "service-conformance".to_string()),
+                ]),
+                env: BTreeMap::new(),
+                network: handle.network.clone(),
+                resources: ContainerResources {
+                    cpus: 1,
+                    memory_mb: 512,
+                },
+                tmpfs: vec!["/tmp".to_string()],
+                read_only_root: true,
+            },
+        )?;
+        let mut service_stdin = service.take_stdin()?;
+        let mut service_stdout = service.take_stdout()?;
+        service_stdin.write_all(b"protocol\n")?;
+        drop(service_stdin);
+        let mut service_output = String::new();
+        service_stdout.read_to_string(&mut service_output)?;
+        assert_eq!(service_output, "service:protocol\n");
+        service.shutdown(Duration::from_secs(2))?;
+        assert!(!AppleContainerRuntime.container_exists(&service_name)?);
+
+        let stop_started = Instant::now();
+        handle.shutdown(Duration::from_secs(1))?;
+        assert!(
+            stop_started.elapsed() < Duration::from_secs(5),
+            "Apple container stop exceeded its bounded cancellation window"
+        );
+        let container_name = handle.container_id.clone();
+        let network_name = handle.network.clone().unwrap();
+        handle.cleanup()?;
+        let verifier = AppleContainerRuntime;
+        assert!(!verifier.container_exists(&container_name)?);
+        assert!(
+            !verifier
+                .list_managed_networks()?
+                .iter()
+                .any(|resource| resource.name == network_name)
         );
         Ok(())
     }

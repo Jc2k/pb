@@ -16,12 +16,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::agent_core::{AgentProfile, AgentRequest, EventSink, SessionAttachment, run_agent};
+use crate::agent_core::{
+    AgentProfile, AgentRequest, EventSink, SessionAttachment, run_agent_managed,
+};
 use crate::events::{AgentEvent, EventEnvelope, HandoffOutcome, SessionMetricsSnapshot};
 use crate::integrations::{
     self, InstalledIntegration, IntegrationConfigSchema, IntegrationInstallRequest,
@@ -363,6 +365,37 @@ pub async fn run_server_with_ready(
     };
     let restored_sessions = restore_sessions(&project_entries);
     let project_usage = build_project_usage_cache(&restored_sessions);
+    if let Err(error) = crate::session_environment::initialize_global_supervisor()
+        .context("failed to reconcile session environments at startup")
+    {
+        notify_ready(&mut ready, Err(format!("{error:#}")));
+        return Err(error);
+    }
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let cleanup = tokio::task::spawn_blocking(|| -> Result<()> {
+                crate::session_environment::global_supervisor().reap_expired()?;
+                if let Some(runtime) = crate::container::detect_runtime() {
+                    crate::cache_manager::global_cache_manager().gc(
+                        runtime.as_ref(),
+                        Duration::from_secs(30 * 24 * 60 * 60),
+                        50 * 1024 * 1024 * 1024,
+                    )?;
+                }
+                Ok(())
+            })
+            .await;
+            match cleanup {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("failed to clean session environments: {error:#}")
+                }
+                Err(error) => eprintln!("session environment cleanup task failed: {error}"),
+            }
+        }
+    });
     let state = AppState {
         sessions: Arc::new(Mutex::new(restored_sessions)),
         projects: Arc::new(Mutex::new(project_entries)),
@@ -989,7 +1022,8 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         },
     );
 
-    if !session.running {
+    let terminate_environment = !session.running;
+    if terminate_environment {
         if let Some(checkpoint) = session.workflow.take() {
             let mut run = checkpoint.run;
             if run.stage == crate::workflow::WorkflowStage::Blocked {
@@ -1048,6 +1082,9 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         workflow,
         completed_workflows,
     );
+    if terminate_environment {
+        crate::session_environment::terminate_global_session(&id)?;
+    }
     Ok(SessionResponse { session_id: id })
 }
 
@@ -1334,6 +1371,11 @@ async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSession
             }
         }
         session_store::delete_session(&workdir, id)?;
+    }
+    crate::session_environment::terminate_global_session(id)?;
+    let workspace_manager = crate::session_workspace::WorkspaceManager::persistent()?;
+    if let Some(record) = workspace_manager.find_record_by_session(id)? {
+        workspace_manager.remove(&record, true)?;
     }
 
     Ok(DeleteSessionResponse {
@@ -1682,10 +1724,11 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 completed_workflows,
                 cancel_token,
             };
-            run_agent(request_for_run.clone(), &models_root, sink)
+            run_agent_managed(request_for_run.clone(), &models_root, sink)
         })
         .await;
 
+        let mut terminate_environment = false;
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&session_id) {
             session.running = false;
@@ -1729,6 +1772,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         == crate::events::TerminationReason::Cancelled
                     {
                         final_status = SessionStatus::Completed;
+                        terminate_environment = true;
                     } else if !run_result.reached_final
                         || run_result.termination_reason != crate::events::TerminationReason::Final
                     {
@@ -1777,6 +1821,11 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             );
         }
         drop(sessions);
+        if terminate_environment
+            && let Err(error) = crate::session_environment::terminate_global_session(&session_id)
+        {
+            eprintln!("failed to terminate cancelled session environment {session_id}: {error:#}");
+        }
         dispatch_next_session(state.clone());
     });
 }
@@ -2487,6 +2536,7 @@ mod workflow_tests {
             top_k: 1,
             seed: 0,
             environment: None,
+            environment_evidence_context: None,
             workspace_graph: None,
             repository_context: None,
             prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),

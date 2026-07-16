@@ -1,6 +1,11 @@
 # Apple container environment architecture
 
-Status: active source of truth for pb environment isolation work.
+Status: implemented runtime foundation. The control-plane document governs current behavior.
+
+The production session control-plane implementation and its stricter completion gates are defined
+in [session-environment-control-plane.md](session-environment-control-plane.md). This document
+remains the runtime-foundation record; where the two overlap, the control-plane document governs
+session ownership, workspaces, services, caches, and reconciliation.
 
 ## Purpose
 
@@ -37,11 +42,12 @@ documents the per-container VM architecture, while the
 8. A logical session owns its task, LSP, MCP, network, and ephemeral container lifecycles.
 9. Cleanup is idempotent and recoverable after process failure; `Drop` is a last line of defence,
    not the resource ledger.
-10. The user's original checkout is not the long-term workspace boundary.
+10. The user's original checkout is never mounted into an agent container; a task-owned worktree
+    is the workspace boundary.
 
-The initial migration enforces items 1 through 7 at the runtime interface. Durable cross-turn
-leases, task worktrees, service adoption, and crash reconciliation remain follow-on milestones and
-are listed explicitly below.
+The runtime foundation and the follow-on durable control plane now enforce these properties. See
+the linked control-plane document for current schemas, lifecycle semantics, tests, and remaining
+hardening boundaries.
 
 ## Control plane
 
@@ -82,9 +88,9 @@ Host requirements include:
 - Apple SDK targets, `xcodebuild`, `xcrun`, `simctl`, notarization, entitlements, and Xcode project
   or workspace files.
 
-A repository can eventually assign different executors to different components. Until component
-requirements are complete, any positive host requirement conservatively selects the local backend
-for the whole project. The presence of a generic CI workflow is not a container requirement.
+A focused component can select a different executor from its siblings. A repository-root task or
+an ambiguous component boundary conservatively applies every positive host requirement to the
+whole task. The presence of a generic CI workflow is not a container requirement.
 
 ### Environment plan and lock
 
@@ -97,9 +103,12 @@ for the whole project. The presence of a generic CI workflow is not a container 
 - persistent cache mounts and their invalidation inputs;
 - human-readable discovery provenance.
 
-A later `.pb/environment.lock` will record resolved image digests, platform, runtime compatibility,
-cache fingerprints, and resolver version. Mutable tags such as `latest` may be accepted as plan
-input, but a reusable build or cache must be keyed by the resolved digest.
+`.pb/environment.lock` records the canonical plan hash, inspected local image identity, platform,
+runtime/version, build inputs, dependency inputs, cache plan, and resolver version. Mutable tags
+such as `latest` may be accepted as plan input, but reuse is keyed by the inspected local identity;
+an identity change invalidates the environment and executable cache scope. A cross-process runtime
+and image-reference lock spans preparation, inspection, and container creation to close mutable-tag
+races.
 
 ### Runtime contract
 
@@ -124,7 +133,8 @@ Every launch receives:
 - resource bounds;
 - a read-only root filesystem with writable tmpfs mounts for transient OS paths;
 - an explicit network attachment or explicit egress policy;
-- an entrypoint that is independent of the image's application entrypoint.
+- for the primary command container, an entrypoint independent of the image's application
+  entrypoint; protocol sidecars intentionally execute their declared image command/arguments.
 
 ### Bootstrap and runtime phases
 
@@ -142,9 +152,11 @@ The default phases are:
 6. Run per-session commands without external network access.
 
 Projects that genuinely require network during agent execution opt into runtime egress explicitly.
-An Apple internal network is host-only, not proof of a physically absent network device. Runtime
-conformance tests therefore verify both external and host reachability before pb claims a stronger
-property.
+An Apple `--internal` network is isolated, not proof of a physically absent network device. Runtime
+conformance therefore requires failed probes to public egress and Apple's
+standard host-service alias. pb never creates the administrator-owned localhost forwarding
+described in Apple's
+[networking guide](https://github.com/apple/container/blob/main/docs/how-to.md#access-a-host-service-from-a-container).
 
 ### Cache trust
 
@@ -161,14 +173,14 @@ the cache. Cache volumes survive session cleanup. They are never shared across u
 
 Download caches can later use a wider content-addressed scope after checksum verification. Compiler
 outputs, virtual environments, package install trees, and other executable artifacts remain
-project/environment scoped. LSP indexes use a separate server-version-scoped cache.
+project/environment scoped. Image LSP indexes derive a separate cache from the inspected image,
+complete server configuration, and initialization options.
 
 ### Workspace boundary
 
-The current migration continues to bind the selected workspace so host editing and Git workflows
-remain coherent. The next workspace milestone replaces the original checkout with a task-owned Git
-worktree and overlays high-I/O paths such as `target`, `node_modules`, `.venv`, compiler caches, and
-LSP indexes with named volumes.
+The selected workspace is now a task-owned Git worktree outside the original checkout. pb binds
+that worktree, never the original checkout, and overlays declared high-I/O paths such as `target`,
+`node_modules`, virtual environments, compiler caches, and LSP indexes with named volumes.
 
 The stronger follow-on mode copies source into an ext4 workspace volume and promotes only an
 inspected diff. That mode requires repository reads, writes, diffs, review, LSP file events, and Git
@@ -177,7 +189,7 @@ special case.
 
 ### Session and service lifecycle
 
-The target `SessionLease` is owned by the daemon and survives individual model turns. It records:
+`SessionLease` is owned by the daemon and survives individual model turns. It records:
 
 - environment and project fingerprints;
 - container, network, volume attachment, and service identifiers;
@@ -192,14 +204,18 @@ At daemon startup, pb lists resources with `dev.pb.managed=true`, reconciles the
 session state, adopts valid active leases, and reaps expired or orphaned resources. Resource names
 and labels introduced in the initial migration are the compatibility boundary for this ledger.
 
-LSP services receive the same canonical `/workspace` view as commands. They start lazily, implement
-the full document lifecycle, respond to server requests, expose stderr and health, and use explicit
-index caches. Initially an LSP may run through `exec` in the task container to guarantee toolchain
-parity; sidecars are appropriate once shared workspace and cache semantics are reliable.
+LSP services receive the same canonical task-worktree view as commands. The session registry keeps
+them across turns; clients implement the full document lifecycle, respond to server requests,
+expose bounded stderr and health, use real request deadlines, restart once on failure, and use
+explicit index caches. A command LSP runs through `exec` in the task container for toolchain parity;
+an image LSP runs as a named session sidecar. Configured working directories are canonicalized and
+must remain beneath the task worktree, including through symlinks.
 
 MCP services declare workspace access (`none`, `read_only`, or `read_write`), network access,
-secrets, cache mounts, and ports. Workspace access defaults to none. Secret references are resolved
-at launch and are not stored as project TOML values.
+secrets, and cache mounts. Workspace access defaults to none and service port publishing is not
+supported. Secret references are resolved at launch and are not stored as project TOML values.
+MCP stdio uses bounded newline-delimited JSON-RPC with version negotiation; remote HTTP endpoints
+fail closed until the daemon owns a complete authenticated Streamable HTTP lifecycle.
 
 ## Configuration version two
 
@@ -228,20 +244,22 @@ key_files = ["Cargo.lock"]
 ```
 
 An optional `[env]` table carries non-secret runtime variables such as `DENO_DIR` or a virtual
-environment `PATH`. Secret values are never placed there.
+environment `PATH`. The configuration contract forbids secrets there; MCP secrets instead use
+named host-variable references whose resolved values are never persisted or placed in argv.
 
 Version-one files continue to deserialize. Saving writes the current version. Unknown fields remain
 errors. Local environments retain the same command lists but ignore container-only resource,
 network, and cache fields.
 
-## Initial migration acceptance criteria
+## Runtime foundation acceptance criteria
 
-The first implementation backed by this document is complete when:
+This foundation and the linked control plane satisfy the following gates:
 
 - Apple pull uses `container image pull`, and no runtime exposes container commit;
 - Apple version 1.0 or newer is validated before use;
 - Apple and OCI launch commands are covered by exact argument tests;
-- launches have unique names, ownership labels, `/workspace` working directory, and resource bounds;
+- primary launches have unique names, ownership labels, `/workspace` working directory, and
+  resource bounds; sidecars use capability-derived mounts/workdirs and the same ownership bounds;
 - runtime roots are read-only with explicit tmpfs and workspace/cache write locations;
 - isolated runtime networks are created and removed with the container handle;
 - setup uses a separate bootstrap launch, runs from `/workspace`, and is never committed;
@@ -250,22 +268,23 @@ The first implementation backed by this document is complete when:
 - no environment means no implicit local command backend;
 - project checks do not silently manufacture a local backend;
 - Apple/Xcode signals take precedence over generic container or CI signals;
-- LSP and MCP integration installation defaults to the detected preferred runtime rather than
-  hard-coded Docker;
+- LSP and MCP integration installation records the detected preferred runtime rather than
+  hard-coded Docker, while an active session lease remains authoritative for sidecar placement;
 - configuration, discovery, runtime construction, and cleanup behaviour have unit coverage;
-- an ignored Apple conformance test exercises pull/run/exec/cleanup when the Apple service and a
-  small test image are available.
+- an ignored Apple conformance test exercises pull/run/exec, named attached-service stdio,
+  bounded stop, and cleanup when the Apple service and a small test image are available.
 
-## Follow-on milestones
+## Further hardening
 
-1. Task-owned Git worktrees and cache overlays; never mount the original checkout.
-2. Durable daemon `SessionLease` persistence, cross-turn reuse, startup reconciliation, and TTL GC.
-3. Environment lockfile with registry-resolved image digests and cache provenance.
-4. LSP supervisor with file-event bridging, cache mounts, health, restart, and graceful shutdown.
-5. MCP capability declarations, secret references, scoped egress, and session-owned services.
-6. Container-local ext4 workspace with inspected diff promotion.
-7. Optional Swift Containerization helper for streaming process I/O, vsock services, and framework
-   lifecycle primitives that cannot be made reliable through CLI subprocesses.
+The task-worktree, durable lease, local image lock, cache manager, LSP supervision, and MCP
+capability milestones are implemented in the control plane. Remaining optional/expansion work is:
 
-Each milestone must add daemon-free conformance coverage and failure-injection tests before the
-safety contract is strengthened in user-facing documentation.
+1. Registry-native digest resolution in addition to mandatory local image identity locking.
+2. Transactional container-local ext4 workspace synchronization and inspected diff promotion.
+3. Fixture images for a real-runtime LSP/MCP protocol and capability matrix in CI.
+4. Automatic backend-specific cache size collection to strengthen recorded estimate quotas.
+5. An optional Swift Containerization helper for vsock services and framework lifecycle primitives
+   that cannot be made reliable through CLI subprocesses.
+
+Each expansion must add daemon-free conformance and failure-injection coverage before the safety
+contract is strengthened further.

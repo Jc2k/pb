@@ -69,6 +69,22 @@ pub struct EnvironmentCache {
     /// Project-relative files whose contents invalidate the cache.
     #[serde(default)]
     pub key_files: Vec<PathBuf>,
+    /// Trust boundary for cache sharing and garbage collection.
+    #[serde(default)]
+    pub trust: CacheTrustClass,
+    /// Optional soft quota recorded for cache accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTrustClass {
+    Download,
+    Toolchain,
+    #[default]
+    ProjectExecutable,
+    LspIndex,
 }
 
 /// Project environment configuration stored at `.pb/environment.toml`.
@@ -175,8 +191,11 @@ impl EnvironmentConfig {
         if !(256..=262_144).contains(&self.resources.memory_mb) {
             bail!("environment resources.memory_mb must be between 256 and 262144");
         }
-        if self.image.trim().is_empty() {
-            bail!("environment image cannot be empty");
+        if self.image.trim().is_empty()
+            || self.image.starts_with('-')
+            || self.image.contains(['\0', '\n', '\r'])
+        {
+            bail!("environment image must be a non-option, single-line reference");
         }
         for (key, value) in &self.env {
             let mut chars = key.chars();
@@ -206,6 +225,19 @@ impl EnvironmentConfig {
             }
             (EnvironmentBackend::AppleContainers, _) => {}
         }
+        if let Some(dockerfile) = &self.dockerfile
+            && (dockerfile.is_absolute()
+                || dockerfile.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }))
+        {
+            bail!("environment dockerfile must stay within the project");
+        }
         let mut cache_ids = BTreeSet::new();
         let mut cache_targets = BTreeSet::new();
         for cache in &self.caches {
@@ -228,9 +260,10 @@ impl EnvironmentConfig {
                     .target
                     .components()
                     .any(|part| part == std::path::Component::ParentDir)
+                || cache.target.to_string_lossy().contains(':')
             {
                 bail!(
-                    "environment cache '{}' target must be an absolute non-escaping container path",
+                    "environment cache '{}' target must be an absolute, non-escaping, CLI-safe container path",
                     cache.id
                 );
             }
@@ -263,6 +296,12 @@ impl EnvironmentConfig {
                         key_file.display()
                     );
                 }
+            }
+            if cache.max_bytes == Some(0) {
+                bail!(
+                    "environment cache '{}' max_bytes must be greater than zero",
+                    cache.id
+                );
             }
         }
         Ok(())
@@ -453,7 +492,18 @@ network = "host"
             id: "workspace".to_string(),
             target: PathBuf::from("/workspace"),
             key_files: vec![],
+            trust: CacheTrustClass::ProjectExecutable,
+            max_bytes: None,
         });
+        assert!(config.validate().is_err());
+
+        config.caches.clear();
+        config.image = "--privileged".to_string();
+        assert!(config.validate().is_err());
+
+        config.image = "pb-dev:locked".to_string();
+        config.mode = EnvironmentMode::Build;
+        config.dockerfile = Some(PathBuf::from("../Dockerfile"));
         assert!(config.validate().is_err());
     }
 }

@@ -3,11 +3,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_LSP_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -19,7 +19,7 @@ pub struct LspConfig {
     pub servers: BTreeMap<String, LspServerConfig>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LspServerConfig {
     pub command: Option<String>,
@@ -29,7 +29,36 @@ pub struct LspServerConfig {
     pub env: BTreeMap<String, String>,
     pub working_directory: Option<PathBuf>,
     pub language_ids: Vec<String>,
+    pub initialization_options: Option<Value>,
+    #[serde(default = "default_lsp_workspace_access")]
+    pub workspace_access: crate::session_environment::ServiceWorkspaceAccess,
+    #[serde(default)]
+    pub network_access: crate::session_environment::ServiceNetworkAccess,
+    pub cache_ids: Vec<String>,
     pub disabled: bool,
+}
+
+impl Default for LspServerConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            container_image: None,
+            container_runtime: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            working_directory: None,
+            language_ids: Vec::new(),
+            initialization_options: None,
+            workspace_access: default_lsp_workspace_access(),
+            network_access: crate::session_environment::ServiceNetworkAccess::None,
+            cache_ids: Vec::new(),
+            disabled: false,
+        }
+    }
+}
+
+fn default_lsp_workspace_access() -> crate::session_environment::ServiceWorkspaceAccess {
+    crate::session_environment::ServiceWorkspaceAccess::ReadOnly
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -62,6 +91,7 @@ pub struct LspToolRegistry {
     pub servers: BTreeMap<String, LspServerConfig>,
     pub tools: BTreeMap<String, LspToolSpec>,
     sessions: BTreeMap<String, Arc<Mutex<LspClient>>>,
+    lease: Option<Arc<crate::session_environment::SessionEnvironmentLease>>,
 }
 
 impl LspToolRegistry {
@@ -130,13 +160,67 @@ pub fn discover_tools(
     servers: BTreeMap<String, LspServerConfig>,
     workspace_root: &Path,
 ) -> LspToolRegistry {
+    discover_tools_inner(servers, workspace_root, None)
+}
+
+struct CachedLspRegistry {
+    fingerprint: String,
+    registry: LspToolRegistry,
+}
+
+static SESSION_LSP_REGISTRIES: OnceLock<Mutex<HashMap<String, CachedLspRegistry>>> =
+    OnceLock::new();
+
+pub fn discover_tools_for_session(
+    session_id: &str,
+    servers: BTreeMap<String, LspServerConfig>,
+    workspace_root: &Path,
+    lease: Arc<crate::session_environment::SessionEnvironmentLease>,
+) -> LspToolRegistry {
+    let fingerprint = crate::environment_lock::sha256(
+        &serde_json::to_vec(&(workspace_root, &servers)).unwrap_or_default(),
+    );
+    let registries = SESSION_LSP_REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut registries) = registries.lock() {
+        if let Some(cached) = registries.get(session_id)
+            && cached.fingerprint == fingerprint
+        {
+            return cached.registry.clone();
+        }
+        let registry = discover_tools_inner(servers, workspace_root, Some(lease));
+        registries.insert(
+            session_id.to_string(),
+            CachedLspRegistry {
+                fingerprint,
+                registry: registry.clone(),
+            },
+        );
+        return registry;
+    }
+    LspToolRegistry::default()
+}
+
+pub fn shutdown_session_services(session_id: &str) {
+    if let Some(registries) = SESSION_LSP_REGISTRIES.get()
+        && let Ok(mut registries) = registries.lock()
+    {
+        registries.remove(session_id);
+    }
+}
+
+fn discover_tools_inner(
+    servers: BTreeMap<String, LspServerConfig>,
+    workspace_root: &Path,
+    lease: Option<Arc<crate::session_environment::SessionEnvironmentLease>>,
+) -> LspToolRegistry {
     let mut registry = LspToolRegistry {
         servers: servers.clone(),
         tools: BTreeMap::new(),
         sessions: BTreeMap::new(),
+        lease: lease.clone(),
     };
     for (server_name, config) in servers {
-        match LspClient::connect(&server_name, &config, workspace_root) {
+        match LspClient::connect(&server_name, &config, workspace_root, lease.as_ref()) {
             Ok(client) => {
                 registry
                     .sessions
@@ -190,7 +274,25 @@ pub fn call_tool(
     let mut client = session
         .lock()
         .map_err(|_| anyhow!("LSP session for {} is poisoned", spec.server_name))?;
-    client.call(spec.operation, workspace_root, arguments)
+    match client.call(spec.operation, workspace_root, arguments) {
+        Ok(result) => Ok(result),
+        Err(first_error) => {
+            let config = registry
+                .servers
+                .get(&spec.server_name)
+                .context("LSP server configuration disappeared during restart")?;
+            *client = LspClient::connect(
+                &spec.server_name,
+                config,
+                workspace_root,
+                registry.lease.as_ref(),
+            )
+            .with_context(|| {
+                format!("LSP request failed ({first_error:#}) and the bounded restart also failed")
+            })?;
+            client.call(spec.operation, workspace_root, arguments)
+        }
+    }
 }
 
 impl LspOperation {
@@ -226,51 +328,146 @@ impl LspOperation {
 }
 
 struct LspClient {
-    child: Child,
+    process: LspProcess,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout_reader: crate::jsonrpc::FramedJsonReader,
     next_id: u64,
     diagnostics: BTreeMap<String, Value>,
     language_id: String,
+    root_uri: String,
+    root_name: String,
+    open_documents: BTreeMap<String, OpenDocument>,
+    stderr_tail: Arc<Mutex<VecDeque<u8>>>,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct OpenDocument {
+    version: u64,
+    content_sha256: String,
+}
+
+enum LspProcess {
+    Host(Child),
+    Exec(crate::container::ManagedProcess),
+    Service(crate::container::ManagedServiceProcess),
+}
+
+impl LspProcess {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Host(child) => Ok(child.try_wait()?),
+            Self::Exec(process) => process.try_wait(),
+            Self::Service(process) => process.try_wait(),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        match self {
+            Self::Host(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Self::Exec(process) => {
+                let _ = process.shutdown(Duration::from_secs(2));
+            }
+            Self::Service(process) => {
+                let _ = process.shutdown(Duration::from_secs(2));
+            }
+        }
+    }
 }
 
 impl LspClient {
-    fn connect(server_name: &str, config: &LspServerConfig, workspace_root: &Path) -> Result<Self> {
-        let (command, args) = stdio_command(server_name, config, workspace_root)?;
-        let cwd = config
-            .working_directory
-            .as_deref()
-            .map(|p| {
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    workspace_root.join(p)
-                }
-            })
-            .unwrap_or_else(|| workspace_root.to_path_buf());
-        let mut child = Command::new(&command)
-            .args(&args)
-            .current_dir(&cwd)
-            .envs(&config.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("failed to start LSP server {server_name}: {command}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("failed to open LSP server stdin")?;
-        let stdout = BufReader::new(
-            child
+    fn connect(
+        server_name: &str,
+        config: &LspServerConfig,
+        workspace_root: &Path,
+        lease: Option<&Arc<crate::session_environment::SessionEnvironmentLease>>,
+    ) -> Result<Self> {
+        let cwd = match config.working_directory.as_deref() {
+            Some(path) => resolve_workspace_path(workspace_root, &path.to_string_lossy())?,
+            None => workspace_root.to_path_buf(),
+        };
+        let (process, stdin, stdout, stderr) = if let Some(lease) = lease {
+            if let Some(image) = config
+                .container_image
+                .as_deref()
+                .filter(|image| !image.trim().is_empty())
+            {
+                let mut service =
+                    lease.spawn_service(crate::session_environment::SessionServiceSpec {
+                        service_name: server_name.to_string(),
+                        role: format!("lsp:{server_name}"),
+                        kind: crate::session_environment::LeaseResourceKind::LspProcess,
+                        image: image.trim().to_string(),
+                        args: config.args.clone(),
+                        env: config.env.clone(),
+                        working_directory: config.working_directory.clone(),
+                        cache_scope_sha256: crate::environment_lock::sha256(&serde_json::to_vec(
+                            config,
+                        )?),
+                        workspace_access: config.workspace_access,
+                        network_access: config.network_access,
+                        cache_ids: config.cache_ids.clone(),
+                    })?;
+                let stdin = service.take_stdin()?;
+                let stdout = service.take_stdout()?;
+                let stderr = service.take_stderr()?;
+                (LspProcess::Service(service), stdin, stdout, Some(stderr))
+            } else {
+                let command = config.command.as_deref().with_context(|| {
+                    format!("LSP server {server_name} has no command or container_image")
+                })?;
+                let mut argv = vec![
+                    "sh".to_string(),
+                    "-lc".to_string(),
+                    "cd \"$1\" && shift && exec \"$@\"".to_string(),
+                    "pb-lsp".to_string(),
+                    cwd.to_string_lossy().into_owned(),
+                    command.to_string(),
+                ];
+                argv.extend(config.args.clone());
+                let mut process = lease.spawn_exec_with_env(&argv, &config.env)?;
+                let stdin = process.take_stdin()?;
+                let stdout = process.take_stdout()?;
+                let stderr = process.take_stderr()?;
+                (LspProcess::Exec(process), stdin, stdout, Some(stderr))
+            }
+        } else {
+            let (command, args) = stdio_command(server_name, config, workspace_root)?;
+            let mut child = Command::new(&command)
+                .args(&args)
+                .current_dir(&cwd)
+                .envs(&config.env)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("failed to start LSP server {server_name}: {command}"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .context("failed to open LSP server stdin")?;
+            let stdout = child
                 .stdout
                 .take()
-                .context("failed to open LSP server stdout")?,
-        );
+                .context("failed to open LSP server stdout")?;
+            (LspProcess::Host(child), stdin, stdout, None)
+        };
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        let stderr_thread = stderr.map(|stderr| drain_stderr(stderr, Arc::clone(&stderr_tail)));
+        let stdout_reader =
+            crate::jsonrpc::FramedJsonReader::spawn("LSP", stdout, MAX_LSP_RESPONSE_BYTES)?;
+        let root_uri = path_to_uri(workspace_root)?;
+        let root_name = workspace_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace")
+            .to_string();
         let mut client = Self {
-            child,
+            process,
             stdin,
-            stdout,
+            stdout_reader,
             next_id: 1,
             diagnostics: BTreeMap::new(),
             language_id: config
@@ -278,9 +475,19 @@ impl LspClient {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "plaintext".to_string()),
+            root_uri: root_uri.clone(),
+            root_name: root_name.clone(),
+            open_documents: BTreeMap::new(),
+            stderr_tail,
+            stderr_thread,
         };
-        let root_uri = path_to_uri(workspace_root)?;
-        client.request("initialize", json!({"processId": std::process::id(), "rootUri": root_uri, "workspaceFolders": [{"uri": root_uri, "name": workspace_root.file_name().and_then(|n| n.to_str()).unwrap_or("workspace")}], "capabilities": {"textDocument":{"hover":{},"definition":{},"references":{},"documentSymbol":{},"publishDiagnostics":{}},"workspace":{"symbol":{}}}}))?;
+        let mut initialize_params = json!({"processId": std::process::id(), "rootUri": root_uri, "workspaceFolders": [{"uri": root_uri, "name": root_name}], "capabilities": {"textDocument":{"synchronization":{"didSave":true,"dynamicRegistration":false},"hover":{},"definition":{},"references":{},"documentSymbol":{},"publishDiagnostics":{}},"workspace":{"symbol":{},"workspaceFolders":true,"configuration":true}}});
+        if let Some(options) = config.initialization_options.clone()
+            && let Some(params) = initialize_params.as_object_mut()
+        {
+            params.insert("initializationOptions".to_string(), options);
+        }
+        client.request("initialize", initialize_params)?;
         client.notify("initialized", json!({}))?;
         Ok(client)
     }
@@ -354,27 +561,71 @@ impl LspClient {
         let text = std::fs::read_to_string(&full)
             .with_context(|| format!("failed to read {}", full.display()))?;
         let uri = path_to_uri(&full)?;
-        self.notify(
-            "textDocument/didOpen",
-            json!({"textDocument":{"uri":uri,"languageId":&self.language_id,"version":1,"text":text}}),
-        )?;
+        let content_sha256 = crate::environment_lock::sha256(text.as_bytes());
+        if let Some(document) = self.open_documents.get(&uri) {
+            if document.content_sha256 != content_sha256 {
+                let version = document.version.saturating_add(1);
+                self.notify(
+                    "textDocument/didChange",
+                    json!({"textDocument":{"uri":uri,"version":version},"contentChanges":[{"text":text}]}),
+                )?;
+                self.open_documents.insert(
+                    uri.clone(),
+                    OpenDocument {
+                        version,
+                        content_sha256,
+                    },
+                );
+            }
+        } else {
+            self.notify(
+                "textDocument/didOpen",
+                json!({"textDocument":{"uri":uri,"languageId":&self.language_id,"version":1,"text":text}}),
+            )?;
+            self.open_documents.insert(
+                uri.clone(),
+                OpenDocument {
+                    version: 1,
+                    content_sha256,
+                },
+            );
+        }
         Ok(uri)
     }
     fn request_text(&mut self, method: &str, params: Value) -> Result<String> {
         Ok(self.request(method, params)?.to_string())
     }
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, LSP_READ_TIMEOUT)
+    }
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         self.write(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
-        let deadline = Instant::now() + LSP_READ_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         loop {
             if Instant::now() > deadline {
                 bail!("timed out waiting for LSP response to {method}");
             }
-            let msg = self.read_message()?;
+            let msg = self.read_message(deadline)?;
             if let Some(method) = msg.get("method").and_then(Value::as_str) {
-                self.handle_notification(method, msg.get("params").cloned().unwrap_or(Value::Null));
+                if let Some(id) = msg.get("id").cloned() {
+                    self.handle_server_request(
+                        id,
+                        method,
+                        msg.get("params").cloned().unwrap_or(Value::Null),
+                    )?;
+                } else {
+                    self.handle_notification(
+                        method,
+                        msg.get("params").cloned().unwrap_or(Value::Null),
+                    );
+                }
                 continue;
             }
             if msg.get("id").and_then(Value::as_u64) != Some(id) {
@@ -396,31 +647,22 @@ impl LspClient {
         self.stdin.flush()?;
         Ok(())
     }
-    fn read_message(&mut self) -> Result<Value> {
-        if let Some(status) = self.child.try_wait()? {
-            bail!("LSP server exited with status {status}");
+    fn read_message(&mut self, deadline: Instant) -> Result<Value> {
+        if let Some(status) = self.process.try_wait()? {
+            bail!(
+                "LSP server exited with status {status}: {}",
+                self.stderr_text()
+            );
         }
-        let mut len = None;
-        loop {
-            let mut line = String::new();
-            if self.stdout.read_line(&mut line)? == 0 {
-                bail!("LSP server exited before response");
-            }
-            let t = line.trim_end_matches(['\r', '\n']);
-            if t.is_empty() {
-                break;
-            }
-            if let Some(v) = t.strip_prefix("Content-Length:") {
-                let parsed = v.trim().parse::<usize>()?;
-                if parsed > MAX_LSP_RESPONSE_BYTES {
-                    bail!("LSP response is too large: {parsed} bytes");
-                }
-                len = Some(parsed);
-            }
-        }
-        let mut body = vec![0; len.context("LSP response missing Content-Length header")?];
-        self.stdout.read_exact(&mut body)?;
-        Ok(serde_json::from_slice(&body)?)
+        self.stdout_reader
+            .recv_until(deadline)
+            .with_context(|| format!("LSP response failed: {}", self.stderr_text()))
+    }
+    fn stderr_text(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| String::from_utf8_lossy(&tail.iter().copied().collect::<Vec<_>>()).into())
+            .unwrap_or_default()
     }
     fn handle_notification(&mut self, method: &str, params: Value) {
         if method == "textDocument/publishDiagnostics"
@@ -435,43 +677,77 @@ impl LspClient {
             );
         }
     }
+
+    fn handle_server_request(&mut self, id: Value, method: &str, params: Value) -> Result<()> {
+        let result = match method {
+            "workspace/configuration" => {
+                let count = params
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                Value::Array((0..count).map(|_| Value::Null).collect())
+            }
+            "workspace/workspaceFolders" => {
+                json!([{"uri": self.root_uri, "name": self.root_name}])
+            }
+            "client/registerCapability"
+            | "client/unregisterCapability"
+            | "window/workDoneProgress/create" => Value::Null,
+            _ => Value::Null,
+        };
+        self.write(&json!({"jsonrpc":"2.0","id":id,"result":result}))
+    }
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        for uri in self.open_documents.keys().cloned().collect::<Vec<_>>() {
+            let _ = self.notify("textDocument/didClose", json!({"textDocument":{"uri":uri}}));
+        }
+        let _ = self.request_with_timeout("shutdown", Value::Null, Duration::from_secs(2));
         let _ = self.notify("exit", json!(null));
-        let _ = self.child.kill();
+        self.process.shutdown();
+        self.stdout_reader.join();
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
     }
+}
+
+fn drain_stderr(
+    mut stderr: ChildStderr,
+    tail: Arc<Mutex<VecDeque<u8>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        while let Ok(read) = stderr.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            if let Ok(mut tail) = tail.lock() {
+                tail.extend(&buffer[..read]);
+                while tail.len() > 64 * 1024 {
+                    tail.pop_front();
+                }
+            }
+        }
+    })
 }
 
 fn stdio_command(
     server_name: &str,
     config: &LspServerConfig,
-    workspace_root: &Path,
+    _workspace_root: &Path,
 ) -> Result<(String, Vec<String>)> {
     if let Some(image) = config
         .container_image
         .as_deref()
         .filter(|i| !i.trim().is_empty())
     {
-        let runtime =
-            crate::container::resolve_runtime_binary(config.container_runtime.as_deref())?;
-        let mut args = vec![
-            "run".to_string(),
-            "-i".to_string(),
-            "--rm".to_string(),
-            "-v".to_string(),
-            format!("{}:{}", workspace_root.display(), workspace_root.display()),
-            "-w".to_string(),
-            workspace_root.display().to_string(),
-        ];
-        for key in config.env.keys() {
-            args.push("-e".to_string());
-            args.push(key.clone());
-        }
-        args.push(image.trim().to_string());
-        args.extend(config.args.clone());
-        return Ok((runtime, args));
+        bail!(
+            "container LSP image '{}' requires an active session environment lease",
+            image.trim()
+        );
     }
     let command = config
         .command
@@ -523,20 +799,36 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn container_stdio_command_mounts_workspace_at_same_path() {
+    fn project_config_round_trips_initialization_and_sidecar_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ProjectLspConfig {
+            servers: BTreeMap::from([(
+                "rust".to_string(),
+                LspServerConfig {
+                    container_image: Some("example/rust-analyzer:locked".to_string()),
+                    initialization_options: Some(json!({"cargo":{"allFeatures":true}})),
+                    cache_ids: vec!["rust-analyzer-index".to_string()],
+                    ..Default::default()
+                },
+            )]),
+        };
+        config.save(dir.path()).unwrap();
+        assert_eq!(ProjectLspConfig::load(dir.path()).unwrap().unwrap(), config);
+    }
+
+    #[test]
+    fn container_lsp_requires_a_session_owned_service() {
         let config = LspServerConfig {
             container_image: Some("example/lsp".to_string()),
             container_runtime: Some("podman".to_string()),
             args: vec!["server".to_string()],
             ..Default::default()
         };
-        let (cmd, args) = stdio_command("rust", &config, Path::new("/workspace/pb")).unwrap();
-        assert_eq!(cmd, "podman");
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["-v", "/workspace/pb:/workspace/pb"])
-        );
-        assert!(args.windows(2).any(|w| w == ["-w", "/workspace/pb"]));
+        let error = stdio_command("rust", &config, Path::new("/workspace/pb"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("active session environment lease"));
     }
 }

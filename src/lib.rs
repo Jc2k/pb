@@ -25,6 +25,7 @@ mod agent_progress;
 mod agent_repository;
 mod agent_tool_errors;
 pub mod browser_tools;
+pub mod cache_manager;
 pub mod checks;
 pub mod cli_ui;
 pub mod config;
@@ -32,6 +33,7 @@ pub mod container;
 pub mod daemon_client;
 pub mod energy;
 pub mod environment;
+pub mod environment_lock;
 pub mod events;
 mod github_oauth;
 pub mod handoff;
@@ -41,19 +43,24 @@ pub mod harness_eval;
 pub mod inference;
 pub mod init;
 pub mod integrations;
+mod jsonrpc;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;
 pub mod policy;
 pub mod projects;
 pub mod service;
+pub mod session_environment;
 pub mod session_power;
 pub mod session_store;
+pub mod session_workspace;
+mod state_lock;
 pub mod tray;
 pub mod user;
 pub mod web;
 pub mod workflow;
 pub mod workspace;
+pub mod workspace_benchmark;
 pub mod workspace_discovery;
 
 pub const DEFAULT_MODEL: &str = "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";
@@ -164,6 +171,8 @@ pub enum EnvCommand {
     Start(EnvWorkdirArgs),
     /// Show the current project environment configuration
     Status(EnvWorkdirArgs),
+    /// Benchmark task-worktree bind I/O against a container-native volume and record the decision
+    Benchmark(EnvBenchmarkArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -738,6 +747,17 @@ pub struct EnvWorkdirArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct EnvBenchmarkArgs {
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+
+    /// Number of small-file workload samples per filesystem strategy
+    #[arg(long, default_value_t = 3)]
+    pub iterations: u32,
+}
+
+#[derive(Args, Debug)]
 pub struct InitArgs {
     /// Project root; defaults to the nearest git repository root
     #[arg(long)]
@@ -965,6 +985,7 @@ async fn run_serve() -> Result<()> {
         top_k: user_config.effective_top_k(),
         seed: user_config.effective_seed(),
         environment: None,
+        environment_evidence_context: None,
         workspace_graph: None,
         repository_context: None,
         prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
@@ -1676,7 +1697,23 @@ fn run_env_command(command: EnvCommand) -> Result<()> {
         EnvCommand::Local(args) => env_local(args),
         EnvCommand::Start(args) => env_start(args),
         EnvCommand::Status(args) => env_status(args),
+        EnvCommand::Benchmark(args) => env_benchmark(args),
     }
+}
+
+fn env_benchmark(args: EnvBenchmarkArgs) -> Result<()> {
+    let root = resolve_env_root(args.workdir)?;
+    let config = EnvironmentConfig::load(&root)?
+        .context("no project environment is configured; run pb init or pb env pull first")?;
+    if config.backend != EnvironmentBackend::AppleContainers {
+        bail!("filesystem benchmark requires a container-backed environment");
+    }
+    let runtime =
+        crate::container::detect_runtime().context("no supported container runtime found")?;
+    let report = crate::workspace_benchmark::run(runtime, &config.image, &root, args.iterations)?;
+    crate::workspace_benchmark::save_report(&report, &root)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn run_service_command(command: ServiceCommand) -> Result<()> {
@@ -2450,6 +2487,8 @@ fn env_pull(args: EnvPullArgs) -> Result<()> {
     let runtime = container::detect_runtime()
         .context("no container runtime found; install docker, podman, or apple/container")?;
     let runtime_info = runtime.info()?;
+    let _image_operation =
+        container::acquire_image_operation_lock(&runtime_info.binary, &args.image)?;
     println!(
         "Using {} {} for the project environment.",
         runtime_info.binary, runtime_info.version
@@ -2495,6 +2534,8 @@ fn env_build(args: EnvBuildArgs) -> Result<()> {
     let runtime = container::detect_runtime()
         .context("no container runtime found; install docker, podman, or apple/container")?;
     let runtime_info = runtime.info()?;
+    let _image_operation =
+        container::acquire_image_operation_lock(&runtime_info.binary, &args.tag)?;
     println!(
         "Using {} {} for the project environment.",
         runtime_info.binary, runtime_info.version
