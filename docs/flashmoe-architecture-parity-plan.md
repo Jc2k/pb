@@ -322,6 +322,32 @@ deterministic three-token raw output remained `5 2`.
   totaling 169,869,312 bytes, zero active or transient buffers, 63 ordinary pooled buffers, and no
   pressure recovery or resource-limit abort.
 
+A tenth pass tested storage-side strategies without retaining a new runtime path. All comparisons
+used the same deterministic three-token request and preserved the raw output `5 2`.
+
+- A positioned-read calibration against the checkpoint's actual 5.1 GB sparse-layer packs sustained
+  about 7.1 GB/s with 21,233,664-byte whole-expert reads at 4, 8, and 16 workers. Quarter-slot reads
+  likewise sustained about 7.0-7.2 GB/s. Four workers already saturated the device under this access
+  pattern, so increasing scheduler width or splitting whole-expert reads did not expose additional
+  storage throughput.
+- Bounded `F_RDADVISE` lookahead for the preceding token's next-layer routes decoded at `0.598` and
+  `0.603 tok/s`, while the immediately restored control reached `0.687 tok/s` and the established
+  warm-cache band was `0.574-0.585 tok/s`. The advice neither reduced the selected experts' logical
+  read volume nor produced a repeatable latency improvement, so speculative advice was removed.
+- A global history cache retained no exact route reuse at its viable roughly 8 GB tier and decoded
+  at `0.569 tok/s`; a 32 GB tier collapsed to `0.082 tok/s` under memory pressure. A five-slot-per-
+  layer cache did find reuse and reduced positioned-read bytes from 12.74 GB/token to 9.79-9.92
+  GB/token, but expert-I/O time increased from the `1.279 s/token` baseline to `1.312-1.314 s/token`
+  and total decode remained `0.585-0.595 tok/s`. The eliminated reads were already OS-page-cache
+  hits, while the application cache duplicated those pages and added whole-expert copies. It was
+  removed in favor of the existing OS-cache contract.
+- The local MLX checkpoint declares one next-token-prediction layer but contains no MTP layer
+  weights. MTP therefore cannot be enabled as a runtime optimization from these artifacts. Reaching
+  `1 tok/s` with supported K=8 quality now requires a typed reduction in physical expert traffic
+  (for example, a validated native packed format) or a complete MTP checkpoint that reduces full
+  model forwards per accepted token; queue depth, speculative page advice, and duplicate caches are
+  closed for this storage layout.
+
 ## Scheduled Graph
 
 Every supported variant resolves the same conceptual stages:
