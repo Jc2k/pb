@@ -57,6 +57,24 @@ impl TokenizerChatTemplate {
         }))
     }
 
+    pub fn from_external_template_bytes(
+        template_bytes: &[u8],
+        tokenizer_config: &Value,
+    ) -> Result<Self> {
+        let template = std::str::from_utf8(template_bytes)
+            .context("external tokenizer chat template is not valid UTF-8")?;
+        if template.trim().is_empty() {
+            bail!("external tokenizer chat template is empty");
+        }
+        Ok(Self {
+            default_template: Some(normalize_external_chat_template(template)),
+            tool_template: None,
+            bos_token: string_or_null(tokenizer_config.get("bos_token"))?,
+            eos_token: string_or_null(tokenizer_config.get("eos_token"))?,
+            pad_token: string_or_null(tokenizer_config.get("pad_token"))?,
+        })
+    }
+
     pub fn render<M, T>(
         &self,
         messages: M,
@@ -105,6 +123,37 @@ impl TokenizerChatTemplate {
         }
         bail!("tokenizer_config.json chat_template did not contain a usable template")
     }
+}
+
+fn normalize_external_chat_template(template: &str) -> String {
+    let bytes = template.as_bytes();
+    let mut normalized = String::with_capacity(template.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'.'
+            && index > 0
+            && matches!(bytes[index - 1], b'a'..=b'z' | b'A'..=b'Z' | b'_' | b')' | b']')
+            && bytes.get(index + 1).is_some_and(u8::is_ascii_digit)
+        {
+            let digit_start = index + 1;
+            let mut digit_end = digit_start;
+            while bytes.get(digit_end).is_some_and(u8::is_ascii_digit) {
+                digit_end += 1;
+            }
+            normalized.push('[');
+            normalized.push_str(&template[digit_start..digit_end]);
+            normalized.push(']');
+            index = digit_end;
+            continue;
+        }
+        let ch = template[index..]
+            .chars()
+            .next()
+            .expect("index remains on a UTF-8 character boundary");
+        normalized.push(ch);
+        index += ch.len_utf8();
+    }
+    normalized
 }
 
 fn parse_chat_template_value(value: &Value) -> Result<(Option<String>, Option<String>)> {
@@ -340,6 +389,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rendered, "plan|answer</answer>");
+    }
+
+    #[test]
+    fn external_template_normalizes_jinja_numeric_attribute_indexes() {
+        let template = TokenizerChatTemplate::from_external_template_bytes(
+            b"{{ messages.0.content }}|{{ messages[0].content }}",
+            &json!({}),
+        )
+        .unwrap();
+        let rendered = template
+            .render(
+                json!([{"role":"user","content":"hi"}]),
+                json!([]),
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(rendered, "hi|hi");
     }
 
     #[test]

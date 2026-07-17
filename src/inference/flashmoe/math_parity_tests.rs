@@ -252,6 +252,7 @@ fn gated_flashmoe_rope_defaults_to_partial_split_half() {
         num_shared_experts: None,
         shared_expert_intermediate_size: None,
         vision_config: None,
+        glm: None,
     };
 
     let rotary_dim = rotary_dim_for(&config, 256, FullAttentionQLayout::Gated);

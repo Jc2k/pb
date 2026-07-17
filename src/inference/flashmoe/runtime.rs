@@ -194,18 +194,23 @@ where
     )?;
     progress("linear_attention_weights", phase_started.elapsed());
     phase_started = Instant::now();
-    let shared_expert_weights = dense.resolve_shared_expert_weight_table(
+    let shared_expert_weights = dense.resolve_shared_expert_weight_table_from(
         config.num_hidden_layers,
         config.hidden_size,
         config.shared_experts(),
         config.shared_expert_intermediate_size(),
+        config.first_sparse_layer(),
+        config.glm.is_none(),
     )?;
     progress("shared_expert_weights", phase_started.elapsed());
     phase_started = Instant::now();
     let dense_layout = dense.registry().resolve_resident_dense_layout()?;
     if matches!(
         model_layout.family,
-        QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe
+        QwenMoeFamily::Qwen35A17B
+            | QwenMoeFamily::Qwen3Moe
+            | QwenMoeFamily::Qwen3VlMoe
+            | QwenMoeFamily::Glm52
     ) && dense_layout == ResidentDenseLayout::Q4
     {
         validate_qwen_q4_graph_bindings(
@@ -242,7 +247,11 @@ where
     let scheduler = FlashMoeExecutionScheduler::new(scheduled_graph, experts)?;
     progress("capability_graph", phase_started.elapsed());
     phase_started = Instant::now();
-    let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config)?;
+    let tokenizer = QwenTokenizer::from_files(
+        &plan.tokenizer,
+        &plan.tokenizer_config,
+        Some(&plan.chat_template),
+    )?;
     progress("tokenizer", phase_started.elapsed());
     Ok(FlashMoeEngine {
         plan: plan.clone(),
@@ -372,6 +381,7 @@ impl MetalExecutionFacade {
                 dense.mmap.clone(),
                 dense.len,
                 &runtime.linear_attention,
+                config.rms_norm_epsilon(),
             )?;
             tracing::info!(
                 model = %plan.model,
@@ -462,6 +472,7 @@ impl MetalExecutionFacade {
             self.inner.runtime(),
             dense_weights,
             Arc::clone(self.inner.buffers()),
+            self.inner.norm_epsilon(),
         )
         .submit(
             position,
@@ -599,12 +610,14 @@ impl MetalExecutionFacade {
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
+        router_correction_bias: Option<&[f32]>,
     ) -> Result<MetalPostAttentionPrep> {
         self.inner.resident_post_attention_prep_topk(
             projections,
             attention_output,
             residual,
             post_norm_weight,
+            router_correction_bias,
         )
     }
 
@@ -738,6 +751,53 @@ impl FlashMoeEngine {
                         self.config.num_hidden_layers
                     )
                 });
+            }
+            if self.config.is_dense_mlp_layer(layer) {
+                if deferred_expert_phase.is_some() {
+                    bail!(
+                        "GLM dense lead-in layer {layer} received a deferred sparse expert phase"
+                    );
+                }
+                let layer_started = OptionalInstant::now(record_detailed_timing);
+                let mut layer_timing = FlashMoeLayerTiming {
+                    layer,
+                    layer_kind: FlashMoeLayerKind::FullAttention,
+                    active_experts: 0,
+                    dimensions: self.layer_dimensions(layer),
+                    buckets: FlashMoeTimingBuckets::default(),
+                };
+                self.forward_glm_dense_layer(
+                    layer,
+                    &mut token_state,
+                    kv_cache,
+                    position,
+                    rope_position,
+                    runtime,
+                    record_detailed_timing.then_some(&mut layer_timing.buckets),
+                )?;
+                if let Some(addition) = layer_addition {
+                    add_in_place(token_state.hidden_mut(), addition);
+                }
+                token_state.clear_next_layer_normed();
+                kv_cache
+                    .record_layer_state_record(token_state.layer_state_record(position, layer))?;
+                layer_timing.buckets.total_wall = layer_started.elapsed();
+                if report_layer_progress {
+                    report_generation_progress(&progress, || {
+                        format!(
+                            "forward dense layer complete position={} layer={}/{} total_ms={}",
+                            position,
+                            layer + 1,
+                            self.config.num_hidden_layers,
+                            layer_started.elapsed().as_millis()
+                        )
+                    });
+                }
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.buckets.add(layer_timing.buckets);
+                    timing.layers.push(layer_timing);
+                }
+                continue;
             }
             let mut pending_for_layer = deferred_expert_phase.take();
             let (deferred_attention_input, deferred_residual_input) = {
@@ -906,16 +966,29 @@ impl FlashMoeEngine {
                     Vec::new()
                 }
                 ScheduledLayerAttentionImplementation::FullAttentionCpuKv => {
-                    let values = self.full_attention_output_values(
-                        layer,
-                        &normed,
-                        deferred_attention_input,
-                        kv_cache,
-                        position,
-                        rope_position,
-                        runtime,
-                        record_detailed_timing.then_some(&mut layer_timing.buckets),
-                    )?;
+                    let values = if runtime.is_mla_attention_layer(layer) {
+                        self.mla_attention_output_values(
+                            layer,
+                            &normed,
+                            deferred_attention_input,
+                            kv_cache,
+                            position,
+                            rope_position,
+                            runtime,
+                            record_detailed_timing.then_some(&mut layer_timing.buckets),
+                        )?
+                    } else {
+                        self.full_attention_output_values(
+                            layer,
+                            &normed,
+                            deferred_attention_input,
+                            kv_cache,
+                            position,
+                            rope_position,
+                            runtime,
+                            record_detailed_timing.then_some(&mut layer_timing.buckets),
+                        )?
+                    };
                     post_attention_values_for_prep =
                         Some((attention_tensor_name(layer, "o_proj"), values));
                     Vec::new()
@@ -1028,7 +1101,8 @@ impl FlashMoeEngine {
                         format!(
                             "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: missing norm tensor {post_norm_name}"
                         )
-                    })?;
+                        })?;
+                let router_correction_bias = self.router_correction_bias(layer)?;
                 let mut prep = self.dense.post_attention_prep_with_metal(
                     metal,
                     layer,
@@ -1038,6 +1112,7 @@ impl FlashMoeEngine {
                     residual_input,
                     &post_norm_weight,
                     scheduled_cmd2.active_experts,
+                    router_correction_bias.as_deref(),
                 )?;
                 if deferred_residual_input.is_some()
                     && let Some(pending) = pending_for_layer.take()
@@ -1396,10 +1471,222 @@ impl FlashMoeEngine {
                 *value *= sigmoid(*gate);
             }
         }
-        if let Some(buckets) = attention_buckets.as_deref_mut() {
+        if let Some(buckets) = attention_buckets {
             buckets.attention_kernel += subphase_started.elapsed();
         }
         Ok(attended)
+    }
+
+    fn mla_attention_output_values(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        deferred_input: Option<MetalStateBuffer>,
+        kv_cache: &mut KvCache,
+        position: usize,
+        rope_position: MropePosition,
+        runtime: &DenseTransformerRuntime,
+        mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
+    ) -> Result<Vec<f32>> {
+        let layout = runtime.mla_attention_layout(layer)?;
+        let q_a_name = attention_tensor_name(layer, "q_a_proj");
+        let kv_a_name = attention_tensor_name(layer, "kv_a_proj_with_mqa");
+        let input_specs = [
+            DenseProjectionRequest::new(&q_a_name, layout.q_lora_rank)?,
+            DenseProjectionRequest::new(&kv_a_name, layout.kv_a_width)?,
+        ];
+        let subphase_started = OptionalInstant::now(attention_buckets.is_some());
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let mut projections = if let Some(input) = deferred_input {
+            self.dense.project_resident_tensors_from_metal_input(
+                &self.metal,
+                &input_specs,
+                input.buffer(),
+                input.len(),
+            )?
+        } else {
+            self.dense
+                .project_resident_tensors_from_cpu_input(&self.metal, &input_specs, normed)?
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let mut projections: Vec<Vec<f32>> =
+            { bail!("GLM MLA execution requires Apple Silicon Metal projections") };
+        let mut compressed = projections
+            .pop()
+            .context("missing batched MLA kv_a projection")?;
+        let mut q_lora = projections
+            .pop()
+            .context("missing batched MLA q_a projection")?;
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_input_projection += subphase_started.elapsed();
+        }
+
+        let subphase_started = OptionalInstant::now(attention_buckets.is_some());
+        let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_a_layernorm");
+        let q_norm = self
+            .model_norm_weight(&q_norm_name, layout.q_lora_rank)?
+            .with_context(|| format!("missing GLM MLA norm tensor {q_norm_name}"))?;
+        rms_norm_with_weight_and_epsilon_in_place(
+            &mut q_lora,
+            Some(&q_norm),
+            self.config
+                .glm_mla_norm_epsilon()
+                .context("GLM MLA execution requires its projection-norm epsilon")?,
+        );
+        let q_b_name = attention_tensor_name(layer, "q_b_proj");
+        let mut query = self
+            .dense
+            .project_resident_tensors_from_cpu_input(
+                &self.metal,
+                &[DenseProjectionRequest::new(&q_b_name, layout.q_width)?],
+                &q_lora,
+            )?
+            .pop()
+            .context("missing MLA q_b projection")?;
+        let theta = self.config.rope_theta.unwrap_or(10_000.0);
+        for head in 0..layout.num_heads {
+            let start = head * layout.qk_head_dim + layout.qk_nope_head_dim;
+            apply_rotary_interleaved_to_split_half(
+                &mut query[start..start + layout.qk_rope_head_dim],
+                rope_position.temporal,
+                layout.qk_rope_head_dim,
+                theta,
+            )?;
+        }
+        let mut rotary_key = compressed.split_off(layout.kv_lora_rank);
+        let kv_norm_name = layer_norm_tensor_name(layer, "self_attn.kv_a_layernorm");
+        let kv_norm = self
+            .model_norm_weight(&kv_norm_name, layout.kv_lora_rank)?
+            .with_context(|| format!("missing GLM MLA norm tensor {kv_norm_name}"))?;
+        rms_norm_with_weight_and_epsilon_in_place(
+            &mut compressed,
+            Some(&kv_norm),
+            self.config
+                .glm_mla_norm_epsilon()
+                .context("GLM MLA execution requires its projection-norm epsilon")?,
+        );
+        apply_rotary_interleaved_to_split_half(
+            &mut rotary_key,
+            rope_position.temporal,
+            layout.qk_rope_head_dim,
+            theta,
+        )?;
+        kv_cache.record_mla_kv(position, layer, compressed, rotary_key)?;
+        let scheduled_attention = self.scheduler.resolve_attention_math(layer, position)?;
+        let scheduled_output =
+            scheduled_attention.resolve_mla_kv_state(FlashMoeMlaKvState::cpu_visible(
+                position,
+                layer,
+                layout.kv_lora_rank,
+                layout.qk_rope_head_dim,
+            ))?;
+        let scheduled_implementation = scheduled_output.implementation();
+        if scheduled_implementation
+            != ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption
+        {
+            bail!(
+                "GLM MLA layer {layer} resolved unexpected scheduled attention implementation {:?}",
+                scheduled_implementation
+            );
+        }
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_misc += subphase_started.elapsed();
+        }
+
+        let subphase_started = OptionalInstant::now(attention_buckets.is_some());
+        let records = kv_cache.mla_records(position, layer)?;
+        let output = self
+            .dense
+            .mla_absorbed_attention(layer, layout, &query, &records)?;
+        if let Some(buckets) = attention_buckets {
+            buckets.attention_kernel += subphase_started.elapsed();
+        }
+        Ok(output)
+    }
+
+    fn forward_glm_dense_layer(
+        &self,
+        layer: usize,
+        token_state: &mut FlashMoeTokenState,
+        kv_cache: &mut KvCache,
+        position: usize,
+        rope_position: MropePosition,
+        runtime: &DenseTransformerRuntime,
+        mut buckets: Option<&mut FlashMoeTimingBuckets>,
+    ) -> Result<()> {
+        let norm_started = OptionalInstant::now(buckets.is_some());
+        let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
+        let normed = self.rms_norm_with_model_weight(&input_norm_name, token_state.hidden())?;
+        if let Some(buckets) = buckets.as_deref_mut() {
+            buckets.combine_norm += norm_started.elapsed();
+        }
+        let attention = self.mla_attention_output_values(
+            layer,
+            &normed,
+            None,
+            kv_cache,
+            position,
+            rope_position,
+            runtime,
+            buckets.as_deref_mut(),
+        )?;
+        let projection_started = OptionalInstant::now(buckets.is_some());
+        let o_name = attention_tensor_name(layer, "o_proj");
+        let projected = self
+            .dense
+            .project_resident_tensors_from_cpu_input(
+                &self.metal,
+                &[DenseProjectionRequest::new(&o_name, runtime.width)?],
+                &attention,
+            )?
+            .pop()
+            .context("missing GLM MLA output projection")?;
+        add_in_place(token_state.hidden_mut(), &projected);
+        if let Some(buckets) = buckets.as_deref_mut() {
+            buckets.attention_projection += projection_started.elapsed();
+        }
+
+        let mlp_started = OptionalInstant::now(buckets.is_some());
+        let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
+        let post_normed = self.rms_norm_with_model_weight(&post_norm_name, token_state.hidden())?;
+        let intermediate = self
+            .config
+            .intermediate_size
+            .with_context(|| format!("GLM dense MLP layer {layer} is missing intermediate_size"))?;
+        let gate_name = format!("model.layers.{layer}.mlp.gate_proj.weight");
+        let up_name = format!("model.layers.{layer}.mlp.up_proj.weight");
+        let mut gate_up = self.dense.project_resident_tensors_from_cpu_input(
+            &self.metal,
+            &[
+                DenseProjectionRequest::new(&gate_name, intermediate)?,
+                DenseProjectionRequest::new(&up_name, intermediate)?,
+            ],
+            &post_normed,
+        )?;
+        let up = gate_up
+            .pop()
+            .context("missing GLM dense MLP up projection")?;
+        let mut activated = gate_up
+            .pop()
+            .context("missing GLM dense MLP gate projection")?;
+        for (gate, up) in activated.iter_mut().zip(up) {
+            *gate = *gate * sigmoid(*gate) * up;
+        }
+        let down_name = format!("model.layers.{layer}.mlp.down_proj.weight");
+        let down = self
+            .dense
+            .project_resident_tensors_from_cpu_input(
+                &self.metal,
+                &[DenseProjectionRequest::new(&down_name, runtime.width)?],
+                &activated,
+            )?
+            .pop()
+            .context("missing GLM dense MLP down projection")?;
+        add_in_place(token_state.hidden_mut(), &down);
+        if let Some(buckets) = buckets {
+            buckets.expert_compute += mlp_started.elapsed();
+        }
+        Ok(())
     }
 
     fn resolve_full_attention_kv_state(
@@ -1434,6 +1721,9 @@ impl FlashMoeEngine {
                 layout.kv_heads,
                 layout.head_dim,
             ),
+            ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption => bail!(
+                "GLM MLA attention must execute through its compressed-KV weight-absorption stage"
+            ),
         }
     }
 
@@ -1459,6 +1749,25 @@ impl FlashMoeEngine {
         }
         self.dense
             .router_command_with_metal(Some(&self.metal), router_score_command, normed)
+    }
+
+    fn router_correction_bias(&self, layer: usize) -> Result<Option<Vec<f32>>> {
+        if self.config.glm.is_none() {
+            return Ok(None);
+        }
+        let tensor_name = format!("model.layers.{layer}.mlp.gate.e_score_correction_bias");
+        let bias = self
+            .dense
+            .read_full_tensor_f32(&tensor_name)?
+            .with_context(|| format!("missing GLM router correction bias {tensor_name}"))?;
+        if bias.len() != self.scheduler.experts_per_layer() {
+            bail!(
+                "GLM router correction bias {tensor_name} has {} values, expected {}",
+                bias.len(),
+                self.scheduler.experts_per_layer()
+            );
+        }
+        Ok(Some(bias))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1776,6 +2085,20 @@ impl FlashMoeEngine {
         let encode_elapsed = encode_started.elapsed();
         let max_tokens = request.max_tokens.max(0) as usize;
         validate_context_capacity(prompt_tokens.len(), max_tokens, request.context_size)?;
+        if let Some(glm) = self.config.glm.as_ref()
+            && glm.index_topk > 0
+        {
+            let required_tokens = prompt_tokens
+                .len()
+                .checked_add(max_tokens)
+                .context("GLM context token count overflow")?;
+            if required_tokens > glm.index_topk {
+                bail!(
+                    "GLM-5.2 full-causal MLA baseline is validated through index_topk={} tokens, but this request needs {required_tokens}; DSA selection is not implemented",
+                    glm.index_topk
+                );
+            }
+        }
         let generation_span = trace_span!(
             target: "flashmoe::perf",
             "generation",
@@ -2357,7 +2680,11 @@ impl FlashMoeEngine {
     ) -> Result<Vec<f32>> {
         let weight = self.model_norm_weight(canonical_name, input.len())?;
         let mut out = input.to_vec();
-        rms_norm_with_weight_in_place(&mut out, weight.as_deref());
+        rms_norm_with_weight_and_epsilon_in_place(
+            &mut out,
+            weight.as_deref(),
+            self.config.rms_norm_epsilon(),
+        );
         Ok(out)
     }
 

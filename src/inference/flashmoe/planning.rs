@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use super::experts::first_missing_expert_pack_for_shape;
-use super::model_family::{QwenModelConfig, is_qwen3_moe, is_qwen3_vl, is_qwen35_or_legacy_alias};
+use super::experts::first_missing_expert_pack_for_shape_from;
+use super::model_family::{
+    QwenModelConfig, is_glm52, is_qwen3_moe, is_qwen3_vl, is_qwen35_or_legacy_alias,
+};
 use super::types::{
     ACTIVE_EXPERTS_PER_TOKEN, BackendSelection, CacheStatus, ExpertQuantization,
     LEGACY_QWEN_CODER_MARKER, QWEN35_BF16_MODEL, QWEN35_MODEL,
@@ -97,6 +99,7 @@ pub struct FlashMoePlan {
     pub model_config: PathBuf,
     pub tokenizer: PathBuf,
     pub tokenizer_config: PathBuf,
+    pub chat_template: PathBuf,
     pub experts_dir: PathBuf,
     pub uses_metal: bool,
     pub streams_experts_from_nand: bool,
@@ -128,7 +131,7 @@ fn is_flashmoe_model_name(model: &str) -> bool {
     if normalized.contains("gguf") {
         return false;
     }
-    is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model) || is_qwen3_moe(model)
+    is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model) || is_qwen3_moe(model) || is_glm52(model)
 }
 
 pub fn is_flashmoe_hf_model(model: &str) -> bool {
@@ -147,7 +150,11 @@ pub fn canonical_model(model: &str) -> String {
 }
 
 pub fn cache_version_for_model(model: &str) -> &'static str {
-    default_expert_quantization(model).cache_version()
+    if is_glm52(model) {
+        super::types::GLM52_CACHE_VERSION
+    } else {
+        default_expert_quantization(model).cache_version()
+    }
 }
 
 pub fn default_expert_quantization(model: &str) -> ExpertQuantization {
@@ -211,7 +218,11 @@ pub fn plan_unchecked_with_routing_and_quantization(
         model,
         models_root,
         routing_policy,
-        quantization.cache_version(),
+        if is_glm52(model) && quantization == ExpertQuantization::FourBitProduction {
+            super::types::GLM52_CACHE_VERSION
+        } else {
+            quantization.cache_version()
+        },
         quantization,
     )
 }
@@ -251,6 +262,7 @@ fn plan_unchecked_with_cache_version_and_quantization(
         model_config: runtime_dir.join("config.json"),
         tokenizer: model_cache_dir.join("tokenizer.json"),
         tokenizer_config: model_cache_dir.join("tokenizer_config.json"),
+        chat_template: model_cache_dir.join("chat_template.jinja"),
         experts_dir: runtime_dir.join("packed_experts"),
         runtime_dir,
         model,
@@ -297,10 +309,11 @@ impl FlashMoePlan {
                     self.model_config.display()
                 )
             })?;
-            if let Some(missing_expert) = first_missing_expert_pack_for_shape(
+            if let Some(missing_expert) = first_missing_expert_pack_for_shape_from(
                 &self.experts_dir,
                 config.num_hidden_layers,
                 config.experts(),
+                config.first_sparse_layer(),
             )? {
                 missing.push(missing_expert);
             }
@@ -330,9 +343,16 @@ impl FlashMoePlan {
             .ok()
             .map(|(_, bytes)| format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0)))
             .unwrap_or_else(|| "unknown".to_string());
+        let runtime_cache_version = if is_glm52(&self.model)
+            && self.quantization == ExpertQuantization::FourBitProduction
+        {
+            super::types::GLM52_CACHE_VERSION
+        } else {
+            self.quantization.cache_version()
+        };
         format!(
             "Flash-MoE {} for {}: {} layers, {} experts/layer, K={}, hidden={}, cache={}, expert store={} (~{} GiB)",
-            self.quantization.cache_version(),
+            runtime_cache_version,
             self.model,
             layers,
             experts,
@@ -487,9 +507,10 @@ pub fn clean_source_shards(
 }
 
 fn is_flashmoe_source_shard_name(file_name: &str) -> bool {
-    (file_name.starts_with("model.safetensors-") || file_name.starts_with("model-"))
+    ((file_name.starts_with("model.safetensors-") || file_name.starts_with("model-"))
         && file_name.contains("-of-")
-        && file_name.ends_with(".safetensors")
+        && file_name.ends_with(".safetensors"))
+        || (file_name.starts_with("out-") && file_name.ends_with(".safetensors"))
 }
 
 fn ensure_cache_cleanup_candidate_is_safe(
@@ -541,7 +562,8 @@ mod tests {
         ExpertLayerPackMetadata, ExpertPackMetadata, expert_layer_metadata_path, expert_layer_path,
     };
     use crate::inference::flashmoe::types::{
-        BF16_CACHE_VERSION, CACHE_VERSION, F16_CACHE_VERSION, QWEN3_VL_MODEL,
+        BF16_CACHE_VERSION, CACHE_VERSION, F16_CACHE_VERSION, GLM52_CACHE_VERSION,
+        GLM52_COLIBRI_MODEL, GLM52_MODEL, GLM52_MXFP4_MODEL, QWEN3_VL_MODEL,
     };
 
     fn qwen_config(model_type: &str, active_experts: usize) -> QwenModelConfig {
@@ -663,6 +685,9 @@ mod tests {
         assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-235B-A22B-Instruct"));
         assert!(is_flashmoe_hf_model(QWEN3_VL_MODEL));
         assert!(is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-30B-A3B-Instruct"));
+        assert!(is_flashmoe_hf_model(GLM52_MODEL));
+        assert!(is_flashmoe_hf_model(GLM52_COLIBRI_MODEL));
+        assert_eq!(GLM52_MODEL, GLM52_MXFP4_MODEL);
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-8B-Instruct"));
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-8B"));
         assert!(!is_flashmoe_hf_model("qwen3-30b-a3b"));
@@ -723,6 +748,11 @@ mod tests {
         );
         assert_eq!(canonical_model(QWEN35_BF16_MODEL), QWEN35_BF16_MODEL);
         assert_eq!(cache_version_for_model(QWEN35_MODEL), CACHE_VERSION);
+        assert_eq!(cache_version_for_model(GLM52_MODEL), GLM52_CACHE_VERSION);
+        assert_eq!(
+            cache_version_for_model(GLM52_COLIBRI_MODEL),
+            GLM52_CACHE_VERSION
+        );
         assert_eq!(
             cache_version_for_model(QWEN35_BF16_MODEL),
             BF16_CACHE_VERSION
@@ -731,6 +761,10 @@ mod tests {
         let plan = plan_unchecked(QWEN35_BF16_MODEL, Path::new("/models"));
         assert!(plan.runtime_dir.ends_with(BF16_CACHE_VERSION));
         assert_eq!(plan.model, QWEN35_BF16_MODEL);
+
+        let glm = plan_unchecked(GLM52_MODEL, Path::new("/models"));
+        assert!(glm.runtime_dir.ends_with(GLM52_CACHE_VERSION));
+        assert!(glm.describe().contains(GLM52_CACHE_VERSION));
     }
 
     #[test]

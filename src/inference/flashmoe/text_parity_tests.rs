@@ -76,6 +76,13 @@ fn test_tokenizer_config_json_with_template(template: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+fn test_tokenizer_config_json_without_template() -> Vec<u8> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(test_tokenizer_config_json()).unwrap();
+    value.as_object_mut().unwrap().remove("chat_template");
+    serde_json::to_vec(&value).unwrap()
+}
+
 #[test]
 fn flashmoe_tokenizer_loads_metadata_from_active_model_dir() {
     let tmp = tempfile::tempdir().unwrap();
@@ -88,7 +95,12 @@ fn flashmoe_tokenizer_loads_metadata_from_active_model_dir() {
     )
     .unwrap();
     let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
-    let tokenizer = QwenTokenizer::from_files(&plan.tokenizer, &plan.tokenizer_config).unwrap();
+    let tokenizer = QwenTokenizer::from_files(
+        &plan.tokenizer,
+        &plan.tokenizer_config,
+        Some(&plan.chat_template),
+    )
+    .unwrap();
     assert_eq!(tokenizer.eos_token_id(), 101);
     assert_eq!(tokenizer.encode("<|im_end|>").unwrap(), vec![101]);
 }
@@ -327,6 +339,51 @@ fn qwen_tokenizer_loads_tokenizer_config_chat_template() {
     assert_eq!(
         tokenizer.encode(&templated).unwrap(),
         vec![100, 5, 3, 101, 100, 6]
+    );
+}
+
+#[test]
+fn glm_tokenizer_uses_external_chat_template_when_config_omits_it() {
+    let config = test_tokenizer_config_json_without_template();
+    let external = br#"{{- '[gMASK]<sop>' }}{%- for message in messages %}{{- '<|' + message.role + '|>' + message.content }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|assistant|>' }}{%- if enable_thinking is false %}{{- '<think></think>' }}{%- endif %}{%- endif %}"#;
+    let tokenizer = QwenTokenizer::from_json_bytes_with_config_and_chat_template(
+        test_tokenizer_json(),
+        &config,
+        external,
+    )
+    .unwrap();
+
+    let rendered = tokenizer
+        .apply_chat_template_to_messages_with_thinking(
+            &[ChatMessage::text(ChatRole::User, "What is 2+2?")],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        rendered,
+        "[gMASK]<sop><|user|>What is 2+2?<|assistant|><think></think>"
+    );
+}
+
+#[test]
+fn embedded_chat_template_takes_precedence_over_external_template() {
+    let tokenizer = QwenTokenizer::from_json_bytes_with_config_and_chat_template(
+        test_tokenizer_json(),
+        test_tokenizer_config_json(),
+        b"external-template-must-not-win",
+    )
+    .unwrap();
+
+    let rendered = tokenizer
+        .apply_chat_template_to_messages(&[ChatMessage::text(ChatRole::User, "hi")], &[], true)
+        .unwrap();
+
+    assert_eq!(
+        rendered,
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
     );
 }
 

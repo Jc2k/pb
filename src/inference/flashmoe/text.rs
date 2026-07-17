@@ -108,7 +108,11 @@ struct TokenizerConfigAddedToken {
 }
 
 impl QwenTokenizer {
-    pub(super) fn from_files(tokenizer_path: &Path, config_path: &Path) -> Result<Self> {
+    pub(super) fn from_files(
+        tokenizer_path: &Path,
+        config_path: &Path,
+        external_chat_template_path: Option<&Path>,
+    ) -> Result<Self> {
         if !config_path.is_file() {
             bail!(
                 "Flash-MoE tokenizer config is required for chat generation: missing {}",
@@ -123,7 +127,25 @@ impl QwenTokenizer {
         let config_bytes = fs::read(config_path).with_context(|| {
             format!("failed to read tokenizer config {}", config_path.display())
         })?;
-        Self::from_json_bytes_with_tokenizer(&bytes, tokenizer, &config_bytes).with_context(|| {
+        let external_chat_template = external_chat_template_path
+            .filter(|path| path.is_file())
+            .map(fs::read)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "failed to read external tokenizer chat template {}",
+                    external_chat_template_path
+                        .expect("present when an external template read was attempted")
+                        .display()
+                )
+            })?;
+        Self::from_json_bytes_with_tokenizer(
+            &bytes,
+            tokenizer,
+            &config_bytes,
+            external_chat_template.as_deref(),
+        )
+        .with_context(|| {
             format!(
                 "failed to load Flash-MoE tokenizer metadata from {} and {}",
                 tokenizer_path.display(),
@@ -146,16 +168,34 @@ impl QwenTokenizer {
             .map_err(|err| anyhow::anyhow!("{err}"))
             .context("tokenizer JSON is invalid")?;
         let config_bytes = config_bytes.context("test tokenizer config is required")?;
-        Self::from_json_bytes_with_tokenizer(bytes, tokenizer, config_bytes)
+        Self::from_json_bytes_with_tokenizer(bytes, tokenizer, config_bytes, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_json_bytes_with_config_and_chat_template(
+        bytes: &[u8],
+        config_bytes: &[u8],
+        external_chat_template: &[u8],
+    ) -> Result<Self> {
+        let tokenizer = Tokenizer::from_bytes(bytes)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+            .context("tokenizer JSON is invalid")?;
+        Self::from_json_bytes_with_tokenizer(
+            bytes,
+            tokenizer,
+            config_bytes,
+            Some(external_chat_template),
+        )
     }
 
     fn from_json_bytes_with_tokenizer(
         bytes: &[u8],
         tokenizer: Tokenizer,
         config_bytes: &[u8],
+        external_chat_template: Option<&[u8]>,
     ) -> Result<Self> {
         let _ = bytes;
-        let config = QwenTokenizerConfig::from_bytes(config_bytes)?;
+        let config = QwenTokenizerConfig::from_bytes(config_bytes, external_chat_template)?;
         if config.split_special_tokens {
             bail!(
                 "tokenizer_config.json sets split_special_tokens=true, which is unsupported for Flash-MoE because generation stop tokens must remain atomic"
@@ -306,7 +346,7 @@ impl QwenTokenizer {
             return Ok(rendered);
         }
         bail!(
-            "tokenizer_config.json is missing chat_template and tokenizer.json is missing Qwen chat special tokens; Flash-MoE chat generation requires one of them"
+            "tokenizer_config.json and chat_template.jinja are missing a chat template, and tokenizer.json is missing Qwen chat special tokens; Flash-MoE chat generation requires one of them"
         )
     }
 
@@ -383,7 +423,7 @@ impl QwenTokenizer {
 }
 
 impl QwenTokenizerConfig {
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    fn from_bytes(bytes: &[u8], external_chat_template: Option<&[u8]>) -> Result<Self> {
         let value: Value =
             serde_json::from_slice(bytes).context("tokenizer_config.json is invalid")?;
         let bos_token = config_token_string(value.get("bos_token"), "bos_token")?;
@@ -402,7 +442,14 @@ impl QwenTokenizerConfig {
             value.get("additional_special_tokens"),
             "additional_special_tokens",
         )?;
-        let chat_template = TokenizerChatTemplate::from_tokenizer_config_value(&value)?;
+        let chat_template = match TokenizerChatTemplate::from_tokenizer_config_value(&value)? {
+            embedded @ Some(_) => embedded,
+            None => external_chat_template
+                .map(|template| {
+                    TokenizerChatTemplate::from_external_template_bytes(template, &value)
+                })
+                .transpose()?,
+        };
         if eos_tokens.is_empty() {
             bail!("tokenizer_config.json must define eos_token for Flash-MoE");
         }

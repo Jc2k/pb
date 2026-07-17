@@ -92,8 +92,10 @@ pub enum FlashMoeStageImplementation {
     MetalResidentAttentionProjections,
     MetalResidentQ4AttentionProjections,
     QwenFullAttentionCpuKv,
+    GlmMlaCpuWeightAbsorption,
     MetalResidentPostAttention,
     CpuSoftmaxTopK,
+    CpuSigmoidNoAuxTopK,
     ParallelPositionedWholeExpertReads,
     MetalTypedExpertResidentSharedCombine,
     MetalResidentLmHeadSampler,
@@ -110,10 +112,12 @@ impl FlashMoeStageImplementation {
             }
             Self::MetalResidentQ4AttentionProjections => "Metal resident-Q4 attention projections",
             Self::QwenFullAttentionCpuKv => "Qwen full-attention CPU KV implementation",
+            Self::GlmMlaCpuWeightAbsorption => "GLM compressed-KV MLA with CPU weight absorption",
             Self::MetalResidentPostAttention => {
                 "Metal resident Q4/BF16/F16/F32 post-attention and router projection"
             }
             Self::CpuSoftmaxTopK => "Qwen-family CPU softmax/topK",
+            Self::CpuSigmoidNoAuxTopK => "GLM CPU sigmoid/noaux topK",
             Self::ParallelPositionedWholeExpertReads => {
                 "parallel positioned reads into typed fixed Q4/BF16/F16 whole-expert slots"
             }
@@ -237,6 +241,7 @@ impl FlashMoeCapabilityPlan {
         })?;
         if expert_storage.slot_spec != expected_slot_spec
             || expert_storage.layers != layout.layers
+            || expert_storage.first_expert_layer != layout.first_sparse_layer
             || expert_storage.experts_per_layer != layout.experts_per_layer
         {
             return Err(FlashMoeUnsupportedCapability::new(
@@ -332,6 +337,16 @@ impl FlashMoeCapabilityPlan {
             FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
             &[cmd2_projection_kernel, kernels::RESIDUAL_ADD_RMS_NORM],
         )?;
+        if layout.family == QwenMoeFamily::Glm52 {
+            // Colibri keeps the router in F32 even though the resident
+            // attention/shared projections are Q4.
+            require_stage_kernels(
+                layout.family,
+                &metal,
+                FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
+                &[kernels::DENSE_MMAP_FMA_MATVEC_F32],
+            )?;
+        }
         let active_expert_kernels: &[&str] = match expert_storage.layout {
             ExpertStorageLayout::FixedQ4 => &[
                 kernels::Q4_FMA_MATVEC_BF16_SCALE_BIAS,
@@ -387,6 +402,16 @@ impl FlashMoeCapabilityPlan {
             FlashMoeGraphStage::LmHeadAndSampling,
             &[lm_head_projection_kernel, kernels::TOPK_VOCAB],
         )?;
+        if layout.family == QwenMoeFamily::Glm52 {
+            // The published Colibri snapshot stores embedding/LM-head source
+            // weights at int8; pull preserves them as resident BF16.
+            require_stage_kernels(
+                layout.family,
+                &metal,
+                FlashMoeGraphStage::LmHeadAndSampling,
+                &[kernels::DENSE_MMAP_FMA_MATVEC_BF16],
+            )?;
+        }
 
         let stages = vec![
             FlashMoeStageCapability::new(
@@ -407,7 +432,11 @@ impl FlashMoeCapabilityPlan {
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::AttentionMath,
                 FlashMoeStagePlacement::CpuDeclared,
-                FlashMoeStageImplementation::QwenFullAttentionCpuKv,
+                if layout.family == QwenMoeFamily::Glm52 {
+                    FlashMoeStageImplementation::GlmMlaCpuWeightAbsorption
+                } else {
+                    FlashMoeStageImplementation::QwenFullAttentionCpuKv
+                },
             ),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
@@ -417,7 +446,14 @@ impl FlashMoeCapabilityPlan {
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::RoutingSoftmaxTopK,
                 FlashMoeStagePlacement::CpuDeclared,
-                FlashMoeStageImplementation::CpuSoftmaxTopK,
+                match layout.execution.routing {
+                    QwenMoeRoutingPlacement::CpuSoftmaxTopK => {
+                        FlashMoeStageImplementation::CpuSoftmaxTopK
+                    }
+                    QwenMoeRoutingPlacement::CpuSigmoidNoAuxTopK => {
+                        FlashMoeStageImplementation::CpuSigmoidNoAuxTopK
+                    }
+                },
             ),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::ActiveExpertReads,
@@ -530,7 +566,7 @@ fn resolve_input_adapter(
 ) -> Result<FlashMoeStageImplementation, FlashMoeUnsupportedCapability> {
     match (layout.family, input_adapter) {
         (
-            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe,
+            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Glm52,
             FlashMoeInputAdapterCapability::QwenText,
         ) => Ok(FlashMoeStageImplementation::QwenTextInput),
         (
@@ -597,6 +633,7 @@ fn test_expert_storage(
         layout: ExpertStorageLayout::FixedQ4,
         slot_spec: ExpertSlotSpec::FixedQ4(fixed_q4),
         layers: layout.layers,
+        first_expert_layer: layout.first_sparse_layer,
         experts_per_layer: layout.experts_per_layer,
     })
 }
@@ -627,7 +664,10 @@ fn validate_upstream_execution_policy(
             "only the unified FlashMoe execution architecture is supported",
         ));
     }
-    if execution.routing != QwenMoeRoutingPlacement::CpuSoftmaxTopK {
+    if !matches!(
+        execution.routing,
+        QwenMoeRoutingPlacement::CpuSoftmaxTopK | QwenMoeRoutingPlacement::CpuSigmoidNoAuxTopK
+    ) {
         return Err(FlashMoeUnsupportedCapability::new(
             layout.family,
             FlashMoeGraphStage::RoutingSoftmaxTopK,
@@ -714,7 +754,7 @@ impl Error for FlashMoeUnsupportedCapability {}
 mod tests {
     use super::*;
     use crate::inference::flashmoe::experts::{DenseExpertDtype, FixedDenseExpertSlotSpec};
-    use crate::inference::flashmoe::{QWEN3_VL_MODEL, QWEN35_MODEL, QwenModelConfig};
+    use crate::inference::flashmoe::{GLM52_MODEL, QWEN3_VL_MODEL, QWEN35_MODEL, QwenModelConfig};
 
     fn config(json: &[u8]) -> QwenModelConfig {
         serde_json::from_slice(json).unwrap()
@@ -796,6 +836,40 @@ mod tests {
         QwenMoeModelLayout::from_config("hf://Qwen/Qwen3-30B-A3B", &config).unwrap()
     }
 
+    fn glm52_layout() -> QwenMoeModelLayout {
+        let config = config(
+            br#"{
+  "model_type": "glm_moe_dsa",
+  "architectures": ["GlmMoeDsaForCausalLM"],
+  "num_hidden_layers": 4,
+  "hidden_size": 6144,
+  "num_attention_heads": 64,
+  "head_dim": 192,
+  "vocab_size": 154880,
+  "rope_parameters": {"rope_theta": 8000000.0},
+  "torch_dtype": "bfloat16",
+  "n_routed_experts": 256,
+  "num_experts_per_tok": 8,
+  "n_shared_experts": 1,
+  "norm_topk_prob": true,
+  "moe_intermediate_size": 2048,
+  "intermediate_size": 12288,
+  "first_k_dense_replace": 3,
+  "q_lora_rank": 2048,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 192,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 256,
+  "n_group": 1,
+  "topk_group": 1,
+  "routed_scaling_factor": 2.5,
+  "rms_norm_eps": 0.00001,
+  "index_topk": 2048
+}"#,
+        );
+        QwenMoeModelLayout::from_config(GLM52_MODEL, &config).unwrap()
+    }
+
     fn attention_layers(layout: &QwenMoeModelLayout) -> Vec<QwenMoeLayerKind> {
         (0..layout.layers)
             .map(|layer| layout.layer_kind(layer))
@@ -818,6 +892,7 @@ mod tests {
             },
             slot_spec: ExpertSlotSpec::FixedDense(slot),
             layers: layout.layers,
+            first_expert_layer: layout.first_sparse_layer,
             experts_per_layer: layout.experts_per_layer,
         }
     }
@@ -854,6 +929,12 @@ mod tests {
     fn metal_without_dense_bf16() -> MetalRuntimeCapabilities {
         let mut names = MetalPipelineNameSet::new();
         names.dense_mmap_bf16 = kernels::FILL_ZERO;
+        MetalRuntimeCapabilities::from_pipeline_names(names)
+    }
+
+    fn metal_without_dense_f32() -> MetalRuntimeCapabilities {
+        let mut names = MetalPipelineNameSet::new();
+        names.dense_mmap_f32 = kernels::FILL_ZERO;
         MetalRuntimeCapabilities::from_pipeline_names(names)
     }
 
@@ -1360,6 +1441,57 @@ mod tests {
                 .implementation,
             FlashMoeStageImplementation::QwenFullAttentionCpuKv
         );
+    }
+
+    #[test]
+    fn glm52_capability_binds_mla_sigmoid_routing_and_sparse_expert_boundary() {
+        let layout = glm52_layout();
+        let plan = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+
+        assert_eq!(plan.family, QwenMoeFamily::Glm52);
+        assert_eq!(plan.expert_storage.first_expert_layer, 3);
+        assert_eq!(plan.routed_expert_scale, 2.5);
+        assert_eq!(
+            plan.stage(FlashMoeGraphStage::AttentionMath)
+                .unwrap()
+                .implementation,
+            FlashMoeStageImplementation::GlmMlaCpuWeightAbsorption
+        );
+        assert_eq!(
+            plan.stage(FlashMoeGraphStage::RoutingSoftmaxTopK)
+                .unwrap()
+                .implementation,
+            FlashMoeStageImplementation::CpuSigmoidNoAuxTopK
+        );
+        let graph =
+            crate::inference::flashmoe::scheduler::FlashMoeScheduledGraph::from_capabilities(&plan)
+                .unwrap();
+        assert_eq!(
+            graph.build_attention_math(3, 0).unwrap().implementation,
+            crate::inference::flashmoe::scheduler::ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption
+        );
+
+        for (metal, expected_stage) in [
+            (
+                metal_without_dense_f32(),
+                FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
+            ),
+            (
+                metal_without_dense_bf16(),
+                FlashMoeGraphStage::LmHeadAndSampling,
+            ),
+        ] {
+            let error = FlashMoeCapabilityPlan::resolve(
+                &layout,
+                text_adapter(),
+                ResidentDenseLayout::Q4,
+                fixed_q4_experts(&layout),
+                &attention_layers(&layout),
+                Some(metal),
+            )
+            .unwrap_err();
+            assert_eq!(error.stage, expected_stage);
+        }
     }
 
     #[test]

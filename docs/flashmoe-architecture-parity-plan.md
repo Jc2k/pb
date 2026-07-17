@@ -5,7 +5,7 @@ This document is the source of truth for bringing pb's MoE backend into architec
 tokenizers, structured requests, Qwen-family model support, Qwen-VL inputs, and the shared inference
 facade with llama.cpp.
 
-The target is one scheduled execution graph for supported Qwen-family MoE models. FlashMoe owns
+The target is one scheduled execution graph for supported MoE model families. FlashMoe owns
 buffer lifetime, expert scheduling, command-buffer sequencing, read scheduling, state transitions,
 and CPU/GPU placement. Model variants provide typed stage implementations without creating another
 runtime.
@@ -66,6 +66,68 @@ The Qwen3.5 Q4 implementation must preserve these upstream-shaped properties:
 - Expert Q4 matvec uses the upstream FMA dequant form.
 - Throughput comparison uses sustained decode/generation throughput. TTFT and prefill are reported
   separately.
+
+## GLM-5.2 Extension Contract
+
+Status: **Shipped baseline**. Indexed MLX MXFP4 and unindexed Colibri import, dense lead-in layers,
+compressed-KV MLA, sigmoid/noaux routing, shared-expert execution, and streamed routed experts are
+implemented. The full `mlx-community/GLM-5.2-mxfp4` checkpoint has completed cache construction,
+load, prefill, decode, and deterministic text generation through FlashMoe. DSA and MTP remain
+design-record follow-ons rather than shipped guarantees.
+
+GLM-5.2 support extends the same scheduler and runtime rather than embedding a checkpoint producer
+or adding an alternate engine. Source-specific quantization ends at the pull/cache boundary;
+runtime storage is normalized into pb's typed resident-dense and fixed-slot expert layouts before
+graph resolution.
+
+- The preferred source is `mlx-community/GLM-5.2-mxfp4`. Its indexed U32 weights hold low-nibble-
+  first E2M1 values and its U8 scales hold E8M0 powers of two for groups of 32. Pull validates that
+  layout, decodes a row at a time, and uses the existing affine-MSE Q4 quantizer to publish the
+  canonical group-64 packed weights with BF16 scale/bias records. Resumable expert validation hashes
+  the exact source weight/scale slice without performing that conversion twice.
+- Pull preserves a repository-level `chat_template.jinja` beside the tokenizer. Text rendering uses
+  an embedded `tokenizer_config.json` template first and otherwise loads that external template, so
+  GLM role/control tokens are applied in ordinary chat generation while `--raw` remains an explicit
+  diagnostic completion path.
+- The Colibri adapter remains supported for unindexed `out-*.safetensors`: packed offset-binary int4
+  or signed int8 tensors plus F32 `.qs` row/group scales. It preserves int4 nibbles, converts
+  symmetric scales into the same affine records, and preserves int8 input/output precision as
+  resident BF16.
+- Both adapters publish the normal aligned dense blob and per-layer fixed expert files under the
+  GLM-specific cache version. Runtime code sees the canonical manifest and never parses MXFP4 or
+  Colibri source containers.
+- Dense attention, embeddings, norms, the first three dense MLPs, and one shared expert per sparse
+  layer remain resident. Routed experts use the existing scheduler-owned parallel positioned-read
+  path, reusable whole-expert slots, Metal CMD3 implementation, and OS page cache; GLM does not add
+  an application expert cache or speculative expert I/O path.
+- GLM's attention implementation is MLA with q/kv LoRA, partial interleaved RoPE, and a compressed
+  KV record containing the normalized KV latent plus rotary key. It is a typed attention-stage
+  implementation in the shared graph, not a separate layer loop. The scheduler declares the
+  unequal latent/rotary widths as MLA state rather than weakening the equal-width K/V contract used
+  by full attention. Q/KV LoRA projection norms retain GLM's fixed `1e-6` epsilon independently of
+  the decoder RMSNorm epsilon in config. Runtime weight absorption accepts either the original
+  two-dimensional `kv_b_proj` or MLX-LM's equivalent pre-absorbed per-head `embed_q` and
+  `unembed_out` tensors; both execute against the same compressed cache without materializing
+  per-token keys and values.
+- Sparse layers select experts with sigmoid scores, `e_score_correction_bias` for selection only,
+  top-K over the corrected scores, selected raw sigmoid weights normalized when
+  `norm_topk_prob=true`, and `routed_scaling_factor` applied after normalization. Qwen softmax
+  routing remains unchanged.
+- `first_k_dense_replace` selects a resident SwiGLU feed-forward stage for the leading layers.
+  Sparse layers retain the shared CMD2/CMD3 lifecycle and always-active shared expert.
+- The baseline correctness graph uses full causal MLA. DSA sparse selection and the MTP head are
+  follow-on typed accelerators and must not silently alter baseline precision, routing, or output.
+  Until DSA is implemented, support must report its validated context/correctness boundary rather
+  than claiming token-exact long-context parity.
+- Focused validation covers indexed MLX MXFP4 dense and aggregate-expert conversion, exact E2M1 and
+  E8M0 decoding, Colibri int4/int8 import, unindexed shards, logical-shape recovery, MLA weight
+  absorption with fused and pre-absorbed weights, distinct compressed-KV scheduler state, RoPE
+  layout, sigmoid/noaux routing, graph capability binding, and sparse-layer expert metadata. Real
+  checkpoint evidence covers all 78 decoder layers, 75 streamed sparse layers, first-token sampling,
+  an eight-token decode, and the checkpoint's full external chat template. A deterministic
+  no-thinking chat request for `What is 2+2?` begins with `4`; the diagnostic raw prompt
+  `The capital of France is` begins with `Paris`. Model loading rejects incomplete MLA,
+  router-bias, dense-lead-in, or expert artifacts before allocating generation state.
 
 ## Scheduled Graph
 
@@ -865,6 +927,7 @@ Current capability matrix:
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
 | Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes; load requires the selected policy to equal metadata-resolved slots before capability resolution | Cross-family 12-combination graph matrix, CLI/planning selection and 3x3 policy/layout rejection coverage, storage, scheduler, and local-Metal fixtures; real checkpoint pending |
+| GLM-5.2 | Canonical resident Q4 plus BF16 Colibri input/output / fixed-Q4 slots from layer 3 | Shipped baseline through the unified runtime and expert scheduler; indexed MLX MXFP4 and unindexed Colibri are source adapters, full causal MLA is bounded by `index_topk`, and DSA/MTP are unimplemented | MXFP4 and Colibri import, MLA/RoPE/KV, routing, capability, expert-boundary, all-target, release, full cache build, and real text inference evidence |
 
 Completion evidence:
 

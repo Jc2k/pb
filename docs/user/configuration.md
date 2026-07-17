@@ -26,6 +26,41 @@ The web server binds to `127.0.0.1:8311` by default. Changing `web.listen` to `0
 interface on available networks. pb does not add authentication or TLS merely because the address
 changed, so treat non-loopback binding as an explicit trust decision.
 
+## GLM-5.2 with FlashMoe
+
+**Configurable.** On Apple Silicon, pb can import GLM-5.2 checkpoints and run the baseline decoder
+through FlashMoe. The preferred source is the indexed MLX MXFP4 checkpoint:
+
+```bash
+pb pull hf://mlx-community/GLM-5.2-mxfp4
+pb config set model.model hf://mlx-community/GLM-5.2-mxfp4
+```
+
+Pull recognizes MLX MXFP4 tensors as packed E2M1 values with one E8M0 scale per 32 values. It
+decodes one row at a time and requantizes it once into FlashMoe's canonical affine Q4 cache; the
+runtime and expert scheduler never depend on the source checkpoint's container or quantization.
+When a checkpoint publishes `chat_template.jinja` separately from `tokenizer_config.json`, pull
+preserves it alongside the tokenizer and FlashMoe uses it for non-raw chat generation. `--raw`
+deliberately bypasses that model-specific conversation framing and is intended for completion and
+diagnostic prompts rather than chat-quality validation.
+The Colibri checkpoint remains a compatible alternative:
+
+```bash
+pb pull hf://jlnsrk/GLM-5.2-colibri-int4
+pb config set model.model hf://jlnsrk/GLM-5.2-colibri-int4
+```
+
+That adapter imports packed offset-binary int4 tensors and preserves Colibri's int8 input/output
+matrices as resident BF16. Both source snapshots are very large. Plan for enough space for the
+source and runtime cache during conversion, or pass `--flashmoe-prune-source-shards` to delete
+source safetensor shards after the runtime cache is complete. The indexed MLX checkpoint has
+completed full-size cache construction plus deterministic prefill and decode validation. Support
+remains Configurable because it requires an explicitly selected local checkpoint and Apple Silicon.
+
+The baseline supports requests through the checkpoint's `index_topk` boundary (2,048 tokens in the
+published snapshot). Longer contexts require GLM's DSA indexer and are rejected explicitly; DSA and
+the optional MTP speculative head are not currently implemented.
+
 ## Project configuration
 
 Project-specific files live below `.pb/` in the repository:

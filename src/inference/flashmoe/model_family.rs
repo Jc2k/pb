@@ -6,9 +6,11 @@ use serde::{Deserialize, de};
 
 use super::types::{
     ACTIVE_EXPERTS_PER_TOKEN, DEFAULT_MROPE_SECTION, FOUR_BIT_EXPERT_SIZE, FULL_ATTN_INTERVAL,
-    FlashMoeLayerKind, GROUP_SIZE, LEGACY_QWEN_CODER_MARKER, NUM_EXPERTS,
+    FlashMoeLayerKind, GLM52_MODEL_MARKER, GROUP_SIZE, LEGACY_QWEN_CODER_MARKER, NUM_EXPERTS,
     QWEN3_ACTIVE_PARAMS_MARKER, QWEN3_VL_MODEL_MARKER, QWEN35_MODEL_MARKER,
 };
+#[cfg(test)]
+use super::types::{GLM52_COLIBRI_MODEL, GLM52_MODEL, GLM52_MXFP4_MODEL};
 use super::vision::Qwen3VLVisionConfig;
 
 pub const QWEN35_Q4_EXPERT_PACKED_WEIGHT_BYTES: usize = 2_097_152;
@@ -18,6 +20,13 @@ pub const QWEN35_Q4_EXPERT_BIAS_BYTES: usize = 131_072;
 pub fn is_qwen35_or_legacy_alias(model: &str) -> bool {
     let normalized = model.to_ascii_lowercase();
     normalized.contains(QWEN35_MODEL_MARKER) || normalized.contains(LEGACY_QWEN_CODER_MARKER)
+}
+
+pub fn is_glm52(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    normalized.contains(GLM52_MODEL_MARKER)
+        || normalized.contains("glm_5.2")
+        || normalized.contains("glm5.2")
 }
 
 pub fn is_qwen3_vl(model: &str) -> bool {
@@ -55,6 +64,7 @@ pub enum QwenMoeFamily {
     Qwen35A17B,
     Qwen3Moe,
     Qwen3VlMoe,
+    Glm52,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +91,7 @@ impl From<QwenMoeLayerKind> for FlashMoeLayerKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QwenMoeRoutingPlacement {
     CpuSoftmaxTopK,
+    CpuSigmoidNoAuxTopK,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +139,30 @@ impl QwenMoeExecutionPolicy {
         expert_buffer_ownership: QwenMoeExpertBufferOwnership::SchedulerReusableWholeExpertSlots,
         command_topology: QwenMoeCommandTopology::UpstreamCmd1Cmd2Cmd3,
     };
+
+    pub const GLM52_PARITY: Self = Self {
+        architecture: QwenMoeExecutionArchitecture::UnifiedFlashMoe,
+        routing: QwenMoeRoutingPlacement::CpuSigmoidNoAuxTopK,
+        expert_reads: QwenMoeExpertReadStrategy::ParallelPositionedReads,
+        expert_cache: QwenMoeExpertCachePolicy::OsPageCacheOnly,
+        expert_buffer_ownership: QwenMoeExpertBufferOwnership::SchedulerReusableWholeExpertSlots,
+        command_topology: QwenMoeCommandTopology::UpstreamCmd1Cmd2Cmd3,
+    };
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlmMoeConfig {
+    pub first_k_dense_replace: usize,
+    pub q_lora_rank: usize,
+    pub kv_lora_rank: usize,
+    pub qk_nope_head_dim: usize,
+    pub qk_rope_head_dim: usize,
+    pub v_head_dim: usize,
+    pub n_group: usize,
+    pub topk_group: usize,
+    pub routed_scaling_factor: f32,
+    pub rms_norm_eps: f32,
+    pub index_topk: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +189,7 @@ pub struct QwenModelConfig {
     pub num_shared_experts: Option<usize>,
     pub shared_expert_intermediate_size: Option<usize>,
     pub vision_config: Option<Qwen3VLVisionConfig>,
+    pub glm: Option<GlmMoeConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -183,6 +219,19 @@ struct RawQwenModelConfig {
     text_config: Option<RawQwenTextConfig>,
     rope_parameters: Option<RawQwenRopeParameters>,
     rope_scaling: Option<RawQwenRopeParameters>,
+    n_routed_experts: Option<usize>,
+    n_shared_experts: Option<usize>,
+    first_k_dense_replace: Option<usize>,
+    q_lora_rank: Option<usize>,
+    kv_lora_rank: Option<usize>,
+    qk_nope_head_dim: Option<usize>,
+    qk_rope_head_dim: Option<usize>,
+    v_head_dim: Option<usize>,
+    n_group: Option<usize>,
+    topk_group: Option<usize>,
+    routed_scaling_factor: Option<f32>,
+    rms_norm_eps: Option<f32>,
+    index_topk: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -302,7 +351,10 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
                 .or(raw.dtype)
                 .or(text.torch_dtype)
                 .or(text.dtype),
-            num_experts: raw.num_experts.or(text.num_experts),
+            num_experts: raw
+                .num_experts
+                .or(raw.n_routed_experts)
+                .or(text.num_experts),
             num_experts_per_tok: raw.num_experts_per_tok.or(text.num_experts_per_tok),
             norm_topk_prob: raw.norm_topk_prob.or(text.norm_topk_prob),
             moe_intermediate_size: raw.moe_intermediate_size.or(text.moe_intermediate_size),
@@ -328,11 +380,27 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
                         .and_then(|params| params.mrope_section)
                 }),
             tie_word_embeddings: raw.tie_word_embeddings.or(text.tie_word_embeddings),
-            num_shared_experts: raw.num_shared_experts.or(text.num_shared_experts),
+            num_shared_experts: raw
+                .num_shared_experts
+                .or(raw.n_shared_experts)
+                .or(text.num_shared_experts),
             shared_expert_intermediate_size: raw
                 .shared_expert_intermediate_size
                 .or(text.shared_expert_intermediate_size),
             vision_config: raw.vision_config,
+            glm: raw.q_lora_rank.map(|q_lora_rank| GlmMoeConfig {
+                first_k_dense_replace: raw.first_k_dense_replace.unwrap_or(0),
+                q_lora_rank,
+                kv_lora_rank: raw.kv_lora_rank.unwrap_or(0),
+                qk_nope_head_dim: raw.qk_nope_head_dim.unwrap_or(0),
+                qk_rope_head_dim: raw.qk_rope_head_dim.unwrap_or(0),
+                v_head_dim: raw.v_head_dim.unwrap_or(0),
+                n_group: raw.n_group.unwrap_or(0),
+                topk_group: raw.topk_group.unwrap_or(0),
+                routed_scaling_factor: raw.routed_scaling_factor.unwrap_or(1.0),
+                rms_norm_eps: raw.rms_norm_eps.unwrap_or(1e-5),
+                index_topk: raw.index_topk.unwrap_or(0),
+            }),
         })
     }
 }
@@ -354,14 +422,16 @@ impl QwenModelConfig {
             .unwrap_or_default()
             .to_ascii_lowercase();
         if !(model_type.contains("qwen")
+            || model_type.contains("glm")
             || self.architectures.as_ref().is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item.to_ascii_lowercase().contains("qwen"))
+                items.iter().any(|item| {
+                    let item = item.to_ascii_lowercase();
+                    item.contains("qwen") || item.contains("glm")
+                })
             }))
         {
             bail!(
-                "Flash-MoE only supports Qwen-family configs, found model_type={:?} architectures={:?}",
+                "Flash-MoE only supports declared Qwen/GLM MoE configs, found model_type={:?} architectures={:?}",
                 self.model_type,
                 self.architectures
             );
@@ -445,6 +515,42 @@ impl QwenModelConfig {
                 );
             }
         }
+        if let Some(glm) = &self.glm {
+            if glm.first_k_dense_replace > self.num_hidden_layers
+                || glm.q_lora_rank == 0
+                || glm.kv_lora_rank == 0
+                || glm.qk_nope_head_dim == 0
+                || glm.qk_rope_head_dim == 0
+                || !glm.qk_rope_head_dim.is_multiple_of(2)
+                || glm.v_head_dim == 0
+                || glm.n_group != 1
+                || glm.topk_group != 1
+            {
+                bail!(
+                    "invalid GLM MLA/MoE config: first_dense={}, q_lora={}, kv_lora={}, qk_nope={}, qk_rope={}, v_head={}, n_group={}, topk_group={}",
+                    glm.first_k_dense_replace,
+                    glm.q_lora_rank,
+                    glm.kv_lora_rank,
+                    glm.qk_nope_head_dim,
+                    glm.qk_rope_head_dim,
+                    glm.v_head_dim,
+                    glm.n_group,
+                    glm.topk_group
+                );
+            }
+            if !glm.routed_scaling_factor.is_finite() || glm.routed_scaling_factor <= 0.0 {
+                bail!(
+                    "GLM routed_scaling_factor must be positive and finite, got {}",
+                    glm.routed_scaling_factor
+                );
+            }
+            if !glm.rms_norm_eps.is_finite() || glm.rms_norm_eps <= 0.0 {
+                bail!(
+                    "GLM rms_norm_eps must be positive and finite, got {}",
+                    glm.rms_norm_eps
+                );
+            }
+        }
         if let Some(dtype) = &self.torch_dtype {
             let dtype = dtype.to_ascii_lowercase();
             if !matches!(
@@ -523,6 +629,120 @@ impl QwenModelConfig {
             .or(self.moe_intermediate_size)
             .or(self.intermediate_size)
             .unwrap_or(0)
+    }
+
+    pub(crate) fn first_sparse_layer(&self) -> usize {
+        self.glm.as_ref().map_or(0, |glm| glm.first_k_dense_replace)
+    }
+
+    pub(crate) fn is_dense_mlp_layer(&self, layer: usize) -> bool {
+        layer < self.first_sparse_layer()
+    }
+
+    pub(crate) fn rms_norm_epsilon(&self) -> f32 {
+        self.glm.as_ref().map_or(1e-6, |glm| glm.rms_norm_eps)
+    }
+
+    pub(crate) fn glm_mla_norm_epsilon(&self) -> Option<f32> {
+        self.glm.as_ref().map(|_| 1e-6)
+    }
+
+    /// Derives GLM's logical matrix shape from the architecture. Source
+    /// adapters use this when a packed checkpoint flattens or compresses the
+    /// safetensors shape.
+    pub(crate) fn glm_logical_tensor_shape(&self, name: &str) -> Option<Vec<usize>> {
+        let glm = self.glm.as_ref()?;
+        if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
+            return Some(vec![self.vocab_size, self.hidden_size]);
+        }
+        let parts = name.split('.').collect::<Vec<_>>();
+        let layer = parts
+            .windows(2)
+            .find(|part| part[0] == "layers")?
+            .get(1)?
+            .parse::<usize>()
+            .ok()?;
+        if layer >= self.num_hidden_layers {
+            return None;
+        }
+        if name.ends_with("mlp.switch_mlp.gate_proj.weight")
+            || name.ends_with("mlp.switch_mlp.up_proj.weight")
+        {
+            return Some(vec![
+                self.experts(),
+                self.moe_intermediate_size?,
+                self.hidden_size,
+            ]);
+        }
+        if name.ends_with("mlp.switch_mlp.down_proj.weight") {
+            return Some(vec![
+                self.experts(),
+                self.hidden_size,
+                self.moe_intermediate_size?,
+            ]);
+        }
+        let qk_head = glm.qk_nope_head_dim.checked_add(glm.qk_rope_head_dim)?;
+        let attention_rows = |per_head: usize| self.num_attention_heads.checked_mul(per_head);
+        let shape = if name.ends_with("self_attn.q_a_proj.weight") {
+            [glm.q_lora_rank, self.hidden_size]
+        } else if name.ends_with("self_attn.q_b_proj.weight") {
+            [attention_rows(qk_head)?, glm.q_lora_rank]
+        } else if name.ends_with("self_attn.kv_a_proj_with_mqa.weight") {
+            [
+                glm.kv_lora_rank.checked_add(glm.qk_rope_head_dim)?,
+                self.hidden_size,
+            ]
+        } else if name.ends_with("self_attn.kv_b_proj.weight") {
+            [
+                attention_rows(glm.qk_nope_head_dim.checked_add(glm.v_head_dim)?)?,
+                glm.kv_lora_rank,
+            ]
+        } else if name.ends_with("self_attn.embed_q.weight") {
+            return Some(vec![
+                self.num_attention_heads,
+                glm.kv_lora_rank,
+                glm.qk_nope_head_dim,
+            ]);
+        } else if name.ends_with("self_attn.unembed_out.weight") {
+            return Some(vec![
+                self.num_attention_heads,
+                glm.v_head_dim,
+                glm.kv_lora_rank,
+            ]);
+        } else if name.ends_with("self_attn.o_proj.weight") {
+            [self.hidden_size, attention_rows(glm.v_head_dim)?]
+        } else if name.ends_with("mlp.gate_proj.weight") || name.ends_with("mlp.up_proj.weight") {
+            [self.intermediate_size?, self.hidden_size]
+        } else if name.ends_with("mlp.down_proj.weight") {
+            [self.hidden_size, self.intermediate_size?]
+        } else if (name.ends_with("mlp.shared_experts.gate_proj.weight")
+            || name.ends_with("mlp.shared_expert.gate_proj.weight"))
+            || (name.ends_with("mlp.shared_experts.up_proj.weight")
+                || name.ends_with("mlp.shared_expert.up_proj.weight"))
+        {
+            [
+                self.moe_intermediate_size?
+                    .checked_mul(self.shared_experts())?,
+                self.hidden_size,
+            ]
+        } else if name.ends_with("mlp.shared_experts.down_proj.weight")
+            || name.ends_with("mlp.shared_expert.down_proj.weight")
+        {
+            [
+                self.hidden_size,
+                self.moe_intermediate_size?
+                    .checked_mul(self.shared_experts())?,
+            ]
+        } else if name.contains(".mlp.experts.")
+            && (name.ends_with("gate_proj.weight") || name.ends_with("up_proj.weight"))
+        {
+            [self.moe_intermediate_size?, self.hidden_size]
+        } else if name.contains(".mlp.experts.") && name.ends_with("down_proj.weight") {
+            [self.hidden_size, self.moe_intermediate_size?]
+        } else {
+            return None;
+        };
+        Some(shape.to_vec())
     }
 }
 
@@ -760,6 +980,7 @@ pub struct QwenMoeModelLayout {
     pub family: QwenMoeFamily,
     pub execution: QwenMoeExecutionPolicy,
     pub layers: usize,
+    pub first_sparse_layer: usize,
     pub hidden_size: usize,
     pub attention_heads: usize,
     pub kv_heads: usize,
@@ -790,9 +1011,14 @@ impl QwenMoeModelLayout {
                 ACTIVE_EXPERTS_PER_TOKEN
             }
             QwenMoeFamily::Qwen35A17B => configured_active_experts,
-            QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => configured_active_experts,
+            QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe | QwenMoeFamily::Glm52 => {
+                configured_active_experts
+            }
         };
-        let routed_expert_scale = 1.0;
+        let routed_expert_scale = config
+            .glm
+            .as_ref()
+            .map_or(1.0, |glm| glm.routed_scaling_factor);
         let routing_weight_normalization = match family {
             QwenMoeFamily::Qwen35A17B => {
                 Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
@@ -806,11 +1032,17 @@ impl QwenMoeModelLayout {
                     }
                 })
             }
+            QwenMoeFamily::Glm52 => Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected),
         };
         let layout = Self {
             family,
-            execution: QwenMoeExecutionPolicy::UPSTREAM_PARITY,
+            execution: if family == QwenMoeFamily::Glm52 {
+                QwenMoeExecutionPolicy::GLM52_PARITY
+            } else {
+                QwenMoeExecutionPolicy::UPSTREAM_PARITY
+            },
             layers: config.num_hidden_layers,
+            first_sparse_layer: config.first_sparse_layer(),
             hidden_size: config.hidden_size,
             attention_heads: config.num_attention_heads,
             kv_heads: config.kv_heads(),
@@ -846,6 +1078,7 @@ impl QwenMoeModelLayout {
                 }
             }
             QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => QwenMoeLayerKind::FullAttention,
+            QwenMoeFamily::Glm52 => QwenMoeLayerKind::FullAttention,
         }
     }
 
@@ -864,6 +1097,13 @@ impl QwenMoeModelLayout {
             || self.vocab_size == 0
         {
             bail!("Qwen MoE layout contains zero-valued required dimensions");
+        }
+        if self.first_sparse_layer >= self.layers {
+            bail!(
+                "MoE layout first sparse layer {} must be within {} model layers",
+                self.first_sparse_layer,
+                self.layers
+            );
         }
         if self.experts_per_layer == 0
             || self.configured_active_experts == 0
@@ -886,6 +1126,9 @@ impl QwenMoeModelLayout {
 
 impl QwenMoeFamily {
     pub fn from_model_and_config(model: &str, config: &QwenModelConfig) -> Result<Self> {
+        if is_glm52(model) || config_is_glm52(config) {
+            return Ok(Self::Glm52);
+        }
         if is_qwen35_or_legacy_alias(model) || config_is_qwen35(config) {
             return Ok(Self::Qwen35A17B);
         }
@@ -896,11 +1139,17 @@ impl QwenMoeFamily {
             return Ok(Self::Qwen3Moe);
         }
         bail!(
-            "FlashMoe only supports Qwen-family MoE models, found model={model:?} model_type={:?} architectures={:?}",
+            "FlashMoe only supports declared Qwen/GLM MoE models, found model={model:?} model_type={:?} architectures={:?}",
             config.model_type,
             config.architectures
         );
     }
+}
+
+fn config_is_glm52(config: &QwenModelConfig) -> bool {
+    config.glm.is_some()
+        && (config_field_contains(config.model_type.as_deref(), "glm_moe_dsa")
+            || config_architecture_contains(config, "GlmMoeDsa"))
 }
 
 fn config_is_qwen35(config: &QwenModelConfig) -> bool {
@@ -1270,5 +1519,81 @@ mod tests {
         assert_eq!(layout.routed_expert_scale, 1.0);
         assert!(layout.has_vision);
         assert_eq!(layout.mrope_section, Some(DEFAULT_MROPE_SECTION));
+    }
+
+    #[test]
+    fn glm52_config_resolves_mla_dense_lead_in_and_sigmoid_routing() {
+        assert!(is_glm52(GLM52_MXFP4_MODEL));
+        assert!(is_glm52(GLM52_COLIBRI_MODEL));
+        let config = config(
+            br#"{
+  "model_type": "glm_moe_dsa",
+  "architectures": ["GlmMoeDsaForCausalLM"],
+  "num_hidden_layers": 78,
+  "hidden_size": 6144,
+  "num_attention_heads": 64,
+  "head_dim": 192,
+  "vocab_size": 154880,
+  "rope_parameters": {"rope_theta": 8000000.0},
+  "torch_dtype": "bfloat16",
+  "n_routed_experts": 256,
+  "num_experts_per_tok": 8,
+  "n_shared_experts": 1,
+  "norm_topk_prob": true,
+  "moe_intermediate_size": 2048,
+  "intermediate_size": 12288,
+  "first_k_dense_replace": 3,
+  "q_lora_rank": 2048,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 192,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 256,
+  "n_group": 1,
+  "topk_group": 1,
+  "routed_scaling_factor": 2.5,
+  "rms_norm_eps": 0.00001,
+  "index_topk": 2048
+}"#,
+        );
+        let layout = QwenMoeModelLayout::from_config(GLM52_MODEL, &config).unwrap();
+
+        assert_eq!(layout.family, QwenMoeFamily::Glm52);
+        assert_eq!(layout.execution, QwenMoeExecutionPolicy::GLM52_PARITY);
+        assert_eq!(layout.first_sparse_layer, 3);
+        assert!(config.is_dense_mlp_layer(2));
+        assert!(!config.is_dense_mlp_layer(3));
+        assert_eq!(layout.experts_per_layer, 256);
+        assert_eq!(layout.scheduled_active_experts, 8);
+        assert_eq!(layout.routed_expert_scale, 2.5);
+        assert_eq!(config.rms_norm_epsilon(), 1e-5);
+        assert_eq!(config.glm_mla_norm_epsilon(), Some(1e-6));
+        assert_eq!(
+            config.glm_logical_tensor_shape("model.layers.3.self_attn.kv_b_proj.weight"),
+            Some(vec![64 * (192 + 256), 512])
+        );
+        assert_eq!(
+            config.glm_logical_tensor_shape("model.layers.3.self_attn.embed_q.weight"),
+            Some(vec![64, 512, 192])
+        );
+        assert_eq!(
+            config.glm_logical_tensor_shape("model.layers.3.self_attn.unembed_out.weight"),
+            Some(vec![64, 256, 512])
+        );
+        assert_eq!(
+            config.glm_logical_tensor_shape("model.layers.3.mlp.experts.7.down_proj.weight"),
+            Some(vec![6144, 2048])
+        );
+        assert_eq!(
+            config.glm_logical_tensor_shape("model.layers.3.mlp.switch_mlp.gate_proj.weight"),
+            Some(vec![256, 2048, 6144])
+        );
+        assert_eq!(
+            config.glm_logical_tensor_shape("model.layers.3.mlp.switch_mlp.up_proj.weight"),
+            Some(vec![256, 2048, 6144])
+        );
+        assert_eq!(
+            config.glm_logical_tensor_shape("model.layers.3.mlp.switch_mlp.down_proj.weight"),
+            Some(vec![256, 6144, 2048])
+        );
     }
 }

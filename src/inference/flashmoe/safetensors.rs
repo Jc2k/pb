@@ -170,6 +170,53 @@ pub(super) fn resolve_safetensors_manifest(
     })
 }
 
+pub(super) fn resolve_unindexed_safetensors_manifest(
+    snapshot_dir: &Path,
+) -> Result<ResolvedSafetensorsManifest> {
+    let mut shard_paths = fs::read_dir(snapshot_dir)
+        .with_context(|| {
+            format!(
+                "failed to read safetensors snapshot {}",
+                snapshot_dir.display()
+            )
+        })?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    shard_paths.retain(|path| {
+        path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("safetensors")
+    });
+    shard_paths.sort();
+    if shard_paths.is_empty() {
+        bail!(
+            "{} contains no safetensors index and no safetensors shards",
+            snapshot_dir.display()
+        );
+    }
+    let mut weight_map = BTreeMap::new();
+    let mut shards = BTreeMap::new();
+    for path in shard_paths {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("safetensors shard has a non-UTF-8 name: {}", path.display()))?
+            .to_string();
+        let shard = parse_safetensors_header(&path)?;
+        for tensor in shard.tensors.keys() {
+            if let Some(existing) = weight_map.insert(tensor.clone(), file_name.clone()) {
+                bail!(
+                    "safetensors tensor {tensor} is declared by multiple actual shards: {existing} and {file_name}"
+                );
+            }
+        }
+        shards.insert(file_name, shard);
+    }
+    Ok(ResolvedSafetensorsManifest {
+        weight_map,
+        shards,
+        source: SafetensorsManifestSource::ActualShardHeaders,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +244,26 @@ mod tests {
         bytes.extend_from_slice(header.as_bytes());
         bytes.extend_from_slice(&1.0f32.to_le_bytes());
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn unindexed_manifest_scans_colibri_style_out_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        write_test_shard(&temp.path().join("out-00000.safetensors"), "layer.0.weight");
+        write_test_shard(&temp.path().join("out-00001.safetensors"), "layer.1.weight");
+
+        let manifest = resolve_unindexed_safetensors_manifest(temp.path()).unwrap();
+
+        assert_eq!(
+            manifest.source,
+            SafetensorsManifestSource::ActualShardHeaders
+        );
+        assert_eq!(manifest.weight_map.len(), 2);
+        assert_eq!(
+            manifest.weight_map["layer.0.weight"],
+            "out-00000.safetensors"
+        );
+        assert_eq!(manifest.shards.len(), 2);
     }
 
     #[test]

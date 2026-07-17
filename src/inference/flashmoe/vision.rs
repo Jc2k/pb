@@ -353,7 +353,9 @@ impl FlashMoeInputAdapterExecutor {
             QwenMoeFamily::Qwen3VlMoe => {
                 Ok(Self::QwenVl(VisionEncoder::from_plan(plan, text_config)?))
             }
-            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe => Ok(Self::QwenText),
+            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Glm52 => {
+                Ok(Self::QwenText)
+            }
         }
     }
 

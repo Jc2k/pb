@@ -40,6 +40,6 @@ pub use scheduler::*;
 pub use types::*;
 pub use vision::{ImagePreprocessor, Qwen3VLVisionConfig, VisionEncoder, VisionEncoding};
 pub use weights::{
-    DenseQ4SourceRefs, DenseStore, DenseTensorRef, ExpertTensorRef, FlashMoeManifest,
-    RuntimeTensorEntry, TensorQuantization, TensorRegistry,
+    DenseQ4SourceFormat, DenseQ4SourceRefs, DenseStore, DenseTensorRef, ExpertTensorRef,
+    FlashMoeManifest, RuntimeTensorEntry, TensorQuantization, TensorRegistry,
 };

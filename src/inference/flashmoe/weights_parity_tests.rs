@@ -217,6 +217,9 @@ fn tiny_attention_manifest(
             vec![config.experts(), config.hidden_size],
         );
         match layer_type {
+            AttentionLayerType::Mla => {
+                panic!("tiny Qwen attention fixture does not construct MLA layers")
+            }
             AttentionLayerType::Full => {
                 push(
                     attention_tensor_name(layer, "q_proj"),
@@ -289,6 +292,9 @@ fn assert_manifest_attention_kinds(layer_types: &[AttentionLayerType]) {
 
     for (layer, layer_type) in layer_types.iter().copied().enumerate() {
         match layer_type {
+            AttentionLayerType::Mla => {
+                panic!("tiny Qwen attention fixture does not construct MLA layers")
+            }
             AttentionLayerType::Full => {
                 assert_eq!(runtime.layer_kind(layer), FlashMoeLayerKind::FullAttention);
                 runtime
@@ -1196,6 +1202,7 @@ fn router_scores_use_cached_full_tensor_matvec() {
         num_shared_experts: None,
         shared_expert_intermediate_size: None,
         vision_config: None,
+        glm: None,
     };
     let mut graph_layout = QwenMoeModelLayout::from_config(QWEN35_MODEL, &config).unwrap();
     graph_layout.hidden_size = GROUP_SIZE;
@@ -1686,6 +1693,7 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
         num_shared_experts: None,
         shared_expert_intermediate_size: None,
         vision_config: None,
+        glm: None,
     };
     let runtime = DenseTransformerRuntime::new(&config);
     let metal = MetalExecutionFacade::new(&plan, &config, &runtime, &store).unwrap();
@@ -1852,6 +1860,7 @@ fn arm_macos_resident_dense_mmap_batch_matches_cpu_reference() {
         num_shared_experts: None,
         shared_expert_intermediate_size: None,
         vision_config: None,
+        glm: None,
     };
     let runtime = DenseTransformerRuntime::new(&config);
     let metal = MetalExecutionFacade::new(&plan, &config, &runtime, &store).unwrap();
@@ -2064,6 +2073,7 @@ fn arm_macos_post_attention_dense_prep_matches_cpu_reference() {
             num_shared_experts: None,
             shared_expert_intermediate_size: None,
             vision_config: None,
+            glm: None,
         };
         let runtime = DenseTransformerRuntime::new(&config);
         let metal = MetalExecutionFacade::new(&plan, &config, &runtime, &store).unwrap();
@@ -2077,6 +2087,7 @@ fn arm_macos_post_attention_dense_prep_matches_cpu_reference() {
                 MetalBatchProjectionInput::Cpu(&residual),
                 &post_norm_weight,
                 2,
+                None,
             )
             .unwrap();
 
@@ -2233,6 +2244,7 @@ fn arm_macos_post_attention_resident_q4_prep_matches_cpu_reference() {
         num_shared_experts: None,
         shared_expert_intermediate_size: None,
         vision_config: None,
+        glm: None,
     };
     let runtime = DenseTransformerRuntime::new(&config);
     let metal = MetalExecutionFacade::new(&plan, &config, &runtime, &store).unwrap();
@@ -2283,6 +2295,7 @@ fn arm_macos_post_attention_resident_q4_prep_matches_cpu_reference() {
             MetalBatchProjectionInput::Cpu(&residual),
             &post_norm_weight,
             3,
+            None,
         )
         .unwrap();
     assert_eq!(prep.width, width);
@@ -2382,7 +2395,8 @@ fn dense_manifest_preserves_non_native_dense_weights() {
     let index_path = snapshot.join("model.safetensors.index.json");
     fs::write(&index_path, index.to_string()).unwrap();
 
-    let (manifest, visual_refs) = build_manifest(QWEN35_MODEL, snapshot, &index_path).unwrap();
+    let (manifest, visual_refs) =
+        build_manifest(QWEN35_MODEL, snapshot, &index_path, None).unwrap();
     assert!(visual_refs.is_empty());
     assert!(manifest.expert_tensors.is_empty());
     let registry = TensorRegistry::from_manifest(&manifest);
@@ -2465,7 +2479,8 @@ fn dense_manifest_imports_native_mlx_q4_triples() {
     let index_path = snapshot.join("model.safetensors.index.json");
     fs::write(&index_path, index.to_string()).unwrap();
 
-    let (manifest, visual_refs) = build_manifest(QWEN35_MODEL, snapshot, &index_path).unwrap();
+    let (manifest, visual_refs) =
+        build_manifest(QWEN35_MODEL, snapshot, &index_path, None).unwrap();
     assert!(visual_refs.is_empty());
     assert!(manifest.expert_tensors.is_empty());
     assert_eq!(manifest.dense_tensors.len(), 1);
@@ -2565,7 +2580,8 @@ fn manifest_classifies_mlx_switch_mlp_tensors_as_aggregate_experts() {
     let index_path = snapshot.join("model.safetensors.index.json");
     fs::write(&index_path, index.to_string()).unwrap();
 
-    let (manifest, visual_refs) = build_manifest(QWEN35_MODEL, snapshot, &index_path).unwrap();
+    let (manifest, visual_refs) =
+        build_manifest(QWEN35_MODEL, snapshot, &index_path, None).unwrap();
 
     assert!(visual_refs.is_empty());
     assert!(manifest.dense_tensors.is_empty());

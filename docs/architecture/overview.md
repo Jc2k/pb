@@ -83,6 +83,29 @@ Environment resources have separate lease records. The supervisor reconciles aba
 at startup and reaps expired idle sessions. Persistent images and approved caches may be reused;
 task containers, services, networks, and ephemeral workspaces remain session-owned.
 
+## Local MoE inference
+
+**Shipped.** FlashMoe runs supported Qwen MoE families through one typed runtime, resident dense
+weights, scheduler-owned positioned expert reads, reusable whole-expert slots, Metal command
+builders, and the operating-system page cache.
+
+**Configurable.** GLM-5.2 extends that runtime at typed boundaries. Pull accepts indexed MLX MXFP4
+or unindexed Colibri tensors through source adapters, normalizes either representation into pb's
+canonical resident-dense and fixed-slot Q4 layouts, and records a source-format-independent runtime
+manifest. MXFP4 E2M1/E8M0 groups are decoded row-wise and requantized once; Colibri packed int4 and
+int8 input/output tensors retain their existing import path. Pull also preserves an external
+`chat_template.jinja` when the tokenizer configuration does not embed one, with embedded templates
+taking precedence at load. Its first three dense MLPs remain
+resident; sparse layers reuse the existing expert scheduler and always-active shared-expert
+command. MLA stores a normalized 512-value latent plus a 64-value rotary key per token, with Metal
+projections and a declared CPU weight-absorption implementation. Sigmoid/noaux routing uses the
+correction bias only for expert selection and keeps the checkpoint's routed scaling factor.
+
+**Design record.** DSA sparse attention and the MTP speculative head remain follow-on typed
+implementations. Until DSA ships, GLM requests beyond `index_topk` fail rather than silently using a
+non-equivalent long-context attention path. The detailed target and validation status live in the
+[FlashMoe architecture parity plan](../flashmoe-architecture-parity-plan.md).
+
 ## Deliberate seams
 
 Several boundaries are intentionally visible rather than folded into one “agent” abstraction:

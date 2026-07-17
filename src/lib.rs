@@ -572,6 +572,10 @@ pub struct FlashMoeInferArgs {
     #[arg(long)]
     pub raw: bool,
 
+    /// Ask the model chat template to suppress emitted reasoning
+    #[arg(long, conflicts_with = "raw")]
+    pub no_thinking: bool,
+
     /// Print top-k candidate token scores to stderr while sampling
     #[arg(long)]
     pub trace_candidates: bool,
@@ -1910,6 +1914,7 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     let mut structured_request =
         inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
     structured_request.trace_candidates = args.trace_candidates;
+    structured_request.enable_thinking = !args.no_thinking;
     if args.raw {
         structured_request.raw_prompt = true;
         structured_request.add_generation_prompt = false;
@@ -2941,15 +2946,12 @@ async fn pull_flashmoe_from_hf(
     let siblings = list_hf_files(client, owner, repo).await?;
     let wanted: Vec<&HfSibling> = siblings
         .iter()
-        .filter(|s| {
-            s.rfilename.ends_with(".safetensors")
-                || crate::inference::flashmoe::expected_hf_files()
-                    .iter()
-                    .any(|name| name == &std::ffi::OsString::from(&s.rfilename))
-        })
+        .filter(|s| flashmoe_hf_file_is_wanted(hf_uri, &s.rfilename))
         .collect();
     if wanted.is_empty() {
-        bail!("no Qwen-family safetensors or tokenizer/config files found in {owner}/{repo}");
+        bail!(
+            "no supported FlashMoe safetensors or tokenizer/config files found in {owner}/{repo}"
+        );
     }
 
     let cache_dir = output_root.join(cache_dir_name(hf_uri));
@@ -3020,6 +3022,19 @@ async fn pull_flashmoe_from_hf(
         plan.runtime_dir.display()
     );
     Ok(())
+}
+
+fn flashmoe_hf_file_is_wanted(model: &str, file_name: &str) -> bool {
+    if crate::inference::flashmoe::is_glm52(model)
+        && (file_name.starts_with("out-mtp-") || file_name.starts_with("out-idx-"))
+        && file_name.ends_with(".safetensors")
+    {
+        return false;
+    }
+    file_name.ends_with(".safetensors")
+        || crate::inference::flashmoe::expected_hf_files()
+            .iter()
+            .any(|name| name == &std::ffi::OsString::from(file_name))
 }
 
 async fn pull_from_hf(
@@ -3559,6 +3574,34 @@ mod tests {
     }
 
     #[test]
+    fn glm_pull_skips_unimplemented_mtp_and_dsa_shards() {
+        assert!(flashmoe_hf_file_is_wanted(
+            crate::inference::flashmoe::GLM52_COLIBRI_MODEL,
+            "out-00000.safetensors"
+        ));
+        assert!(!flashmoe_hf_file_is_wanted(
+            crate::inference::flashmoe::GLM52_COLIBRI_MODEL,
+            "out-mtp-00000.safetensors"
+        ));
+        assert!(!flashmoe_hf_file_is_wanted(
+            crate::inference::flashmoe::GLM52_COLIBRI_MODEL,
+            "out-idx-00000.safetensors"
+        ));
+        assert!(flashmoe_hf_file_is_wanted(
+            crate::inference::flashmoe::GLM52_MODEL,
+            "model.safetensors.index.json"
+        ));
+        assert!(flashmoe_hf_file_is_wanted(
+            crate::inference::flashmoe::GLM52_MODEL,
+            "chat_template.jinja"
+        ));
+        assert!(flashmoe_hf_file_is_wanted(
+            crate::inference::flashmoe::QWEN35_MODEL,
+            "out-mtp-00000.safetensors"
+        ));
+    }
+
+    #[test]
     fn flashmoe_cli_selects_expert_storage_for_pull_and_infer() {
         let pull = Cli::try_parse_from([
             "pb",
@@ -3597,6 +3640,21 @@ mod tests {
         };
         assert_eq!(infer.expert_storage, Some(FlashMoeExpertStorageArg::Bf16));
         assert_eq!(infer.images, vec![PathBuf::from("public/icon-192.png")]);
+
+        let no_thinking =
+            Cli::try_parse_from(["pb", "harness", "infer", "What is 2+2?", "--no-thinking"])
+                .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Infer(no_thinking),
+        } = no_thinking.command
+        else {
+            panic!("expected harness infer command");
+        };
+        assert!(no_thinking.no_thinking);
+        assert!(
+            Cli::try_parse_from(["pb", "harness", "infer", "2+2=", "--raw", "--no-thinking",])
+                .is_err()
+        );
     }
 
     #[test]

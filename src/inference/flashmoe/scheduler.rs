@@ -15,8 +15,9 @@ use super::model_family::{QwenMoeFamily, QwenMoeLayerKind, QwenMoeRoutingWeightN
 use super::state::{
     FlashMoeCmd1InputState, FlashMoeCmd2InputState, FlashMoeCmd3InputState,
     FlashMoeCmd3OutputState, FlashMoeExpertPhaseOutput, FlashMoeFullAttentionKvState,
-    FlashMoeGpuBufferDescriptor, FlashMoePostAttentionPrepState, FlashMoeRoutingOutputSource,
-    FlashMoeRoutingOutputState, FlashMoeStateBufferRole, FlashMoeStatePlacement,
+    FlashMoeGpuBufferDescriptor, FlashMoeMlaKvState, FlashMoePostAttentionPrepState,
+    FlashMoeRoutingOutputSource, FlashMoeRoutingOutputState, FlashMoeStateBufferRole,
+    FlashMoeStatePlacement,
 };
 use super::weights::{
     RouterScoreBatch, RouterScoreProjectionDescriptor, RouterScoreProjectionExecution,
@@ -1047,6 +1048,7 @@ pub(crate) struct ScheduledCmd1ResolvedCommand<TInput> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledAttentionMathImplementation {
     CpuKvCache,
+    CpuGlmMlaWeightAbsorption,
 }
 
 impl ScheduledAttentionMathImplementation {
@@ -1059,6 +1061,10 @@ impl ScheduledAttentionMathImplementation {
                 FlashMoeStagePlacement::CpuDeclared,
                 FlashMoeStageImplementation::QwenFullAttentionCpuKv,
             ) => Ok(Self::CpuKvCache),
+            (
+                FlashMoeStagePlacement::CpuDeclared,
+                FlashMoeStageImplementation::GlmMlaCpuWeightAbsorption,
+            ) => Ok(Self::CpuGlmMlaWeightAbsorption),
             _ => Err(FlashMoeUnsupportedCapability::new(
                 family,
                 stage.stage,
@@ -1072,7 +1078,9 @@ impl ScheduledAttentionMathImplementation {
 
     fn kv_placement(self) -> FlashMoeStatePlacement {
         match self {
-            Self::CpuKvCache => FlashMoeStatePlacement::CpuVisible,
+            Self::CpuKvCache | Self::CpuGlmMlaWeightAbsorption => {
+                FlashMoeStatePlacement::CpuVisible
+            }
         }
     }
 }
@@ -1090,6 +1098,12 @@ impl ScheduledAttentionMath {
         self,
         state: FlashMoeFullAttentionKvState,
     ) -> Result<ScheduledAttentionMathOutput> {
+        if self.implementation != ScheduledAttentionMathImplementation::CpuKvCache {
+            bail!(
+                "FlashMoe scheduled attention implementation {:?} requires compressed MLA KV state",
+                self.implementation
+            );
+        }
         if !state.is_declared_graph_state() {
             bail!("FlashMoe scheduled attention KV state is not declared graph state");
         }
@@ -1120,12 +1134,70 @@ impl ScheduledAttentionMath {
             state,
         })
     }
+
+    pub(crate) fn resolve_mla_kv_state(
+        self,
+        state: FlashMoeMlaKvState,
+    ) -> Result<ScheduledMlaAttentionMathOutput> {
+        if self.implementation != ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption {
+            bail!(
+                "FlashMoe scheduled attention implementation {:?} does not accept compressed MLA KV state",
+                self.implementation
+            );
+        }
+        if !state.is_declared_graph_state() {
+            bail!("FlashMoe scheduled MLA KV state is not declared graph state");
+        }
+        if state.layer() != self.layer {
+            bail!(
+                "FlashMoe scheduled attention layer {} does not match MLA KV state layer {}",
+                self.layer,
+                state.layer()
+            );
+        }
+        if state.position() != self.position {
+            bail!(
+                "FlashMoe scheduled attention position {} does not match MLA KV state position {}",
+                self.position,
+                state.position()
+            );
+        }
+        if state.placement() != self.implementation.kv_placement() {
+            bail!(
+                "FlashMoe scheduled attention implementation {:?} requires {:?} MLA KV state, got {:?}",
+                self.implementation,
+                self.implementation.kv_placement(),
+                state.placement()
+            );
+        }
+        Ok(ScheduledMlaAttentionMathOutput {
+            attention: self,
+            state,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledAttentionMathOutput {
     pub attention: ScheduledAttentionMath,
     state: FlashMoeFullAttentionKvState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledMlaAttentionMathOutput {
+    pub attention: ScheduledAttentionMath,
+    state: FlashMoeMlaKvState,
+}
+
+impl ScheduledMlaAttentionMathOutput {
+    pub(crate) fn implementation(self) -> ScheduledAttentionMathImplementation {
+        self.attention.implementation
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> FlashMoeMlaKvState {
+        self.state
+    }
 }
 
 impl ScheduledAttentionMathOutput {
@@ -4196,6 +4268,7 @@ mod tests {
             },
             slot_spec: ExpertSlotSpec::FixedDense(graph_spec),
             layers: layout.layers,
+            first_expert_layer: layout.first_sparse_layer,
             experts_per_layer: layout.experts_per_layer,
         };
         let resolved_attention = capabilities
@@ -5164,7 +5237,7 @@ mod tests {
                         gate: projection("shared.gate", 0, 16, 32, 2),
                         up: projection("shared.up", 64, 80, 96, 2),
                         down: projection("shared.down", 128, 144, 160, 2),
-                        router: projection("shared.router", 192, 208, 224, 1),
+                        router: Some(projection("shared.router", 192, 208, 224, 1)),
                         shared_experts: 1,
                         intermediate: 2,
                         width,
@@ -5203,7 +5276,7 @@ mod tests {
                         gate: projection("shared.gate", 0, 2),
                         up: projection("shared.up", 64, 2),
                         down: projection("shared.down", 128, 2),
-                        router: projection("shared.router", 192, 1),
+                        router: Some(projection("shared.router", 192, 1)),
                         shared_experts: 1,
                         intermediate: 2,
                         width,
@@ -5218,6 +5291,7 @@ mod tests {
                 Arc::clone(&dense_mmap),
                 dense_mmap.len() as u64,
                 &[None],
+                1e-6,
             )
             .unwrap();
             let f32_bytes = |values: &[f32]| {
@@ -5273,6 +5347,7 @@ mod tests {
                             metal.runtime(),
                             dense_weights,
                             Arc::clone(metal.buffers()),
+                            metal.norm_epsilon(),
                         )
                         .submit(
                             position,
@@ -5359,7 +5434,7 @@ mod tests {
             gate: dummy_q4_projection("shared.gate", 16, 32).into(),
             up: dummy_q4_projection("shared.up", 16, 32).into(),
             down: dummy_q4_projection("shared.down", 32, 16).into(),
-            router: dummy_q4_projection("shared.router", 1, 32).into(),
+            router: Some(dummy_q4_projection("shared.router", 1, 32).into()),
             shared_experts: 1,
             intermediate: 16,
             width: 32,
@@ -5644,6 +5719,37 @@ mod tests {
         assert_eq!(output.state().position(), 9);
         assert_eq!(output.state().layer(), 14);
         assert!(output.validate_execution_state(14, 9, 128).is_ok());
+    }
+
+    #[test]
+    fn scheduled_glm_attention_resolves_distinct_compressed_mla_state() {
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&qwen35_layout()).unwrap();
+        let mut graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let attention = graph
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::AttentionMath)
+            .unwrap();
+        attention.implementation = FlashMoeStageImplementation::GlmMlaCpuWeightAbsorption;
+        let attention = graph.build_attention_math(14, 9).unwrap();
+
+        let output = attention
+            .resolve_mla_kv_state(FlashMoeMlaKvState::cpu_visible(9, 14, 512, 64))
+            .unwrap();
+
+        assert_eq!(
+            output.implementation(),
+            ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption
+        );
+        assert_eq!(output.state().latent_len(), 512);
+        assert_eq!(output.state().rotary_len(), 64);
+        assert!(
+            attention
+                .resolve_kv_state(FlashMoeFullAttentionKvState::cpu_visible(9, 14, 512, 512))
+                .unwrap_err()
+                .to_string()
+                .contains("requires compressed MLA KV state")
+        );
     }
 
     #[test]

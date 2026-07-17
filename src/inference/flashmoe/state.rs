@@ -1470,7 +1470,65 @@ impl FlashMoeFullAttentionKvState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeMlaKvState {
+    position: usize,
+    layer: usize,
+    latent_len: usize,
+    rotary_len: usize,
+    placement: FlashMoeStatePlacement,
+}
+
+impl FlashMoeMlaKvState {
+    pub(crate) fn cpu_visible(
+        position: usize,
+        layer: usize,
+        latent_len: usize,
+        rotary_len: usize,
+    ) -> Self {
+        Self {
+            position,
+            layer,
+            latent_len,
+            rotary_len,
+            placement: FlashMoeStatePlacement::CpuVisible,
+        }
+    }
+
+    pub(crate) fn position(self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn layer(self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn latent_len(self) -> usize {
+        self.latent_len
+    }
+
+    pub(crate) fn rotary_len(self) -> usize {
+        self.rotary_len
+    }
+
+    pub(crate) fn role(self) -> FlashMoeStateBufferRole {
+        FlashMoeStateBufferRole::Kv
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        self.placement
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        self.latent_len() > 0
+            && self.rotary_len() > 0
+            && FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && FlashMoeStatePlacement::GRAPH_PLACEMENTS.contains(&self.placement())
+    }
+}
+
 type KvEntry = (Arc<[f32]>, Arc<[f32]>);
+type MlaKvEntry = (Arc<[f32]>, Arc<[f32]>);
 
 #[derive(Debug, Clone)]
 pub(super) struct KvCache {
@@ -1480,6 +1538,7 @@ pub(super) struct KvCache {
     generated_tokens: Vec<(usize, u32)>,
     layer_states: Vec<(usize, usize, u64)>,
     kv: Vec<Vec<Option<KvEntry>>>,
+    mla_kv: Vec<Vec<Option<MlaKvEntry>>>,
 }
 
 impl KvCache {
@@ -1491,6 +1550,7 @@ impl KvCache {
             generated_tokens: Vec::new(),
             layer_states: Vec::new(),
             kv: vec![vec![None; capacity]; layers],
+            mla_kv: vec![vec![None; capacity]; layers],
         }
     }
 
@@ -1516,6 +1576,9 @@ impl KvCache {
             return;
         }
         for layer in &mut self.kv {
+            layer.resize_with(capacity, || None);
+        }
+        for layer in &mut self.mla_kv {
             layer.resize_with(capacity, || None);
         }
         self.capacity = capacity;
@@ -1591,6 +1654,47 @@ impl KvCache {
         let layer = record.layer();
         let (key, value) = record.into_key_value();
         self.record_kv(position, layer, key, value)
+    }
+
+    pub(super) fn record_mla_kv(
+        &mut self,
+        position: usize,
+        layer: usize,
+        latent: Vec<f32>,
+        rotary_key: Vec<f32>,
+    ) -> Result<()> {
+        self.ensure_position(position)?;
+        if layer >= self.layers {
+            bail!(
+                "MLA KV cache layer {layer} exceeds layer count {}",
+                self.layers
+            );
+        }
+        self.mla_kv[layer][position] = Some((Arc::from(latent), Arc::from(rotary_key)));
+        Ok(())
+    }
+
+    pub(super) fn mla_records(
+        &self,
+        position: usize,
+        layer: usize,
+    ) -> Result<Vec<(&[f32], &[f32])>> {
+        self.ensure_position(position)?;
+        if layer >= self.layers {
+            bail!(
+                "MLA KV cache layer {layer} exceeds layer count {}",
+                self.layers
+            );
+        }
+        Ok(self.mla_kv[layer]
+            .iter()
+            .take(position + 1)
+            .filter_map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|(latent, rotary)| (&latent[..], &rotary[..]))
+            })
+            .collect())
     }
 
     pub(super) fn causal_attention(
@@ -2535,5 +2639,19 @@ mod tests {
 
         assert!(!FlashMoeFullAttentionKvState::cpu_visible(7, 3, 0, 0).is_declared_graph_state());
         assert!(!FlashMoeFullAttentionKvState::gpu_resident(7, 3, 4, 5).is_declared_graph_state());
+    }
+
+    #[test]
+    fn mla_kv_state_declares_distinct_latent_and_rotary_widths() {
+        let state = FlashMoeMlaKvState::cpu_visible(7, 3, 512, 64);
+        assert_eq!(state.position(), 7);
+        assert_eq!(state.layer(), 3);
+        assert_eq!(state.latent_len(), 512);
+        assert_eq!(state.rotary_len(), 64);
+        assert_eq!(state.role(), FlashMoeStateBufferRole::Kv);
+        assert_eq!(state.placement(), FlashMoeStatePlacement::CpuVisible);
+        assert!(state.is_declared_graph_state());
+        assert!(!FlashMoeMlaKvState::cpu_visible(7, 3, 0, 64).is_declared_graph_state());
+        assert!(!FlashMoeMlaKvState::cpu_visible(7, 3, 512, 0).is_declared_graph_state());
     }
 }

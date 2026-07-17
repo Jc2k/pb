@@ -21,7 +21,7 @@ use super::experts::{
     EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32, expert_scale_bias_dtype_size,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::math::routing_softmax_top_k;
+use super::math::{routing_sigmoid_noaux_top_k, routing_softmax_top_k};
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::ScheduledQ4ExpertPhaseMlpPayload;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1522,6 +1522,7 @@ pub(crate) struct MetalExecutionContext {
     linear_attention_state: Mutex<MetalLinearAttentionStateCache>,
     buffers: Arc<MetalBufferPool>,
     resources: Arc<MetalResourceLedger>,
+    norm_epsilon: f32,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1551,6 +1552,7 @@ impl MetalExecutionContext {
         dense_mmap: Arc<memmap2::Mmap>,
         dense_len: u64,
         linear_layouts: &[Option<LinearAttentionLayout>],
+        norm_epsilon: f32,
     ) -> anyhow::Result<Self> {
         let runtime = MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new())?;
         let resources = Arc::new(unsafe { MetalResourceLedger::from_device(runtime.device) });
@@ -1570,6 +1572,7 @@ impl MetalExecutionContext {
             linear_attention_state: Mutex::new(linear_attention_state),
             buffers: Arc::new(MetalBufferPool::new(Arc::clone(&resources))),
             resources,
+            norm_epsilon,
         })
     }
 
@@ -1583,6 +1586,10 @@ impl MetalExecutionContext {
 
     pub(crate) fn buffers(&self) -> &Arc<MetalBufferPool> {
         &self.buffers
+    }
+
+    pub(crate) fn norm_epsilon(&self) -> f32 {
+        self.norm_epsilon
     }
 
     pub(crate) fn set_working_set_limit_bytes(&self, limit: usize) -> anyhow::Result<()> {
@@ -1719,6 +1726,7 @@ impl MetalExecutionContext {
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
+        router_correction_bias: Option<&[f32]>,
     ) -> anyhow::Result<MetalPostAttentionPrep> {
         let dense_weights = self.dense_weights.as_ref().context(
             "FlashMoe unsupported scheduled CMD2 resident post-attention prep path: resident dense Metal weights are unavailable",
@@ -1729,8 +1737,15 @@ impl MetalExecutionContext {
             &self.runtime.pipelines,
             dense_weights,
             &self.buffers,
+            self.norm_epsilon,
         )
-        .execute(projections, attention_output, residual, post_norm_weight)
+        .execute(
+            projections,
+            attention_output,
+            residual,
+            post_norm_weight,
+            router_correction_bias,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2064,6 +2079,7 @@ pub(crate) struct MetalResidentPostAttentionPrepBuilder<'a> {
     residual_rms_norm_pipeline: MetalObjcId,
     dense_weights: &'a MetalDenseWeights,
     buffers: &'a MetalBufferPool,
+    norm_epsilon: f32,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2074,6 +2090,7 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
         pipelines: &'a MetalPipelineSet<MetalObjcId>,
         dense_weights: &'a MetalDenseWeights,
         buffers: &'a MetalBufferPool,
+        norm_epsilon: f32,
     ) -> Self {
         Self {
             device,
@@ -2082,6 +2099,7 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
             residual_rms_norm_pipeline: pipelines.residual_rms_norm_pipeline,
             dense_weights,
             buffers,
+            norm_epsilon,
         }
     }
 
@@ -2091,6 +2109,7 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
         attention_output: &[f32],
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
+        router_correction_bias: Option<&[f32]>,
     ) -> anyhow::Result<MetalPostAttentionPrep> {
         let plan = projections.resident_plan(
             attention_output.len(),
@@ -2184,6 +2203,11 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
                 set_buffer(encoder, residual_buffer, 3);
                 set_buffer(encoder, normed_buffer, 4);
                 set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                set_bytes(
+                    encoder,
+                    f32_as_bytes(std::slice::from_ref(&self.norm_epsilon)),
+                    6,
+                );
                 dispatch_single_threadgroup(encoder, 256);
                 encode_resident_projection(
                     self.pipelines,
@@ -2224,7 +2248,11 @@ impl<'a> MetalResidentPostAttentionPrepBuilder<'a> {
                 msg_send_ptr0(router_logits_buffer, sel("contents")).cast::<f32>();
             let router_scores =
                 std::slice::from_raw_parts(router_logits_ptr, projections.router.rows()).to_vec();
-            let active = routing_softmax_top_k(&router_scores, plan.active_count);
+            let active = if let Some(correction_bias) = router_correction_bias {
+                routing_sigmoid_noaux_top_k(&router_scores, correction_bias, plan.active_count)?
+            } else {
+                routing_softmax_top_k(&router_scores, plan.active_count)
+            };
             let output = MetalPostAttentionPrep::new(
                 plan.layer,
                 plan.width,
@@ -2392,6 +2420,7 @@ pub(crate) struct MetalScheduledCmd3Builder<'a> {
     runtime: &'a MetalRuntime,
     dense_weights: &'a MetalDenseWeights,
     buffers: Arc<MetalBufferPool>,
+    norm_epsilon: f32,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2400,11 +2429,13 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         runtime: &'a MetalRuntime,
         dense_weights: &'a MetalDenseWeights,
         buffers: Arc<MetalBufferPool>,
+        norm_epsilon: f32,
     ) -> Self {
         Self {
             runtime,
             dense_weights,
             buffers,
+            norm_epsilon,
         }
     }
 
@@ -2665,6 +2696,11 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     set_buffer(encoder, next_buffers.weight, 1);
                     set_buffer(encoder, next_buffers.next_normed, 2);
                     set_buffer(encoder, next_buffers.width, 3);
+                    set_bytes(
+                        encoder,
+                        f32_as_bytes(std::slice::from_ref(&self.norm_epsilon)),
+                        4,
+                    );
                     dispatch_single_threadgroup(encoder, next_plan.dispatch_threads);
                 }
                 Ok(())
@@ -2859,15 +2895,23 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                         work.up_out,
                         0,
                     )?;
-                    encode_resident_projection(
-                        &self.runtime.pipelines,
-                        encoder,
-                        self.dense_weights,
-                        &weights.router,
-                        stage.normed,
-                        work.router_out,
-                        0,
-                    )?;
+                    let shared_router = if let Some(router) = weights.router.as_ref() {
+                        encode_resident_projection(
+                            &self.runtime.pipelines,
+                            encoder,
+                            self.dense_weights,
+                            router,
+                            stage.normed,
+                            work.router_out,
+                            0,
+                        )?;
+                        work.router_out
+                    } else {
+                        self.phase_buffer_with_bytes(
+                            f32_as_bytes(std::slice::from_ref(&80.0f32)),
+                            buffers,
+                        )?
+                    };
                     msg_send_void1_id(
                         encoder,
                         sel("setComputePipelineState:"),
@@ -2875,7 +2919,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     );
                     set_buffer(encoder, work.gate_out, 0);
                     set_buffer(encoder, work.up_out, 1);
-                    set_buffer(encoder, work.router_out, 2);
+                    set_buffer(encoder, shared_router, 2);
                     set_buffer(encoder, work.activated, 3);
                     set_buffer(encoder, work.intermediate, 4);
                     set_buffer(encoder, work.total_intermediate, 5);
@@ -2889,7 +2933,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                         stage.shared_output,
                         0,
                     )?;
-                    Ok(work.router_out)
+                    Ok(shared_router)
                 }
                 MetalCmd3SharedPhaseSource::None => {
                     let fill_width = u32::try_from(command.shared.fill_zero_width())
@@ -3794,6 +3838,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 set_buffer(encoder, residual_buffer, 3);
                 set_buffer(encoder, normed_buffer, 4);
                 set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&eps)), 6);
                 dispatch_single_threadgroup(encoder, 256);
                 encode_resident_projection(
                     &self.pipelines,
@@ -7051,6 +7096,7 @@ kernel void rms_norm_reduced(
     device const float* weight [[buffer(1)]],
     device float* output [[buffer(2)]],
     constant uint& width [[buffer(3)]],
+    constant float& epsilon [[buffer(4)]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -7074,7 +7120,7 @@ kernel void rms_norm_reduced(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float scale = rsqrt(partial[0] / float(max(width, 1u)) + 1.0e-6f);
+    float scale = rsqrt(partial[0] / float(max(width, 1u)) + epsilon);
     for (uint i = lid; i < width; i += threads) {
         output[i] = input[i] * scale * weight[i];
     }
@@ -7087,6 +7133,7 @@ kernel void residual_add_rms_norm(
     device float* hidden [[buffer(3)]],
     device float* normed [[buffer(4)]],
     constant uint& width [[buffer(5)]],
+    constant float& epsilon [[buffer(6)]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -7111,7 +7158,7 @@ kernel void residual_add_rms_norm(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float scale = rsqrt(partial[0] / float(max(width, 1u)) + 1.0e-6f);
+    float scale = rsqrt(partial[0] / float(max(width, 1u)) + epsilon);
     for (uint i = lid; i < width; i += threads) {
         float value = projected[i] + residual[i];
         hidden[i] = value;
@@ -8467,7 +8514,7 @@ mod tests {
             gate: test_resident_q4_projection("gate", 6, 4),
             up: test_resident_q4_projection("up", 6, 4),
             down: test_resident_q4_projection("down", 4, 6),
-            router: test_resident_q4_projection("router", 2, 4),
+            router: Some(test_resident_q4_projection("router", 2, 4)),
             shared_experts: 2,
             intermediate: 3,
             width: 4,
@@ -8566,7 +8613,7 @@ mod tests {
             gate: test_resident_q4_projection("gate", 6, 4),
             up: test_resident_q4_projection("up", 6, 4),
             down: test_resident_q4_projection("down", 4, 6),
-            router: test_resident_q4_projection("router", 2, 4),
+            router: Some(test_resident_q4_projection("router", 2, 4)),
             shared_experts: 2,
             intermediate: 3,
             width: 4,
@@ -9020,7 +9067,7 @@ mod tests {
             gate: test_resident_q4_projection("gate", 6, 4),
             up: test_resident_q4_projection("up", 6, 4),
             down: test_resident_q4_projection("down", 4, 6),
-            router: test_resident_q4_projection("router", 2, 4),
+            router: Some(test_resident_q4_projection("router", 2, 4)),
             shared_experts: 2,
             intermediate: 3,
             width: 4,
@@ -9058,7 +9105,7 @@ mod tests {
             gate: test_resident_q4_projection("gate", 6, 4),
             up: test_resident_q4_projection("up", 6, 4),
             down: test_resident_q4_projection("down", 4, 6),
-            router: test_resident_q4_projection("router", 2, 4),
+            router: Some(test_resident_q4_projection("router", 2, 4)),
             shared_experts: 2,
             intermediate: 3,
             width: 4,
@@ -9621,7 +9668,7 @@ mod tests {
         let buffers = MetalBufferPool::default();
         let pipelines = test_objc_pipeline_set(id);
         let builder =
-            MetalResidentPostAttentionPrepBuilder::new(id, id, &pipelines, &dense, &buffers);
+            MetalResidentPostAttentionPrepBuilder::new(id, id, &pipelines, &dense, &buffers, 1e-6);
         let projections = Cmd2ResidentPostAttentionPrepProjections::new(
             7,
             ResidentMmapMatvecProjection::Q4(test_q4_projection(
@@ -9647,6 +9694,7 @@ mod tests {
                 &[0.0; 15],
                 MetalBatchProjectionInput::Cpu(&[0.0; 4]),
                 &[1.0; 4],
+                None,
             )
             .unwrap_err();
         assert!(

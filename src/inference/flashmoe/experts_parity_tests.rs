@@ -941,7 +941,8 @@ fn packer_copies_native_mlx_q4_switch_mlp_experts_without_requantizing() {
     let index_path = snapshot.join("model.safetensors.index.json");
     fs::write(&index_path, index.to_string()).unwrap();
 
-    let (manifest, visual_refs) = build_manifest(QWEN35_MODEL, &snapshot, &index_path).unwrap();
+    let (manifest, visual_refs) =
+        build_manifest(QWEN35_MODEL, &snapshot, &index_path, None).unwrap();
     assert!(visual_refs.is_empty());
     assert!(manifest.dense_tensors.is_empty());
     assert_eq!(manifest.expert_tensors.len(), 3);
@@ -984,6 +985,117 @@ fn packer_copies_native_mlx_q4_switch_mlp_experts_without_requantizing() {
     assert_eq!(down1.packed, down_packed[32..]);
     assert_eq!(down1.scale_bytes, down_scales[16..]);
     assert_eq!(down1.bias_bytes, down_biases[16..]);
+}
+
+#[test]
+fn packer_imports_mlx_mxfp4_switch_mlp_experts_into_canonical_q4_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot = tmp.path().join(crate::cache_dir_name(GLM52_MODEL));
+    fs::create_dir_all(&snapshot).unwrap();
+    let plan = plan_unchecked(GLM52_MODEL, tmp.path());
+    fs::create_dir_all(&plan.experts_dir).unwrap();
+
+    let tensor = |name: &str, nibble_pair: u8| {
+        vec![
+            (
+                format!("model.layers.3.mlp.switch_mlp.{name}.weight"),
+                "U32".to_string(),
+                vec![2, 32, 4],
+                vec![nibble_pair; 2 * 32 * 16],
+            ),
+            (
+                format!("model.layers.3.mlp.switch_mlp.{name}.scales"),
+                "U8".to_string(),
+                vec![2, 32, 1],
+                vec![127; 2 * 32],
+            ),
+        ]
+    };
+    let tensors = tensor("gate_proj", 0x22)
+        .into_iter()
+        .chain(tensor("up_proj", 0x44))
+        .chain(tensor("down_proj", 0x11))
+        .collect::<Vec<_>>();
+    let fixture_refs = typed_fixture_refs(&tensors);
+    fs::write(
+        snapshot.join("experts.safetensors"),
+        make_typed_safetensors(&fixture_refs),
+    )
+    .unwrap();
+    let weight_map = tensors
+        .iter()
+        .map(|(name, _, _, _)| {
+            (
+                name.clone(),
+                serde_json::Value::String("experts.safetensors".to_string()),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let index = serde_json::json!({"weight_map": weight_map});
+    let index_path = snapshot.join("model.safetensors.index.json");
+    fs::write(&index_path, index.to_string()).unwrap();
+
+    let config: QwenModelConfig = serde_json::from_value(serde_json::json!({
+        "model_type": "glm_moe_dsa",
+        "architectures": ["GlmMoeDsaForCausalLM"],
+        "num_hidden_layers": 78,
+        "hidden_size": 32,
+        "num_attention_heads": 1,
+        "head_dim": 32,
+        "vocab_size": 128,
+        "n_routed_experts": 2,
+        "num_experts_per_tok": 1,
+        "n_shared_experts": 1,
+        "norm_topk_prob": true,
+        "moe_intermediate_size": 32,
+        "intermediate_size": 32,
+        "first_k_dense_replace": 3,
+        "q_lora_rank": 32,
+        "kv_lora_rank": 32,
+        "qk_nope_head_dim": 32,
+        "qk_rope_head_dim": 32,
+        "v_head_dim": 32,
+        "n_group": 1,
+        "topk_group": 1,
+        "routed_scaling_factor": 2.5,
+        "index_topk": 2048
+    }))
+    .unwrap();
+
+    let (manifest, visual_refs) =
+        build_manifest(GLM52_MODEL, &snapshot, &index_path, Some(&config)).unwrap();
+    assert!(visual_refs.is_empty());
+    assert_eq!(manifest.expert_tensors.len(), 3);
+    assert!(manifest.expert_tensors.iter().all(|tensor| {
+        tensor.shape == vec![2, 32, 32]
+            && tensor.q4_sources.as_ref().is_some_and(|source| {
+                source.source_format == DenseQ4SourceFormat::MlxMxfp4
+                    && source.source_group_size == Some(32)
+            })
+    }));
+
+    pack_expert_tensors(
+        &snapshot,
+        ExpertPackingPolicy::new(&plan.model, &plan.experts_dir, plan.quantization),
+        &manifest.expert_tensors,
+        Some(&config),
+    )
+    .unwrap();
+
+    let expert0 = read_pbq4_expert_records(&plan.experts_dir, 3, 0).unwrap();
+    let input = [1.0f32; 32];
+    for (suffix, expected) in [
+        ("gate_proj.weight", 32.0),
+        ("up_proj.weight", 64.0),
+        ("down_proj.weight", 16.0),
+    ] {
+        let record = packed_expert_record_suffix(&expert0, suffix).unwrap();
+        assert_eq!(record.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
+        let projected = project_packed_expert_record(record, &input, 32).unwrap();
+        for actual in projected {
+            assert_close_with_tolerance(actual, expected, 0.01);
+        }
+    }
 }
 
 #[test]

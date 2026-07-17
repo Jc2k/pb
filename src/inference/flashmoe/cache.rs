@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 
 use super::experts::*;
 use super::metal::METAL_SHADERS;
-use super::model_family::QwenModelConfig;
+use super::model_family::{QwenModelConfig, is_glm52};
 use super::planning::*;
 use super::safetensors::*;
 use super::types::ExpertQuantization;
@@ -29,6 +29,7 @@ pub fn expected_hf_files() -> Vec<OsString> {
         "generation_config.json",
         "tokenizer.json",
         "tokenizer_config.json",
+        "chat_template.jinja",
         "model.safetensors.index.json",
     ]
     .into_iter()
@@ -97,20 +98,17 @@ pub fn build_cache_from_hf_snapshot_with_quantization(
 
     let index_json = snapshot_dir.join("model.safetensors.index.json");
     let (mut manifest, visual_tensor_refs) = if index_json.is_file() {
-        build_manifest(model, snapshot_dir, &index_json)?
+        build_manifest(model, snapshot_dir, &index_json, config.as_ref())?
     } else {
-        (
-            FlashMoeManifest {
-                model: canonical_model(model),
-                cache_version: cache_version_for_model(model).to_string(),
-                dense_shards: Vec::new(),
-                expert_tensors: Vec::new(),
-                dense_tensors: Vec::new(),
-            },
-            Vec::new(),
-        )
+        build_unindexed_manifest(model, snapshot_dir, config.as_ref())?
     };
-    manifest.cache_version = plan.quantization.cache_version().to_string();
+    let runtime_cache_version =
+        if is_glm52(&plan.model) && plan.quantization == ExpertQuantization::FourBitProduction {
+            super::types::GLM52_CACHE_VERSION
+        } else {
+            plan.quantization.cache_version()
+        };
+    manifest.cache_version = runtime_cache_version.to_string();
     let manifest_bytes =
         serde_json::to_vec_pretty(&manifest).context("failed to encode Flash-MoE manifest")?;
     fs::write(&plan.tensor_manifest, manifest_bytes).with_context(|| {
@@ -140,7 +138,7 @@ pub fn build_cache_from_hf_snapshot_with_quantization(
             write_dense_tensor_store(snapshot_dir, vision_weights, &visual_tensor_refs)?;
             let vision_manifest_data = FlashMoeManifest {
                 model: canonical_model(model),
-                cache_version: plan.quantization.cache_version().to_string(),
+                cache_version: runtime_cache_version.to_string(),
                 dense_shards: Vec::new(),
                 expert_tensors: Vec::new(),
                 dense_tensors: visual_tensor_refs,
@@ -180,6 +178,7 @@ pub fn build_cache_from_hf_snapshot_with_quantization(
 pub(super) fn prepare_tokenizer_artifacts(snapshot_dir: &Path, plan: &FlashMoePlan) -> Result<()> {
     let tokenizer_json = snapshot_dir.join("tokenizer.json");
     let tokenizer_config_json = snapshot_dir.join("tokenizer_config.json");
+    let chat_template = snapshot_dir.join("chat_template.jinja");
     if !tokenizer_json.is_file() {
         bail!(
             "Flash-MoE requires tokenizer.json from the active model directory; missing {}",
@@ -206,6 +205,15 @@ pub(super) fn prepare_tokenizer_artifacts(snapshot_dir: &Path, plan: &FlashMoePl
             )
         })?;
     }
+    if chat_template.is_file() && chat_template != plan.chat_template {
+        fs::copy(&chat_template, &plan.chat_template).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                chat_template.display(),
+                plan.chat_template.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -213,6 +221,7 @@ pub(super) fn build_manifest(
     model: &str,
     snapshot_dir: &Path,
     index_json: &Path,
+    config: Option<&QwenModelConfig>,
 ) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
     let resolved_manifest = resolve_safetensors_manifest(snapshot_dir, index_json)?;
     if resolved_manifest.source == SafetensorsManifestSource::ActualShardHeaders {
@@ -221,6 +230,28 @@ pub(super) fn build_manifest(
             "resolved safetensors manifest from actual shard headers because the declared index references missing shards"
         );
     }
+    build_manifest_from_resolved(model, snapshot_dir, config, resolved_manifest)
+}
+
+pub(super) fn build_unindexed_manifest(
+    model: &str,
+    snapshot_dir: &Path,
+    config: Option<&QwenModelConfig>,
+) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
+    let resolved_manifest = resolve_unindexed_safetensors_manifest(snapshot_dir)?;
+    tracing::info!(
+        snapshot = %snapshot_dir.display(),
+        "resolved unindexed safetensors manifest from actual shard headers"
+    );
+    build_manifest_from_resolved(model, snapshot_dir, config, resolved_manifest)
+}
+
+fn build_manifest_from_resolved(
+    model: &str,
+    snapshot_dir: &Path,
+    config: Option<&QwenModelConfig>,
+    resolved_manifest: ResolvedSafetensorsManifest,
+) -> Result<(FlashMoeManifest, Vec<DenseTensorRef>)> {
     let weight_map = resolved_manifest.weight_map;
     let mut dense_shards = BTreeSet::new();
     let mut dense_tensor_refs = Vec::new();
@@ -230,12 +261,25 @@ pub(super) fn build_manifest(
     let mut runtime_offset = 0u64;
     let mut visual_offset = 0u64;
     for (tensor, shard) in &weight_map {
-        let canonical_tensor = canonical_hf_tensor_name(&tensor);
+        let canonical_tensor = canonical_hf_tensor_name(tensor);
         if skip_flashmoe_runtime_tensor(&canonical_tensor) {
             continue;
         }
+        if let Some(config) = config
+            && config.glm.is_some()
+            && (canonical_tensor.contains(".indexer.")
+                || canonical_tensor.contains(".indexers_proj.")
+                || canonical_tensor.contains(".shared_head.")
+                || canonical_tensor.ends_with(".eh_proj.weight")
+                || canonical_tensor.ends_with(".enorm.weight")
+                || canonical_tensor.ends_with(".hnorm.weight")
+                || tensor_layer(&canonical_tensor)
+                    .is_some_and(|layer| layer >= config.num_hidden_layers))
+        {
+            continue;
+        }
         if is_q4_aux_tensor_name(&canonical_tensor)
-            && weight_map.contains_key(q4_weight_name_for_aux(&tensor).as_str())
+            && weight_map.contains_key(q4_weight_name_for_aux(tensor).as_str())
         {
             continue;
         }
@@ -258,10 +302,20 @@ pub(super) fn build_manifest(
         let tensor_source_offsets = tensor_info.data_offsets;
         if is_expert_tensor_name(&canonical_tensor) {
             let (layer, expert) = parse_layer_expert(&canonical_tensor);
-            let native_q4 =
-                dense_native_q4_sources(snapshot_dir, &weight_map, &mut shard_cache, &tensor)?;
+            let glm_shape =
+                config.and_then(|config| config.glm_logical_tensor_shape(&canonical_tensor));
+            let native_q4 = dense_native_q4_sources(
+                snapshot_dir,
+                &weight_map,
+                &mut shard_cache,
+                tensor,
+                glm_shape.as_deref(),
+            )?;
             let runtime_shape = if native_q4.is_some() {
-                logical_shape_for_mlx_q4(&tensor_shape)?
+                match glm_shape {
+                    Some(shape) => shape,
+                    None => logical_shape_for_mlx_q4(&tensor_shape)?,
+                }
             } else {
                 tensor_shape
             };
@@ -298,16 +352,40 @@ pub(super) fn build_manifest(
             let source_byte_len = tensor_source_offsets[1]
                 .checked_sub(tensor_source_offsets[0])
                 .with_context(|| format!("invalid data_offsets for tensor {tensor}"))?;
-            let native_q4 =
-                dense_native_q4_sources(snapshot_dir, &weight_map, &mut shard_cache, &tensor)?;
+            let glm_shape =
+                config.and_then(|config| config.glm_logical_tensor_shape(&canonical_tensor));
+            let native_q4 = dense_native_q4_sources(
+                snapshot_dir,
+                &weight_map,
+                &mut shard_cache,
+                tensor,
+                glm_shape.as_deref(),
+            )?;
             let quantization =
                 dense_tensor_quantization(&canonical_tensor, &tensor_dtype, &native_q4);
             let runtime_shape = if native_q4.is_some() {
-                logical_shape_for_mlx_q4(&tensor_shape)?
+                match glm_shape {
+                    Some(shape) => shape,
+                    None => logical_shape_for_mlx_q4(&tensor_shape)?,
+                }
             } else {
                 tensor_shape.clone()
             };
+            let preserves_colibri_int8 = native_q4
+                .as_ref()
+                .is_some_and(|source| source.source_format == DenseQ4SourceFormat::ColibriInt8);
+            let runtime_dtype = if preserves_colibri_int8 {
+                "BF16".to_string()
+            } else {
+                tensor_dtype
+            };
             let byte_len = match &quantization {
+                TensorQuantization::None if preserves_colibri_int8 => runtime_shape
+                    .iter()
+                    .try_fold(2u64, |bytes, dimension| {
+                        bytes.checked_mul(*dimension as u64)
+                    })
+                    .context("Colibri int8-to-BF16 runtime tensor byte count overflow")?,
                 TensorQuantization::None => source_byte_len,
                 TensorQuantization::Q4 {
                     group_size,
@@ -326,7 +404,7 @@ pub(super) fn build_manifest(
             dense_tensor_refs.push(DenseTensorRef {
                 tensor: canonical_tensor,
                 shard: shard.clone(),
-                dtype: tensor_dtype,
+                dtype: runtime_dtype,
                 shape: runtime_shape,
                 source_offsets: tensor_source_offsets,
                 runtime_offset,
@@ -347,6 +425,14 @@ pub(super) fn build_manifest(
         },
         visual_tensor_refs,
     ))
+}
+
+fn tensor_layer(name: &str) -> Option<usize> {
+    let parts = name.split('.').collect::<Vec<_>>();
+    parts
+        .windows(2)
+        .find(|part| part[0] == "layers")
+        .and_then(|part| part[1].parse().ok())
 }
 
 pub(super) fn is_expert_tensor_name(name: &str) -> bool {
@@ -383,6 +469,7 @@ mod tests {
         let files = expected_hf_files();
         assert!(files.contains(&OsString::from("config.json")));
         assert!(files.contains(&OsString::from("tokenizer_config.json")));
+        assert!(files.contains(&OsString::from("chat_template.jinja")));
         assert!(files.contains(&OsString::from("model.safetensors.index.json")));
         assert_eq!(expected_vl_hf_files(), files);
     }

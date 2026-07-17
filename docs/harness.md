@@ -222,7 +222,8 @@ example `pb harness infer ...`. `infer` and `bench` accept
 `--metal-working-set-limit-mib <MiB>` to lower the device-derived safety limit. The override can
 only make the default policy stricter. `--resource-summary` prints the opt-in JSON resource ledger;
 normal runs keep it disabled and emit tracing only for high-water changes, pressure recovery, or a
-resource-limit abort.
+resource-limit abort. `infer --no-thinking` asks a checkpoint's chat template to suppress emitted
+reasoning; it cannot be combined with `--raw`, which bypasses the chat template entirely.
 
 The agent/evaluation handoff plumbing does not apply to `pb harness infer`, `pb harness bench`, or
 `pb harness cache-clean`: their arguments, dispatch paths, output, and exit behavior are unchanged.

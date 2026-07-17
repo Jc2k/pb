@@ -14,7 +14,7 @@ use super::experts::{
     AggregateExpertTensor, EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32,
     ExpertSourceTensor, expert_scale_bias_dtype_size,
 };
-use super::math::{q4_dequantize_rows_with_group_size, quantize_q4};
+use super::math::{q4_dequantize_rows_with_group_size, quantize_q4, softmax_in_place};
 #[cfg(test)]
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
 use super::metal::{MetalBatchProjectionInput, MetalObjcId as ObjcId, MetalPostAttentionPrep};
@@ -74,20 +74,26 @@ const DENSE_DECODED_TILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DENSE_Q4_FULL_DECODE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 pub(super) const DENSE_Q4_MLX_FORMAT: &str = "dense-q4-affine-mlx-v1";
+pub(super) const DENSE_Q4_COLIBRI_FORMAT: &str = "dense-q4-affine-colibri-import-v1";
+pub(super) const DENSE_Q4_MXFP4_FORMAT: &str = "dense-q4-affine-mxfp4-import-v1";
 
 pub(super) fn skip_flashmoe_runtime_tensor(canonical_tensor: &str) -> bool {
     canonical_tensor.starts_with("mtp.")
 }
 
 pub(super) fn is_q4_aux_tensor_name(canonical_tensor: &str) -> bool {
-    canonical_tensor.ends_with(".scales") || canonical_tensor.ends_with(".biases")
+    canonical_tensor.ends_with(".scales")
+        || canonical_tensor.ends_with(".biases")
+        || canonical_tensor.ends_with(".weight.qs")
 }
 
 pub(super) fn q4_weight_name_for_aux(tensor: &str) -> String {
     tensor
         .strip_suffix(".scales")
         .or_else(|| tensor.strip_suffix(".biases"))
+        .or_else(|| tensor.strip_suffix(".qs"))
         .map(|base| format!("{base}.weight"))
+        .map(|name| name.replace(".weight.weight", ".weight"))
         .unwrap_or_else(|| tensor.to_string())
 }
 
@@ -115,6 +121,7 @@ pub(super) fn dense_native_q4_sources(
     weight_map: &BTreeMap<String, String>,
     shard_cache: &mut BTreeMap<String, SafetensorShard>,
     tensor: &str,
+    glm_shape: Option<&[usize]>,
 ) -> Result<Option<DenseQ4SourceRefs>> {
     let canonical_tensor = canonical_hf_tensor_name(tensor);
     if !canonical_tensor.ends_with(".weight") {
@@ -127,59 +134,183 @@ pub(super) fn dense_native_q4_sources(
         let path = snapshot_dir.join(weight_shard);
         shard_cache.insert(weight_shard.clone(), parse_safetensors_header(&path)?);
     }
-    let (weight_shape, weight_offsets) = {
+    let (weight_dtype, weight_shape, weight_offsets) = {
         let weight_info = shard_cache
             .get(weight_shard)
             .and_then(|shard| shard.tensors.get(tensor))
             .with_context(|| format!("tensor {tensor} missing from safetensors header"))?;
-        if !weight_info.dtype.eq_ignore_ascii_case("U32") {
-            return Ok(None);
-        }
-        (weight_info.shape.clone(), weight_info.data_offsets)
+        (
+            weight_info.dtype.clone(),
+            weight_info.shape.clone(),
+            weight_info.data_offsets,
+        )
     };
 
+    if weight_dtype.eq_ignore_ascii_case("U8")
+        && let Some(logical_shape) = glm_shape
+    {
+        let scales_name = format!("{tensor}.qs");
+        let Some(scales_shard) = weight_map.get(&scales_name) else {
+            return Ok(None);
+        };
+        if !shard_cache.contains_key(scales_shard) {
+            let path = snapshot_dir.join(scales_shard);
+            shard_cache.insert(scales_shard.clone(), parse_safetensors_header(&path)?);
+        }
+        let scales_info = shard_cache
+            .get(scales_shard)
+            .and_then(|shard| shard.tensors.get(&scales_name))
+            .with_context(|| format!("tensor {scales_name} missing from safetensors header"))?;
+        if !scales_info
+            .dtype
+            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_F32)
+        {
+            bail!(
+                "Colibri tensor {tensor} expects F32 .qs scales, found {}",
+                scales_info.dtype
+            );
+        }
+        let [rows, cols] = logical_shape else {
+            bail!("Colibri tensor {tensor} logical shape must be a matrix, got {logical_shape:?}");
+        };
+        let weight_bytes = weight_offsets[1].saturating_sub(weight_offsets[0]) as usize;
+        let q4_bytes = rows
+            .checked_mul(cols.div_ceil(2))
+            .context("Colibri q4 tensor byte count overflow")?;
+        let int8_bytes = rows
+            .checked_mul(*cols)
+            .context("Colibri int8 tensor byte count overflow")?;
+        let bits = if weight_bytes == q4_bytes {
+            4
+        } else if weight_bytes == int8_bytes {
+            8
+        } else {
+            bail!(
+                "Colibri tensor {tensor} has {weight_bytes} packed bytes for logical shape {logical_shape:?}; expected {q4_bytes} (int4) or {int8_bytes} (int8)"
+            );
+        };
+        let scale_bytes =
+            scales_info.data_offsets[1].saturating_sub(scales_info.data_offsets[0]) as usize;
+        if !scale_bytes.is_multiple_of(4 * rows) {
+            bail!(
+                "Colibri tensor {tensor} has {scale_bytes} scale bytes, which is not F32 row-group data for {rows} rows"
+            );
+        }
+        let source_groups_per_row = scale_bytes / 4 / rows;
+        if source_groups_per_row == 0 || source_groups_per_row > *cols {
+            bail!(
+                "Colibri tensor {tensor} has invalid source groups per row {source_groups_per_row} for {cols} columns"
+            );
+        }
+        let source_group_size = cols.div_ceil(source_groups_per_row);
+        if cols.div_ceil(source_group_size) != source_groups_per_row {
+            bail!(
+                "Colibri tensor {tensor} scale count cannot resolve a contiguous source group size"
+            );
+        }
+        return Ok(Some(DenseQ4SourceRefs {
+            scales_shard: scales_shard.clone(),
+            scales_offsets: scales_info.data_offsets,
+            biases_shard: scales_shard.clone(),
+            biases_offsets: scales_info.data_offsets,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            source_format: if bits == 4 {
+                DenseQ4SourceFormat::ColibriInt4
+            } else {
+                DenseQ4SourceFormat::ColibriInt8
+            },
+            source_group_size: Some(source_group_size),
+        }));
+    }
+
+    if !weight_dtype.eq_ignore_ascii_case("U32") {
+        return Ok(None);
+    }
+
     let scales_name = q4_aux_tensor_name(tensor, "scales");
-    let biases_name = q4_aux_tensor_name(tensor, "biases");
-    let (Some(scales_shard), Some(biases_shard)) =
-        (weight_map.get(&scales_name), weight_map.get(&biases_name))
-    else {
+    let Some(scales_shard) = weight_map.get(&scales_name) else {
         return Ok(None);
     };
-    for shard in [scales_shard, biases_shard] {
+    if !shard_cache.contains_key(scales_shard) {
+        let path = snapshot_dir.join(scales_shard);
+        shard_cache.insert(scales_shard.clone(), parse_safetensors_header(&path)?);
+    }
+    let (scales_dtype, scales_offsets) = {
+        let scales_info = shard_cache
+            .get(scales_shard)
+            .and_then(|shard| shard.tensors.get(&scales_name))
+            .with_context(|| format!("tensor {scales_name} missing from safetensors header"))?;
+        (scales_info.dtype.clone(), scales_info.data_offsets)
+    };
+    let logical_shape = logical_shape_for_mlx_q4(&weight_shape)?;
+
+    if scales_dtype.eq_ignore_ascii_case("U8") {
+        let (cols, prefix) = logical_shape
+            .split_last()
+            .with_context(|| format!("MLX MXFP4 tensor {tensor} has an empty logical shape"))?;
+        let rows = prefix.iter().try_fold(1usize, |rows, dimension| {
+            rows.checked_mul(*dimension)
+                .context("MLX MXFP4 logical row count overflow")
+        })?;
+        let source_group_size = 32;
+        let expected_weight_bytes = rows
+            .checked_mul(cols.div_ceil(2))
+            .context("MLX MXFP4 packed byte count overflow")?;
+        let expected_scale_bytes = rows
+            .checked_mul(cols.div_ceil(source_group_size))
+            .context("MLX MXFP4 scale byte count overflow")?;
+        let weight_bytes = usize::try_from(weight_offsets[1] - weight_offsets[0])
+            .context("MLX MXFP4 packed byte count exceeds usize")?;
+        let scale_bytes = usize::try_from(scales_offsets[1] - scales_offsets[0])
+            .context("MLX MXFP4 scale byte count exceeds usize")?;
+        if weight_bytes != expected_weight_bytes || scale_bytes != expected_scale_bytes {
+            bail!(
+                "MLX MXFP4 tensor {tensor} layout mismatch: weight/scales bytes {weight_bytes}/{scale_bytes}, expected {expected_weight_bytes}/{expected_scale_bytes} for {logical_shape:?}"
+            );
+        }
+        return Ok(Some(DenseQ4SourceRefs {
+            scales_shard: scales_shard.clone(),
+            scales_offsets,
+            biases_shard: scales_shard.clone(),
+            biases_offsets: scales_offsets,
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            source_format: DenseQ4SourceFormat::MlxMxfp4,
+            source_group_size: Some(source_group_size),
+        }));
+    }
+
+    let biases_name = q4_aux_tensor_name(tensor, "biases");
+    let Some(biases_shard) = weight_map.get(&biases_name) else {
+        return Ok(None);
+    };
+    for shard in [biases_shard] {
         if !shard_cache.contains_key(shard) {
             let path = snapshot_dir.join(shard);
             shard_cache.insert(shard.clone(), parse_safetensors_header(&path)?);
         }
     }
-    let scales_info = shard_cache
-        .get(scales_shard)
-        .and_then(|shard| shard.tensors.get(&scales_name))
-        .with_context(|| format!("tensor {scales_name} missing from safetensors header"))?;
     let biases_info = shard_cache
         .get(biases_shard)
         .and_then(|shard| shard.tensors.get(&biases_name))
         .with_context(|| format!("tensor {biases_name} missing from safetensors header"))?;
-    if !scales_info
-        .dtype
-        .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+    if !scales_dtype.eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
         || !biases_info
             .dtype
             .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
     {
         bail!(
             "native dense q4 tensor {tensor} expects BF16 scales/biases, found {}/{}",
-            scales_info.dtype,
+            scales_dtype,
             biases_info.dtype
         );
     }
-    let logical_shape = logical_shape_for_mlx_q4(&weight_shape)?;
     let layout = dense_q4_layout_with_scale_bias_dtype(
         &logical_shape,
         GROUP_SIZE,
         EXPERT_SCALE_BIAS_DTYPE_BF16,
     )?;
     let weight_bytes = weight_offsets[1].saturating_sub(weight_offsets[0]);
-    let scales_bytes = scales_info.data_offsets[1].saturating_sub(scales_info.data_offsets[0]);
+    let scales_bytes = scales_offsets[1].saturating_sub(scales_offsets[0]);
     let biases_bytes = biases_info.data_offsets[1].saturating_sub(biases_info.data_offsets[0]);
     if weight_bytes != layout.packed_bytes as u64
         || scales_bytes != layout.scales_bytes as u64
@@ -194,10 +325,12 @@ pub(super) fn dense_native_q4_sources(
     }
     Ok(Some(DenseQ4SourceRefs {
         scales_shard: scales_shard.clone(),
-        scales_offsets: scales_info.data_offsets,
+        scales_offsets,
         biases_shard: biases_shard.clone(),
         biases_offsets: biases_info.data_offsets,
         scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+        source_format: DenseQ4SourceFormat::MlxAffine,
+        source_group_size: None,
     }))
 }
 
@@ -207,10 +340,26 @@ pub(super) fn dense_tensor_quantization(
     native_q4: &Option<DenseQ4SourceRefs>,
 ) -> TensorQuantization {
     let _ = (canonical_tensor, tensor_dtype);
-    if let Some(native_q4) = native_q4 {
+    if native_q4
+        .as_ref()
+        .is_some_and(|source| source.source_format == DenseQ4SourceFormat::ColibriInt8)
+    {
+        // Colibri keeps the large embedding and LM-head matrices at int8 by
+        // default. Preserve that source precision in a runtime layout the
+        // existing resident dense kernels can consume instead of requantizing
+        // the values to q4.
+        TensorQuantization::None
+    } else if let Some(native_q4) = native_q4 {
         TensorQuantization::Q4 {
             group_size: GROUP_SIZE,
-            format: DENSE_Q4_MLX_FORMAT.to_string(),
+            format: match native_q4.source_format {
+                DenseQ4SourceFormat::MlxAffine => DENSE_Q4_MLX_FORMAT,
+                DenseQ4SourceFormat::ColibriInt4 | DenseQ4SourceFormat::ColibriInt8 => {
+                    DENSE_Q4_COLIBRI_FORMAT
+                }
+                DenseQ4SourceFormat::MlxMxfp4 => DENSE_Q4_MXFP4_FORMAT,
+            }
+            .to_string(),
             scale_bias_dtype: native_q4.scale_bias_dtype.clone(),
         }
     } else {
@@ -278,8 +427,32 @@ pub(super) fn write_dense_tensor_store(
         let raw = &bytes[start as usize..end as usize];
         match &tensor.quantization {
             TensorQuantization::None => {
-                out.write_all(raw)
-                    .with_context(|| format!("failed to write dense tensor {}", tensor.tensor))?;
+                if let Some(q4_sources) = &tensor.q4_sources
+                    && q4_sources.source_format == DenseQ4SourceFormat::ColibriInt8
+                {
+                    let (scale_bytes, scale_shard) = shard_cache
+                        .get(&q4_sources.scales_shard)
+                        .expect("inserted above");
+                    let scale_start = scale_shard.data_start + q4_sources.scales_offsets[0];
+                    let scale_end = scale_shard.data_start + q4_sources.scales_offsets[1];
+                    write_colibri_int8_bf16_tensor(
+                        &mut out,
+                        &tensor.tensor,
+                        raw,
+                        &scale_bytes[scale_start as usize..scale_end as usize],
+                        q4_sources.source_group_size.with_context(|| {
+                            format!(
+                                "Colibri int8 tensor {} is missing its source group size",
+                                tensor.tensor
+                            )
+                        })?,
+                        &tensor.shape,
+                    )?;
+                } else {
+                    out.write_all(raw).with_context(|| {
+                        format!("failed to write dense tensor {}", tensor.tensor)
+                    })?;
+                }
             }
             TensorQuantization::Q4 {
                 group_size,
@@ -292,6 +465,60 @@ pub(super) fn write_dense_tensor_store(
                     scale_bias_dtype,
                 )?;
                 if let Some(q4_sources) = &tensor.q4_sources {
+                    if matches!(
+                        q4_sources.source_format,
+                        DenseQ4SourceFormat::ColibriInt4 | DenseQ4SourceFormat::ColibriInt8
+                    ) {
+                        let bits = if q4_sources.source_format == DenseQ4SourceFormat::ColibriInt4 {
+                            4
+                        } else {
+                            8
+                        };
+                        let (scale_bytes, scale_shard) = shard_cache
+                            .get(&q4_sources.scales_shard)
+                            .expect("inserted above");
+                        let scale_start = scale_shard.data_start + q4_sources.scales_offsets[0];
+                        let scale_end = scale_shard.data_start + q4_sources.scales_offsets[1];
+                        let source_scales = &scale_bytes[scale_start as usize..scale_end as usize];
+                        write_colibri_q4_affine_tensor(
+                            &mut out,
+                            &tensor.tensor,
+                            raw,
+                            source_scales,
+                            bits,
+                            q4_sources.source_group_size.with_context(|| {
+                                format!(
+                                    "Colibri tensor {} is missing its source group size",
+                                    tensor.tensor
+                                )
+                            })?,
+                            layout,
+                        )?;
+                        current = current.saturating_add(tensor.byte_len);
+                        continue;
+                    }
+                    if q4_sources.source_format == DenseQ4SourceFormat::MlxMxfp4 {
+                        let (scale_bytes, scale_shard) = shard_cache
+                            .get(&q4_sources.scales_shard)
+                            .expect("inserted above");
+                        let scale_start = scale_shard.data_start + q4_sources.scales_offsets[0];
+                        let scale_end = scale_shard.data_start + q4_sources.scales_offsets[1];
+                        write_mlx_mxfp4_affine_tensor(
+                            &mut out,
+                            &tensor.tensor,
+                            raw,
+                            &scale_bytes[scale_start as usize..scale_end as usize],
+                            q4_sources.source_group_size.with_context(|| {
+                                format!(
+                                    "MLX MXFP4 tensor {} is missing its source group size",
+                                    tensor.tensor
+                                )
+                            })?,
+                            layout,
+                        )?;
+                        current = current.saturating_add(tensor.byte_len);
+                        continue;
+                    }
                     if raw.len() != layout.packed_bytes {
                         bail!(
                             "native dense q4 packed byte length mismatch for {}: raw={} expected={}",
@@ -403,6 +630,293 @@ pub(super) fn write_dense_tensor_store(
     Ok(())
 }
 
+fn encode_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let lsb = (bits >> 16) & 1;
+    ((bits.wrapping_add(0x7fff + lsb)) >> 16) as u16
+}
+
+fn decode_f32_le(bytes: &[u8]) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        bail!("F32 byte length {} is not divisible by four", bytes.len());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+        .collect())
+}
+
+fn write_colibri_int8_bf16_tensor(
+    out: &mut impl Write,
+    tensor_name: &str,
+    source_weights: &[u8],
+    source_scale_bytes: &[u8],
+    source_group_size: usize,
+    shape: &[usize],
+) -> Result<()> {
+    let [rows, cols] = shape else {
+        bail!("Colibri int8 tensor {tensor_name} must be a matrix, got {shape:?}");
+    };
+    let expected_weights = rows
+        .checked_mul(*cols)
+        .context("Colibri int8 tensor element count overflow")?;
+    if source_weights.len() != expected_weights {
+        bail!(
+            "Colibri int8 tensor {tensor_name} has {} source bytes, expected {expected_weights}",
+            source_weights.len()
+        );
+    }
+    let source_scales = decode_f32_le(source_scale_bytes)?;
+    let groups_per_row = cols.div_ceil(source_group_size);
+    let expected_scales = rows
+        .checked_mul(groups_per_row)
+        .context("Colibri int8 scale count overflow")?;
+    if source_scales.len() != expected_scales {
+        bail!(
+            "Colibri int8 tensor {tensor_name} has {} scales, expected {expected_scales}",
+            source_scales.len()
+        );
+    }
+    for row in 0..*rows {
+        for col in 0..*cols {
+            let quantized = source_weights[row * *cols + col] as i8 as f32;
+            let scale = source_scales[row * groups_per_row + col / source_group_size];
+            out.write_all(&encode_bf16_bits(quantized * scale).to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn write_colibri_q4_affine_tensor(
+    out: &mut impl Write,
+    tensor_name: &str,
+    source_weights: &[u8],
+    source_scale_bytes: &[u8],
+    bits: u8,
+    source_group_size: usize,
+    layout: DenseQ4Layout,
+) -> Result<()> {
+    if layout.scale_bias_bytes != 2 {
+        bail!("Colibri import for {tensor_name} requires BF16 runtime scale/bias storage");
+    }
+    if bits != 4 && bits != 8 {
+        bail!("Colibri tensor {tensor_name} has unsupported quantization width {bits}");
+    }
+    let source_scales = decode_f32_le(source_scale_bytes)?;
+    let source_groups_per_row = layout.cols.div_ceil(source_group_size);
+    let expected_source_scales = layout
+        .rows
+        .checked_mul(source_groups_per_row)
+        .context("Colibri source scale count overflow")?;
+    if source_scales.len() != expected_source_scales {
+        bail!(
+            "Colibri tensor {tensor_name} has {} source scales, expected {expected_source_scales}",
+            source_scales.len()
+        );
+    }
+    let source_row_bytes = match bits {
+        4 => layout.cols.div_ceil(2),
+        8 => layout.cols,
+        _ => unreachable!(),
+    };
+    if source_weights.len() != layout.rows * source_row_bytes {
+        bail!(
+            "Colibri tensor {tensor_name} has {} weight bytes, expected {}",
+            source_weights.len(),
+            layout.rows * source_row_bytes
+        );
+    }
+
+    let can_preserve_q4 = bits == 4
+        && (0..layout.groups_per_row).all(|group| {
+            let start = group * layout.group_size;
+            let end = ((group + 1) * layout.group_size).min(layout.cols);
+            start / source_group_size == end.saturating_sub(1) / source_group_size
+        });
+    let mut runtime_scales = Vec::with_capacity(layout.rows * layout.groups_per_row);
+    let mut runtime_biases = Vec::with_capacity(layout.rows * layout.groups_per_row);
+
+    if can_preserve_q4 {
+        out.write_all(source_weights)
+            .with_context(|| format!("failed to write Colibri packed q4 tensor {tensor_name}"))?;
+        for row in 0..layout.rows {
+            for group in 0..layout.groups_per_row {
+                let source_group = (group * layout.group_size) / source_group_size;
+                let scale = source_scales[row * source_groups_per_row + source_group];
+                runtime_scales.push(encode_bf16_bits(scale));
+                runtime_biases.push(encode_bf16_bits(-8.0 * scale));
+            }
+        }
+    } else {
+        let mut packed_row = vec![0u8; layout.row_packed_bytes];
+        let mut values = vec![0.0f32; layout.cols];
+        for row in 0..layout.rows {
+            packed_row.fill(0);
+            let source_row = &source_weights[row * source_row_bytes..(row + 1) * source_row_bytes];
+            for (col, value) in values.iter_mut().enumerate() {
+                let quantized = if bits == 8 {
+                    source_row[col] as i8 as i32
+                } else {
+                    let byte = source_row[col / 2];
+                    let nibble = if col.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    };
+                    nibble as i32 - 8
+                };
+                let source_group = col / source_group_size;
+                *value =
+                    quantized as f32 * source_scales[row * source_groups_per_row + source_group];
+            }
+            for group in 0..layout.groups_per_row {
+                let start = group * layout.group_size;
+                let end = ((group + 1) * layout.group_size).min(layout.cols);
+                let max_abs = values[start..end]
+                    .iter()
+                    .map(|value| value.abs())
+                    .fold(0.0f32, f32::max);
+                let scale = (max_abs / 7.0).max(1e-8);
+                runtime_scales.push(encode_bf16_bits(scale));
+                runtime_biases.push(encode_bf16_bits(-8.0 * scale));
+                for (offset, value) in values[start..end].iter().enumerate() {
+                    let col = start + offset;
+                    let quantized = (value / scale).round().clamp(-8.0, 7.0) as i32 + 8;
+                    if col.is_multiple_of(2) {
+                        packed_row[col / 2] |= quantized as u8;
+                    } else {
+                        packed_row[col / 2] |= (quantized as u8) << 4;
+                    }
+                }
+            }
+            out.write_all(&packed_row).with_context(|| {
+                format!("failed to write converted Colibri q4 row for {tensor_name}")
+            })?;
+        }
+    }
+
+    if runtime_scales.len() * 2 != layout.scales_bytes
+        || runtime_biases.len() * 2 != layout.scales_bytes
+    {
+        bail!(
+            "Colibri tensor {tensor_name} produced invalid affine scale/bias lengths {}/{}; expected {} bytes each",
+            runtime_scales.len() * 2,
+            runtime_biases.len() * 2,
+            layout.scales_bytes
+        );
+    }
+    for scale in runtime_scales {
+        out.write_all(&scale.to_le_bytes())?;
+    }
+    for bias in runtime_biases {
+        out.write_all(&bias.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn decode_mlx_mxfp4_e2m1(nibble: u8) -> f32 {
+    const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let magnitude = MAGNITUDES[(nibble & 0x07) as usize];
+    if nibble & 0x08 == 0 {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
+fn decode_mlx_mxfp4_e8m0(bits: u8) -> Result<f32> {
+    let ieee = if bits == 0 {
+        0x0040_0000
+    } else {
+        u32::from(bits) << 23
+    };
+    let value = f32::from_bits(ieee);
+    if !value.is_finite() {
+        bail!("MLX MXFP4 E8M0 scale byte 0x{bits:02x} is not finite");
+    }
+    Ok(value)
+}
+
+pub(super) fn write_mlx_mxfp4_affine_tensor(
+    out: &mut impl Write,
+    tensor_name: &str,
+    source_weights: &[u8],
+    source_scale_bytes: &[u8],
+    source_group_size: usize,
+    layout: DenseQ4Layout,
+) -> Result<()> {
+    if layout.scale_bias_bytes != 2 {
+        bail!("MLX MXFP4 import for {tensor_name} requires BF16 runtime scale/bias storage");
+    }
+    if source_group_size != 32 {
+        bail!(
+            "MLX MXFP4 tensor {tensor_name} requires source group size 32, found {source_group_size}"
+        );
+    }
+    let source_row_bytes = layout.cols.div_ceil(2);
+    let source_groups_per_row = layout.cols.div_ceil(source_group_size);
+    let expected_weights = layout
+        .rows
+        .checked_mul(source_row_bytes)
+        .context("MLX MXFP4 source weight byte count overflow")?;
+    let expected_scales = layout
+        .rows
+        .checked_mul(source_groups_per_row)
+        .context("MLX MXFP4 source scale byte count overflow")?;
+    if source_weights.len() != expected_weights || source_scale_bytes.len() != expected_scales {
+        bail!(
+            "MLX MXFP4 tensor {tensor_name} has weight/scales bytes {}/{}, expected {expected_weights}/{expected_scales}",
+            source_weights.len(),
+            source_scale_bytes.len()
+        );
+    }
+
+    let mut runtime_scales = Vec::with_capacity(layout.rows * layout.groups_per_row);
+    let mut runtime_biases = Vec::with_capacity(layout.rows * layout.groups_per_row);
+    let mut values = vec![0.0f32; layout.cols];
+    for row in 0..layout.rows {
+        let source_row = &source_weights[row * source_row_bytes..(row + 1) * source_row_bytes];
+        let source_scales =
+            &source_scale_bytes[row * source_groups_per_row..(row + 1) * source_groups_per_row];
+        for (col, value) in values.iter_mut().enumerate() {
+            let byte = source_row[col / 2];
+            let nibble = if col.is_multiple_of(2) {
+                byte & 0x0f
+            } else {
+                byte >> 4
+            };
+            let scale = decode_mlx_mxfp4_e8m0(source_scales[col / source_group_size])?;
+            *value = decode_mlx_mxfp4_e2m1(nibble) * scale;
+        }
+        let quantized = quantize_q4(&values, &[1, layout.cols], layout.group_size)
+            .with_context(|| format!("failed to requantize MLX MXFP4 tensor {tensor_name}"))?;
+        if quantized.values.len() != layout.row_packed_bytes
+            || quantized.scales.len() != layout.groups_per_row
+            || quantized.biases.len() != layout.groups_per_row
+        {
+            bail!("MLX MXFP4 tensor {tensor_name} produced an invalid runtime q4 row layout");
+        }
+        out.write_all(&quantized.values).with_context(|| {
+            format!("failed to write converted MLX MXFP4 q4 row for {tensor_name}")
+        })?;
+        runtime_scales.extend(quantized.scales.into_iter().map(encode_bf16_bits));
+        runtime_biases.extend(quantized.biases.into_iter().map(encode_bf16_bits));
+    }
+
+    if runtime_scales.len() * 2 != layout.scales_bytes
+        || runtime_biases.len() * 2 != layout.scales_bytes
+    {
+        bail!("MLX MXFP4 tensor {tensor_name} produced invalid affine scale/bias lengths");
+    }
+    for scale in runtime_scales {
+        out.write_all(&scale.to_le_bytes())?;
+    }
+    for bias in runtime_biases {
+        out.write_all(&bias.to_le_bytes())?;
+    }
+    Ok(())
+}
+
 pub(super) fn write_padding(out: &mut fs::File, mut bytes: u64) -> Result<()> {
     const ZEROES: [u8; 4096] = [0; 4096];
     while bytes > 0 {
@@ -505,6 +1019,9 @@ pub(super) fn validate_required_tensor_manifest(
                     )?;
                 }
             }
+            AttentionLayerType::Mla => {
+                let _ = infer_mla_attention_layout(config, registry, layer)?;
+            }
             AttentionLayerType::Linear => {
                 let _ = infer_linear_attention_layout(config, registry, layer)?;
             }
@@ -519,11 +1036,35 @@ pub(super) fn validate_required_tensor_manifest(
             &layer_norm_tensor_name(layer, "post_attention_layernorm"),
             &[config.hidden_size],
         )?;
+        if config.is_dense_mlp_layer(layer) {
+            let intermediate = config.intermediate_size.with_context(|| {
+                format!("GLM dense MLP layer {layer} is missing intermediate_size")
+            })?;
+            for (projection, shape) in [
+                ("gate_proj", [intermediate, config.hidden_size]),
+                ("up_proj", [intermediate, config.hidden_size]),
+                ("down_proj", [config.hidden_size, intermediate]),
+            ] {
+                require_tensor_shape(
+                    registry,
+                    &format!("model.layers.{layer}.mlp.{projection}.weight"),
+                    &shape,
+                )?;
+            }
+            continue;
+        }
         require_tensor_shape(
             registry,
             &router_tensor_name(layer),
             &[config.experts(), config.hidden_size],
         )?;
+        if config.glm.is_some() {
+            require_tensor_shape(
+                registry,
+                &format!("model.layers.{layer}.mlp.gate.e_score_correction_bias"),
+                &[config.experts()],
+            )?;
+        }
         let shared_experts = config.shared_experts();
         if shared_experts > 0 {
             let shared_inter = config.shared_expert_intermediate_size();
@@ -550,11 +1091,13 @@ pub(super) fn validate_required_tensor_manifest(
                 &shared_expert_tensor_name(layer, "down_proj"),
                 &[config.hidden_size, total_shared_inter],
             )?;
-            require_tensor_shape(
-                registry,
-                &shared_expert_gate_tensor_name(layer),
-                &[shared_experts, config.hidden_size],
-            )?;
+            if config.glm.is_none() {
+                require_tensor_shape(
+                    registry,
+                    &shared_expert_gate_tensor_name(layer),
+                    &[shared_experts, config.hidden_size],
+                )?;
+            }
         }
         // Per-expert tensor presence is intentionally not validated here.
         //
@@ -578,7 +1121,60 @@ pub(super) fn validate_qwen_q4_graph_bindings(
     store_len: u64,
 ) -> Result<()> {
     for layer in 0..config.num_hidden_layers {
-        if !runtime.is_linear_attention_layer(layer) {
+        if runtime.is_mla_attention_layer(layer) {
+            let layout = runtime.mla_attention_layout(layer)?;
+            for (projection, output_width, input_width) in [
+                ("q_a_proj", layout.q_lora_rank, runtime.width),
+                ("q_b_proj", layout.q_width, layout.q_lora_rank),
+                ("kv_a_proj_with_mqa", layout.kv_a_width, runtime.width),
+                ("o_proj", runtime.width, layout.attention_output_width),
+            ] {
+                require_resident_q4_graph_projection(
+                    family,
+                    registry,
+                    store_len,
+                    "MLA projection",
+                    &attention_tensor_name(layer, projection),
+                    output_width,
+                    input_width,
+                )?;
+            }
+            match layout.kv_projection {
+                MlaKvProjectionLayout::FusedKvB => {
+                    require_resident_q4_graph_projection(
+                        family,
+                        registry,
+                        store_len,
+                        "MLA KV-B projection",
+                        &attention_tensor_name(layer, "kv_b_proj"),
+                        layout.kv_b_width,
+                        layout.kv_lora_rank,
+                    )?;
+                }
+                MlaKvProjectionLayout::AbsorbedMultiLinear => {
+                    require_resident_q4_multilinear_projection(
+                        family,
+                        registry,
+                        store_len,
+                        "MLA absorbed query projection",
+                        &attention_tensor_name(layer, "embed_q"),
+                        layout.num_heads,
+                        layout.kv_lora_rank,
+                        layout.qk_nope_head_dim,
+                    )?;
+                    require_resident_q4_multilinear_projection(
+                        family,
+                        registry,
+                        store_len,
+                        "MLA absorbed output projection",
+                        &attention_tensor_name(layer, "unembed_out"),
+                        layout.num_heads,
+                        layout.v_head_dim,
+                        layout.kv_lora_rank,
+                    )?;
+                }
+            }
+        } else if !runtime.is_linear_attention_layer(layer) {
             let layout = runtime.full_attention_layout(layer)?;
             let requests = full_attention_input_projection_requests(
                 layer,
@@ -607,15 +1203,48 @@ pub(super) fn validate_qwen_q4_graph_bindings(
             )?;
         }
 
-        require_resident_q4_graph_projection(
-            family,
-            registry,
-            store_len,
-            "CMD2 router projection",
-            &router_tensor_name(layer),
-            config.experts(),
-            runtime.width,
-        )?;
+        if config.is_dense_mlp_layer(layer) {
+            let intermediate = config.intermediate_size.with_context(|| {
+                format!("GLM dense MLP layer {layer} is missing intermediate_size")
+            })?;
+            for (projection, output_width, input_width) in [
+                ("gate_proj", intermediate, runtime.width),
+                ("up_proj", intermediate, runtime.width),
+                ("down_proj", runtime.width, intermediate),
+            ] {
+                require_resident_q4_graph_projection(
+                    family,
+                    registry,
+                    store_len,
+                    "dense lead-in MLP projection",
+                    &format!("model.layers.{layer}.mlp.{projection}.weight"),
+                    output_width,
+                    input_width,
+                )?;
+            }
+        } else {
+            if config.glm.is_some() {
+                require_resident_graph_projection(
+                    family,
+                    registry,
+                    store_len,
+                    "CMD2 GLM router projection",
+                    &router_tensor_name(layer),
+                    config.experts(),
+                    runtime.width,
+                )?;
+            } else {
+                require_resident_q4_graph_projection(
+                    family,
+                    registry,
+                    store_len,
+                    "CMD2 router projection",
+                    &router_tensor_name(layer),
+                    config.experts(),
+                    runtime.width,
+                )?;
+            }
+        }
     }
 
     let lm_head_name = if registry.tensor("lm_head.weight").is_some() {
@@ -623,15 +1252,52 @@ pub(super) fn validate_qwen_q4_graph_bindings(
     } else {
         "model.embed_tokens.weight"
     };
-    require_resident_q4_graph_projection(
-        family,
-        registry,
+    if config.glm.is_some() {
+        require_resident_graph_projection(
+            family,
+            registry,
+            store_len,
+            "GLM LM-head sampling projection",
+            lm_head_name,
+            config.vocab_size,
+            runtime.width,
+        )?;
+    } else {
+        require_resident_q4_graph_projection(
+            family,
+            registry,
+            store_len,
+            "LM-head sampling projection",
+            lm_head_name,
+            config.vocab_size,
+            runtime.width,
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn require_resident_graph_projection(
+    family: QwenMoeFamily,
+    registry: &TensorRegistry,
+    store_len: u64,
+    stage: &str,
+    tensor_name: &str,
+    output_width: usize,
+    input_width: usize,
+) -> Result<()> {
+    let entry = registry.require(tensor_name)?;
+    ResidentMmapMatvecProjection::from_entry(
+        tensor_name,
+        entry,
         store_len,
-        "LM-head sampling projection",
-        lm_head_name,
-        config.vocab_size,
-        runtime.width,
-    )?;
+        output_width,
+        input_width,
+    )
+    .with_context(|| {
+        format!(
+            "FlashMoe unsupported resolved {family:?} {stage}: tensor {tensor_name} cannot bind resident shape {output_width}x{input_width}"
+        )
+    })?;
     Ok(())
 }
 
@@ -660,6 +1326,33 @@ pub(super) fn require_resident_q4_graph_projection(
     Ok(())
 }
 
+pub(super) fn require_resident_q4_multilinear_projection(
+    family: QwenMoeFamily,
+    registry: &TensorRegistry,
+    store_len: u64,
+    stage: &str,
+    tensor_name: &str,
+    heads: usize,
+    output_width_per_head: usize,
+    input_width: usize,
+) -> Result<()> {
+    let entry = registry.require(tensor_name)?;
+    DenseQ4MmapMatvecProjection::from_multilinear_entry(
+        tensor_name,
+        entry,
+        store_len,
+        heads,
+        output_width_per_head,
+        input_width,
+    )?
+    .with_context(|| {
+        format!(
+            "FlashMoe unsupported resolved {family:?} Q4 {stage}: tensor {tensor_name} cannot bind the resident multilinear projection for shape {heads}x{output_width_per_head}x{input_width}"
+        )
+    })?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DenseTransformerRuntime {
     pub(super) width: usize,
@@ -670,6 +1363,7 @@ pub(super) struct DenseTransformerRuntime {
     #[cfg(test)]
     pub(super) kv_heads: usize,
     pub(super) full_attention: Vec<Option<FullAttentionLayout>>,
+    pub(super) mla_attention: Vec<Option<MlaAttentionLayout>>,
     pub(super) linear_attention: Vec<Option<LinearAttentionLayout>>,
 }
 
@@ -688,6 +1382,7 @@ impl DenseTransformerRuntime {
             #[cfg(test)]
             kv_heads,
             full_attention: vec![None; config.num_hidden_layers],
+            mla_attention: vec![None; config.num_hidden_layers],
             linear_attention: vec![None; config.num_hidden_layers],
         }
     }
@@ -702,6 +1397,10 @@ impl DenseTransformerRuntime {
                 AttentionLayerType::Full => {
                     runtime.full_attention[layer] =
                         Some(infer_full_attention_layout(config, registry, layer)?);
+                }
+                AttentionLayerType::Mla => {
+                    runtime.mla_attention[layer] =
+                        Some(infer_mla_attention_layout(config, registry, layer)?);
                 }
                 AttentionLayerType::Linear => {
                     runtime.linear_attention[layer] =
@@ -729,6 +1428,21 @@ impl DenseTransformerRuntime {
             .with_context(|| format!("missing linear-attention runtime layout for layer {layer}"))
     }
 
+    pub(super) fn mla_attention_layout(&self, layer: usize) -> Result<MlaAttentionLayout> {
+        self.mla_attention
+            .get(layer)
+            .copied()
+            .flatten()
+            .with_context(|| format!("missing MLA runtime layout for layer {layer}"))
+    }
+
+    pub(super) fn is_mla_attention_layer(&self, layer: usize) -> bool {
+        self.mla_attention
+            .get(layer)
+            .and_then(|layout| *layout)
+            .is_some()
+    }
+
     pub(super) fn is_linear_attention_layer(&self, layer: usize) -> bool {
         self.linear_attention
             .get(layer)
@@ -739,11 +1453,18 @@ impl DenseTransformerRuntime {
     pub(super) fn resolved_attention_layers(&self) -> Result<Vec<QwenMoeLayerKind>> {
         self.full_attention
             .iter()
+            .zip(&self.mla_attention)
             .zip(&self.linear_attention)
             .enumerate()
-            .map(|(layer, (full, linear))| match (full.is_some(), linear.is_some()) {
-                (true, false) => Ok(QwenMoeLayerKind::FullAttention),
-                (false, true) => Ok(QwenMoeLayerKind::LinearAttention),
+            .map(|(layer, ((full, mla), linear))| match (
+                full.is_some(),
+                mla.is_some(),
+                linear.is_some(),
+            ) {
+                (true, false, false) | (false, true, false) => {
+                    Ok(QwenMoeLayerKind::FullAttention)
+                }
+                (false, false, true) => Ok(QwenMoeLayerKind::LinearAttention),
                 _ => bail!(
                     "FlashMoe dense runtime layer {layer} must resolve exactly one attention implementation"
                 ),
@@ -755,11 +1476,12 @@ impl DenseTransformerRuntime {
     pub(super) fn layer_kind(&self, layer: usize) -> FlashMoeLayerKind {
         if self.is_linear_attention_layer(layer) {
             FlashMoeLayerKind::LinearAttention
-        } else if self
-            .full_attention
-            .get(layer)
-            .and_then(|layout| *layout)
-            .is_some()
+        } else if self.is_mla_attention_layer(layer)
+            || self
+                .full_attention
+                .get(layer)
+                .and_then(|layout| *layout)
+                .is_some()
         {
             FlashMoeLayerKind::FullAttention
         } else {
@@ -771,7 +1493,30 @@ impl DenseTransformerRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AttentionLayerType {
     Full,
+    Mla,
     Linear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MlaKvProjectionLayout {
+    FusedKvB,
+    AbsorbedMultiLinear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MlaAttentionLayout {
+    pub(super) q_lora_rank: usize,
+    pub(super) kv_lora_rank: usize,
+    pub(super) qk_nope_head_dim: usize,
+    pub(super) qk_rope_head_dim: usize,
+    pub(super) qk_head_dim: usize,
+    pub(super) v_head_dim: usize,
+    pub(super) num_heads: usize,
+    pub(super) q_width: usize,
+    pub(super) kv_a_width: usize,
+    pub(super) kv_b_width: usize,
+    pub(super) attention_output_width: usize,
+    pub(super) kv_projection: MlaKvProjectionLayout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1025,6 +1770,111 @@ pub(super) fn infer_full_attention_layout(
     )
 }
 
+pub(super) fn infer_mla_attention_layout(
+    config: &QwenModelConfig,
+    registry: &TensorRegistry,
+    layer: usize,
+) -> Result<MlaAttentionLayout> {
+    let glm = config
+        .glm
+        .as_ref()
+        .with_context(|| format!("MLA tensors at layer {layer} require a GLM config"))?;
+    let qk_head_dim = glm
+        .qk_nope_head_dim
+        .checked_add(glm.qk_rope_head_dim)
+        .context("MLA q/k head width overflow")?;
+    let q_width = config
+        .num_attention_heads
+        .checked_mul(qk_head_dim)
+        .context("MLA query width overflow")?;
+    let kv_a_width = glm
+        .kv_lora_rank
+        .checked_add(glm.qk_rope_head_dim)
+        .context("MLA compressed KV width overflow")?;
+    let kv_b_head_width = glm
+        .qk_nope_head_dim
+        .checked_add(glm.v_head_dim)
+        .context("MLA KV-B head width overflow")?;
+    let kv_b_width = config
+        .num_attention_heads
+        .checked_mul(kv_b_head_width)
+        .context("MLA KV-B width overflow")?;
+    let attention_output_width = config
+        .num_attention_heads
+        .checked_mul(glm.v_head_dim)
+        .context("MLA attention output width overflow")?;
+
+    let expected = [
+        ("q_a_proj", glm.q_lora_rank, config.hidden_size),
+        ("q_b_proj", q_width, glm.q_lora_rank),
+        ("kv_a_proj_with_mqa", kv_a_width, config.hidden_size),
+        ("o_proj", config.hidden_size, attention_output_width),
+    ];
+    for (projection, expected_rows, expected_cols) in expected {
+        let tensor_name = attention_tensor_name(layer, projection);
+        let (rows, cols) = require_2d_tensor_shape(registry, &tensor_name)?;
+        if rows != expected_rows || cols != expected_cols {
+            bail!(
+                "MLA layer {layer} projection {tensor_name} has shape [{rows},{cols}], expected [{expected_rows},{expected_cols}]"
+            );
+        }
+    }
+    let kv_b_name = attention_tensor_name(layer, "kv_b_proj");
+    let embed_q_name = attention_tensor_name(layer, "embed_q");
+    let unembed_out_name = attention_tensor_name(layer, "unembed_out");
+    let kv_projection = if registry.tensor(&kv_b_name).is_some() {
+        require_tensor_shape(registry, &kv_b_name, &[kv_b_width, glm.kv_lora_rank])?;
+        MlaKvProjectionLayout::FusedKvB
+    } else if registry.tensor(&embed_q_name).is_some()
+        && registry.tensor(&unembed_out_name).is_some()
+    {
+        require_tensor_shape(
+            registry,
+            &embed_q_name,
+            &[
+                config.num_attention_heads,
+                glm.kv_lora_rank,
+                glm.qk_nope_head_dim,
+            ],
+        )?;
+        require_tensor_shape(
+            registry,
+            &unembed_out_name,
+            &[config.num_attention_heads, glm.v_head_dim, glm.kv_lora_rank],
+        )?;
+        MlaKvProjectionLayout::AbsorbedMultiLinear
+    } else {
+        bail!(
+            "MLA layer {layer} is missing {kv_b_name} or the absorbed pair {embed_q_name} and {unembed_out_name}"
+        );
+    };
+    require_tensor_shape(
+        registry,
+        &layer_norm_tensor_name(layer, "self_attn.q_a_layernorm"),
+        &[glm.q_lora_rank],
+    )?;
+    require_tensor_shape(
+        registry,
+        &layer_norm_tensor_name(layer, "self_attn.kv_a_layernorm"),
+        &[glm.kv_lora_rank],
+    )?;
+
+    Ok(MlaAttentionLayout {
+        q_lora_rank: glm.q_lora_rank,
+        kv_lora_rank: glm.kv_lora_rank,
+        qk_nope_head_dim: glm.qk_nope_head_dim,
+        qk_rope_head_dim: glm.qk_rope_head_dim,
+        qk_head_dim,
+        v_head_dim: glm.v_head_dim,
+        num_heads: config.num_attention_heads,
+        q_width,
+        kv_a_width,
+        kv_b_width,
+        attention_output_width,
+        kv_projection,
+    })
+}
+
 pub(super) fn rotary_dim_for(
     config: &QwenModelConfig,
     head_dim: usize,
@@ -1131,7 +1981,9 @@ pub(super) fn ensure_runtime_tensor_storage_supported(
             scale_bias_dtype,
             ..
         } => {
-            if !tensor.dtype.eq_ignore_ascii_case("U32") {
+            if !(tensor.dtype.eq_ignore_ascii_case("U32")
+                || tensor.dtype.eq_ignore_ascii_case("U8"))
+            {
                 bail!(
                     "Flash-MoE q4 tensor {canonical_name} has unsupported packed dtype {}",
                     tensor.dtype
@@ -1152,22 +2004,31 @@ pub(super) fn infer_attention_layer_type(
 ) -> Result<AttentionLayerType> {
     let linear_prefix = format!("model.layers.{layer}.linear_attn.");
     let has_linear = registry.has_tensor_with_prefix(&linear_prefix);
-    let has_full = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    let has_mla = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
         .iter()
         .any(|projection| {
             registry
                 .tensor(&attention_tensor_name(layer, projection))
                 .is_some()
         });
+    let has_full = ["q_proj", "k_proj", "v_proj"].iter().any(|projection| {
+        registry
+            .tensor(&attention_tensor_name(layer, projection))
+            .is_some()
+    });
 
-    match (has_linear, has_full) {
-        (true, true) => bail!(
+    match (has_linear, has_mla, has_full) {
+        (true, false, true) => bail!(
             "Flash-MoE tensor manifest has both linear-attention tensors ({linear_prefix}*) and full-attention self_attn projection tensors for layer {layer}"
         ),
-        (true, false) => Ok(AttentionLayerType::Linear),
-        (false, true) => Ok(AttentionLayerType::Full),
-        (false, false) => bail!(
-            "Flash-MoE tensor manifest is missing attention tensors for layer {layer}; expected either model.layers.{layer}.linear_attn.* or model.layers.{layer}.self_attn.{{q,k,v,o}}_proj.weight"
+        (true, true, _) | (_, true, true) => bail!(
+            "Flash-MoE tensor manifest resolves more than one attention implementation for layer {layer}"
+        ),
+        (true, false, false) => Ok(AttentionLayerType::Linear),
+        (false, true, false) => Ok(AttentionLayerType::Mla),
+        (false, false, true) => Ok(AttentionLayerType::Full),
+        (false, false, false) => bail!(
+            "Flash-MoE tensor manifest is missing attention tensors for layer {layer}; expected linear attention, MLA, or self_attn.{{q,k,v,o}}_proj tensors"
         ),
     }
 }
@@ -1249,12 +2110,31 @@ pub struct DenseTensorRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DenseQ4SourceFormat {
+    MlxAffine,
+    ColibriInt4,
+    ColibriInt8,
+    MlxMxfp4,
+}
+
+impl Default for DenseQ4SourceFormat {
+    fn default() -> Self {
+        Self::MlxAffine
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DenseQ4SourceRefs {
     pub scales_shard: String,
     pub scales_offsets: [u64; 2],
     pub biases_shard: String,
     pub biases_offsets: [u64; 2],
     pub scale_bias_dtype: String,
+    #[serde(default)]
+    pub source_format: DenseQ4SourceFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_group_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1468,7 +2348,7 @@ pub(crate) fn canonical_hf_tensor_name(name: &str) -> String {
             .replace(".mlp.linear_fc1.", ".mlp.fc1.")
             .replace(".mlp.linear_fc2.", ".mlp.fc2.")
     } else {
-        canonical
+        canonical.replace(".mlp.shared_experts.", ".mlp.shared_expert.")
     }
 }
 
@@ -1476,6 +2356,7 @@ pub(crate) fn canonical_hf_tensor_name(name: &str) -> String {
 pub(crate) struct DenseQ4Layout {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
+    pub(crate) group_size: usize,
     pub(crate) row_packed_bytes: usize,
     pub(crate) groups_per_row: usize,
     pub(crate) packed_bytes: usize,
@@ -1530,6 +2411,7 @@ pub(crate) fn dense_q4_layout_with_scale_bias_dtype(
     Ok(DenseQ4Layout {
         rows,
         cols,
+        group_size,
         row_packed_bytes,
         groups_per_row,
         packed_bytes,
@@ -2219,7 +3101,6 @@ impl<'a> DenseProjectionRequest<'a> {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn new(tensor_name: &'a str, output_width: usize) -> Result<Self> {
         Self::validate(tensor_name, output_width)?;
         Ok(Self {
@@ -2543,8 +3424,70 @@ impl DenseQ4MmapMatvecProjection {
         };
         let (rows, cols) =
             validate_dense_matvec_shape(entry, tensor_name, output_width, input_len)?;
+        Self::from_validated_entry(
+            tensor_name,
+            entry,
+            store_len,
+            rows,
+            cols,
+            output_width,
+            *group_size,
+            scale_bias_dtype,
+        )
+    }
+
+    pub(crate) fn from_multilinear_entry(
+        tensor_name: &str,
+        entry: &RuntimeTensorEntry,
+        store_len: u64,
+        heads: usize,
+        output_width_per_head: usize,
+        input_len: usize,
+    ) -> Result<Option<Self>> {
+        let TensorQuantization::Q4 {
+            group_size,
+            scale_bias_dtype,
+            ..
+        } = &entry.quantization
+        else {
+            return Ok(None);
+        };
+        let expected_shape = [heads, output_width_per_head, input_len];
+        if entry.shape.as_slice() != expected_shape {
+            bail!(
+                "Flash-MoE dense tensor {tensor_name} shape mismatch: expected multilinear shape {:?}, actual shape {:?}",
+                expected_shape,
+                entry.shape
+            );
+        }
+        let rows = heads
+            .checked_mul(output_width_per_head)
+            .context("dense Q4 multilinear row count overflow")?;
+        Self::from_validated_entry(
+            tensor_name,
+            entry,
+            store_len,
+            rows,
+            input_len,
+            rows,
+            *group_size,
+            scale_bias_dtype,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_validated_entry(
+        tensor_name: &str,
+        entry: &RuntimeTensorEntry,
+        store_len: u64,
+        rows: usize,
+        cols: usize,
+        output_width: usize,
+        group_size: usize,
+        scale_bias_dtype: &str,
+    ) -> Result<Option<Self>> {
         let layout =
-            dense_q4_layout_with_scale_bias_dtype(&entry.shape, *group_size, scale_bias_dtype)?;
+            dense_q4_layout_with_scale_bias_dtype(&entry.shape, group_size, scale_bias_dtype)?;
         if entry.byte_len as usize != layout.total_bytes
             || rows != layout.rows
             || cols != layout.cols
@@ -2576,8 +3519,8 @@ impl DenseQ4MmapMatvecProjection {
             output_width,
             row_packed_bytes: layout.row_packed_bytes,
             groups_per_row: layout.groups_per_row,
-            group_size: *group_size,
-            scale_bias_dtype: scale_bias_dtype.clone(),
+            group_size,
+            scale_bias_dtype: scale_bias_dtype.to_string(),
         }))
     }
 }
@@ -2861,7 +3804,7 @@ pub(crate) struct SharedExpertPhaseResidentProjections {
     pub(crate) gate: ResidentMmapMatvecProjection,
     pub(crate) up: ResidentMmapMatvecProjection,
     pub(crate) down: ResidentMmapMatvecProjection,
-    pub(crate) router: ResidentMmapMatvecProjection,
+    pub(crate) router: Option<ResidentMmapMatvecProjection>,
     pub(crate) shared_experts: usize,
     pub(crate) intermediate: usize,
     pub(crate) width: usize,
@@ -2873,12 +3816,18 @@ impl SharedExpertPhaseResidentProjections {
             SharedExpertPhaseShape::new(self.width, self.shared_experts, self.intermediate)?;
         if self.gate.cols() != shape.width
             || self.up.cols() != shape.width
-            || self.router.cols() != shape.width
+            || self
+                .router
+                .as_ref()
+                .is_some_and(|router| router.cols() != shape.width)
             || self.down.cols() != shape.total_intermediate
             || self.gate.output_width() != shape.total_intermediate
             || self.up.output_width() != shape.total_intermediate
             || self.down.output_width() != shape.width
-            || self.router.output_width() != shape.shared_experts
+            || self
+                .router
+                .as_ref()
+                .is_some_and(|router| router.output_width() != shape.shared_experts)
         {
             bail!(
                 "FlashMoe scheduled resident shared-expert shape is invalid: width={} shared_experts={} intermediate={} gate=({},{}) up=({},{}) down=({},{}) router=({},{})",
@@ -2891,8 +3840,10 @@ impl SharedExpertPhaseResidentProjections {
                 self.up.cols(),
                 self.down.output_width(),
                 self.down.cols(),
-                self.router.output_width(),
-                self.router.cols()
+                self.router
+                    .as_ref()
+                    .map_or(0, |router| router.output_width()),
+                self.router.as_ref().map_or(0, |router| router.cols())
             );
         }
         Ok(shape)
@@ -2937,7 +3888,7 @@ where
         gate: gate.into(),
         up: up.into(),
         down: down.into(),
-        router: router.into(),
+        router: Some(router.into()),
         shared_experts,
         intermediate,
         width,
@@ -2946,11 +3897,34 @@ where
     Ok(Some(shared))
 }
 
+#[cfg(test)]
 pub(crate) fn build_required_shared_expert_resident_phase_projections<F, P>(
     layer: usize,
     width: usize,
     shared_experts: usize,
     intermediate: usize,
+    projection: F,
+) -> Result<Option<SharedExpertPhaseResidentProjections>>
+where
+    F: FnMut(&str, usize, usize) -> Result<Option<P>>,
+    P: Into<ResidentMmapMatvecProjection>,
+{
+    build_required_shared_expert_resident_phase_projections_with_router(
+        layer,
+        width,
+        shared_experts,
+        intermediate,
+        true,
+        projection,
+    )
+}
+
+pub(crate) fn build_required_shared_expert_resident_phase_projections_with_router<F, P>(
+    layer: usize,
+    width: usize,
+    shared_experts: usize,
+    intermediate: usize,
+    requires_router: bool,
     mut projection: F,
 ) -> Result<Option<SharedExpertPhaseResidentProjections>>
 where
@@ -2981,17 +3955,23 @@ where
             "FlashMoe unsupported scheduled CMD3 shared-expert path: missing resident shared down projection {down_name}"
         )
     })?;
-    let router = projection(&router_name, shape.shared_experts, shape.width)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "FlashMoe unsupported scheduled CMD3 shared-expert path: missing resident shared router projection {router_name}"
+    let router = if requires_router {
+        Some(
+            projection(&router_name, shape.shared_experts, shape.width)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "FlashMoe unsupported scheduled CMD3 shared-expert path: missing resident shared router projection {router_name}"
+                )
+            })?,
         )
-    })?;
+    } else {
+        None
+    };
 
     let shared = SharedExpertPhaseResidentProjections {
         gate: gate.into(),
         up: up.into(),
         down: down.into(),
-        router: router.into(),
+        router: router.map(Into::into),
         shared_experts,
         intermediate,
         width,
@@ -3910,6 +4890,53 @@ impl DenseStore {
         }
     }
 
+    fn dense_q4_mmap_multilinear_projection(
+        &self,
+        tensor_name: &str,
+        heads: usize,
+        output_width_per_head: usize,
+        input_len: usize,
+    ) -> Result<Option<DenseQ4MmapMatvecProjection>> {
+        let output_width = heads
+            .checked_mul(output_width_per_head)
+            .context("dense Q4 multilinear output width overflow")?;
+        let key = DenseQ4ProjectionKey::new(tensor_name, output_width, input_len);
+        if let Some(projection) = self
+            .q4_mmap_projections
+            .lock()
+            .expect("dense q4 projection cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(Some((*projection).clone()));
+        }
+        let Some(entry) = self.registry.tensor(tensor_name) else {
+            return Ok(None);
+        };
+        let Some(projection) = DenseQ4MmapMatvecProjection::from_multilinear_entry(
+            tensor_name,
+            entry,
+            self.len,
+            heads,
+            output_width_per_head,
+            input_len,
+        )?
+        else {
+            return Ok(None);
+        };
+        let projection = Arc::new(projection);
+        let mut cache = self
+            .q4_mmap_projections
+            .lock()
+            .expect("dense q4 projection cache poisoned");
+        if let Some(existing) = cache.get(&key).cloned() {
+            Ok(Some((*existing).clone()))
+        } else {
+            cache.insert(key, projection.clone());
+            Ok(Some((*projection).clone()))
+        }
+    }
+
     pub(super) fn resident_mmap_projection(
         &self,
         tensor_name: &str,
@@ -3934,6 +4961,293 @@ impl DenseStore {
         .map(Some)
     }
 
+    fn q4_affine_scalar(&self, byte_offset: u64, dtype: &str, index: usize) -> Result<f32> {
+        let element_size = expert_scale_bias_dtype_size(dtype)
+            .with_context(|| format!("unsupported Q4 scale/bias dtype {dtype}"))?;
+        let start = usize::try_from(byte_offset)
+            .context("Q4 scale/bias offset exceeds usize")?
+            .checked_add(
+                index
+                    .checked_mul(element_size)
+                    .context("Q4 scalar offset overflow")?,
+            )
+            .context("Q4 scalar offset overflow")?;
+        let end = start
+            .checked_add(element_size)
+            .context("Q4 scalar range overflow")?;
+        let bytes = self
+            .mmap
+            .get(start..end)
+            .with_context(|| format!("Q4 scalar range {start}..{end} exceeds dense mmap"))?;
+        if dtype.eq_ignore_ascii_case("F32")
+            || dtype.eq_ignore_ascii_case("FLOAT32")
+            || dtype.eq_ignore_ascii_case("FP32")
+        {
+            Ok(f32::from_le_bytes(bytes.try_into().unwrap()))
+        } else if dtype.eq_ignore_ascii_case("BF16") || dtype.eq_ignore_ascii_case("BFLOAT16") {
+            let bits = u16::from_le_bytes(bytes.try_into().unwrap()) as u32;
+            Ok(f32::from_bits(bits << 16))
+        } else if dtype.eq_ignore_ascii_case("F16")
+            || dtype.eq_ignore_ascii_case("FLOAT16")
+            || dtype.eq_ignore_ascii_case("FP16")
+        {
+            Ok(f16_to_f32(u16::from_le_bytes(bytes.try_into().unwrap())))
+        } else {
+            bail!("unsupported Q4 scale/bias dtype {dtype}")
+        }
+    }
+
+    fn q4_row_add_scaled(
+        &self,
+        projection: &DenseQ4MmapMatvecProjection,
+        row: usize,
+        coefficient: f32,
+        output: &mut [f32],
+    ) -> Result<()> {
+        if row >= projection.rows || output.len() != projection.cols {
+            bail!(
+                "Q4 row accumulation for {} has row {row}/{} and output width {}/{}",
+                projection.tensor_name,
+                projection.rows,
+                output.len(),
+                projection.cols
+            );
+        }
+        let packed_start = usize::try_from(projection.packed_byte_offset)
+            .context("Q4 packed offset exceeds usize")?
+            .checked_add(
+                row.checked_mul(projection.row_packed_bytes)
+                    .context("Q4 packed row offset overflow")?,
+            )
+            .context("Q4 packed row offset overflow")?;
+        let packed = self
+            .mmap
+            .get(packed_start..packed_start + projection.row_packed_bytes)
+            .with_context(|| format!("Q4 packed row {row} exceeds dense mmap"))?;
+        for group in 0..projection.groups_per_row {
+            let scalar_index = row * projection.groups_per_row + group;
+            let scale = self.q4_affine_scalar(
+                projection.scales_byte_offset,
+                &projection.scale_bias_dtype,
+                scalar_index,
+            )?;
+            let bias = self.q4_affine_scalar(
+                projection.biases_byte_offset,
+                &projection.scale_bias_dtype,
+                scalar_index,
+            )?;
+            let start = group * projection.group_size;
+            let end = (start + projection.group_size).min(projection.cols);
+            for col in start..end {
+                let byte = packed[col / 2];
+                let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                output[col] += coefficient * q.mul_add(scale, bias);
+            }
+        }
+        Ok(())
+    }
+
+    fn q4_row_dot(
+        &self,
+        projection: &DenseQ4MmapMatvecProjection,
+        row: usize,
+        input: &[f32],
+    ) -> Result<f32> {
+        if row >= projection.rows || input.len() != projection.cols {
+            bail!(
+                "Q4 row dot for {} has row {row}/{} and input width {}/{}",
+                projection.tensor_name,
+                projection.rows,
+                input.len(),
+                projection.cols
+            );
+        }
+        let packed_start = usize::try_from(projection.packed_byte_offset)
+            .context("Q4 packed offset exceeds usize")?
+            .checked_add(
+                row.checked_mul(projection.row_packed_bytes)
+                    .context("Q4 packed row offset overflow")?,
+            )
+            .context("Q4 packed row offset overflow")?;
+        let packed = self
+            .mmap
+            .get(packed_start..packed_start + projection.row_packed_bytes)
+            .with_context(|| format!("Q4 packed row {row} exceeds dense mmap"))?;
+        let mut sum = 0.0;
+        for group in 0..projection.groups_per_row {
+            let scalar_index = row * projection.groups_per_row + group;
+            let scale = self.q4_affine_scalar(
+                projection.scales_byte_offset,
+                &projection.scale_bias_dtype,
+                scalar_index,
+            )?;
+            let bias = self.q4_affine_scalar(
+                projection.biases_byte_offset,
+                &projection.scale_bias_dtype,
+                scalar_index,
+            )?;
+            let start = group * projection.group_size;
+            let end = (start + projection.group_size).min(projection.cols);
+            for col in start..end {
+                let byte = packed[col / 2];
+                let q = if col & 1 == 0 { byte & 0x0f } else { byte >> 4 } as f32;
+                sum += input[col] * q.mul_add(scale, bias);
+            }
+        }
+        Ok(sum)
+    }
+
+    pub(super) fn mla_absorbed_attention(
+        &self,
+        layer: usize,
+        layout: MlaAttentionLayout,
+        query: &[f32],
+        records: &[(&[f32], &[f32])],
+    ) -> Result<Vec<f32>> {
+        if query.len() != layout.q_width || records.is_empty() {
+            bail!(
+                "MLA layer {layer} requires query width {} and a non-empty KV cache, got {} and {} records",
+                layout.q_width,
+                query.len(),
+                records.len()
+            );
+        }
+        for (latent, rotary) in records {
+            if latent.len() != layout.kv_lora_rank || rotary.len() != layout.qk_rope_head_dim {
+                bail!(
+                    "MLA layer {layer} cache record has latent/rotary widths {}/{}, expected {}/{}",
+                    latent.len(),
+                    rotary.len(),
+                    layout.kv_lora_rank,
+                    layout.qk_rope_head_dim
+                );
+            }
+        }
+        enum AbsorbedWeights {
+            Fused(DenseQ4MmapMatvecProjection),
+            MultiLinear {
+                embed_q: DenseQ4MmapMatvecProjection,
+                unembed_out: DenseQ4MmapMatvecProjection,
+            },
+        }
+        let weights = match layout.kv_projection {
+            MlaKvProjectionLayout::FusedKvB => {
+                let tensor_name = attention_tensor_name(layer, "kv_b_proj");
+                let projection = self
+                    .dense_q4_mmap_projection(
+                        &tensor_name,
+                        layout.kv_b_width,
+                        layout.kv_lora_rank,
+                    )?
+                    .with_context(|| {
+                        format!(
+                            "GLM MLA weight absorption requires resident Q4 projection {tensor_name}"
+                        )
+                    })?;
+                AbsorbedWeights::Fused(projection)
+            }
+            MlaKvProjectionLayout::AbsorbedMultiLinear => {
+                let embed_q_name = attention_tensor_name(layer, "embed_q");
+                let embed_q = self
+                    .dense_q4_mmap_multilinear_projection(
+                        &embed_q_name,
+                        layout.num_heads,
+                        layout.kv_lora_rank,
+                        layout.qk_nope_head_dim,
+                    )?
+                    .with_context(|| {
+                        format!(
+                            "GLM MLA weight absorption requires resident Q4 projection {embed_q_name}"
+                        )
+                    })?;
+                let unembed_out_name = attention_tensor_name(layer, "unembed_out");
+                let unembed_out = self
+                    .dense_q4_mmap_multilinear_projection(
+                        &unembed_out_name,
+                        layout.num_heads,
+                        layout.v_head_dim,
+                        layout.kv_lora_rank,
+                    )?
+                    .with_context(|| {
+                        format!(
+                            "GLM MLA weight absorption requires resident Q4 projection {unembed_out_name}"
+                        )
+                    })?;
+                AbsorbedWeights::MultiLinear {
+                    embed_q,
+                    unembed_out,
+                }
+            }
+        };
+        let mut output = vec![0.0; layout.attention_output_width];
+        let scale = (layout.qk_head_dim as f32).sqrt().recip();
+        let kv_b_head_width = layout.qk_nope_head_dim + layout.v_head_dim;
+        for head in 0..layout.num_heads {
+            let query_head = &query[head * layout.qk_head_dim..(head + 1) * layout.qk_head_dim];
+            let (query_nope, query_rope) = query_head.split_at(layout.qk_nope_head_dim);
+            let absorbed_query = match &weights {
+                AbsorbedWeights::Fused(projection) => {
+                    let row_base = head * kv_b_head_width;
+                    let mut absorbed_query = vec![0.0; layout.kv_lora_rank];
+                    for (dimension, coefficient) in query_nope.iter().copied().enumerate() {
+                        self.q4_row_add_scaled(
+                            projection,
+                            row_base + dimension,
+                            coefficient,
+                            &mut absorbed_query,
+                        )?;
+                    }
+                    absorbed_query
+                }
+                AbsorbedWeights::MultiLinear { embed_q, .. } => (0..layout.kv_lora_rank)
+                    .map(|dimension| {
+                        self.q4_row_dot(embed_q, head * layout.kv_lora_rank + dimension, query_nope)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            let mut scores = records
+                .iter()
+                .map(|(latent, rotary)| {
+                    let latent_score = absorbed_query
+                        .iter()
+                        .zip(*latent)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    let rotary_score = query_rope
+                        .iter()
+                        .zip(*rotary)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    (latent_score + rotary_score) * scale
+                })
+                .collect::<Vec<_>>();
+            softmax_in_place(&mut scores);
+            let mut context = vec![0.0; layout.kv_lora_rank];
+            for (weight, (latent, _)) in scores.iter().zip(records) {
+                for (slot, value) in context.iter_mut().zip(*latent) {
+                    *slot += *weight * value;
+                }
+            }
+            let head_output = &mut output[head * layout.v_head_dim..(head + 1) * layout.v_head_dim];
+            for (dimension, slot) in head_output.iter_mut().enumerate() {
+                *slot = match &weights {
+                    AbsorbedWeights::Fused(projection) => self.q4_row_dot(
+                        projection,
+                        head * kv_b_head_width + layout.qk_nope_head_dim + dimension,
+                        &context,
+                    )?,
+                    AbsorbedWeights::MultiLinear { unembed_out, .. } => self.q4_row_dot(
+                        unembed_out,
+                        head * layout.v_head_dim + dimension,
+                        &context,
+                    )?,
+                };
+            }
+        }
+        Ok(output)
+    }
+
+    #[cfg(test)]
     pub(super) fn resolve_shared_expert_weight_table(
         &self,
         layer_count: usize,
@@ -3941,13 +5255,36 @@ impl DenseStore {
         shared_experts: usize,
         intermediate: usize,
     ) -> Result<SharedExpertWeightTable> {
+        self.resolve_shared_expert_weight_table_from(
+            layer_count,
+            width,
+            shared_experts,
+            intermediate,
+            0,
+            true,
+        )
+    }
+
+    pub(super) fn resolve_shared_expert_weight_table_from(
+        &self,
+        layer_count: usize,
+        width: usize,
+        shared_experts: usize,
+        intermediate: usize,
+        first_sparse_layer: usize,
+        requires_router: bool,
+    ) -> Result<SharedExpertWeightTable> {
         let layers = (0..layer_count)
             .map(|layer| {
-                build_required_shared_expert_resident_phase_projections(
+                if layer < first_sparse_layer {
+                    return Ok(SharedExpertLayerWeights::None);
+                }
+                build_required_shared_expert_resident_phase_projections_with_router(
                     layer,
                     width,
                     shared_experts,
                     intermediate,
+                    requires_router,
                     |tensor_name, output_width, input_len| {
                         self.resident_mmap_projection(tensor_name, output_width, input_len)
                     },
@@ -3972,6 +5309,7 @@ impl DenseStore {
         residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
         active_experts: usize,
+        router_correction_bias: Option<&[f32]>,
     ) -> Result<MetalPostAttentionPrep> {
         metal.require_resident_dense_weights()?;
         let residual_len = residual.len();
@@ -3991,6 +5329,7 @@ impl DenseStore {
             attention_output,
             residual,
             post_norm_weight,
+            router_correction_bias,
         )
     }
 
@@ -4947,6 +6286,240 @@ mod tests {
     use super::*;
 
     #[test]
+    fn colibri_int4_import_preserves_nibbles_and_builds_affine_bias() {
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&[1, 64], 64, EXPERT_SCALE_BIAS_DTYPE_BF16)
+                .unwrap();
+        let packed = (0..32).map(|value| value as u8).collect::<Vec<_>>();
+        let mut output = Vec::new();
+
+        write_colibri_q4_affine_tensor(
+            &mut output,
+            "tiny.weight",
+            &packed,
+            &2.0f32.to_le_bytes(),
+            4,
+            64,
+            layout,
+        )
+        .unwrap();
+
+        assert_eq!(&output[..packed.len()], packed.as_slice());
+        let scale = u16::from_le_bytes(output[32..34].try_into().unwrap()) as u32;
+        let bias = u16::from_le_bytes(output[34..36].try_into().unwrap()) as u32;
+        assert_eq!(f32::from_bits(scale << 16), 2.0);
+        assert_eq!(f32::from_bits(bias << 16), -16.0);
+    }
+
+    #[test]
+    fn colibri_int8_import_preserves_source_precision_as_bf16() {
+        let mut output = Vec::new();
+        write_colibri_int8_bf16_tensor(
+            &mut output,
+            "lm_head.weight",
+            &[(-2i8) as u8, 3],
+            &0.5f32.to_le_bytes(),
+            2,
+            &[1, 2],
+        )
+        .unwrap();
+
+        let first = u16::from_le_bytes(output[0..2].try_into().unwrap()) as u32;
+        let second = u16::from_le_bytes(output[2..4].try_into().unwrap()) as u32;
+        assert_eq!(f32::from_bits(first << 16), -1.0);
+        assert_eq!(f32::from_bits(second << 16), 1.5);
+    }
+
+    #[test]
+    fn mlx_mxfp4_import_decodes_e2m1_and_e8m0_before_runtime_q4() {
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&[1, 64], 64, EXPERT_SCALE_BIAS_DTYPE_BF16)
+                .unwrap();
+        let mut packed = vec![0x91; 16]; // +0.5, -0.5 at E8M0 scale 1.
+        packed.extend(vec![0xe6; 16]); // +4, -4 at E8M0 scale 2.
+        let mut output = Vec::new();
+
+        write_mlx_mxfp4_affine_tensor(&mut output, "tiny.weight", &packed, &[127, 128], 32, layout)
+            .unwrap();
+
+        assert_eq!(output.len(), layout.total_bytes);
+        let scale_bits = u16::from_le_bytes(output[32..34].try_into().unwrap()) as u32;
+        let bias_bits = u16::from_le_bytes(output[34..36].try_into().unwrap()) as u32;
+        let decoded = q4_dequantize_rows_with_group_size(
+            &output[..32],
+            &[f32::from_bits(scale_bits << 16)],
+            &[f32::from_bits(bias_bits << 16)],
+            1,
+            64,
+            64,
+        )
+        .unwrap();
+        for (actual, expected) in decoded[..32].iter().zip([0.5f32, -0.5].into_iter().cycle()) {
+            assert!((actual - expected).abs() < 0.6, "{actual} != {expected}");
+        }
+        for (actual, expected) in decoded[32..].iter().zip([8.0f32, -8.0].into_iter().cycle()) {
+            assert!((actual - expected).abs() < 0.6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn mla_weight_absorption_uses_compressed_latent_without_expanding_kv() {
+        let temp = tempfile::tempdir().unwrap();
+        let dense_path = temp.path().join("dense.bin");
+        let manifest_path = temp.path().join("manifest.json");
+        let tensor_name = attention_tensor_name(0, "kv_b_proj");
+        let layout = dense_q4_layout_with_scale_bias_dtype(&[2, 2], 2, "F32").unwrap();
+        let mut bytes = vec![0x01, 0x10]; // Wk=[1,0], Wv=[0,1]
+        for value in [1.0f32, 1.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [0.0f32, 0.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(bytes.len(), layout.total_bytes);
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: "tiny-glm".to_string(),
+                cache_version: "test".to_string(),
+                dense_shards: vec!["tiny.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![DenseTensorRef {
+                    tensor: tensor_name,
+                    shard: "tiny.safetensors".to_string(),
+                    dtype: "U32".to_string(),
+                    shape: vec![2, 2],
+                    source_offsets: [0, 2],
+                    runtime_offset: 0,
+                    byte_len: layout.total_bytes as u64,
+                    quantization: TensorQuantization::Q4 {
+                        group_size: 2,
+                        format: "test".to_string(),
+                        scale_bias_dtype: "F32".to_string(),
+                    },
+                    q4_sources: None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let mla = MlaAttentionLayout {
+            q_lora_rank: 2,
+            kv_lora_rank: 2,
+            qk_nope_head_dim: 1,
+            qk_rope_head_dim: 2,
+            qk_head_dim: 3,
+            v_head_dim: 1,
+            num_heads: 1,
+            q_width: 3,
+            kv_a_width: 4,
+            kv_b_width: 2,
+            attention_output_width: 1,
+            kv_projection: MlaKvProjectionLayout::FusedKvB,
+        };
+        let latent = [1.0, 3.0];
+        let rotary = [0.0, 0.0];
+        let output = store
+            .mla_absorbed_attention(0, mla, &[2.0, 0.0, 0.0], &[(&latent, &rotary)])
+            .unwrap();
+
+        assert_eq!(output, vec![3.0]);
+    }
+
+    #[test]
+    fn mla_weight_absorption_accepts_mlx_preabsorbed_multilinear_weights() {
+        let temp = tempfile::tempdir().unwrap();
+        let dense_path = temp.path().join("dense.bin");
+        let manifest_path = temp.path().join("manifest.json");
+        let embed_name = attention_tensor_name(0, "embed_q");
+        let unembed_name = attention_tensor_name(0, "unembed_out");
+        let embed_layout = dense_q4_layout_with_scale_bias_dtype(&[1, 2, 1], 1, "F32").unwrap();
+        let unembed_layout = dense_q4_layout_with_scale_bias_dtype(&[1, 1, 2], 2, "F32").unwrap();
+        let mut bytes = vec![0x01, 0x00]; // embed_q maps [q] to [q, 0].
+        for value in [1.0f32, 1.0, 0.0, 0.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(bytes.len(), embed_layout.total_bytes);
+        let unembed_offset = bytes.len() as u64;
+        bytes.push(0x10); // unembed_out maps [x, y] to y.
+        for value in [1.0f32, 0.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(
+            bytes.len(),
+            embed_layout.total_bytes + unembed_layout.total_bytes
+        );
+        fs::write(&dense_path, &bytes).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&FlashMoeManifest {
+                model: "tiny-glm-mlx".to_string(),
+                cache_version: "test".to_string(),
+                dense_shards: vec!["tiny.safetensors".to_string()],
+                expert_tensors: Vec::new(),
+                dense_tensors: vec![
+                    DenseTensorRef {
+                        tensor: embed_name,
+                        shard: "tiny.safetensors".to_string(),
+                        dtype: "U32".to_string(),
+                        shape: vec![1, 2, 1],
+                        source_offsets: [0, 2],
+                        runtime_offset: 0,
+                        byte_len: embed_layout.total_bytes as u64,
+                        quantization: TensorQuantization::Q4 {
+                            group_size: 1,
+                            format: "test".to_string(),
+                            scale_bias_dtype: "F32".to_string(),
+                        },
+                        q4_sources: None,
+                    },
+                    DenseTensorRef {
+                        tensor: unembed_name,
+                        shard: "tiny.safetensors".to_string(),
+                        dtype: "U32".to_string(),
+                        shape: vec![1, 1, 2],
+                        source_offsets: [0, 1],
+                        runtime_offset: unembed_offset,
+                        byte_len: unembed_layout.total_bytes as u64,
+                        quantization: TensorQuantization::Q4 {
+                            group_size: 2,
+                            format: "test".to_string(),
+                            scale_bias_dtype: "F32".to_string(),
+                        },
+                        q4_sources: None,
+                    },
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = DenseStore::open(dense_path, manifest_path).unwrap();
+        let mla = MlaAttentionLayout {
+            q_lora_rank: 2,
+            kv_lora_rank: 2,
+            qk_nope_head_dim: 1,
+            qk_rope_head_dim: 2,
+            qk_head_dim: 3,
+            v_head_dim: 1,
+            num_heads: 1,
+            q_width: 3,
+            kv_a_width: 4,
+            kv_b_width: 2,
+            attention_output_width: 1,
+            kv_projection: MlaKvProjectionLayout::AbsorbedMultiLinear,
+        };
+        let latent = [1.0, 3.0];
+        let rotary = [0.0, 0.0];
+        let output = store
+            .mla_absorbed_attention(0, mla, &[2.0, 0.0, 0.0], &[(&latent, &rotary)])
+            .unwrap();
+
+        assert_eq!(output, vec![3.0]);
+    }
+
+    #[test]
     fn qwen_family_tensor_names_are_canonicalized_for_runtime() {
         assert_eq!(
             canonical_hf_tensor_name("model.language_model.embed_tokens.weight"),
@@ -4999,6 +6572,7 @@ mod tests {
             num_shared_experts: None,
             shared_expert_intermediate_size: None,
             vision_config: None,
+            glm: None,
         }
     }
 
@@ -5103,6 +6677,8 @@ mod tests {
             biases_shard: "biases.safetensors".to_string(),
             biases_offsets: [0, 8],
             scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            source_format: DenseQ4SourceFormat::MlxAffine,
+            source_group_size: None,
         };
 
         assert_eq!(
@@ -6444,12 +8020,17 @@ mod tests {
                 let SharedExpertLayerWeights::Resident(shared) = table.layer(layer).unwrap() else {
                     panic!("configured shared experts must resolve resident bindings");
                 };
-                for projection in [&shared.gate, &shared.up, &shared.down, &shared.router] {
+                for projection in [&shared.gate, &shared.up, &shared.down] {
                     let ResidentMmapMatvecProjection::Dense(projection) = projection else {
                         panic!("{dtype} fixture resolved a Q4 projection");
                     };
                     assert_eq!(projection.dtype, dtype);
                 }
+                let ResidentMmapMatvecProjection::Dense(router) = shared.router.as_ref().unwrap()
+                else {
+                    panic!("{dtype} fixture resolved a Q4 router projection");
+                };
+                assert_eq!(router.dtype, dtype);
                 assert_eq!(
                     shared.validated_shape().unwrap(),
                     SharedExpertPhaseShape::new(4, 2, 3).unwrap()
@@ -6780,7 +8361,7 @@ mod tests {
             gate: gate.into(),
             up: up.into(),
             down: down.into(),
-            router: router.into(),
+            router: Some(router.into()),
             shared_experts: 1,
             intermediate: 16,
             width: 32,
@@ -6788,7 +8369,7 @@ mod tests {
 
         assert_eq!(shared.gate.q4().unwrap().packed_byte_offset, 128);
         assert_eq!(shared.down.output_width(), 32);
-        assert_eq!(shared.router.cols(), 32);
+        assert_eq!(shared.router.as_ref().unwrap().cols(), 32);
         assert_eq!(shared.shared_experts, 1);
         assert_eq!(shared.intermediate, 16);
         assert_eq!(shared.width, 32);
@@ -6832,8 +8413,8 @@ mod tests {
         assert_eq!(shared.gate.cols(), 32);
         assert_eq!(shared.down.output_width(), 32);
         assert_eq!(shared.down.cols(), 32);
-        assert_eq!(shared.router.output_width(), 2);
-        assert_eq!(shared.router.cols(), 32);
+        assert_eq!(shared.router.as_ref().unwrap().output_width(), 2);
+        assert_eq!(shared.router.as_ref().unwrap().cols(), 32);
         assert_eq!(
             shared.validated_shape().unwrap(),
             SharedExpertPhaseShape::new(32, 2, 16).unwrap()

@@ -140,9 +140,17 @@ pub(super) fn rms_norm_in_place(values: &mut [f32]) {
 }
 
 pub(super) fn rms_norm_with_weight_in_place(values: &mut [f32], weight: Option<&[f32]>) {
+    rms_norm_with_weight_and_epsilon_in_place(values, weight, 1e-6);
+}
+
+pub(super) fn rms_norm_with_weight_and_epsilon_in_place(
+    values: &mut [f32],
+    weight: Option<&[f32]>,
+    epsilon: f32,
+) {
     let mean_square =
         values.iter().map(|value| value * value).sum::<f32>() / values.len().max(1) as f32;
-    let scale = (mean_square + 1e-6).sqrt().recip();
+    let scale = (mean_square + epsilon).sqrt().recip();
     for (idx, value) in values.iter_mut().enumerate() {
         *value *= scale;
         if let Some(weight) = weight
@@ -648,6 +656,63 @@ pub fn routing_softmax_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut probabilities = scores.to_vec();
     softmax_in_place(&mut probabilities);
     routing_top_k(&probabilities, k)
+}
+
+/// GLM/DeepSeek noaux-tc routing: correction bias affects selection only;
+/// returned weights are the unbiased sigmoid scores. Normalization and the
+/// routed scaling factor remain scheduler-owned.
+pub fn routing_sigmoid_noaux_top_k(
+    logits: &[f32],
+    correction_bias: &[f32],
+    k: usize,
+) -> Result<Vec<(usize, f32)>> {
+    if logits.len() != correction_bias.len() {
+        bail!(
+            "sigmoid/noaux router logits length {} does not match correction bias length {}",
+            logits.len(),
+            correction_bias.len()
+        );
+    }
+    let raw = logits
+        .iter()
+        .map(|score| 1.0 / (1.0 + (-score).exp()))
+        .collect::<Vec<_>>();
+    let choice = raw
+        .iter()
+        .zip(correction_bias)
+        .map(|(score, bias)| score + bias)
+        .collect::<Vec<_>>();
+    Ok(routing_top_k(&choice, k)
+        .into_iter()
+        .map(|(expert, _)| (expert, raw[expert]))
+        .collect())
+}
+
+/// GLM's interleaved input pairs are written in split-half rotary layout.
+pub(super) fn apply_rotary_interleaved_to_split_half(
+    values: &mut [f32],
+    position: usize,
+    rotary_dim: usize,
+    theta: f64,
+) -> Result<()> {
+    if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) || values.len() < rotary_dim {
+        bail!(
+            "interleaved RoPE requires a positive even rotary width, got {rotary_dim} for {} values",
+            values.len()
+        );
+    }
+    let input = values[..rotary_dim].to_vec();
+    let half = rotary_dim / 2;
+    for pair in 0..half {
+        let frequency = theta.powf(-((2 * pair) as f64) / rotary_dim as f64);
+        let angle = position as f64 * frequency;
+        let (sin, cos) = angle.sin_cos();
+        let a = input[2 * pair];
+        let b = input[2 * pair + 1];
+        values[pair] = a * cos as f32 - b * sin as f32;
+        values[half + pair] = b * cos as f32 + a * sin as f32;
+    }
+    Ok(())
 }
 
 pub fn q4_fma_matvec(
@@ -1274,5 +1339,25 @@ mod tests {
             decoded,
             vec![1.0, 1.5, 2.0, 1.25, 1.0, -0.875, -0.75, -0.625, 6.25, 7.0]
         );
+    }
+
+    #[test]
+    fn glm_noaux_router_uses_bias_for_selection_but_raw_sigmoid_for_weights() {
+        let mut selected =
+            routing_sigmoid_noaux_top_k(&[0.0, 2.0, -2.0], &[1.0, -1.0, 0.0], 2).unwrap();
+        selected.sort_by_key(|(expert, _)| *expert);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0, 0);
+        assert!((selected[0].1 - 0.5).abs() < 1e-6);
+        assert_eq!(selected[1].0, 2);
+        assert!((selected[1].1 - (1.0 / (1.0 + 2.0f32.exp()))).abs() < 1e-6);
+    }
+
+    #[test]
+    fn glm_interleaved_rope_writes_split_half_layout() {
+        let mut values = vec![1.0, 2.0, 3.0, 4.0];
+        apply_rotary_interleaved_to_split_half(&mut values, 0, 4, 10_000.0).unwrap();
+        assert_eq!(values, vec![1.0, 3.0, 2.0, 4.0]);
     }
 }

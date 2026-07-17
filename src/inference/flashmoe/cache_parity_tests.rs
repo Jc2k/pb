@@ -16,6 +16,7 @@ fn build_cache_writes_runtime_metadata_and_metal_kernels() {
         test_tokenizer_config_json(),
     )
     .unwrap();
+    std::fs::write(snapshot.join("chat_template.jinja"), b"external-template").unwrap();
     write_test_config(&snapshot);
     std::fs::write(
         snapshot.join("model.safetensors.index.json"),
@@ -26,7 +27,27 @@ fn build_cache_writes_runtime_metadata_and_metal_kernels() {
     assert!(plan.runtime_dir.join("kernels.metal").is_file());
     assert!(plan.tokenizer.is_file());
     assert!(plan.tokenizer_config.is_file());
+    assert!(plan.chat_template.is_file());
     assert!(plan.tensor_manifest.is_file());
+}
+
+#[test]
+fn tokenizer_artifacts_copy_optional_external_chat_template() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot = tmp.path().join("source");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::write(snapshot.join("tokenizer.json"), test_tokenizer_json()).unwrap();
+    std::fs::write(
+        snapshot.join("tokenizer_config.json"),
+        test_tokenizer_config_json(),
+    )
+    .unwrap();
+    std::fs::write(snapshot.join("chat_template.jinja"), b"glm-template").unwrap();
+    let plan = plan_unchecked(GLM52_MODEL, &tmp.path().join("models"));
+
+    prepare_tokenizer_artifacts(&snapshot, &plan).unwrap();
+
+    assert_eq!(std::fs::read(&plan.chat_template).unwrap(), b"glm-template");
 }
 
 #[test]
@@ -143,6 +164,137 @@ fn build_cache_parses_safetensors_index_into_manifest() {
             ..
         }
     ));
+}
+
+#[test]
+fn colibri_unindexed_manifest_preserves_int8_io_as_resident_bf16() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot = tmp.path();
+    let tensors = vec![
+        (
+            "model.embed_tokens.weight".to_string(),
+            "U8".to_string(),
+            vec![2],
+            vec![(-2i8) as u8, 3],
+        ),
+        (
+            "model.embed_tokens.weight.qs".to_string(),
+            "F32".to_string(),
+            vec![1],
+            0.5f32.to_le_bytes().to_vec(),
+        ),
+    ];
+    std::fs::write(
+        snapshot.join("out-00000.safetensors"),
+        make_typed_safetensors(&typed_fixture_refs(&tensors)),
+    )
+    .unwrap();
+    let config: QwenModelConfig = serde_json::from_value(serde_json::json!({
+        "model_type": "glm_moe_dsa",
+        "architectures": ["GlmMoeDsaForCausalLM"],
+        "num_hidden_layers": 2,
+        "hidden_size": 2,
+        "num_attention_heads": 1,
+        "head_dim": 1,
+        "vocab_size": 1,
+        "n_routed_experts": 2,
+        "num_experts_per_tok": 1,
+        "n_shared_experts": 1,
+        "norm_topk_prob": true,
+        "moe_intermediate_size": 1,
+        "intermediate_size": 2,
+        "first_k_dense_replace": 1,
+        "q_lora_rank": 1,
+        "kv_lora_rank": 1,
+        "qk_nope_head_dim": 1,
+        "qk_rope_head_dim": 2,
+        "v_head_dim": 1,
+        "n_group": 1,
+        "topk_group": 1,
+        "routed_scaling_factor": 2.5,
+        "index_topk": 16
+    }))
+    .unwrap();
+
+    let (manifest, visual) =
+        build_unindexed_manifest(GLM52_MODEL, snapshot, Some(&config)).unwrap();
+
+    assert!(visual.is_empty());
+    assert_eq!(manifest.dense_shards, vec!["out-00000.safetensors"]);
+    let embedding = &manifest.dense_tensors[0];
+    assert_eq!(embedding.dtype, "BF16");
+    assert_eq!(embedding.shape, vec![1, 2]);
+    assert_eq!(embedding.byte_len, 4);
+    assert_eq!(embedding.quantization, TensorQuantization::None);
+    assert_eq!(
+        embedding.q4_sources.as_ref().unwrap().source_format,
+        DenseQ4SourceFormat::ColibriInt8
+    );
+
+    let destination = snapshot.join("dense.bin");
+    write_dense_tensor_store(snapshot, &destination, &manifest.dense_tensors).unwrap();
+    let bytes = std::fs::read(destination).unwrap();
+    let first = u16::from_le_bytes(bytes[0..2].try_into().unwrap()) as u32;
+    let second = u16::from_le_bytes(bytes[2..4].try_into().unwrap()) as u32;
+    assert_eq!(f32::from_bits(first << 16), -1.0);
+    assert_eq!(f32::from_bits(second << 16), 1.5);
+}
+
+#[test]
+fn mlx_mxfp4_manifest_and_dense_writer_build_canonical_q4() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot = tmp.path();
+    let weight = "model.layers.0.self_attn.q_proj.weight";
+    let scales = "model.layers.0.self_attn.q_proj.scales";
+    let mut packed = vec![0x91; 16];
+    packed.extend(vec![0xe6; 16]);
+    let tensors = vec![
+        (weight.to_string(), "U32".to_string(), vec![1, 8], packed),
+        (
+            scales.to_string(),
+            "U8".to_string(),
+            vec![1, 2],
+            vec![127, 128],
+        ),
+    ];
+    std::fs::write(
+        snapshot.join("model.safetensors"),
+        make_typed_safetensors(&typed_fixture_refs(&tensors)),
+    )
+    .unwrap();
+    let index_path = snapshot.join("model.safetensors.index.json");
+    std::fs::write(
+        &index_path,
+        format!(
+            r#"{{"weight_map":{{"{weight}":"model.safetensors","{scales}":"model.safetensors"}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let (manifest, visual) = build_manifest(GLM52_MODEL, snapshot, &index_path, None).unwrap();
+    assert!(visual.is_empty());
+    assert_eq!(manifest.dense_tensors.len(), 1);
+    let tensor = &manifest.dense_tensors[0];
+    assert_eq!(tensor.shape, vec![1, 64]);
+    assert_eq!(
+        tensor.q4_sources.as_ref().unwrap().source_format,
+        DenseQ4SourceFormat::MlxMxfp4
+    );
+    assert_eq!(
+        tensor.quantization,
+        TensorQuantization::Q4 {
+            group_size: GROUP_SIZE,
+            format: DENSE_Q4_MXFP4_FORMAT.to_string(),
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+        }
+    );
+
+    let destination = snapshot.join("dense.bin");
+    write_dense_tensor_store(snapshot, &destination, &manifest.dense_tensors).unwrap();
+    assert_eq!(
+        std::fs::metadata(destination).unwrap().len(),
+        tensor.byte_len
+    );
 }
 
 #[test]
