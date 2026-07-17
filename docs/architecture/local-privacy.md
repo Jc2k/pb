@@ -51,6 +51,12 @@ only the workspace, network, cache, and secret capabilities declared for it, but
 the service can communicate outside the session. Capability declaration makes the edge auditable;
 it does not make a third party private.
 
+Local host-command MCP servers stay on the machine but inherit the user's host permissions. Safari
+browser automation is one example: pb exposes Safari Technology Preview's own MCP tools when the
+server is configured, rather than owning a parallel WebDriver session. Page content, screenshots,
+console data, and other browser diagnostics flow from Safari to the local agent process. They do
+not become a network disclosure unless another enabled edge sends them elsewhere.
+
 ### Commands
 
 A command can contain its own network client. pb's stage and policy checks govern whether the

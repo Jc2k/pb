@@ -148,5 +148,19 @@ configuration directory with owner-only mode on Unix:
 pb mcp setup github
 ```
 
+On macOS, Safari Technology Preview 247 or newer includes its own local MCP server. pb does not
+ship a separate WebDriver browser-control layer. Configure the preview server for the current
+project with:
+
+```bash
+pb mcp setup safari
+```
+
+The command points the project MCP entry at Safari Technology Preview's `safaridriver --mcp`.
+Before starting an agent, enable **Developer > Enable remote automation and external agents** in
+Safari Technology Preview. Use `--driver-path` if the application is installed somewhere other
+than `/Applications`. Because this is a host-command MCP server, use it with a local execution
+environment rather than a container-backed session.
+
 Enabling any remote integration is also a privacy decision. Review [Your data and privacy](data-and-privacy.md)
 before granting repository or egress access.

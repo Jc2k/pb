@@ -11,7 +11,7 @@ sandbox.
 
 - model completions, including confident claims about completion;
 - repository text that may contain prompt-like instructions;
-- command, check, LSP, browser, research, and MCP output;
+- command, check, LSP, research, and MCP output, including browser MCP results;
 - advisory-agent responses;
 - stale evidence produced before the latest mutation;
 - project configuration until it passes parsing, path, and authority validation.
@@ -95,6 +95,10 @@ environment variables for service secret injection; they should not contain the 
 
 pb does not turn a secret-bearing host command into a contained operation. Prefer capability-scoped
 container integrations when repository, egress, and secret boundaries matter.
+
+The same host-command limit applies to Safari Technology Preview's MCP server. pb does not wrap it
+in a second browser-control sandbox; Safari owns the browser session and access controls, while pb's
+stage and policy rules govern which discovered MCP tools the model may call.
 
 ## Security contract in one sentence
 

@@ -24,7 +24,6 @@ pub mod agent_core;
 mod agent_progress;
 mod agent_repository;
 mod agent_tool_errors;
-pub mod browser_tools;
 pub mod cache_manager;
 pub mod checks;
 pub mod cli_ui;
@@ -261,6 +260,9 @@ pub struct IntegrationsRemoveArgs {
 pub enum McpSetupCommand {
     /// Configure the official GitHub MCP server for the current project
     Github(McpSetupGithubArgs),
+
+    /// Configure Safari Technology Preview's built-in MCP server for the current project
+    Safari(McpSetupSafariArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -280,6 +282,25 @@ pub struct McpSetupGithubArgs {
     /// Print the GitHub authorization URL instead of opening a browser
     #[arg(long)]
     pub no_open: bool,
+
+    /// Do not overwrite an existing server with the same name
+    #[arg(long)]
+    pub no_overwrite: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct McpSetupSafariArgs {
+    /// Project root; defaults to the nearest git repository root
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+
+    /// MCP server name to write under [servers.<name>]
+    #[arg(long, default_value = "safari")]
+    pub server_name: String,
+
+    /// Path to the Safari Technology Preview safaridriver executable
+    #[arg(long)]
+    pub driver_path: Option<PathBuf>,
 
     /// Do not overwrite an existing server with the same name
     #[arg(long)]
@@ -1170,7 +1191,60 @@ async fn run_mcp_command(command: McpCommand) -> Result<()> {
     match command {
         McpCommand::Setup { command } => match command {
             McpSetupCommand::Github(args) => mcp_setup_github(args).await,
+            McpSetupCommand::Safari(args) => mcp_setup_safari(args),
         },
+    }
+}
+
+const SAFARI_TECHNOLOGY_PREVIEW_MCP_DRIVER: &str =
+    "/Applications/Safari Technology Preview.app/Contents/MacOS/safaridriver";
+
+fn mcp_setup_safari(args: McpSetupSafariArgs) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        bail!("Safari MCP setup requires macOS and Safari Technology Preview 247 or newer")
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let root = resolve_env_root(args.workdir)?;
+        if args.server_name.trim().is_empty() {
+            bail!("--server-name cannot be empty");
+        }
+        let driver_path = args
+            .driver_path
+            .unwrap_or_else(|| PathBuf::from(SAFARI_TECHNOLOGY_PREVIEW_MCP_DRIVER));
+        if !driver_path.is_file() {
+            bail!(
+                "Safari MCP driver was not found at {}. Install Safari Technology Preview 247 or newer, or pass --driver-path",
+                driver_path.display()
+            );
+        }
+
+        let mut config = ProjectMcpConfig::load(&root)?.unwrap_or_default();
+        if args.no_overwrite && config.servers.contains_key(&args.server_name) {
+            bail!(
+                "MCP server '{}' already exists in {}; remove --no-overwrite to replace it",
+                args.server_name,
+                mcp::project_mcp_config_path(&root).display()
+            );
+        }
+        config.servers.insert(
+            args.server_name.clone(),
+            safari_mcp_server_config(&driver_path),
+        );
+        config.save(&root)?;
+
+        println!(
+            "Safari MCP server '{}' saved to {}.",
+            args.server_name,
+            mcp::project_mcp_config_path(&root).display()
+        );
+        println!(
+            "In Safari Technology Preview, enable Developer > Enable remote automation and external agents before starting the agent."
+        );
+        Ok(())
     }
 }
 
@@ -1270,6 +1344,17 @@ fn github_mcp_server_config(runtime: &str, token_path: &Path) -> McpServerConfig
                 "GITHUB_PERSONAL_ACCESS_TOKEN=\"$(cat {token_path})\" exec {runtime} run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server"
             ),
         ],
+        env: Default::default(),
+        working_directory: None,
+        disabled: false,
+        ..Default::default()
+    }
+}
+
+fn safari_mcp_server_config(driver_path: &Path) -> McpServerConfig {
+    McpServerConfig {
+        command: Some(driver_path.to_string_lossy().into_owned()),
+        args: vec!["--mcp".to_string()],
         env: Default::default(),
         working_directory: None,
         disabled: false,
@@ -4190,6 +4275,20 @@ mod tests {
         assert!(command.contains("cat '/tmp/pb-github-token'"));
         assert!(command.contains("GITHUB_PERSONAL_ACCESS_TOKEN"));
         assert!(command.contains("ghcr.io/github/github-mcp-server"));
+    }
+
+    #[test]
+    fn safari_mcp_server_config_uses_preview_driver_directly() {
+        let driver =
+            Path::new("/Applications/Safari Technology Preview.app/Contents/MacOS/safaridriver");
+        let config = safari_mcp_server_config(driver);
+        assert_eq!(
+            config.command.as_deref(),
+            Some("/Applications/Safari Technology Preview.app/Contents/MacOS/safaridriver")
+        );
+        assert_eq!(config.args, vec!["--mcp"]);
+        assert!(config.env.is_empty());
+        assert!(!config.disabled);
     }
 
     #[test]
