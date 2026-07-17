@@ -688,6 +688,10 @@ mod tests {
         assert!(is_flashmoe_hf_model(GLM52_MODEL));
         assert!(is_flashmoe_hf_model(GLM52_COLIBRI_MODEL));
         assert_eq!(GLM52_MODEL, GLM52_MXFP4_MODEL);
+        assert!(
+            !is_flashmoe_hf_model("hf://antirez/deepseek-v4-gguf"),
+            "DeepSeek V4 must remain an explicit unsupported capability until Gate 8 closes"
+        );
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-8B-Instruct"));
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-8B"));
         assert!(!is_flashmoe_hf_model("qwen3-30b-a3b"));

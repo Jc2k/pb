@@ -110,10 +110,14 @@ completes. Fused Colibri `kv_b_proj` weights retain their CPU transpose implemen
 routing uses the correction bias only for expert selection and keeps the checkpoint's routed scaling
 factor.
 
-**Design record.** DSA sparse attention and the MTP speculative head remain follow-on typed
-implementations. Until DSA ships, GLM requests beyond `index_topk` fail rather than silently using a
-non-equivalent long-context attention path. The detailed target and validation status live in the
-[FlashMoe architecture parity plan](../flashmoe-architecture-parity-plan.md).
+**Design record.** DSA sparse attention and the MTP speculative head remain GLM follow-on typed
+implementations. DeepSeek V4 Flash is also an active design gate, not shipped support: its
+four-stream hyperconnections, alternating compressed-attention/indexer schedule, hash plus scored
+top-6 routing, and mixed IQ2/Q2 expert layout require new typed stages in the shared graph. pb does
+not substitute the reference Pi runtime's reduced top-2 profile or hide a second engine behind the
+FlashMoe name. Until each capability closes, GLM requests beyond `index_topk` and every DeepSeek V4
+Flash request remain explicit unsupported paths. The detailed target and validation status live in
+the [FlashMoe architecture parity plan](../flashmoe-architecture-parity-plan.md).
 
 ## Deliberate seams
 
