@@ -9,9 +9,11 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
 use encoding_rs::UTF_8;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -21,14 +23,18 @@ use llama_cpp_2::mtmd::{
     MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker,
 };
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::energy::{self, EnergyEstimate};
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
 const BATCH_SIZE: usize = 512;
 const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
+const LLAMA_SESSION_CACHE_VERSION: &str = "llamacpp-session-v1";
+const MAX_PERSISTED_SESSION_STATES: usize = 4;
 
 /// Parameters for a single generation call.
 #[derive(Debug, Clone)]
@@ -84,6 +90,30 @@ pub struct LlamaCppBackend {
     chat_template: Option<TokenizerChatTemplate>,
     /// Path to the primary model GGUF file.
     pub model_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LlamaSessionSettings {
+    ctx_size: u32,
+    threads: Option<i32>,
+    threads_batch: Option<i32>,
+}
+
+struct CachedLlamaContext<'a> {
+    context: LlamaContext<'a>,
+    evaluated_tokens: Vec<LlamaToken>,
+    settings: LlamaSessionSettings,
+}
+
+/// One logical chat session with a live llama.cpp context and a crash-safe disk snapshot.
+///
+/// Exact token-prefix comparison is the invalidation authority. A changed system prompt,
+/// tool schema, chat template, or compacted transcript therefore falls back to the longest
+/// safe prefix instead of reusing stale attention state.
+pub struct LlamaCppChatSession<'a> {
+    backend: &'a LlamaCppBackend,
+    session_id: String,
+    cached: Option<CachedLlamaContext<'a>>,
 }
 
 fn suppress_logs() {
@@ -156,6 +186,15 @@ impl LlamaCppBackend {
         )
     }
 
+    /// Start a reusable structured-chat session.
+    pub fn start_chat_session(&self, session_id: impl Into<String>) -> LlamaCppChatSession<'_> {
+        LlamaCppChatSession {
+            backend: self,
+            session_id: session_id.into(),
+            cached: None,
+        }
+    }
+
     /// Render and tokenize the exact structured chat prompt used by [`Self::generate_chat`].
     pub fn measure_chat_prompt(&self, request: &LlamaCppChatRequest) -> Result<usize> {
         let (prompt, add_bos) = self.render_chat_prompt(&request.messages, &request.tools)?;
@@ -180,26 +219,12 @@ impl LlamaCppBackend {
     ) -> Result<Output> {
         let energy_start = energy::sample();
         let started = std::time::Instant::now();
-        let n_ctx = NonZeroU32::new(ctx_size).context("ctx-size must be > 0")?;
-        let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
-        if let Some(threads) = threads {
-            ctx_params = ctx_params.with_n_threads(threads);
-        }
-        if let Some(threads_batch) = threads_batch.or(threads) {
-            ctx_params = ctx_params.with_n_threads_batch(threads_batch);
-        }
-
-        let mut ctx = match self.model.new_context(&self.backend, ctx_params.clone()) {
-            Ok(ctx) => ctx,
-            Err(accelerated_error) => self
-                .model
-                .new_context(&self.backend, ctx_params.with_offload_kqv(false))
-                .with_context(|| {
-                    format!(
-                        "failed to create llama context, including CPU K/Q/V fallback after accelerated context error: {accelerated_error}"
-                    )
-                })?,
+        let settings = LlamaSessionSettings {
+            ctx_size,
+            threads,
+            threads_batch,
         };
+        let mut ctx = self.new_text_context(settings)?;
 
         let tokens = self
             .model
@@ -276,6 +301,29 @@ impl LlamaCppBackend {
             duration_ms: duration_millis(started),
             energy,
         })
+    }
+
+    fn new_text_context(&self, settings: LlamaSessionSettings) -> Result<LlamaContext<'_>> {
+        let n_ctx = NonZeroU32::new(settings.ctx_size).context("ctx-size must be > 0")?;
+        let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
+        if let Some(threads) = settings.threads {
+            ctx_params = ctx_params.with_n_threads(threads);
+        }
+        if let Some(threads_batch) = settings.threads_batch.or(settings.threads) {
+            ctx_params = ctx_params.with_n_threads_batch(threads_batch);
+        }
+
+        match self.model.new_context(&self.backend, ctx_params.clone()) {
+            Ok(ctx) => Ok(ctx),
+            Err(accelerated_error) => self
+                .model
+                .new_context(&self.backend, ctx_params.with_offload_kqv(false))
+                .with_context(|| {
+                    format!(
+                        "failed to create llama context, including CPU K/Q/V fallback after accelerated context error: {accelerated_error}"
+                    )
+                }),
+        }
     }
 
     /// Run vision (multimodal) generation for the given request and image path.
@@ -391,6 +439,249 @@ impl LlamaCppBackend {
             duration_ms: duration_millis(started),
             energy,
         })
+    }
+}
+
+impl LlamaCppChatSession<'_> {
+    /// Generate the next response while reusing the longest exact token prefix from this session.
+    pub fn generate_chat(&mut self, request: &LlamaCppChatRequest) -> Result<Output> {
+        let energy_start = energy::sample();
+        let started = std::time::Instant::now();
+        let (prompt, add_bos) = self
+            .backend
+            .render_chat_prompt(&request.messages, &request.tools)?;
+        let tokens = self
+            .backend
+            .model
+            .str_to_token(&prompt, add_bos)
+            .context("failed to tokenize chat prompt")?;
+        let settings = LlamaSessionSettings {
+            ctx_size: request.ctx_size,
+            threads: request.threads,
+            threads_batch: request.threads_batch,
+        };
+
+        let needs_context = self
+            .cached
+            .as_ref()
+            .is_none_or(|cached| cached.settings != settings);
+        if needs_context {
+            let mut context = self.backend.new_text_context(settings)?;
+            let evaluated_tokens = self.load_persisted_state(&mut context, settings, &tokens);
+            self.cached = Some(CachedLlamaContext {
+                context,
+                evaluated_tokens,
+                settings,
+            });
+        }
+
+        let cached = self
+            .cached
+            .as_mut()
+            .context("llama session context is missing")?;
+        ensure_prompt_fits_context(tokens.len(), request.max_tokens, cached.context.n_ctx())?;
+
+        let mut prefill_start = common_token_prefix_len(&cached.evaluated_tokens, &tokens);
+        if prefill_start < cached.evaluated_tokens.len() {
+            // A shorter prompt needs its final token evaluated again because llama.cpp's logits
+            // buffer still belongs to the longer cached sequence.
+            if prefill_start == tokens.len() {
+                prefill_start = prefill_start.saturating_sub(1);
+            }
+            let truncated = if prefill_start == 0 {
+                cached.context.clear_kv_cache();
+                true
+            } else {
+                cached
+                    .context
+                    .clear_kv_cache_seq(Some(0), Some(prefill_start as u32), None)
+                    .unwrap_or(false)
+            };
+            if !truncated {
+                cached.context = self.backend.new_text_context(settings)?;
+                prefill_start = 0;
+            }
+        }
+
+        tracing::debug!(
+            session_id = %self.session_id,
+            prompt_tokens = tokens.len(),
+            reused_prefix_tokens = prefill_start,
+            "prepared llama.cpp session prefix"
+        );
+
+        let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
+        for range in prompt_batch_ranges_from(prefill_start, tokens.len(), BATCH_SIZE) {
+            batch.clear();
+            let is_final_batch = range.end == tokens.len();
+            for token_index in range.clone() {
+                let is_last_prompt_token = is_final_batch && token_index + 1 == tokens.len();
+                batch
+                    .add(tokens[token_index], token_index as i32, &[0], is_last_prompt_token)
+                    .with_context(|| {
+                        format!(
+                            "failed to add prompt token {token_index} to batch (batch capacity: {BATCH_SIZE}, prompt tokens: {})",
+                            tokens.len()
+                        )
+                    })?;
+            }
+            cached.context.decode(&mut batch).with_context(|| {
+                format!(
+                    "failed to decode prompt batch {}..{}",
+                    range.start, range.end
+                )
+            })?;
+        }
+
+        let mut evaluated_tokens = tokens;
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::top_k(request.top_k),
+            LlamaSampler::temp(request.temperature),
+            LlamaSampler::dist(request.seed),
+        ]);
+        let mut decoder = UTF_8.new_decoder();
+        let mut output = String::new();
+        let mut n_cur =
+            i32::try_from(evaluated_tokens.len()).context("prompt token count exceeds i32::MAX")?;
+        let mut generated_tokens: usize = 0;
+        let mut finish_reason = FinishReason::MaxTokens;
+        let mut sample_index = if batch.n_tokens() == 0 {
+            -1
+        } else {
+            batch.n_tokens() - 1
+        };
+
+        while generated_tokens < usize::try_from(request.max_tokens).unwrap_or(0) {
+            let token = sampler.sample(&cached.context, sample_index);
+            sampler.accept(token);
+            if self.backend.model.is_eog_token(token) {
+                finish_reason = FinishReason::EndOfGeneration;
+                break;
+            }
+            let piece = self
+                .backend
+                .model
+                .token_to_piece(token, &mut decoder, true, None)
+                .context("failed to decode output token")?;
+            output.push_str(&piece);
+            batch.clear();
+            batch
+                .add(token, n_cur, &[0], true)
+                .context("failed to queue generated token")?;
+            cached
+                .context
+                .decode(&mut batch)
+                .context("failed to decode generated token")?;
+            evaluated_tokens.push(token);
+            n_cur += 1;
+            generated_tokens += 1;
+            sample_index = batch.n_tokens() - 1;
+        }
+
+        let prompt_token_count = evaluated_tokens.len().saturating_sub(generated_tokens);
+        cached.evaluated_tokens = evaluated_tokens;
+        if let Err(error) = self.persist_state(settings) {
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %error,
+                "failed to persist llama.cpp session cache; generation remains valid"
+            );
+        }
+
+        let energy =
+            energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
+        Ok(Output {
+            content: output,
+            finish_reason,
+            prompt_tokens: prompt_token_count,
+            generated_tokens,
+            duration_ms: duration_millis(started),
+            energy,
+        })
+    }
+
+    fn load_persisted_state(
+        &self,
+        context: &mut LlamaContext<'_>,
+        settings: LlamaSessionSettings,
+        prompt_tokens: &[LlamaToken],
+    ) -> Vec<LlamaToken> {
+        let Some(path) = self.cache_path(settings) else {
+            return Vec::new();
+        };
+        if !path.is_file() {
+            return Vec::new();
+        }
+        match context.state_load_file(&path, settings.ctx_size as usize) {
+            Ok(tokens) => {
+                let prefix_len = common_token_prefix_len(&tokens, prompt_tokens);
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    cache = %path.display(),
+                    cached_tokens = tokens.len(),
+                    reusable_prefix_tokens = prefix_len,
+                    "loaded llama.cpp session cache"
+                );
+                tokens
+            }
+            Err(error) => {
+                context.clear_kv_cache();
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    cache = %path.display(),
+                    error = %error,
+                    "ignored incompatible llama.cpp session cache"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn persist_state(&self, settings: LlamaSessionSettings) -> Result<()> {
+        let Some(path) = self.cache_path(settings) else {
+            return Ok(());
+        };
+        let cached = self
+            .cached
+            .as_ref()
+            .context("llama session context is missing")?;
+        let parent = path
+            .parent()
+            .context("llama session cache path has no parent")?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create llama session cache {}", parent.display())
+        })?;
+        secure_cache_directory(parent)?;
+        let temporary = tempfile::Builder::new()
+            .prefix(".llamacpp-state-")
+            .tempfile_in(parent)
+            .with_context(|| format!("failed to create temporary cache in {}", parent.display()))?;
+        cached
+            .context
+            .state_save_file(temporary.path(), &cached.evaluated_tokens)
+            .with_context(|| {
+                format!(
+                    "failed to save llama session state to {}",
+                    temporary.path().display()
+                )
+            })?;
+        let temporary = temporary.into_temp_path();
+        replace_cache_file(&temporary, &path)?;
+        prune_session_cache(parent, &path)?;
+        Ok(())
+    }
+
+    fn cache_path(&self, settings: LlamaSessionSettings) -> Option<PathBuf> {
+        if self.session_id.trim().is_empty() || llama_session_cache_disabled() {
+            return None;
+        }
+        let root = llama_session_cache_root()?;
+        Some(llama_session_cache_path(
+            &root,
+            &self.backend.model_path,
+            &self.session_id,
+            settings.ctx_size,
+        ))
     }
 }
 
@@ -513,11 +804,128 @@ fn find_multimodal_projector(model_path: &Path) -> Result<PathBuf> {
 }
 
 fn prompt_batch_ranges(token_count: usize, batch_size: usize) -> Vec<Range<usize>> {
+    prompt_batch_ranges_from(0, token_count, batch_size)
+}
+
+fn prompt_batch_ranges_from(
+    start_token: usize,
+    token_count: usize,
+    batch_size: usize,
+) -> Vec<Range<usize>> {
     assert!(batch_size > 0, "batch_size must be greater than zero");
-    (0..token_count)
+    (start_token..token_count)
         .step_by(batch_size)
         .map(|start| start..std::cmp::min(start + batch_size, token_count))
         .collect()
+}
+
+fn common_token_prefix_len(left: &[LlamaToken], right: &[LlamaToken]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn llama_session_cache_disabled() -> bool {
+    std::env::var("PB_LLAMA_SESSION_CACHE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        })
+}
+
+fn llama_session_cache_root() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("PB_CACHE_DIR").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(root).join(LLAMA_SESSION_CACHE_VERSION));
+    }
+    dirs::cache_dir().map(|root| root.join("pb").join(LLAMA_SESSION_CACHE_VERSION))
+}
+
+fn llama_session_cache_path(
+    root: &Path,
+    model_path: &Path,
+    session_id: &str,
+    ctx_size: u32,
+) -> PathBuf {
+    let canonical_model = model_path
+        .canonicalize()
+        .unwrap_or_else(|_| model_path.to_path_buf());
+    let metadata = model_path.metadata().ok();
+    let size = metadata.as_ref().map_or(0, fs::Metadata::len);
+    let modified_nanos = metadata
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    let mut digest = Sha256::new();
+    digest.update(LLAMA_SESSION_CACHE_VERSION.as_bytes());
+    digest.update([0]);
+    digest.update(canonical_model.to_string_lossy().as_bytes());
+    digest.update([0]);
+    digest.update(size.to_le_bytes());
+    digest.update(modified_nanos.to_le_bytes());
+    digest.update(ctx_size.to_le_bytes());
+    digest.update(session_id.as_bytes());
+    root.join(format!("{:x}.state", digest.finalize()))
+}
+
+fn replace_cache_file(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    if destination.exists() {
+        fs::remove_file(destination).with_context(|| {
+            format!(
+                "failed to replace llama session cache {}",
+                destination.display()
+            )
+        })?;
+    }
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "failed to atomically replace llama session cache {}",
+            destination.display()
+        )
+    })
+}
+
+fn secure_cache_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure llama session cache {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn prune_session_cache(root: &Path, current: &Path) -> Result<()> {
+    let mut states = fs::read_dir(root)
+        .with_context(|| format!("failed to inspect llama session cache {}", root.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "state")
+        })
+        .map(|path| {
+            let modified = path
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+            (modified, path)
+        })
+        .collect::<Vec<_>>();
+    states.sort_by(|left, right| {
+        (right.1 == current)
+            .cmp(&(left.1 == current))
+            .then_with(|| right.0.cmp(&left.0))
+    });
+    for (_, path) in states.into_iter().skip(MAX_PERSISTED_SESSION_STATES) {
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to prune llama session cache {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn ensure_prompt_fits_context(prompt_tokens: usize, max_tokens: i32, n_ctx: u32) -> Result<()> {
@@ -554,6 +962,60 @@ mod tests {
             prompt_batch_ranges(1_025, 512),
             vec![0..512, 512..1_024, 1_024..1_025]
         );
+        assert_eq!(prompt_batch_ranges_from(700, 1_025, 512), vec![700..1_025]);
+    }
+
+    #[test]
+    fn session_prefix_reuse_stops_at_the_first_changed_token() {
+        let cached = [1, 2, 3, 4].map(LlamaToken::new);
+        let extended = [1, 2, 3, 4, 5].map(LlamaToken::new);
+        let changed = [1, 2, 9, 4].map(LlamaToken::new);
+
+        assert_eq!(common_token_prefix_len(&cached, &extended), 4);
+        assert_eq!(common_token_prefix_len(&cached, &changed), 2);
+    }
+
+    #[test]
+    fn session_cache_key_invalidates_model_context_and_session_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model = tmp.path().join("model.gguf");
+        fs::write(&model, b"model-v1").unwrap();
+        let root = tmp.path().join("cache");
+
+        let original = llama_session_cache_path(&root, &model, "session-a", 8_192);
+        let other_session = llama_session_cache_path(&root, &model, "session-b", 8_192);
+        let other_context = llama_session_cache_path(&root, &model, "session-a", 16_384);
+        fs::write(&model, b"model-v2-with-a-new-size").unwrap();
+        let changed_model = llama_session_cache_path(&root, &model, "session-a", 8_192);
+
+        assert_ne!(original, other_session);
+        assert_ne!(original, other_context);
+        assert_ne!(original, changed_model);
+        assert!(
+            !original
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("session-a")
+        );
+    }
+
+    #[test]
+    fn session_cache_pruning_is_bounded_and_preserves_current_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut paths = Vec::new();
+        for index in 0..6 {
+            let path = tmp.path().join(format!("{index}.state"));
+            fs::write(&path, index.to_string()).unwrap();
+            paths.push(path);
+        }
+        let current = paths[0].clone();
+
+        prune_session_cache(tmp.path(), &current).unwrap();
+
+        let remaining = fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(remaining, MAX_PERSISTED_SESSION_STATES);
+        assert!(current.is_file());
     }
 
     #[test]

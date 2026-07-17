@@ -11,6 +11,7 @@ updates, and provider publication are explicit paths across the machine boundary
 | User settings and project registry | `<config-dir>/pb/` | Kept until changed or removed. |
 | GitHub OAuth token | `<config-dir>/pb/github-token` | Kept locally; owner-only mode on Unix. |
 | Model weights | `$XDG_DATA_HOME/pb/models` or `~/.local/share/pb/models` | Kept for reuse. |
+| llama.cpp session states | `<platform-cache>/pb/llamacpp-session-v1` or `$PB_CACHE_DIR/llamacpp-session-v1` | Up to four files, replaced as sessions run; may contain prompt tokens. |
 | Project configuration | `<repository>/.pb/` | Owned by the repository; may be committed intentionally. |
 | Session history and workflow checkpoints | Repository-local Git notes under `refs/notes/pb/sessions` | Kept locally until the session is deleted; Git notes are not pushed by ordinary branch pushes. |
 | Session containers, networks, workspaces, and services | Runtime-managed, session-owned resources | Reconciled and removed at terminal cleanup or expiry. |
@@ -68,3 +69,5 @@ Delete a finished daemon session with `pb queue --delete-session SESSION_ID`. Th
 notes ref. `pb self uninstall --delete-data` removes the installed application together with pb's
 known data, cache, configuration, state, and logs after confirmation. Review project-owned `.pb/`
 files and container runtime storage separately when you need a full project-specific cleanup.
+Set `PB_LLAMA_SESSION_CACHE=off` before an agent run if its prompt-derived llama.cpp state should not
+be written to disk; remove the `llamacpp-session-v1` cache directory to discard existing snapshots.

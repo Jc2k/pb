@@ -2434,11 +2434,12 @@ fn run_agent_inner<S: EventSink>(
         flashmoe_generator = FlashMoeCompletionEngine { engine };
         &mut flashmoe_generator
     } else {
-        llama_generator = LlamaCompletionEngine {
-            llamacpp: llamacpp_backend
+        llama_generator = LlamaCompletionEngine::new(
+            llamacpp_backend
                 .as_ref()
                 .context("llama.cpp backend was not loaded")?,
-        };
+            &args.session_id,
+        );
         &mut llama_generator
     };
 
@@ -6394,7 +6395,8 @@ fn run_step_limit_monitor(
     monitor_request.tool_allowlist = Some(Vec::new());
     monitor_request.sub_agent_depth = args.sub_agent_depth + 1;
 
-    let mut monitor_generator = LlamaCompletionEngine { llamacpp };
+    let monitor_session_id = format!("{}:monitor:{nesting_depth}", args.session_id);
+    let mut monitor_generator = LlamaCompletionEngine::new(llamacpp, &monitor_session_id);
     let outcome = run_agent_steps(
         &mut monitor_generator,
         TextBackendKind::LlamaCpp,
@@ -9864,7 +9866,7 @@ pub(crate) fn run_local_model_eval_steps(
     let run_budget = RefCell::new(RunBudget::default());
     let outcome = match engine {
         LocalModelEvalEngine::LlamaCpp(llamacpp) => {
-            let mut generator = LlamaCompletionEngine { llamacpp };
+            let mut generator = LlamaCompletionEngine::new(llamacpp, &args.session_id);
             run_agent_steps(
                 &mut generator,
                 TextBackendKind::LlamaCpp,
@@ -9918,6 +9920,16 @@ pub(crate) fn run_local_model_eval_steps(
 
 struct LlamaCompletionEngine<'a> {
     llamacpp: &'a LlamaCppBackend,
+    session: llamacpp::LlamaCppChatSession<'a>,
+}
+
+impl<'a> LlamaCompletionEngine<'a> {
+    fn new(llamacpp: &'a LlamaCppBackend, session_id: &str) -> Self {
+        Self {
+            llamacpp,
+            session: llamacpp.start_chat_session(session_id),
+        }
+    }
 }
 
 impl CompletionEngine for LlamaCompletionEngine<'_> {
@@ -9950,7 +9962,7 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         _enable_thinking: bool,
     ) -> Result<CompletionOutput> {
         let request = llama_chat_request(args, messages, tools)?;
-        let mut output = self.llamacpp.generate_chat(&request)?;
+        let mut output = self.session.generate_chat(&request)?;
         let tool_calls = parse_model_tool_call_output(&mut output.content)?;
         Ok(CompletionOutput {
             content: output.content,
@@ -12949,7 +12961,13 @@ fn run_sub_agent(
             let llamacpp = context
                 .llamacpp
                 .context("sub_agent requires a loaded llama.cpp backend")?;
-            llama_generator = LlamaCompletionEngine { llamacpp };
+            let sub_session_id = format!(
+                "{}:sub:{}:{}",
+                sub_request.session_id,
+                profile.as_str(),
+                sub_request.sub_agent_depth
+            );
+            llama_generator = LlamaCompletionEngine::new(llamacpp, &sub_session_id);
             &mut llama_generator
         }
         TextBackendKind::FlashMoe => {

@@ -26,6 +26,24 @@ The web server binds to `127.0.0.1:8311` by default. Changing `web.listen` to `0
 interface on available networks. pb does not add authentication or TLS merely because the address
 changed, so treat non-loopback binding as an explicit trust decision.
 
+## Inference session cache
+
+**Shipped.** Agent calls through llama.cpp keep one live context for the logical session and reuse
+the longest exact rendered-token prefix on each pass. At the end of a pass, pb also saves the
+llama.cpp state so a later process can resume without prefilling the unchanged prefix again. The
+cache key includes the model file identity, context size, and a hash of the session id; exact token
+comparison invalidates changed system instructions, tools, templates, messages, and compaction.
+
+States live below the platform cache directory at `pb/llamacpp-session-v1/`. Set `PB_CACHE_DIR` to
+move pb's cache root, or set `PB_LLAMA_SESSION_CACHE=off` to disable disk snapshots while retaining
+the in-process context. pb keeps at most four llama.cpp state files and writes replacements through
+a temporary owner-only cache directory. These files can be large because they contain the model's
+evaluated attention state and associated prompt tokens.
+
+FlashMoe already reuses an exact prompt-prefix KV and recurrent-state snapshot for the active
+session. Its state is currently memory-only; serializing FlashMoe's mixed CPU/Metal and recurrent
+state remains a design item rather than an implied restart guarantee.
+
 ## GLM-5.2 with FlashMoe
 
 **Configurable.** On Apple Silicon, pb can import GLM-5.2 checkpoints and run the baseline decoder

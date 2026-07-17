@@ -95,21 +95,24 @@ impl InferenceBackend for crate::inference::llamacpp::LlamaCppBackend {
     }
 
     fn generate_chat(&mut self, request: &ChatInferenceRequest) -> Result<BackendOutput> {
-        let output = crate::inference::llamacpp::LlamaCppBackend::generate_chat(
-            self,
-            &crate::inference::llamacpp::LlamaCppChatRequest {
-                messages: serde_json::to_value(&request.messages)?,
-                tools: serde_json::to_value(&request.tools)?,
-                ctx_size: llama_ctx_size(&request.options)?,
-                threads: request.options.threads,
-                threads_batch: request.options.threads_batch,
-                gpu_layers: llama_gpu_layers(&request.options),
-                max_tokens: request.options.max_tokens,
-                top_k: request.options.top_k,
-                temperature: request.options.temperature,
-                seed: request.options.seed,
-            },
-        )?;
+        let llama_request = crate::inference::llamacpp::LlamaCppChatRequest {
+            messages: serde_json::to_value(&request.messages)?,
+            tools: serde_json::to_value(&request.tools)?,
+            ctx_size: llama_ctx_size(&request.options)?,
+            threads: request.options.threads,
+            threads_batch: request.options.threads_batch,
+            gpu_layers: llama_gpu_layers(&request.options),
+            max_tokens: request.options.max_tokens,
+            top_k: request.options.top_k,
+            temperature: request.options.temperature,
+            seed: request.options.seed,
+        };
+        let output = if let Some(session_id) = request.session_id.as_deref() {
+            self.start_chat_session(session_id)
+                .generate_chat(&llama_request)?
+        } else {
+            crate::inference::llamacpp::LlamaCppBackend::generate_chat(self, &llama_request)?
+        };
         Ok(output.into())
     }
 

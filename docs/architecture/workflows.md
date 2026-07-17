@@ -100,6 +100,28 @@ When a model response is truncated before producing a valid action, pb can retry
 disabled and, within the same global budget, use a larger output cap. These recovery mechanics help
 the model express an allowed action; they never expose a new capability or waive a transition gate.
 
+## Context compaction and inference reuse
+
+**Shipped.** pb renders and tokenizes every prompt before inference. It reserves the requested
+generation space plus a fixed safety margin, begins compacting above 70% of usable prompt capacity,
+and targets 60%. Only completed assistant/tool groups become deterministic receipts. The system
+instructions, task, active contract/stage material, accepted artifacts, checks, fingerprints, and
+terminal requirements remain byte-for-byte authoritative. If those anchors cannot fit, the call
+ends with `context_limit` instead of asking the model to summarize or silently dropping evidence.
+
+This is sufficient for correctness and bounded long-running agent use. A model-authored rolling
+summary would weaken the authority and audit guarantees, so it is not the next compaction step.
+Future compaction work should be driven by measured retrieval or quality failures and should retain
+the same deterministic receipt and durable-event boundary.
+
+Compaction is also cache-safe. Both local inference paths compare the exact rendered token prefix
+before reusing attention state. llama.cpp keeps the live context across passes and saves a bounded
+set of restartable states to the local cache directory; FlashMoe retains its prompt-boundary KV and
+recurrent state in memory. When a system prompt, tool schema, stage prompt, or compacted transcript
+changes, reuse stops at the first changed token. The remaining suffix is evaluated normally. A
+compaction event can therefore cause one deliberate cache discontinuity, but it cannot attach stale
+KV state to a different prompt.
+
 ## Where the workflow ends
 
 Ready means local delivery is complete under the configured contract. Publication is a separate
