@@ -358,8 +358,41 @@ E2M1 weights and group-32 E8M0 scales reduces a slot to 20,054,016 bytes (5.56%)
 sparse layers falls from 12,740,198,400 to 12,032,409,600 logical bytes per token. The scheduler's
 parallel positioned reads, reusable whole-slot leases, CMD3 handoff, and OS-page-cache policy are
 unchanged. Focused import, storage, capability, scheduler, CPU projection, and real-Metal kernel
-tests pass; the full-checkpoint cache rebuild and decode measurement remain pending at this
-checkpoint.
+tests pass. A complete rebuild published all 75 sparse layers and 256 experts per layer without
+fallback or retained source shards; each layer pack is 5,133,828,096 bytes and the runtime occupies
+about 368 GiB. The deterministic raw output remained `5 2`.
+
+- One detailed run decoded at `0.650 tok/s`; three back-to-back non-instrumented prompts stabilized
+  at `0.644-0.645 tok/s`. The latter is a 5.9% throughput increase over the preceding affine-Q4
+  `0.609 tok/s` result, matching the 5.56% logical-byte reduction closely enough to identify storage
+  volume—not native decode arithmetic—as the gain.
+- The detailed native run measured `1.539 s/token`: expert I/O averaged `1.041 s/token`, the fused
+  attention/post-attention command averaged `0.459 s/token`, and routed-expert submission averaged
+  `0.007 s/token`. The resource ledger retained exactly eight anonymous expert wrappers totaling
+  160,432,128 bytes and reported no pressure recovery or resource-limit abort.
+- The 12,032,409,600 logical bytes per token leave a best observed effective rate near 7.5 GB/s.
+  Native MXFP4 therefore improves the shipped baseline but cannot by itself reach `1 tok/s` on this
+  storage device.
+
+A twelfth pass evaluated Colibri's gate/up fusion and macOS direct-read strategies without retaining
+a new runtime path. The same deterministic request preserved `5 2` throughout.
+
+- A native-MXFP4 gate/up/SwiGLU kernel removed two dispatches and two temporary-buffer acquisitions
+  per routed expert. A real-Metal reference test passed, but detailed routed-expert submission only
+  fell from `0.00732` to `0.00677 s/token`, while the GPU-side bucket stayed effectively flat at
+  `0.459` versus `0.458 s/token`. The kernel and staged-buffer changes were removed because the
+  saving was immaterial beside expert I/O.
+- A 12,032,409,600-byte read-only calibration found buffered positioned reads varying between
+  6.4 and 7.6 GiB/s and `F_NOCACHE` reads holding about 7.3-7.4 GiB/s. The integrated all-direct
+  reader nevertheless decoded at only `0.445 tok/s`, well below the buffered `0.587-0.645 tok/s`
+  regimes, because it forced repeated routes back to physical storage. The direct reader was
+  removed; buffered `pread` and the OS page cache remain authoritative.
+- Colibri's reported 2.24 tok/s Apple-Silicon result uses an approximately 98 GiB process with a
+  110 GB expert-cache budget and 74-75% application-cache hit rate on a 128 GB M5 Max. This host's
+  roughly 56 GB recommended Metal working set cannot reproduce that hot-tier regime, and pb's prior
+  bounded application-cache experiment already showed that duplicating warm OS pages raises I/O
+  latency. Direct reads are useful for Colibri's cold misses, not as a replacement for pb's buffered
+  repeated-route path.
 
 ## Scheduled Graph
 
@@ -1164,7 +1197,7 @@ Current capability matrix:
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
 | Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes; load requires the selected policy to equal metadata-resolved slots before capability resolution | Cross-family 12-combination graph matrix, CLI/planning selection and 3x3 policy/layout rejection coverage, storage, scheduler, and local-Metal fixtures; real checkpoint pending |
-| GLM-5.2 | Canonical resident Q4 plus BF16 Colibri input/output / fixed native-MXFP4 or affine-Q4 slots from layer 3 | Shipped baseline through the unified runtime and expert scheduler; indexed MLX preserves typed E2M1/E8M0 expert storage while unindexed Colibri adapts to affine Q4, full causal MLA is bounded by `index_topk`, and DSA/MTP are unimplemented | Native MXFP4 import/storage/capability/CPU/local-Metal parity plus Colibri import, MLA/RoPE/KV, routing, expert-boundary, all-target, release, prior affine-cache build, and real text inference evidence; native full-cache measurement pending |
+| GLM-5.2 | Canonical resident Q4 plus BF16 Colibri input/output / fixed native-MXFP4 or affine-Q4 slots from layer 3 | Shipped baseline through the unified runtime and expert scheduler; indexed MLX preserves typed E2M1/E8M0 expert storage while unindexed Colibri adapts to affine Q4, full causal MLA is bounded by `index_topk`, and DSA/MTP are unimplemented | Native MXFP4 import/storage/capability/CPU/local-Metal parity plus Colibri import, MLA/RoPE/KV, routing, expert-boundary, all-target, release, complete 75-layer native cache build, and real text/performance evidence |
 
 Completion evidence:
 
