@@ -67,6 +67,7 @@ impl ReusableExpertBytes {
         let mmap = memmap2::MmapMut::map_anon(capacity)
             .context("failed to allocate page-aligned reusable expert buffer")?;
         Ok(Self {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             attachment: OnceLock::new(),
             backing: ReusableExpertBytesBacking::PageAligned(mmap),
             len: 0,

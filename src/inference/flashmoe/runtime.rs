@@ -24,6 +24,7 @@ use super::vision::{
 };
 use super::weights::*;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::metal::MetalObjcId as ObjcId;
 use super::scheduler::ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef;
 
@@ -46,6 +47,7 @@ enum MlaAttentionOutput {
     MetalPostAttention(MetalPostAttentionPrep),
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ScheduledCmd3Input for ExpertPhaseInput {
     fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
         match self {
@@ -62,6 +64,11 @@ impl ScheduledCmd3Input for ExpertPhaseInput {
     }
 }
 
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Debug, Clone, Copy)]
+struct GlmMlaPostAttentionRequest<'a>(std::marker::PhantomData<&'a ()>);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 type ScheduledExpertCommand<'a> =
     ScheduledCmd3Command<'a, Arc<ScheduledExpertSlot>, ExpertPhaseInput, SharedExpertPhaseRef<'a>>;
 
@@ -473,6 +480,7 @@ impl MetalExecutionFacade {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
     fn submit_scheduled_cmd3(
         &self,
@@ -507,6 +515,7 @@ impl MetalExecutionFacade {
             payloads,
         )
     }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(super) fn submit_scheduled_expert_command(
         &self,
         command: ScheduledExpertCommand<'_>,

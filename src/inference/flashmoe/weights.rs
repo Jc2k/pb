@@ -17,10 +17,11 @@ use super::experts::{
 use super::math::{q4_dequantize_rows_with_group_size, quantize_q4, softmax_in_place};
 #[cfg(test)]
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
+use super::metal::MetalGlmMlaAbsorbedAttentionInput;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::metal::{
-    MetalBatchProjectionInput, MetalGlmMlaAbsorbedAttentionInput, MetalGlmMlaFusedAttentionInput,
-    MetalGlmMlaFusedAttentionOutput, MetalGlmMlaPostAttentionInput, MetalObjcId as ObjcId,
-    MetalPostAttentionPrep,
+    MetalBatchProjectionInput, MetalGlmMlaFusedAttentionInput, MetalGlmMlaFusedAttentionOutput,
+    MetalGlmMlaPostAttentionInput, MetalObjcId as ObjcId, MetalPostAttentionPrep,
 };
 use super::model_family::{
     QwenModelConfig, QwenMoeFamily, QwenMoeLayerKind, QwenNormWeightSemantics,
