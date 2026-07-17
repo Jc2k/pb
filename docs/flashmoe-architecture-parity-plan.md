@@ -394,6 +394,31 @@ a new runtime path. The same deterministic request preserved `5 2` throughout.
   latency. Direct reads are useful for Colibri's cold misses, not as a replacement for pb's buffered
   repeated-route path.
 
+A thirteenth pass profiled the remaining Colibri-style hot-tier and lower-K options without
+retaining either. A deterministic 16-token chat generation produced 38 complete forwards (23
+prompt/prefill positions and 15 decode positions) and 22,800 real layer/expert accesses. Simulating
+independent per-layer LRU tiers against that exact trace gave:
+
+| Experts retained per sparse layer | Resident native-MXFP4 bytes | Decode hit rate | Remaining logical expert traffic/token |
+| ---: | ---: | ---: | ---: |
+| 5 | 7.00 GiB | 6.36% | 10.49 GiB |
+| 10 | 14.01 GiB | 24.77% | 8.43 GiB |
+| 20 | 28.02 GiB | 48.31% | 5.79 GiB |
+| 40 | 56.03 GiB | 65.13% | 3.91 GiB |
+| 80 | 112.06 GiB | 77.19% | 2.56 GiB |
+
+The 20-entry tier is the first point that could approach `1 tok/s` by byte-count extrapolation, but
+its 28 GiB is already near the prior 32 GiB cache that collapsed to `0.082 tok/s` under memory
+pressure once resident dense weights and working buffers were present. The 40-entry tier exceeds
+this host's recommended Metal working set before accounting for the 10.5 GB resident dense graph.
+No application hot tier was reintroduced.
+
+Explicit lower-K routing did cross the numerical target but failed the model-quality contract. K=4
+decoded three raw prompts at `1.027-1.078 tok/s` (`1.050 tok/s` aggregate) and a longer chat decode
+at `1.248 tok/s`, but the no-thinking arithmetic request `What is 2+2?` answered `40, 1,` instead of
+`4`. K=5 decoded at `0.975 tok/s` and also produced an incorrect arithmetic continuation. These
+remain diagnostic lower bounds; GLM's configured K=8 is still the only supported routing width.
+
 ## Scheduled Graph
 
 Every supported variant resolves the same conceptual stages:
