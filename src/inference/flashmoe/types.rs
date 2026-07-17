@@ -298,6 +298,8 @@ pub struct FlashMoeMetalResourceSnapshot {
     pub ledger_high_water_bytes: usize,
     pub resident_dense_bytes: usize,
     pub recurrent_state_bytes: usize,
+    pub resident_expert_wrapper_buffers: usize,
+    pub resident_expert_wrapper_bytes: usize,
     pub active_general_buffers: usize,
     pub active_general_bytes: usize,
     pub pooled_buffers: usize,

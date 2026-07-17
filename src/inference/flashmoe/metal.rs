@@ -18,7 +18,8 @@ use super::types::FlashMoeMetalResourceSnapshot;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::experts::{
-    EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32, expert_scale_bias_dtype_size,
+    EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32, ReusableExpertBytes,
+    expert_scale_bias_dtype_size,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::math::{routing_sigmoid_noaux_top_k, routing_softmax_top_k};
@@ -178,6 +179,45 @@ struct MetalExpertSourceBufferEntry {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalPersistentExpertBuffer {
+    device: usize,
+    buffer: usize,
+    resources: Arc<MetalResourceLedger>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalPersistentExpertBuffer {
+    fn new(
+        device: MetalObjcId,
+        buffer: MetalObjcId,
+        len: usize,
+        resources: Arc<MetalResourceLedger>,
+    ) -> Self {
+        resources.register_buffer(buffer, len, MetalTrackedBufferClass::ResidentExpertWrapper);
+        Self {
+            device: device as usize,
+            buffer: buffer as usize,
+            resources,
+        }
+    }
+
+    fn buffer_for_device(&self, device: MetalObjcId) -> Option<MetalObjcId> {
+        (self.device == device as usize).then_some(self.buffer as MetalObjcId)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalPersistentExpertBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.resources.release_buffer(self.buffer as MetalObjcId);
+            release(self.buffer as MetalObjcId);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default)]
 pub(crate) struct MetalExpertSourceBufferCache {
     entries: Vec<MetalExpertSourceBufferEntry>,
@@ -283,6 +323,7 @@ const METAL_MINIMUM_WORKING_SET_HEADROOM_BYTES: usize = 1024 * 1024 * 1024;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetalTrackedBufferClass {
+    ResidentExpertWrapper,
     ActiveGeneral,
     Pooled,
     TransientExpert,
@@ -322,6 +363,7 @@ struct MetalResourceLedgerState {
     active_general: MetalResourceCounter,
     pooled: MetalResourceCounter,
     transient_expert: MetalResourceCounter,
+    resident_expert_wrapper: MetalResourceCounter,
     resident_dense_bytes: usize,
     recurrent_state_bytes: usize,
     ledger_high_water_bytes: usize,
@@ -351,6 +393,7 @@ impl MetalResourceLedgerState {
             active_general: MetalResourceCounter::default(),
             pooled: MetalResourceCounter::default(),
             transient_expert: MetalResourceCounter::default(),
+            resident_expert_wrapper: MetalResourceCounter::default(),
             resident_dense_bytes: 0,
             recurrent_state_bytes: 0,
             ledger_high_water_bytes: 0,
@@ -379,6 +422,7 @@ impl MetalResourceLedgerState {
             .saturating_add(self.active_general.bytes)
             .saturating_add(self.pooled.bytes)
             .saturating_add(self.transient_expert.bytes)
+            .saturating_add(self.resident_expert_wrapper.bytes)
     }
 
     fn update_ledger_high_water(&mut self) {
@@ -387,6 +431,7 @@ impl MetalResourceLedgerState {
 
     fn counter_mut(&mut self, class: MetalTrackedBufferClass) -> &mut MetalResourceCounter {
         match class {
+            MetalTrackedBufferClass::ResidentExpertWrapper => &mut self.resident_expert_wrapper,
             MetalTrackedBufferClass::ActiveGeneral => &mut self.active_general,
             MetalTrackedBufferClass::Pooled => &mut self.pooled,
             MetalTrackedBufferClass::TransientExpert => &mut self.transient_expert,
@@ -444,6 +489,8 @@ impl MetalResourceLedgerState {
             ledger_high_water_bytes: self.ledger_high_water_bytes,
             resident_dense_bytes: self.resident_dense_bytes,
             recurrent_state_bytes: self.recurrent_state_bytes,
+            resident_expert_wrapper_buffers: self.resident_expert_wrapper.count,
+            resident_expert_wrapper_bytes: self.resident_expert_wrapper.bytes,
             active_general_buffers: self.active_general.count,
             active_general_bytes: self.active_general.bytes,
             pooled_buffers: self.pooled.count,
@@ -3331,7 +3378,12 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
     ) -> anyhow::Result<()> {
         unsafe {
             let source = payload.source;
-            let buffer = self.expert_source_buffer(source.bytes, buffers, source_buffers)?;
+            let buffer = self.expert_source_buffer(
+                source.bytes,
+                source.reusable_bytes,
+                buffers,
+                source_buffers,
+            )?;
             let rows =
                 u32::try_from(payload.rows).context("Metal CMD3 dense expert rows exceed u32")?;
             let cols =
@@ -3371,7 +3423,12 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         source_buffers: &mut MetalExpertSourceBufferCache,
     ) -> anyhow::Result<()> {
         unsafe {
-            let buffer = self.expert_source_buffer(source.bytes, buffers, source_buffers)?;
+            let buffer = self.expert_source_buffer(
+                source.bytes,
+                source.reusable_bytes,
+                buffers,
+                source_buffers,
+            )?;
             let rows = u32::try_from(payload.rows).context("Metal CMD3 expert rows exceed u32")?;
             let cols = u32::try_from(payload.cols).context("Metal CMD3 expert cols exceed u32")?;
             let groups = u32::try_from(payload.cols.div_ceil(payload.group_size).max(1))
@@ -3400,10 +3457,24 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
     unsafe fn expert_source_buffer(
         &self,
         bytes: &[u8],
+        reusable_bytes: Option<&ReusableExpertBytes>,
         buffers: &mut Vec<MetalPhaseBuffer>,
         cache: &mut MetalExpertSourceBufferCache,
     ) -> anyhow::Result<MetalObjcId> {
         if let Some(buffer) = cache.get(bytes) {
+            return Ok(buffer);
+        }
+        if let Some(reusable_bytes) = reusable_bytes
+            && let Some(buffer) = unsafe {
+                persistent_expert_source_buffer(
+                    self.runtime.device,
+                    bytes,
+                    reusable_bytes,
+                    self.buffers.as_ref(),
+                )?
+            }
+        {
+            cache.insert(bytes, buffer);
             return Ok(buffer);
         }
         let phase = unsafe { self.expert_source_phase_buffer(bytes)? };
@@ -7020,6 +7091,36 @@ unsafe fn wrap_expert_slot_as_metal_buffer(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn persistent_expert_source_buffer(
+    device: MetalObjcId,
+    bytes: &[u8],
+    reusable_bytes: &ReusableExpertBytes,
+    buffers: &MetalBufferPool,
+) -> anyhow::Result<Option<MetalObjcId>> {
+    let whole_slot = reusable_bytes.as_slice();
+    if whole_slot.as_ptr() != bytes.as_ptr() || whole_slot.len() != bytes.len() {
+        return Ok(None);
+    }
+    if let Some(attachment) = reusable_bytes.attachment::<MetalPersistentExpertBuffer>() {
+        return Ok(attachment.buffer_for_device(device));
+    }
+    unsafe {
+        buffers.ensure_allocation_capacity(device, bytes.len())?;
+    }
+    let Some(buffer) = (unsafe { wrap_expert_slot_as_metal_buffer(device, bytes) }) else {
+        return Ok(None);
+    };
+    Ok(reusable_bytes
+        .install_attachment(MetalPersistentExpertBuffer::new(
+            device,
+            buffer,
+            bytes.len(),
+            Arc::clone(buffers.resources()),
+        ))
+        .and_then(|attachment| attachment.buffer_for_device(device)))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn wrap_dense_mmap_as_metal_buffer(
     device: MetalObjcId,
     mmap: Arc<memmap2::Mmap>,
@@ -9539,11 +9640,18 @@ mod tests {
             128,
             MetalTrackedBufferClass::TransientExpert,
         );
+        ledger.register_buffer(
+            0x3000usize as MetalObjcId,
+            256,
+            MetalTrackedBufferClass::ResidentExpertWrapper,
+        );
 
         let active = ledger.snapshot();
         assert_eq!(active.active_general_buffers, 1);
         assert_eq!(active.transient_expert_buffers, 1);
-        assert_eq!(active.ledger_live_bytes, 492);
+        assert_eq!(active.resident_expert_wrapper_buffers, 1);
+        assert_eq!(active.resident_expert_wrapper_bytes, 256);
+        assert_eq!(active.ledger_live_bytes, 748);
         assert_eq!(active.driver_high_water_bytes, 2 * gib);
 
         ledger.transition_buffer(0x1000usize as MetalObjcId, MetalTrackedBufferClass::Pooled);
@@ -9552,14 +9660,16 @@ mod tests {
         assert_eq!(pooled.active_general_buffers, 0);
         assert_eq!(pooled.transient_expert_buffers, 0);
         assert_eq!(pooled.pooled_buffers, 1);
-        assert_eq!(pooled.ledger_live_bytes, 364);
+        assert_eq!(pooled.ledger_live_bytes, 620);
 
         ledger.release_buffer(0x1000usize as MetalObjcId);
+        ledger.release_buffer(0x3000usize as MetalObjcId);
         ledger.record_resident_resources(0, 0);
         let released = ledger.snapshot();
         assert_eq!(released.ledger_live_bytes, 0);
         assert_eq!(released.pooled_buffers, 0);
-        assert_eq!(released.ledger_high_water_bytes, 492);
+        assert_eq!(released.resident_expert_wrapper_buffers, 0);
+        assert_eq!(released.ledger_high_water_bytes, 748);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -10909,6 +11019,7 @@ mod tests {
                 packed_offset: 0,
                 scale_offset: 1024,
                 bias_offset: 2048,
+                reusable_bytes: None,
             }),
         }
     }
@@ -12130,6 +12241,50 @@ mod tests {
             );
             assert_eq!(msg_send_usize0(buffer, sel("length")), page_size);
             release(buffer);
+            release(device);
+        });
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn metal_reuses_wrapper_attached_to_page_aligned_expert_slot() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let device = metal_default_device();
+            assert!(!device.is_null());
+            let resources = Arc::new(MetalResourceLedger::from_device(device));
+            let buffers = MetalBufferPool::new(Arc::clone(&resources));
+            let page_size = metal_page_size();
+            let mut scratch = super::super::experts::ReusableExpertBuffer::default();
+            scratch
+                .prepare_payload(page_size, page_size)
+                .unwrap()
+                .fill(0x5a);
+            let bytes = scratch.take_payload();
+
+            let first = persistent_expert_source_buffer(device, &bytes, &bytes, &buffers)
+                .unwrap()
+                .unwrap();
+            let second = persistent_expert_source_buffer(device, &bytes, &bytes, &buffers)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(second, first);
+            assert_eq!(
+                msg_send_ptr0(first, sel("contents")).cast::<u8>(),
+                bytes.as_ptr() as *mut u8
+            );
+            assert_eq!(msg_send_usize0(first, sel("length")), page_size);
+            let attached = resources.snapshot();
+            assert_eq!(attached.resident_expert_wrapper_buffers, 1);
+            assert_eq!(attached.resident_expert_wrapper_bytes, page_size);
+            assert_eq!(attached.active_general_buffers, 0);
+            drop(bytes);
+            let released = resources.snapshot();
+            assert_eq!(released.resident_expert_wrapper_buffers, 0);
+            assert_eq!(released.resident_expert_wrapper_bytes, 0);
+            assert_eq!(released.buffer_releases, 1);
+            drop(buffers);
             release(device);
         });
     }

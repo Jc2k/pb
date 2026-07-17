@@ -5552,6 +5552,7 @@ mod tests {
                 packed_offset: 0,
                 scale_offset: 128,
                 bias_offset: 256,
+                reusable_bytes: None,
             }),
         }
     }

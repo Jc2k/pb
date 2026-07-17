@@ -32,9 +32,11 @@ architectural completion.
 - PBQ4 is an import/build compatibility format, not a runtime execution layout.
 - Production expert execution consumes scheduler-owned reusable whole-expert slots.
 - Fixed whole-expert slots use page-aligned reusable backing. On Apple Silicon, scheduled CMD3
-  wraps completed aligned slots as non-owning shared Metal buffers while the submission retains the
-  slot leases through GPU completion; non-aligned compatibility payloads use copied staging. This
-  handoff does not retain expert identity or introduce an application expert cache.
+  lazily binds one non-owning shared Metal buffer to each backing allocation and reuses that wrapper
+  whenever the identity-free slot returns from the scheduler pool. The submission retains the slot
+  lease through GPU completion, and the wrapper is released before its backing allocation;
+  non-aligned compatibility payloads use copied staging. This handoff does not retain expert
+  identity or introduce an application expert cache.
 - Direct component-buffer execution, upload-heavy reconstruction, and fused-to-unfused substitution
   are unsupported unless each is an explicitly resolved graph-stage implementation.
 - Reference CPU implementations belong in tests, diagnostics, and explicit development tools.
@@ -57,9 +59,11 @@ The Qwen3.5 Q4 implementation must preserve these upstream-shaped properties:
   fixed gate/up/down packed-weight, scale, and bias offsets.
 - Active experts are issued in parallel with positioned reads into scheduler-owned reusable
   whole-expert slots.
-- Page-aligned fixed slots are handed directly to Metal CMD3 under their scheduler leases. Copied
-  staging remains the compatibility path for payloads that cannot satisfy Metal's no-copy memory
-  contract.
+- Page-aligned fixed slots are handed directly to Metal CMD3 under their scheduler leases. Their
+  non-owning Metal wrappers follow backing-allocation lifetime rather than expert identity, avoiding
+  repeated VM wrapper creation while preserving the same positioned-read and lease lifecycle.
+  Copied staging remains the compatibility path for payloads that cannot satisfy Metal's no-copy
+  memory contract.
 - The OS page cache is the expert cache. There is no application expert LRU, LZ4 main path, mmap
   expert read path, broad prefetch, speculative read path, `dispatch_io`, or hidden scheduling
   toggle.
@@ -261,10 +265,10 @@ former MLA-command-then-CMD2 sequence. The deterministic raw output remained `5 
   buffers retain no expert identity and remain within the existing general-buffer bound.
 
 A seventh pass removed the second whole-expert memory copy. Worker `pread` now fills page-aligned
-anonymous reusable slots; Metal CMD3 wraps each completed fixed slot without copying and releases
-the wrapper before the scheduler lease can return its backing to the pool. Non-aligned compatibility
-payloads keep the copied staging path. A real-Metal pointer-identity test verifies that the wrapped
-buffer exposes the original slot address. The deterministic three-token raw output remained `5 2`.
+anonymous reusable slots; Metal CMD3 wraps each completed fixed slot without copying while the
+scheduler lease retains its backing through command completion. Non-aligned compatibility payloads
+keep the copied staging path. A real-Metal pointer-identity test verifies that the wrapped buffer
+exposes the original slot address. The deterministic three-token raw output remained `5 2`.
 
 - Two consecutive detailed runs both decoded at `0.512 tok/s`. The second measured `1.952 s/token`,
   down from the sixth pass's `2.059 s/token` and up from `0.486 tok/s` (5.3%). Expert compute fell
@@ -292,6 +296,31 @@ are unchanged. The deterministic three-token raw output remained `5 2`.
 - Expert I/O was the control: it averaged `1.278 s/token` in both the checkpoint and new runs, with
   the same 12,740,198,400 bytes read per token. The resource ledger also remained at 63 pooled
   buffers and 2,222,752 pooled bytes with no pressure recovery.
+
+A ninth pass made each anonymous scheduler slot own its no-copy Metal wrapper for the lifetime of
+that backing allocation. The wrapper has no layer or expert key, and the scheduler's existing lease
+still prevents a worker from overwriting the slot before GPU completion. Wrapper creation observes
+the Metal working-set limit, is recorded by the resource ledger, and releases the Metal object before
+the host allocation is dropped. Non-aligned compatibility payloads retain copied staging. The
+deterministic three-token raw output remained `5 2`.
+
+- Under a matched physical-I/O regime, the restored eighth-pass control decoded at `0.394 tok/s`
+  (`2.537 s/token`). Two persistent-wrapper runs decoded at `0.422` and `0.417 tok/s`; their mean
+  was `0.420 tok/s` (`2.382 s/token`), a 6.6% throughput increase and 6.1% lower latency.
+- Attention averaged `0.434 s/token` across the two new runs versus `0.580 s/token` in the control,
+  a 25.2% reduction. Expert-command completion fell from `0.012` to `0.009 s/token`, a 29.0%
+  reduction. The savings come from avoiding hundreds of repeated driver/VM wrapper creations and
+  releases per token, not from changing command math or expert bytes.
+- Expert I/O isolated the change: it averaged `1.907 s/token` in the new runs and `1.908 s/token` in
+  the control, with the same 12,740,198,400 bytes read per token. This slower storage regime also
+  explains why these absolute throughput figures are below the eighth pass's warm-cache evidence;
+  the back-to-back comparison, rather than cross-regime tok/s, measures this pass.
+- A final ledger-aware warm-cache run decoded at `0.585 tok/s` (`1.708 s/token`) versus the eighth
+  pass's comparable `0.542 tok/s` (`1.846 s/token`). Expert I/O was effectively identical at `1.279`
+  versus `1.279 s/token`; attention fell from `0.518` to `0.393 s/token`, and expert completion from
+  `0.012` to `0.008 s/token`. The resource snapshot reported exactly eight resident expert wrappers
+  totaling 169,869,312 bytes, zero active or transient buffers, 63 ordinary pooled buffers, and no
+  pressure recovery or resource-limit abort.
 
 ## Scheduled Graph
 

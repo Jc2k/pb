@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(not(unix))]
@@ -9,6 +11,8 @@ use std::io::{Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -44,6 +48,9 @@ pub(crate) const EXPERT_SCALE_BIAS_DTYPE_BF16: &str = "BF16";
 pub(crate) const EXPERT_PACK_SCALE_BIAS_DTYPE: &str = EXPERT_SCALE_BIAS_DTYPE_BF16;
 
 pub struct ReusableExpertBytes {
+    // Attachments must drop before backing because they can contain non-owning views of it.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    attachment: OnceLock<Box<dyn Any + Send + Sync>>,
     backing: ReusableExpertBytesBacking,
     len: usize,
 }
@@ -58,6 +65,7 @@ impl ReusableExpertBytes {
         let mmap = memmap2::MmapMut::map_anon(capacity)
             .context("failed to allocate page-aligned reusable expert buffer")?;
         Ok(Self {
+            attachment: OnceLock::new(),
             backing: ReusableExpertBytesBacking::PageAligned(mmap),
             len: 0,
         })
@@ -84,6 +92,21 @@ impl ReusableExpertBytes {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn attachment<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.attachment.get()?.downcast_ref()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn install_attachment<T: Any + Send + Sync>(&self, attachment: T) -> Option<&T> {
+        if self.attachment.get().is_none() {
+            let _ = self.attachment.set(Box::new(attachment));
+        } else {
+            drop(attachment);
+        }
+        self.attachment()
+    }
+
     fn clear(&mut self) {
         if let ReusableExpertBytesBacking::Heap(bytes) = &mut self.backing {
             bytes.clear();
@@ -105,8 +128,16 @@ impl ReusableExpertBytes {
         Ok(())
     }
 
-    fn into_vec(self) -> Vec<u8> {
-        match self.backing {
+    fn into_vec(mut self) -> Vec<u8> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(attachment) = self.attachment.take() {
+            drop(attachment);
+        }
+        let backing = std::mem::replace(
+            &mut self.backing,
+            ReusableExpertBytesBacking::Heap(Vec::new()),
+        );
+        match backing {
             ReusableExpertBytesBacking::Heap(mut bytes) => {
                 bytes.truncate(self.len);
                 bytes
@@ -126,6 +157,8 @@ impl From<Vec<u8>> for ReusableExpertBytes {
     fn from(bytes: Vec<u8>) -> Self {
         let len = bytes.len();
         Self {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            attachment: OnceLock::new(),
             backing: ReusableExpertBytesBacking::Heap(bytes),
             len,
         }
@@ -3366,6 +3399,7 @@ impl FixedQ4ExpertPayload {
             packed_offset: self.spec.layout.component(weight_kind).offset,
             scale_offset: self.spec.layout.component(scale_kind).offset,
             bias_offset: self.spec.layout.component(bias_kind).offset,
+            reusable_bytes: Some(&self.bytes),
         }
     }
 
@@ -3507,6 +3541,7 @@ impl FixedQ4ExpertPayload {
 pub(crate) struct DenseMatvecSource<'a> {
     pub(crate) bytes: &'a [u8],
     pub(crate) byte_offset: usize,
+    pub(crate) reusable_bytes: Option<&'a ReusableExpertBytes>,
 }
 
 impl DenseMatvecSource<'_> {
@@ -3625,6 +3660,7 @@ impl FixedDenseExpertPayload {
             source: DenseMatvecSource {
                 bytes: &self.bytes,
                 byte_offset: component.offset,
+                reusable_bytes: Some(&self.bytes),
             },
         })
     }
@@ -3879,6 +3915,7 @@ pub(crate) struct Q4MatvecSource<'a> {
     pub(crate) packed_offset: usize,
     pub(crate) scale_offset: usize,
     pub(crate) bias_offset: usize,
+    pub(crate) reusable_bytes: Option<&'a ReusableExpertBytes>,
 }
 
 impl<'a> Q4MatvecSource<'a> {
@@ -6389,6 +6426,45 @@ mod tests {
         ));
         assert_eq!((payload.as_ptr() as usize) % 4096, 0);
         assert_eq!(payload.as_slice(), &[7; 16 * 1024]);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn reusable_expert_attachment_follows_identity_free_pool_slot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropMarker(Arc<AtomicUsize>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let pool: ReusableExpertBytePool = Arc::new(Mutex::new(Vec::new()));
+        let slot_bytes = 16 * 1024;
+        let mut scratch = ReusableExpertBuffer::default();
+        scratch.prepare_payload(slot_bytes, slot_bytes).unwrap();
+        let payload = scratch.take_payload();
+        let initial_ptr = payload.as_ptr();
+        assert!(
+            payload
+                .install_attachment(DropMarker(Arc::clone(&drops)))
+                .is_some()
+        );
+
+        recycle_reusable_expert_bytes(&pool, payload, slot_bytes);
+        let reused = take_reusable_expert_bytes(&pool, slot_bytes).unwrap();
+        assert_eq!(reused.as_ptr(), initial_ptr);
+        assert!(reused.attachment::<DropMarker>().is_some());
+        let previous = scratch.adopt_buffer(reused);
+        assert_eq!(previous.capacity(), 0);
+        scratch.prepare_payload(slot_bytes, slot_bytes).unwrap();
+        assert_eq!(scratch.bytes.as_ptr(), initial_ptr);
+
+        drop(scratch);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
