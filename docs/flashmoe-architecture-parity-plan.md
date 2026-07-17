@@ -110,9 +110,11 @@ graph resolution.
   `unembed_out` tensors; both execute against the same compressed cache without materializing
   per-token keys and values. The capability graph binds MLX's pre-absorbed Q4 multilinear tensors
   to one resident Metal dispatch per projection while retaining CPU causal-score, softmax, and
-  compressed-context reduction. The fused `kv_b_proj` adapter remains on its declared CPU transpose
-  implementation until it has an equivalent resident kernel; runtime probing does not switch
-  between them.
+  compressed-context reduction. The preceding MLX input chain encodes `q_a`, `kv_a`, both projection
+  RMSNorms, and `q_b` in one ordered Metal command. Only the final query and normalized compressed KV
+  return to CPU for rotary/cache work, avoiding the old intermediate `q_a` readback and command
+  boundary. The fused `kv_b_proj` adapter remains on its declared CPU transpose implementation until
+  it has an equivalent resident kernel; runtime probing does not switch between them.
 - Sparse layers select experts with sigmoid scores, `e_score_correction_bias` for selection only,
   top-K over the corrected scores, selected raw sigmoid weights normalized when
   `norm_topk_prob=true`, and `routed_scaling_factor` applied after normalization. Qwen softmax
@@ -158,6 +160,21 @@ about 11 GB/token. FlashMoe already coalesces each selected expert into one posi
 issues the active set in parallel. Colibri's application LRU/hot pinning and speculative lookahead
 remain outside pb's OS-page-cache and non-speculative I/O contract; DSA and MTP remain the larger
 typed follow-ons for reducing attention work or forwards per accepted token.
+
+A second pass on the same date fused the MLX `q_a`/`kv_a`/projection-norm/`q_b` input chain into one
+Metal command. A real-Metal reference test covers distinct Q/KV projections, in-place Q/KV RMSNorm,
+the chained `q_b` projection, and preservation of the non-normalized rotary suffix. The deterministic
+three-token raw output remained `5 2`.
+
+- In a back-to-back checkpoint/new-binary comparison, MLA attention fell from `1.581` to
+  `1.332 s/token`; its CPU setup/miscellaneous bucket fell from `0.246` to `0.004 s/token` while the
+  absorbed-attention kernel stayed flat at `0.486` versus `0.487 s/token`.
+- Observed decode improved from `0.202` to `0.226 tok/s` (`4.946` to `4.421 s/token`). Expert I/O also
+  varied from `1.945` to `1.694 s/token`; holding that unrelated bucket at the checkpoint value gives
+  `4.672 s/token`, or about `0.214 tok/s`. The fused command therefore accounts for roughly a 5.9%
+  end-to-end improvement under equal I/O, while `0.226 tok/s` is the measured whole-run result.
+- A separate run reached `0.248 tok/s` when expert I/O fell to `1.290 s/token`. That is useful evidence
+  for the remaining storage-side opportunity, but is not attributed to the attention change.
 
 ## Scheduled Graph
 

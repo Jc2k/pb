@@ -4504,6 +4504,42 @@ impl DenseStore {
         Ok(outputs)
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn glm_mla_input_projections_with_metal(
+        &self,
+        metal: &MetalExecutionFacade,
+        layer: usize,
+        layout: MlaAttentionLayout,
+        input: MetalBatchProjectionInput<'_>,
+        q_norm_weight: &[f32],
+        kv_norm_weight: &[f32],
+        norm_epsilon: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let q_a_name = attention_tensor_name(layer, "q_a_proj");
+        let kv_a_name = attention_tensor_name(layer, "kv_a_proj_with_mqa");
+        let q_b_name = attention_tensor_name(layer, "q_b_proj");
+        let q_a = self
+            .resident_mmap_projection(&q_a_name, layout.q_lora_rank, input.len())?
+            .with_context(|| format!("missing resident GLM MLA projection {q_a_name}"))?;
+        let kv_a = self
+            .resident_mmap_projection(&kv_a_name, layout.kv_a_width, input.len())?
+            .with_context(|| format!("missing resident GLM MLA projection {kv_a_name}"))?;
+        let q_b = self
+            .resident_mmap_projection(&q_b_name, layout.q_width, layout.q_lora_rank)?
+            .with_context(|| format!("missing resident GLM MLA projection {q_b_name}"))?;
+        metal.resident_glm_mla_input_projection_chain(
+            &q_a,
+            &kv_a,
+            &q_b,
+            input,
+            q_norm_weight,
+            kv_norm_weight,
+            layout.kv_lora_rank,
+            norm_epsilon,
+        )
+    }
+
     fn required_resident_static_tensor(
         &self,
         layer: usize,

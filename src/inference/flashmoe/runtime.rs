@@ -699,6 +699,33 @@ impl MetalExecutionFacade {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resident_glm_mla_input_projection_chain(
+        &self,
+        q_a: &ResidentMmapMatvecProjection,
+        kv_a: &ResidentMmapMatvecProjection,
+        q_b: &ResidentMmapMatvecProjection,
+        input: MetalBatchProjectionInput<'_>,
+        q_norm_weight: &[f32],
+        kv_norm_weight: &[f32],
+        kv_lora_rank: usize,
+        norm_epsilon: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.inner
+            .resident_glm_mla_input_projection_chain(
+                q_a,
+                kv_a,
+                q_b,
+                input,
+                q_norm_weight,
+                kv_norm_weight,
+                kv_lora_rank,
+                norm_epsilon,
+            )?
+            .context("FlashMoe required GLM MLA input projection chain did not resolve")
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(super) fn resident_mmap_matvec_batch_with_input_buffer(
         &self,
         projections: &[ResidentMmapMatvecProjection],
@@ -1525,60 +1552,47 @@ impl FlashMoeEngine {
         mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
     ) -> Result<Vec<f32>> {
         let layout = runtime.mla_attention_layout(layer)?;
-        let q_a_name = attention_tensor_name(layer, "q_a_proj");
-        let kv_a_name = attention_tensor_name(layer, "kv_a_proj_with_mqa");
-        let input_specs = [
-            DenseProjectionRequest::new(&q_a_name, layout.q_lora_rank)?,
-            DenseProjectionRequest::new(&kv_a_name, layout.kv_a_width)?,
-        ];
-        let subphase_started = OptionalInstant::now(attention_buckets.is_some());
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let mut projections = if let Some(input) = deferred_input {
-            self.dense.project_resident_tensors_from_metal_input(
-                &self.metal,
-                &input_specs,
-                input.buffer(),
-                input.len(),
-            )?
-        } else {
-            self.dense
-                .project_resident_tensors_from_cpu_input(&self.metal, &input_specs, normed)?
-        };
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let mut projections: Vec<Vec<f32>> =
-            { bail!("GLM MLA execution requires Apple Silicon Metal projections") };
-        let mut compressed = projections
-            .pop()
-            .context("missing batched MLA kv_a projection")?;
-        let mut q_lora = projections
-            .pop()
-            .context("missing batched MLA q_a projection")?;
-        if let Some(buckets) = attention_buckets.as_deref_mut() {
-            buckets.attention_input_projection += subphase_started.elapsed();
-        }
-
         let subphase_started = OptionalInstant::now(attention_buckets.is_some());
         let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_a_layernorm");
         let q_norm = self
             .model_norm_weight(&q_norm_name, layout.q_lora_rank)?
             .with_context(|| format!("missing GLM MLA norm tensor {q_norm_name}"))?;
-        rms_norm_with_weight_and_epsilon_in_place(
-            &mut q_lora,
-            Some(&q_norm),
-            self.config
-                .glm_mla_norm_epsilon()
-                .context("GLM MLA execution requires its projection-norm epsilon")?,
-        );
-        let q_b_name = attention_tensor_name(layer, "q_b_proj");
-        let mut query = self
-            .dense
-            .project_resident_tensors_from_cpu_input(
+        let kv_norm_name = layer_norm_tensor_name(layer, "self_attn.kv_a_layernorm");
+        let kv_norm = self
+            .model_norm_weight(&kv_norm_name, layout.kv_lora_rank)?
+            .with_context(|| format!("missing GLM MLA norm tensor {kv_norm_name}"))?;
+        let norm_epsilon = self
+            .config
+            .glm_mla_norm_epsilon()
+            .context("GLM MLA execution requires its projection-norm epsilon")?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let (mut query, mut compressed) = {
+            let input = deferred_input
+                .map(|input| MetalBatchProjectionInput::Buffer {
+                    buffer: input.buffer(),
+                    len: input.len(),
+                })
+                .unwrap_or(MetalBatchProjectionInput::Cpu(normed));
+            self.dense.glm_mla_input_projections_with_metal(
                 &self.metal,
-                &[DenseProjectionRequest::new(&q_b_name, layout.q_width)?],
-                &q_lora,
+                layer,
+                layout,
+                input,
+                &q_norm,
+                &kv_norm,
+                norm_epsilon,
             )?
-            .pop()
-            .context("missing MLA q_b projection")?;
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let (mut query, mut compressed): (Vec<f32>, Vec<f32>) = {
+            let _ = (deferred_input, normed, q_norm, kv_norm, norm_epsilon);
+            bail!("GLM MLA execution requires Apple Silicon Metal projections")
+        };
+        if let Some(buckets) = attention_buckets.as_deref_mut() {
+            buckets.attention_input_projection += subphase_started.elapsed();
+        }
+
+        let subphase_started = OptionalInstant::now(attention_buckets.is_some());
         let theta = self.config.rope_theta.unwrap_or(10_000.0);
         for head in 0..layout.num_heads {
             let start = head * layout.qk_head_dim + layout.qk_nope_head_dim;
@@ -1590,17 +1604,6 @@ impl FlashMoeEngine {
             )?;
         }
         let mut rotary_key = compressed.split_off(layout.kv_lora_rank);
-        let kv_norm_name = layer_norm_tensor_name(layer, "self_attn.kv_a_layernorm");
-        let kv_norm = self
-            .model_norm_weight(&kv_norm_name, layout.kv_lora_rank)?
-            .with_context(|| format!("missing GLM MLA norm tensor {kv_norm_name}"))?;
-        rms_norm_with_weight_and_epsilon_in_place(
-            &mut compressed,
-            Some(&kv_norm),
-            self.config
-                .glm_mla_norm_epsilon()
-                .context("GLM MLA execution requires its projection-norm epsilon")?,
-        );
         apply_rotary_interleaved_to_split_half(
             &mut rotary_key,
             rope_position.temporal,

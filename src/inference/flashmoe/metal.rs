@@ -1805,6 +1805,35 @@ impl MetalExecutionContext {
         .execute_with_input_buffer(projections, input_buffer, input_len)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resident_glm_mla_input_projection_chain(
+        &self,
+        q_a: &ResidentMmapMatvecProjection,
+        kv_a: &ResidentMmapMatvecProjection,
+        q_b: &ResidentMmapMatvecProjection,
+        input: MetalBatchProjectionInput<'_>,
+        q_norm_weight: &[f32],
+        kv_norm_weight: &[f32],
+        kv_lora_rank: usize,
+        norm_epsilon: f32,
+    ) -> anyhow::Result<Option<(Vec<f32>, Vec<f32>)>> {
+        MetalResidentProjectionBatchBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.buffers,
+        )
+        .execute_glm_mla_input_projection_chain(
+            q_a,
+            kv_a,
+            q_b,
+            input,
+            q_norm_weight,
+            kv_norm_weight,
+            kv_lora_rank,
+            norm_epsilon,
+        )
+    }
+
     pub(crate) fn resident_q4_multilinear(
         &self,
         projection: &DenseQ4MmapMatvecProjection,
@@ -3978,6 +4007,199 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
 
     fn recycle_or_release_buffers(&self, buffers: &[MetalObjcId], release_only: bool) {
         self.buffers.recycle_or_release(buffers, release_only);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_glm_mla_input_projection_chain(
+        &self,
+        q_a: &ResidentMmapMatvecProjection,
+        kv_a: &ResidentMmapMatvecProjection,
+        q_b: &ResidentMmapMatvecProjection,
+        input: MetalBatchProjectionInput<'_>,
+        q_norm_weight: &[f32],
+        kv_norm_weight: &[f32],
+        kv_lora_rank: usize,
+        norm_epsilon: f32,
+    ) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let input_len = input.len();
+        validate_resident_projection(q_a, input_len, dense_weights.len)?;
+        validate_resident_projection(kv_a, input_len, dense_weights.len)?;
+        validate_resident_projection(q_b, q_a.output_width(), dense_weights.len)?;
+        if q_a.rows() != q_a.output_width()
+            || kv_a.rows() != kv_a.output_width()
+            || q_b.rows() != q_b.output_width()
+            || q_norm_weight.len() != q_a.output_width()
+            || kv_lora_rank == 0
+            || kv_lora_rank > kv_a.output_width()
+            || kv_norm_weight.len() != kv_lora_rank
+            || !norm_epsilon.is_finite()
+            || norm_epsilon <= 0.0
+        {
+            bail!(
+                "GLM MLA fused input projection chain has incompatible shapes q_a={}x{} output={} kv_a={}x{} output={} q_b={}x{} output={} q_norm={} kv_norm={} kv_lora_rank={} epsilon={norm_epsilon}",
+                q_a.rows(),
+                q_a.cols(),
+                q_a.output_width(),
+                kv_a.rows(),
+                kv_a.cols(),
+                kv_a.output_width(),
+                q_b.rows(),
+                q_b.cols(),
+                q_b.output_width(),
+                q_norm_weight.len(),
+                kv_norm_weight.len(),
+                kv_lora_rank,
+            );
+        }
+
+        unsafe {
+            let mut buffers = Vec::with_capacity(6);
+            let input_buffer = match input {
+                MetalBatchProjectionInput::Cpu(values) => self.buffers.tracked_buffer_with_bytes(
+                    self.runtime.device,
+                    f32_as_bytes(values),
+                    &mut buffers,
+                )?,
+                MetalBatchProjectionInput::Buffer { buffer, .. } => buffer,
+            };
+            let q_a_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                q_a.rows() * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let kv_a_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                kv_a.rows() * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let query_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                q_b.rows() * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let q_norm_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(q_norm_weight),
+                &mut buffers,
+            )?;
+            let kv_norm_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(kv_norm_weight),
+                &mut buffers,
+            )?;
+
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Flash-MoE GLM MLA input projection command buffer",
+                "failed to create Flash-MoE GLM MLA input projection compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            let encode_result = (|| -> Result<()> {
+                encode_resident_projection(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    q_a,
+                    input_buffer,
+                    q_a_buffer,
+                    0,
+                )?;
+                encode_resident_projection(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    kv_a,
+                    input_buffer,
+                    kv_a_buffer,
+                    0,
+                )?;
+
+                let q_width = u32::try_from(q_a.output_width())
+                    .context("GLM MLA q_a width does not fit u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.rms_norm_reduced_pipeline,
+                );
+                set_buffer(encoder, q_a_buffer, 0);
+                set_buffer(encoder, q_norm_buffer, 1);
+                set_buffer(encoder, q_a_buffer, 2);
+                set_bytes(encoder, u32_as_bytes(&q_width), 3);
+                set_bytes(
+                    encoder,
+                    f32_as_bytes(std::slice::from_ref(&norm_epsilon)),
+                    4,
+                );
+                dispatch_single_threadgroup(encoder, 256);
+
+                let kv_width =
+                    u32::try_from(kv_lora_rank).context("GLM MLA KV LoRA rank does not fit u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.rms_norm_reduced_pipeline,
+                );
+                set_buffer(encoder, kv_a_buffer, 0);
+                set_buffer(encoder, kv_norm_buffer, 1);
+                set_buffer(encoder, kv_a_buffer, 2);
+                set_bytes(encoder, u32_as_bytes(&kv_width), 3);
+                set_bytes(
+                    encoder,
+                    f32_as_bytes(std::slice::from_ref(&norm_epsilon)),
+                    4,
+                );
+                dispatch_single_threadgroup(encoder, 256);
+
+                encode_resident_projection(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    q_b,
+                    q_a_buffer,
+                    query_buffer,
+                    0,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = encode_result {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, true);
+                return Err(error);
+            }
+            encoding.end_encoding();
+
+            let context = MetalCommandContext::new("glm_mla_input_projection_chain")
+                .with("input_len", input_len)
+                .with("q_a", q_a.tensor_name())
+                .with("kv_a", kv_a.tensor_name())
+                .with("q_b", q_b.tensor_name())
+                .with("q_width", q_b.output_width())
+                .with("kv_width", kv_a.output_width());
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            let query = read_f32_buffer(query_buffer, q_b.output_width());
+            let compressed = read_f32_buffer(kv_a_buffer, kv_a.output_width());
+            drop(encoding);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some((query, compressed)))
+        }
     }
 
     pub(crate) fn execute_q4_multilinear(
@@ -9702,6 +9924,113 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn resident_glm_mla_input_projection_chain_matches_reference() {
+        fn write_q4_projection(
+            mmap: &mut [u8],
+            offset: &mut usize,
+            name: &str,
+            rows: usize,
+            cols: usize,
+            nibble: impl Fn(usize) -> u8,
+        ) -> ResidentMmapMatvecProjection {
+            let packed_byte_offset = *offset;
+            let packed_bytes = rows * cols.div_ceil(2);
+            for row in 0..rows {
+                let value = nibble(row) & 0x0f;
+                mmap[packed_byte_offset + row * cols.div_ceil(2)
+                    ..packed_byte_offset + (row + 1) * cols.div_ceil(2)]
+                    .fill(value | (value << 4));
+            }
+            let scales_byte_offset = packed_byte_offset + packed_bytes;
+            for row in 0..rows {
+                mmap[scales_byte_offset + row * 2..scales_byte_offset + row * 2 + 2]
+                    .copy_from_slice(&0x3f80u16.to_le_bytes());
+            }
+            let biases_byte_offset = scales_byte_offset + rows * 2;
+            mmap[biases_byte_offset..biases_byte_offset + rows * 2].fill(0);
+            *offset = biases_byte_offset + rows * 2;
+            ResidentMmapMatvecProjection::Q4(DenseQ4MmapMatvecProjection {
+                tensor_name: name.to_string(),
+                packed_byte_offset: packed_byte_offset as u64,
+                scales_byte_offset: scales_byte_offset as u64,
+                biases_byte_offset: biases_byte_offset as u64,
+                rows,
+                cols,
+                output_width: rows,
+                row_packed_bytes: cols.div_ceil(2),
+                groups_per_row: 1,
+                group_size: cols,
+                scale_bias_dtype: "BF16".to_string(),
+            })
+        }
+
+        let input = (1..=8).map(|value| value as f32).collect::<Vec<_>>();
+        let mut mmap = memmap2::MmapMut::map_anon(16 * 1024).unwrap();
+        let mut offset = 0usize;
+        let q_a = write_q4_projection(&mut mmap, &mut offset, "q_a", 16, 8, |row| {
+            (row % 7 + 1) as u8
+        });
+        let kv_a = write_q4_projection(&mut mmap, &mut offset, "kv_a", 16, 8, |row| {
+            (row % 5 + 1) as u8
+        });
+        let q_b = write_q4_projection(&mut mmap, &mut offset, "q_b", 16, 16, |_| 1);
+        let mmap = Arc::new(mmap.make_read_only().unwrap());
+        let context = MetalExecutionContext::compile(mmap, 16 * 1024, &[], 1e-6).unwrap();
+        let q_norm = vec![1.0; 16];
+        let kv_norm = vec![1.0; 8];
+        let (query, compressed) = context
+            .resident_glm_mla_input_projection_chain(
+                &q_a,
+                &kv_a,
+                &q_b,
+                MetalBatchProjectionInput::Cpu(&input),
+                &q_norm,
+                &kv_norm,
+                8,
+                1e-6,
+            )
+            .unwrap()
+            .unwrap();
+
+        let input_sum = input.iter().sum::<f32>();
+        let mut q_a_reference = (0..16)
+            .map(|row| (row % 7 + 1) as f32 * input_sum)
+            .collect::<Vec<_>>();
+        let q_scale = (q_a_reference.iter().map(|value| value * value).sum::<f32>()
+            / q_a_reference.len() as f32
+            + 1e-6)
+            .sqrt()
+            .recip();
+        for value in &mut q_a_reference {
+            *value *= q_scale;
+        }
+        let expected_query = vec![q_a_reference.iter().sum::<f32>(); 16];
+        for (actual, expected) in query.iter().zip(expected_query) {
+            assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+        }
+
+        let mut expected_compressed = (0..16)
+            .map(|row| (row % 5 + 1) as f32 * input_sum)
+            .collect::<Vec<_>>();
+        let kv_scale = (expected_compressed[..8]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            / 8.0
+            + 1e-6)
+            .sqrt()
+            .recip();
+        for value in &mut expected_compressed[..8] {
+            *value *= kv_scale;
+        }
+        for (actual, expected) in compressed.iter().zip(expected_compressed) {
+            assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
