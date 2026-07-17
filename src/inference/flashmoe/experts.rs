@@ -30,7 +30,7 @@ use super::weights::{
     write_mlx_mxfp4_affine_tensor,
 };
 
-pub type ReusableExpertBytePool = Arc<Mutex<Vec<Vec<u8>>>>;
+pub type ReusableExpertBytePool = Arc<Mutex<Vec<ReusableExpertBytes>>>;
 
 const FIXED_Q4_EXPERT_BUFFER_POOL_LIMIT: usize = ACTIVE_EXPERTS_PER_TOKEN * 4;
 pub(crate) const PBQ4_EXPERT_MAGIC: &[u8] = b"PBQ4EXPERT ";
@@ -42,6 +42,137 @@ const EXPERT_COMPONENT_ALIGNMENT: usize = 4096;
 pub(crate) const EXPERT_SCALE_BIAS_DTYPE_F32: &str = "F32";
 pub(crate) const EXPERT_SCALE_BIAS_DTYPE_BF16: &str = "BF16";
 pub(crate) const EXPERT_PACK_SCALE_BIAS_DTYPE: &str = EXPERT_SCALE_BIAS_DTYPE_BF16;
+
+pub struct ReusableExpertBytes {
+    backing: ReusableExpertBytesBacking,
+    len: usize,
+}
+
+enum ReusableExpertBytesBacking {
+    Heap(Vec<u8>),
+    PageAligned(memmap2::MmapMut),
+}
+
+impl ReusableExpertBytes {
+    fn page_aligned(capacity: usize) -> Result<Self> {
+        let mmap = memmap2::MmapMut::map_anon(capacity)
+            .context("failed to allocate page-aligned reusable expert buffer")?;
+        Ok(Self {
+            backing: ReusableExpertBytesBacking::PageAligned(mmap),
+            len: 0,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.backing {
+            ReusableExpertBytesBacking::Heap(bytes) => &bytes[..self.len],
+            ReusableExpertBytesBacking::PageAligned(bytes) => &bytes[..self.len],
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match &mut self.backing {
+            ReusableExpertBytesBacking::Heap(bytes) => &mut bytes[..self.len],
+            ReusableExpertBytesBacking::PageAligned(bytes) => &mut bytes[..self.len],
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        match &self.backing {
+            ReusableExpertBytesBacking::Heap(bytes) => bytes.capacity(),
+            ReusableExpertBytesBacking::PageAligned(bytes) => bytes.len(),
+        }
+    }
+
+    fn clear(&mut self) {
+        if let ReusableExpertBytesBacking::Heap(bytes) = &mut self.backing {
+            bytes.clear();
+        }
+        self.len = 0;
+    }
+
+    fn resize_zeroed(&mut self, len: usize) -> Result<()> {
+        if len > self.capacity() {
+            bail!(
+                "reusable expert buffer length {len} exceeds capacity {}",
+                self.capacity()
+            );
+        }
+        if let ReusableExpertBytesBacking::Heap(bytes) = &mut self.backing {
+            bytes.resize(len, 0);
+        }
+        self.len = len;
+        Ok(())
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self.backing {
+            ReusableExpertBytesBacking::Heap(mut bytes) => {
+                bytes.truncate(self.len);
+                bytes
+            }
+            ReusableExpertBytesBacking::PageAligned(bytes) => bytes[..self.len].to_vec(),
+        }
+    }
+}
+
+impl Default for ReusableExpertBytes {
+    fn default() -> Self {
+        Self::from(Vec::new())
+    }
+}
+
+impl From<Vec<u8>> for ReusableExpertBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        Self {
+            backing: ReusableExpertBytesBacking::Heap(bytes),
+            len,
+        }
+    }
+}
+
+impl Clone for ReusableExpertBytes {
+    fn clone(&self) -> Self {
+        Self::from(self.as_slice().to_vec())
+    }
+}
+
+impl std::fmt::Debug for ReusableExpertBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReusableExpertBytes")
+            .field("len", &self.len)
+            .field("capacity", &self.capacity())
+            .field(
+                "page_aligned",
+                &matches!(self.backing, ReusableExpertBytesBacking::PageAligned(_)),
+            )
+            .finish()
+    }
+}
+
+impl PartialEq for ReusableExpertBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl PartialEq<Vec<u8>> for ReusableExpertBytes {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for ReusableExpertBytes {}
+
+impl std::ops::Deref for ReusableExpertBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpertReadPath {
@@ -2795,7 +2926,7 @@ impl ExpertLayerReader {
             scratch.slot_view(self.metadata.layer, expert, plan.offset, plan.slot_capacity)?;
         let descriptor = slot.descriptor();
         let payload = if slot.payload().starts_with(PBQ4_EXPERT_MAGIC) {
-            ExpertRawPayload::Pbq4(scratch.take_payload())
+            ExpertRawPayload::Pbq4(scratch.take_payload().into_vec())
         } else {
             match self.slot_spec {
                 ExpertSlotSpec::FixedQ4(spec) => {
@@ -2805,14 +2936,14 @@ impl ExpertLayerReader {
                             self.path.display()
                         )
                     })?;
-                    ExpertRawPayload::FixedQ4(FixedQ4ExpertPayload::from_whole_slot(
+                    ExpertRawPayload::FixedQ4(FixedQ4ExpertPayload::from_reusable_whole_slot(
                         spec,
                         scratch.take_payload(),
                         Some(Arc::clone(&self.buffer_pool)),
                     )?)
                 }
                 ExpertSlotSpec::FixedDense(spec) => {
-                    ExpertRawPayload::FixedDense(FixedDenseExpertPayload::from_whole_slot(
+                    ExpertRawPayload::FixedDense(FixedDenseExpertPayload::from_reusable_whole_slot(
                         spec,
                         scratch.take_payload(),
                         Some(Arc::clone(&self.buffer_pool)),
@@ -3153,7 +3284,7 @@ impl ExpertSlotSpec {
 #[derive(Debug)]
 pub(crate) struct FixedQ4ExpertPayload {
     pub(crate) spec: FixedQ4ExpertSlotSpec,
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) bytes: ReusableExpertBytes,
     pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
 }
 
@@ -3186,9 +3317,18 @@ impl Drop for FixedQ4ExpertPayload {
 }
 
 impl FixedQ4ExpertPayload {
+    #[cfg(test)]
     pub(crate) fn from_whole_slot(
         spec: FixedQ4ExpertSlotSpec,
         bytes: Vec<u8>,
+        recycle_pool: Option<ReusableExpertBytePool>,
+    ) -> Result<Self> {
+        Self::from_reusable_whole_slot(spec, bytes.into(), recycle_pool)
+    }
+
+    fn from_reusable_whole_slot(
+        spec: FixedQ4ExpertSlotSpec,
+        bytes: ReusableExpertBytes,
         recycle_pool: Option<ReusableExpertBytePool>,
     ) -> Result<Self> {
         if bytes.len() < spec.layout.expert_bytes {
@@ -3386,7 +3526,7 @@ pub(crate) struct DenseMatvecPayload<'a> {
 #[derive(Debug)]
 pub(crate) struct FixedDenseExpertPayload {
     pub(crate) spec: FixedDenseExpertSlotSpec,
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) bytes: ReusableExpertBytes,
     pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
 }
 
@@ -3421,9 +3561,18 @@ impl Drop for FixedDenseExpertPayload {
 }
 
 impl FixedDenseExpertPayload {
+    #[cfg(test)]
     pub(crate) fn from_whole_slot(
         spec: FixedDenseExpertSlotSpec,
         bytes: Vec<u8>,
+        recycle_pool: Option<ReusableExpertBytePool>,
+    ) -> Result<Self> {
+        Self::from_reusable_whole_slot(spec, bytes.into(), recycle_pool)
+    }
+
+    fn from_reusable_whole_slot(
+        spec: FixedDenseExpertSlotSpec,
+        bytes: ReusableExpertBytes,
         recycle_pool: Option<ReusableExpertBytePool>,
     ) -> Result<Self> {
         if bytes.len() < spec.expert_bytes {
@@ -3776,7 +3925,7 @@ pub(crate) fn decode_fixed_q4_bf16_component_bytes(bytes: &[u8]) -> Result<Vec<f
 pub fn take_reusable_expert_bytes(
     pool: &ReusableExpertBytePool,
     min_capacity: usize,
-) -> Option<Vec<u8>> {
+) -> Option<ReusableExpertBytes> {
     let mut pool = pool.lock().expect("fixed Q4 expert byte pool poisoned");
     let index = pool
         .iter()
@@ -3786,9 +3935,10 @@ pub fn take_reusable_expert_bytes(
 
 pub fn recycle_reusable_expert_bytes(
     pool: &ReusableExpertBytePool,
-    mut bytes: Vec<u8>,
+    bytes: impl Into<ReusableExpertBytes>,
     min_capacity: usize,
 ) {
+    let mut bytes = bytes.into();
     if bytes.capacity() < min_capacity {
         return;
     }
@@ -3899,7 +4049,7 @@ impl<'a> FixedQ4ExpertSlotView<'a> {
 
 #[derive(Debug, Default)]
 pub struct ReusableExpertBuffer {
-    bytes: Vec<u8>,
+    bytes: ReusableExpertBytes,
 }
 
 impl ReusableExpertBuffer {
@@ -3912,12 +4062,18 @@ impl ReusableExpertBuffer {
             bail!("expert payload length {payload_len} exceeds slot capacity {slot_capacity}");
         }
         if self.bytes.capacity() < slot_capacity {
-            self.bytes
-                .try_reserve_exact(slot_capacity - self.bytes.capacity())
-                .context("failed to reserve reusable expert buffer")?;
+            self.bytes = if payload_len == slot_capacity && slot_capacity > 0 {
+                ReusableExpertBytes::page_aligned(slot_capacity)?
+            } else {
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(slot_capacity)
+                    .context("failed to reserve reusable expert buffer")?;
+                ReusableExpertBytes::from(bytes)
+            };
         }
-        self.bytes.resize(payload_len, 0);
-        Ok(&mut self.bytes)
+        self.bytes.resize_zeroed(payload_len)?;
+        Ok(self.bytes.as_mut_slice())
     }
 
     pub fn slot_view(
@@ -3927,10 +4083,16 @@ impl ReusableExpertBuffer {
         slot_offset: u64,
         slot_capacity: usize,
     ) -> Result<ExpertSlotView<'_>> {
-        ExpertSlotView::new(layer, expert, slot_offset, slot_capacity, &self.bytes)
+        ExpertSlotView::new(
+            layer,
+            expert,
+            slot_offset,
+            slot_capacity,
+            self.bytes.as_slice(),
+        )
     }
 
-    pub fn take_payload(&mut self) -> Vec<u8> {
+    pub fn take_payload(&mut self) -> ReusableExpertBytes {
         std::mem::take(&mut self.bytes)
     }
 
@@ -3938,7 +4100,7 @@ impl ReusableExpertBuffer {
         self.bytes.capacity()
     }
 
-    pub fn adopt_buffer(&mut self, mut bytes: Vec<u8>) -> Vec<u8> {
+    pub fn adopt_buffer(&mut self, mut bytes: ReusableExpertBytes) -> ReusableExpertBytes {
         bytes.clear();
         std::mem::replace(&mut self.bytes, bytes)
     }
@@ -6211,6 +6373,25 @@ mod tests {
     }
 
     #[test]
+    fn reusable_expert_buffer_uses_page_aligned_backing_for_a_whole_slot() {
+        let mut buffer = ReusableExpertBuffer::default();
+        let slot_bytes = 16 * 1024;
+        buffer
+            .prepare_payload(slot_bytes, slot_bytes)
+            .unwrap()
+            .fill(7);
+
+        let payload = buffer.take_payload();
+
+        assert!(matches!(
+            &payload.backing,
+            ReusableExpertBytesBacking::PageAligned(_)
+        ));
+        assert_eq!((payload.as_ptr() as usize) % 4096, 0);
+        assert_eq!(payload.as_slice(), &[7; 16 * 1024]);
+    }
+
+    #[test]
     fn fixed_q4_expert_slot_view_slices_components_from_one_payload() {
         let payload: Vec<u8> = (0..45).collect();
         let slot = ExpertSlotView::new(4, 7, 4096, 45, &payload).unwrap();
@@ -6930,7 +7111,7 @@ mod tests {
         {
             let _payload = FixedQ4ExpertPayload {
                 spec,
-                bytes,
+                bytes: bytes.into(),
                 recycle_pool: Some(Arc::clone(&pool)),
             };
         }

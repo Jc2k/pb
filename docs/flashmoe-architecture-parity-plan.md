@@ -31,6 +31,10 @@ architectural completion.
   through typed layouts and leave the scheduler, state lifecycle, and command topology unchanged.
 - PBQ4 is an import/build compatibility format, not a runtime execution layout.
 - Production expert execution consumes scheduler-owned reusable whole-expert slots.
+- Fixed whole-expert slots use page-aligned reusable backing. On Apple Silicon, scheduled CMD3
+  wraps completed aligned slots as non-owning shared Metal buffers while the submission retains the
+  slot leases through GPU completion; non-aligned compatibility payloads use copied staging. This
+  handoff does not retain expert identity or introduce an application expert cache.
 - Direct component-buffer execution, upload-heavy reconstruction, and fused-to-unfused substitution
   are unsupported unless each is an explicitly resolved graph-stage implementation.
 - Reference CPU implementations belong in tests, diagnostics, and explicit development tools.
@@ -51,6 +55,9 @@ The Qwen3.5 Q4 implementation must preserve these upstream-shaped properties:
   fixed gate/up/down packed-weight, scale, and bias offsets.
 - Active experts are issued in parallel with positioned reads into scheduler-owned reusable
   whole-expert slots.
+- Page-aligned fixed slots are handed directly to Metal CMD3 under their scheduler leases. Copied
+  staging remains the compatibility path for payloads that cannot satisfy Metal's no-copy memory
+  contract.
 - The OS page cache is the expert cache. There is no application expert LRU, LZ4 main path, mmap
   expert read path, broad prefetch, speculative read path, `dispatch_io`, or hidden scheduling
   toggle.
@@ -251,6 +258,24 @@ former MLA-command-then-CMD2 sequence. The deterministic raw output remained `5 
   buffers, 71 allocations, 30,487 reuses, and no pressure recovery. The five additional small pooled
   buffers retain no expert identity and remain within the existing general-buffer bound.
 
+A seventh pass removed the second whole-expert memory copy. Worker `pread` now fills page-aligned
+anonymous reusable slots; Metal CMD3 wraps each completed fixed slot without copying and releases
+the wrapper before the scheduler lease can return its backing to the pool. Non-aligned compatibility
+payloads keep the copied staging path. A real-Metal pointer-identity test verifies that the wrapped
+buffer exposes the original slot address. The deterministic three-token raw output remained `5 2`.
+
+- Two consecutive detailed runs both decoded at `0.512 tok/s`. The second measured `1.952 s/token`,
+  down from the sixth pass's `2.059 s/token` and up from `0.486 tok/s` (5.3%). Expert compute fell
+  from about `0.193` to `0.027 s/token`; expert I/O measured `1.277` versus `1.308 s/token`, while
+  the enclosing attention bucket varied from `0.512` to `0.603 s/token`.
+- Holding the sixth pass's non-expert buckets constant, the removed copy is worth about
+  `0.166 s/token`, implying `1.893 s/token` or `0.528 tok/s`. The smaller measured whole-run gain is
+  consistent with the opposing attention variation rather than residual expert staging work.
+- The resource ledger fell from 71 pooled buffers and 172,092,064 pooled bytes to 63 buffers and
+  2,222,752 bytes, with zero transient expert buffers, 63 allocations, 26,895 reuses, and no
+  pressure recovery. The missing eight 21,233,664-byte allocations are exactly the former K=8 GLM
+  staging set; the scheduler's reusable host slots retain no expert identity.
+
 ## Scheduled Graph
 
 Every supported variant resolves the same conceptual stages:
@@ -444,15 +469,17 @@ Baseline reviewed on 2026-07-11:
   creation and its later completion/status polling each run inside a nested autorelease pool. The
   completion pool drains Metal's committed-command auxiliaries at the layer boundary instead of
   leaving their expert-buffer references alive until the outer token autorelease pool drains.
-  Scheduler `pread` expert payloads are copied into transient Metal staging buffers for only the
-  active expert slots. Successful commands return those allocations to a separate, bounded
-  16-buffer staging pool; every checkout overwrites the whole payload, the pool carries no
-  layer/expert key, and it is not an application expert cache. It cannot enter or evict the general
-  reusable pool. Error cleanup and working-set pressure still mark staging resources purgeable-empty
-  and release them. A long-prefill VM profile showed that unbounded ordinary release left one
-  2,654,208-byte IOAccelerator mapping per expert projection binding; separating and bounding the
-  staging pool limits that mapping set to reusable active-slot capacity while preserving explicit
-  purge on eviction and pressure recovery.
+  Scheduler `pread` expert payloads use page-aligned reusable whole-slot storage. Scheduled CMD3
+  wraps aligned fixed slots as non-owning shared Metal buffers; its submission owns the slot leases
+  until the command completes and releases the wrappers before the bytes return to the worker pool.
+  Non-aligned compatibility payloads are copied into transient Metal staging buffers. Successful
+  copied commands return those allocations to a separate, bounded 16-buffer staging pool; every
+  checkout overwrites the whole payload, the pool carries no layer/expert key, and it is not an
+  application expert cache. It cannot enter or evict the general reusable pool. Error cleanup and
+  working-set pressure still mark copied staging resources purgeable-empty and release them. A
+  long-prefill VM profile showed that unbounded ordinary release left one 2,654,208-byte
+  IOAccelerator mapping per expert projection binding; separating and bounding the copied fallback
+  limits that mapping set while the aligned path avoids the second whole-expert memory copy.
   The session cache removes a non-prefix-matching entry before allocating the replacement KV cache.
   Harness workflow stages intentionally share a logical session id while changing their system
   prompts, so stale planning/review state cannot remain resident throughout a fresh stage prefill

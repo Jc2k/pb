@@ -969,18 +969,24 @@ impl MetalBufferPool {
         self.resources.record_phase_cleanup(buffers.len());
         unsafe {
             for buffer in buffers {
-                if buffer.class == MetalPhaseBufferClass::TransientExpert {
-                    if release_only {
-                        self.resources.release_buffer(buffer.id);
-                        purge_and_release_metal_buffer(buffer.id);
-                    } else {
-                        self.recycle_expert_staging(buffer.id);
+                match buffer.class {
+                    MetalPhaseBufferClass::BorrowedExpert => release(buffer.id),
+                    MetalPhaseBufferClass::TransientExpert => {
+                        if release_only {
+                            self.resources.release_buffer(buffer.id);
+                            purge_and_release_metal_buffer(buffer.id);
+                        } else {
+                            self.recycle_expert_staging(buffer.id);
+                        }
                     }
-                } else if release_only {
-                    self.resources.release_buffer(buffer.id);
-                    release(buffer.id);
-                } else {
-                    self.recycle(buffer.id);
+                    MetalPhaseBufferClass::General => {
+                        if release_only {
+                            self.resources.release_buffer(buffer.id);
+                            release(buffer.id);
+                        } else {
+                            self.recycle(buffer.id);
+                        }
+                    }
                 }
             }
         }
@@ -3400,15 +3406,18 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         if let Some(buffer) = cache.get(bytes) {
             return Ok(buffer);
         }
-        let phase = unsafe { self.copied_expert_source_buffer(bytes)? };
+        let phase = unsafe { self.expert_source_phase_buffer(bytes)? };
         let buffer = phase.id;
         buffers.push(phase);
         cache.insert(bytes, buffer);
         Ok(buffer)
     }
 
-    unsafe fn copied_expert_source_buffer(&self, bytes: &[u8]) -> anyhow::Result<MetalPhaseBuffer> {
+    unsafe fn expert_source_phase_buffer(&self, bytes: &[u8]) -> anyhow::Result<MetalPhaseBuffer> {
         unsafe {
+            if let Some(buffer) = wrap_expert_slot_as_metal_buffer(self.runtime.device, bytes) {
+                return Ok(MetalPhaseBuffer::borrowed_expert(buffer));
+            }
             let buffer = self
                 .buffers
                 .transient_expert_buffer_with_bytes(self.runtime.device, bytes)?;
@@ -6827,6 +6836,7 @@ impl MetalCmd3ExecutionPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetalPhaseBufferClass {
     General,
+    BorrowedExpert,
     TransientExpert,
 }
 
@@ -6850,6 +6860,13 @@ impl MetalPhaseBuffer {
         Self {
             id,
             class: MetalPhaseBufferClass::TransientExpert,
+        }
+    }
+
+    pub(crate) fn borrowed_expert(id: MetalObjcId) -> Self {
+        Self {
+            id,
+            class: MetalPhaseBufferClass::BorrowedExpert,
         }
     }
 }
@@ -6973,6 +6990,32 @@ fn metal_page_size() -> usize {
         } else {
             16 * 1024
         }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn wrap_expert_slot_as_metal_buffer(
+    device: MetalObjcId,
+    bytes: &[u8],
+) -> Option<MetalObjcId> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let page_size = metal_page_size();
+    let ptr = bytes.as_ptr() as *mut c_void;
+    if (ptr as usize) % page_size != 0 || bytes.len() % page_size != 0 {
+        return None;
+    }
+    unsafe {
+        let buffer = msg_send_id4_ptr_usize_u64_ptr(
+            device,
+            sel("newBufferWithBytesNoCopy:length:options:deallocator:"),
+            ptr,
+            bytes.len(),
+            0,
+            ptr::null_mut(),
+        );
+        (!buffer.is_null()).then_some(buffer)
     }
 }
 
@@ -12062,5 +12105,32 @@ mod tests {
         let expert = MetalPhaseBuffer::transient_expert(id);
         assert_eq!(expert.id, id);
         assert_eq!(expert.class, MetalPhaseBufferClass::TransientExpert);
+
+        let borrowed = MetalPhaseBuffer::borrowed_expert(id);
+        assert_eq!(borrowed.id, id);
+        assert_eq!(borrowed.class, MetalPhaseBufferClass::BorrowedExpert);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn metal_wraps_page_aligned_expert_slot_without_copying() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let device = metal_default_device();
+            assert!(!device.is_null());
+            let page_size = metal_page_size();
+            let mut bytes = memmap2::MmapMut::map_anon(page_size).unwrap();
+            bytes.fill(0x5a);
+
+            let buffer = wrap_expert_slot_as_metal_buffer(device, &bytes).unwrap();
+
+            assert_eq!(
+                msg_send_ptr0(buffer, sel("contents")).cast::<u8>(),
+                bytes.as_mut_ptr()
+            );
+            assert_eq!(msg_send_usize0(buffer, sel("length")), page_size);
+            release(buffer);
+            release(device);
+        });
     }
 }
