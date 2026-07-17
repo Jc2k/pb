@@ -42,6 +42,8 @@ architectural completion.
   in the same ownership slice to move its owner.
 - If an architecture-aligned change makes `2+2=` or a parity fixture wrong, debug math, logits, and
   state through the unified path. Do not restore the old architecture to hide the error.
+- Synchronous Metal completion retains the bounded timeout and terminal-status diagnostics while
+  polling finely enough that host-side wait granularity does not become a per-layer decode stage.
 
 ## Upstream Parity Contract
 
@@ -275,6 +277,21 @@ buffer exposes the original slot address. The deterministic three-token raw outp
   2,222,752 bytes, with zero transient expert buffers, 63 allocations, 26,895 reuses, and no
   pressure recovery. The missing eight 21,233,664-byte allocations are exactly the former K=8 GLM
   staging set; the scheduler's reusable host slots retain no expert identity.
+
+An eighth pass reduced synchronous Metal command-status polling from 2 ms to 100 us while retaining
+the 120-second timeout, terminal-status validation, and detailed Metal error reporting. This changes
+only host completion granularity: command construction, GPU work, state ownership, and model math
+are unchanged. The deterministic three-token raw output remained `5 2`.
+
+- Two consecutive detailed runs decoded at `0.549` and `0.542 tok/s`, up from the seventh pass's
+  repeated `0.512 tok/s`. Their mean `1.833 s/token` is 6.1% below the `1.952 s/token` checkpoint.
+- Resident attention averaged `0.509 s/token` across the two new runs versus `0.603 s/token` in the
+  checkpoint, a 15.6% reduction. Expert-command completion averaged `0.012 s/token` versus
+  `0.027 s/token`, a 54.4% reduction. Both buckets previously accumulated one coarse polling sleep
+  at many layer boundaries rather than measuring additional GPU work.
+- Expert I/O was the control: it averaged `1.278 s/token` in both the checkpoint and new runs, with
+  the same 12,740,198,400 bytes read per token. The resource ledger also remained at 63 pooled
+  buffers and 2,222,752 pooled bytes with no pressure recovery.
 
 ## Scheduled Graph
 

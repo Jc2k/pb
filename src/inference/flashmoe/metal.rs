@@ -1112,7 +1112,7 @@ impl MetalDispatchPlan {
 }
 
 const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
-const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_micros(100);
 
 pub(crate) mod kernels {
     pub(crate) const Q4_FMA_MATVEC: &str = "q4_fma_matvec";
@@ -9681,7 +9681,7 @@ mod tests {
     fn command_wait_policy_uses_upstream_shaped_timeout_defaults() {
         let policy = MetalCommandWaitPolicy::default();
         assert_eq!(policy.timeout, Duration::from_secs(120));
-        assert_eq!(policy.poll_interval, Duration::from_millis(2));
+        assert_eq!(policy.poll_interval, Duration::from_micros(100));
     }
 
     #[test]
