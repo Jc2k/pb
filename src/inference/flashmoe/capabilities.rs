@@ -95,7 +95,7 @@ pub enum FlashMoeStageImplementation {
     MetalResidentQ4AttentionProjections,
     QwenFullAttentionCpuKv,
     GlmMlaCpuWeightAbsorption,
-    GlmMlaMetalQ4MultilinearCpuReduction,
+    GlmMlaMetalQ4AbsorbedAttention,
     MetalResidentPostAttention,
     CpuSoftmaxTopK,
     CpuSigmoidNoAuxTopK,
@@ -116,8 +116,8 @@ impl FlashMoeStageImplementation {
             Self::MetalResidentQ4AttentionProjections => "Metal resident-Q4 attention projections",
             Self::QwenFullAttentionCpuKv => "Qwen full-attention CPU KV implementation",
             Self::GlmMlaCpuWeightAbsorption => "GLM compressed-KV MLA with CPU weight absorption",
-            Self::GlmMlaMetalQ4MultilinearCpuReduction => {
-                "GLM compressed-KV MLA with Metal resident-Q4 multilinear and CPU causal reduction"
+            Self::GlmMlaMetalQ4AbsorbedAttention => {
+                "GLM compressed-KV MLA with Metal resident-Q4 absorbed attention"
             }
             Self::MetalResidentPostAttention => {
                 "Metal resident Q4/BF16/F16/F32 post-attention and router projection"
@@ -141,7 +141,7 @@ impl FlashMoeStageImplementation {
 pub(crate) enum FlashMoeAttentionMathCapability {
     QwenFullAttentionCpuKv,
     GlmMlaCpuWeightAbsorption,
-    GlmMlaMetalQ4MultilinearCpuReduction,
+    GlmMlaMetalQ4AbsorbedAttention,
 }
 
 impl fmt::Display for FlashMoeStageImplementation {
@@ -384,7 +384,7 @@ impl FlashMoeCapabilityPlan {
                     FlashMoeStageImplementation::GlmMlaCpuWeightAbsorption,
                 )
             }
-            FlashMoeAttentionMathCapability::GlmMlaMetalQ4MultilinearCpuReduction
+            FlashMoeAttentionMathCapability::GlmMlaMetalQ4AbsorbedAttention
                 if layout.family == QwenMoeFamily::Glm52
                     && dense_layout == ResidentDenseLayout::Q4 =>
             {
@@ -392,11 +392,16 @@ impl FlashMoeCapabilityPlan {
                     layout.family,
                     &metal,
                     FlashMoeGraphStage::AttentionMath,
-                    &[kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS],
+                    &[
+                        kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS,
+                        kernels::GLM_MLA_ABSORBED_SCORES,
+                        kernels::GLM_MLA_SOFTMAX,
+                        kernels::GLM_MLA_CONTEXT,
+                    ],
                 )?;
                 (
-                    FlashMoeStagePlacement::MetalWithCpuReduction,
-                    FlashMoeStageImplementation::GlmMlaMetalQ4MultilinearCpuReduction,
+                    FlashMoeStagePlacement::Metal,
+                    FlashMoeStageImplementation::GlmMlaMetalQ4AbsorbedAttention,
                 )
             }
             _ => {
@@ -1561,7 +1566,7 @@ mod tests {
             ResidentDenseLayout::Q4,
             fixed_q4_experts(&layout),
             &attention_layers(&layout),
-            FlashMoeAttentionMathCapability::GlmMlaMetalQ4MultilinearCpuReduction,
+            FlashMoeAttentionMathCapability::GlmMlaMetalQ4AbsorbedAttention,
             Some(MetalRuntimeCapabilities::from_pipeline_names(
                 MetalPipelineNameSet::new(),
             )),
@@ -1572,7 +1577,7 @@ mod tests {
                 .stage(FlashMoeGraphStage::AttentionMath)
                 .unwrap()
                 .placement,
-            FlashMoeStagePlacement::MetalWithCpuReduction
+            FlashMoeStagePlacement::Metal
         );
         assert_eq!(
             FlashMoeScheduledGraph::from_capabilities(&metal_mla)
@@ -1580,7 +1585,7 @@ mod tests {
                 .build_attention_math(3, 0)
                 .unwrap()
                 .implementation,
-            ScheduledAttentionMathImplementation::MetalQ4GlmMlaWeightAbsorptionCpuReduction
+            ScheduledAttentionMathImplementation::MetalQ4GlmMlaAbsorbedAttention
         );
 
         for (metal, expected_stage) in [

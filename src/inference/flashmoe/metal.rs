@@ -100,6 +100,19 @@ pub(crate) enum MetalBatchProjectionInput<'a> {
     Buffer { buffer: MetalObjcId, len: usize },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetalGlmMlaAbsorbedAttentionInput<'a> {
+    pub(crate) heads: usize,
+    pub(crate) latent_rank: usize,
+    pub(crate) query_nope: &'a [f32],
+    pub(crate) query_rope: &'a [f32],
+    pub(crate) record_latents: &'a [f32],
+    pub(crate) record_rotary: &'a [f32],
+    pub(crate) sequence: usize,
+    pub(crate) rope_dim: usize,
+    pub(crate) scale: f32,
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalBatchProjectionInput<'_> {
     pub(crate) fn len(self) -> usize {
@@ -988,6 +1001,9 @@ pub(crate) mod kernels {
         "q4_mmap_fma_matvec_batch_bf16_scale_bias";
     pub(crate) const Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS: &str =
         "q4_mmap_fma_multilinear_bf16_scale_bias";
+    pub(crate) const GLM_MLA_ABSORBED_SCORES: &str = "glm_mla_absorbed_scores";
+    pub(crate) const GLM_MLA_SOFTMAX: &str = "glm_mla_softmax";
+    pub(crate) const GLM_MLA_CONTEXT: &str = "glm_mla_context";
     pub(crate) const DENSE_MMAP_FMA_MATVEC_BF16: &str = "dense_mmap_fma_matvec_bf16";
     pub(crate) const DENSE_MMAP_FMA_MATVEC_F16: &str = "dense_mmap_fma_matvec_f16";
     pub(crate) const DENSE_MMAP_FMA_MATVEC_F32: &str = "dense_mmap_fma_matvec_f32";
@@ -1060,6 +1076,9 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::Q4_MMAP_FMA_MATVEC_BATCH,
     kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
     kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS,
+    kernels::GLM_MLA_ABSORBED_SCORES,
+    kernels::GLM_MLA_SOFTMAX,
+    kernels::GLM_MLA_CONTEXT,
     kernels::DENSE_MMAP_FMA_MATVEC_BF16,
     kernels::DENSE_MMAP_FMA_MATVEC_F16,
     kernels::DENSE_MMAP_FMA_MATVEC_F32,
@@ -1096,6 +1115,9 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) q4_mmap_batch: &'static str,
     pub(crate) q4_mmap_batch_bf16_scale_bias: &'static str,
     pub(crate) q4_mmap_multilinear_bf16_scale_bias: &'static str,
+    pub(crate) glm_mla_absorbed_scores: &'static str,
+    pub(crate) glm_mla_softmax: &'static str,
+    pub(crate) glm_mla_context: &'static str,
     pub(crate) dense_mmap_bf16: &'static str,
     pub(crate) dense_mmap_f16: &'static str,
     pub(crate) dense_mmap_f32: &'static str,
@@ -1133,6 +1155,9 @@ impl MetalPipelineNameSet {
             q4_mmap_batch: kernels::Q4_MMAP_FMA_MATVEC_BATCH,
             q4_mmap_batch_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
             q4_mmap_multilinear_bf16_scale_bias: kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS,
+            glm_mla_absorbed_scores: kernels::GLM_MLA_ABSORBED_SCORES,
+            glm_mla_softmax: kernels::GLM_MLA_SOFTMAX,
+            glm_mla_context: kernels::GLM_MLA_CONTEXT,
             dense_mmap_bf16: kernels::DENSE_MMAP_FMA_MATVEC_BF16,
             dense_mmap_f16: kernels::DENSE_MMAP_FMA_MATVEC_F16,
             dense_mmap_f32: kernels::DENSE_MMAP_FMA_MATVEC_F32,
@@ -1170,6 +1195,9 @@ impl MetalPipelineNameSet {
             self.q4_mmap_batch,
             self.q4_mmap_batch_bf16_scale_bias,
             self.q4_mmap_multilinear_bf16_scale_bias,
+            self.glm_mla_absorbed_scores,
+            self.glm_mla_softmax,
+            self.glm_mla_context,
             self.dense_mmap_bf16,
             self.dense_mmap_f16,
             self.dense_mmap_f32,
@@ -1208,6 +1236,9 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) q4_mmap_batch_pipeline: T,
     pub(crate) q4_mmap_batch_bf16_scale_bias_pipeline: T,
     pub(crate) q4_mmap_multilinear_bf16_scale_bias_pipeline: T,
+    pub(crate) glm_mla_absorbed_scores_pipeline: T,
+    pub(crate) glm_mla_softmax_pipeline: T,
+    pub(crate) glm_mla_context_pipeline: T,
     pub(crate) dense_mmap_bf16_pipeline: T,
     pub(crate) dense_mmap_f16_pipeline: T,
     pub(crate) dense_mmap_f32_pipeline: T,
@@ -1244,6 +1275,9 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.q4_mmap_batch_pipeline);
         release(self.q4_mmap_batch_bf16_scale_bias_pipeline);
         release(self.q4_mmap_multilinear_bf16_scale_bias_pipeline);
+        release(self.glm_mla_absorbed_scores_pipeline);
+        release(self.glm_mla_softmax_pipeline);
+        release(self.glm_mla_context_pipeline);
         release(self.dense_mmap_bf16_pipeline);
         release(self.dense_mmap_f16_pipeline);
         release(self.dense_mmap_f32_pipeline);
@@ -1478,6 +1512,9 @@ impl MetalRuntime {
                 q4_mmap_multilinear_bf16_scale_bias_pipeline: take_pipeline(
                     names.q4_mmap_multilinear_bf16_scale_bias,
                 ),
+                glm_mla_absorbed_scores_pipeline: take_pipeline(names.glm_mla_absorbed_scores),
+                glm_mla_softmax_pipeline: take_pipeline(names.glm_mla_softmax),
+                glm_mla_context_pipeline: take_pipeline(names.glm_mla_context),
                 dense_mmap_bf16_pipeline: take_pipeline(names.dense_mmap_bf16),
                 dense_mmap_f16_pipeline: take_pipeline(names.dense_mmap_f16),
                 dense_mmap_f32_pipeline: take_pipeline(names.dense_mmap_f32),
@@ -1834,6 +1871,7 @@ impl MetalExecutionContext {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resident_q4_multilinear(
         &self,
         projection: &DenseQ4MmapMatvecProjection,
@@ -1847,6 +1885,20 @@ impl MetalExecutionContext {
             &self.buffers,
         )
         .execute_q4_multilinear(projection, heads, rows_per_head, inputs)
+    }
+
+    pub(crate) fn resident_glm_mla_absorbed_attention(
+        &self,
+        embed_q: &DenseQ4MmapMatvecProjection,
+        unembed_out: &DenseQ4MmapMatvecProjection,
+        input: MetalGlmMlaAbsorbedAttentionInput<'_>,
+    ) -> anyhow::Result<Option<Vec<f32>>> {
+        MetalResidentProjectionBatchBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.buffers,
+        )
+        .execute_glm_mla_absorbed_attention(embed_q, unembed_out, input)
     }
 
     #[cfg(test)]
@@ -3980,6 +4032,47 @@ pub(crate) struct MetalResidentProjectionBatchBuilder<'a> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn encode_q4_mmap_multilinear(
+    pipelines: &MetalPipelineSet<MetalObjcId>,
+    encoder: MetalObjcId,
+    dense_weights: &MetalDenseWeights,
+    projection: &DenseQ4MmapMatvecProjection,
+    input_buffer: MetalObjcId,
+    output_buffer: MetalObjcId,
+    rows_per_head: usize,
+) -> Result<()> {
+    unsafe {
+        let rows_u32 = u32::try_from(projection.rows).context("multilinear rows do not fit u32")?;
+        let cols_u32 = u32::try_from(projection.cols).context("multilinear cols do not fit u32")?;
+        let groups_u32 = u32::try_from(projection.groups_per_row)
+            .context("multilinear groups do not fit u32")?;
+        let group_size_u32 = u32::try_from(projection.group_size)
+            .context("multilinear group size does not fit u32")?;
+        let rows_per_head_u32 =
+            u32::try_from(rows_per_head).context("multilinear rows per head do not fit u32")?;
+
+        msg_send_void1_id(
+            encoder,
+            sel("setComputePipelineState:"),
+            pipelines.q4_mmap_multilinear_bf16_scale_bias_pipeline,
+        );
+        set_buffer(encoder, dense_weights.buffer, 0);
+        set_buffer(encoder, input_buffer, 1);
+        set_buffer(encoder, output_buffer, 2);
+        set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+        set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+        set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+        set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+        set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+        set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+        set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+        set_bytes(encoder, u32_as_bytes(&rows_per_head_u32), 10);
+        dispatch_q4_mmap_threadgroups(encoder, projection.rows as u64);
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl<'a> MetalResidentProjectionBatchBuilder<'a> {
     pub(crate) fn new(
         runtime: &'a MetalRuntime,
@@ -4202,6 +4295,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn execute_q4_multilinear(
         &self,
         projection: &DenseQ4MmapMatvecProjection,
@@ -4261,33 +4355,15 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 }
             };
             let encoder = encoding.encoder();
-            let rows_u32 = u32::try_from(rows).context("multilinear rows do not fit u32")?;
-            let cols_u32 =
-                u32::try_from(projection.cols).context("multilinear cols do not fit u32")?;
-            let groups_u32 = u32::try_from(projection.groups_per_row)
-                .context("multilinear groups do not fit u32")?;
-            let group_size_u32 = u32::try_from(projection.group_size)
-                .context("multilinear group size does not fit u32")?;
-            let rows_per_head_u32 =
-                u32::try_from(rows_per_head).context("multilinear rows per head do not fit u32")?;
-
-            msg_send_void1_id(
+            encode_q4_mmap_multilinear(
+                &self.pipelines,
                 encoder,
-                sel("setComputePipelineState:"),
-                self.pipelines.q4_mmap_multilinear_bf16_scale_bias_pipeline,
-            );
-            set_buffer(encoder, dense_weights.buffer, 0);
-            set_buffer(encoder, input_buffer, 1);
-            set_buffer(encoder, output_buffer, 2);
-            set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
-            set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
-            set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
-            set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
-            set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
-            set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
-            set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
-            set_bytes(encoder, u32_as_bytes(&rows_per_head_u32), 10);
-            dispatch_q4_mmap_threadgroups(encoder, rows as u64);
+                dense_weights,
+                projection,
+                input_buffer,
+                output_buffer,
+                rows_per_head,
+            )?;
             encoding.end_encoding();
 
             let context = MetalCommandContext::new("dense_q4_mmap_multilinear")
@@ -4306,6 +4382,252 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
             drop(encoding);
             self.recycle(input_buffer);
             self.recycle(output_buffer);
+            Ok(Some(output))
+        }
+    }
+
+    pub(crate) fn execute_glm_mla_absorbed_attention(
+        &self,
+        embed_q: &DenseQ4MmapMatvecProjection,
+        unembed_out: &DenseQ4MmapMatvecProjection,
+        input: MetalGlmMlaAbsorbedAttentionInput<'_>,
+    ) -> Result<Option<Vec<f32>>> {
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let absorbed_width = input
+            .heads
+            .checked_mul(input.latent_rank)
+            .context("GLM MLA absorbed-query width overflow")?;
+        let query_nope_width = input
+            .heads
+            .checked_mul(embed_q.cols)
+            .context("GLM MLA no-PE query width overflow")?;
+        let query_rope_width = input
+            .heads
+            .checked_mul(input.rope_dim)
+            .context("GLM MLA rotary-query width overflow")?;
+        let score_count = input
+            .heads
+            .checked_mul(input.sequence)
+            .context("GLM MLA score count overflow")?;
+        let record_latent_width = input
+            .sequence
+            .checked_mul(input.latent_rank)
+            .context("GLM MLA latent-record width overflow")?;
+        let record_rotary_width = input
+            .sequence
+            .checked_mul(input.rope_dim)
+            .context("GLM MLA rotary-record width overflow")?;
+        let output_rows_per_head = unembed_out
+            .rows
+            .checked_div(input.heads.max(1))
+            .context("GLM MLA output rows-per-head division failed")?;
+        let scale_bias_is_bf16 = |projection: &DenseQ4MmapMatvecProjection| {
+            projection
+                .scale_bias_dtype
+                .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+        };
+        if input.heads == 0
+            || input.latent_rank == 0
+            || input.rope_dim == 0
+            || input.sequence == 0
+            || !input.scale.is_finite()
+            || embed_q.rows != absorbed_width
+            || embed_q.output_width != absorbed_width
+            || embed_q.cols == 0
+            || !input.latent_rank.is_multiple_of(16)
+            || !scale_bias_is_bf16(embed_q)
+            || unembed_out.rows == 0
+            || unembed_out.rows % input.heads != 0
+            || unembed_out.output_width != unembed_out.rows
+            || unembed_out.cols != input.latent_rank
+            || !output_rows_per_head.is_multiple_of(16)
+            || !scale_bias_is_bf16(unembed_out)
+            || input.query_nope.len() != query_nope_width
+            || input.query_rope.len() != query_rope_width
+            || input.record_latents.len() != record_latent_width
+            || input.record_rotary.len() != record_rotary_width
+        {
+            bail!(
+                "GLM MLA Metal absorbed attention has incompatible shapes embed={}x{} output={} unembed={}x{} output={} heads={} latent_rank={} rope_dim={} sequence={} query_nope={} query_rope={} record_latents={} record_rotary={} scale={}",
+                embed_q.rows,
+                embed_q.cols,
+                embed_q.output_width,
+                unembed_out.rows,
+                unembed_out.cols,
+                unembed_out.output_width,
+                input.heads,
+                input.latent_rank,
+                input.rope_dim,
+                input.sequence,
+                input.query_nope.len(),
+                input.query_rope.len(),
+                input.record_latents.len(),
+                input.record_rotary.len(),
+                input.scale,
+            );
+        }
+        validate_resident_projection(
+            &ResidentMmapMatvecProjection::Q4(embed_q.clone()),
+            embed_q.cols,
+            dense_weights.len,
+        )?;
+        validate_resident_projection(
+            &ResidentMmapMatvecProjection::Q4(unembed_out.clone()),
+            input.latent_rank,
+            dense_weights.len,
+        )?;
+
+        unsafe {
+            let mut buffers = Vec::with_capacity(8);
+            let query_nope_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(input.query_nope),
+                &mut buffers,
+            )?;
+            let query_rope_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(input.query_rope),
+                &mut buffers,
+            )?;
+            let record_latents_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(input.record_latents),
+                &mut buffers,
+            )?;
+            let record_rotary_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(input.record_rotary),
+                &mut buffers,
+            )?;
+            let absorbed_queries_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                absorbed_width * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let scores_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                score_count * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let contexts_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                absorbed_width * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let output_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                unembed_out.rows * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Flash-MoE GLM MLA absorbed-attention command buffer",
+                "failed to create Flash-MoE GLM MLA absorbed-attention compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            let encode_result = (|| -> Result<()> {
+                encode_q4_mmap_multilinear(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    embed_q,
+                    query_nope_buffer,
+                    absorbed_queries_buffer,
+                    input.latent_rank,
+                )?;
+
+                let heads = u32::try_from(input.heads).context("GLM MLA heads do not fit u32")?;
+                let latent_rank = u32::try_from(input.latent_rank)
+                    .context("GLM MLA latent rank does not fit u32")?;
+                let rope_dim =
+                    u32::try_from(input.rope_dim).context("GLM MLA rope dim does not fit u32")?;
+                let sequence =
+                    u32::try_from(input.sequence).context("GLM MLA sequence does not fit u32")?;
+
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.glm_mla_absorbed_scores_pipeline,
+                );
+                set_buffer(encoder, absorbed_queries_buffer, 0);
+                set_buffer(encoder, query_rope_buffer, 1);
+                set_buffer(encoder, record_latents_buffer, 2);
+                set_buffer(encoder, record_rotary_buffer, 3);
+                set_buffer(encoder, scores_buffer, 4);
+                set_bytes(encoder, u32_as_bytes(&heads), 5);
+                set_bytes(encoder, u32_as_bytes(&latent_rank), 6);
+                set_bytes(encoder, u32_as_bytes(&rope_dim), 7);
+                set_bytes(encoder, u32_as_bytes(&sequence), 8);
+                set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&input.scale)), 9);
+                dispatch_threads(encoder, score_count as u64);
+
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.glm_mla_softmax_pipeline,
+                );
+                set_buffer(encoder, scores_buffer, 0);
+                set_bytes(encoder, u32_as_bytes(&heads), 1);
+                set_bytes(encoder, u32_as_bytes(&sequence), 2);
+                dispatch_threads(encoder, input.heads as u64);
+
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.glm_mla_context_pipeline,
+                );
+                set_buffer(encoder, scores_buffer, 0);
+                set_buffer(encoder, record_latents_buffer, 1);
+                set_buffer(encoder, contexts_buffer, 2);
+                set_bytes(encoder, u32_as_bytes(&heads), 3);
+                set_bytes(encoder, u32_as_bytes(&latent_rank), 4);
+                set_bytes(encoder, u32_as_bytes(&sequence), 5);
+                dispatch_threads(encoder, absorbed_width as u64);
+
+                encode_q4_mmap_multilinear(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    unembed_out,
+                    contexts_buffer,
+                    output_buffer,
+                    output_rows_per_head,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = encode_result {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, true);
+                return Err(error);
+            }
+            encoding.end_encoding();
+
+            let context = MetalCommandContext::new("glm_mla_absorbed_attention")
+                .with("heads", input.heads)
+                .with("latent_rank", input.latent_rank)
+                .with("rope_dim", input.rope_dim)
+                .with("sequence", input.sequence);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            let output = read_f32_buffer(output_buffer, unembed_out.rows);
+            drop(encoding);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
             Ok(Some(output))
         }
     }
@@ -7583,6 +7905,87 @@ kernel void attention_scores(
     scores[token] = acc * rsqrt(float(max(head_dim, 1u)));
 }
 
+kernel void glm_mla_absorbed_scores(
+    device const float* absorbed_queries [[buffer(0)]],
+    device const float* query_rope [[buffer(1)]],
+    device const float* record_latents [[buffer(2)]],
+    device const float* record_rotary [[buffer(3)]],
+    device float* scores [[buffer(4)]],
+    constant uint& heads [[buffer(5)]],
+    constant uint& latent_rank [[buffer(6)]],
+    constant uint& rope_dim [[buffer(7)]],
+    constant uint& sequence [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    uint index [[thread_position_in_grid]]) {
+    uint total = heads * sequence;
+    if (index >= total) { return; }
+    uint head = index / sequence;
+    uint position = index - head * sequence;
+    float score = 0.0f;
+    uint query_latent_offset = head * latent_rank;
+    uint record_latent_offset = position * latent_rank;
+    for (uint dim = 0; dim < latent_rank; ++dim) {
+        score = fma(
+            absorbed_queries[query_latent_offset + dim],
+            record_latents[record_latent_offset + dim],
+            score);
+    }
+    uint query_rope_offset = head * rope_dim;
+    uint record_rope_offset = position * rope_dim;
+    for (uint dim = 0; dim < rope_dim; ++dim) {
+        score = fma(
+            query_rope[query_rope_offset + dim],
+            record_rotary[record_rope_offset + dim],
+            score);
+    }
+    scores[index] = score * scale;
+}
+
+kernel void glm_mla_softmax(
+    device float* scores [[buffer(0)]],
+    constant uint& heads [[buffer(1)]],
+    constant uint& sequence [[buffer(2)]],
+    uint head [[thread_position_in_grid]]) {
+    if (head >= heads) { return; }
+    uint offset = head * sequence;
+    float maximum = scores[offset];
+    for (uint position = 1; position < sequence; ++position) {
+        maximum = max(maximum, scores[offset + position]);
+    }
+    float denominator = 0.0f;
+    for (uint position = 0; position < sequence; ++position) {
+        float value = exp(scores[offset + position] - maximum);
+        scores[offset + position] = value;
+        denominator += value;
+    }
+    float inverse = 1.0f / max(denominator, 1.0e-20f);
+    for (uint position = 0; position < sequence; ++position) {
+        scores[offset + position] *= inverse;
+    }
+}
+
+kernel void glm_mla_context(
+    device const float* scores [[buffer(0)]],
+    device const float* record_latents [[buffer(1)]],
+    device float* contexts [[buffer(2)]],
+    constant uint& heads [[buffer(3)]],
+    constant uint& latent_rank [[buffer(4)]],
+    constant uint& sequence [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    uint total = heads * latent_rank;
+    if (index >= total) { return; }
+    uint head = index / latent_rank;
+    uint dim = index - head * latent_rank;
+    float value = 0.0f;
+    for (uint position = 0; position < sequence; ++position) {
+        value = fma(
+            scores[head * sequence + position],
+            record_latents[position * latent_rank + dim],
+            value);
+    }
+    contexts[index] = value;
+}
+
 kernel void expert_mlp_fused(
     device const float* gate [[buffer(0)]],
     device const float* up [[buffer(1)]],
@@ -8500,7 +8903,7 @@ mod tests {
             released,
             [
                 (1..=8).collect::<Vec<_>>(),
-                vec![33],
+                vec![33, 34, 35, 36],
                 vec![24, 25, 26],
                 (9..=16).collect::<Vec<_>>(),
                 vec![18, 19, 27, 28, 20, 21, 29, 30, 22, 23, 31, 32],
@@ -8520,6 +8923,9 @@ mod tests {
             q4_mmap_batch_pipeline: 7,
             q4_mmap_batch_bf16_scale_bias_pipeline: 8,
             q4_mmap_multilinear_bf16_scale_bias_pipeline: 33,
+            glm_mla_absorbed_scores_pipeline: 34,
+            glm_mla_softmax_pipeline: 35,
+            glm_mla_context_pipeline: 36,
             dense_mmap_bf16_pipeline: 24,
             dense_mmap_f16_pipeline: 25,
             dense_mmap_f32_pipeline: 26,
@@ -8558,6 +8964,9 @@ mod tests {
             q4_mmap_batch_pipeline: id,
             q4_mmap_batch_bf16_scale_bias_pipeline: id,
             q4_mmap_multilinear_bf16_scale_bias_pipeline: id,
+            glm_mla_absorbed_scores_pipeline: id,
+            glm_mla_softmax_pipeline: id,
+            glm_mla_context_pipeline: id,
             dense_mmap_bf16_pipeline: id,
             dense_mmap_f16_pipeline: id,
             dense_mmap_f32_pipeline: id,
@@ -9924,6 +10333,168 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn resident_glm_mla_absorbed_attention_matches_reference() {
+        fn write_projection(
+            mmap: &mut [u8],
+            offset: &mut usize,
+            name: &str,
+            rows: usize,
+            cols: usize,
+            nibble: impl Fn(usize) -> u8,
+        ) -> DenseQ4MmapMatvecProjection {
+            let packed_byte_offset = *offset;
+            let row_packed_bytes = cols.div_ceil(2);
+            for row in 0..rows {
+                let value = nibble(row) & 0x0f;
+                mmap[packed_byte_offset + row * row_packed_bytes
+                    ..packed_byte_offset + (row + 1) * row_packed_bytes]
+                    .fill(value | (value << 4));
+            }
+            let scales_byte_offset = packed_byte_offset + rows * row_packed_bytes;
+            for row in 0..rows {
+                mmap[scales_byte_offset + row * 2..scales_byte_offset + row * 2 + 2]
+                    .copy_from_slice(&0x3f80u16.to_le_bytes());
+            }
+            let biases_byte_offset = scales_byte_offset + rows * 2;
+            mmap[biases_byte_offset..biases_byte_offset + rows * 2].fill(0);
+            *offset = biases_byte_offset + rows * 2;
+            DenseQ4MmapMatvecProjection {
+                tensor_name: name.to_string(),
+                packed_byte_offset: packed_byte_offset as u64,
+                scales_byte_offset: scales_byte_offset as u64,
+                biases_byte_offset: biases_byte_offset as u64,
+                rows,
+                cols,
+                output_width: rows,
+                row_packed_bytes,
+                groups_per_row: 1,
+                group_size: cols,
+                scale_bias_dtype: "BF16".to_string(),
+            }
+        }
+
+        let heads = 2usize;
+        let latent_rank = 16usize;
+        let nope_dim = 8usize;
+        let rope_dim = 4usize;
+        let output_per_head = 16usize;
+        let sequence = 2usize;
+        let mut mmap = memmap2::MmapMut::map_anon(64 * 1024).unwrap();
+        let mut offset = 0usize;
+        let embed_q = write_projection(
+            &mut mmap,
+            &mut offset,
+            "test.embed_q",
+            heads * latent_rank,
+            nope_dim,
+            |row| (row % 3 + 1) as u8,
+        );
+        let unembed_out = write_projection(
+            &mut mmap,
+            &mut offset,
+            "test.unembed_out",
+            heads * output_per_head,
+            latent_rank,
+            |row| (row % 5 + 1) as u8,
+        );
+        let mmap = Arc::new(mmap.make_read_only().unwrap());
+        let context = MetalExecutionContext::compile(mmap, 64 * 1024, &[], 1e-6).unwrap();
+        let query_nope = [vec![1.0; nope_dim], vec![2.0; nope_dim]].concat();
+        let query_rope = vec![0.25, -0.5, 0.75, 1.0, -0.25, 0.5, -0.75, 1.5];
+        let record_latents = (0..sequence)
+            .flat_map(|position| {
+                (0..latent_rank).map(move |dim| {
+                    if position == 0 {
+                        (dim + 1) as f32 / latent_rank as f32
+                    } else {
+                        (latent_rank - dim) as f32 / latent_rank as f32
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let record_rotary = vec![0.5, 0.25, -0.5, 1.0, -0.25, 0.75, 0.5, -1.0];
+        let scale = (nope_dim + rope_dim) as f32;
+        let scale = scale.sqrt().recip();
+
+        let actual = context
+            .resident_glm_mla_absorbed_attention(
+                &embed_q,
+                &unembed_out,
+                MetalGlmMlaAbsorbedAttentionInput {
+                    heads,
+                    latent_rank,
+                    query_nope: &query_nope,
+                    query_rope: &query_rope,
+                    record_latents: &record_latents,
+                    record_rotary: &record_rotary,
+                    sequence,
+                    rope_dim,
+                    scale,
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let mut expected = Vec::with_capacity(heads * output_per_head);
+        for head in 0..heads {
+            let query_sum = query_nope[head * nope_dim..(head + 1) * nope_dim]
+                .iter()
+                .sum::<f32>();
+            let absorbed = (0..latent_rank)
+                .map(|dim| ((head * latent_rank + dim) % 3 + 1) as f32 * query_sum)
+                .collect::<Vec<_>>();
+            let mut scores = (0..sequence)
+                .map(|position| {
+                    let latent =
+                        &record_latents[position * latent_rank..(position + 1) * latent_rank];
+                    let rotary = &record_rotary[position * rope_dim..(position + 1) * rope_dim];
+                    let latent_score = absorbed
+                        .iter()
+                        .zip(latent)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    let rotary_score = query_rope[head * rope_dim..(head + 1) * rope_dim]
+                        .iter()
+                        .zip(rotary)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    (latent_score + rotary_score) * scale
+                })
+                .collect::<Vec<_>>();
+            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator = scores
+                .iter()
+                .map(|score| (*score - maximum).exp())
+                .sum::<f32>();
+            for score in &mut scores {
+                *score = (*score - maximum).exp() / denominator;
+            }
+            let context_values = (0..latent_rank)
+                .map(|dim| {
+                    (0..sequence)
+                        .map(|position| {
+                            scores[position] * record_latents[position * latent_rank + dim]
+                        })
+                        .sum::<f32>()
+                })
+                .collect::<Vec<_>>();
+            let context_sum = context_values.iter().sum::<f32>();
+            expected.extend(
+                (0..output_per_head)
+                    .map(|row| ((head * output_per_head + row) % 5 + 1) as f32 * context_sum),
+            );
+        }
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "output {index}: actual={actual} expected={expected}"
+            );
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

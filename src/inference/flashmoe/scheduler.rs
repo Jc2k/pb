@@ -1049,7 +1049,7 @@ pub(crate) struct ScheduledCmd1ResolvedCommand<TInput> {
 pub enum ScheduledAttentionMathImplementation {
     CpuKvCache,
     CpuGlmMlaWeightAbsorption,
-    MetalQ4GlmMlaWeightAbsorptionCpuReduction,
+    MetalQ4GlmMlaAbsorbedAttention,
 }
 
 impl ScheduledAttentionMathImplementation {
@@ -1067,9 +1067,9 @@ impl ScheduledAttentionMathImplementation {
                 FlashMoeStageImplementation::GlmMlaCpuWeightAbsorption,
             ) => Ok(Self::CpuGlmMlaWeightAbsorption),
             (
-                FlashMoeStagePlacement::MetalWithCpuReduction,
-                FlashMoeStageImplementation::GlmMlaMetalQ4MultilinearCpuReduction,
-            ) => Ok(Self::MetalQ4GlmMlaWeightAbsorptionCpuReduction),
+                FlashMoeStagePlacement::Metal,
+                FlashMoeStageImplementation::GlmMlaMetalQ4AbsorbedAttention,
+            ) => Ok(Self::MetalQ4GlmMlaAbsorbedAttention),
             _ => Err(FlashMoeUnsupportedCapability::new(
                 family,
                 stage.stage,
@@ -1085,7 +1085,7 @@ impl ScheduledAttentionMathImplementation {
         match self {
             Self::CpuKvCache
             | Self::CpuGlmMlaWeightAbsorption
-            | Self::MetalQ4GlmMlaWeightAbsorptionCpuReduction => FlashMoeStatePlacement::CpuVisible,
+            | Self::MetalQ4GlmMlaAbsorbedAttention => FlashMoeStatePlacement::CpuVisible,
         }
     }
 }
@@ -1147,7 +1147,7 @@ impl ScheduledAttentionMath {
         if !matches!(
             self.implementation,
             ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption
-                | ScheduledAttentionMathImplementation::MetalQ4GlmMlaWeightAbsorptionCpuReduction
+                | ScheduledAttentionMathImplementation::MetalQ4GlmMlaAbsorbedAttention
         ) {
             bail!(
                 "FlashMoe scheduled attention implementation {:?} does not accept compressed MLA KV state",

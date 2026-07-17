@@ -99,8 +99,10 @@ taking precedence at load. Its first three dense MLPs remain
 resident; sparse layers reuse the existing expert scheduler and always-active shared-expert
 command. MLA stores a normalized 512-value latent plus a 64-value rotary key per token, with Metal
 projections and a typed weight-absorption stage. MLX's pre-absorbed Q4 per-head projections execute
-on Metal before the declared CPU causal reduction. Its `q_a`, `kv_a`, projection RMSNorms, and
-`q_b` execute as one ordered Metal command with only the final query and compressed KV read back;
+with causal absorbed scores, softmax, latent-context reduction, and output unembedding in one ordered
+Metal command. The compressed-KV cache remains declared CPU-visible and is uploaded to that command;
+only the attention result is read back. Its `q_a`, `kv_a`, projection RMSNorms, and `q_b` execute as
+one ordered Metal command with only the final query and compressed KV read back;
 fused Colibri `kv_b_proj` weights retain their CPU transpose implementation. Sigmoid/noaux routing
 uses the correction bias only for expert selection and keeps the checkpoint's routed scaling factor.
 

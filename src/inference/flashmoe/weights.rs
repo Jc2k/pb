@@ -17,7 +17,10 @@ use super::experts::{
 use super::math::{q4_dequantize_rows_with_group_size, quantize_q4, softmax_in_place};
 #[cfg(test)]
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
-use super::metal::{MetalBatchProjectionInput, MetalObjcId as ObjcId, MetalPostAttentionPrep};
+use super::metal::{
+    MetalBatchProjectionInput, MetalGlmMlaAbsorbedAttentionInput, MetalObjcId as ObjcId,
+    MetalPostAttentionPrep,
+};
 use super::model_family::{
     QwenModelConfig, QwenMoeFamily, QwenMoeLayerKind, QwenNormWeightSemantics,
 };
@@ -5283,7 +5286,7 @@ impl DenseStore {
         Ok(output)
     }
 
-    pub(super) fn mla_absorbed_attention_metal_multilinear(
+    pub(super) fn mla_absorbed_attention_metal(
         &self,
         metal: &MetalExecutionFacade,
         layer: usize,
@@ -5348,50 +5351,51 @@ impl DenseStore {
                 .checked_mul(layout.qk_nope_head_dim)
                 .context("MLA no-PE query size overflow")?,
         );
+        let mut query_rope = Vec::with_capacity(
+            layout
+                .num_heads
+                .checked_mul(layout.qk_rope_head_dim)
+                .context("MLA rotary query size overflow")?,
+        );
         for head in 0..layout.num_heads {
             let start = head * layout.qk_head_dim;
             query_nope.extend_from_slice(&query[start..start + layout.qk_nope_head_dim]);
+            query_rope.extend_from_slice(
+                &query[start + layout.qk_nope_head_dim..start + layout.qk_head_dim],
+            );
         }
-        let absorbed_queries = metal.resident_q4_multilinear(
-            &embed_q,
-            layout.num_heads,
-            layout.kv_lora_rank,
-            &query_nope,
-        )?;
-        let mut contexts = vec![0.0; layout.num_heads * layout.kv_lora_rank];
+        let mut record_latents = Vec::with_capacity(
+            records
+                .len()
+                .checked_mul(layout.kv_lora_rank)
+                .context("MLA latent record size overflow")?,
+        );
+        let mut record_rotary = Vec::with_capacity(
+            records
+                .len()
+                .checked_mul(layout.qk_rope_head_dim)
+                .context("MLA rotary record size overflow")?,
+        );
+        for (latent, rotary) in records {
+            record_latents.extend_from_slice(latent);
+            record_rotary.extend_from_slice(rotary);
+        }
         let scale = (layout.qk_head_dim as f32).sqrt().recip();
-        for head in 0..layout.num_heads {
-            let query_start = head * layout.qk_head_dim;
-            let query_rope =
-                &query[query_start + layout.qk_nope_head_dim..query_start + layout.qk_head_dim];
-            let absorbed_query =
-                &absorbed_queries[head * layout.kv_lora_rank..(head + 1) * layout.kv_lora_rank];
-            let mut scores = records
-                .iter()
-                .map(|(latent, rotary)| {
-                    let latent_score = absorbed_query
-                        .iter()
-                        .zip(*latent)
-                        .map(|(left, right)| left * right)
-                        .sum::<f32>();
-                    let rotary_score = query_rope
-                        .iter()
-                        .zip(*rotary)
-                        .map(|(left, right)| left * right)
-                        .sum::<f32>();
-                    (latent_score + rotary_score) * scale
-                })
-                .collect::<Vec<_>>();
-            softmax_in_place(&mut scores);
-            let context =
-                &mut contexts[head * layout.kv_lora_rank..(head + 1) * layout.kv_lora_rank];
-            for (weight, (latent, _)) in scores.iter().zip(records) {
-                for (slot, value) in context.iter_mut().zip(*latent) {
-                    *slot += *weight * value;
-                }
-            }
-        }
-        metal.resident_q4_multilinear(&unembed_out, layout.num_heads, layout.v_head_dim, &contexts)
+        metal.resident_glm_mla_absorbed_attention(
+            &embed_q,
+            &unembed_out,
+            MetalGlmMlaAbsorbedAttentionInput {
+                heads: layout.num_heads,
+                latent_rank: layout.kv_lora_rank,
+                query_nope: &query_nope,
+                query_rope: &query_rope,
+                record_latents: &record_latents,
+                record_rotary: &record_rotary,
+                sequence: records.len(),
+                rope_dim: layout.qk_rope_head_dim,
+                scale,
+            },
+        )
     }
 
     #[cfg(test)]

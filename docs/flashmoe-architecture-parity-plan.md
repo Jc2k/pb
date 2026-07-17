@@ -108,9 +108,11 @@ graph resolution.
   the decoder RMSNorm epsilon in config. Runtime weight absorption accepts either the original
   two-dimensional `kv_b_proj` or MLX-LM's equivalent pre-absorbed per-head `embed_q` and
   `unembed_out` tensors; both execute against the same compressed cache without materializing
-  per-token keys and values. The capability graph binds MLX's pre-absorbed Q4 multilinear tensors
-  to one resident Metal dispatch per projection while retaining CPU causal-score, softmax, and
-  compressed-context reduction. The preceding MLX input chain encodes `q_a`, `kv_a`, both projection
+  per-token keys and values. The capability graph binds MLX's pre-absorbed Q4 multilinear tensors,
+  causal absorbed scores, softmax, compressed-context reduction, and output unembedding into one
+  ordered Metal command. The compressed-KV records remain scheduler-declared CPU-visible state and
+  are uploaded for that command; the attention result is the only readback. The preceding MLX input
+  chain encodes `q_a`, `kv_a`, both projection
   RMSNorms, and `q_b` in one ordered Metal command. Only the final query and normalized compressed KV
   return to CPU for rotary/cache work, avoiding the old intermediate `q_a` readback and command
   boundary. The fused `kv_b_proj` adapter remains on its declared CPU transpose implementation until
@@ -175,6 +177,21 @@ three-token raw output remained `5 2`.
   end-to-end improvement under equal I/O, while `0.226 tok/s` is the measured whole-run result.
 - A separate run reached `0.248 tok/s` when expert I/O fell to `1.290 s/token`. That is useful evidence
   for the remaining storage-side opportunity, but is not attributed to the attention change.
+
+A third pass moved the absorbed causal scores, softmax, and compressed-context reduction between
+the existing Q4 `embed_q` and `unembed_out` projections into their shared Metal command. A focused
+real-Metal test compares the complete command with a CPU reference across distinct heads and two KV
+records. The same three-token request remained token-identical as `5 2`.
+
+- The absorbed-attention kernel bucket fell from `0.487` to `0.237 s/token`, a 51.3% reduction.
+  Total decode measured `0.222 tok/s` (`4.513 s/token`) versus the preceding `0.226 tok/s`
+  (`4.421 s/token`) run because expert I/O rose from `1.694` to `1.947 s/token`. Replacing only that
+  noisy I/O bucket with the preceding value gives `4.261 s/token`, or about `0.235 tok/s`: a
+  `0.161 s/token` intrinsic whole-token improvement for this pass.
+- Diagnostic K=4 and K=1 runs reached `0.410` and `0.667 tok/s`, respectively, but changed the raw
+  output to `4 5` and `л2`. They are lower-bound measurements, not supported quality modes. Even K=1
+  leaves a `1.499 s/token` floor, proving that expert traffic alone cannot reach the 1 tok/s goal;
+  resident graph/command work remains necessary alongside any future typed storage optimization.
 
 ## Scheduled Graph
 
