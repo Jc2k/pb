@@ -114,6 +114,29 @@ pub(crate) struct MetalGlmMlaAbsorbedAttentionInput<'a> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetalGlmMlaFusedAttentionInput<'a> {
+    pub(crate) input: MetalBatchProjectionInput<'a>,
+    pub(crate) heads: usize,
+    pub(crate) latent_rank: usize,
+    pub(crate) nope_dim: usize,
+    pub(crate) rope_dim: usize,
+    pub(crate) previous_record_latents: &'a [f32],
+    pub(crate) previous_record_rotary: &'a [f32],
+    pub(crate) rope_cos: &'a [f32],
+    pub(crate) rope_sin: &'a [f32],
+    pub(crate) scale: f32,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalGlmMlaFusedAttentionOutput {
+    pub(crate) attention: Vec<f32>,
+    pub(crate) latent: Vec<f32>,
+    pub(crate) rotary: Vec<f32>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalBatchProjectionInput<'_> {
     pub(crate) fn len(self) -> usize {
         match self {
@@ -1081,6 +1104,7 @@ pub(crate) mod kernels {
         "q4_mmap_fma_matvec_batch_bf16_scale_bias";
     pub(crate) const Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS: &str =
         "q4_mmap_fma_multilinear_bf16_scale_bias";
+    pub(crate) const GLM_MLA_PREPARE_QUERY_KV: &str = "glm_mla_prepare_query_kv";
     pub(crate) const GLM_MLA_ABSORBED_SCORES: &str = "glm_mla_absorbed_scores";
     pub(crate) const GLM_MLA_SOFTMAX: &str = "glm_mla_softmax";
     pub(crate) const GLM_MLA_CONTEXT: &str = "glm_mla_context";
@@ -1156,6 +1180,7 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::Q4_MMAP_FMA_MATVEC_BATCH,
     kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
     kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS,
+    kernels::GLM_MLA_PREPARE_QUERY_KV,
     kernels::GLM_MLA_ABSORBED_SCORES,
     kernels::GLM_MLA_SOFTMAX,
     kernels::GLM_MLA_CONTEXT,
@@ -1195,6 +1220,7 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) q4_mmap_batch: &'static str,
     pub(crate) q4_mmap_batch_bf16_scale_bias: &'static str,
     pub(crate) q4_mmap_multilinear_bf16_scale_bias: &'static str,
+    pub(crate) glm_mla_prepare_query_kv: &'static str,
     pub(crate) glm_mla_absorbed_scores: &'static str,
     pub(crate) glm_mla_softmax: &'static str,
     pub(crate) glm_mla_context: &'static str,
@@ -1235,6 +1261,7 @@ impl MetalPipelineNameSet {
             q4_mmap_batch: kernels::Q4_MMAP_FMA_MATVEC_BATCH,
             q4_mmap_batch_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
             q4_mmap_multilinear_bf16_scale_bias: kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS,
+            glm_mla_prepare_query_kv: kernels::GLM_MLA_PREPARE_QUERY_KV,
             glm_mla_absorbed_scores: kernels::GLM_MLA_ABSORBED_SCORES,
             glm_mla_softmax: kernels::GLM_MLA_SOFTMAX,
             glm_mla_context: kernels::GLM_MLA_CONTEXT,
@@ -1275,6 +1302,7 @@ impl MetalPipelineNameSet {
             self.q4_mmap_batch,
             self.q4_mmap_batch_bf16_scale_bias,
             self.q4_mmap_multilinear_bf16_scale_bias,
+            self.glm_mla_prepare_query_kv,
             self.glm_mla_absorbed_scores,
             self.glm_mla_softmax,
             self.glm_mla_context,
@@ -1316,6 +1344,7 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) q4_mmap_batch_pipeline: T,
     pub(crate) q4_mmap_batch_bf16_scale_bias_pipeline: T,
     pub(crate) q4_mmap_multilinear_bf16_scale_bias_pipeline: T,
+    pub(crate) glm_mla_prepare_query_kv_pipeline: T,
     pub(crate) glm_mla_absorbed_scores_pipeline: T,
     pub(crate) glm_mla_softmax_pipeline: T,
     pub(crate) glm_mla_context_pipeline: T,
@@ -1355,6 +1384,7 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.q4_mmap_batch_pipeline);
         release(self.q4_mmap_batch_bf16_scale_bias_pipeline);
         release(self.q4_mmap_multilinear_bf16_scale_bias_pipeline);
+        release(self.glm_mla_prepare_query_kv_pipeline);
         release(self.glm_mla_absorbed_scores_pipeline);
         release(self.glm_mla_softmax_pipeline);
         release(self.glm_mla_context_pipeline);
@@ -1592,6 +1622,7 @@ impl MetalRuntime {
                 q4_mmap_multilinear_bf16_scale_bias_pipeline: take_pipeline(
                     names.q4_mmap_multilinear_bf16_scale_bias,
                 ),
+                glm_mla_prepare_query_kv_pipeline: take_pipeline(names.glm_mla_prepare_query_kv),
                 glm_mla_absorbed_scores_pipeline: take_pipeline(names.glm_mla_absorbed_scores),
                 glm_mla_softmax_pipeline: take_pipeline(names.glm_mla_softmax),
                 glm_mla_context_pipeline: take_pipeline(names.glm_mla_context),
@@ -1947,6 +1978,37 @@ impl MetalExecutionContext {
             q_norm_weight,
             kv_norm_weight,
             kv_lora_rank,
+            norm_epsilon,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resident_glm_mla_fused_attention(
+        &self,
+        q_a: &ResidentMmapMatvecProjection,
+        kv_a: &ResidentMmapMatvecProjection,
+        q_b: &ResidentMmapMatvecProjection,
+        embed_q: &DenseQ4MmapMatvecProjection,
+        unembed_out: &DenseQ4MmapMatvecProjection,
+        input: MetalGlmMlaFusedAttentionInput<'_>,
+        q_norm_weight: &[f32],
+        kv_norm_weight: &[f32],
+        norm_epsilon: f32,
+    ) -> anyhow::Result<Option<MetalGlmMlaFusedAttentionOutput>> {
+        MetalResidentProjectionBatchBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.buffers,
+        )
+        .execute_glm_mla_fused_attention(
+            q_a,
+            kv_a,
+            q_b,
+            embed_q,
+            unembed_out,
+            input,
+            q_norm_weight,
+            kv_norm_weight,
             norm_epsilon,
         )
     }
@@ -4375,6 +4437,452 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_glm_mla_fused_attention(
+        &self,
+        q_a: &ResidentMmapMatvecProjection,
+        kv_a: &ResidentMmapMatvecProjection,
+        q_b: &ResidentMmapMatvecProjection,
+        embed_q: &DenseQ4MmapMatvecProjection,
+        unembed_out: &DenseQ4MmapMatvecProjection,
+        input: MetalGlmMlaFusedAttentionInput<'_>,
+        q_norm_weight: &[f32],
+        kv_norm_weight: &[f32],
+        norm_epsilon: f32,
+    ) -> Result<Option<MetalGlmMlaFusedAttentionOutput>> {
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let input_len = input.input.len();
+        validate_resident_projection(q_a, input_len, dense_weights.len)?;
+        validate_resident_projection(kv_a, input_len, dense_weights.len)?;
+        validate_resident_projection(q_b, q_a.output_width(), dense_weights.len)?;
+        validate_resident_projection(
+            &ResidentMmapMatvecProjection::Q4(embed_q.clone()),
+            input.nope_dim,
+            dense_weights.len,
+        )?;
+        validate_resident_projection(
+            &ResidentMmapMatvecProjection::Q4(unembed_out.clone()),
+            input.latent_rank,
+            dense_weights.len,
+        )?;
+
+        let query_width = input
+            .heads
+            .checked_mul(
+                input
+                    .nope_dim
+                    .checked_add(input.rope_dim)
+                    .context("GLM MLA fused query head width overflow")?,
+            )
+            .context("GLM MLA fused query width overflow")?;
+        let query_nope_width = input
+            .heads
+            .checked_mul(input.nope_dim)
+            .context("GLM MLA fused no-PE query width overflow")?;
+        let query_rope_width = input
+            .heads
+            .checked_mul(input.rope_dim)
+            .context("GLM MLA fused rotary-query width overflow")?;
+        let previous_records = input
+            .previous_record_latents
+            .len()
+            .checked_div(input.latent_rank.max(1))
+            .context("GLM MLA fused previous-record count division failed")?;
+        let sequence = previous_records
+            .checked_add(1)
+            .context("GLM MLA fused sequence overflow")?;
+        let record_latent_width = sequence
+            .checked_mul(input.latent_rank)
+            .context("GLM MLA fused latent-record width overflow")?;
+        let record_rotary_width = sequence
+            .checked_mul(input.rope_dim)
+            .context("GLM MLA fused rotary-record width overflow")?;
+        let absorbed_width = input
+            .heads
+            .checked_mul(input.latent_rank)
+            .context("GLM MLA fused absorbed-query width overflow")?;
+        let score_count = input
+            .heads
+            .checked_mul(sequence)
+            .context("GLM MLA fused score count overflow")?;
+        let prepare_count = query_nope_width
+            .checked_add(query_rope_width)
+            .and_then(|values| values.checked_add(input.latent_rank))
+            .and_then(|values| values.checked_add(input.rope_dim))
+            .context("GLM MLA fused preparation width overflow")?;
+        let output_rows_per_head = unembed_out
+            .rows
+            .checked_div(input.heads.max(1))
+            .context("GLM MLA fused output rows-per-head division failed")?;
+        let scale_bias_is_bf16 = |projection: &DenseQ4MmapMatvecProjection| {
+            projection
+                .scale_bias_dtype
+                .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+        };
+        if input.heads == 0
+            || input.latent_rank == 0
+            || input.nope_dim == 0
+            || input.rope_dim == 0
+            || !input.rope_dim.is_multiple_of(2)
+            || !input.latent_rank.is_multiple_of(16)
+            || !input.scale.is_finite()
+            || !norm_epsilon.is_finite()
+            || norm_epsilon <= 0.0
+            || q_a.rows() != q_a.output_width()
+            || kv_a.rows() != input.latent_rank + input.rope_dim
+            || kv_a.output_width() != input.latent_rank + input.rope_dim
+            || q_b.rows() != query_width
+            || q_b.output_width() != query_width
+            || q_norm_weight.len() != q_a.output_width()
+            || kv_norm_weight.len() != input.latent_rank
+            || embed_q.rows != absorbed_width
+            || embed_q.output_width != absorbed_width
+            || embed_q.cols != input.nope_dim
+            || !scale_bias_is_bf16(embed_q)
+            || unembed_out.rows == 0
+            || unembed_out.rows % input.heads != 0
+            || unembed_out.output_width != unembed_out.rows
+            || unembed_out.cols != input.latent_rank
+            || !output_rows_per_head.is_multiple_of(16)
+            || !scale_bias_is_bf16(unembed_out)
+            || input.previous_record_latents.len()
+                != previous_records.saturating_mul(input.latent_rank)
+            || input.previous_record_rotary.len() != previous_records.saturating_mul(input.rope_dim)
+            || input.rope_cos.len() != input.rope_dim / 2
+            || input.rope_sin.len() != input.rope_dim / 2
+        {
+            bail!(
+                "GLM MLA fused Metal attention has incompatible shapes q_a={}x{} output={} kv_a={}x{} output={} q_b={}x{} output={} embed={}x{} output={} unembed={}x{} output={} heads={} latent={} nope={} rope={} previous_latents={} previous_rotary={} cos={} sin={} q_norm={} kv_norm={} scale={} epsilon={norm_epsilon}",
+                q_a.rows(),
+                q_a.cols(),
+                q_a.output_width(),
+                kv_a.rows(),
+                kv_a.cols(),
+                kv_a.output_width(),
+                q_b.rows(),
+                q_b.cols(),
+                q_b.output_width(),
+                embed_q.rows,
+                embed_q.cols,
+                embed_q.output_width,
+                unembed_out.rows,
+                unembed_out.cols,
+                unembed_out.output_width,
+                input.heads,
+                input.latent_rank,
+                input.nope_dim,
+                input.rope_dim,
+                input.previous_record_latents.len(),
+                input.previous_record_rotary.len(),
+                input.rope_cos.len(),
+                input.rope_sin.len(),
+                q_norm_weight.len(),
+                kv_norm_weight.len(),
+                input.scale,
+            );
+        }
+
+        let mut record_latents = Vec::with_capacity(record_latent_width);
+        record_latents.extend_from_slice(input.previous_record_latents);
+        record_latents.resize(record_latent_width, 0.0);
+        let mut record_rotary = Vec::with_capacity(record_rotary_width);
+        record_rotary.extend_from_slice(input.previous_record_rotary);
+        record_rotary.resize(record_rotary_width, 0.0);
+
+        unsafe {
+            let mut buffers = Vec::with_capacity(17);
+            let input_buffer = match input.input {
+                MetalBatchProjectionInput::Cpu(values) => self.buffers.tracked_buffer_with_bytes(
+                    self.runtime.device,
+                    f32_as_bytes(values),
+                    &mut buffers,
+                )?,
+                MetalBatchProjectionInput::Buffer { buffer, .. } => buffer,
+            };
+            let q_a_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                q_a.rows() * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let kv_a_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                kv_a.rows() * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let query_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                query_width * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let q_norm_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(q_norm_weight),
+                &mut buffers,
+            )?;
+            let kv_norm_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(kv_norm_weight),
+                &mut buffers,
+            )?;
+            let query_nope_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                query_nope_width * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let query_rope_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                query_rope_width * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let record_latents_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(&record_latents),
+                &mut buffers,
+            )?;
+            let record_rotary_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(&record_rotary),
+                &mut buffers,
+            )?;
+            let rope_cos_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(input.rope_cos),
+                &mut buffers,
+            )?;
+            let rope_sin_buffer = self.buffers.tracked_buffer_with_bytes(
+                self.runtime.device,
+                f32_as_bytes(input.rope_sin),
+                &mut buffers,
+            )?;
+            let absorbed_queries_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                absorbed_width * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let scores_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                score_count * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let contexts_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                absorbed_width * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+            let output_buffer = self.buffers.tracked_buffer_with_len(
+                self.runtime.device,
+                unembed_out.rows * std::mem::size_of::<f32>(),
+                &mut buffers,
+            )?;
+
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Flash-MoE fused GLM MLA command buffer",
+                "failed to create Flash-MoE fused GLM MLA compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            let encode_result = (|| -> Result<()> {
+                encode_resident_projection(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    q_a,
+                    input_buffer,
+                    q_a_buffer,
+                    0,
+                )?;
+                encode_resident_projection(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    kv_a,
+                    input_buffer,
+                    kv_a_buffer,
+                    0,
+                )?;
+
+                let q_rank = u32::try_from(q_a.output_width())
+                    .context("GLM MLA fused Q LoRA rank does not fit u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.rms_norm_reduced_pipeline,
+                );
+                set_buffer(encoder, q_a_buffer, 0);
+                set_buffer(encoder, q_norm_buffer, 1);
+                set_buffer(encoder, q_a_buffer, 2);
+                set_bytes(encoder, u32_as_bytes(&q_rank), 3);
+                set_bytes(
+                    encoder,
+                    f32_as_bytes(std::slice::from_ref(&norm_epsilon)),
+                    4,
+                );
+                dispatch_single_threadgroup(encoder, 256);
+
+                let latent_rank = u32::try_from(input.latent_rank)
+                    .context("GLM MLA fused latent rank does not fit u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.rms_norm_reduced_pipeline,
+                );
+                set_buffer(encoder, kv_a_buffer, 0);
+                set_buffer(encoder, kv_norm_buffer, 1);
+                set_buffer(encoder, kv_a_buffer, 2);
+                set_bytes(encoder, u32_as_bytes(&latent_rank), 3);
+                set_bytes(
+                    encoder,
+                    f32_as_bytes(std::slice::from_ref(&norm_epsilon)),
+                    4,
+                );
+                dispatch_single_threadgroup(encoder, 256);
+
+                encode_resident_projection(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    q_b,
+                    q_a_buffer,
+                    query_buffer,
+                    0,
+                )?;
+
+                let heads =
+                    u32::try_from(input.heads).context("GLM MLA fused heads do not fit u32")?;
+                let nope_dim = u32::try_from(input.nope_dim)
+                    .context("GLM MLA fused no-PE dim does not fit u32")?;
+                let rope_dim = u32::try_from(input.rope_dim)
+                    .context("GLM MLA fused RoPE dim does not fit u32")?;
+                let sequence =
+                    u32::try_from(sequence).context("GLM MLA fused sequence does not fit u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.glm_mla_prepare_query_kv_pipeline,
+                );
+                set_buffer(encoder, query_buffer, 0);
+                set_buffer(encoder, kv_a_buffer, 1);
+                set_buffer(encoder, query_nope_buffer, 2);
+                set_buffer(encoder, query_rope_buffer, 3);
+                set_buffer(encoder, record_latents_buffer, 4);
+                set_buffer(encoder, record_rotary_buffer, 5);
+                set_buffer(encoder, rope_cos_buffer, 6);
+                set_buffer(encoder, rope_sin_buffer, 7);
+                set_bytes(encoder, u32_as_bytes(&heads), 8);
+                set_bytes(encoder, u32_as_bytes(&nope_dim), 9);
+                set_bytes(encoder, u32_as_bytes(&rope_dim), 10);
+                set_bytes(encoder, u32_as_bytes(&latent_rank), 11);
+                set_bytes(encoder, u32_as_bytes(&sequence), 12);
+                dispatch_threads(encoder, prepare_count as u64);
+
+                encode_q4_mmap_multilinear(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    embed_q,
+                    query_nope_buffer,
+                    absorbed_queries_buffer,
+                    input.latent_rank,
+                )?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.glm_mla_absorbed_scores_pipeline,
+                );
+                set_buffer(encoder, absorbed_queries_buffer, 0);
+                set_buffer(encoder, query_rope_buffer, 1);
+                set_buffer(encoder, record_latents_buffer, 2);
+                set_buffer(encoder, record_rotary_buffer, 3);
+                set_buffer(encoder, scores_buffer, 4);
+                set_bytes(encoder, u32_as_bytes(&heads), 5);
+                set_bytes(encoder, u32_as_bytes(&latent_rank), 6);
+                set_bytes(encoder, u32_as_bytes(&rope_dim), 7);
+                set_bytes(encoder, u32_as_bytes(&sequence), 8);
+                set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&input.scale)), 9);
+                dispatch_threads(encoder, score_count as u64);
+
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.glm_mla_softmax_pipeline,
+                );
+                set_buffer(encoder, scores_buffer, 0);
+                set_bytes(encoder, u32_as_bytes(&heads), 1);
+                set_bytes(encoder, u32_as_bytes(&sequence), 2);
+                dispatch_threads(encoder, input.heads as u64);
+
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.glm_mla_context_pipeline,
+                );
+                set_buffer(encoder, scores_buffer, 0);
+                set_buffer(encoder, record_latents_buffer, 1);
+                set_buffer(encoder, contexts_buffer, 2);
+                set_bytes(encoder, u32_as_bytes(&heads), 3);
+                set_bytes(encoder, u32_as_bytes(&latent_rank), 4);
+                set_bytes(encoder, u32_as_bytes(&sequence), 5);
+                dispatch_threads(encoder, absorbed_width as u64);
+
+                encode_q4_mmap_multilinear(
+                    &self.pipelines,
+                    encoder,
+                    dense_weights,
+                    unembed_out,
+                    contexts_buffer,
+                    output_buffer,
+                    output_rows_per_head,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = encode_result {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, true);
+                return Err(error);
+            }
+            encoding.end_encoding();
+
+            let context = MetalCommandContext::new("glm_mla_fused_attention")
+                .with("input_len", input_len)
+                .with("heads", input.heads)
+                .with("latent_rank", input.latent_rank)
+                .with("rope_dim", input.rope_dim)
+                .with("sequence", sequence);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            let attention = read_f32_buffer(output_buffer, unembed_out.rows);
+            let latent = read_f32_buffer(kv_a_buffer, input.latent_rank);
+            let rotary = read_f32_buffer_offset(
+                record_rotary_buffer,
+                previous_records * input.rope_dim,
+                input.rope_dim,
+            );
+            drop(encoding);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some(MetalGlmMlaFusedAttentionOutput {
+                attention,
+                latent,
+                rotary,
+            }))
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn execute_q4_multilinear(
         &self,
@@ -6515,6 +7023,16 @@ pub(crate) unsafe fn read_f32_buffer(buffer: MetalObjcId, len: usize) -> Vec<f32
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn read_f32_buffer_offset(buffer: MetalObjcId, offset: usize, len: usize) -> Vec<f32> {
+    unsafe {
+        let contents = msg_send_ptr0(buffer, sel("contents")).cast::<f32>();
+        let mut output = vec![0.0f32; len];
+        ptr::copy_nonoverlapping(contents.add(offset), output.as_mut_ptr(), len);
+        output
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn write_f32_buffer(buffer: MetalObjcId, values: &[f32]) {
     unsafe {
         let contents = msg_send_ptr0(buffer, sel("contents"));
@@ -7985,6 +8503,59 @@ kernel void attention_scores(
     scores[token] = acc * rsqrt(float(max(head_dim, 1u)));
 }
 
+kernel void glm_mla_prepare_query_kv(
+    device const float* query [[buffer(0)]],
+    device const float* compressed [[buffer(1)]],
+    device float* query_nope [[buffer(2)]],
+    device float* query_rope [[buffer(3)]],
+    device float* record_latents [[buffer(4)]],
+    device float* record_rotary [[buffer(5)]],
+    device const float* rope_cos [[buffer(6)]],
+    device const float* rope_sin [[buffer(7)]],
+    constant uint& heads [[buffer(8)]],
+    constant uint& nope_dim [[buffer(9)]],
+    constant uint& rope_dim [[buffer(10)]],
+    constant uint& latent_rank [[buffer(11)]],
+    constant uint& sequence [[buffer(12)]],
+    uint index [[thread_position_in_grid]]) {
+    uint nope_values = heads * nope_dim;
+    uint query_rope_values = heads * rope_dim;
+    uint rope_half = rope_dim / 2;
+    if (index < nope_values) {
+        uint head = index / nope_dim;
+        uint dim = index - head * nope_dim;
+        query_nope[index] = query[head * (nope_dim + rope_dim) + dim];
+        return;
+    }
+    uint section = index - nope_values;
+    if (section < query_rope_values) {
+        uint head = section / rope_dim;
+        uint dim = section - head * rope_dim;
+        uint pair = dim < rope_half ? dim : dim - rope_half;
+        uint input_offset = head * (nope_dim + rope_dim) + nope_dim + pair * 2;
+        float a = query[input_offset];
+        float b = query[input_offset + 1];
+        query_rope[section] = dim < rope_half
+            ? a * rope_cos[pair] - b * rope_sin[pair]
+            : b * rope_cos[pair] + a * rope_sin[pair];
+        return;
+    }
+    section -= query_rope_values;
+    if (section < latent_rank) {
+        record_latents[(sequence - 1) * latent_rank + section] = compressed[section];
+        return;
+    }
+    section -= latent_rank;
+    if (section < rope_dim) {
+        uint pair = section < rope_half ? section : section - rope_half;
+        float a = compressed[latent_rank + pair * 2];
+        float b = compressed[latent_rank + pair * 2 + 1];
+        record_rotary[(sequence - 1) * rope_dim + section] = section < rope_half
+            ? a * rope_cos[pair] - b * rope_sin[pair]
+            : b * rope_cos[pair] + a * rope_sin[pair];
+    }
+}
+
 kernel void glm_mla_absorbed_scores(
     device const float* absorbed_queries [[buffer(0)]],
     device const float* query_rope [[buffer(1)]],
@@ -8983,7 +9554,7 @@ mod tests {
             released,
             [
                 (1..=8).collect::<Vec<_>>(),
-                vec![33, 34, 35, 36],
+                vec![33, 37, 34, 35, 36],
                 vec![24, 25, 26],
                 (9..=16).collect::<Vec<_>>(),
                 vec![18, 19, 27, 28, 20, 21, 29, 30, 22, 23, 31, 32],
@@ -9003,6 +9574,7 @@ mod tests {
             q4_mmap_batch_pipeline: 7,
             q4_mmap_batch_bf16_scale_bias_pipeline: 8,
             q4_mmap_multilinear_bf16_scale_bias_pipeline: 33,
+            glm_mla_prepare_query_kv_pipeline: 37,
             glm_mla_absorbed_scores_pipeline: 34,
             glm_mla_softmax_pipeline: 35,
             glm_mla_context_pipeline: 36,
@@ -9044,6 +9616,7 @@ mod tests {
             q4_mmap_batch_pipeline: id,
             q4_mmap_batch_bf16_scale_bias_pipeline: id,
             q4_mmap_multilinear_bf16_scale_bias_pipeline: id,
+            glm_mla_prepare_query_kv_pipeline: id,
             glm_mla_absorbed_scores_pipeline: id,
             glm_mla_softmax_pipeline: id,
             glm_mla_context_pipeline: id,
@@ -10680,6 +11253,214 @@ mod tests {
             *value *= kv_scale;
         }
         for (actual, expected) in compressed.iter().zip(expected_compressed) {
+            assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn resident_glm_mla_fused_attention_matches_two_command_reference() {
+        fn write_q4_projection(
+            mmap: &mut [u8],
+            offset: &mut usize,
+            name: &str,
+            rows: usize,
+            cols: usize,
+            nibble: impl Fn(usize) -> u8,
+        ) -> DenseQ4MmapMatvecProjection {
+            let packed_byte_offset = *offset;
+            let packed_bytes = rows * cols.div_ceil(2);
+            for row in 0..rows {
+                let value = nibble(row) & 0x0f;
+                mmap[packed_byte_offset + row * cols.div_ceil(2)
+                    ..packed_byte_offset + (row + 1) * cols.div_ceil(2)]
+                    .fill(value | (value << 4));
+            }
+            let scales_byte_offset = packed_byte_offset + packed_bytes;
+            for row in 0..rows {
+                mmap[scales_byte_offset + row * 2..scales_byte_offset + row * 2 + 2]
+                    .copy_from_slice(&0x3f80u16.to_le_bytes());
+            }
+            let biases_byte_offset = scales_byte_offset + rows * 2;
+            mmap[biases_byte_offset..biases_byte_offset + rows * 2].fill(0);
+            *offset = biases_byte_offset + rows * 2;
+            DenseQ4MmapMatvecProjection {
+                tensor_name: name.to_string(),
+                packed_byte_offset: packed_byte_offset as u64,
+                scales_byte_offset: scales_byte_offset as u64,
+                biases_byte_offset: biases_byte_offset as u64,
+                rows,
+                cols,
+                output_width: rows,
+                row_packed_bytes: cols.div_ceil(2),
+                groups_per_row: 1,
+                group_size: cols,
+                scale_bias_dtype: "BF16".to_string(),
+            }
+        }
+
+        let input = (1..=8).map(|value| value as f32).collect::<Vec<_>>();
+        let heads = 2usize;
+        let q_rank = 16usize;
+        let latent_rank = 16usize;
+        let nope_dim = 8usize;
+        let rope_dim = 4usize;
+        let output_per_head = 16usize;
+        let mut mmap = memmap2::MmapMut::map_anon(64 * 1024).unwrap();
+        let mut offset = 0usize;
+        let q_a_q4 = write_q4_projection(&mut mmap, &mut offset, "q_a", q_rank, 8, |row| {
+            (row % 7 + 1) as u8
+        });
+        let kv_a_q4 = write_q4_projection(
+            &mut mmap,
+            &mut offset,
+            "kv_a",
+            latent_rank + rope_dim,
+            8,
+            |row| (row % 5 + 1) as u8,
+        );
+        let q_b_q4 = write_q4_projection(
+            &mut mmap,
+            &mut offset,
+            "q_b",
+            heads * (nope_dim + rope_dim),
+            q_rank,
+            |row| (row % 3 + 1) as u8,
+        );
+        let embed_q = write_q4_projection(
+            &mut mmap,
+            &mut offset,
+            "embed_q",
+            heads * latent_rank,
+            nope_dim,
+            |row| (row % 3 + 1) as u8,
+        );
+        let unembed_out = write_q4_projection(
+            &mut mmap,
+            &mut offset,
+            "unembed_out",
+            heads * output_per_head,
+            latent_rank,
+            |row| (row % 5 + 1) as u8,
+        );
+        let q_a = ResidentMmapMatvecProjection::Q4(q_a_q4);
+        let kv_a = ResidentMmapMatvecProjection::Q4(kv_a_q4);
+        let q_b = ResidentMmapMatvecProjection::Q4(q_b_q4);
+        let mmap = Arc::new(mmap.make_read_only().unwrap());
+        let context = MetalExecutionContext::compile(mmap, 64 * 1024, &[], 1e-6).unwrap();
+        let q_norm = vec![1.0; q_rank];
+        let kv_norm = vec![1.0; latent_rank];
+        let previous_latent = (0..latent_rank)
+            .map(|dim| (dim + 1) as f32 / latent_rank as f32)
+            .collect::<Vec<_>>();
+        let previous_rotary = vec![0.5, -0.25, 0.75, -1.0];
+        let rope_position = 3usize;
+        let theta = 10_000.0f64;
+        let mut rope_cos = Vec::new();
+        let mut rope_sin = Vec::new();
+        for pair in 0..rope_dim / 2 {
+            let frequency = theta.powf(-((2 * pair) as f64) / rope_dim as f64);
+            let (sin, cos) = (rope_position as f64 * frequency).sin_cos();
+            rope_cos.push(cos as f32);
+            rope_sin.push(sin as f32);
+        }
+
+        let (mut query, mut compressed) = context
+            .resident_glm_mla_input_projection_chain(
+                &q_a,
+                &kv_a,
+                &q_b,
+                MetalBatchProjectionInput::Cpu(&input),
+                &q_norm,
+                &kv_norm,
+                latent_rank,
+                1e-6,
+            )
+            .unwrap()
+            .unwrap();
+        for head in 0..heads {
+            let start = head * (nope_dim + rope_dim) + nope_dim;
+            super::super::math::apply_rotary_interleaved_to_split_half(
+                &mut query[start..start + rope_dim],
+                rope_position,
+                rope_dim,
+                theta,
+            )
+            .unwrap();
+        }
+        let mut current_rotary = compressed.split_off(latent_rank);
+        super::super::math::apply_rotary_interleaved_to_split_half(
+            &mut current_rotary,
+            rope_position,
+            rope_dim,
+            theta,
+        )
+        .unwrap();
+        let mut query_nope = Vec::new();
+        let mut query_rope = Vec::new();
+        for head in 0..heads {
+            let start = head * (nope_dim + rope_dim);
+            query_nope.extend_from_slice(&query[start..start + nope_dim]);
+            query_rope.extend_from_slice(&query[start + nope_dim..start + nope_dim + rope_dim]);
+        }
+        let record_latents = [previous_latent.clone(), compressed.clone()].concat();
+        let record_rotary = [previous_rotary.clone(), current_rotary.clone()].concat();
+        let scale = ((nope_dim + rope_dim) as f32).sqrt().recip();
+        let reference = context
+            .resident_glm_mla_absorbed_attention(
+                &embed_q,
+                &unembed_out,
+                MetalGlmMlaAbsorbedAttentionInput {
+                    heads,
+                    latent_rank,
+                    query_nope: &query_nope,
+                    query_rope: &query_rope,
+                    record_latents: &record_latents,
+                    record_rotary: &record_rotary,
+                    sequence: 2,
+                    rope_dim,
+                    scale,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let fused = context
+            .resident_glm_mla_fused_attention(
+                &q_a,
+                &kv_a,
+                &q_b,
+                &embed_q,
+                &unembed_out,
+                MetalGlmMlaFusedAttentionInput {
+                    input: MetalBatchProjectionInput::Cpu(&input),
+                    heads,
+                    latent_rank,
+                    nope_dim,
+                    rope_dim,
+                    previous_record_latents: &previous_latent,
+                    previous_record_rotary: &previous_rotary,
+                    rope_cos: &rope_cos,
+                    rope_sin: &rope_sin,
+                    scale,
+                },
+                &q_norm,
+                &kv_norm,
+                1e-6,
+            )
+            .unwrap()
+            .unwrap();
+
+        for (index, (actual, expected)) in fused.attention.iter().zip(&reference).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "attention {index}: actual={actual} expected={expected}"
+            );
+        }
+        for (actual, expected) in fused.latent.iter().zip(&compressed) {
+            assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+        }
+        for (actual, expected) in fused.rotary.iter().zip(&current_rotary) {
             assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
         }
     }

@@ -725,6 +725,35 @@ impl MetalExecutionFacade {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resident_glm_mla_fused_attention(
+        &self,
+        q_a: &ResidentMmapMatvecProjection,
+        kv_a: &ResidentMmapMatvecProjection,
+        q_b: &ResidentMmapMatvecProjection,
+        embed_q: &DenseQ4MmapMatvecProjection,
+        unembed_out: &DenseQ4MmapMatvecProjection,
+        input: MetalGlmMlaFusedAttentionInput<'_>,
+        q_norm_weight: &[f32],
+        kv_norm_weight: &[f32],
+        norm_epsilon: f32,
+    ) -> Result<MetalGlmMlaFusedAttentionOutput> {
+        self.inner
+            .resident_glm_mla_fused_attention(
+                q_a,
+                kv_a,
+                q_b,
+                embed_q,
+                unembed_out,
+                input,
+                q_norm_weight,
+                kv_norm_weight,
+                norm_epsilon,
+            )?
+            .context("FlashMoe required fused GLM MLA attention did not resolve")
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(super) fn resident_mmap_matvec_batch_with_input_buffer(
         &self,
         projections: &[ResidentMmapMatvecProjection],
@@ -1564,6 +1593,61 @@ impl FlashMoeEngine {
             .config
             .glm_mla_norm_epsilon()
             .context("GLM MLA execution requires its projection-norm epsilon")?;
+        let scheduled_attention = self.scheduler.resolve_attention_math(layer, position)?;
+        let scheduled_output =
+            scheduled_attention.resolve_mla_kv_state(FlashMoeMlaKvState::cpu_visible(
+                position,
+                layer,
+                layout.kv_lora_rank,
+                layout.qk_rope_head_dim,
+            ))?;
+        let scheduled_implementation = scheduled_output.implementation();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if scheduled_implementation
+            == ScheduledAttentionMathImplementation::MetalQ4GlmMlaAbsorbedAttention
+        {
+            let records = kv_cache.mla_records(position, layer)?;
+            if records.len() != position {
+                bail!(
+                    "GLM MLA layer {layer} position {position} expected {position} previous cache records, found {}",
+                    records.len()
+                );
+            }
+            let theta = self.config.rope_theta.unwrap_or(10_000.0);
+            let rope_half = layout.qk_rope_head_dim / 2;
+            let mut rope_cos = Vec::with_capacity(rope_half);
+            let mut rope_sin = Vec::with_capacity(rope_half);
+            for pair in 0..rope_half {
+                let frequency = theta.powf(-((2 * pair) as f64) / layout.qk_rope_head_dim as f64);
+                let angle = rope_position.temporal as f64 * frequency;
+                let (sin, cos) = angle.sin_cos();
+                rope_cos.push(cos as f32);
+                rope_sin.push(sin as f32);
+            }
+            let input = deferred_input
+                .map(|input| MetalBatchProjectionInput::Buffer {
+                    buffer: input.buffer(),
+                    len: input.len(),
+                })
+                .unwrap_or(MetalBatchProjectionInput::Cpu(normed));
+            let fused = self.dense.glm_mla_fused_attention_with_metal(
+                &self.metal,
+                layer,
+                layout,
+                input,
+                &q_norm,
+                &kv_norm,
+                norm_epsilon,
+                &records,
+                &rope_cos,
+                &rope_sin,
+            )?;
+            kv_cache.record_mla_kv(position, layer, fused.latent, fused.rotary)?;
+            if let Some(buckets) = attention_buckets {
+                buckets.attention_kernel += subphase_started.elapsed();
+            }
+            return Ok(fused.attention);
+        }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let (mut query, mut compressed) = {
             let input = deferred_input
@@ -1610,15 +1694,6 @@ impl FlashMoeEngine {
             theta,
         )?;
         kv_cache.record_mla_kv(position, layer, compressed, rotary_key)?;
-        let scheduled_attention = self.scheduler.resolve_attention_math(layer, position)?;
-        let scheduled_output =
-            scheduled_attention.resolve_mla_kv_state(FlashMoeMlaKvState::cpu_visible(
-                position,
-                layer,
-                layout.kv_lora_rank,
-                layout.qk_rope_head_dim,
-            ))?;
-        let scheduled_implementation = scheduled_output.implementation();
         if !matches!(
             scheduled_implementation,
             ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption

@@ -18,8 +18,8 @@ use super::math::{q4_dequantize_rows_with_group_size, quantize_q4, softmax_in_pl
 #[cfg(test)]
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
 use super::metal::{
-    MetalBatchProjectionInput, MetalGlmMlaAbsorbedAttentionInput, MetalObjcId as ObjcId,
-    MetalPostAttentionPrep,
+    MetalBatchProjectionInput, MetalGlmMlaAbsorbedAttentionInput, MetalGlmMlaFusedAttentionInput,
+    MetalGlmMlaFusedAttentionOutput, MetalObjcId as ObjcId, MetalPostAttentionPrep,
 };
 use super::model_family::{
     QwenModelConfig, QwenMoeFamily, QwenMoeLayerKind, QwenNormWeightSemantics,
@@ -4539,6 +4539,115 @@ impl DenseStore {
             q_norm_weight,
             kv_norm_weight,
             layout.kv_lora_rank,
+            norm_epsilon,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn glm_mla_fused_attention_with_metal(
+        &self,
+        metal: &MetalExecutionFacade,
+        layer: usize,
+        layout: MlaAttentionLayout,
+        input: MetalBatchProjectionInput<'_>,
+        q_norm_weight: &[f32],
+        kv_norm_weight: &[f32],
+        norm_epsilon: f32,
+        previous_records: &[(&[f32], &[f32])],
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> Result<MetalGlmMlaFusedAttentionOutput> {
+        if layout.kv_projection != MlaKvProjectionLayout::AbsorbedMultiLinear {
+            bail!(
+                "MLA layer {layer} fused Metal execution requires pre-absorbed embed_q/unembed_out weights"
+            );
+        }
+        let q_a_name = attention_tensor_name(layer, "q_a_proj");
+        let kv_a_name = attention_tensor_name(layer, "kv_a_proj_with_mqa");
+        let q_b_name = attention_tensor_name(layer, "q_b_proj");
+        let embed_q_name = attention_tensor_name(layer, "embed_q");
+        let unembed_out_name = attention_tensor_name(layer, "unembed_out");
+        let q_a = self
+            .resident_mmap_projection(&q_a_name, layout.q_lora_rank, input.len())?
+            .with_context(|| format!("missing resident GLM MLA projection {q_a_name}"))?;
+        let kv_a = self
+            .resident_mmap_projection(&kv_a_name, layout.kv_a_width, input.len())?
+            .with_context(|| format!("missing resident GLM MLA projection {kv_a_name}"))?;
+        let q_b = self
+            .resident_mmap_projection(&q_b_name, layout.q_width, layout.q_lora_rank)?
+            .with_context(|| format!("missing resident GLM MLA projection {q_b_name}"))?;
+        let embed_q = self
+            .dense_q4_mmap_multilinear_projection(
+                &embed_q_name,
+                layout.num_heads,
+                layout.kv_lora_rank,
+                layout.qk_nope_head_dim,
+            )?
+            .with_context(|| {
+                format!(
+                    "GLM MLA fused Metal execution requires resident Q4 projection {embed_q_name}"
+                )
+            })?;
+        let unembed_out = self
+            .dense_q4_mmap_multilinear_projection(
+                &unembed_out_name,
+                layout.num_heads,
+                layout.v_head_dim,
+                layout.kv_lora_rank,
+            )?
+            .with_context(|| {
+                format!(
+                    "GLM MLA fused Metal execution requires resident Q4 projection {unembed_out_name}"
+                )
+            })?;
+
+        let mut previous_record_latents = Vec::with_capacity(
+            previous_records
+                .len()
+                .checked_mul(layout.kv_lora_rank)
+                .context("MLA fused previous latent size overflow")?,
+        );
+        let mut previous_record_rotary = Vec::with_capacity(
+            previous_records
+                .len()
+                .checked_mul(layout.qk_rope_head_dim)
+                .context("MLA fused previous rotary size overflow")?,
+        );
+        for (latent, rotary) in previous_records {
+            if latent.len() != layout.kv_lora_rank || rotary.len() != layout.qk_rope_head_dim {
+                bail!(
+                    "MLA layer {layer} previous cache record has latent/rotary widths {}/{}, expected {}/{}",
+                    latent.len(),
+                    rotary.len(),
+                    layout.kv_lora_rank,
+                    layout.qk_rope_head_dim,
+                );
+            }
+            previous_record_latents.extend_from_slice(latent);
+            previous_record_rotary.extend_from_slice(rotary);
+        }
+        let scale = (layout.qk_head_dim as f32).sqrt().recip();
+        metal.resident_glm_mla_fused_attention(
+            &q_a,
+            &kv_a,
+            &q_b,
+            &embed_q,
+            &unembed_out,
+            MetalGlmMlaFusedAttentionInput {
+                input,
+                heads: layout.num_heads,
+                latent_rank: layout.kv_lora_rank,
+                nope_dim: layout.qk_nope_head_dim,
+                rope_dim: layout.qk_rope_head_dim,
+                previous_record_latents: &previous_record_latents,
+                previous_record_rotary: &previous_record_rotary,
+                rope_cos,
+                rope_sin,
+                scale,
+            },
+            q_norm_weight,
+            kv_norm_weight,
             norm_epsilon,
         )
     }

@@ -109,14 +109,15 @@ graph resolution.
   two-dimensional `kv_b_proj` or MLX-LM's equivalent pre-absorbed per-head `embed_q` and
   `unembed_out` tensors; both execute against the same compressed cache without materializing
   per-token keys and values. The capability graph binds MLX's pre-absorbed Q4 multilinear tensors,
+  input `q_a`/`kv_a`/projection-RMSNorm/`q_b`, interleaved-to-split-half RoPE, current-record append,
   causal absorbed scores, softmax, compressed-context reduction, and output unembedding into one
-  ordered Metal command. The compressed-KV records remain scheduler-declared CPU-visible state and
-  are uploaded for that command; the attention result is the only readback. The preceding MLX input
-  chain encodes `q_a`, `kv_a`, both projection
-  RMSNorms, and `q_b` in one ordered Metal command. Only the final query and normalized compressed KV
-  return to CPU for rotary/cache work, avoiding the old intermediate `q_a` readback and command
-  boundary. The fused `kv_b_proj` adapter remains on its declared CPU transpose implementation until
-  it has an equivalent resident kernel; runtime probing does not switch between them.
+  ordered Metal command. The compressed-KV records remain scheduler-declared CPU-visible session
+  state: prior records are uploaded before the command, while the current normalized latent and
+  rotated key return to CPU only after the final attention output is ready. The CPU cache therefore
+  remains authoritative for prefix reuse and session snapshots without an intermediate query/KV
+  readback or a second command submission. The fused `kv_b_proj` adapter remains on its declared CPU
+  transpose implementation until it has an equivalent resident kernel; runtime probing does not
+  switch between them.
 - Sparse layers select experts with sigmoid scores, `e_score_correction_bias` for selection only,
   top-K over the corrected scores, selected raw sigmoid weights normalized when
   `norm_topk_prob=true`, and `routed_scaling_factor` applied after normalization. Qwen softmax
@@ -210,6 +211,26 @@ purge them. The same three-token request remained token-identical as `5 2`.
   transient expert buffers, 60 allocations, 30,012 reuses, and no pressure recovery. Eight
   whole-expert staging allocations were sufficient for the active K=8 width; the 16-buffer bound
   permits size variation without retaining a token- or expert-identity cache.
+
+A fifth pass joined the GLM MLA input projections, exact CPU-precomputed RoPE factors, current
+compressed-KV append, absorbed attention, and output unembedding into one ordered Metal command.
+The CPU compressed-KV cache remains authoritative: previous records are uploaded before submission,
+and the current record is copied back only after the command completes. A focused real-Metal test
+matches the former two-command path's attention output, normalized latent, and rotated key. The same
+three-token request again remained token-identical as `5 2`.
+
+- Against a serial control captured under the same high-I/O conditions, attention fell from `0.725`
+  to `0.502 s/token` and total decode from `3.158` to `2.948 s/token`. Expert I/O was flat at `1.931`
+  versus `1.934 s/token`, isolating a 30.8% attention reduction, 6.6% lower total latency, and a
+  throughput increase from `0.317` to `0.339 tok/s`.
+- A repeat reached `0.345 tok/s` (`2.901 s/token`) with attention at `0.474 s/token` and expert I/O
+  again at `1.935 s/token`. Replacing only that noisy I/O bucket with the fourth pass's best
+  `1.366 s/token` measurement gives `2.332 s/token`, or about `0.429 tok/s`; this remains below the
+  `1 tok/s` objective and identifies expert traffic as the dominant measured bucket.
+- The fused timing is recorded in the attention-kernel bucket because its internal projection,
+  RoPE, attention, and unembedding phases share a single command boundary. The resource ledger
+  reported 66 pooled buffers totaling 171,953,056 bytes, zero transient expert buffers, 66
+  allocations, 30,942 reuses, and no pressure recovery.
 
 ## Scheduled Graph
 

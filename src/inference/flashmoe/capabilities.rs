@@ -394,6 +394,7 @@ impl FlashMoeCapabilityPlan {
                     FlashMoeGraphStage::AttentionMath,
                     &[
                         kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS,
+                        kernels::GLM_MLA_PREPARE_QUERY_KV,
                         kernels::GLM_MLA_ABSORBED_SCORES,
                         kernels::GLM_MLA_SOFTMAX,
                         kernels::GLM_MLA_CONTEXT,
@@ -1027,6 +1028,12 @@ mod tests {
         MetalRuntimeCapabilities::from_pipeline_names(names)
     }
 
+    fn metal_without_glm_mla_prepare_query_kv() -> MetalRuntimeCapabilities {
+        let mut names = MetalPipelineNameSet::new();
+        names.glm_mla_prepare_query_kv = kernels::FILL_ZERO;
+        MetalRuntimeCapabilities::from_pipeline_names(names)
+    }
+
     fn metal_without_residual_rms_norm() -> MetalRuntimeCapabilities {
         let mut names = MetalPipelineNameSet::new();
         names.residual_rms_norm = kernels::FILL_ZERO;
@@ -1586,6 +1593,24 @@ mod tests {
                 .unwrap()
                 .implementation,
             ScheduledAttentionMathImplementation::MetalQ4GlmMlaAbsorbedAttention
+        );
+
+        let missing_prepare = FlashMoeCapabilityPlan::resolve_with_attention_math(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&layout),
+            &attention_layers(&layout),
+            FlashMoeAttentionMathCapability::GlmMlaMetalQ4AbsorbedAttention,
+            Some(metal_without_glm_mla_prepare_query_kv()),
+        )
+        .unwrap_err();
+        assert_eq!(missing_prepare.stage, FlashMoeGraphStage::AttentionMath);
+        assert!(
+            missing_prepare
+                .reason
+                .contains(kernels::GLM_MLA_PREPARE_QUERY_KV),
+            "{missing_prepare}"
         );
 
         for (metal, expected_stage) in [
