@@ -110,12 +110,13 @@ graph resolution.
   `unembed_out` tensors; both execute against the same compressed cache without materializing
   per-token keys and values. The capability graph binds MLX's pre-absorbed Q4 multilinear tensors,
   input `q_a`/`kv_a`/projection-RMSNorm/`q_b`, interleaved-to-split-half RoPE, current-record append,
-  causal absorbed scores, softmax, compressed-context reduction, and output unembedding into one
-  ordered Metal command. The compressed-KV records remain scheduler-declared CPU-visible session
-  state: prior records are uploaded before the command, while the current normalized latent and
-  rotated key return to CPU only after the final attention output is ready. The CPU cache therefore
-  remains authoritative for prefix reuse and session snapshots without an intermediate query/KV
-  readback or a second command submission. The fused `kv_b_proj` adapter remains on its declared CPU
+  causal absorbed scores, softmax, compressed-context reduction, output unembedding, `o_proj`,
+  residual/post-attention RMSNorm, and router projection into one ordered Metal command for sparse
+  layers. The compressed-KV records remain scheduler-declared CPU-visible session state: prior
+  records are uploaded before the command, while the current normalized latent and rotated key
+  return alongside the CPU routing candidates after the command completes. The CPU cache therefore
+  remains authoritative for prefix reuse and session snapshots without intermediate query/KV or
+  attention-output readback and re-upload. The fused `kv_b_proj` adapter remains on its declared CPU
   transpose implementation until it has an equivalent resident kernel; runtime probing does not
   switch between them.
 - Sparse layers select experts with sigmoid scores, `e_score_correction_bias` for selection only,
@@ -231,6 +232,24 @@ three-token request again remained token-identical as `5 2`.
   RoPE, attention, and unembedding phases share a single command boundary. The resource ledger
   reported 66 pooled buffers totaling 171,953,056 bytes, zero transient expert buffers, 66
   allocations, 30,942 reuses, and no pressure recovery.
+
+A sixth pass extended the sparse-layer command through `o_proj`, residual addition, post-attention
+RMSNorm, and router projection. The CPU routing algorithm and correction-bias semantics are
+unchanged, but they now consume logits at the same wait that returns the current compressed-KV
+record. A real-Metal reference test compares routes plus retained residual/normed buffers with the
+former MLA-command-then-CMD2 sequence. The deterministic raw output remained `5 2`.
+
+- In a back-to-back checkpoint/new-binary comparison, total decode fell from `2.487` to
+  `2.059 s/token`, raising throughput from `0.402` to `0.486 tok/s` (20.9%). Expert I/O increased
+  slightly from `1.287` to `1.308 s/token`; replacing only that bucket with the control value gives
+  `2.037 s/token`, or about `0.491 tok/s`.
+- The separate CMD2 combine/norm/router bucket fell from `0.391` to `0.0003 s/token`; the enclosing
+  attention wall bucket also fell from `0.571` to `0.512 s/token`. The fused attention-kernel bucket
+  now includes post-attention projection and routing work and is not additive with the enclosing
+  attention bucket.
+- The resource ledger reported 71 pooled buffers totaling 172,092,064 bytes, zero transient expert
+  buffers, 71 allocations, 30,487 reuses, and no pressure recovery. The five additional small pooled
+  buffers retain no expert identity and remain within the existing general-buffer bound.
 
 ## Scheduled Graph
 

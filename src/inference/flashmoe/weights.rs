@@ -19,7 +19,8 @@ use super::math::{q4_dequantize_rows_with_group_size, quantize_q4, softmax_in_pl
 use super::math::{q4_fma_matvec_with_group_size, rms_norm_with_weight_in_place};
 use super::metal::{
     MetalBatchProjectionInput, MetalGlmMlaAbsorbedAttentionInput, MetalGlmMlaFusedAttentionInput,
-    MetalGlmMlaFusedAttentionOutput, MetalObjcId as ObjcId, MetalPostAttentionPrep,
+    MetalGlmMlaFusedAttentionOutput, MetalGlmMlaPostAttentionInput, MetalObjcId as ObjcId,
+    MetalPostAttentionPrep,
 };
 use super::model_family::{
     QwenModelConfig, QwenMoeFamily, QwenMoeLayerKind, QwenNormWeightSemantics,
@@ -1520,6 +1521,16 @@ pub(super) struct MlaAttentionLayout {
     pub(super) kv_b_width: usize,
     pub(super) attention_output_width: usize,
     pub(super) kv_projection: MlaKvProjectionLayout,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GlmMlaPostAttentionRequest<'a> {
+    pub(super) residual: MetalBatchProjectionInput<'a>,
+    pub(super) post_norm_weight: &'a [f32],
+    pub(super) router_correction_bias: Option<&'a [f32]>,
+    pub(super) experts: usize,
+    pub(super) active_experts: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4557,6 +4568,7 @@ impl DenseStore {
         previous_records: &[(&[f32], &[f32])],
         rope_cos: &[f32],
         rope_sin: &[f32],
+        post_attention: Option<GlmMlaPostAttentionRequest<'_>>,
     ) -> Result<MetalGlmMlaFusedAttentionOutput> {
         if layout.kv_projection != MlaKvProjectionLayout::AbsorbedMultiLinear {
             bail!(
@@ -4601,6 +4613,22 @@ impl DenseStore {
                     "GLM MLA fused Metal execution requires resident Q4 projection {unembed_out_name}"
                 )
             })?;
+        let post_projections = post_attention
+            .map(|post| {
+                let out_proj_name = attention_tensor_name(layer, "o_proj");
+                build_required_cmd2_resident_post_attention_prep_projections(
+                    layer,
+                    post.experts,
+                    &out_proj_name,
+                    layout.attention_output_width,
+                    post.residual.len(),
+                    post.active_experts,
+                    |tensor_name, output_width, input_len| {
+                        self.resident_mmap_projection(tensor_name, output_width, input_len)
+                    },
+                )
+            })
+            .transpose()?;
 
         let mut previous_record_latents = Vec::with_capacity(
             previous_records
@@ -4645,6 +4673,14 @@ impl DenseStore {
                 rope_cos,
                 rope_sin,
                 scale,
+                post_attention: post_attention.zip(post_projections.as_ref()).map(
+                    |(post, projections)| MetalGlmMlaPostAttentionInput {
+                        projections,
+                        residual: post.residual,
+                        post_norm_weight: post.post_norm_weight,
+                        router_correction_bias: post.router_correction_bias,
+                    },
+                ),
             },
             q_norm_weight,
             kv_norm_weight,

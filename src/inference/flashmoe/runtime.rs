@@ -39,6 +39,13 @@ pub(super) enum ExpertPhaseInput {
     MetalPostAttention(MetalPostAttentionPrep),
 }
 
+#[derive(Debug)]
+enum MlaAttentionOutput {
+    Values(Vec<f32>),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    MetalPostAttention(MetalPostAttentionPrep),
+}
+
 impl ScheduledCmd3Input for ExpertPhaseInput {
     fn scheduled_cmd3_input_source(&self) -> ScheduledCmd3InputSource {
         match self {
@@ -1057,8 +1064,43 @@ impl FlashMoeEngine {
                     Vec::new()
                 }
                 ScheduledLayerAttentionImplementation::FullAttentionCpuKv => {
-                    let values = if runtime.is_mla_attention_layer(layer) {
-                        self.mla_attention_output_values(
+                    if runtime.is_mla_attention_layer(layer) {
+                        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                        let mla_output = {
+                            let residual = deferred_residual_input
+                                .map(|input| MetalBatchProjectionInput::Buffer {
+                                    buffer: input.buffer(),
+                                    len: input.len(),
+                                })
+                                .unwrap_or(MetalBatchProjectionInput::Cpu(token_state.hidden()));
+                            let post_norm_weight = self
+                                .model_norm_weight(post_norm_name.as_str(), runtime.width)?
+                                .with_context(|| {
+                                    format!(
+                                        "FlashMoe unsupported fused GLM MLA CMD2 path: missing norm tensor {post_norm_name}"
+                                    )
+                                })?;
+                            let router_correction_bias = self.router_correction_bias(layer)?;
+                            self.mla_attention_output_values(
+                                layer,
+                                &normed,
+                                deferred_attention_input,
+                                kv_cache,
+                                position,
+                                rope_position,
+                                runtime,
+                                Some(GlmMlaPostAttentionRequest {
+                                    residual,
+                                    post_norm_weight: &post_norm_weight,
+                                    router_correction_bias: router_correction_bias.as_deref(),
+                                    experts: self.scheduler.experts_per_layer(),
+                                    active_experts: self.scheduler.active_experts(),
+                                }),
+                                record_detailed_timing.then_some(&mut layer_timing.buckets),
+                            )?
+                        };
+                        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                        let mla_output = self.mla_attention_output_values(
                             layer,
                             &normed,
                             deferred_attention_input,
@@ -1066,10 +1108,26 @@ impl FlashMoeEngine {
                             position,
                             rope_position,
                             runtime,
+                            None,
                             record_detailed_timing.then_some(&mut layer_timing.buckets),
-                        )?
+                        )?;
+                        match mla_output {
+                            MlaAttentionOutput::Values(values) => {
+                                post_attention_values_for_prep =
+                                    Some((attention_tensor_name(layer, "o_proj"), values));
+                            }
+                            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                            MlaAttentionOutput::MetalPostAttention(prep) => {
+                                if deferred_residual_input.is_some()
+                                    && let Some(pending) = pending_for_layer.take()
+                                {
+                                    pending.finish_without_readback()?;
+                                }
+                                early_metal_post_attention_prep = Some(prep);
+                            }
+                        }
                     } else {
-                        self.full_attention_output_values(
+                        let values = self.full_attention_output_values(
                             layer,
                             &normed,
                             deferred_attention_input,
@@ -1078,10 +1136,10 @@ impl FlashMoeEngine {
                             rope_position,
                             runtime,
                             record_detailed_timing.then_some(&mut layer_timing.buckets),
-                        )?
-                    };
-                    post_attention_values_for_prep =
-                        Some((attention_tensor_name(layer, "o_proj"), values));
+                        )?;
+                        post_attention_values_for_prep =
+                            Some((attention_tensor_name(layer, "o_proj"), values));
+                    }
                     Vec::new()
                 }
             };
@@ -1577,8 +1635,9 @@ impl FlashMoeEngine {
         position: usize,
         rope_position: MropePosition,
         runtime: &DenseTransformerRuntime,
+        post_attention: Option<GlmMlaPostAttentionRequest<'_>>,
         mut attention_buckets: Option<&mut FlashMoeTimingBuckets>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<MlaAttentionOutput> {
         let layout = runtime.mla_attention_layout(layer)?;
         let subphase_started = OptionalInstant::now(attention_buckets.is_some());
         let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_a_layernorm");
@@ -1641,12 +1700,20 @@ impl FlashMoeEngine {
                 &records,
                 &rope_cos,
                 &rope_sin,
+                post_attention,
             )?;
             kv_cache.record_mla_kv(position, layer, fused.latent, fused.rotary)?;
             if let Some(buckets) = attention_buckets {
                 buckets.attention_kernel += subphase_started.elapsed();
             }
-            return Ok(fused.attention);
+            return Ok(match fused.terminal {
+                MetalGlmMlaFusedAttentionTerminal::Attention(attention) => {
+                    MlaAttentionOutput::Values(attention)
+                }
+                MetalGlmMlaFusedAttentionTerminal::PostAttention(prep) => {
+                    MlaAttentionOutput::MetalPostAttention(prep)
+                }
+            });
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let (mut query, mut compressed) = {
@@ -1724,7 +1791,7 @@ impl FlashMoeEngine {
         if let Some(buckets) = attention_buckets {
             buckets.attention_kernel += subphase_started.elapsed();
         }
-        Ok(output)
+        Ok(MlaAttentionOutput::Values(output))
     }
 
     fn forward_glm_dense_layer(
@@ -1751,8 +1818,12 @@ impl FlashMoeEngine {
             position,
             rope_position,
             runtime,
+            None,
             buckets.as_deref_mut(),
         )?;
+        let MlaAttentionOutput::Values(attention) = attention else {
+            bail!("dense GLM MLA layer {layer} unexpectedly produced sparse post-attention state")
+        };
         let projection_started = OptionalInstant::now(buckets.is_some());
         let o_name = attention_tensor_name(layer, "o_proj");
         let projected = self

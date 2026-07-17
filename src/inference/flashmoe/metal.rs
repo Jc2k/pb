@@ -126,12 +126,29 @@ pub(crate) struct MetalGlmMlaFusedAttentionInput<'a> {
     pub(crate) rope_cos: &'a [f32],
     pub(crate) rope_sin: &'a [f32],
     pub(crate) scale: f32,
+    pub(crate) post_attention: Option<MetalGlmMlaPostAttentionInput<'a>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetalGlmMlaPostAttentionInput<'a> {
+    pub(crate) projections: &'a Cmd2ResidentPostAttentionPrepProjections,
+    pub(crate) residual: MetalBatchProjectionInput<'a>,
+    pub(crate) post_norm_weight: &'a [f32],
+    pub(crate) router_correction_bias: Option<&'a [f32]>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) enum MetalGlmMlaFusedAttentionTerminal {
+    Attention(Vec<f32>),
+    PostAttention(MetalPostAttentionPrep),
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct MetalGlmMlaFusedAttentionOutput {
-    pub(crate) attention: Vec<f32>,
+    pub(crate) terminal: MetalGlmMlaFusedAttentionTerminal,
     pub(crate) latent: Vec<f32>,
     pub(crate) rotary: Vec<f32>,
 }
@@ -4516,6 +4533,33 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
             .rows
             .checked_div(input.heads.max(1))
             .context("GLM MLA fused output rows-per-head division failed")?;
+        let post_plan = input
+            .post_attention
+            .map(|post| {
+                post.projections.resident_plan(
+                    unembed_out.rows,
+                    post.residual.len(),
+                    post.post_norm_weight.len(),
+                )
+            })
+            .transpose()?;
+        if let (Some(post), Some(plan)) = (input.post_attention, post_plan) {
+            validate_resident_projection(
+                &post.projections.out_proj,
+                unembed_out.rows,
+                dense_weights.len,
+            )?;
+            validate_resident_projection(&post.projections.router, plan.width, dense_weights.len)?;
+            if post
+                .router_correction_bias
+                .is_some_and(|bias| bias.len() != plan.experts)
+            {
+                bail!(
+                    "GLM MLA fused post-attention router correction bias length does not match {} experts",
+                    plan.experts
+                );
+            }
+        }
         let scale_bias_is_bf16 = |projection: &DenseQ4MmapMatvecProjection| {
             projection
                 .scale_bias_dtype
@@ -4592,7 +4636,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
         record_rotary.resize(record_rotary_width, 0.0);
 
         unsafe {
-            let mut buffers = Vec::with_capacity(17);
+            let mut buffers = Vec::with_capacity(24);
             let input_buffer = match input.input {
                 MetalBatchProjectionInput::Cpu(values) => self.buffers.tracked_buffer_with_bytes(
                     self.runtime.device,
@@ -4676,6 +4720,53 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 unembed_out.rows * std::mem::size_of::<f32>(),
                 &mut buffers,
             )?;
+            let post_buffers = if let (Some(post), Some(plan)) = (input.post_attention, post_plan) {
+                let residual_input_buffer = match post.residual {
+                    MetalBatchProjectionInput::Cpu(values) => {
+                        self.buffers.tracked_buffer_with_bytes(
+                            self.runtime.device,
+                            f32_as_bytes(values),
+                            &mut buffers,
+                        )?
+                    }
+                    MetalBatchProjectionInput::Buffer { buffer, .. } => buffer,
+                };
+                let norm_weight_buffer = self.buffers.tracked_buffer_with_bytes(
+                    self.runtime.device,
+                    f32_as_bytes(post.post_norm_weight),
+                    &mut buffers,
+                )?;
+                let projected_buffer = self.buffers.tracked_buffer_with_len(
+                    self.runtime.device,
+                    plan.width * std::mem::size_of::<f32>(),
+                    &mut buffers,
+                )?;
+                let residual_buffer = self.buffers.tracked_buffer_with_len(
+                    self.runtime.device,
+                    plan.width * std::mem::size_of::<f32>(),
+                    &mut buffers,
+                )?;
+                let normed_buffer = self.buffers.tracked_buffer_with_len(
+                    self.runtime.device,
+                    plan.width * std::mem::size_of::<f32>(),
+                    &mut buffers,
+                )?;
+                let router_logits_buffer = self.buffers.tracked_buffer_with_len(
+                    self.runtime.device,
+                    plan.experts * std::mem::size_of::<f32>(),
+                    &mut buffers,
+                )?;
+                Some((
+                    residual_input_buffer,
+                    norm_weight_buffer,
+                    projected_buffer,
+                    residual_buffer,
+                    normed_buffer,
+                    router_logits_buffer,
+                ))
+            } else {
+                None
+            };
 
             let mut encoding = match MetalCommandEncoding::new(
                 self.command_queue,
@@ -4842,6 +4933,55 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                     output_buffer,
                     output_rows_per_head,
                 )?;
+                if let (Some(post), Some(plan), Some(post_buffers)) =
+                    (input.post_attention, post_plan, post_buffers)
+                {
+                    let (
+                        residual_input_buffer,
+                        norm_weight_buffer,
+                        projected_buffer,
+                        residual_buffer,
+                        normed_buffer,
+                        router_logits_buffer,
+                    ) = post_buffers;
+                    encode_resident_projection(
+                        &self.pipelines,
+                        encoder,
+                        dense_weights,
+                        &post.projections.out_proj,
+                        output_buffer,
+                        projected_buffer,
+                        0,
+                    )?;
+                    let width = u32::try_from(plan.width)
+                        .context("GLM MLA fused post-attention width does not fit u32")?;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.pipelines.residual_rms_norm_pipeline,
+                    );
+                    set_buffer(encoder, projected_buffer, 0);
+                    set_buffer(encoder, residual_input_buffer, 1);
+                    set_buffer(encoder, norm_weight_buffer, 2);
+                    set_buffer(encoder, residual_buffer, 3);
+                    set_buffer(encoder, normed_buffer, 4);
+                    set_bytes(encoder, u32_as_bytes(&width), 5);
+                    set_bytes(
+                        encoder,
+                        f32_as_bytes(std::slice::from_ref(&norm_epsilon)),
+                        6,
+                    );
+                    dispatch_single_threadgroup(encoder, 256);
+                    encode_resident_projection(
+                        &self.pipelines,
+                        encoder,
+                        dense_weights,
+                        &post.projections.router,
+                        normed_buffer,
+                        router_logits_buffer,
+                        0,
+                    )?;
+                }
                 Ok(())
             })();
             if let Err(error) = encode_result {
@@ -4864,19 +5004,65 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
                 return Err(error.into());
             }
-            let attention = read_f32_buffer(output_buffer, unembed_out.rows);
             let latent = read_f32_buffer(kv_a_buffer, input.latent_rank);
             let rotary = read_f32_buffer_offset(
                 record_rotary_buffer,
                 previous_records * input.rope_dim,
                 input.rope_dim,
             );
+            let terminal = (|| -> Result<MetalGlmMlaFusedAttentionTerminal> {
+                if let (Some(post), Some(plan), Some(post_buffers)) =
+                    (input.post_attention, post_plan, post_buffers)
+                {
+                    let (_, _, _, residual_buffer, normed_buffer, router_logits_buffer) =
+                        post_buffers;
+                    let router_scores = read_f32_buffer(router_logits_buffer, plan.experts);
+                    let active = if let Some(correction_bias) = post.router_correction_bias {
+                        routing_sigmoid_noaux_top_k(
+                            &router_scores,
+                            correction_bias,
+                            plan.active_count,
+                        )?
+                    } else {
+                        routing_softmax_top_k(&router_scores, plan.active_count)
+                    };
+                    Ok(MetalGlmMlaFusedAttentionTerminal::PostAttention(
+                        MetalPostAttentionPrep::new(
+                            plan.layer,
+                            plan.width,
+                            plan.experts,
+                            active,
+                            residual_buffer,
+                            normed_buffer,
+                        )?,
+                    ))
+                } else {
+                    Ok(MetalGlmMlaFusedAttentionTerminal::Attention(
+                        read_f32_buffer(output_buffer, unembed_out.rows),
+                    ))
+                }
+            })();
             drop(encoding);
+            let terminal = match terminal {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, false);
+                    return Err(error);
+                }
+            };
+            let retained = match &terminal {
+                MetalGlmMlaFusedAttentionTerminal::Attention(_) => None,
+                MetalGlmMlaFusedAttentionTerminal::PostAttention(prep) => {
+                    Some((prep.residual_buffer, prep.normed_buffer))
+                }
+            };
             for buffer in buffers {
-                self.recycle(buffer);
+                if retained.is_none_or(|retained| buffer != retained.0 && buffer != retained.1) {
+                    self.recycle(buffer);
+                }
             }
             Ok(Some(MetalGlmMlaFusedAttentionOutput {
-                attention,
+                terminal,
                 latent,
                 rotary,
             }))
@@ -11344,6 +11530,32 @@ mod tests {
             latent_rank,
             |row| (row % 5 + 1) as u8,
         );
+        let out_proj = ResidentMmapMatvecProjection::Q4(write_q4_projection(
+            &mut mmap,
+            &mut offset,
+            "o_proj",
+            16,
+            heads * output_per_head,
+            |row| (row % 3 + 1) as u8,
+        ));
+        let router = ResidentMmapMatvecProjection::Q4(write_q4_projection(
+            &mut mmap,
+            &mut offset,
+            "router",
+            4,
+            16,
+            |row| (row % 4 + 1) as u8,
+        ));
+        let post_projections = Cmd2ResidentPostAttentionPrepProjections::new(
+            3,
+            out_proj,
+            router,
+            4,
+            16,
+            heads * output_per_head,
+            2,
+        )
+        .unwrap();
         let q_a = ResidentMmapMatvecProjection::Q4(q_a_q4);
         let kv_a = ResidentMmapMatvecProjection::Q4(kv_a_q4);
         let q_b = ResidentMmapMatvecProjection::Q4(q_b_q4);
@@ -11443,6 +11655,7 @@ mod tests {
                     rope_cos: &rope_cos,
                     rope_sin: &rope_sin,
                     scale,
+                    post_attention: None,
                 },
                 &q_norm,
                 &kv_norm,
@@ -11451,7 +11664,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        for (index, (actual, expected)) in fused.attention.iter().zip(&reference).enumerate() {
+        let MetalGlmMlaFusedAttentionTerminal::Attention(fused_attention) = &fused.terminal else {
+            panic!("reference-only fused MLA test unexpectedly produced post-attention state")
+        };
+        for (index, (actual, expected)) in fused_attention.iter().zip(&reference).enumerate() {
             assert!(
                 (actual - expected).abs() < 1e-3,
                 "attention {index}: actual={actual} expected={expected}"
@@ -11462,6 +11678,77 @@ mod tests {
         }
         for (actual, expected) in fused.rotary.iter().zip(&current_rotary) {
             assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+        }
+
+        let residual = (0..16)
+            .map(|index| (index as f32 - 7.0) / 8.0)
+            .collect::<Vec<_>>();
+        let post_norm = vec![1.0; 16];
+        let correction_bias = vec![0.0, 0.2, -0.1, 0.1];
+        let reference_post = context
+            .resident_post_attention_prep_topk(
+                &post_projections,
+                &reference,
+                MetalBatchProjectionInput::Cpu(&residual),
+                &post_norm,
+                Some(&correction_bias),
+            )
+            .unwrap();
+        let fused_post = context
+            .resident_glm_mla_fused_attention(
+                &q_a,
+                &kv_a,
+                &q_b,
+                &embed_q,
+                &unembed_out,
+                MetalGlmMlaFusedAttentionInput {
+                    input: MetalBatchProjectionInput::Cpu(&input),
+                    heads,
+                    latent_rank,
+                    nope_dim,
+                    rope_dim,
+                    previous_record_latents: &previous_latent,
+                    previous_record_rotary: &previous_rotary,
+                    rope_cos: &rope_cos,
+                    rope_sin: &rope_sin,
+                    scale,
+                    post_attention: Some(MetalGlmMlaPostAttentionInput {
+                        projections: &post_projections,
+                        residual: MetalBatchProjectionInput::Cpu(&residual),
+                        post_norm_weight: &post_norm,
+                        router_correction_bias: Some(&correction_bias),
+                    }),
+                },
+                &q_norm,
+                &kv_norm,
+                1e-6,
+            )
+            .unwrap()
+            .unwrap();
+        let MetalGlmMlaFusedAttentionTerminal::PostAttention(fused_post) = fused_post.terminal
+        else {
+            panic!("fused MLA post-attention test did not produce post-attention state")
+        };
+        assert_eq!(fused_post.active, reference_post.active);
+        unsafe {
+            let reference_residual = read_f32_buffer(reference_post.residual_buffer, 16);
+            let fused_residual = read_f32_buffer(fused_post.residual_buffer, 16);
+            let reference_normed = read_f32_buffer(reference_post.normed_buffer, 16);
+            let fused_normed = read_f32_buffer(fused_post.normed_buffer, 16);
+            for (actual, expected) in fused_residual.iter().zip(reference_residual) {
+                assert!((actual - expected).abs() < 1e-3, "{actual} != {expected}");
+            }
+            for (actual, expected) in fused_normed.iter().zip(reference_normed) {
+                assert!((actual - expected).abs() < 1e-3, "{actual} != {expected}");
+            }
+            for buffer in [
+                reference_post.residual_buffer,
+                reference_post.normed_buffer,
+                fused_post.residual_buffer,
+                fused_post.normed_buffer,
+            ] {
+                context.buffers.recycle(buffer);
+            }
         }
     }
 

@@ -102,12 +102,13 @@ resident; sparse layers reuse the existing expert scheduler and always-active sh
 command. MLA stores a normalized 512-value latent plus a 64-value rotary key per token, with Metal
 projections and a typed weight-absorption stage. For MLX's pre-absorbed Q4 per-head projections,
 `q_a`, `kv_a`, both projection RMSNorms, `q_b`, RoPE, current-record append, causal absorbed scores,
-softmax, latent-context reduction, and output unembedding execute in one ordered Metal command. The
-compressed-KV cache remains authoritative CPU-visible session state: prior records are uploaded
-before the command, and the current normalized latent and rotated key return only after its attention
-output is ready. Fused Colibri `kv_b_proj` weights retain their CPU transpose implementation.
-Sigmoid/noaux routing uses the correction bias only for expert selection and keeps the checkpoint's
-routed scaling factor.
+softmax, latent-context reduction, output unembedding, `o_proj`, residual/post-attention RMSNorm, and
+router projection execute in one ordered Metal command on sparse layers. The compressed-KV cache
+remains authoritative CPU-visible session state: prior records are uploaded before the command, and
+the current normalized latent and rotated key return with the CPU routing candidates after it
+completes. Fused Colibri `kv_b_proj` weights retain their CPU transpose implementation. Sigmoid/noaux
+routing uses the correction bias only for expert selection and keeps the checkpoint's routed scaling
+factor.
 
 **Design record.** DSA sparse attention and the MTP speculative head remain follow-on typed
 implementations. Until DSA ships, GLM requests beyond `index_topk` fail rather than silently using a
