@@ -232,6 +232,8 @@ impl MetalLinearAttentionLayerState {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const METAL_REUSABLE_BUFFER_POOL_LIMIT: usize = 64;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const METAL_REUSABLE_EXPERT_STAGING_POOL_LIMIT: usize = 16;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const METAL_WORKING_SET_HEADROOM_PERCENT: usize = 10;
@@ -613,6 +615,7 @@ impl MetalReusableBuffer {
 #[derive(Debug)]
 pub(crate) struct MetalBufferPool {
     reusable: Mutex<Vec<MetalReusableBuffer>>,
+    reusable_expert_staging: Mutex<Vec<MetalReusableBuffer>>,
     resources: Arc<MetalResourceLedger>,
 }
 
@@ -628,6 +631,7 @@ impl MetalBufferPool {
     fn new(resources: Arc<MetalResourceLedger>) -> Self {
         Self {
             reusable: Mutex::new(Vec::new()),
+            reusable_expert_staging: Mutex::new(Vec::new()),
             resources,
         }
     }
@@ -651,7 +655,7 @@ impl MetalBufferPool {
         class: MetalTrackedBufferClass,
     ) -> anyhow::Result<MetalObjcId> {
         unsafe {
-            {
+            if class != MetalTrackedBufferClass::TransientExpert {
                 let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
                 if let Some(index) = best_fit_reusable_buffer_index(&reusable, len) {
                     let buffer = reusable.swap_remove(index);
@@ -737,8 +741,8 @@ impl MetalBufferPool {
 
     fn release_idle_buffers(&self) -> (usize, usize) {
         let mut reusable = self.reusable.lock().expect("metal buffer pool poisoned");
-        let released_buffers = reusable.len();
-        let released_bytes = reusable
+        let mut released_buffers = reusable.len();
+        let mut released_bytes = reusable
             .iter()
             .map(|buffer| buffer.len)
             .fold(0usize, usize::saturating_add);
@@ -746,6 +750,24 @@ impl MetalBufferPool {
             for reusable_buffer in reusable.drain(..) {
                 self.resources.release_buffer(reusable_buffer.id);
                 release(reusable_buffer.id);
+            }
+        }
+        drop(reusable);
+        let mut expert_staging = self
+            .reusable_expert_staging
+            .lock()
+            .expect("metal expert staging pool poisoned");
+        released_buffers = released_buffers.saturating_add(expert_staging.len());
+        released_bytes = released_bytes.saturating_add(
+            expert_staging
+                .iter()
+                .map(|buffer| buffer.len)
+                .fold(0usize, usize::saturating_add),
+        );
+        unsafe {
+            for reusable_buffer in expert_staging.drain(..) {
+                self.resources.release_buffer(reusable_buffer.id);
+                purge_and_release_metal_buffer(reusable_buffer.id);
             }
         }
         (released_buffers, released_bytes)
@@ -770,11 +792,26 @@ impl MetalBufferPool {
         bytes: &[u8],
     ) -> anyhow::Result<MetalObjcId> {
         unsafe {
-            let buffer = self.buffer_with_len_class(
-                device,
-                bytes.len(),
-                MetalTrackedBufferClass::TransientExpert,
-            )?;
+            let buffer = {
+                let mut reusable = self
+                    .reusable_expert_staging
+                    .lock()
+                    .expect("metal expert staging pool poisoned");
+                best_fit_reusable_buffer_index(&reusable, bytes.len()).map(|index| {
+                    let buffer = reusable.swap_remove(index);
+                    self.resources
+                        .transition_buffer(buffer.id, MetalTrackedBufferClass::TransientExpert);
+                    buffer.id
+                })
+            };
+            let buffer = match buffer {
+                Some(buffer) => buffer,
+                None => self.buffer_with_len_class(
+                    device,
+                    bytes.len(),
+                    MetalTrackedBufferClass::TransientExpert,
+                )?,
+            };
             let contents = msg_send_ptr0(buffer, sel("contents"));
             ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
             Ok(buffer)
@@ -842,6 +879,35 @@ impl MetalBufferPool {
         }
     }
 
+    unsafe fn recycle_expert_staging(&self, buffer: MetalObjcId) {
+        unsafe {
+            let len = msg_send_usize0(buffer, sel("length"));
+            let mut reusable = self
+                .reusable_expert_staging
+                .lock()
+                .expect("metal expert staging pool poisoned");
+            if reusable.len() < METAL_REUSABLE_EXPERT_STAGING_POOL_LIMIT {
+                self.resources
+                    .transition_buffer(buffer, MetalTrackedBufferClass::Pooled);
+                reusable.push(MetalReusableBuffer::new(buffer, len));
+                return;
+            }
+            let Some(index) = reusable_buffer_replacement_index(&reusable, len) else {
+                drop(reusable);
+                self.resources.release_buffer(buffer);
+                purge_and_release_metal_buffer(buffer);
+                return;
+            };
+            self.resources
+                .transition_buffer(buffer, MetalTrackedBufferClass::Pooled);
+            let evicted =
+                std::mem::replace(&mut reusable[index], MetalReusableBuffer::new(buffer, len));
+            drop(reusable);
+            self.resources.release_buffer(evicted.id);
+            purge_and_release_metal_buffer(evicted.id);
+        }
+    }
+
     pub(crate) fn recycle_or_release(&self, buffers: &[MetalObjcId], release_only: bool) {
         unsafe {
             for buffer in buffers.iter().copied() {
@@ -864,8 +930,12 @@ impl MetalBufferPool {
         unsafe {
             for buffer in buffers {
                 if buffer.class == MetalPhaseBufferClass::TransientExpert {
-                    self.resources.release_buffer(buffer.id);
-                    purge_and_release_metal_buffer(buffer.id);
+                    if release_only {
+                        self.resources.release_buffer(buffer.id);
+                        purge_and_release_metal_buffer(buffer.id);
+                    } else {
+                        self.recycle_expert_staging(buffer.id);
+                    }
                 } else if release_only {
                     self.resources.release_buffer(buffer.id);
                     release(buffer.id);
@@ -882,6 +952,16 @@ impl MetalBufferPool {
             for buffer in reusable.drain(..) {
                 self.resources.release_buffer(buffer.id);
                 release(buffer.id);
+            }
+        }
+        let expert_staging = self
+            .reusable_expert_staging
+            .get_mut()
+            .expect("metal expert staging pool poisoned");
+        unsafe {
+            for buffer in expert_staging.drain(..) {
+                self.resources.release_buffer(buffer.id);
+                purge_and_release_metal_buffer(buffer.id);
             }
         }
     }
@@ -10849,6 +10929,43 @@ mod tests {
         assert_eq!(buffer.id, id);
         assert_eq!(buffer.len, 4096);
         assert_eq!(METAL_REUSABLE_BUFFER_POOL_LIMIT, 64);
+        assert_eq!(METAL_REUSABLE_EXPERT_STAGING_POOL_LIMIT, 16);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn metal_expert_staging_pool_reuses_completed_slot_allocation() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let runtime =
+                MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new()).unwrap();
+            let resources = Arc::new(MetalResourceLedger::from_device(runtime.device));
+            let buffers = MetalBufferPool::new(Arc::clone(&resources));
+            let bytes = vec![0x5au8; 64 * 1024];
+
+            let first = buffers
+                .transient_expert_buffer_with_bytes(runtime.device, &bytes)
+                .unwrap();
+            buffers
+                .recycle_or_release_phase(vec![MetalPhaseBuffer::transient_expert(first)], false);
+            let pooled = resources.snapshot();
+            assert_eq!(pooled.transient_expert_buffers, 0);
+            assert_eq!(pooled.pooled_buffers, 1);
+
+            let second = buffers
+                .transient_expert_buffer_with_bytes(runtime.device, &bytes)
+                .unwrap();
+            assert_eq!(second, first);
+            let checked_out = resources.snapshot();
+            assert_eq!(checked_out.transient_expert_buffers, 1);
+            assert_eq!(checked_out.pooled_buffers, 0);
+
+            buffers
+                .recycle_or_release_phase(vec![MetalPhaseBuffer::transient_expert(second)], true);
+            let released = resources.snapshot();
+            assert_eq!(released.transient_expert_buffers, 0);
+            assert_eq!(released.pooled_buffers, 0);
+        });
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

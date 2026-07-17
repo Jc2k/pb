@@ -87,7 +87,9 @@ task containers, services, networks, and ephemeral workspaces remain session-own
 
 **Shipped.** FlashMoe runs supported Qwen MoE families through one typed runtime, resident dense
 weights, scheduler-owned positioned expert reads, reusable whole-expert slots, Metal command
-builders, and the operating-system page cache.
+builders, and the operating-system page cache. Metal expert staging allocations use a separate
+bounded pool whose bytes are overwritten on every checkout; it is allocation reuse rather than an
+expert-identity cache and is drained under working-set pressure.
 
 **Configurable.** GLM-5.2 extends that runtime at typed boundaries. Pull accepts indexed MLX MXFP4
 or unindexed Colibri tensors through source adapters, normalizes either representation into pb's

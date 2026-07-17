@@ -193,6 +193,24 @@ records. The same three-token request remained token-identical as `5 2`.
   leaves a `1.499 s/token` floor, proving that expert traffic alone cannot reach the 1 tok/s goal;
   resident graph/command work remains necessary alongside any future typed storage optimization.
 
+A fourth pass replaced per-layer Metal expert-staging allocation and purge churn with the bounded,
+identity-free staging pool described above. The buffers remain staging allocations: all bytes are
+overwritten on checkout, no expert or layer key survives recycling, and pressure/error paths still
+purge them. The same three-token request remained token-identical as `5 2`.
+
+- Expert compute fell from `0.832` to `0.197 s/token`, a 76.3% reduction. Total decode fell from
+  `4.513` to `2.644 s/token`, raising observed throughput from `0.222` to `0.378 tok/s` (70.3%).
+  The absorbed-attention kernel was effectively unchanged at `0.237` versus `0.238 s/token`, which
+  is the expected control for a staging-allocation change.
+- The whole-run expert-I/O and MLA-input buckets also fell from `1.947` to `1.366 s/token` and from
+  `0.986` to `0.404 s/token`. Those reductions are consistent with removing repeated driver and
+  memory-allocation pressure, but include OS-page-cache and run-to-run effects and are not treated
+  as isolated storage or attention improvements.
+- The post-run resource ledger reported 60 pooled buffers totaling 171,832,752 bytes, zero
+  transient expert buffers, 60 allocations, 30,012 reuses, and no pressure recovery. Eight
+  whole-expert staging allocations were sufficient for the active K=8 width; the 16-buffer bound
+  permits size variation without retaining a token- or expert-identity cache.
+
 ## Scheduled Graph
 
 Every supported variant resolves the same conceptual stages:
@@ -387,11 +405,14 @@ Baseline reviewed on 2026-07-11:
   completion pool drains Metal's committed-command auxiliaries at the layer boundary instead of
   leaving their expert-buffer references alive until the outer token autorelease pool drains.
   Scheduler `pread` expert payloads are copied into transient Metal staging buffers for only the
-  active expert slots. After the command completes, each staging resource is marked purgeable-empty
-  and released instead of entering the general reusable pool. A long-prefill VM profile showed that
-  ordinary release left one 2,654,208-byte IOAccelerator mapping per expert projection binding; the
-  explicit purge removes those mappings at the layer boundary while general phase buffers remain
-  reusable.
+  active expert slots. Successful commands return those allocations to a separate, bounded
+  16-buffer staging pool; every checkout overwrites the whole payload, the pool carries no
+  layer/expert key, and it is not an application expert cache. It cannot enter or evict the general
+  reusable pool. Error cleanup and working-set pressure still mark staging resources purgeable-empty
+  and release them. A long-prefill VM profile showed that unbounded ordinary release left one
+  2,654,208-byte IOAccelerator mapping per expert projection binding; separating and bounding the
+  staging pool limits that mapping set to reusable active-slot capacity while preserving explicit
+  purge on eviction and pressure recovery.
   The session cache removes a non-prefix-matching entry before allocating the replacement KV cache.
   Harness workflow stages intentionally share a logical session id while changing their system
   prompts, so stale planning/review state cannot remain resident throughout a fresh stage prefill
