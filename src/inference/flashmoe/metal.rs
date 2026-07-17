@@ -1164,6 +1164,7 @@ const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_mi
 pub(crate) mod kernels {
     pub(crate) const Q4_FMA_MATVEC: &str = "q4_fma_matvec";
     pub(crate) const Q4_FMA_MATVEC_BF16_SCALE_BIAS: &str = "q4_fma_matvec_bf16_scale_bias";
+    pub(crate) const MXFP4_FMA_MATVEC_E8M0: &str = "mxfp4_fma_matvec_e8m0";
     pub(crate) const Q4_SWIGLU_FUSED: &str = "q4_swiglu_fused";
     pub(crate) const Q4_SWIGLU_FUSED_BF16_SCALE_BIAS: &str = "q4_swiglu_fused_bf16_scale_bias";
     pub(crate) const Q4_MMAP_FMA_MATVEC: &str = "q4_mmap_fma_matvec";
@@ -1243,6 +1244,7 @@ impl MetalRuntimeCapabilities {
 const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::Q4_FMA_MATVEC,
     kernels::Q4_FMA_MATVEC_BF16_SCALE_BIAS,
+    kernels::MXFP4_FMA_MATVEC_E8M0,
     kernels::Q4_SWIGLU_FUSED,
     kernels::Q4_SWIGLU_FUSED_BF16_SCALE_BIAS,
     kernels::Q4_MMAP_FMA_MATVEC,
@@ -1283,6 +1285,7 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
 pub(crate) struct MetalPipelineNameSet {
     pub(crate) q4: &'static str,
     pub(crate) q4_bf16_scale_bias: &'static str,
+    pub(crate) mxfp4_e8m0: &'static str,
     pub(crate) q4_swiglu: &'static str,
     pub(crate) q4_swiglu_bf16_scale_bias: &'static str,
     pub(crate) q4_mmap: &'static str,
@@ -1324,6 +1327,7 @@ impl MetalPipelineNameSet {
         Self {
             q4: kernels::Q4_FMA_MATVEC,
             q4_bf16_scale_bias: kernels::Q4_FMA_MATVEC_BF16_SCALE_BIAS,
+            mxfp4_e8m0: kernels::MXFP4_FMA_MATVEC_E8M0,
             q4_swiglu: kernels::Q4_SWIGLU_FUSED,
             q4_swiglu_bf16_scale_bias: kernels::Q4_SWIGLU_FUSED_BF16_SCALE_BIAS,
             q4_mmap: kernels::Q4_MMAP_FMA_MATVEC,
@@ -1365,6 +1369,7 @@ impl MetalPipelineNameSet {
         vec![
             self.q4,
             self.q4_bf16_scale_bias,
+            self.mxfp4_e8m0,
             self.q4_swiglu,
             self.q4_swiglu_bf16_scale_bias,
             self.q4_mmap,
@@ -1407,6 +1412,7 @@ impl MetalPipelineNameSet {
 pub(crate) struct MetalPipelineSet<T> {
     pub(crate) q4_pipeline: T,
     pub(crate) q4_bf16_scale_bias_pipeline: T,
+    pub(crate) mxfp4_e8m0_pipeline: T,
     pub(crate) q4_swiglu_pipeline: T,
     pub(crate) q4_swiglu_bf16_scale_bias_pipeline: T,
     pub(crate) q4_mmap_pipeline: T,
@@ -1447,6 +1453,7 @@ impl<T: Copy> MetalPipelineSet<T> {
     pub(crate) fn release_with(&self, mut release: impl FnMut(T)) {
         release(self.q4_pipeline);
         release(self.q4_bf16_scale_bias_pipeline);
+        release(self.mxfp4_e8m0_pipeline);
         release(self.q4_swiglu_pipeline);
         release(self.q4_swiglu_bf16_scale_bias_pipeline);
         release(self.q4_mmap_pipeline);
@@ -1681,6 +1688,7 @@ impl MetalRuntime {
             let pipelines = MetalPipelineSet {
                 q4_pipeline: take_pipeline(names.q4),
                 q4_bf16_scale_bias_pipeline: take_pipeline(names.q4_bf16_scale_bias),
+                mxfp4_e8m0_pipeline: take_pipeline(names.mxfp4_e8m0),
                 q4_swiglu_pipeline: take_pipeline(names.q4_swiglu),
                 q4_swiglu_bf16_scale_bias_pipeline: take_pipeline(names.q4_swiglu_bf16_scale_bias),
                 q4_mmap_pipeline: take_pipeline(names.q4_mmap),
@@ -3435,11 +3443,15 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 .context("Metal CMD3 expert groups exceed u32")?;
             let group_size = u32::try_from(payload.group_size)
                 .context("Metal CMD3 expert group size exceeds u32")?;
-            msg_send_void1_id(
-                encoder,
-                sel("setComputePipelineState:"),
-                self.runtime.pipelines.q4_bf16_scale_bias_pipeline,
-            );
+            let pipeline = if payload
+                .scale_bias_dtype
+                .eq_ignore_ascii_case(super::experts::EXPERT_SCALE_DTYPE_E8M0)
+            {
+                self.runtime.pipelines.mxfp4_e8m0_pipeline
+            } else {
+                self.runtime.pipelines.q4_bf16_scale_bias_pipeline
+            };
+            msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
             set_buffer_with_offset(encoder, buffer, source.packed_offset as u64, 0);
             set_buffer(encoder, input, 1);
             set_buffer_with_offset(encoder, buffer, source.scale_offset as u64, 2);
@@ -7950,6 +7962,105 @@ kernel void q4_fma_matvec_bf16_scale_bias(
     }
 }
 
+inline float mxfp4_e2m1_to_float(uchar nibble) {
+    float magnitude;
+    switch (nibble & 0x07) {
+        case 0: magnitude = 0.0f; break;
+        case 1: magnitude = 0.5f; break;
+        case 2: magnitude = 1.0f; break;
+        case 3: magnitude = 1.5f; break;
+        case 4: magnitude = 2.0f; break;
+        case 5: magnitude = 3.0f; break;
+        case 6: magnitude = 4.0f; break;
+        default: magnitude = 6.0f; break;
+    }
+    return (nibble & 0x08) == 0 ? magnitude : -magnitude;
+}
+
+inline float mxfp4_e8m0_to_float(uchar bits) {
+    return exp2(float(int(bits) - 127));
+}
+
+kernel void mxfp4_fma_matvec_e8m0(
+    device const uchar* packed [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device float* output [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& cols [[buffer(6)]],
+    constant uint& groups_per_row [[buffer(7)]],
+    constant uint& group_size [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 8192;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    uint packed_stride = (cols + 1) / 2;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[8192];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) {
+        return;
+    }
+
+    float acc = 0.0f;
+    uint packed_row = row * packed_stride;
+    uint scale_row = row * groups_per_row;
+    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0);
+    if (use_word_path) {
+        device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
+        uint packed_words_per_row = cols / 8;
+        uint word_row = row * packed_words_per_row;
+        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
+            uint word = packed_words[word_row + packed_word];
+            uint col0 = packed_word * 8;
+            uint group = col0 / group_size;
+            float scale = mxfp4_e8m0_to_float(scales[scale_row + group]);
+            float x0 = use_input_cache ? input_cache[col0 + 0] : input[col0 + 0];
+            float x1 = use_input_cache ? input_cache[col0 + 1] : input[col0 + 1];
+            float x2 = use_input_cache ? input_cache[col0 + 2] : input[col0 + 2];
+            float x3 = use_input_cache ? input_cache[col0 + 3] : input[col0 + 3];
+            float x4 = use_input_cache ? input_cache[col0 + 4] : input[col0 + 4];
+            float x5 = use_input_cache ? input_cache[col0 + 5] : input[col0 + 5];
+            float x6 = use_input_cache ? input_cache[col0 + 6] : input[col0 + 6];
+            float x7 = use_input_cache ? input_cache[col0 + 7] : input[col0 + 7];
+            acc += mxfp4_e2m1_to_float(uchar((word >>  0) & 0x0f)) * scale * x0;
+            acc += mxfp4_e2m1_to_float(uchar((word >>  4) & 0x0f)) * scale * x1;
+            acc += mxfp4_e2m1_to_float(uchar((word >>  8) & 0x0f)) * scale * x2;
+            acc += mxfp4_e2m1_to_float(uchar((word >> 12) & 0x0f)) * scale * x3;
+            acc += mxfp4_e2m1_to_float(uchar((word >> 16) & 0x0f)) * scale * x4;
+            acc += mxfp4_e2m1_to_float(uchar((word >> 20) & 0x0f)) * scale * x5;
+            acc += mxfp4_e2m1_to_float(uchar((word >> 24) & 0x0f)) * scale * x6;
+            acc += mxfp4_e2m1_to_float(uchar((word >> 28) & 0x0f)) * scale * x7;
+        }
+    } else {
+        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
+            uchar byte = packed[packed_row + packed_col];
+            uint col0 = packed_col * 2;
+            float x0 = use_input_cache ? input_cache[col0] : input[col0];
+            float scale0 = mxfp4_e8m0_to_float(scales[scale_row + col0 / group_size]);
+            acc += mxfp4_e2m1_to_float(byte & 0x0f) * scale0 * x0;
+            uint col1 = col0 + 1;
+            if (col1 < cols) {
+                float x1 = use_input_cache ? input_cache[col1] : input[col1];
+                float scale1 = mxfp4_e8m0_to_float(scales[scale_row + col1 / group_size]);
+                acc += mxfp4_e2m1_to_float(byte >> 4) * scale1 * x1;
+            }
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        output[row] = sum;
+    }
+}
+
 kernel void q4_swiglu_fused(
     device const uchar* gate_packed [[buffer(0)]],
     device const uchar* up_packed [[buffer(1)]],
@@ -9884,6 +9995,82 @@ mod tests {
         assert_eq!(compiled, required);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn native_mxfp4_matvec_matches_e2m1_e8m0_reference() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let runtime =
+                MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new()).unwrap();
+            let packed = [vec![0x22u8; 16], vec![0x95u8; 16]].concat();
+            let input = (1..=32).map(|value| value as f32).collect::<Vec<_>>();
+            let scales = [127u8, 127u8];
+            let packed_buffer = OwnedMetalObject::new(msg_send_id3_ptr_usize_u64(
+                runtime.device,
+                sel("newBufferWithBytes:length:options:"),
+                packed.as_ptr().cast(),
+                packed.len(),
+                0,
+            ))
+            .unwrap();
+            let input_bytes = f32_as_bytes(&input);
+            let input_buffer = OwnedMetalObject::new(msg_send_id3_ptr_usize_u64(
+                runtime.device,
+                sel("newBufferWithBytes:length:options:"),
+                input_bytes.as_ptr().cast(),
+                input_bytes.len(),
+                0,
+            ))
+            .unwrap();
+            let scale_buffer = OwnedMetalObject::new(msg_send_id3_ptr_usize_u64(
+                runtime.device,
+                sel("newBufferWithBytes:length:options:"),
+                scales.as_ptr().cast(),
+                scales.len(),
+                0,
+            ))
+            .unwrap();
+            let output_buffer = OwnedMetalObject::new(msg_send_id2_usize_u64(
+                runtime.device,
+                sel("newBufferWithLength:options:"),
+                2 * std::mem::size_of::<f32>(),
+                0,
+            ))
+            .unwrap();
+            let mut encoding = MetalCommandEncoding::new(
+                runtime.command_queue,
+                Arc::new(MetalResourceLedger::default()),
+                "failed to create MXFP4 test command buffer",
+                "failed to create MXFP4 test encoder",
+            )
+            .unwrap();
+            let encoder = encoding.encoder();
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                runtime.pipelines.mxfp4_e8m0_pipeline,
+            );
+            set_buffer(encoder, packed_buffer.id(), 0);
+            set_buffer(encoder, input_buffer.id(), 1);
+            set_buffer(encoder, scale_buffer.id(), 2);
+            set_buffer(encoder, output_buffer.id(), 4);
+            for (index, value) in [(5, 2u32), (6, 32), (7, 1), (8, 32)] {
+                set_bytes(encoder, u32_as_bytes(&value), index);
+            }
+            dispatch_q4_threadgroups(encoder, 2);
+            encoding.end_encoding();
+            let (command_buffer, command_lease) = encoding.into_command_buffer();
+            let context = MetalCommandContext::new("native MXFP4 reference test");
+            commit_metal_command_buffer(command_buffer, &context);
+            wait_for_metal_command_buffer(command_buffer, &context).unwrap();
+            let actual = read_f32_buffer(output_buffer.id(), 2);
+            release(command_buffer);
+            drop(command_lease);
+            assert!((actual[0] - 528.0).abs() < 1e-4, "{actual:?}");
+            assert!((actual[1] - 632.0).abs() < 1e-4, "{actual:?}");
+        });
+    }
+
     #[test]
     fn pipeline_set_releases_every_resolved_pipeline() {
         let pipelines = test_pipeline_set();
@@ -9892,7 +10079,7 @@ mod tests {
         assert_eq!(
             released,
             [
-                (1..=8).collect::<Vec<_>>(),
+                vec![1, 2, 38, 3, 4, 5, 6, 7, 8],
                 vec![33, 37, 34, 35, 36],
                 vec![24, 25, 26],
                 (9..=16).collect::<Vec<_>>(),
@@ -9906,6 +10093,7 @@ mod tests {
         MetalPipelineSet {
             q4_pipeline: 1,
             q4_bf16_scale_bias_pipeline: 2,
+            mxfp4_e8m0_pipeline: 38,
             q4_swiglu_pipeline: 3,
             q4_swiglu_bf16_scale_bias_pipeline: 4,
             q4_mmap_pipeline: 5,
@@ -9948,6 +10136,7 @@ mod tests {
         MetalPipelineSet {
             q4_pipeline: id,
             q4_bf16_scale_bias_pipeline: id,
+            mxfp4_e8m0_pipeline: id,
             q4_swiglu_pipeline: id,
             q4_swiglu_bf16_scale_bias_pipeline: id,
             q4_mmap_pipeline: id,

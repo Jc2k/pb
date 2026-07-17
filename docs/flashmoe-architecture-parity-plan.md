@@ -89,25 +89,28 @@ load, prefill, decode, and deterministic text generation through FlashMoe. DSA a
 design-record follow-ons rather than shipped guarantees.
 
 GLM-5.2 support extends the same scheduler and runtime rather than embedding a checkpoint producer
-or adding an alternate engine. Source-specific quantization ends at the pull/cache boundary;
-runtime storage is normalized into pb's typed resident-dense and fixed-slot expert layouts before
+or adding an alternate engine. Source-container concerns end at the pull/cache boundary; concrete
+quantization remains explicit in pb's typed resident-dense and fixed-slot expert layouts before
 graph resolution.
 
 - The preferred source is `mlx-community/GLM-5.2-mxfp4`. Its indexed U32 weights hold low-nibble-
   first E2M1 values and its U8 scales hold E8M0 powers of two for groups of 32. Pull validates that
-  layout, decodes a row at a time, and uses the existing affine-MSE Q4 quantizer to publish the
-  canonical group-64 packed weights with BF16 scale/bias records. Resumable expert validation hashes
-  the exact source weight/scale slice without performing that conversion twice.
+  layout and publishes routed experts without requantization as fixed native-MXFP4 slots. Each
+  projection retains the source E2M1 nibbles and one E8M0 byte per group with no affine bias. The
+  native Metal matvec decodes that typed representation directly; capability resolution fails if
+  its kernel is absent. Resumable expert validation hashes the exact source weight/scale slice, and
+  rejects the E8M0 `0xff` non-finite encoding before publishing a slot.
 - Pull preserves a repository-level `chat_template.jinja` beside the tokenizer. Text rendering uses
   an embedded `tokenizer_config.json` template first and otherwise loads that external template, so
   GLM role/control tokens are applied in ordinary chat generation while `--raw` remains an explicit
   diagnostic completion path.
 - The Colibri adapter remains supported for unindexed `out-*.safetensors`: packed offset-binary int4
   or signed int8 tensors plus F32 `.qs` row/group scales. It preserves int4 nibbles, converts
-  symmetric scales into the same affine records, and preserves int8 input/output precision as
+  symmetric scales into fixed affine-Q4 records, and preserves int8 input/output precision as
   resident BF16.
 - Both adapters publish the normal aligned dense blob and per-layer fixed expert files under the
-  GLM-specific cache version. Runtime code sees the canonical manifest and never parses MXFP4 or
+  GLM-specific cache version. Distinct fixed-MXFP4 and fixed-affine-Q4 metadata bind the runtime
+  kernel without source probing; runtime code sees the canonical manifest and never parses MLX or
   Colibri source containers.
 - Dense attention, embeddings, norms, the first three dense MLPs, and one shared expert per sparse
   layer remain resident. Routed experts use the existing scheduler-owned parallel positioned-read
@@ -142,8 +145,9 @@ graph resolution.
   follow-on typed accelerators and must not silently alter baseline precision, routing, or output.
   Until DSA is implemented, support must report its validated context/correctness boundary rather
   than claiming token-exact long-context parity.
-- Focused validation covers indexed MLX MXFP4 dense and aggregate-expert conversion, exact E2M1 and
-  E8M0 decoding, Colibri int4/int8 import, unindexed shards, logical-shape recovery, MLA weight
+- Focused validation covers indexed MLX MXFP4 dense conversion and aggregate-expert preservation,
+  exact CPU and local-Metal E2M1/E8M0 decoding, malformed E8M0 rejection, metadata resolution,
+  missing-kernel capability failure, Colibri int4/int8 import, unindexed shards, logical-shape recovery, MLA weight
   absorption with fused and pre-absorbed weights, distinct compressed-KV scheduler state, RoPE
   layout, sigmoid/noaux routing, graph capability binding, and sparse-layer expert metadata. Real
   checkpoint evidence covers all 78 decoder layers, 75 streamed sparse layers, first-token sampling,
@@ -347,6 +351,15 @@ used the same deterministic three-token request and preserved the raw output `5 
   (for example, a validated native packed format) or a complete MTP checkpoint that reduces full
   model forwards per accepted token; queue depth, speculative page advice, and duplicate caches are
   closed for this storage layout.
+
+An eleventh pass introduces typed native MXFP4 expert storage for the preferred MLX checkpoint.
+The prior affine conversion expanded each routed expert to 21,233,664 bytes. Preserving the source
+E2M1 weights and group-32 E8M0 scales reduces a slot to 20,054,016 bytes (5.56%), so K=8 across 75
+sparse layers falls from 12,740,198,400 to 12,032,409,600 logical bytes per token. The scheduler's
+parallel positioned reads, reusable whole-slot leases, CMD3 handoff, and OS-page-cache policy are
+unchanged. Focused import, storage, capability, scheduler, CPU projection, and real-Metal kernel
+tests pass; the full-checkpoint cache rebuild and decode measurement remain pending at this
+checkpoint.
 
 ## Scheduled Graph
 
@@ -1151,7 +1164,7 @@ Current capability matrix:
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
 | Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes; load requires the selected policy to equal metadata-resolved slots before capability resolution | Cross-family 12-combination graph matrix, CLI/planning selection and 3x3 policy/layout rejection coverage, storage, scheduler, and local-Metal fixtures; real checkpoint pending |
-| GLM-5.2 | Canonical resident Q4 plus BF16 Colibri input/output / fixed-Q4 slots from layer 3 | Shipped baseline through the unified runtime and expert scheduler; indexed MLX MXFP4 and unindexed Colibri are source adapters, full causal MLA is bounded by `index_topk`, and DSA/MTP are unimplemented | MXFP4 and Colibri import, MLA/RoPE/KV, routing, capability, expert-boundary, all-target, release, full cache build, and real text inference evidence |
+| GLM-5.2 | Canonical resident Q4 plus BF16 Colibri input/output / fixed native-MXFP4 or affine-Q4 slots from layer 3 | Shipped baseline through the unified runtime and expert scheduler; indexed MLX preserves typed E2M1/E8M0 expert storage while unindexed Colibri adapts to affine Q4, full causal MLA is bounded by `index_topk`, and DSA/MTP are unimplemented | Native MXFP4 import/storage/capability/CPU/local-Metal parity plus Colibri import, MLA/RoPE/KV, routing, expert-boundary, all-target, release, prior affine-cache build, and real text inference evidence; native full-cache measurement pending |
 
 Completion evidence:
 
@@ -1162,9 +1175,10 @@ Completion evidence:
 - Qwen3 text Q4 has real deterministic output parity with upstream MLX-LM. Qwen3-VL Q4 has real
   cache/load/text evidence plus a real image request through the typed adapter and shared decoder.
 - Q4/BF16/F16 expert storage has one explicit production policy, separate namespaces, exact source
-  dtype checks, metadata binding before graph construction, and direct 3x3 match/rejection
-  coverage. Dense Q4/BF16/F16/F32 and fixed-Q4/BF16/F16 combinations retain one scheduler/CMD
-  contract with capability and local-Metal reference evidence.
+  dtype checks, metadata binding before graph construction, and direct coverage of affine-Q4,
+  native-MXFP4, BF16, and F16 resolved layouts against every requested policy. Dense
+  Q4/BF16/F16/F32 and fixed-Q4/MXFP4/BF16/F16 combinations retain one scheduler/CMD contract with
+  capability and local-Metal reference evidence.
 - The final Gate 6 suite passed with 684 tests and seven device-dependent tests ignored. Web assets
   and the release binary rebuilt, the required default Qwen3.5 smoke printed `4`, Qwen3 text real
   smokes matched upstream, and Qwen3-VL text and image requests exited successfully.

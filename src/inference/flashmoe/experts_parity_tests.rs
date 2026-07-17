@@ -3,7 +3,9 @@
 use super::*;
 use crate::inference::flashmoe::cache::{build_cache_from_hf_snapshot, build_manifest};
 use crate::inference::flashmoe::math::{q4_fma_matvec, q4_fma_matvec_with_group_size};
-use crate::inference::flashmoe::model_family::{QwenMoeExpertComponentKind, QwenMoeQ4ExpertLayout};
+use crate::inference::flashmoe::model_family::{
+    QwenMoeExpertComponentKind, QwenMoeModelLayout, QwenMoeQ4ExpertLayout,
+};
 use crate::inference::flashmoe::planning::plan_unchecked;
 use crate::inference::flashmoe::test_fixtures::*;
 use crate::inference::flashmoe::text::test_tokenizer_json;
@@ -135,6 +137,7 @@ fn flashmoe_parity_q4_expert_pack_and_mlp_goldens() {
         layout: fixed_q4_test_layout(2, 2, GROUP_SIZE),
         hidden_size: 2,
         intermediate_size: 2,
+        encoding: FixedQ4ExpertEncoding::AffineBf16,
     };
     let fixed_q4 = fixed_q4_payload_from_pbq4_records(0, 1, spec, &records, None).unwrap();
     let intermediate = [silu(gate[0]) * up[0], silu(gate[1]) * up[1]];
@@ -281,6 +284,7 @@ fn pbq4_records_are_adapted_to_fixed_q4_payload() {
         layout,
         hidden_size: 64,
         intermediate_size: 2,
+        encoding: FixedQ4ExpertEncoding::AffineBf16,
     };
     let fixed = fixed_q4_payload_from_pbq4_records(layer, expert, spec, &records, None).unwrap();
 
@@ -442,6 +446,7 @@ fn pbq4_layer_cache_rewrites_to_fixed_q4_slots() {
         layout,
         hidden_size: 64,
         intermediate_size: 2,
+        encoding: FixedQ4ExpertEncoding::AffineBf16,
     };
     assert!(rewrite_pbq4_layer_to_fixed_q4(tmp.path(), layer, 1, spec).unwrap());
     assert!(!rewrite_pbq4_layer_to_fixed_q4(tmp.path(), layer, 1, spec).unwrap());
@@ -988,7 +993,7 @@ fn packer_copies_native_mlx_q4_switch_mlp_experts_without_requantizing() {
 }
 
 #[test]
-fn packer_imports_mlx_mxfp4_switch_mlp_experts_into_canonical_q4_records() {
+fn packer_preserves_mlx_mxfp4_switch_mlp_experts_in_fixed_native_slots() {
     let tmp = tempfile::tempdir().unwrap();
     let snapshot = tmp.path().join(crate::cache_dir_name(GLM52_MODEL));
     fs::create_dir_all(&snapshot).unwrap();
@@ -1082,16 +1087,26 @@ fn packer_imports_mlx_mxfp4_switch_mlp_experts_into_canonical_q4_records() {
     )
     .unwrap();
 
-    let expert0 = read_pbq4_expert_records(&plan.experts_dir, 3, 0).unwrap();
+    let model_layout = QwenMoeModelLayout::from_config(GLM52_MODEL, &config).unwrap();
+    let spec = FixedQ4ExpertSlotSpec::mxfp4_from_model_layout(&model_layout).unwrap();
+    let metadata = read_expert_layer_pack_metadata(&plan.experts_dir, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.format, FIXED_MXFP4_EXPERT_LAYER_FORMAT_V1);
+    assert_eq!(metadata.expert_size, spec.layout.expert_bytes as u64);
+    let store = ExpertSlotStore::open_with_fixed_q4(plan.experts_dir.clone(), spec).unwrap();
+    let mut reads = store.read_many_raw(3, &[0]).unwrap();
+    let expert0 = match reads.remove(0).payload {
+        ExpertRawPayload::FixedQ4(payload) => payload,
+        other => panic!("expected fixed MXFP4 payload, found {other:?}"),
+    };
     let input = [1.0f32; 32];
-    for (suffix, expected) in [
-        ("gate_proj.weight", 32.0),
-        ("up_proj.weight", 64.0),
-        ("down_proj.weight", 16.0),
+    for (projection, expected) in [
+        (ExpertMlpProjection::Gate, 32.0),
+        (ExpertMlpProjection::Up, 64.0),
+        (ExpertMlpProjection::Down, 16.0),
     ] {
-        let record = packed_expert_record_suffix(&expert0, suffix).unwrap();
-        assert_eq!(record.scale_bias_dtype, EXPERT_SCALE_BIAS_DTYPE_BF16);
-        let projected = project_packed_expert_record(record, &input, 32).unwrap();
+        let projected = expert0.project_cpu(projection, &input, 32).unwrap();
         for actual in projected {
             assert_close_with_tolerance(actual, expected, 0.01);
         }
@@ -1136,7 +1151,7 @@ fn native_q4_qwen35_expert_pack_uses_fixed_slot_layout() {
     let (packed, metadata) = build_fixed_native_q4_expert_pack(
         0,
         7,
-        fixed,
+        FixedQ4ExpertSlotSpec::new(fixed, layout.hidden, layout.intermediate).unwrap(),
         vec![
             native_input(
                 "model.layers.0.mlp.experts.7.gate_proj.weight",

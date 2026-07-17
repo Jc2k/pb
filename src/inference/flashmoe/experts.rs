@@ -41,10 +41,12 @@ pub(crate) const PBQ4_EXPERT_MAGIC: &[u8] = b"PBQ4EXPERT ";
 pub(crate) const PBQ4_EXPERT_LAYER_FORMAT_V1: &str = "PBQ4EXPERT_LAYER_V1";
 pub(crate) const PBQ4_EXPERT_LAYER_FORMAT_V2: &str = "PBQ4EXPERT_LAYER_V2";
 pub(crate) const FIXED_Q4_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_Q4_EXPERT_LAYER_V1";
+pub(crate) const FIXED_MXFP4_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_MXFP4_EXPERT_LAYER_V1";
 pub(crate) const FIXED_DENSE_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_DENSE_EXPERT_LAYER_V1";
 const EXPERT_COMPONENT_ALIGNMENT: usize = 4096;
 pub(crate) const EXPERT_SCALE_BIAS_DTYPE_F32: &str = "F32";
 pub(crate) const EXPERT_SCALE_BIAS_DTYPE_BF16: &str = "BF16";
+pub(crate) const EXPERT_SCALE_DTYPE_E8M0: &str = "E8M0";
 pub(crate) const EXPERT_PACK_SCALE_BIAS_DTYPE: &str = EXPERT_SCALE_BIAS_DTYPE_BF16;
 
 pub struct ReusableExpertBytes {
@@ -281,6 +283,21 @@ impl ExpertLayerPackMetadata {
         }
     }
 
+    pub(crate) fn new_fixed_mxfp4(
+        layer: usize,
+        expert_size: u64,
+        experts: usize,
+        packs: Vec<ExpertPackMetadata>,
+    ) -> Self {
+        Self {
+            format: FIXED_MXFP4_EXPERT_LAYER_FORMAT_V1.to_string(),
+            layer,
+            expert_size,
+            experts,
+            packs,
+        }
+    }
+
     pub(crate) fn new_fixed_dense(
         layer: usize,
         expert_size: u64,
@@ -304,6 +321,7 @@ impl ExpertLayerPackMetadata {
         if self.format != PBQ4_EXPERT_LAYER_FORMAT_V1
             && self.format != PBQ4_EXPERT_LAYER_FORMAT_V2
             && self.format != FIXED_Q4_EXPERT_LAYER_FORMAT_V1
+            && self.format != FIXED_MXFP4_EXPERT_LAYER_FORMAT_V1
             && self.format != FIXED_DENSE_EXPERT_LAYER_FORMAT_V1
         {
             bail!(
@@ -938,7 +956,7 @@ impl ExpertLayerStorageFormat {
                 metadata.format.as_str(),
                 PBQ4_EXPERT_LAYER_FORMAT_V1 | PBQ4_EXPERT_LAYER_FORMAT_V2
             ),
-            Self::FixedQ4(_) => metadata.format == FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
+            Self::FixedQ4(spec) => metadata.format == spec.metadata_format(),
             Self::FixedDense(_) => metadata.format == FIXED_DENSE_EXPERT_LAYER_FORMAT_V1,
         }
     }
@@ -952,9 +970,14 @@ impl ExpertLayerStorageFormat {
     ) -> ExpertLayerPackMetadata {
         match self {
             Self::Pbq4Import => ExpertLayerPackMetadata::new(layer, slot_size, experts, packs),
-            Self::FixedQ4(_) => {
-                ExpertLayerPackMetadata::new_fixed_q4(layer, slot_size, experts, packs)
-            }
+            Self::FixedQ4(spec) => match spec.encoding {
+                FixedQ4ExpertEncoding::AffineBf16 => {
+                    ExpertLayerPackMetadata::new_fixed_q4(layer, slot_size, experts, packs)
+                }
+                FixedQ4ExpertEncoding::MlxMxfp4 => {
+                    ExpertLayerPackMetadata::new_fixed_mxfp4(layer, slot_size, experts, packs)
+                }
+            },
             Self::FixedDense(_) => {
                 ExpertLayerPackMetadata::new_fixed_dense(layer, slot_size, experts, packs)
             }
@@ -1082,6 +1105,9 @@ pub(crate) trait AggregateExpertTensor {
     fn aggregate_tensor_name(&self) -> &str;
     fn aggregate_tensor_shape(&self) -> &[usize];
     fn aggregate_tensor_has_native_q4(&self) -> bool;
+    fn aggregate_tensor_is_mxfp4(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) trait ExpertSourceTensor: AggregateExpertTensor {
@@ -1203,19 +1229,45 @@ pub(crate) fn aggregate_native_q4_enabled<T: AggregateExpertTensor>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn fixed_native_q4_aggregate_layout<T: AggregateExpertTensor>(
     aggregate_tensors: &AggregateExpertTensors<'_, T>,
     down: &T,
     layout: AggregateExpertLayout,
 ) -> Result<Option<QwenMoeQ4ExpertLayout>> {
+    Ok(fixed_native_q4_aggregate_spec(aggregate_tensors, down, layout)?.map(|spec| spec.layout))
+}
+
+pub(crate) fn fixed_native_q4_aggregate_spec<T: AggregateExpertTensor>(
+    aggregate_tensors: &AggregateExpertTensors<'_, T>,
+    down: &T,
+    layout: AggregateExpertLayout,
+) -> Result<Option<FixedQ4ExpertSlotSpec>> {
     if !aggregate_native_q4_enabled(aggregate_tensors, down)? {
         return Ok(None);
+    }
+    let mxfp4_count = [
+        aggregate_tensors.gate.tensor.aggregate_tensor_is_mxfp4(),
+        aggregate_tensors.up.tensor.aggregate_tensor_is_mxfp4(),
+        down.aggregate_tensor_is_mxfp4(),
+    ]
+    .into_iter()
+    .filter(|mxfp4| *mxfp4)
+    .count();
+    if mxfp4_count != 0 && mxfp4_count != 3 {
+        bail!("aggregate expert tensors must be all MLX MXFP4 or all affine Q4");
+    }
+    if mxfp4_count == 3 {
+        let fixed = QwenMoeQ4ExpertLayout::fixed_mxfp4(layout.hidden, layout.intermediate, 32)?;
+        return FixedQ4ExpertSlotSpec::new_mxfp4(fixed, layout.hidden, layout.intermediate)
+            .map(Some);
     }
     if !layout.hidden.is_multiple_of(GROUP_SIZE) || !layout.intermediate.is_multiple_of(GROUP_SIZE)
     {
         return Ok(None);
     }
-    QwenMoeQ4ExpertLayout::fixed_bf16(layout.hidden, layout.intermediate, GROUP_SIZE).map(Some)
+    let fixed = QwenMoeQ4ExpertLayout::fixed_bf16(layout.hidden, layout.intermediate, GROUP_SIZE)?;
+    FixedQ4ExpertSlotSpec::new(fixed, layout.hidden, layout.intermediate).map(Some)
 }
 
 pub(crate) fn validate_aggregate_expert_tensor_shape<T: AggregateExpertTensor>(
@@ -1521,6 +1573,7 @@ pub(crate) fn expert_scale_bias_dtype_size(dtype: &str) -> Result<usize> {
     match dtype.to_ascii_uppercase().as_str() {
         EXPERT_SCALE_BIAS_DTYPE_F32 | "FLOAT32" | "FP32" => Ok(4),
         EXPERT_SCALE_BIAS_DTYPE_BF16 | "BFLOAT16" => Ok(2),
+        EXPERT_SCALE_DTYPE_E8M0 => Ok(1),
         other => bail!("unsupported q4 scale/bias dtype {other}"),
     }
 }
@@ -1695,7 +1748,7 @@ pub(crate) fn build_native_q4_expert_pack(
 pub(crate) fn build_fixed_native_q4_expert_pack(
     layer: usize,
     expert: usize,
-    fixed: QwenMoeQ4ExpertLayout,
+    spec: FixedQ4ExpertSlotSpec,
     inputs: Vec<NativeQ4ExpertRecordInput>,
 ) -> Result<(Vec<u8>, ExpertPackMetadata)> {
     if inputs.len() != 3 {
@@ -1710,12 +1763,13 @@ pub(crate) fn build_fixed_native_q4_expert_pack(
                     inputs.len()
                 )
             })?;
+    let fixed = spec.layout;
     let mut out = vec![0u8; fixed.expert_bytes];
     let mut records = Vec::with_capacity(3);
     write_fixed_native_q4_component(
         &mut out,
         &mut records,
-        fixed,
+        spec,
         gate,
         QwenMoeExpertComponentKind::GateWeight,
         QwenMoeExpertComponentKind::GateScale,
@@ -1724,7 +1778,7 @@ pub(crate) fn build_fixed_native_q4_expert_pack(
     write_fixed_native_q4_component(
         &mut out,
         &mut records,
-        fixed,
+        spec,
         up,
         QwenMoeExpertComponentKind::UpWeight,
         QwenMoeExpertComponentKind::UpScale,
@@ -1733,7 +1787,7 @@ pub(crate) fn build_fixed_native_q4_expert_pack(
     write_fixed_native_q4_component(
         &mut out,
         &mut records,
-        fixed,
+        spec,
         down,
         QwenMoeExpertComponentKind::DownWeight,
         QwenMoeExpertComponentKind::DownScale,
@@ -1753,26 +1807,49 @@ pub(crate) fn build_fixed_native_q4_expert_pack(
 fn write_fixed_native_q4_component(
     out: &mut [u8],
     records: &mut Vec<ExpertPackRecord>,
-    layout: QwenMoeQ4ExpertLayout,
+    spec: FixedQ4ExpertSlotSpec,
     input: NativeQ4ExpertRecordInput,
     weight_kind: QwenMoeExpertComponentKind,
     scale_kind: QwenMoeExpertComponentKind,
     bias_kind: QwenMoeExpertComponentKind,
 ) -> Result<()> {
-    let scale_bias_bytes = expert_scale_bias_dtype_size(&input.scale_bias_dtype)?;
-    let scale_bias_len = input
-        .groups
-        .checked_mul(scale_bias_bytes)
-        .context("fixed native q4 expert scale/bias byte length overflow")?;
-    if input.scale_bytes.len() != scale_bias_len || input.bias_bytes.len() != scale_bias_len {
-        bail!(
-            "native q4 expert tensor {} scale/bias bytes {}/{} do not match {} groups of {} bytes",
-            input.tensor,
-            input.scale_bytes.len(),
-            input.bias_bytes.len(),
-            input.groups,
-            scale_bias_bytes
-        );
+    let layout = spec.layout;
+    match spec.encoding {
+        FixedQ4ExpertEncoding::AffineBf16 => {
+            let scale_bias_bytes = expert_scale_bias_dtype_size(&input.scale_bias_dtype)?;
+            let scale_bias_len = input
+                .groups
+                .checked_mul(scale_bias_bytes)
+                .context("fixed native q4 expert scale/bias byte length overflow")?;
+            if input.scale_bytes.len() != scale_bias_len || input.bias_bytes.len() != scale_bias_len
+            {
+                bail!(
+                    "native q4 expert tensor {} scale/bias bytes {}/{} do not match {} groups of {} bytes",
+                    input.tensor,
+                    input.scale_bytes.len(),
+                    input.bias_bytes.len(),
+                    input.groups,
+                    scale_bias_bytes
+                );
+            }
+        }
+        FixedQ4ExpertEncoding::MlxMxfp4 => {
+            if !input
+                .scale_bias_dtype
+                .eq_ignore_ascii_case(EXPERT_SCALE_DTYPE_E8M0)
+                || input.scale_bytes.len() != input.groups
+                || !input.bias_bytes.is_empty()
+            {
+                bail!(
+                    "native MXFP4 expert tensor {} requires one E8M0 byte per group and no bias bytes; found dtype={} scales={} biases={} groups={}",
+                    input.tensor,
+                    input.scale_bias_dtype,
+                    input.scale_bytes.len(),
+                    input.bias_bytes.len(),
+                    input.groups
+                );
+            }
+        }
     }
     let weight = layout.component(weight_kind);
     let scale = layout.component(scale_kind);
@@ -2424,6 +2501,7 @@ pub(crate) struct ExpertSlotStore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpertStorageLayout {
     FixedQ4,
+    FixedMxfp4,
     FixedBf16,
     FixedF16,
 }
@@ -2431,7 +2509,7 @@ pub(crate) enum ExpertStorageLayout {
 impl ExpertStorageLayout {
     fn quantization(self) -> ExpertQuantization {
         match self {
-            Self::FixedQ4 => ExpertQuantization::FourBitProduction,
+            Self::FixedQ4 | Self::FixedMxfp4 => ExpertQuantization::FourBitProduction,
             Self::FixedBf16 => ExpertQuantization::Bf16,
             Self::FixedF16 => ExpertQuantization::F16,
         }
@@ -2440,6 +2518,7 @@ impl ExpertStorageLayout {
     fn as_str(self) -> &'static str {
         match self {
             Self::FixedQ4 => "fixed-Q4",
+            Self::FixedMxfp4 => "fixed-MXFP4",
             Self::FixedBf16 => "fixed-BF16",
             Self::FixedF16 => "fixed-F16",
         }
@@ -2656,6 +2735,7 @@ impl ExpertSlotStore {
             FIXED_Q4_EXPERT_LAYER_FORMAT_V1
             | PBQ4_EXPERT_LAYER_FORMAT_V1
             | PBQ4_EXPERT_LAYER_FORMAT_V2 => ExpertStorageLayout::FixedQ4,
+            FIXED_MXFP4_EXPERT_LAYER_FORMAT_V1 => ExpertStorageLayout::FixedMxfp4,
             FIXED_DENSE_EXPERT_LAYER_FORMAT_V1 => {
                 match resolve_fixed_dense_metadata_dtype(&metadata)? {
                     DenseExpertDtype::Bf16 => ExpertStorageLayout::FixedBf16,
@@ -2668,7 +2748,7 @@ impl ExpertSlotStore {
         };
         validate_requested_expert_storage(&root, resolved_layout, requested_quantization)?;
         let (slot_spec, upgraded_pbq4_layers) = match metadata.format.as_str() {
-            FIXED_Q4_EXPERT_LAYER_FORMAT_V1 => (
+            FIXED_Q4_EXPERT_LAYER_FORMAT_V1 | FIXED_MXFP4_EXPERT_LAYER_FORMAT_V1 => (
                 ExpertSlotSpec::from_model_layout(layout, resolved_layout)?,
                 0,
             ),
@@ -3065,10 +3145,17 @@ pub(crate) fn read_exact_at_positioned(file: &fs::File, buf: &mut [u8], offset: 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FixedQ4ExpertEncoding {
+    AffineBf16,
+    MlxMxfp4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FixedQ4ExpertSlotSpec {
     pub(crate) layout: QwenMoeQ4ExpertLayout,
     pub(crate) hidden_size: usize,
     pub(crate) intermediate_size: usize,
+    pub(crate) encoding: FixedQ4ExpertEncoding,
 }
 
 impl FixedQ4ExpertSlotSpec {
@@ -3087,7 +3174,18 @@ impl FixedQ4ExpertSlotSpec {
             layout,
             hidden_size,
             intermediate_size,
+            encoding: FixedQ4ExpertEncoding::AffineBf16,
         })
+    }
+
+    pub(crate) fn new_mxfp4(
+        layout: QwenMoeQ4ExpertLayout,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<Self> {
+        let mut spec = Self::new(layout, hidden_size, intermediate_size)?;
+        spec.encoding = FixedQ4ExpertEncoding::MlxMxfp4;
+        Ok(spec)
     }
 
     #[cfg(test)]
@@ -3108,6 +3206,28 @@ impl FixedQ4ExpertSlotSpec {
             )
         })?;
         Self::new(q4_layout, layout.hidden_size, layout.moe_intermediate_size)
+    }
+
+    pub(crate) fn mxfp4_from_model_layout(layout: &QwenMoeModelLayout) -> Result<Self> {
+        let q4_layout = QwenMoeQ4ExpertLayout::fixed_mxfp4(
+            layout.hidden_size,
+            layout.moe_intermediate_size,
+            32,
+        )
+        .with_context(|| {
+            format!(
+                "FlashMoe unsupported {:?} fixed-MXFP4 expert storage dimensions",
+                layout.family
+            )
+        })?;
+        Self::new_mxfp4(q4_layout, layout.hidden_size, layout.moe_intermediate_size)
+    }
+
+    pub(crate) const fn metadata_format(self) -> &'static str {
+        match self.encoding {
+            FixedQ4ExpertEncoding::AffineBf16 => FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
+            FixedQ4ExpertEncoding::MlxMxfp4 => FIXED_MXFP4_EXPERT_LAYER_FORMAT_V1,
+        }
     }
 }
 
@@ -3264,6 +3384,9 @@ impl ExpertSlotSpec {
             ExpertStorageLayout::FixedQ4 => {
                 FixedQ4ExpertSlotSpec::from_model_layout(layout).map(Self::FixedQ4)
             }
+            ExpertStorageLayout::FixedMxfp4 => {
+                FixedQ4ExpertSlotSpec::mxfp4_from_model_layout(layout).map(Self::FixedQ4)
+            }
             ExpertStorageLayout::FixedBf16 => {
                 FixedDenseExpertSlotSpec::from_model_layout(layout, DenseExpertDtype::Bf16)
                     .map(Self::FixedDense)
@@ -3277,7 +3400,10 @@ impl ExpertSlotSpec {
 
     pub(crate) const fn storage_layout(self) -> ExpertStorageLayout {
         match self {
-            Self::FixedQ4(_) => ExpertStorageLayout::FixedQ4,
+            Self::FixedQ4(spec) => match spec.encoding {
+                FixedQ4ExpertEncoding::AffineBf16 => ExpertStorageLayout::FixedQ4,
+                FixedQ4ExpertEncoding::MlxMxfp4 => ExpertStorageLayout::FixedMxfp4,
+            },
             Self::FixedDense(spec) => match spec.dtype {
                 DenseExpertDtype::Bf16 => ExpertStorageLayout::FixedBf16,
                 DenseExpertDtype::F16 => ExpertStorageLayout::FixedF16,
@@ -3294,7 +3420,7 @@ impl ExpertSlotSpec {
 
     pub(crate) const fn metadata_format(self) -> &'static str {
         match self {
-            Self::FixedQ4(_) => FIXED_Q4_EXPERT_LAYER_FORMAT_V1,
+            Self::FixedQ4(spec) => spec.metadata_format(),
             Self::FixedDense(_) => FIXED_DENSE_EXPERT_LAYER_FORMAT_V1,
         }
     }
@@ -3434,6 +3560,16 @@ impl FixedQ4ExpertPayload {
         let payload = self
             .matvec_payload(projection, input.len(), output_width)
             .context("fixed Q4 projection metadata is incompatible with input/output shape")?;
+        if self.spec.encoding == FixedQ4ExpertEncoding::MlxMxfp4 {
+            return mxfp4_fma_matvec_with_group_size(
+                payload.packed,
+                &input[..payload.cols],
+                payload.scale_bytes,
+                payload.rows,
+                payload.cols,
+                payload.group_size,
+            );
+        }
         let (scale_kind, bias_kind) = projection.scale_bias_kinds();
         let (owned_scales, owned_biases);
         let (scales, biases) = if payload.scales.len() >= payload.scale_bias_groups
@@ -3513,9 +3649,16 @@ impl FixedQ4ExpertPayload {
                 ),
             ),
         };
+        let (scale_bytes_per_group, bias_bytes_per_group, scale_bias_dtype) =
+            match self.spec.encoding {
+                FixedQ4ExpertEncoding::AffineBf16 => (2, 2, EXPERT_SCALE_BIAS_DTYPE_BF16),
+                FixedQ4ExpertEncoding::MlxMxfp4 => (1, 0, EXPERT_SCALE_DTYPE_E8M0),
+            };
+        let needed_scale_bytes = needed_groups.checked_mul(scale_bytes_per_group)?;
+        let needed_bias_bytes = needed_groups.checked_mul(bias_bytes_per_group)?;
         if packed.len() < needed_packed
-            || scale_bytes.len() < needed_groups * 2
-            || bias_bytes.len() < needed_groups * 2
+            || scale_bytes.len() < needed_scale_bytes
+            || bias_bytes.len() < needed_bias_bytes
         {
             return None;
         }
@@ -3529,9 +3672,9 @@ impl FixedQ4ExpertPayload {
             #[cfg(test)]
             biases: &[],
             scale_bias_groups: needed_groups,
-            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16,
-            scale_bytes: &scale_bytes[..needed_groups * 2],
-            bias_bytes: &bias_bytes[..needed_groups * 2],
+            scale_bias_dtype,
+            scale_bytes: &scale_bytes[..needed_scale_bytes],
+            bias_bytes: &bias_bytes[..needed_bias_bytes],
             source: Some(source),
         })
     }
@@ -3959,6 +4102,56 @@ pub(crate) fn decode_fixed_q4_bf16_component_bytes(bytes: &[u8]) -> Result<Vec<f
         .collect())
 }
 
+#[cfg(test)]
+fn mxfp4_fma_matvec_with_group_size(
+    packed: &[u8],
+    input: &[f32],
+    scales: &[u8],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Result<Vec<f32>> {
+    const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let row_bytes = cols.div_ceil(2);
+    let groups_per_row = cols.div_ceil(group_size);
+    if input.len() < cols
+        || packed.len() < rows.saturating_mul(row_bytes)
+        || scales.len() < rows.saturating_mul(groups_per_row)
+    {
+        bail!("MXFP4 matvec payload is shorter than its declared shape");
+    }
+    let mut output = vec![0.0f32; rows];
+    for (row, value) in output.iter_mut().enumerate() {
+        let mut sum = 0.0f32;
+        for col in 0..cols {
+            let byte = packed[row * row_bytes + col / 2];
+            let nibble = if col.is_multiple_of(2) {
+                byte & 0x0f
+            } else {
+                byte >> 4
+            };
+            let magnitude = MAGNITUDES[(nibble & 0x07) as usize];
+            let weight = if nibble & 0x08 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            };
+            let scale_bits = scales[row * groups_per_row + col / group_size];
+            let scale = if scale_bits == 0 {
+                f32::from_bits(0x0040_0000)
+            } else {
+                f32::from_bits(u32::from(scale_bits) << 23)
+            };
+            if !scale.is_finite() {
+                bail!("MXFP4 E8M0 scale byte 0x{scale_bits:02x} is not finite");
+            }
+            sum += weight * scale * input[col];
+        }
+        *value = sum;
+    }
+    Ok(output)
+}
+
 pub fn take_reusable_expert_bytes(
     pool: &ReusableExpertBytePool,
     min_capacity: usize,
@@ -4255,7 +4448,24 @@ pub(super) fn pack_direct_expert_layer(
     {
         let config = config.context("model config is required for native Q4 expert packing")?;
         let layout = QwenMoeModelLayout::from_config(policy.model, config)?;
-        Some(FixedQ4ExpertSlotSpec::from_model_layout(&layout)?)
+        let sources = experts
+            .values()
+            .flatten()
+            .filter_map(|tensor| tensor.q4_sources.as_ref());
+        let (mxfp4, total) = sources.fold((0usize, 0usize), |(mxfp4, total), source| {
+            (
+                mxfp4 + usize::from(source.source_format == DenseQ4SourceFormat::MlxMxfp4),
+                total + 1,
+            )
+        });
+        if mxfp4 != 0 && mxfp4 != total {
+            bail!("direct expert tensors must be all MLX MXFP4 or all affine Q4");
+        }
+        Some(if mxfp4 == total && total != 0 {
+            FixedQ4ExpertSlotSpec::mxfp4_from_model_layout(&layout)?
+        } else {
+            FixedQ4ExpertSlotSpec::from_model_layout(&layout)?
+        })
     } else {
         None
     };
@@ -4362,10 +4572,11 @@ pub(super) fn build_direct_expert_pack(
                     tensor.shape.clone(),
                     0,
                     tensor.shape.iter().product(),
+                    spec.encoding,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        return build_fixed_native_q4_expert_pack(layer, expert, spec.layout, inputs);
+        return build_fixed_native_q4_expert_pack(layer, expert, spec, inputs);
     }
     let mut inputs = Vec::with_capacity(tensors.len());
     for tensor in tensors {
@@ -4425,6 +4636,7 @@ fn expected_fixed_native_q4_direct_expert_pack(
                 tensor.shape.clone(),
                 0,
                 tensor.shape.iter().product(),
+                spec.encoding,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -4464,7 +4676,7 @@ pub(super) fn pack_aggregate_expert_layer(
         layout.experts
     );
     let fixed_dense = fixed_dense_expert_slot_spec_for_pack(policy, Some(config))?;
-    let fixed_native_q4 = fixed_native_q4_aggregate_layout(&aggregate_tensors, down, layout)?;
+    let fixed_native_q4 = fixed_native_q4_aggregate_spec(&aggregate_tensors, down, layout)?;
     let mut shard_cache = BTreeMap::<String, (memmap2::Mmap, SafetensorShard)>::new();
     let mut expected = Vec::with_capacity(layout.experts);
     for expert in 0..layout.experts {
@@ -4487,11 +4699,14 @@ pub(super) fn pack_aggregate_expert_layer(
                 &aggregate_tensors,
                 down,
                 layout,
+                fixed_native_q4
+                    .map(|spec| spec.encoding)
+                    .unwrap_or(FixedQ4ExpertEncoding::AffineBf16),
             )?,
         };
         let packed_bytes = match (fixed_dense, fixed_native_q4) {
             (Some(spec), _) => spec.expert_bytes as u64,
-            (None, Some(fixed)) => fixed.expert_bytes as u64,
+            (None, Some(spec)) => spec.layout.expert_bytes as u64,
             (None, None) => pbq4_expert_pack_wire_size(&records)?,
         };
         expected.push(ExpectedExpertPack {
@@ -4500,44 +4715,42 @@ pub(super) fn pack_aggregate_expert_layer(
             records,
         });
     }
-    let skipped =
-        rewrite_expert_layer_pack(
-            policy.experts_dir,
-            layer,
-            layout.experts,
-            match (fixed_dense, fixed_native_q4) {
-                (Some(spec), _) => ExpertLayerStorageFormat::FixedDense(spec),
-                (None, Some(fixed)) => ExpertLayerStorageFormat::FixedQ4(
-                    FixedQ4ExpertSlotSpec::new(fixed, layout.hidden, layout.intermediate)?,
-                ),
-                (None, None) => ExpertLayerStorageFormat::Pbq4Import,
-            },
-            &expected,
-            |expert| {
-                if let Some(spec) = fixed_dense {
-                    build_fixed_dense_aggregate_expert_pack(
-                        snapshot_dir,
-                        &mut shard_cache,
-                        layer,
-                        expert,
-                        &aggregate_tensors,
-                        down,
-                        layout,
-                        spec,
-                    )
-                } else {
-                    build_aggregate_expert_pack(
-                        snapshot_dir,
-                        &mut shard_cache,
-                        layer,
-                        expert,
-                        &aggregate_tensors,
-                        down,
-                        layout,
-                    )
-                }
-            },
-        )?;
+    let skipped = rewrite_expert_layer_pack(
+        policy.experts_dir,
+        layer,
+        layout.experts,
+        match (fixed_dense, fixed_native_q4) {
+            (Some(spec), _) => ExpertLayerStorageFormat::FixedDense(spec),
+            (None, Some(spec)) => ExpertLayerStorageFormat::FixedQ4(spec),
+            (None, None) => ExpertLayerStorageFormat::Pbq4Import,
+        },
+        &expected,
+        |expert| {
+            if let Some(spec) = fixed_dense {
+                build_fixed_dense_aggregate_expert_pack(
+                    snapshot_dir,
+                    &mut shard_cache,
+                    layer,
+                    expert,
+                    &aggregate_tensors,
+                    down,
+                    layout,
+                    spec,
+                )
+            } else {
+                build_aggregate_expert_pack(
+                    snapshot_dir,
+                    &mut shard_cache,
+                    layer,
+                    expert,
+                    &aggregate_tensors,
+                    down,
+                    layout,
+                    fixed_native_q4,
+                )
+            }
+        },
+    )?;
     eprintln!(
         "prepared aggregate experts for layer {layer} ({layer_index}/{layer_total}): {}/{} ({skipped} reused)",
         layout.experts, layout.experts,
@@ -4553,6 +4766,7 @@ pub(super) fn build_aggregate_expert_pack(
     aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
+    fixed_native_q4: Option<FixedQ4ExpertSlotSpec>,
 ) -> Result<(Vec<u8>, ExpertPackMetadata)> {
     if aggregate_native_q4_enabled(aggregate_tensors, down)? {
         return build_native_q4_aggregate_expert_pack(
@@ -4563,6 +4777,7 @@ pub(super) fn build_aggregate_expert_pack(
             aggregate_tensors,
             down,
             layout,
+            fixed_native_q4,
         );
     }
 
@@ -4746,6 +4961,7 @@ pub(super) fn expected_aggregate_expert_records(
     aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
+    encoding: FixedQ4ExpertEncoding,
 ) -> Result<Vec<ExpectedExpertPackRecord>> {
     if aggregate_native_q4_enabled(aggregate_tensors, down)? {
         return expected_native_q4_aggregate_expert_records(
@@ -4756,6 +4972,7 @@ pub(super) fn expected_aggregate_expert_records(
             aggregate_tensors,
             down,
             layout,
+            encoding,
         );
     }
 
@@ -4800,7 +5017,11 @@ pub(super) fn build_native_q4_aggregate_expert_pack(
     aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
+    fixed_native_q4: Option<FixedQ4ExpertSlotSpec>,
 ) -> Result<(Vec<u8>, ExpertPackMetadata)> {
+    let encoding = fixed_native_q4
+        .map(|spec| spec.encoding)
+        .unwrap_or(FixedQ4ExpertEncoding::AffineBf16);
     let inputs = vec![
         native_q4_expert_record_input(
             snapshot_dir,
@@ -4810,6 +5031,7 @@ pub(super) fn build_native_q4_aggregate_expert_pack(
             vec![layout.intermediate, layout.hidden],
             aggregate_tensors.gate.start(expert)?,
             layout.single_projection_values,
+            encoding,
         )?,
         native_q4_expert_record_input(
             snapshot_dir,
@@ -4819,6 +5041,7 @@ pub(super) fn build_native_q4_aggregate_expert_pack(
             vec![layout.intermediate, layout.hidden],
             aggregate_tensors.up.start(expert)?,
             layout.single_projection_values,
+            encoding,
         )?,
         native_q4_expert_record_input(
             snapshot_dir,
@@ -4830,10 +5053,11 @@ pub(super) fn build_native_q4_aggregate_expert_pack(
                 .checked_mul(layout.down_expert_values)
                 .context("aggregate down expert offset overflow")?,
             layout.down_expert_values,
+            encoding,
         )?,
     ];
-    if let Some(fixed) = fixed_native_q4_aggregate_layout(aggregate_tensors, down, layout)? {
-        return build_fixed_native_q4_expert_pack(layer, expert, fixed, inputs);
+    if let Some(spec) = fixed_native_q4 {
+        return build_fixed_native_q4_expert_pack(layer, expert, spec, inputs);
     }
     build_native_q4_expert_pack(layer, expert, inputs)
 }
@@ -4846,6 +5070,7 @@ pub(super) fn expected_native_q4_aggregate_expert_records(
     aggregate_tensors: &AggregateExpertTensors<'_, ExpertTensorRef>,
     down: &ExpertTensorRef,
     layout: AggregateExpertLayout,
+    encoding: FixedQ4ExpertEncoding,
 ) -> Result<Vec<ExpectedExpertPackRecord>> {
     Ok(vec![
         expected_native_q4_expert_record(
@@ -4856,6 +5081,7 @@ pub(super) fn expected_native_q4_aggregate_expert_records(
             vec![layout.intermediate, layout.hidden],
             aggregate_tensors.gate.start(expert)?,
             layout.single_projection_values,
+            encoding,
         )?,
         expected_native_q4_expert_record(
             snapshot_dir,
@@ -4865,6 +5091,7 @@ pub(super) fn expected_native_q4_aggregate_expert_records(
             vec![layout.intermediate, layout.hidden],
             aggregate_tensors.up.start(expert)?,
             layout.single_projection_values,
+            encoding,
         )?,
         expected_native_q4_expert_record(
             snapshot_dir,
@@ -4876,6 +5103,7 @@ pub(super) fn expected_native_q4_aggregate_expert_records(
                 .checked_mul(layout.down_expert_values)
                 .context("aggregate down expert offset overflow")?,
             layout.down_expert_values,
+            encoding,
         )?,
     ])
 }
@@ -4888,6 +5116,7 @@ pub(super) fn expected_native_q4_expert_record(
     shape: Vec<usize>,
     element_offset: usize,
     element_count: usize,
+    encoding: FixedQ4ExpertEncoding,
 ) -> Result<ExpectedExpertPackRecord> {
     if source
         .q4_sources
@@ -4902,6 +5131,22 @@ pub(super) fn expected_native_q4_expert_record(
             element_offset,
             element_count,
         )?;
+        if encoding == FixedQ4ExpertEncoding::MlxMxfp4 {
+            return Ok(ExpectedExpertPackRecord {
+                tensor,
+                dtype: source
+                    .dtype
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                shape,
+                source_offsets: source_slice.packed_offsets,
+                source_hash: sha256_hex_parts(&[&source_slice.weights, &source_slice.scales]),
+                packed_bytes: source_slice.weights.len() as u64,
+                groups: source_slice.scales.len(),
+                group_size: source_slice.source_group_size,
+                scale_bias_dtype: EXPERT_SCALE_DTYPE_E8M0.to_string(),
+            });
+        }
         let layout = dense_q4_layout_with_scale_bias_dtype(
             &shape,
             GROUP_SIZE,
@@ -4930,6 +5175,7 @@ pub(super) fn expected_native_q4_expert_record(
         shape,
         element_offset,
         element_count,
+        encoding,
     )?;
     expected_native_q4_expert_record_from_input(input)
 }
@@ -5126,6 +5372,19 @@ struct MlxMxfp4ExpertSourceSlice {
     source_group_size: usize,
 }
 
+fn validate_mxfp4_e8m0_scales(tensor: &str, scales: &[u8]) -> Result<()> {
+    if let Some((index, _)) = scales
+        .iter()
+        .enumerate()
+        .find(|(_, scale)| **scale == u8::MAX)
+    {
+        bail!(
+            "MLX MXFP4 expert tensor {tensor} contains non-finite E8M0 scale 0xff at byte {index}"
+        );
+    }
+    Ok(())
+}
+
 fn mlx_mxfp4_expert_source_slice(
     snapshot_dir: &Path,
     shard_cache: &mut BTreeMap<String, (memmap2::Mmap, SafetensorShard)>,
@@ -5208,6 +5467,7 @@ fn mlx_mxfp4_expert_source_slice(
         scale_offset,
         scale_bytes,
     )?;
+    validate_mxfp4_e8m0_scales(&source.tensor, &scales)?;
     Ok(MlxMxfp4ExpertSourceSlice {
         weights,
         scales,
@@ -5256,11 +5516,21 @@ pub(super) fn native_q4_expert_record_input(
     shape: Vec<usize>,
     element_offset: usize,
     element_count: usize,
+    encoding: FixedQ4ExpertEncoding,
 ) -> Result<NativeQ4ExpertRecordInput> {
     let q4_sources = source
         .q4_sources
         .as_ref()
         .with_context(|| format!("expert tensor {} is not native MLX Q4", source.tensor))?;
+    if encoding == FixedQ4ExpertEncoding::MlxMxfp4
+        && q4_sources.source_format != DenseQ4SourceFormat::MlxMxfp4
+    {
+        bail!(
+            "native MXFP4 expert storage requires MLX MXFP4 source tensor {}, found {:?}",
+            source.tensor,
+            q4_sources.source_format
+        );
+    }
     if matches!(
         q4_sources.source_format,
         DenseQ4SourceFormat::ColibriInt4 | DenseQ4SourceFormat::ColibriInt8
@@ -5357,6 +5627,26 @@ pub(super) fn native_q4_expert_record_input(
             element_offset,
             element_count,
         )?;
+        if encoding == FixedQ4ExpertEncoding::MlxMxfp4 {
+            return Ok(NativeQ4ExpertRecordInput {
+                tensor,
+                dtype: source
+                    .dtype
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                shape,
+                source_offsets: source_slice.packed_offsets,
+                source_hash: Some(sha256_hex_parts(&[
+                    &source_slice.weights,
+                    &source_slice.scales,
+                ])),
+                packed: source_slice.weights,
+                scale_bytes: source_slice.scales,
+                bias_bytes: Vec::new(),
+                groups: element_count / source_slice.source_group_size,
+                scale_bias_dtype: EXPERT_SCALE_DTYPE_E8M0.to_string(),
+            });
+        }
         let layout = dense_q4_layout_with_scale_bias_dtype(
             &shape,
             GROUP_SIZE,
@@ -6297,6 +6587,7 @@ mod tests {
                 layout,
                 hidden_size: 2,
                 intermediate_size: 2,
+                encoding: FixedQ4ExpertEncoding::AffineBf16,
             },
         )
         .unwrap();
@@ -6585,9 +6876,42 @@ mod tests {
     }
 
     #[test]
+    fn expert_store_resolves_native_mxfp4_layout_from_fixed_slot_metadata() {
+        let layout = tiny_qwen_moe_layout();
+        let temp = tempfile::tempdir().unwrap();
+        let spec = FixedQ4ExpertSlotSpec::mxfp4_from_model_layout(&layout).unwrap();
+        fs::write(
+            expert_layer_path(temp.path(), 0),
+            vec![0u8; spec.layout.expert_bytes * layout.experts_per_layer],
+        )
+        .unwrap();
+        let metadata = ExpertLayerPackMetadata::new_fixed_mxfp4(
+            0,
+            spec.layout.expert_bytes as u64,
+            layout.experts_per_layer,
+            (0..layout.experts_per_layer)
+                .map(|expert| tiny_pack_metadata(0, expert, spec.layout.expert_bytes as u64))
+                .collect(),
+        );
+        write_expert_metadata_atomically(temp.path(), 0, &metadata).unwrap();
+
+        let resolved = ExpertSlotStore::resolve_from_metadata(
+            temp.path().to_path_buf(),
+            &layout,
+            ExpertQuantization::FourBitProduction,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.descriptor.layout, ExpertStorageLayout::FixedMxfp4);
+        assert_eq!(resolved.descriptor.slot_spec, ExpertSlotSpec::FixedQ4(spec));
+        assert_eq!(resolved.upgraded_pbq4_layers, 0);
+    }
+
+    #[test]
     fn requested_expert_storage_rejects_every_mismatched_resolved_layout() {
         for resolved in [
             ExpertStorageLayout::FixedQ4,
+            ExpertStorageLayout::FixedMxfp4,
             ExpertStorageLayout::FixedBf16,
             ExpertStorageLayout::FixedF16,
         ] {
@@ -6614,6 +6938,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn native_mxfp4_import_rejects_non_finite_e8m0_scales() {
+        validate_mxfp4_e8m0_scales("gate_proj.weight", &[126, 127, 128]).unwrap();
+
+        let error = validate_mxfp4_e8m0_scales("gate_proj.weight", &[127, u8::MAX]).unwrap_err();
+        assert!(error.to_string().contains("gate_proj.weight"));
+        assert!(error.to_string().contains("non-finite E8M0 scale 0xff"));
+        assert!(error.to_string().contains("byte 1"));
     }
 
     #[test]
@@ -7179,6 +7513,7 @@ mod tests {
             layout: QwenMoeQ4ExpertLayout::qwen35_a17b(),
             hidden_size: 3584,
             intermediate_size: 1024,
+            encoding: FixedQ4ExpertEncoding::AffineBf16,
         };
         let pool = Arc::new(Mutex::new(Vec::new()));
         let mut bytes = Vec::with_capacity(spec.layout.expert_bytes);

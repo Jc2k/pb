@@ -14,7 +14,7 @@ pub const GLM52_MXFP4_MODEL: &str = "hf://mlx-community/GLM-5.2-mxfp4";
 pub const GLM52_MODEL: &str = GLM52_MXFP4_MODEL;
 pub const GLM52_COLIBRI_MODEL: &str = "hf://jlnsrk/GLM-5.2-colibri-int4";
 pub const GLM52_MODEL_MARKER: &str = "glm-5.2";
-pub const GLM52_CACHE_VERSION: &str = "flashmoe-v4-glm52-q4";
+pub const GLM52_CACHE_VERSION: &str = "flashmoe-v5-glm52-mxfp4";
 /// Lowercase substring used to identify Qwen3 MoE checkpoints with active
 /// parameter counts in their HF repository names, e.g. Qwen3-30B-A3B.
 pub const QWEN3_ACTIVE_PARAMS_MARKER: &str = "-a";

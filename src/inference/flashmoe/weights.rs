@@ -2100,6 +2100,12 @@ impl AggregateExpertTensor for ExpertTensorRef {
     fn aggregate_tensor_has_native_q4(&self) -> bool {
         self.q4_sources.is_some()
     }
+
+    fn aggregate_tensor_is_mxfp4(&self) -> bool {
+        self.q4_sources
+            .as_ref()
+            .is_some_and(|source| source.source_format == DenseQ4SourceFormat::MlxMxfp4)
+    }
 }
 
 impl ExpertSourceTensor for ExpertTensorRef {

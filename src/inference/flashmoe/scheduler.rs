@@ -2346,7 +2346,17 @@ impl<'a> ScheduledExpertPhaseMlpPayload<'a> {
 
     pub(crate) fn storage_layout(&self) -> ExpertStorageLayout {
         match self {
-            Self::Q4(_) => ExpertStorageLayout::FixedQ4,
+            Self::Q4(payload) => {
+                if payload
+                    .gate
+                    .scale_bias_dtype
+                    .eq_ignore_ascii_case(super::experts::EXPERT_SCALE_DTYPE_E8M0)
+                {
+                    ExpertStorageLayout::FixedMxfp4
+                } else {
+                    ExpertStorageLayout::FixedQ4
+                }
+            }
             Self::Dense(payload) => match payload.gate.dtype {
                 super::experts::DenseExpertDtype::Bf16 => ExpertStorageLayout::FixedBf16,
                 super::experts::DenseExpertDtype::F16 => ExpertStorageLayout::FixedF16,
@@ -2489,24 +2499,32 @@ impl<'a> ScheduledQ4ExpertPhaseMlpPayload<'a> {
         projection: &str,
         payload: &Q4MatvecPayload<'a>,
     ) -> Result<Q4MatvecSource<'a>> {
-        if !payload
+        let affine_bf16 = payload
             .scale_bias_dtype
-            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
-        {
+            .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16);
+        let mxfp4 = payload
+            .scale_bias_dtype
+            .eq_ignore_ascii_case(super::experts::EXPERT_SCALE_DTYPE_E8M0);
+        if !affine_bf16 && !mxfp4 {
             bail!(
-                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} {projection} projection uses {} scale/bias values; the resolved implementation requires BF16",
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} {projection} projection uses {} scale/bias values; the resolved implementation requires BF16 affine or E8M0 MXFP4",
                 payload.scale_bias_dtype
             );
         }
-        let expected_scale_bias_bytes = payload
+        let expected_scale_bytes = payload
             .scale_bias_groups
-            .checked_mul(std::mem::size_of::<u16>())
-            .context("fixed Q4 expert scale/bias byte size overflow")?;
-        if payload.scale_bytes.len() != expected_scale_bias_bytes
-            || payload.bias_bytes.len() != expected_scale_bias_bytes
+            .checked_mul(if affine_bf16 {
+                std::mem::size_of::<u16>()
+            } else {
+                1
+            })
+            .context("fixed Q4 expert scale byte size overflow")?;
+        let expected_bias_bytes = if affine_bf16 { expected_scale_bytes } else { 0 };
+        if payload.scale_bytes.len() != expected_scale_bytes
+            || payload.bias_bytes.len() != expected_bias_bytes
         {
             bail!(
-                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} {projection} projection has scale/bias byte lengths {}/{}; expected {expected_scale_bias_bytes}",
+                "FlashMoe unsupported active expert CMD3 path: fixed Q4 expert layer {layer} expert {expert} {projection} projection has scale/bias byte lengths {}/{}; expected {expected_scale_bytes}/{expected_bias_bytes}",
                 payload.scale_bytes.len(),
                 payload.bias_bytes.len()
             );

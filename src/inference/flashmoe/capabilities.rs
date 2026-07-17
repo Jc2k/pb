@@ -443,6 +443,9 @@ impl FlashMoeCapabilityPlan {
                 kernels::Q4_FMA_MATVEC_BF16_SCALE_BIAS,
                 kernels::SILU_PRODUCT,
             ],
+            ExpertStorageLayout::FixedMxfp4 => {
+                &[kernels::MXFP4_FMA_MATVEC_E8M0, kernels::SILU_PRODUCT]
+            }
             ExpertStorageLayout::FixedBf16 => {
                 &[kernels::DENSE_MMAP_FMA_MATVEC_BF16, kernels::SILU_PRODUCT]
             }
@@ -709,7 +712,11 @@ fn resolve_input_adapter(
 fn test_expert_storage(
     layout: &QwenMoeModelLayout,
 ) -> Result<ExpertStoreExecutionDescriptor, FlashMoeUnsupportedCapability> {
-    let fixed_q4 = FixedQ4ExpertSlotSpec::from_model_layout(layout).map_err(|error| {
+    let fixed_q4 = match layout.family {
+        QwenMoeFamily::Glm52 => FixedQ4ExpertSlotSpec::mxfp4_from_model_layout(layout),
+        _ => FixedQ4ExpertSlotSpec::from_model_layout(layout),
+    }
+    .map_err(|error| {
         FlashMoeUnsupportedCapability::new(
             layout.family,
             FlashMoeGraphStage::ActiveExpertReads,
@@ -717,7 +724,10 @@ fn test_expert_storage(
         )
     })?;
     Ok(ExpertStoreExecutionDescriptor {
-        layout: ExpertStorageLayout::FixedQ4,
+        layout: match layout.family {
+            QwenMoeFamily::Glm52 => ExpertStorageLayout::FixedMxfp4,
+            _ => ExpertStorageLayout::FixedQ4,
+        },
         slot_spec: ExpertSlotSpec::FixedQ4(fixed_q4),
         layers: layout.layers,
         first_expert_layer: layout.first_sparse_layer,
@@ -1031,6 +1041,12 @@ mod tests {
     fn metal_without_glm_mla_prepare_query_kv() -> MetalRuntimeCapabilities {
         let mut names = MetalPipelineNameSet::new();
         names.glm_mla_prepare_query_kv = kernels::FILL_ZERO;
+        MetalRuntimeCapabilities::from_pipeline_names(names)
+    }
+
+    fn metal_without_mxfp4() -> MetalRuntimeCapabilities {
+        let mut names = MetalPipelineNameSet::new();
+        names.mxfp4_e8m0 = kernels::FILL_ZERO;
         MetalRuntimeCapabilities::from_pipeline_names(names)
     }
 
@@ -1545,6 +1561,16 @@ mod tests {
         let plan = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
 
         assert_eq!(plan.family, QwenMoeFamily::Glm52);
+        assert_eq!(plan.expert_storage.layout, ExpertStorageLayout::FixedMxfp4);
+        assert_eq!(
+            plan.expert_storage
+                .slot_spec
+                .fixed_q4()
+                .unwrap()
+                .layout
+                .expert_bytes,
+            20_054_016
+        );
         assert_eq!(plan.expert_storage.first_expert_layer, 3);
         assert_eq!(plan.routed_expert_scale, 2.5);
         assert_eq!(
@@ -1611,6 +1637,26 @@ mod tests {
                 .reason
                 .contains(kernels::GLM_MLA_PREPARE_QUERY_KV),
             "{missing_prepare}"
+        );
+
+        let missing_mxfp4 = FlashMoeCapabilityPlan::resolve(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&layout),
+            &attention_layers(&layout),
+            Some(metal_without_mxfp4()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            missing_mxfp4.stage,
+            FlashMoeGraphStage::Cmd3ExpertAndSharedCombine
+        );
+        assert!(
+            missing_mxfp4
+                .reason
+                .contains(kernels::MXFP4_FMA_MATVEC_E8M0),
+            "{missing_mxfp4}"
         );
 
         for (metal, expected_stage) in [

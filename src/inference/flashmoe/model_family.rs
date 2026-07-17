@@ -774,6 +774,114 @@ pub struct QwenMoeQ4ExpertLayout {
 }
 
 impl QwenMoeQ4ExpertLayout {
+    pub fn fixed_mxfp4(
+        hidden_size: usize,
+        intermediate_size: usize,
+        group_size: usize,
+    ) -> Result<Self> {
+        if hidden_size == 0 || intermediate_size == 0 || group_size == 0 {
+            bail!(
+                "fixed-MXFP4 expert layout requires non-zero hidden, intermediate, and group dimensions"
+            );
+        }
+        if !hidden_size.is_multiple_of(group_size) || !intermediate_size.is_multiple_of(group_size)
+        {
+            bail!(
+                "fixed-MXFP4 expert dimensions hidden={hidden_size} intermediate={intermediate_size} must be divisible by group_size={group_size}"
+            );
+        }
+
+        fn projection_bytes(rows: usize, cols: usize, group_size: usize) -> Result<(usize, usize)> {
+            let values = rows
+                .checked_mul(cols)
+                .context("fixed-MXFP4 projection element count overflow")?;
+            if !values.is_multiple_of(2) {
+                bail!("fixed-MXFP4 projection element count {values} must be even");
+            }
+            let packed = values / 2;
+            let scales = rows
+                .checked_mul(cols / group_size)
+                .context("fixed-MXFP4 E8M0 scale byte count overflow")?;
+            Ok((packed, scales))
+        }
+
+        let (gate_weight_bytes, gate_scale_bytes) =
+            projection_bytes(intermediate_size, hidden_size, group_size)?;
+        let (down_weight_bytes, down_scale_bytes) =
+            projection_bytes(hidden_size, intermediate_size, group_size)?;
+        let gate_scale_offset = gate_weight_bytes;
+        let gate_bias_offset = gate_scale_offset
+            .checked_add(gate_scale_bytes)
+            .context("fixed-MXFP4 gate bias offset overflow")?;
+        let up_weight_offset = gate_bias_offset;
+        let up_scale_offset = up_weight_offset
+            .checked_add(gate_weight_bytes)
+            .context("fixed-MXFP4 up scale offset overflow")?;
+        let up_bias_offset = up_scale_offset
+            .checked_add(gate_scale_bytes)
+            .context("fixed-MXFP4 up bias offset overflow")?;
+        let down_weight_offset = up_bias_offset;
+        let down_scale_offset = down_weight_offset
+            .checked_add(down_weight_bytes)
+            .context("fixed-MXFP4 down scale offset overflow")?;
+        let down_bias_offset = down_scale_offset
+            .checked_add(down_scale_bytes)
+            .context("fixed-MXFP4 down bias offset overflow")?;
+        let layout = Self {
+            expert_bytes: down_bias_offset,
+            group_size,
+            components: [
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::GateWeight,
+                    offset: 0,
+                    bytes: gate_weight_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::GateScale,
+                    offset: gate_scale_offset,
+                    bytes: gate_scale_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::GateBias,
+                    offset: gate_bias_offset,
+                    bytes: 0,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::UpWeight,
+                    offset: up_weight_offset,
+                    bytes: gate_weight_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::UpScale,
+                    offset: up_scale_offset,
+                    bytes: gate_scale_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::UpBias,
+                    offset: up_bias_offset,
+                    bytes: 0,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::DownWeight,
+                    offset: down_weight_offset,
+                    bytes: down_weight_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::DownScale,
+                    offset: down_scale_offset,
+                    bytes: down_scale_bytes,
+                },
+                QwenMoeExpertComponentLayout {
+                    kind: QwenMoeExpertComponentKind::DownBias,
+                    offset: down_bias_offset,
+                    bytes: 0,
+                },
+            ],
+        };
+        layout.validate()?;
+        Ok(layout)
+    }
+
     pub fn fixed_bf16(
         hidden_size: usize,
         intermediate_size: usize,
@@ -1439,6 +1547,46 @@ mod tests {
             }
         );
         expert_layout.validate().unwrap();
+    }
+
+    #[test]
+    fn glm52_native_mxfp4_expert_layout_preserves_source_encoding() {
+        let layout = QwenMoeQ4ExpertLayout::fixed_mxfp4(6144, 2048, 32).unwrap();
+
+        assert_eq!(layout.expert_bytes, 20_054_016);
+        assert_eq!(
+            layout.component(QwenMoeExpertComponentKind::GateScale),
+            QwenMoeExpertComponentLayout {
+                kind: QwenMoeExpertComponentKind::GateScale,
+                offset: 6_291_456,
+                bytes: 393_216,
+            }
+        );
+        assert_eq!(
+            layout.component(QwenMoeExpertComponentKind::GateBias),
+            QwenMoeExpertComponentLayout {
+                kind: QwenMoeExpertComponentKind::GateBias,
+                offset: 6_684_672,
+                bytes: 0,
+            }
+        );
+        assert_eq!(
+            layout.component(QwenMoeExpertComponentKind::DownWeight),
+            QwenMoeExpertComponentLayout {
+                kind: QwenMoeExpertComponentKind::DownWeight,
+                offset: 13_369_344,
+                bytes: 6_291_456,
+            }
+        );
+        assert_eq!(
+            layout.component(QwenMoeExpertComponentKind::DownScale),
+            QwenMoeExpertComponentLayout {
+                kind: QwenMoeExpertComponentKind::DownScale,
+                offset: 19_660_800,
+                bytes: 393_216,
+            }
+        );
+        layout.validate().unwrap();
     }
 
     #[test]
