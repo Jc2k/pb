@@ -1,6 +1,37 @@
 # pb
 
-A local coding agent CLI with an optional web front end.
+pb is a local-first coding agent for getting from an idea to a checked commit without assembling a
+model runner, project sandbox, review loop, and user interface yourself. It runs the coding model on
+your Mac, keeps project context and session history under your control, and comes with sensible
+defaults for the ordinary work around a change: inspect, plan, edit, check, review, and commit.
+
+Use it from a friendly web interface or stay in the terminal. Tell pb what you want to build or fix;
+it works inside your repository, shows its progress, and leaves you with the evidence behind the
+result. You can start with the defaults and introduce project-specific environments, policies, MCP
+tools, or model settings only when you need them.
+
+## Why pb
+
+- **Local first.** Inference, repository access, history, and the control plane live on your machine
+  by default. Integrations that can send data elsewhere are explicit and documented.
+- **Less setup.** pb can inspect a repository, choose a practical execution environment, pull a local
+  model, and provide both terminal and web entry points.
+- **Sensible guard rails.** The workflow owns planning, checks, fresh-context review, completion, and
+  commit creation instead of trusting a model to declare its own work done.
+- **Clear when things go wrong.** Sessions are durable and reattachable, and results distinguish a
+  completed change from no-change, blocked, and failed outcomes.
+
+pb currently targets Apple silicon Macs. Start with the
+[getting-started guide](https://jc2k.github.io/pb/user/getting-started.html), or see the short path
+below.
+
+```bash
+pb self install
+pb pull
+cd /path/to/project
+pb init
+pb queue "Add validation for empty project names" --workdir "$PWD"
+```
 
 The user guide and architecture documentation are published at
 [jc2k.github.io/pb](https://jc2k.github.io/pb/). The site explores pb's workflows, security model,
