@@ -5247,6 +5247,117 @@ impl DenseStore {
         Ok(output)
     }
 
+    pub(super) fn mla_absorbed_attention_metal_multilinear(
+        &self,
+        metal: &MetalExecutionFacade,
+        layer: usize,
+        layout: MlaAttentionLayout,
+        query: &[f32],
+        records: &[(&[f32], &[f32])],
+    ) -> Result<Vec<f32>> {
+        if query.len() != layout.q_width || records.is_empty() {
+            bail!(
+                "MLA layer {layer} requires query width {} and a non-empty KV cache, got {} and {} records",
+                layout.q_width,
+                query.len(),
+                records.len()
+            );
+        }
+        for (latent, rotary) in records {
+            if latent.len() != layout.kv_lora_rank || rotary.len() != layout.qk_rope_head_dim {
+                bail!(
+                    "MLA layer {layer} cache record has latent/rotary widths {}/{}, expected {}/{}",
+                    latent.len(),
+                    rotary.len(),
+                    layout.kv_lora_rank,
+                    layout.qk_rope_head_dim
+                );
+            }
+        }
+        if layout.kv_projection != MlaKvProjectionLayout::AbsorbedMultiLinear {
+            bail!(
+                "MLA layer {layer} Metal multilinear execution requires pre-absorbed embed_q/unembed_out weights"
+            );
+        }
+        let embed_q_name = attention_tensor_name(layer, "embed_q");
+        let embed_q = self
+            .dense_q4_mmap_multilinear_projection(
+                &embed_q_name,
+                layout.num_heads,
+                layout.kv_lora_rank,
+                layout.qk_nope_head_dim,
+            )?
+            .with_context(|| {
+                format!(
+                    "GLM MLA Metal weight absorption requires resident Q4 projection {embed_q_name}"
+                )
+            })?;
+        let unembed_out_name = attention_tensor_name(layer, "unembed_out");
+        let unembed_out = self
+            .dense_q4_mmap_multilinear_projection(
+                &unembed_out_name,
+                layout.num_heads,
+                layout.v_head_dim,
+                layout.kv_lora_rank,
+            )?
+            .with_context(|| {
+                format!(
+                    "GLM MLA Metal weight absorption requires resident Q4 projection {unembed_out_name}"
+                )
+            })?;
+
+        let mut query_nope = Vec::with_capacity(
+            layout
+                .num_heads
+                .checked_mul(layout.qk_nope_head_dim)
+                .context("MLA no-PE query size overflow")?,
+        );
+        for head in 0..layout.num_heads {
+            let start = head * layout.qk_head_dim;
+            query_nope.extend_from_slice(&query[start..start + layout.qk_nope_head_dim]);
+        }
+        let absorbed_queries = metal.resident_q4_multilinear(
+            &embed_q,
+            layout.num_heads,
+            layout.kv_lora_rank,
+            &query_nope,
+        )?;
+        let mut contexts = vec![0.0; layout.num_heads * layout.kv_lora_rank];
+        let scale = (layout.qk_head_dim as f32).sqrt().recip();
+        for head in 0..layout.num_heads {
+            let query_start = head * layout.qk_head_dim;
+            let query_rope =
+                &query[query_start + layout.qk_nope_head_dim..query_start + layout.qk_head_dim];
+            let absorbed_query =
+                &absorbed_queries[head * layout.kv_lora_rank..(head + 1) * layout.kv_lora_rank];
+            let mut scores = records
+                .iter()
+                .map(|(latent, rotary)| {
+                    let latent_score = absorbed_query
+                        .iter()
+                        .zip(*latent)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    let rotary_score = query_rope
+                        .iter()
+                        .zip(*rotary)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    (latent_score + rotary_score) * scale
+                })
+                .collect::<Vec<_>>();
+            softmax_in_place(&mut scores);
+            let context =
+                &mut contexts[head * layout.kv_lora_rank..(head + 1) * layout.kv_lora_rank];
+            for (weight, (latent, _)) in scores.iter().zip(records) {
+                for (slot, value) in context.iter_mut().zip(*latent) {
+                    *slot += *weight * value;
+                }
+            }
+        }
+        metal.resident_q4_multilinear(&unembed_out, layout.num_heads, layout.v_head_dim, &contexts)
+    }
+
     #[cfg(test)]
     pub(super) fn resolve_shared_expert_weight_table(
         &self,

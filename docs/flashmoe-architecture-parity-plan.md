@@ -108,7 +108,11 @@ graph resolution.
   the decoder RMSNorm epsilon in config. Runtime weight absorption accepts either the original
   two-dimensional `kv_b_proj` or MLX-LM's equivalent pre-absorbed per-head `embed_q` and
   `unembed_out` tensors; both execute against the same compressed cache without materializing
-  per-token keys and values.
+  per-token keys and values. The capability graph binds MLX's pre-absorbed Q4 multilinear tensors
+  to one resident Metal dispatch per projection while retaining CPU causal-score, softmax, and
+  compressed-context reduction. The fused `kv_b_proj` adapter remains on its declared CPU transpose
+  implementation until it has an equivalent resident kernel; runtime probing does not switch
+  between them.
 - Sparse layers select experts with sigmoid scores, `e_score_correction_bias` for selection only,
   top-K over the corrected scores, selected raw sigmoid weights normalized when
   `norm_topk_prob=true`, and `routed_scaling_factor` applied after normalization. Qwen softmax
@@ -125,9 +129,35 @@ graph resolution.
   layout, sigmoid/noaux routing, graph capability binding, and sparse-layer expert metadata. Real
   checkpoint evidence covers all 78 decoder layers, 75 streamed sparse layers, first-token sampling,
   an eight-token decode, and the checkpoint's full external chat template. A deterministic
-  no-thinking chat request for `What is 2+2?` begins with `4`; the diagnostic raw prompt
+  no-thinking chat request for `What is 2+2?` completes as `2 + 2 = 4`; the diagnostic raw prompt
   `The capital of France is` begins with `Paris`. Model loading rejects incomplete MLA,
   router-bias, dense-lead-in, or expert artifacts before allocating generation state.
+
+### GLM-5.2 Performance Evidence
+
+The 2026-07-17 performance pass used the exact deterministic raw request
+`2+2=` with three generated tokens and detailed per-layer timings against the local
+`mlx-community/GLM-5.2-mxfp4` cache. The output remained token-identical as `5 2`.
+
+- The shipped CPU-absorption baseline decoded at `0.170 tok/s` (`5.880 s/token`). Moving only
+  pre-absorbed resident-Q4 `embed_q` and `unembed_out` multilinear work to Metal decoded at
+  `0.205 tok/s` (`4.876 s/token`), a 20.6% throughput increase and 17.1% lower decode latency.
+- Attention wall time fell from `2.506` to `1.592 s/token`; its absorbed-attention bucket fell from
+  `1.397` to `0.480 s/token`. Expert I/O remained essentially unchanged at `1.983` versus
+  `1.939 s/token`, which is the expected control for an attention-only change.
+- Each GLM token still selects eight 21,233,664-byte slots across 75 sparse layers: 12,740,198,400
+  bytes (`11.865 GiB`) of expert traffic before staging. The measured result therefore does not
+  support a 3-4 tok/s SSD-only target for this layout.
+
+The comparison sources establish different regimes. The
+[MLX-LM lazy-loading issue](https://github.com/ml-explore/mlx-lm/issues/1438) is a design request for
+on-demand expert loading, LRU residency, and optional next-layer prefetch, not published performance
+evidence. [Colibri](https://github.com/JustVugg/colibri) reports 4+ tok/s with six RTX 5090 GPUs and
+hot expert tiers, while its README estimates only 0.05-0.1 tok/s for a cold 1 GB/s SSD path reading
+about 11 GB/token. FlashMoe already coalesces each selected expert into one positioned read and
+issues the active set in parallel. Colibri's application LRU/hot pinning and speculative lookahead
+remain outside pb's OS-page-cache and non-speculative I/O contract; DSA and MTP remain the larger
+typed follow-ons for reducing attention work or forwards per accepted token.
 
 ## Scheduled Graph
 

@@ -986,6 +986,8 @@ pub(crate) mod kernels {
     pub(crate) const Q4_MMAP_FMA_MATVEC_BATCH: &str = "q4_mmap_fma_matvec_batch";
     pub(crate) const Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS: &str =
         "q4_mmap_fma_matvec_batch_bf16_scale_bias";
+    pub(crate) const Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS: &str =
+        "q4_mmap_fma_multilinear_bf16_scale_bias";
     pub(crate) const DENSE_MMAP_FMA_MATVEC_BF16: &str = "dense_mmap_fma_matvec_bf16";
     pub(crate) const DENSE_MMAP_FMA_MATVEC_F16: &str = "dense_mmap_fma_matvec_f16";
     pub(crate) const DENSE_MMAP_FMA_MATVEC_F32: &str = "dense_mmap_fma_matvec_f32";
@@ -1057,6 +1059,7 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
     kernels::Q4_MMAP_FMA_MATVEC_BATCH,
     kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
+    kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS,
     kernels::DENSE_MMAP_FMA_MATVEC_BF16,
     kernels::DENSE_MMAP_FMA_MATVEC_F16,
     kernels::DENSE_MMAP_FMA_MATVEC_F32,
@@ -1092,6 +1095,7 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) q4_mmap_bf16_scale_bias: &'static str,
     pub(crate) q4_mmap_batch: &'static str,
     pub(crate) q4_mmap_batch_bf16_scale_bias: &'static str,
+    pub(crate) q4_mmap_multilinear_bf16_scale_bias: &'static str,
     pub(crate) dense_mmap_bf16: &'static str,
     pub(crate) dense_mmap_f16: &'static str,
     pub(crate) dense_mmap_f32: &'static str,
@@ -1128,6 +1132,7 @@ impl MetalPipelineNameSet {
             q4_mmap_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BF16_SCALE_BIAS,
             q4_mmap_batch: kernels::Q4_MMAP_FMA_MATVEC_BATCH,
             q4_mmap_batch_bf16_scale_bias: kernels::Q4_MMAP_FMA_MATVEC_BATCH_BF16_SCALE_BIAS,
+            q4_mmap_multilinear_bf16_scale_bias: kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS,
             dense_mmap_bf16: kernels::DENSE_MMAP_FMA_MATVEC_BF16,
             dense_mmap_f16: kernels::DENSE_MMAP_FMA_MATVEC_F16,
             dense_mmap_f32: kernels::DENSE_MMAP_FMA_MATVEC_F32,
@@ -1164,6 +1169,7 @@ impl MetalPipelineNameSet {
             self.q4_mmap_bf16_scale_bias,
             self.q4_mmap_batch,
             self.q4_mmap_batch_bf16_scale_bias,
+            self.q4_mmap_multilinear_bf16_scale_bias,
             self.dense_mmap_bf16,
             self.dense_mmap_f16,
             self.dense_mmap_f32,
@@ -1201,6 +1207,7 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) q4_mmap_bf16_scale_bias_pipeline: T,
     pub(crate) q4_mmap_batch_pipeline: T,
     pub(crate) q4_mmap_batch_bf16_scale_bias_pipeline: T,
+    pub(crate) q4_mmap_multilinear_bf16_scale_bias_pipeline: T,
     pub(crate) dense_mmap_bf16_pipeline: T,
     pub(crate) dense_mmap_f16_pipeline: T,
     pub(crate) dense_mmap_f32_pipeline: T,
@@ -1236,6 +1243,7 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.q4_mmap_bf16_scale_bias_pipeline);
         release(self.q4_mmap_batch_pipeline);
         release(self.q4_mmap_batch_bf16_scale_bias_pipeline);
+        release(self.q4_mmap_multilinear_bf16_scale_bias_pipeline);
         release(self.dense_mmap_bf16_pipeline);
         release(self.dense_mmap_f16_pipeline);
         release(self.dense_mmap_f32_pipeline);
@@ -1466,6 +1474,9 @@ impl MetalRuntime {
                 q4_mmap_batch_pipeline: take_pipeline(names.q4_mmap_batch),
                 q4_mmap_batch_bf16_scale_bias_pipeline: take_pipeline(
                     names.q4_mmap_batch_bf16_scale_bias,
+                ),
+                q4_mmap_multilinear_bf16_scale_bias_pipeline: take_pipeline(
+                    names.q4_mmap_multilinear_bf16_scale_bias,
                 ),
                 dense_mmap_bf16_pipeline: take_pipeline(names.dense_mmap_bf16),
                 dense_mmap_f16_pipeline: take_pipeline(names.dense_mmap_f16),
@@ -1792,6 +1803,21 @@ impl MetalExecutionContext {
             &self.buffers,
         )
         .execute_with_input_buffer(projections, input_buffer, input_len)
+    }
+
+    pub(crate) fn resident_q4_multilinear(
+        &self,
+        projection: &DenseQ4MmapMatvecProjection,
+        heads: usize,
+        rows_per_head: usize,
+        inputs: &[f32],
+    ) -> anyhow::Result<Option<Vec<f32>>> {
+        MetalResidentProjectionBatchBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.buffers,
+        )
+        .execute_q4_multilinear(projection, heads, rows_per_head, inputs)
     }
 
     #[cfg(test)]
@@ -3952,6 +3978,114 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
 
     fn recycle_or_release_buffers(&self, buffers: &[MetalObjcId], release_only: bool) {
         self.buffers.recycle_or_release(buffers, release_only);
+    }
+
+    pub(crate) fn execute_q4_multilinear(
+        &self,
+        projection: &DenseQ4MmapMatvecProjection,
+        heads: usize,
+        rows_per_head: usize,
+        inputs: &[f32],
+    ) -> Result<Option<Vec<f32>>> {
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let rows = heads
+            .checked_mul(rows_per_head)
+            .context("resident Q4 multilinear row count overflow")?;
+        let input_values = heads
+            .checked_mul(projection.cols)
+            .context("resident Q4 multilinear input length overflow")?;
+        if heads == 0
+            || rows_per_head == 0
+            || !rows_per_head.is_multiple_of(16)
+            || projection.rows != rows
+            || projection.output_width != rows
+            || inputs.len() != input_values
+            || !projection
+                .scale_bias_dtype
+                .eq_ignore_ascii_case(EXPERT_SCALE_BIAS_DTYPE_BF16)
+        {
+            bail!(
+                "resident Q4 multilinear projection {} has incompatible shape rows={} cols={} output_width={} heads={heads} rows_per_head={rows_per_head} input_len={} scale_bias_dtype={}",
+                projection.tensor_name,
+                projection.rows,
+                projection.cols,
+                projection.output_width,
+                inputs.len(),
+                projection.scale_bias_dtype,
+            );
+        }
+        validate_resident_projection(
+            &ResidentMmapMatvecProjection::Q4(projection.clone()),
+            projection.cols,
+            dense_weights.len,
+        )?;
+
+        unsafe {
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(inputs))?;
+            let output_buffer = self.buffer_with_len(rows * std::mem::size_of::<f32>())?;
+            let buffers = [input_buffer, output_buffer];
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Flash-MoE resident Q4 multilinear command buffer",
+                "failed to create Flash-MoE resident Q4 multilinear compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            let rows_u32 = u32::try_from(rows).context("multilinear rows do not fit u32")?;
+            let cols_u32 =
+                u32::try_from(projection.cols).context("multilinear cols do not fit u32")?;
+            let groups_u32 = u32::try_from(projection.groups_per_row)
+                .context("multilinear groups do not fit u32")?;
+            let group_size_u32 = u32::try_from(projection.group_size)
+                .context("multilinear group size does not fit u32")?;
+            let rows_per_head_u32 =
+                u32::try_from(rows_per_head).context("multilinear rows per head do not fit u32")?;
+
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.q4_mmap_multilinear_bf16_scale_bias_pipeline,
+            );
+            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, input_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
+            set_bytes(encoder, u64_as_bytes(&projection.scales_byte_offset), 4);
+            set_bytes(encoder, u64_as_bytes(&projection.biases_byte_offset), 5);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 6);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&group_size_u32), 9);
+            set_bytes(encoder, u32_as_bytes(&rows_per_head_u32), 10);
+            dispatch_q4_mmap_threadgroups(encoder, rows as u64);
+            encoding.end_encoding();
+
+            let context = MetalCommandContext::new("dense_q4_mmap_multilinear")
+                .with("tensor", projection.tensor_name.as_str())
+                .with("heads", heads)
+                .with("rows_per_head", rows_per_head)
+                .with("cols", projection.cols);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            let output = read_f32_buffer(output_buffer, rows);
+            drop(encoding);
+            self.recycle(input_buffer);
+            self.recycle(output_buffer);
+            Ok(Some(output))
+        }
     }
 
     unsafe fn try_encode_q4_mmap_projection_batch(
@@ -6929,6 +7063,53 @@ inline float q4_mmap_fma_row_bf16(
     return simd_sum(acc);
 }
 
+kernel void q4_mmap_fma_multilinear_bf16_scale_bias(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* inputs [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& packed_byte_offset [[buffer(3)]],
+    constant ulong& scales_byte_offset [[buffer(4)]],
+    constant ulong& biases_byte_offset [[buffer(5)]],
+    constant uint& rows [[buffer(6)]],
+    constant uint& cols [[buffer(7)]],
+    constant uint& groups_per_row [[buffer(8)]],
+    constant uint& group_size [[buffer(9)]],
+    constant uint& rows_per_head [[buffer(10)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 16;
+    const uint input_cache_len = 4096;
+    uint row0 = tile * rows_per_threadgroup + simd_group;
+    uint row1 = row0 + 8;
+    uint head = (tile * rows_per_threadgroup) / rows_per_head;
+    device const float* input = inputs + head * cols;
+    threadgroup float input_cache[4096];
+    for (uint col = lid; col < cols && col < input_cache_len; col += 256) {
+        input_cache[col] = input[col];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row0 < rows) {
+        float sum = q4_mmap_fma_row_bf16(
+            weight_bytes, input, input_cache,
+            packed_byte_offset, scales_byte_offset, biases_byte_offset,
+            row0, cols, groups_per_row, group_size, simd_lane);
+        if (simd_lane == 0) {
+            output[row0] = sum;
+        }
+    }
+    if (row1 < rows) {
+        float sum = q4_mmap_fma_row_bf16(
+            weight_bytes, input, input_cache,
+            packed_byte_offset, scales_byte_offset, biases_byte_offset,
+            row1, cols, groups_per_row, group_size, simd_lane);
+        if (simd_lane == 0) {
+            output[row1] = sum;
+        }
+    }
+}
+
 kernel void q4_mmap_fma_matvec_batch(
     device const uchar* weight_bytes [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -8097,6 +8278,7 @@ mod tests {
             released,
             [
                 (1..=8).collect::<Vec<_>>(),
+                vec![33],
                 vec![24, 25, 26],
                 (9..=16).collect::<Vec<_>>(),
                 vec![18, 19, 27, 28, 20, 21, 29, 30, 22, 23, 31, 32],
@@ -8115,6 +8297,7 @@ mod tests {
             q4_mmap_bf16_scale_bias_pipeline: 6,
             q4_mmap_batch_pipeline: 7,
             q4_mmap_batch_bf16_scale_bias_pipeline: 8,
+            q4_mmap_multilinear_bf16_scale_bias_pipeline: 33,
             dense_mmap_bf16_pipeline: 24,
             dense_mmap_f16_pipeline: 25,
             dense_mmap_f32_pipeline: 26,
@@ -8152,6 +8335,7 @@ mod tests {
             q4_mmap_bf16_scale_bias_pipeline: id,
             q4_mmap_batch_pipeline: id,
             q4_mmap_batch_bf16_scale_bias_pipeline: id,
+            q4_mmap_multilinear_bf16_scale_bias_pipeline: id,
             dense_mmap_bf16_pipeline: id,
             dense_mmap_f16_pipeline: id,
             dense_mmap_f32_pipeline: id,
@@ -9467,6 +9651,57 @@ mod tests {
                 footprint.saturating_sub(baseline_footprint)
             );
         });
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn resident_q4_multilinear_uses_each_heads_own_input() {
+        let heads = 2usize;
+        let rows_per_head = 16usize;
+        let cols = 8usize;
+        let rows = heads * rows_per_head;
+        let packed_bytes = rows * cols.div_ceil(2);
+        let scalar_bytes = rows * std::mem::size_of::<u16>();
+        let scales_offset = packed_bytes;
+        let biases_offset = scales_offset + scalar_bytes;
+        let mut mmap = memmap2::MmapMut::map_anon(4096).unwrap();
+        for row in 0..rows {
+            let nibble = (row % 7 + 1) as u8;
+            mmap[row * 4..row * 4 + 4].fill(nibble | (nibble << 4));
+            mmap[scales_offset + row * 2..scales_offset + row * 2 + 2]
+                .copy_from_slice(&0x3f80u16.to_le_bytes());
+            mmap[biases_offset + row * 2..biases_offset + row * 2 + 2]
+                .copy_from_slice(&0u16.to_le_bytes());
+        }
+        let mmap = Arc::new(mmap.make_read_only().unwrap());
+        let context = MetalExecutionContext::compile(mmap, 4096, &[], 1e-6).unwrap();
+        let projection = DenseQ4MmapMatvecProjection {
+            tensor_name: "test.multilinear.weight".to_string(),
+            packed_byte_offset: 0,
+            scales_byte_offset: scales_offset as u64,
+            biases_byte_offset: biases_offset as u64,
+            rows,
+            cols,
+            output_width: rows,
+            row_packed_bytes: cols.div_ceil(2),
+            groups_per_row: 1,
+            group_size: cols,
+            scale_bias_dtype: "BF16".to_string(),
+        };
+        let inputs = [vec![1.0; cols], vec![2.0; cols]].concat();
+        let actual = context
+            .resident_q4_multilinear(&projection, heads, rows_per_head, &inputs)
+            .unwrap()
+            .unwrap();
+        let expected = (0..rows)
+            .map(|row| {
+                let nibble = (row % 7 + 1) as f32;
+                let input = if row < rows_per_head { 1.0 } else { 2.0 };
+                nibble * cols as f32 * input
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

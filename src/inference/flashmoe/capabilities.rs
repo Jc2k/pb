@@ -67,6 +67,7 @@ impl fmt::Display for FlashMoeGraphStage {
 pub enum FlashMoeStagePlacement {
     InputAdapter,
     Metal,
+    MetalWithCpuReduction,
     CpuDeclared,
     SchedulerIo,
     Sampler,
@@ -77,6 +78,7 @@ impl FlashMoeStagePlacement {
         match self {
             Self::InputAdapter => "input adapter",
             Self::Metal => "Metal",
+            Self::MetalWithCpuReduction => "Metal with declared CPU reduction",
             Self::CpuDeclared => "declared CPU",
             Self::SchedulerIo => "scheduler I/O",
             Self::Sampler => "sampler",
@@ -93,6 +95,7 @@ pub enum FlashMoeStageImplementation {
     MetalResidentQ4AttentionProjections,
     QwenFullAttentionCpuKv,
     GlmMlaCpuWeightAbsorption,
+    GlmMlaMetalQ4MultilinearCpuReduction,
     MetalResidentPostAttention,
     CpuSoftmaxTopK,
     CpuSigmoidNoAuxTopK,
@@ -113,6 +116,9 @@ impl FlashMoeStageImplementation {
             Self::MetalResidentQ4AttentionProjections => "Metal resident-Q4 attention projections",
             Self::QwenFullAttentionCpuKv => "Qwen full-attention CPU KV implementation",
             Self::GlmMlaCpuWeightAbsorption => "GLM compressed-KV MLA with CPU weight absorption",
+            Self::GlmMlaMetalQ4MultilinearCpuReduction => {
+                "GLM compressed-KV MLA with Metal resident-Q4 multilinear and CPU causal reduction"
+            }
             Self::MetalResidentPostAttention => {
                 "Metal resident Q4/BF16/F16/F32 post-attention and router projection"
             }
@@ -129,6 +135,13 @@ impl FlashMoeStageImplementation {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlashMoeAttentionMathCapability {
+    QwenFullAttentionCpuKv,
+    GlmMlaCpuWeightAbsorption,
+    GlmMlaMetalQ4MultilinearCpuReduction,
 }
 
 impl fmt::Display for FlashMoeStageImplementation {
@@ -197,12 +210,39 @@ pub struct FlashMoeCapabilityPlan {
 }
 
 impl FlashMoeCapabilityPlan {
+    #[cfg(test)]
     pub(crate) fn resolve(
         layout: &QwenMoeModelLayout,
         input_adapter: FlashMoeInputAdapterCapability,
         dense_layout: ResidentDenseLayout,
         expert_storage: ExpertStoreExecutionDescriptor,
         manifest_attention_layers: &[QwenMoeLayerKind],
+        metal: Option<MetalRuntimeCapabilities>,
+    ) -> Result<Self, FlashMoeUnsupportedCapability> {
+        let attention_math = if layout.family == QwenMoeFamily::Glm52 {
+            FlashMoeAttentionMathCapability::GlmMlaCpuWeightAbsorption
+        } else {
+            FlashMoeAttentionMathCapability::QwenFullAttentionCpuKv
+        };
+        Self::resolve_with_attention_math(
+            layout,
+            input_adapter,
+            dense_layout,
+            expert_storage,
+            manifest_attention_layers,
+            attention_math,
+            metal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_with_attention_math(
+        layout: &QwenMoeModelLayout,
+        input_adapter: FlashMoeInputAdapterCapability,
+        dense_layout: ResidentDenseLayout,
+        expert_storage: ExpertStoreExecutionDescriptor,
+        manifest_attention_layers: &[QwenMoeLayerKind],
+        attention_math: FlashMoeAttentionMathCapability,
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         validate_upstream_execution_policy(layout)?;
@@ -215,6 +255,7 @@ impl FlashMoeCapabilityPlan {
             dense_layout,
             expert_storage,
             attention_layers,
+            attention_math,
             metal,
         )
     }
@@ -226,6 +267,7 @@ impl FlashMoeCapabilityPlan {
         dense_layout: ResidentDenseLayout,
         expert_storage: ExpertStoreExecutionDescriptor,
         attention_layers: Box<[QwenMoeLayerKind]>,
+        attention_math: FlashMoeAttentionMathCapability,
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         let expected_slot_spec = ExpertSlotSpec::from_model_layout(layout, expert_storage.layout)
@@ -325,6 +367,49 @@ impl FlashMoeCapabilityPlan {
                 ],
             )?;
         }
+        let (attention_placement, attention_implementation) = match attention_math {
+            FlashMoeAttentionMathCapability::QwenFullAttentionCpuKv
+                if layout.family != QwenMoeFamily::Glm52 =>
+            {
+                (
+                    FlashMoeStagePlacement::CpuDeclared,
+                    FlashMoeStageImplementation::QwenFullAttentionCpuKv,
+                )
+            }
+            FlashMoeAttentionMathCapability::GlmMlaCpuWeightAbsorption
+                if layout.family == QwenMoeFamily::Glm52 =>
+            {
+                (
+                    FlashMoeStagePlacement::CpuDeclared,
+                    FlashMoeStageImplementation::GlmMlaCpuWeightAbsorption,
+                )
+            }
+            FlashMoeAttentionMathCapability::GlmMlaMetalQ4MultilinearCpuReduction
+                if layout.family == QwenMoeFamily::Glm52
+                    && dense_layout == ResidentDenseLayout::Q4 =>
+            {
+                require_stage_kernels(
+                    layout.family,
+                    &metal,
+                    FlashMoeGraphStage::AttentionMath,
+                    &[kernels::Q4_MMAP_FMA_MULTILINEAR_BF16_SCALE_BIAS],
+                )?;
+                (
+                    FlashMoeStagePlacement::MetalWithCpuReduction,
+                    FlashMoeStageImplementation::GlmMlaMetalQ4MultilinearCpuReduction,
+                )
+            }
+            _ => {
+                return Err(FlashMoeUnsupportedCapability::new(
+                    layout.family,
+                    FlashMoeGraphStage::AttentionMath,
+                    format!(
+                        "attention math capability {attention_math:?} is incompatible with family {:?} and resident layout {dense_layout:?}",
+                        layout.family
+                    ),
+                ));
+            }
+        };
         let cmd2_projection_kernel = match dense_layout {
             ResidentDenseLayout::Q4 => kernels::Q4_MMAP_FMA_MATVEC,
             ResidentDenseLayout::Bf16 => kernels::DENSE_MMAP_FMA_MATVEC_BF16,
@@ -431,12 +516,8 @@ impl FlashMoeCapabilityPlan {
             ),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::AttentionMath,
-                FlashMoeStagePlacement::CpuDeclared,
-                if layout.family == QwenMoeFamily::Glm52 {
-                    FlashMoeStageImplementation::GlmMlaCpuWeightAbsorption
-                } else {
-                    FlashMoeStageImplementation::QwenFullAttentionCpuKv
-                },
+                attention_placement,
+                attention_implementation,
             ),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
@@ -754,6 +835,9 @@ impl Error for FlashMoeUnsupportedCapability {}
 mod tests {
     use super::*;
     use crate::inference::flashmoe::experts::{DenseExpertDtype, FixedDenseExpertSlotSpec};
+    use crate::inference::flashmoe::scheduler::{
+        FlashMoeScheduledGraph, ScheduledAttentionMathImplementation,
+    };
     use crate::inference::flashmoe::{GLM52_MODEL, QWEN3_VL_MODEL, QWEN35_MODEL, QwenModelConfig};
 
     fn config(json: &[u8]) -> QwenModelConfig {
@@ -1469,6 +1553,34 @@ mod tests {
         assert_eq!(
             graph.build_attention_math(3, 0).unwrap().implementation,
             crate::inference::flashmoe::scheduler::ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption
+        );
+
+        let metal_mla = FlashMoeCapabilityPlan::resolve_with_attention_math(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&layout),
+            &attention_layers(&layout),
+            FlashMoeAttentionMathCapability::GlmMlaMetalQ4MultilinearCpuReduction,
+            Some(MetalRuntimeCapabilities::from_pipeline_names(
+                MetalPipelineNameSet::new(),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            metal_mla
+                .stage(FlashMoeGraphStage::AttentionMath)
+                .unwrap()
+                .placement,
+            FlashMoeStagePlacement::MetalWithCpuReduction
+        );
+        assert_eq!(
+            FlashMoeScheduledGraph::from_capabilities(&metal_mla)
+                .unwrap()
+                .build_attention_math(3, 0)
+                .unwrap()
+                .implementation,
+            ScheduledAttentionMathImplementation::MetalQ4GlmMlaWeightAbsorptionCpuReduction
         );
 
         for (metal, expected_stage) in [

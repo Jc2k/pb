@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use objc2::rc::autoreleasepool;
 use tracing::{debug, info, trace, trace_span};
 
-use super::capabilities::FlashMoeCapabilityPlan;
+use super::capabilities::{FlashMoeAttentionMathCapability, FlashMoeCapabilityPlan};
 use super::experts::ExpertSlotStore;
 use super::math::*;
 use super::metal::*;
@@ -235,12 +235,26 @@ where
     let expert_storage = resolved_experts.descriptor;
     progress("expert_store", phase_started.elapsed());
     phase_started = Instant::now();
-    let capability_plan = FlashMoeCapabilityPlan::resolve(
+    let attention_math = if model_layout.family == QwenMoeFamily::Glm52
+        && runtime.mla_attention.iter().all(|layout| {
+            matches!(
+                layout.map(|layout| layout.kv_projection),
+                Some(MlaKvProjectionLayout::AbsorbedMultiLinear)
+            )
+        }) {
+        FlashMoeAttentionMathCapability::GlmMlaMetalQ4MultilinearCpuReduction
+    } else if model_layout.family == QwenMoeFamily::Glm52 {
+        FlashMoeAttentionMathCapability::GlmMlaCpuWeightAbsorption
+    } else {
+        FlashMoeAttentionMathCapability::QwenFullAttentionCpuKv
+    };
+    let capability_plan = FlashMoeCapabilityPlan::resolve_with_attention_math(
         &model_layout,
         input_adapter,
         dense_layout,
         expert_storage,
         &attention_layers,
+        attention_math,
         Some(metal.runtime_capabilities()),
     )?;
     let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
@@ -658,6 +672,28 @@ impl MetalExecutionFacade {
             let _ = (projections, input);
             bail!(
                 "FlashMoe unsupported required resident projection batch: Apple Silicon Metal is unavailable"
+            )
+        }
+    }
+
+    pub(super) fn resident_q4_multilinear(
+        &self,
+        projection: &DenseQ4MmapMatvecProjection,
+        heads: usize,
+        rows_per_head: usize,
+        inputs: &[f32],
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .resident_q4_multilinear(projection, heads, rows_per_head, inputs)?
+                .context("FlashMoe required resident Q4 multilinear projection did not resolve")
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (projection, heads, rows_per_head, inputs);
+            bail!(
+                "FlashMoe unsupported resident Q4 multilinear projection: Apple Silicon Metal is unavailable"
             )
         }
     }
@@ -1581,9 +1617,11 @@ impl FlashMoeEngine {
                 layout.qk_rope_head_dim,
             ))?;
         let scheduled_implementation = scheduled_output.implementation();
-        if scheduled_implementation
-            != ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption
-        {
+        if !matches!(
+            scheduled_implementation,
+            ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption
+                | ScheduledAttentionMathImplementation::MetalQ4GlmMlaWeightAbsorptionCpuReduction
+        ) {
             bail!(
                 "GLM MLA layer {layer} resolved unexpected scheduled attention implementation {:?}",
                 scheduled_implementation
@@ -1595,9 +1633,23 @@ impl FlashMoeEngine {
 
         let subphase_started = OptionalInstant::now(attention_buckets.is_some());
         let records = kv_cache.mla_records(position, layer)?;
-        let output = self
-            .dense
-            .mla_absorbed_attention(layer, layout, &query, &records)?;
+        let output = match scheduled_implementation {
+            ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption => self
+                .dense
+                .mla_absorbed_attention(layer, layout, &query, &records)?,
+            ScheduledAttentionMathImplementation::MetalQ4GlmMlaWeightAbsorptionCpuReduction => {
+                self.dense.mla_absorbed_attention_metal_multilinear(
+                    &self.metal,
+                    layer,
+                    layout,
+                    &query,
+                    &records,
+                )?
+            }
+            ScheduledAttentionMathImplementation::CpuKvCache => {
+                bail!("GLM MLA layer {layer} resolved the full-attention CPU KV implementation")
+            }
+        };
         if let Some(buckets) = attention_buckets {
             buckets.attention_kernel += subphase_started.elapsed();
         }
@@ -1724,6 +1776,11 @@ impl FlashMoeEngine {
             ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption => bail!(
                 "GLM MLA attention must execute through its compressed-KV weight-absorption stage"
             ),
+            ScheduledAttentionMathImplementation::MetalQ4GlmMlaWeightAbsorptionCpuReduction => {
+                bail!(
+                    "GLM MLA attention must execute through its compressed-KV Metal weight-absorption stage"
+                )
+            }
         }
     }
 
