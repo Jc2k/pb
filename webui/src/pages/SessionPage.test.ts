@@ -176,6 +176,9 @@ Deno.test("session metrics expose the canonical estimate and its measurement qua
   ok(component.includes("the energy a 10 W LED bulb uses in"));
   ok(component.includes('case "session_metrics"'));
   ok(component.includes('case "llm_invocation"'));
+  ok(component.includes("e.prompt_cache.cached_tokens"));
+  ok(component.includes("e.prompt_cache.prefilled_tokens"));
+  ok(component.includes('e.prompt_cache.source.replaceAll("_", " ")'));
   ok(component.includes("Power-estimate details"));
   ok(component.includes("Measurement coverage"));
   ok(component.includes("Gross device energy"));

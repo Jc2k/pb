@@ -377,6 +377,7 @@ pub async fn run_server_with_ready(
             interval.tick().await;
             let cleanup = tokio::task::spawn_blocking(|| -> Result<()> {
                 crate::session_environment::global_supervisor().reap_expired()?;
+                crate::inference::flashmoe::reap_idle_shared_runtimes()?;
                 if let Some(runtime) = crate::container::detect_runtime() {
                     crate::cache_manager::global_cache_manager().gc(
                         runtime.as_ref(),

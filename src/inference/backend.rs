@@ -270,6 +270,7 @@ mod tests {
                 finish_reason: crate::inference::flashmoe::GenerationFinishReason::MaxTokens,
                 prompt_tokens: 321,
                 generated_tokens: 24,
+                prompt_cache: Default::default(),
             },
             10,
             None,

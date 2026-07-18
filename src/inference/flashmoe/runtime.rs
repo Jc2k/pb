@@ -15,6 +15,7 @@ use super::metal::*;
 use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout};
 use super::planning::{FlashMoePlan, ResolvedRoutingPolicy};
 use super::scheduler::*;
+use super::session_cache::FlashMoeDiskCache;
 use super::state::*;
 use super::text::*;
 use super::types::*;
@@ -123,6 +124,7 @@ fn trace_cmd2_state(position: usize, layer: usize, prep: &MetalPostAttentionPrep
 
 struct SampledDecode {
     token: u32,
+    hidden: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -281,6 +283,8 @@ where
         Some(&plan.chat_template),
     )?;
     progress("tokenizer", phase_started.elapsed());
+    let session_cache =
+        FlashMoeSessionCache::new(FlashMoeDiskCache::from_plan(plan, config.num_hidden_layers));
     Ok(FlashMoeEngine {
         plan: plan.clone(),
         scheduler,
@@ -294,7 +298,7 @@ where
         runtime,
         linear_attention_weights,
         shared_expert_weights,
-        session_cache: FlashMoeSessionCache::default(),
+        session_cache,
     })
 }
 
@@ -783,6 +787,13 @@ impl MetalExecutionFacade {
 }
 
 impl FlashMoeEngine {
+    pub fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
+        if session_id.trim().is_empty() {
+            return Ok(());
+        }
+        self.session_cache.persist_session(session_id)
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(super) fn forward_token_input(
         &mut self,
@@ -2128,6 +2139,27 @@ impl FlashMoeEngine {
             )
     }
 
+    fn stable_base_prefix_len(
+        &self,
+        request: &StructuredGenerationRequest,
+        prompt_tokens: &[u32],
+    ) -> Result<usize> {
+        if request.raw_prompt
+            || !matches!(
+                request.messages.first().map(|message| &message.role),
+                Some(ChatRole::System)
+            )
+        {
+            return Ok(0);
+        }
+        let mut base = request.clone();
+        base.messages.truncate(1);
+        base.add_generation_prompt = false;
+        base.max_tokens = 0;
+        let (_, rendered_base) = self.structured_prompt_tokens(&base)?;
+        Ok(common_token_prefix_len(prompt_tokens, &rendered_base))
+    }
+
     pub fn generate_in_session(
         &mut self,
         session_id: &str,
@@ -2216,6 +2248,20 @@ impl FlashMoeEngine {
         self.generate_structured_inner_with_session(request, None, Some(&mut timing), false)
     }
 
+    pub fn generate_structured_summary_timed_in_session(
+        &mut self,
+        session_id: &str,
+        request: &StructuredGenerationRequest,
+    ) -> Result<TimedGenerationOutput> {
+        let mut timing = self.new_generation_timing();
+        self.generate_structured_inner_with_session(
+            request,
+            (!session_id.is_empty()).then_some(session_id),
+            Some(&mut timing),
+            false,
+        )
+    }
+
     pub fn generate_structured_summary_timed_with_progress(
         &mut self,
         request: &StructuredGenerationRequest,
@@ -2226,6 +2272,23 @@ impl FlashMoeEngine {
         self.generate_structured_inner_with_session_progress(
             request,
             None,
+            Some(&mut timing),
+            progress,
+            false,
+        )
+    }
+
+    pub fn generate_structured_summary_timed_in_session_with_progress(
+        &mut self,
+        session_id: &str,
+        request: &StructuredGenerationRequest,
+        progress: &mut dyn FnMut(String),
+    ) -> Result<TimedGenerationOutput> {
+        let mut timing = self.new_generation_timing();
+        let progress = Some(Rc::new(RefCell::new(progress)));
+        self.generate_structured_inner_with_session_progress(
+            request,
+            (!session_id.is_empty()).then_some(session_id),
             Some(&mut timing),
             progress,
             false,
@@ -2291,6 +2354,7 @@ impl FlashMoeEngine {
         let encode_started = Instant::now();
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let encode_elapsed = encode_started.elapsed();
+        let base_prefix_len = self.stable_base_prefix_len(request, &prompt_tokens)?;
         let max_tokens = request.max_tokens.max(0) as usize;
         validate_context_capacity(prompt_tokens.len(), max_tokens, request.context_size)?;
         if let Some(glm) = self.config.glm.as_ref()
@@ -2335,14 +2399,17 @@ impl FlashMoeEngine {
             request.tools.len(),
             session_id.unwrap_or("<none>")
         );
-        let mut generation = self.session_cache.begin_generation(
+        let mut generation = self.session_cache.begin_generation_with_base(
             session_id,
             prompt_tokens,
+            base_prefix_len,
             max_tokens,
             self.config.num_hidden_layers,
         );
         let prefill_start = generation.prefill_start();
         let prompt_len = generation.prompt_len();
+        let prompt_cache_source = generation.cache_source();
+        let prompt_cache_restore_ms = generation.cache_restore_ms();
         if prefill_start > 0 {
             debug!(
                 target: "flashmoe::lifecycle",
@@ -2384,21 +2451,55 @@ impl FlashMoeEngine {
                 prefill_start,
                 prompt_len.saturating_sub(prefill_start)
             );
-            let hidden = {
-                let (prompt_tokens, prefill_start, kv_cache) = generation.prefill_inputs();
-                let detailed = if detailed_timing {
-                    timing.as_deref_mut()
-                } else {
-                    None
-                };
-                self.prefill_from(
-                    prompt_tokens,
-                    prefill_start,
-                    kv_cache,
-                    detailed,
-                    progress.clone(),
-                )?
-            };
+            let mut cursor = prefill_start;
+            let mut hidden = None;
+            let base_prefix_len = generation.base_prefix_len();
+            if cursor < base_prefix_len {
+                hidden = Some({
+                    let (prompt_tokens, _, kv_cache) = generation.prefill_inputs();
+                    let detailed = if detailed_timing {
+                        timing.as_deref_mut()
+                    } else {
+                        None
+                    };
+                    self.prefill_range(
+                        prompt_tokens,
+                        cursor,
+                        base_prefix_len,
+                        kv_cache,
+                        detailed,
+                        progress.clone(),
+                    )?
+                });
+                let recurrent = self.metal.capture_linear_attention_session_state()?;
+                generation.capture_base_cache(
+                    hidden
+                        .as_ref()
+                        .expect("base prefill produced hidden")
+                        .clone(),
+                    recurrent,
+                );
+                cursor = base_prefix_len;
+            }
+            if cursor < prompt_len {
+                hidden = Some({
+                    let (prompt_tokens, _, kv_cache) = generation.prefill_inputs();
+                    let detailed = if detailed_timing {
+                        timing.as_deref_mut()
+                    } else {
+                        None
+                    };
+                    self.prefill_range(
+                        prompt_tokens,
+                        cursor,
+                        prompt_len,
+                        kv_cache,
+                        detailed,
+                        progress.clone(),
+                    )?
+                });
+            }
+            let hidden = hidden.context("FlashMoe prefill produced no final hidden state")?;
             report_generation_progress(&progress, || {
                 format!(
                     "prefill complete tokens={} elapsed_ms={}",
@@ -2462,6 +2563,8 @@ impl FlashMoeEngine {
         let prefill_or_ttft_wall = prefill_or_ttft_started.elapsed();
         let decode_phase_started = Instant::now();
         let mut decode_tokens = 0usize;
+        let mut evaluated_generated_tokens = 0usize;
+        let mut generated_head_hidden = None;
         let report_decode_progress = progress.is_some()
             || tracing::enabled!(target: "flashmoe::perf", tracing::Level::TRACE);
         while generation.should_decode() {
@@ -2500,6 +2603,8 @@ impl FlashMoeEngine {
                 )?
             };
             let token = sampled.token;
+            evaluated_generated_tokens = generated_len;
+            generated_head_hidden = Some(sampled.hidden);
             decode_tokens = decode_tokens.saturating_add(1);
             report_generation_progress(&progress, || {
                 format!(
@@ -2522,6 +2627,13 @@ impl FlashMoeEngine {
         }
         let decode_wall = decode_phase_started.elapsed();
 
+        if let Some(last_hidden) = generated_head_hidden
+            && generation.requires_prompt_snapshot()
+        {
+            let recurrent = self.metal.capture_linear_attention_session_state()?;
+            generation.capture_generated_cache(evaluated_generated_tokens, last_hidden, recurrent);
+        }
+
         self.session_cache.commit_generation(&mut generation)?;
 
         let generated = generation.into_generated();
@@ -2537,6 +2649,12 @@ impl FlashMoeEngine {
             finish_reason,
             prompt_tokens: prompt_len,
             generated_tokens: generated.len(),
+            prompt_cache: PromptCacheStats {
+                source: prompt_cache_source,
+                cached_tokens: prefill_start,
+                prefilled_tokens: prompt_len.saturating_sub(prefill_start),
+                restore_ms: prompt_cache_restore_ms,
+            },
         };
         let total_wall = generation_started.elapsed();
         info!(
@@ -2564,17 +2682,18 @@ impl FlashMoeEngine {
         Ok(TimedGenerationOutput { output, timing })
     }
 
-    fn prefill_from(
+    fn prefill_range(
         &mut self,
         prompt_tokens: &[u32],
         start_position: usize,
+        end_position: usize,
         kv_cache: &mut KvCache,
         mut timing: Option<&mut FlashMoeGenerationTiming>,
         progress: GenerationProgress<'_>,
     ) -> Result<Vec<f32>> {
-        if start_position > prompt_tokens.len() {
+        if start_position > end_position || end_position > prompt_tokens.len() {
             bail!(
-                "prefill start position {start_position} exceeds prompt length {}",
+                "prefill range {start_position}..{end_position} exceeds prompt length {}",
                 prompt_tokens.len()
             );
         }
@@ -2587,6 +2706,7 @@ impl FlashMoeEngine {
             .iter()
             .copied()
             .enumerate()
+            .take(end_position)
             .skip(start_position)
         {
             kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
@@ -2597,7 +2717,7 @@ impl FlashMoeEngine {
                 format!(
                     "prefill token begin processed={} remaining={} position={}",
                     position.saturating_sub(start_position) + 1,
-                    prompt_tokens.len().saturating_sub(position + 1),
+                    end_position.saturating_sub(position + 1),
                     position
                 )
             });
@@ -2618,7 +2738,7 @@ impl FlashMoeEngine {
                 timing.tokens.push(token_timing);
             }
             let processed = position.saturating_sub(start_position) + 1;
-            let remaining = prompt_tokens.len().saturating_sub(position + 1);
+            let remaining = end_position.saturating_sub(position + 1);
             let should_report = report_prefill_progress
                 && (processed == 1
                     || remaining == 0
@@ -2862,6 +2982,12 @@ impl FlashMoeEngine {
             finish_reason,
             prompt_tokens: runtime_inputs.prompt_tokens().len(),
             generated_tokens: generated.len(),
+            prompt_cache: PromptCacheStats {
+                source: PromptCacheSource::None,
+                cached_tokens: 0,
+                prefilled_tokens: runtime_inputs.prompt_tokens().len(),
+                restore_ms: 0,
+            },
         })
     }
 
@@ -2947,7 +3073,7 @@ impl FlashMoeEngine {
                 timing.tokens.push(token_timing);
             }
         }
-        Ok(SampledDecode { token })
+        Ok(SampledDecode { token, hidden })
     }
 
     fn sample_from_hidden(

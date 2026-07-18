@@ -740,6 +740,9 @@ export function MessageBubble({
         <article className="session-correction" aria-label={`Model inference step ${e.step}`}>
           <span>
             Model inference {e.step} · {formatHumanDurationMs(e.duration_ms)} · {formatNumber(e.prompt_tokens + e.generated_tokens)} tokens
+            {e.prompt_cache
+              ? ` · ${formatNumber(e.prompt_cache.cached_tokens)} cached, ${formatNumber(e.prompt_cache.prefilled_tokens)} prefilled (${e.prompt_cache.source.replaceAll("_", " ")})`
+              : ""}
             {e.energy_joules !== undefined ? ` · ${formatEnergy(e.energy_joules)}` : ""}
             {e.average_power_watts !== undefined ? ` at ${formatPower(e.average_power_watts)}` : ""}
           </span>

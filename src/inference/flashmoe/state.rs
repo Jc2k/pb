@@ -1,8 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::math::causal_attention;
+use super::session_cache::FlashMoeDiskCache;
+use super::types::PromptCacheSource;
 use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone)]
@@ -1527,18 +1530,18 @@ impl FlashMoeMlaKvState {
     }
 }
 
-type KvEntry = (Arc<[f32]>, Arc<[f32]>);
-type MlaKvEntry = (Arc<[f32]>, Arc<[f32]>);
+pub(super) type KvEntry = (Arc<[f32]>, Arc<[f32]>);
+pub(super) type MlaKvEntry = (Arc<[f32]>, Arc<[f32]>);
 
 #[derive(Debug, Clone)]
 pub(super) struct KvCache {
-    layers: usize,
-    capacity: usize,
+    pub(super) layers: usize,
+    pub(super) capacity: usize,
     prompt_tokens: Vec<(usize, u32)>,
     generated_tokens: Vec<(usize, u32)>,
     layer_states: Vec<(usize, usize, u64)>,
-    kv: Vec<Vec<Option<KvEntry>>>,
-    mla_kv: Vec<Vec<Option<MlaKvEntry>>>,
+    pub(super) kv: Vec<Vec<Option<KvEntry>>>,
+    pub(super) mla_kv: Vec<Vec<Option<MlaKvEntry>>>,
 }
 
 impl KvCache {
@@ -1754,20 +1757,45 @@ impl KvCache {
 
 #[derive(Debug, Default)]
 pub(super) struct FlashMoeSessionCache {
-    entries: BTreeMap<String, FlashMoeCachedSessionState>,
+    entries: BTreeMap<String, Vec<FlashMoeCachedSessionState>>,
+    session_order: VecDeque<String>,
+    prefixes: BTreeMap<String, FlashMoeCachedSessionState>,
+    prefix_order: VecDeque<String>,
+    dirty_sessions: BTreeSet<String>,
+    dirty_prefixes: BTreeSet<String>,
+    disk: Option<FlashMoeDiskCache>,
 }
 
 #[derive(Debug, Clone)]
-struct FlashMoeCachedSessionState {
-    cpu: FlashMoeSessionState<KvCache>,
-    recurrent: FlashMoeLinearAttentionSessionSnapshot,
+pub(super) struct FlashMoeCachedSessionState {
+    pub(super) cpu: FlashMoeSessionState<KvCache>,
+    pub(super) recurrent: FlashMoeLinearAttentionSessionSnapshot,
 }
 
 impl FlashMoeSessionCache {
+    pub(crate) fn new(disk: Option<FlashMoeDiskCache>) -> Self {
+        Self {
+            disk,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin_generation(
         &mut self,
         session_id: Option<&str>,
         prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        layers: usize,
+    ) -> FlashMoeGenerationState {
+        self.begin_generation_with_base(session_id, prompt_tokens, 0, max_tokens, layers)
+    }
+
+    pub(crate) fn begin_generation_with_base(
+        &mut self,
+        session_id: Option<&str>,
+        prompt_tokens: Vec<u32>,
+        base_prefix_len: usize,
         max_tokens: usize,
         layers: usize,
     ) -> FlashMoeGenerationState {
@@ -1776,12 +1804,91 @@ impl FlashMoeSessionCache {
         // fresh stage prompts. Once the new prompt diverges, the cached state
         // cannot contribute to this generation and must not remain resident
         // beside the replacement KV cache for the duration of a long prefill.
-        let cached = session_id
+        if let Some(id) = session_id {
+            self.session_order.retain(|existing| existing != id);
+        }
+        let mut cached = session_id
             .and_then(|id| self.entries.remove(id))
-            .and_then(|state| {
-                reusable_session_prefix_len(&state.cpu.tokens, &prompt_tokens)
-                    .map(|prefix_len| (prefix_len, state))
+            .and_then(|states| {
+                states
+                    .into_iter()
+                    .filter_map(|state| {
+                        reusable_session_prefix_len(&state.cpu.tokens, &prompt_tokens)
+                            .map(|prefix_len| (prefix_len, state))
+                    })
+                    .max_by_key(|(prefix_len, _)| *prefix_len)
             });
+        let mut cache_source = if cached.is_some() {
+            PromptCacheSource::MemorySession
+        } else {
+            PromptCacheSource::None
+        };
+        let base_prefix_len = base_prefix_len.min(prompt_tokens.len());
+        let base_key = (base_prefix_len > 0)
+            .then(|| FlashMoeDiskCache::token_key(&prompt_tokens[..base_prefix_len]));
+        if let Some(key) = base_key.as_ref()
+            && let Some(state) = self.prefixes.get(key).cloned()
+            && reusable_session_prefix_len(&state.cpu.tokens, &prompt_tokens).is_some_and(
+                |prefix_len| {
+                    cached
+                        .as_ref()
+                        .is_none_or(|(cached_len, _)| prefix_len > *cached_len)
+                },
+            )
+        {
+            self.touch_prefix(key);
+            cached = Some((state.cpu.tokens.len(), state));
+            cache_source = PromptCacheSource::MemoryPrefix;
+        }
+        let restore_started = Instant::now();
+        let mut used_disk = false;
+        if cached.is_none()
+            && let (Some(id), Some(disk)) = (session_id, self.disk.as_ref())
+        {
+            match disk.load_session(id) {
+                Ok(states) => {
+                    if let Some(found) = states
+                        .into_iter()
+                        .filter_map(|state| {
+                            reusable_session_prefix_len(&state.cpu.tokens, &prompt_tokens)
+                                .map(|prefix_len| (prefix_len, state))
+                        })
+                        .max_by_key(|(prefix_len, _)| *prefix_len)
+                    {
+                        cached = Some(found);
+                        cache_source = PromptCacheSource::DiskSession;
+                        used_disk = true;
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    session = id,
+                    error = %format!("{error:#}"),
+                    "ignored unreadable FlashMoe session cache"
+                ),
+            }
+        }
+        if cached.is_none()
+            && let (Some(key), Some(disk)) = (base_key.as_ref(), self.disk.as_ref())
+        {
+            match disk.load_prefix(&prompt_tokens[..base_prefix_len]) {
+                Ok(Some(state)) => {
+                    self.prefixes.insert(key.clone(), state.clone());
+                    self.touch_prefix(key);
+                    cached = Some((base_prefix_len, state));
+                    cache_source = PromptCacheSource::DiskPrefix;
+                    used_disk = true;
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    prefix = key,
+                    error = %format!("{error:#}"),
+                    "ignored unreadable FlashMoe prefix cache"
+                ),
+            }
+        }
+        let restore_ms = used_disk
+            .then(|| u64::try_from(restore_started.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
         let (kv_cache, prefill_start, cached_last_hidden, cached_recurrent) =
             if let Some((prefix_len, state)) = cached {
                 let FlashMoeSessionState {
@@ -1810,6 +1917,13 @@ impl FlashMoeSessionCache {
             prompt_cache: None,
             cached_recurrent,
             prompt_recurrent: None,
+            generated_cache: None,
+            generated_recurrent: None,
+            cache_source,
+            cache_restore_ms: restore_ms,
+            base_prefix_len,
+            base_cache: None,
+            base_recurrent: None,
             generated: Vec::new(),
             max_tokens,
             stopped: false,
@@ -1831,12 +1945,104 @@ impl FlashMoeSessionCache {
             .prompt_recurrent
             .take()
             .context("session cache recurrent snapshot is missing")?;
-        self.entries.insert(
-            session_id.clone(),
-            FlashMoeCachedSessionState { cpu, recurrent },
-        );
+        let mut checkpoints = vec![FlashMoeCachedSessionState { cpu, recurrent }];
+        if let (Some(cpu), Some(recurrent)) = (
+            generation.generated_cache.take(),
+            generation.generated_recurrent.take(),
+        ) {
+            checkpoints.push(FlashMoeCachedSessionState { cpu, recurrent });
+        }
+        self.entries.insert(session_id.clone(), checkpoints);
+        self.touch_session(session_id);
+        self.dirty_sessions.insert(session_id.clone());
+        self.evict_excess_sessions(memory_session_limit());
+        if let (Some(cpu), Some(recurrent)) = (
+            generation.base_cache.take(),
+            generation.base_recurrent.take(),
+        ) {
+            let state = FlashMoeCachedSessionState { cpu, recurrent };
+            let key = FlashMoeDiskCache::token_key(&state.cpu.tokens);
+            self.prefixes.insert(key.clone(), state);
+            self.touch_prefix(&key);
+            self.dirty_prefixes.insert(key);
+            while self.prefixes.len() > 4 {
+                let Some(oldest) = self.prefix_order.pop_front() else {
+                    break;
+                };
+                self.prefixes.remove(&oldest);
+                self.dirty_prefixes.remove(&oldest);
+            }
+        }
         Ok(())
     }
+
+    fn touch_prefix(&mut self, key: &str) {
+        self.prefix_order.retain(|existing| existing != key);
+        self.prefix_order.push_back(key.to_string());
+    }
+
+    fn touch_session(&mut self, session_id: &str) {
+        self.session_order.retain(|existing| existing != session_id);
+        self.session_order.push_back(session_id.to_string());
+    }
+
+    fn evict_excess_sessions(&mut self, limit: usize) {
+        while self.entries.len() > limit {
+            let Some(oldest) = self.session_order.pop_front() else {
+                break;
+            };
+            if self.dirty_sessions.contains(&oldest)
+                && let (Some(disk), Some(safe_prompt)) = (
+                    self.disk.as_ref(),
+                    self.entries.get(&oldest).and_then(|states| states.first()),
+                )
+                && let Err(error) = disk.persist_session(&oldest, std::slice::from_ref(safe_prompt))
+            {
+                tracing::warn!(
+                    session = oldest,
+                    error = %format!("{error:#}"),
+                    "could not persist evicted FlashMoe session cache"
+                );
+            }
+            self.entries.remove(&oldest);
+            self.dirty_sessions.remove(&oldest);
+        }
+    }
+
+    pub(crate) fn persist_session(&mut self, session_id: &str) -> Result<()> {
+        let Some(disk) = self.disk.as_ref() else {
+            return Ok(());
+        };
+        let prefix_keys = self.dirty_prefixes.iter().cloned().collect::<Vec<_>>();
+        for key in &prefix_keys {
+            if let Some(state) = self.prefixes.get(key) {
+                disk.persist_prefix(state)?;
+            }
+        }
+        if self.dirty_sessions.contains(session_id)
+            && let Some(states) = self.entries.get(session_id)
+            && let Some(safe_prompt) = states.first()
+        {
+            // The generated head is a speculative in-memory accelerator. Persist
+            // only the canonical prompt boundary so restart durability does not
+            // double checkpoint writes or depend on output re-tokenization.
+            disk.persist_session(session_id, std::slice::from_ref(safe_prompt))?;
+        }
+        for key in prefix_keys {
+            self.dirty_prefixes.remove(&key);
+        }
+        self.dirty_sessions.remove(session_id);
+        Ok(())
+    }
+}
+
+fn memory_session_limit() -> usize {
+    const DEFAULT_MEMORY_SESSIONS: usize = 2;
+    std::env::var("PB_FLASHMOE_MEMORY_SESSIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MEMORY_SESSIONS)
 }
 
 #[derive(Debug)]
@@ -1849,6 +2055,13 @@ pub(super) struct FlashMoeGenerationState {
     prompt_cache: Option<FlashMoeSessionState<KvCache>>,
     cached_recurrent: Option<FlashMoeLinearAttentionSessionSnapshot>,
     prompt_recurrent: Option<FlashMoeLinearAttentionSessionSnapshot>,
+    generated_cache: Option<FlashMoeSessionState<KvCache>>,
+    generated_recurrent: Option<FlashMoeLinearAttentionSessionSnapshot>,
+    cache_source: PromptCacheSource,
+    cache_restore_ms: u64,
+    base_prefix_len: usize,
+    base_cache: Option<FlashMoeSessionState<KvCache>>,
+    base_recurrent: Option<FlashMoeLinearAttentionSessionSnapshot>,
     generated: Vec<u32>,
     max_tokens: usize,
     stopped: bool,
@@ -1861,6 +2074,18 @@ impl FlashMoeGenerationState {
 
     pub(crate) fn prefill_start(&self) -> usize {
         self.prefill_start
+    }
+
+    pub(crate) fn cache_source(&self) -> PromptCacheSource {
+        self.cache_source
+    }
+
+    pub(crate) fn cache_restore_ms(&self) -> u64 {
+        self.cache_restore_ms
+    }
+
+    pub(crate) fn base_prefix_len(&self) -> usize {
+        self.base_prefix_len
     }
 
     pub(crate) fn take_cached_last_hidden(&mut self) -> Option<Vec<f32>> {
@@ -1895,6 +2120,43 @@ impl FlashMoeGenerationState {
             last_hidden,
         ));
         self.prompt_recurrent = Some(recurrent);
+    }
+
+    pub(crate) fn capture_base_cache(
+        &mut self,
+        last_hidden: Vec<f32>,
+        recurrent: FlashMoeLinearAttentionSessionSnapshot,
+    ) {
+        if self.base_prefix_len == 0 || self.base_prefix_len > self.prompt_tokens.len() {
+            return;
+        }
+        self.base_cache = Some(FlashMoeSessionState::new(
+            self.prompt_tokens[..self.base_prefix_len].to_vec(),
+            self.kv_cache.shallow_snapshot(),
+            last_hidden,
+        ));
+        self.base_recurrent = Some(recurrent);
+    }
+
+    pub(crate) fn capture_generated_cache(
+        &mut self,
+        evaluated_generated_tokens: usize,
+        last_hidden: Vec<f32>,
+        recurrent: FlashMoeLinearAttentionSessionSnapshot,
+    ) {
+        if self.session_id.is_none() || evaluated_generated_tokens == 0 {
+            return;
+        }
+        let mut tokens = stable_session_cache_tokens(&self.prompt_tokens);
+        tokens.extend_from_slice(
+            &self.generated[..evaluated_generated_tokens.min(self.generated.len())],
+        );
+        self.generated_cache = Some(FlashMoeSessionState::new(
+            tokens,
+            self.kv_cache.shallow_snapshot(),
+            last_hidden,
+        ));
+        self.generated_recurrent = Some(recurrent);
     }
 
     pub(crate) fn should_sample_first(&self) -> bool {
@@ -2064,6 +2326,70 @@ mod tests {
         );
         assert_eq!(reused.kv_cache.keys_values(1, 0).unwrap().len(), 2);
         assert!(reused.generated.is_empty());
+    }
+
+    #[test]
+    fn generation_lifecycle_prefers_the_exact_generated_head_checkpoint() {
+        let mut sessions = FlashMoeSessionCache::default();
+        let mut generation = sessions.begin_generation(Some("chat"), vec![10, 20], 3, 1);
+        generation.capture_prompt_cache(vec![2.0], recurrent_session_snapshot());
+        generation.record_sampled_token(30, false);
+        generation
+            .kv_cache
+            .record_kv(2, 0, vec![3.0], vec![4.0])
+            .unwrap();
+        generation.capture_generated_cache(1, vec![3.0], recurrent_session_snapshot());
+        sessions.commit_generation(&mut generation).unwrap();
+
+        let mut reused = sessions.begin_generation(Some("chat"), vec![10, 20, 30, 40], 1, 1);
+        assert_eq!(reused.prefill_start(), 3);
+        assert_eq!(reused.cache_source(), PromptCacheSource::MemorySession);
+        assert_eq!(reused.take_cached_last_hidden(), None);
+        assert_eq!(reused.kv_cache.keys_values(2, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stable_base_checkpoint_is_shared_across_logical_sessions() {
+        let mut sessions = FlashMoeSessionCache::default();
+        let mut first =
+            sessions.begin_generation_with_base(Some("first"), vec![10, 20, 30], 2, 1, 1);
+        first
+            .kv_cache
+            .record_kv(0, 0, vec![1.0], vec![2.0])
+            .unwrap();
+        first
+            .kv_cache
+            .record_kv(1, 0, vec![3.0], vec![4.0])
+            .unwrap();
+        first.capture_base_cache(vec![5.0], recurrent_session_snapshot());
+        first.capture_prompt_cache(vec![6.0], recurrent_session_snapshot());
+        sessions.commit_generation(&mut first).unwrap();
+
+        let mut second =
+            sessions.begin_generation_with_base(Some("second"), vec![10, 20, 99], 2, 1, 1);
+        assert_eq!(second.prefill_start(), 2);
+        assert_eq!(second.cache_source(), PromptCacheSource::MemoryPrefix);
+        assert_eq!(second.take_cached_last_hidden(), None);
+        assert_eq!(second.kv_cache.keys_values(1, 0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn memory_session_cache_evicts_the_least_recently_used_conversation() {
+        let mut sessions = FlashMoeSessionCache::default();
+        for (session_id, token) in [("first", 10), ("second", 20), ("third", 30)] {
+            let mut generation = sessions.begin_generation(Some(session_id), vec![token], 1, 1);
+            generation.capture_prompt_cache(vec![token as f32], recurrent_session_snapshot());
+            sessions.commit_generation(&mut generation).unwrap();
+        }
+
+        sessions.evict_excess_sessions(2);
+        assert!(!sessions.entries.contains_key("first"));
+        assert!(sessions.entries.contains_key("second"));
+        assert!(sessions.entries.contains_key("third"));
+        assert_eq!(
+            sessions.session_order,
+            VecDeque::from(["second".into(), "third".into()])
+        );
     }
 
     #[test]

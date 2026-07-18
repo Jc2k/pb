@@ -273,6 +273,25 @@ pub enum GenerationFinishReason {
     MaxTokens,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheSource {
+    #[default]
+    None,
+    MemorySession,
+    MemoryPrefix,
+    DiskSession,
+    DiskPrefix,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheStats {
+    pub source: PromptCacheSource,
+    pub cached_tokens: usize,
+    pub prefilled_tokens: usize,
+    pub restore_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerationOutput {
     pub content: String,
@@ -280,6 +299,7 @@ pub struct GenerationOutput {
     pub finish_reason: GenerationFinishReason,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
+    pub prompt_cache: PromptCacheStats,
 }
 
 #[derive(Debug, Clone)]

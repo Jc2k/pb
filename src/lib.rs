@@ -612,6 +612,14 @@ pub struct FlashMoeInferArgs {
     /// Print the final Metal resource ledger as JSON
     #[arg(long)]
     pub resource_summary: bool,
+
+    /// Reuse a logical FlashMoe session and persist its prompt state
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    /// Repeat the same request in one loaded runtime (for prompt-cache verification)
+    #[arg(long, default_value_t = 1)]
+    pub repeat: usize,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1903,10 +1911,16 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     if args.top_k < 1 {
         bail!("--top-k must be at least 1");
     }
+    if args.repeat < 1 {
+        bail!("--repeat must be at least 1");
+    }
     if args.raw && !args.images.is_empty() {
         bail!(
             "--raw cannot be combined with --image; multimodal input requires the typed Qwen-VL chat template"
         );
+    }
+    if !args.images.is_empty() && (args.repeat != 1 || args.session_id.is_some()) {
+        bail!("--repeat and --session-id currently support text FlashMoe inference only");
     }
 
     let user_config = UserConfig::load()?;
@@ -1954,6 +1968,8 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         "flashmoe infer: backend loaded in {} ms",
         load_started.elapsed().as_millis()
     );
+    let session_id = args.session_id.clone();
+    let repeat = args.repeat;
     let request = inference::flashmoe::GenerationRequest {
         prompt: args.prompt,
         max_tokens: args.max_tokens,
@@ -1965,8 +1981,8 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         "flashmoe infer: generating max_tokens={} temperature={} top_k={}",
         args.max_tokens, args.temperature, args.top_k
     );
-    let generation_started = Instant::now();
     if !args.images.is_empty() {
+        let generation_started = Instant::now();
         let mut content = args
             .images
             .into_iter()
@@ -2004,32 +2020,62 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         structured_request.raw_prompt = true;
         structured_request.add_generation_prompt = false;
     }
-    let timed = if args.verbose || args.trace_candidates {
-        let verbose = args.verbose;
-        let mut progress = |message: String| {
-            if verbose || message.starts_with("sampling candidates") {
-                eprintln!("flashmoe infer: {message}");
+    let mut last_timed = None;
+    for pass in 1..=repeat {
+        let generation_started = Instant::now();
+        let timed = if args.verbose || args.trace_candidates {
+            let verbose = args.verbose;
+            let mut progress = |message: String| {
+                if verbose || message.starts_with("sampling candidates") {
+                    eprintln!("flashmoe infer: {message}");
+                }
+            };
+            if let Some(session_id) = session_id.as_deref() {
+                engine.generate_structured_summary_timed_in_session_with_progress(
+                    session_id,
+                    &structured_request,
+                    &mut progress,
+                )?
+            } else {
+                engine.generate_structured_summary_timed_with_progress(
+                    &structured_request,
+                    &mut progress,
+                )?
             }
+        } else if let Some(session_id) = session_id.as_deref() {
+            engine.generate_structured_summary_timed_in_session(session_id, &structured_request)?
+        } else {
+            engine.generate_structured_summary_timed(&structured_request)?
         };
-        engine
-            .generate_structured_summary_timed_with_progress(&structured_request, &mut progress)?
-    } else {
-        engine.generate_structured_summary_timed(&structured_request)?
-    };
-    eprintln!(
-        "flashmoe infer: generated {} tokens in {} ms",
-        timed.output.generated_tokens,
-        generation_started.elapsed().as_millis()
-    );
-    let throughput = flashmoe_throughput_summary(&timed);
-    eprintln!(
-        "flashmoe infer: throughput total_ms={} prefill_or_ttft_ms={} decode_tokens={} decode_ms={} decode_tok_s={}",
-        throughput.total_wall.as_millis(),
-        throughput.prefill_or_ttft_wall.as_millis(),
-        throughput.decode_tokens,
-        throughput.decode_wall.as_millis(),
-        fmt_optional_tok_s(throughput.decode_tok_s())
-    );
+        eprintln!(
+            "flashmoe infer: pass={pass}/{repeat} generated {} tokens in {} ms",
+            timed.output.generated_tokens,
+            generation_started.elapsed().as_millis()
+        );
+        let throughput = flashmoe_throughput_summary(&timed);
+        eprintln!(
+            "flashmoe infer: pass={pass}/{repeat} throughput total_ms={} prefill_or_ttft_ms={} decode_tokens={} decode_ms={} decode_tok_s={}",
+            throughput.total_wall.as_millis(),
+            throughput.prefill_or_ttft_wall.as_millis(),
+            throughput.decode_tokens,
+            throughput.decode_wall.as_millis(),
+            fmt_optional_tok_s(throughput.decode_tok_s())
+        );
+        eprintln!(
+            "flashmoe infer: pass={pass}/{repeat} prompt_cache source={:?} cached_tokens={} prefilled_tokens={} restore_ms={}",
+            timed.output.prompt_cache.source,
+            timed.output.prompt_cache.cached_tokens,
+            timed.output.prompt_cache.prefilled_tokens,
+            timed.output.prompt_cache.restore_ms,
+        );
+        last_timed = Some(timed);
+    }
+    if let Some(session_id) = session_id.as_deref()
+        && let Err(error) = engine.persist_session_cache(session_id)
+    {
+        eprintln!("flashmoe infer: failed to persist session cache: {error:#}");
+    }
+    let timed = last_timed.context("FlashMoe inference repeat loop produced no output")?;
     let content = timed.output.content.trim();
     if content.is_empty() {
         bail!("FlashMoe inference returned an empty response");
@@ -3943,6 +3989,7 @@ mod tests {
                 finish_reason: crate::inference::flashmoe::GenerationFinishReason::EndOfGeneration,
                 prompt_tokens: 1,
                 generated_tokens: 1,
+                prompt_cache: Default::default(),
             },
             timing: crate::inference::flashmoe::FlashMoeGenerationTiming {
                 model: "test-model".to_string(),
@@ -4024,6 +4071,7 @@ mod tests {
                 finish_reason: crate::inference::flashmoe::GenerationFinishReason::EndOfGeneration,
                 prompt_tokens: 1,
                 generated_tokens: 3,
+                prompt_cache: Default::default(),
             },
             timing: crate::inference::flashmoe::FlashMoeGenerationTiming {
                 model: "test-model".to_string(),

@@ -866,6 +866,19 @@ Baseline reviewed on 2026-07-11:
   mismatched recurrent layers, restores recurrent bytes, and clears transient conv/delta/gate
   outputs. Reset lock failure is also an error rather than a silent no-op. State tests cover typed
   snapshot shape/order and lifecycle transfer; a local-Metal test proves the real buffer round trip.
+- Managed inference now obtains FlashMoe through a process-level per-model runtime pool. The pool
+  locks only for model calls, so tool execution and nested advisory work do not retain a global
+  inference lock; idle runtimes are reaped and the resident model count is bounded. A logical
+  session keeps a safe prompt checkpoint plus an evaluated generated-token head and selects the
+  longest exact match. The first stable system/tool prefix is a separate content-addressed
+  checkpoint, so another session can skip that prefill without sharing later conversation state.
+- `flashmoe-session-v1` serializes populated full-attention KV and compressed MLA records, typed
+  linear-attention conv/SSM snapshots, final hidden state, and exact token ids. Model/runtime and
+  token hashes reject stale state; owner-only atomic files and an explicit byte budget bound local
+  persistence. Durable session state commits only the canonical prompt boundary; the speculative
+  generated head remains memory-only. Agent events and the web transcript report cache source, reused tokens,
+  actually-prefilled tokens, and restore latency. Hidden `harness infer --session-id --repeat`
+  exercises live and restart restoration through the production path.
 - Deferred CMD3 ownership is now Metal-native. `MetalScheduledCmd3Submission` owns command/buffer
   lifetime and exposes validated `MetalStateBuffer` views for hidden and next-layer normed state;
   `runtime.rs` no longer wraps raw pointers or carries a non-Metal ready continuation. The

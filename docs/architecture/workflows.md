@@ -158,13 +158,23 @@ summary would weaken the authority and audit guarantees, so it is not the next c
 Future compaction work should be driven by measured retrieval or quality failures and should retain
 the same deterministic receipt and durable-event boundary.
 
-Compaction is also cache-safe. Both local inference paths compare the exact rendered token prefix
-before reusing attention state. llama.cpp keeps the live context across passes and saves a bounded
-set of restartable states to the local cache directory; FlashMoe retains its prompt-boundary KV and
-recurrent state in memory. When a system prompt, tool schema, stage prompt, or compacted transcript
-changes, reuse stops at the first changed token. The remaining suffix is evaluated normally. A
-compaction event can therefore cause one deliberate cache discontinuity, but it cannot attach stale
-KV state to a different prompt.
+Compaction is also cache-safe. Both local inference paths compare exact rendered tokens before
+reusing attention state. llama.cpp keeps the live context across passes and saves byte-budgeted
+restartable state. The service keeps FlashMoe model/Metal runtimes resident across managed turns; a
+bounded LRU of logical sessions retains both a safe prompt checkpoint and an exact generated-token
+head, while the stable first-system-message prefix is content-addressed for cross-session reuse.
+FlashMoe also persists full-attention KV or MLA KV, linear-attention recurrence, the final hidden
+state, and token ids in a model-fingerprinted local cache.
+
+Dynamic branch, recent-commit, environment-evidence, and per-turn discussion authority are rendered
+as a second system message. The first system message and its authorized native-tool schema therefore
+form a stable checkpoint without weakening tool authority. A changed token never reuses later state.
+If compaction or a stage/tool-schema transition diverges before the newest checkpoint, pb falls back
+to a matching stable prefix when one exists and evaluates the remaining suffix normally.
+
+Each `llm_invocation` records total prompt tokens, cached tokens, actually-prefilled tokens, cache
+source, and disk-restore time. These counts distinguish context size from work performed and make a
+cache miss or invalidation visible in the web transcript.
 
 ## Where the workflow ends
 

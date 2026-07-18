@@ -19,12 +19,16 @@ Normal prompts are generated inside the pb process and sent to the selected loca
 backend. Session events and workflow checkpoints are persisted into repository-local Git notes.
 The web UI is embedded in the binary and served by the local Rust process.
 
-llama.cpp session acceleration is local as well. pb keeps a live exact-prefix context during an
-agent run and stores up to four restartable state files under the platform cache root. A state file
-contains derived attention state plus the associated prompt tokens, so it can reflect repository
-content that appeared in the prompt. Filenames hash the model, context, and session identity; the
-cache directory is owner-only on Unix. `PB_LLAMA_SESSION_CACHE=off` disables disk persistence.
-FlashMoe's equivalent exact-prefix state is currently process-memory only.
+Inference acceleration is local as well. llama.cpp keeps a live exact-prefix context during an
+agent run and stores byte-budgeted restartable state under the platform cache root. FlashMoe keeps
+loaded model/Metal runtimes in a bounded idle pool, holds safe prompt, generated-head, and shared
+system-prefix checkpoints in memory, and writes compatible KV/MLA/recurrent checkpoints to its own
+byte-budgeted cache. State files contain token ids and derived attention or recurrent state, so
+they can reflect repository content that appeared in the prompt. Model, tokenizer, template,
+runtime-layout, and token hashes prevent incompatible restoration; session filenames are hashed;
+directories and files are owner-only on Unix; writes use temporary files and atomic replacement.
+`PB_LLAMA_SESSION_CACHE=off` and `PB_FLASHMOE_SESSION_CACHE=off` independently disable disk
+persistence without disabling in-process reuse.
 
 No hosted model API is required by the core workflow.
 
@@ -77,7 +81,7 @@ explicit local backend inherits host connectivity.
 | User-global | Model preferences, project registry, OAuth token | Stored below the user's config/data roots; not checked into a project. |
 | Repository-owned | `.pb/` configuration, source, acceptance facts | Visible to project collaborators if committed; secret values should not appear here. |
 | Session-owned | Task workspace, container, services, network, event stream | Reconciled or removed when terminal/expired, except persisted history. |
-| Reusable local artifact | Model weights, images, declared caches, llama.cpp session state | May survive sessions; managed separately from task cleanup. |
+| Reusable local artifact | Model weights, images, declared caches, llama.cpp and FlashMoe session state | May survive sessions; managed separately from task cleanup. |
 | External disclosure | Search query, remote tool arguments, provider mutation | Occurs only through an enabled edge; governed by its provider and local policy. |
 
 ## Persistence is not publication

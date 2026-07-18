@@ -238,6 +238,12 @@ export type AgentEvent =
       duration_ms: number;
       prompt_tokens: number;
       generated_tokens: number;
+      prompt_cache?: {
+        source: string;
+        cached_tokens: number;
+        prefilled_tokens: number;
+        restore_ms?: number;
+      };
       context?: {
         context_capacity: number;
         reserved_generation_tokens: number;

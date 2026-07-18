@@ -357,6 +357,15 @@ pub struct AgentContextUsage {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheUsage {
+    pub source: String,
+    pub cached_tokens: usize,
+    pub prefilled_tokens: usize,
+    #[serde(default)]
+    pub restore_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSectionUsage {
     pub label: String,
     pub chars: usize,
@@ -677,6 +686,8 @@ pub enum AgentEvent {
         duration_ms: u64,
         prompt_tokens: usize,
         generated_tokens: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_cache: Option<PromptCacheUsage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context: Option<AgentContextUsage>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1301,6 +1312,7 @@ impl EventEnvelope {
                 duration_ms,
                 prompt_tokens,
                 generated_tokens,
+                prompt_cache,
                 context,
                 energy_joules,
                 energy_kwh,
@@ -1314,6 +1326,7 @@ impl EventEnvelope {
                     duration_ms,
                     prompt_tokens,
                     generated_tokens,
+                    prompt_cache,
                     context,
                     energy_joules,
                     energy_kwh,
@@ -1639,6 +1652,12 @@ mod tests {
             duration_ms: 10,
             prompt_tokens: 4960,
             generated_tokens: 3,
+            prompt_cache: Some(PromptCacheUsage {
+                source: "memory_prefix".to_string(),
+                cached_tokens: 4096,
+                prefilled_tokens: 864,
+                restore_ms: 0,
+            }),
             context: Some(context.clone()),
             energy_joules: None,
             energy_kwh: None,
@@ -1652,6 +1671,7 @@ mod tests {
             restored.event,
             AgentEvent::LlmInvocation {
                 context: Some(restored),
+                prompt_cache: Some(PromptCacheUsage { cached_tokens: 4096, .. }),
                 ..
             } if restored == context
         ));

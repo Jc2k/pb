@@ -228,9 +228,13 @@ only make the default policy stricter. `--resource-summary` prints the opt-in JS
 normal runs keep it disabled and emit tracing only for high-water changes, pressure recovery, or a
 resource-limit abort. `infer --no-thinking` asks a checkpoint's chat template to suppress emitted
 reasoning; it cannot be combined with `--raw`, which bypasses the chat template entirely.
+`infer --session-id ID --repeat N` runs text inference through the exact production session cache,
+prints cached and actually-prefilled token counts for each pass, and flushes the final checkpoint.
+Running the same command again verifies a disk restore; `--repeat 2` verifies live reuse without a
+second model load.
 
 The agent/evaluation handoff plumbing does not apply to `pb harness infer`, `pb harness bench`, or
-`pb harness cache-clean`: their arguments, dispatch paths, output, and exit behavior are unchanged.
+`pb harness cache-clean`; they remain direct diagnostic utilities rather than workflow stages.
 
 ## Control evaluation
 

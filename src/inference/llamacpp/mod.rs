@@ -9,7 +9,7 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use encoding_rs::UTF_8;
@@ -34,7 +34,7 @@ use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate
 const BATCH_SIZE: usize = 512;
 const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
 const LLAMA_SESSION_CACHE_VERSION: &str = "llamacpp-session-v1";
-const MAX_PERSISTED_SESSION_STATES: usize = 4;
+const DEFAULT_LLAMA_SESSION_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Parameters for a single generation call.
 #[derive(Debug, Clone)]
@@ -79,6 +79,10 @@ pub struct Output {
     pub finish_reason: FinishReason,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
+    pub cached_prompt_tokens: usize,
+    pub prefilled_prompt_tokens: usize,
+    pub prompt_cache_source: Option<String>,
+    pub prompt_cache_restore_ms: u64,
     pub duration_ms: u64,
     pub energy: Option<EnergyEstimate>,
 }
@@ -103,6 +107,8 @@ struct CachedLlamaContext<'a> {
     context: LlamaContext<'a>,
     evaluated_tokens: Vec<LlamaToken>,
     settings: LlamaSessionSettings,
+    restored_from_disk: bool,
+    restore_ms: u64,
 }
 
 /// One logical chat session with a live llama.cpp context and a crash-safe disk snapshot.
@@ -344,6 +350,10 @@ impl LlamaCppBackend {
             finish_reason,
             prompt_tokens: tokens.len(),
             generated_tokens,
+            cached_prompt_tokens: 0,
+            prefilled_prompt_tokens: tokens.len(),
+            prompt_cache_source: None,
+            prompt_cache_restore_ms: 0,
             duration_ms: duration_millis(started),
             energy,
         })
@@ -482,6 +492,10 @@ impl LlamaCppBackend {
             finish_reason,
             prompt_tokens: chunks.total_positions() as usize,
             generated_tokens,
+            cached_prompt_tokens: 0,
+            prefilled_prompt_tokens: chunks.total_positions() as usize,
+            prompt_cache_source: None,
+            prompt_cache_restore_ms: 0,
             duration_ms: duration_millis(started),
             energy,
         })
@@ -513,11 +527,17 @@ impl LlamaCppChatSession<'_> {
             .is_none_or(|cached| cached.settings != settings);
         if needs_context {
             let mut context = self.backend.new_text_context(settings)?;
+            let restore_started = Instant::now();
             let evaluated_tokens = self.load_persisted_state(&mut context, settings, &tokens);
+            let restored_from_disk = !evaluated_tokens.is_empty();
             self.cached = Some(CachedLlamaContext {
                 context,
                 evaluated_tokens,
                 settings,
+                restored_from_disk,
+                restore_ms: restored_from_disk
+                    .then(|| duration_millis(restore_started))
+                    .unwrap_or(0),
             });
         }
 
@@ -555,6 +575,20 @@ impl LlamaCppChatSession<'_> {
             reused_prefix_tokens = prefill_start,
             "prepared llama.cpp session prefix"
         );
+        let prompt_cache_source = (prefill_start > 0).then(|| {
+            if cached.restored_from_disk {
+                "disk_session".to_string()
+            } else {
+                "memory_session".to_string()
+            }
+        });
+        let prompt_cache_restore_ms = if prompt_cache_source.as_deref() == Some("disk_session") {
+            cached.restore_ms
+        } else {
+            0
+        };
+        cached.restored_from_disk = false;
+        cached.restore_ms = 0;
 
         let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
         for range in prompt_batch_ranges_from(prefill_start, tokens.len(), BATCH_SIZE) {
@@ -641,6 +675,10 @@ impl LlamaCppChatSession<'_> {
             finish_reason,
             prompt_tokens: prompt_token_count,
             generated_tokens,
+            cached_prompt_tokens: prefill_start,
+            prefilled_prompt_tokens: prompt_token_count.saturating_sub(prefill_start),
+            prompt_cache_source,
+            prompt_cache_restore_ms,
             duration_ms: duration_millis(started),
             energy,
         })
@@ -711,9 +749,20 @@ impl LlamaCppChatSession<'_> {
                     temporary.path().display()
                 )
             })?;
+        let max_bytes = llama_session_cache_max_bytes();
+        let state_bytes = temporary.as_file().metadata()?.len();
+        if state_bytes > max_bytes {
+            tracing::warn!(
+                session_id = %self.session_id,
+                state_bytes,
+                max_bytes,
+                "llama.cpp session state exceeds the configured disk-cache budget"
+            );
+            return Ok(());
+        }
         let temporary = temporary.into_temp_path();
         replace_cache_file(&temporary, &path)?;
-        prune_session_cache(parent, &path)?;
+        prune_session_cache(parent, &path, max_bytes)?;
         Ok(())
     }
 
@@ -883,6 +932,14 @@ fn llama_session_cache_disabled() -> bool {
         })
 }
 
+fn llama_session_cache_max_bytes() -> u64 {
+    std::env::var("PB_LLAMA_SESSION_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LLAMA_SESSION_CACHE_MAX_BYTES)
+}
+
 fn llama_session_cache_root() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("PB_CACHE_DIR").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(root).join(LLAMA_SESSION_CACHE_VERSION));
@@ -945,7 +1002,7 @@ fn secure_cache_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn prune_session_cache(root: &Path, current: &Path) -> Result<()> {
+fn prune_session_cache(root: &Path, current: &Path, max_bytes: u64) -> Result<()> {
     let mut states = fs::read_dir(root)
         .with_context(|| format!("failed to inspect llama session cache {}", root.display()))?
         .filter_map(|entry| entry.ok())
@@ -955,21 +1012,28 @@ fn prune_session_cache(root: &Path, current: &Path) -> Result<()> {
                 .is_some_and(|extension| extension == "state")
         })
         .map(|path| {
-            let modified = path
-                .metadata()
-                .and_then(|metadata| metadata.modified())
+            let metadata = path.metadata();
+            let modified = metadata
+                .as_ref()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
                 .unwrap_or(UNIX_EPOCH);
-            (modified, path)
+            let bytes = metadata.map(|metadata| metadata.len()).unwrap_or(0);
+            (modified, bytes, path)
         })
         .collect::<Vec<_>>();
-    states.sort_by(|left, right| {
-        (right.1 == current)
-            .cmp(&(left.1 == current))
-            .then_with(|| right.0.cmp(&left.0))
-    });
-    for (_, path) in states.into_iter().skip(MAX_PERSISTED_SESSION_STATES) {
+    let mut total = states.iter().map(|(_, bytes, _)| *bytes).sum::<u64>();
+    states.sort_by_key(|(modified, _, _)| *modified);
+    for (_, bytes, path) in states {
+        if total <= max_bytes {
+            break;
+        }
+        if path == current {
+            continue;
+        }
         fs::remove_file(&path)
             .with_context(|| format!("failed to prune llama session cache {}", path.display()))?;
+        total = total.saturating_sub(bytes);
     }
     Ok(())
 }
@@ -1057,10 +1121,13 @@ mod tests {
         }
         let current = paths[0].clone();
 
-        prune_session_cache(tmp.path(), &current).unwrap();
+        prune_session_cache(tmp.path(), &current, 4).unwrap();
 
-        let remaining = fs::read_dir(tmp.path()).unwrap().count();
-        assert_eq!(remaining, MAX_PERSISTED_SESSION_STATES);
+        let remaining_bytes = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum::<u64>();
+        assert!(remaining_bytes <= 4);
         assert!(current.is_file());
     }
 

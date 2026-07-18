@@ -28,21 +28,39 @@ changed, so treat non-loopback binding as an explicit trust decision.
 
 ## Inference session cache
 
-**Shipped.** Agent calls through llama.cpp keep one live context for the logical session and reuse
-the longest exact rendered-token prefix on each pass. At the end of a pass, pb also saves the
-llama.cpp state so a later process can resume without prefilling the unchanged prefix again. The
-cache key includes the model file identity, context size, and a hash of the session id; exact token
-comparison invalidates changed system instructions, tools, templates, messages, and compaction.
+**Shipped.** Both local text backends compare exact rendered token prefixes before reusing model
+state. llama.cpp keeps one live context for the logical run and saves restartable state so a later
+process can resume without prefilling the unchanged prefix. The cache key includes the model file
+identity, context size, and a hash of the session id; exact token comparison invalidates changed
+system instructions, tools, templates, messages, and compaction.
 
 States live below the platform cache directory at `pb/llamacpp-session-v1/`. Set `PB_CACHE_DIR` to
 move pb's cache root, or set `PB_LLAMA_SESSION_CACHE=off` to disable disk snapshots while retaining
-the in-process context. pb keeps at most four llama.cpp state files and writes replacements through
-a temporary owner-only cache directory. These files can be large because they contain the model's
-evaluated attention state and associated prompt tokens.
+the in-process context. `PB_LLAMA_SESSION_CACHE_MAX_BYTES` sets its byte budget; the default is 8
+GiB. pb writes replacements through a temporary owner-only cache directory. These files can be
+large because they contain the model's evaluated attention state and associated prompt tokens.
 
-FlashMoe already reuses an exact prompt-prefix KV and recurrent-state snapshot for the active
-session. Its state is currently memory-only; serializing FlashMoe's mixed CPU/Metal and recurrent
-state remains a design item rather than an implied restart guarantee.
+FlashMoe keeps up to two checkpoints for each of the two most recently used logical sessions in
+memory by default: the safe rendered-prompt boundary and an evaluated generated-token head. Set
+`PB_FLASHMOE_MEMORY_SESSIONS` to another positive count. If canonical chat rendering preserves
+generated tokens exactly, the next pass resumes from the generated head; otherwise it falls back to
+the safe boundary. A stable first-system-message prefix is also content-addressed and may be shared
+by other sessions using the same model, tokenizer, template, tool schema, and system tokens.
+Full-attention KV, compressed MLA KV, linear-attention conv/SSM state, final hidden state, and token
+ids are stored together, so hybrid Qwen and GLM checkpoints restore the state their forward graph
+actually needs.
+
+The web/service path retains loaded FlashMoe runtimes across managed turns. It retains up to two
+idle models by default and reaps an unused runtime after 15 minutes. Set
+`PB_FLASHMOE_RESIDENT_MODELS` or `PB_FLASHMOE_IDLE_SECONDS` to change those process-memory bounds.
+
+FlashMoe restart snapshots live below `pb/flashmoe-session-v1/`, or below
+`$PB_CACHE_DIR/flashmoe-session-v1/`. They are model-fingerprinted, content-addressed, owner-only,
+checksummed, and pruned to an 8 GiB byte budget. Set `PB_FLASHMOE_SESSION_CACHE_MAX_BYTES` to a
+different positive byte count or `PB_FLASHMOE_SESSION_CACHE=off` to retain memory reuse without
+writing prompt-derived state. Only the canonical prompt boundary is written for a session; the
+speculative generated head stays in memory, avoiding a second large durable write per turn. A
+checkpoint larger than the whole budget is skipped rather than making generation fail.
 
 For llama.cpp text sessions, pb probes the requested context after loading an accelerated model.
 If Metal can load the weights but cannot create that context, pb reports the degradation and
