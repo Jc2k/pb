@@ -5079,7 +5079,12 @@ fn run_agent_steps(
                     attempted_workflow_terminal_submission(args, &output, finish_reason);
                 terminal_submission_only |= attempted_terminal_submission;
                 consecutive_parse_failures = consecutive_parse_failures.saturating_add(1);
-                let signature = parse_failure_signature(&output, &error.to_string());
+                let signature = parse_failure_signature(
+                    &output,
+                    &error.to_string(),
+                    finish_reason,
+                    &progress_state(workspace_root, &gate_state)?,
+                );
                 let repeated_parse_failures =
                     deterministic_failures.record(DeterministicFailureKind::Parse, signature);
 
@@ -5122,6 +5127,19 @@ fn run_agent_steps(
                         MAX_CONSECUTIVE_PARSE_FAILURES,
                     )
                 };
+                if finish_reason == CompletionFinishReason::MaxTokens
+                    && let Some(tool) = truncated_native_tool_name(&output)
+                {
+                    if matches!(tool, "write_file" | "replace_file") {
+                        error_msg.push_str(&format!(
+                            "\nThe capped {tool} call was not executed and no partial file exists. Retry only with materially shorter, complete content that fits this turn, or choose another exposed action. Do not read the intended path as if the truncated content had been written, and do not repeat the same oversized payload.\n"
+                        ));
+                    } else {
+                        error_msg.push_str(&format!(
+                            "\nThe capped {tool} call was not executed. Retry with the smallest complete argument object that fits this turn, or choose another exposed action; do not repeat the same oversized payload.\n"
+                        ));
+                    }
+                }
                 if attempted_terminal_submission
                     && let Some(required) =
                         args.workflow_stage.and_then(workflow_terminal_tool_name)
@@ -5141,10 +5159,20 @@ fn run_agent_steps(
                 if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
                     || repeated_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
                 {
-                    sink.emit(AgentEvent::Error {
-                        message: format!(
+                    let retry_limit_message = if repeated_parse_failures
+                        >= MAX_CONSECUTIVE_PARSE_FAILURES
+                        && consecutive_parse_failures < MAX_CONSECUTIVE_PARSE_FAILURES
+                    {
+                        format!(
+                            "model repeated an equivalent unparsable structured action {repeated_parse_failures} times without workspace or evidence progress; stopping to avoid an infinite retry loop. Last parse error: {error}"
+                        )
+                    } else {
+                        format!(
                             "model produced {consecutive_parse_failures} consecutive unparsable structured actions; stopping to avoid an infinite retry loop. Last parse error: {error}"
-                        ),
+                        )
+                    };
+                    sink.emit(AgentEvent::Error {
+                        message: retry_limit_message,
                         summary: "Parse retry limit reached".to_string(),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
@@ -5165,7 +5193,6 @@ fn run_agent_steps(
             }
         };
         consecutive_parse_failures = 0;
-        deterministic_failures.clear(DeterministicFailureKind::Parse);
 
         match action {
             AgentAction::Final { content, thinking } => {
@@ -5603,6 +5630,9 @@ fn run_agent_steps(
                     sink,
                     &mut metrics,
                 )?;
+                if progress_outcomes.iter().any(|outcome| outcome.success) {
+                    deterministic_failures.clear(DeterministicFailureKind::Parse);
+                }
                 let progress_decision = record_tool_progress(
                     &mut progress_guard,
                     &progress_outcomes,
@@ -5753,6 +5783,9 @@ fn run_agent_steps(
                     sink,
                     &mut metrics,
                 )?;
+                if progress_outcomes.iter().any(|outcome| outcome.success) {
+                    deterministic_failures.clear(DeterministicFailureKind::Parse);
+                }
                 let progress_decision = record_tool_progress(
                     &mut progress_guard,
                     &progress_outcomes,
@@ -7341,11 +7374,46 @@ struct ParseFailure {
     finish_reason: CompletionFinishReason,
 }
 
-fn parse_failure_signature(output: &str, error: &str) -> u64 {
+fn parse_failure_signature(
+    output: &str,
+    error: &str,
+    finish_reason: CompletionFinishReason,
+    state: &ProgressState,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
+    if finish_reason == CompletionFinishReason::MaxTokens
+        && let Some(tool) = truncated_native_tool_name(output)
+    {
+        "truncated_native_tool".hash(&mut hasher);
+        tool.hash(&mut hasher);
+        state.workspace_fingerprint.hash(&mut hasher);
+        state.evidence_fingerprint.hash(&mut hasher);
+        return hasher.finish();
+    }
     output.trim().hash(&mut hasher);
     error.hash(&mut hasher);
+    state.workspace_fingerprint.hash(&mut hasher);
+    state.evidence_fingerprint.hash(&mut hasher);
     hasher.finish()
+}
+
+fn truncated_native_tool_name(output: &str) -> Option<&str> {
+    const DEEPSEEK_INVOKE: &str = "<｜DSML｜invoke name=\"";
+    if let Some((_, suffix)) = output.split_once(DEEPSEEK_INVOKE) {
+        return suffix
+            .split_once('"')
+            .map(|(name, _)| name)
+            .filter(|name| !name.is_empty());
+    }
+
+    let (_, tool_call) = output.split_once("<tool_call>")?;
+    let (_, after_name) = tool_call.split_once("\"name\"")?;
+    let (_, value) = after_name.split_once(':')?;
+    let value = value.trim_start().strip_prefix('"')?;
+    value
+        .split_once('"')
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
 }
 
 fn stable_hash(value: &(impl Hash + ?Sized)) -> u64 {
@@ -19280,6 +19348,85 @@ the next imagined action"#;
     }
 
     #[test]
+    fn repeated_capped_native_action_survives_an_unchanged_failed_tool_call() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Ask, 256);
+        request.max_steps = 8;
+        request.turn_max_tokens_cap = Some(256);
+        let truncated_write = |preamble: &str| ScriptedCompletion {
+            content: format!(
+                "{preamble}\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">unfinished"
+            ),
+            truncated: true,
+        };
+        let completions = vec![
+            truncated_write("first oversized attempt"),
+            truncated_write("same-cap recovery"),
+            tool_completion("read_file", json!({"path": "missing.js"})),
+            truncated_write("second oversized attempt"),
+            truncated_write("third oversized attempt"),
+            scripted_final("must not run"),
+        ];
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(&request, completions, tmp.path(), &mut |event| {
+            events.push(event)
+        })
+        .unwrap();
+
+        assert!(
+            !outcome.reached_final,
+            "outcome={outcome:#?}\nevents={events:#?}"
+        );
+        assert_eq!(outcome.termination_reason, TerminationReason::ParseLoop);
+        assert_eq!(outcome.llm_invocations, 5);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { message, .. }
+                if message.contains("capped write_file call was not executed")
+                    && message.contains("no partial file exists")
+                    && message.contains("materially shorter, complete content")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { message, .. }
+                if message.contains("equivalent unparsable structured action 3 times")
+                    && message.contains("without workspace or evidence progress")
+        )));
+    }
+
+    #[test]
+    fn successful_tool_result_resets_capped_native_action_sequence() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("evidence.txt"), "useful evidence\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Ask, 256);
+        request.max_steps = 8;
+        request.turn_max_tokens_cap = Some(256);
+        let truncated_write = |preamble: &str| ScriptedCompletion {
+            content: format!(
+                "{preamble}\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">unfinished"
+            ),
+            truncated: true,
+        };
+        let completions = vec![
+            truncated_write("first oversized attempt"),
+            truncated_write("same-cap recovery"),
+            tool_completion("read_file", json!({"path": "evidence.txt"})),
+            truncated_write("new sequence one"),
+            truncated_write("new sequence two"),
+            scripted_final("stopped repeating after useful evidence"),
+        ];
+        let outcome =
+            run_scripted_agent_steps(&request, completions, tmp.path(), &mut |_| {}).unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert_eq!(outcome.llm_invocations, 6);
+        assert_eq!(outcome.tool_calls, 1);
+    }
+
+    #[test]
     fn ar1_unknown_tool_suggests_one_exposed_correction_without_executing_it() {
         let tmp = init_contract_test_repo();
         std::fs::write(tmp.path().join("probe.txt"), "probe evidence\n").unwrap();
@@ -20913,6 +21060,49 @@ the next imagined action"#;
         assert!(diagnostic.contains("finish_reason=max_tokens"));
         assert!(diagnostic.contains("[completion excerpt truncated]"));
         assert!(diagnostic.len() < MAX_REJECTED_COMPLETION_CHARS + 200);
+    }
+
+    #[test]
+    fn capped_native_action_signature_tracks_real_progress_state() {
+        let before = ProgressState {
+            workspace_fingerprint: "workspace-a".to_string(),
+            evidence_fingerprint: "evidence-a".to_string(),
+        };
+        let after = ProgressState {
+            workspace_fingerprint: "workspace-b".to_string(),
+            evidence_fingerprint: "evidence-a".to_string(),
+        };
+        let first = "one\n<｜DSML｜invoke name=\"write_file\">";
+        let second = "different prose\n<｜DSML｜invoke name=\"write_file\">";
+
+        assert_eq!(
+            parse_failure_signature(
+                first,
+                "first parser detail",
+                CompletionFinishReason::MaxTokens,
+                &before,
+            ),
+            parse_failure_signature(
+                second,
+                "different parser detail",
+                CompletionFinishReason::MaxTokens,
+                &before,
+            )
+        );
+        assert_ne!(
+            parse_failure_signature(
+                first,
+                "first parser detail",
+                CompletionFinishReason::MaxTokens,
+                &before,
+            ),
+            parse_failure_signature(
+                first,
+                "first parser detail",
+                CompletionFinishReason::MaxTokens,
+                &after,
+            )
+        );
     }
 
     #[test]

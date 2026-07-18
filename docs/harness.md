@@ -166,6 +166,13 @@ artifact. The former profile gate/final-grace/handoff behavior is retained only 
 actually restored persisted request that predates conversation intent, so old sessions remain
 readable without letting a new request opt into weaker control by omitting fields.
 
+For max-token native calls, repeated-failure identity includes the attempted tool and current
+workspace/evidence fingerprints. A parsed tool action that subsequently fails without progress does
+not erase the earlier capped-action history. Capped `write_file` and `replace_file` corrections say
+that no partial file was created and direct the model to produce materially shorter complete content.
+The preserved DeepSeek V4 Flash field evidence is recorded in the
+[agent-harness field run](benchmarks/deepseek-v4-flash-agent.md).
+
 Implementation turns whose accepted plan consists only of creating currently missing paths start
 in action-first mode: reasoning is disabled for the first bounded turn so the model spends that
 turn on a native edit action. Later implementation turns, every repair turn, planning, and both

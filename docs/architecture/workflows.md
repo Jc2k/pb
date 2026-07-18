@@ -104,6 +104,12 @@ the model express an allowed action; they never expose a new capability or waive
 Retries consume model-invocation and generated-token budgets, but remain part of the same visible
 stage step. Stage-step accounting is checkpointed at the `StepStarted` boundary, so an action-only
 retry cannot prematurely terminalize a workflow while its result is still being recorded.
+Equivalent max-token native actions are correlated by attempted tool name and the current workspace
+and evidence fingerprints. A merely parsed action does not erase that history before its outcome is
+known; a successful executed action clears it, while a real workspace or evidence transition also
+changes the signature. For a capped file write, the correction explicitly says that no partial file
+exists and requires materially shorter complete content. The third equivalent failure at unchanged
+state terminates without another model turn.
 
 Compatibility tool turns are single-action boundaries. Implementation prompts tell the model to
 stop after the action and never imitate pb's transcript or invent later results. If a local model

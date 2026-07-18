@@ -87,6 +87,10 @@ cancellation, and unsatisfied acceptance have distinct terminal paths.
 
 Budgets apply across retries and advisors. Recovery can help express an allowed action, but it does
 not erase usage, broaden authority, or turn a partial result into success.
+Repeated capped native actions remain one bounded failure sequence while workspace and evidence
+fingerprints are unchanged, even if an intervening action parses but then fails. A successful state
+transition or executed tool result resets that sequence; a truncated file-write payload is never
+treated as a partial file.
 
 ## Persistence contract
 
