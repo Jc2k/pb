@@ -174,6 +174,7 @@ struct HarnessRunAudit {
 #[derive(Debug, Clone)]
 struct Observation {
     rank: u8,
+    classification: &'static str,
     title: String,
     detail: String,
 }
@@ -280,16 +281,31 @@ impl EventSink for HarnessEventSink {
             }
             AgentEvent::Error {
                 message, summary, ..
-            } => state.observations.push(Observation {
-                rank: 0,
-                title: nonempty_or(summary, "agent error"),
-                detail: compact_detail(message),
-            }),
+            } => {
+                let bounded_stop = matches!(
+                    summary.as_str(),
+                    "Step limit reached"
+                        | "No-progress tool loop"
+                        | "Repeated tool call loop"
+                        | "Contract unsatisfied"
+                );
+                state.observations.push(Observation {
+                    rank: 2,
+                    classification: if bounded_stop {
+                        "model_limitation"
+                    } else {
+                        "experiment_error"
+                    },
+                    title: nonempty_or(summary, "agent error"),
+                    detail: compact_detail(message),
+                });
+            }
             AgentEvent::Correction {
                 message, summary, ..
             } => {
                 state.observations.push(Observation {
-                    rank: 1,
+                    rank: 3,
+                    classification: "model_limitation",
                     title: nonempty_or(summary, "agent correction"),
                     detail: compact_detail(message),
                 });
@@ -607,6 +623,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         workflow_policy: Some(workflow_policy),
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
+        workflow_action_first_turn: false,
         workflow_checkpoint: resumed_workflow,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: false,
@@ -1057,7 +1074,10 @@ fn prepare_scratch(requested: Option<&Path>) -> Result<ScratchLayout> {
                         path.display()
                     );
                 }
-                (path.to_path_buf(), true)
+                let mut entries = std::fs::read_dir(path).with_context(|| {
+                    format!("failed to inspect harness scratch {}", path.display())
+                })?;
+                (path.to_path_buf(), entries.next().is_some())
             } else {
                 std::fs::create_dir_all(path).with_context(|| {
                     format!("failed to create harness scratch {}", path.display())
@@ -1303,19 +1323,22 @@ fn add_run_observations(
 ) {
     match result {
         Err(error) => observations.push(Observation {
-            rank: 0,
+            rank: 2,
+            classification: "experiment_error",
             title: "agent run failed".to_string(),
             detail: compact_detail(&format!("{error:#}")),
         }),
         Ok(result) if !result.reached_final => observations.push(Observation {
-            rank: 0,
+            rank: 2,
+            classification: "model_limitation",
             title: "agent did not reach a final answer".to_string(),
             detail: "The step budget ended before the full task completion contract was satisfied."
                 .to_string(),
         }),
         Ok(result) if !result.verified_completed && result.contract_status != crate::events::ContractStatus::Unspecified => {
             observations.push(Observation {
-                rank: 0,
+                rank: 2,
+                classification: "model_limitation",
                 title: "acceptance contract was not satisfied".to_string(),
                 detail: format!(
                     "The model emitted a final action, but the run terminated as {} with contract_status={}.",
@@ -1333,7 +1356,8 @@ fn add_run_observations(
         && committed.trim().is_empty()
     {
         observations.push(Observation {
-            rank: 1,
+            rank: 2,
+            classification: "experiment_error",
             title: "completed run produced no commits".to_string(),
             detail: "Confirm whether the task genuinely required no repository changes."
                 .to_string(),
@@ -1342,14 +1366,16 @@ fn add_run_observations(
     let status = require_git_success(workspace, &["status", "--short"]).unwrap_or_default();
     if !status.trim().is_empty() {
         observations.push(Observation {
-            rank: 1,
+            rank: 2,
+            classification: "experiment_error",
             title: "workspace has uncommitted changes".to_string(),
             detail: compact_detail(&status),
         });
     }
     if summary.summary.trim().is_empty() {
         observations.push(Observation {
-            rank: 2,
+            rank: 3,
+            classification: "experiment_error",
             title: "agent emitted no session summary".to_string(),
             detail: "Review the final event stream to determine the actual outcome.".to_string(),
         });
@@ -1357,6 +1383,7 @@ fn add_run_observations(
     if observations.is_empty() {
         observations.push(Observation {
             rank: 3,
+            classification: "positive_evidence",
             title: "no automatic runtime issues observed".to_string(),
             detail: "Manual review of the committed implementation and tests is still required."
                 .to_string(),
@@ -1524,8 +1551,8 @@ fn write_journal(
     journal.push_str("\n## Ranked observations\n\n");
     for observation in observations.iter() {
         journal.push_str(&format!(
-            "1. **P{} — {}.** {}\n",
-            observation.rank, observation.title, observation.detail
+            "1. **P{} — {} — {}.** {}\n",
+            observation.rank, observation.classification, observation.title, observation.detail
         ));
     }
     journal.push_str("\n## Agent summary\n\n");
@@ -1593,7 +1620,7 @@ fn write_running_journal(
          - Cumulative events: `{events}`\n\
          {workspace_metadata}{workflow_metadata}\n\
          ## Ranked observations\n\n\
-         1. **P1 — run has not finalized.** If the harness was interrupted, inspect the raw event stream and workspace before deciding whether to rerun.\n\n\
+         1. **P2 — experiment_error — run has not finalized.** If the harness was interrupted, inspect the raw event stream and workspace before deciding whether to rerun.\n\n\
          ## Follow-up improvement plan\n\n\
          - [ ] Wait for the blocking agent run to finish, or diagnose why it was interrupted.\n\
          - [ ] Review the workspace and raw events before making changes to pb.\n",
@@ -1773,6 +1800,34 @@ mod tests {
         assert_eq!(
             require_git_success(&layout.workspace, &["log", "-1", "--pretty=%s"]).unwrap(),
             "chore: initialize harness workspace"
+        );
+    }
+
+    #[test]
+    fn existing_empty_scratch_directory_is_initialized_as_a_new_run() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        std::fs::create_dir(&root).unwrap();
+
+        let layout = prepare_scratch(Some(&root)).unwrap();
+
+        assert!(!layout.resumed);
+        assert!(layout.workspace.join(".git").is_dir());
+    }
+
+    #[test]
+    fn existing_non_harness_scratch_directory_is_rejected() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("unrelated.txt"), "keep\n").unwrap();
+
+        let error = prepare_scratch(Some(&root)).unwrap_err();
+
+        assert!(error.to_string().contains("has no git workspace"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("unrelated.txt")).unwrap(),
+            "keep\n"
         );
     }
 
@@ -2486,7 +2541,7 @@ mod tests {
 
         let journal = std::fs::read_to_string(layout.journal).unwrap();
         assert!(journal.contains("Status: `running`"));
-        assert!(journal.contains("P1 — run has not finalized"));
+        assert!(journal.contains("P2 — experiment_error — run has not finalized"));
         assert!(journal.contains("Build a test project"));
     }
 

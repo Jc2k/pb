@@ -166,6 +166,12 @@ artifact. The former profile gate/final-grace/handoff behavior is retained only 
 actually restored persisted request that predates conversation intent, so old sessions remain
 readable without letting a new request opt into weaker control by omitting fields.
 
+Implementation turns whose accepted plan consists only of creating currently missing paths start
+in action-first mode: reasoning is disabled for the first bounded turn so the model spends that
+turn on a native edit action. Later implementation turns, every repair turn, planning, and both
+fresh review stages retain normal reasoning. The decision is derived once from the validated plan
+and current workspace; it is not a model option or environment toggle.
+
 Each run creates a persistent scratch root under the system temporary directory unless
 `--scratch-dir` selects a new path. The layout is:
 
@@ -181,6 +187,11 @@ pb-harness-.../
     ├── events.jsonl # immutable event stream for this invocation
     └── journal.md   # final journal, or running recovery journal if interrupted
 ```
+
+An explicitly supplied scratch directory may already exist when it is empty; the harness
+initializes it as a new scratch root. A non-empty existing directory is treated only as a resume
+candidate and is rejected unless it contains the expected Git workspace, so unrelated contents
+are never adopted or overwritten.
 
 The harness allocates the run ID and writes the per-run `running` journal plus a `started` index
 record before model loading. Events are flushed to both streams. Final journals are atomically
@@ -208,6 +219,12 @@ model, including diagnostics that the command redirected to stdout. This is the 
 recorded in the event stream, so a failed compiler or test invocation remains actionable without
 granting it completion evidence.
 
+For a trusted contract, named check evidence is earned only by `run_check({"id":"..."})`. A raw
+`run_command` that exactly matches or extends the declared command remains ordinary shell evidence;
+its result explicitly steers the model to the named function but never marks the check current.
+The checked-in `fixtures/harness-browser-game` example supplies a dependency-free named check that
+rejects HTTP(S), protocol-relative, npm, and JSR references in generated browser assets.
+
 The workspace starts on `main` with one empty baseline commit. The agent receives the same
 conversation/workflow engine as web and queue, a local command backend rooted in the scratch
 repository, and the build profile by default. Strict stage capabilities—not the profile prompt—
@@ -222,6 +239,11 @@ The journal is an initial audit aid, not a substitute for review. A supervising 
 4. Add ranked manual observations that automatic event classification could not infer.
 5. Replace or extend the scaffold with a concrete plan for non-blocking improvements after the task
    succeeds.
+
+Automatic observations include an explicit `pb_defect`, `model_limitation`, `experiment_error`, or
+`positive_evidence` classification. Bounded model stops, missing evidence, dirty experimental
+workspaces, and an unfinished run are P2/P3 observations rather than P0/P1 defects. P0/P1 is
+reserved for severe, evidenced pb failures that require immediate supervisor action.
 
 The automatic missing-commit observation applies only to a `ready` delivery. Engine errors,
 exhausted repairs, failed checks, and other incomplete outcomes retain their actual terminal cause

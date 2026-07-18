@@ -398,6 +398,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         workflow_policy: None,
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
+        workflow_action_first_turn: false,
         workflow_checkpoint: None,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: true,
@@ -462,6 +463,7 @@ fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
         workflow_policy: Some(crate::workflow::WorkflowConfigDocument::default().compile()?),
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
+        workflow_action_first_turn: false,
         workflow_checkpoint: None,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: false,
@@ -858,6 +860,7 @@ fn execute_workflow_assertion(
                     system_prompt: "plan".to_string(),
                     user_prompt: "plan".to_string(),
                     expected_content_fingerprint: None,
+                    action_first_turn: false,
                 },
                 vec![
                     ScriptedCompletion {
@@ -916,6 +919,7 @@ fn execute_workflow_assertion(
                     system_prompt: "plan".to_string(),
                     user_prompt: "plan".to_string(),
                     expected_content_fingerprint: None,
+                    action_first_turn: false,
                 },
                 vec![
                     ScriptedCompletion {
@@ -1068,6 +1072,7 @@ fn execute_workflow_assertion(
                     system_prompt: "implement".to_string(),
                     user_prompt: "implement".to_string(),
                     expected_content_fingerprint: None,
+                    action_first_turn: false,
                 },
                 vec![
                     ScriptedCompletion {
@@ -1823,6 +1828,7 @@ fn run_real_model_fixture(
         workflow_policy: None,
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
+        workflow_action_first_turn: false,
         workflow_checkpoint: None,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: true,

@@ -545,6 +545,11 @@ pub struct AgentRequest {
     /// memory; persisted and direct requests cannot use it to manufacture terminal eligibility.
     #[serde(skip)]
     pub(crate) workflow_expected_content_fingerprint: Option<String>,
+    /// Harness-owned hint for a first implementation turn whose accepted plan contains only
+    /// creation of currently missing paths. This is calculated from the validated plan and
+    /// current workspace, never accepted from persisted input.
+    #[serde(skip)]
+    pub(crate) workflow_action_first_turn: bool,
     /// Durable harness-owned checkpoint used only to resume an existing delivery workflow. A
     /// caller cannot use this to grant capabilities: the digest, policy, repository, Git control
     /// state, and stage are reconciled before another model invocation.
@@ -3265,7 +3270,7 @@ fn build_direct_harness_instructions(
     };
     let contract_instructions = contract.map_or_else(String::new, |contract| {
         format!(
-            " The trusted harness acceptance contract below is authoritative. Use run_check(id) for its named checks; run_command never satisfies them. Do not finalize until all applicable facts are current after the last mutation.\n{}\n",
+            " The trusted harness acceptance contract below is authoritative. For every named check, call the native function exactly as run_check({{\"id\":\"<check-id>\"}}); run_command never satisfies or refreshes named-check evidence, even when it runs the same command. Do not finalize until all applicable facts are current after the last mutation.\n{}\n",
             contract.prompt_summary()
         )
     });
@@ -5033,7 +5038,7 @@ fn run_agent_steps(
             workspace_root,
             generation_messages,
             generation_tools,
-            workflow_completion_enable_thinking(suppress_thinking, terminal_only_turn),
+            workflow_completion_enable_thinking(args, step, suppress_thinking, terminal_only_turn),
             step,
             &mut metrics,
             sink,
@@ -7630,10 +7635,14 @@ fn completion_finish_reason_label(finish_reason: CompletionFinishReason) -> &'st
 }
 
 fn workflow_completion_enable_thinking(
+    args: &AgentRequest,
+    step: usize,
     suppress_thinking: bool,
     terminal_submission_only: bool,
 ) -> bool {
-    !suppress_thinking && !terminal_submission_only
+    !suppress_thinking
+        && !terminal_submission_only
+        && !(args.workflow_action_first_turn && step == 1)
 }
 
 fn attempted_workflow_terminal_submission(
@@ -7719,6 +7728,7 @@ pub(crate) struct StageContext {
     pub system_prompt: String,
     pub user_prompt: String,
     pub expected_content_fingerprint: Option<String>,
+    pub action_first_turn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -7770,6 +7780,7 @@ fn run_stage(
     );
     args.workflow_stage = Some(contract.stage);
     args.workflow_expected_content_fingerprint = context.expected_content_fingerprint.clone();
+    args.workflow_action_first_turn = context.action_first_turn;
     // StageCapabilities is the authoritative allowlist. A legacy/direct-run allowlist must not
     // accidentally remove the required typed terminal action or add authority to this stage.
     args.tool_allowlist = None;
@@ -9309,6 +9320,7 @@ fn delivery_stage_context(
                     run.planning_content().fingerprint,
                 ),
                 expected_content_fingerprint: Some(run.planning_content().fingerprint.clone()),
+                action_first_turn: false,
             })
         }
         crate::workflow::WorkflowStage::PlanReview => {
@@ -9326,6 +9338,7 @@ fn delivery_stage_context(
                     run.planning_content().fingerprint,
                 ),
                 expected_content_fingerprint: Some(run.planning_content().fingerprint.clone()),
+                action_first_turn: false,
             })
         }
         crate::workflow::WorkflowStage::Implementing
@@ -9354,6 +9367,12 @@ fn delivery_stage_context(
                     run.task, current.fingerprint,
                 ),
                 expected_content_fingerprint: None,
+                action_first_turn: run.stage == crate::workflow::WorkflowStage::Implementing
+                    && repair_context.is_none()
+                    && plan_is_unambiguous_missing_path_creation(
+                        &plan.artifact,
+                        &run.repository.repo_root,
+                    ),
             })
         }
         crate::workflow::WorkflowStage::CodeReview => {
@@ -9392,10 +9411,27 @@ fn delivery_stage_context(
                     checked_fingerprint,
                 ),
                 expected_content_fingerprint: Some(checked_fingerprint.to_string()),
+                action_first_turn: false,
             })
         }
         stage => bail!("cannot build planning context for {stage:?}"),
     }
+}
+
+fn plan_is_unambiguous_missing_path_creation(
+    plan: &crate::workflow::PlanArtifact,
+    workspace_root: &Path,
+) -> bool {
+    let mut saw_path = false;
+    for planned in plan.steps.iter().flat_map(|step| step.paths.iter()) {
+        saw_path = true;
+        if planned.change != crate::workflow::PlannedChange::Create
+            || workspace_root.join(&planned.path).exists()
+        {
+            return false;
+        }
+    }
+    saw_path
 }
 
 fn delivery_repository_brief(
@@ -12167,6 +12203,7 @@ fn run_tool(
             let backend = command_backend
                 .context("run_command is not available: no project environment is configured")?;
             let result = if context.request.workflow_stage.is_none()
+                && context.request.contract.is_none()
                 && let Some(check_id) = exact_workspace_check_id(context.request, cmd)
             {
                 let runtime = context.workspace_checks.with_context(|| {
@@ -12206,7 +12243,13 @@ fn run_tool(
                     .borrow_mut()
                     .legacy_review_command_evidence_gathered = true;
             }
-            Ok(result)
+            if let Some(check_id) = resembling_named_check_id(context.request, cmd) {
+                Ok(format!(
+                    "{result}\n\nHarness steering: run_command cannot satisfy named check '{check_id}', even when the command succeeds. After the final mutation, call run_check with exactly {{\"id\":\"{check_id}\"}}."
+                ))
+            } else {
+                Ok(result)
+            }
         }
         _ => bail!("unknown tool: {tool}"),
     }
@@ -12335,6 +12378,27 @@ fn exact_workspace_check_id(request: &AgentRequest, command: &str) -> Option<Str
             .find(|check| check.cwd == "." && check.command.trim() == command.trim())
             .map(|check| check.id.clone())
     })
+}
+
+fn resembling_named_check_id(request: &AgentRequest, command: &str) -> Option<String> {
+    let command = command.trim();
+    request.workspace_graph.as_ref().and_then(|graph| {
+        graph.checks.values().find_map(|check| {
+            let named = check.command.trim();
+            let resembles = command == named
+                || command
+                    .strip_prefix(named)
+                    .is_some_and(starts_with_whitespace)
+                || named
+                    .strip_prefix(command)
+                    .is_some_and(starts_with_whitespace);
+            resembles.then(|| check.id.clone())
+        })
+    })
+}
+
+fn starts_with_whitespace(value: &str) -> bool {
+    value.chars().next().is_some_and(char::is_whitespace)
 }
 
 fn tool_is_in_request_allowlist(tool: &str, allowlist: Option<&[String]>) -> bool {
@@ -15480,6 +15544,7 @@ mod tests {
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
+            workflow_action_first_turn: false,
             workflow_checkpoint: None,
             conversation_handoff: None,
             legacy_prompt_owned_delivery: true,
@@ -15554,6 +15619,7 @@ mod tests {
             system_prompt: "Follow the typed workflow stage contract.".to_string(),
             user_prompt: "Complete this bounded stage.".to_string(),
             expected_content_fingerprint: None,
+            action_first_turn: false,
         }
     }
 
@@ -20726,10 +20792,64 @@ the next imagined action"#;
 
     #[test]
     fn workflow_recovery_suppresses_thinking_after_truncation_or_for_terminal_only_turns() {
-        assert!(workflow_completion_enable_thinking(false, false));
-        assert!(!workflow_completion_enable_thinking(true, false));
-        assert!(!workflow_completion_enable_thinking(false, true));
-        assert!(!workflow_completion_enable_thinking(true, true));
+        let args = test_agent_request(AgentProfile::Build, 256);
+        assert!(workflow_completion_enable_thinking(&args, 1, false, false));
+        assert!(!workflow_completion_enable_thinking(&args, 1, true, false));
+        assert!(!workflow_completion_enable_thinking(&args, 1, false, true));
+        assert!(!workflow_completion_enable_thinking(&args, 1, true, true));
+    }
+
+    #[test]
+    fn action_first_creation_suppresses_only_the_first_implementation_turn() {
+        let mut args = test_agent_request(AgentProfile::Build, 256);
+        args.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        args.workflow_action_first_turn = true;
+
+        assert!(!workflow_completion_enable_thinking(&args, 1, false, false));
+        assert!(workflow_completion_enable_thinking(&args, 2, false, false));
+
+        args.workflow_stage = Some(crate::workflow::WorkflowStage::Repairing);
+        args.workflow_action_first_turn = false;
+        assert!(workflow_completion_enable_thinking(&args, 1, false, false));
+    }
+
+    #[test]
+    fn action_first_requires_only_validated_creates_of_missing_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let mut plan = crate::workflow::PlanArtifact {
+            summary: "create a file".to_string(),
+            requirements: vec![],
+            steps: vec![crate::workflow::PlanStep {
+                id: "create".to_string(),
+                requirement_ids: vec![],
+                component_ids: vec![],
+                paths: vec![crate::workflow::PlanPath {
+                    path: "new.txt".to_string(),
+                    change: crate::workflow::PlannedChange::Create,
+                }],
+                description: "create it".to_string(),
+            }],
+            acceptance: vec![],
+            risks: vec![],
+            assumptions: vec![],
+            open_questions: vec![],
+            resolved_challenge_ids: vec![],
+        };
+
+        assert!(plan_is_unambiguous_missing_path_creation(
+            &plan,
+            root.path()
+        ));
+        std::fs::write(root.path().join("new.txt"), "exists\n").unwrap();
+        assert!(!plan_is_unambiguous_missing_path_creation(
+            &plan,
+            root.path()
+        ));
+        plan.steps[0].paths[0].change = crate::workflow::PlannedChange::Modify;
+        assert!(!plan_is_unambiguous_missing_path_creation(
+            &plan,
+            root.path()
+        ));
     }
 
     #[test]
@@ -21892,6 +22012,55 @@ the next imagined action"#;
     }
 
     #[test]
+    fn raw_command_resembling_contract_check_is_steered_without_evidence() {
+        let tmp = init_contract_test_repo();
+        let contract = normalized_test_contract("true");
+        let graph = contract
+            .compile_workspace_graph(crate::workspace::WorkspaceGraph::legacy(&[]))
+            .unwrap();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 2;
+        request.tool_allowlist = Some(vec!["run_command".to_string(), "run_check".to_string()]);
+        request.workspace_graph = Some(graph);
+        request.contract = Some(contract);
+        let completions = vec![
+            ScriptedCompletion {
+                content: serde_json::json!({
+                    "type": "tool_call",
+                    "tool": "run_command",
+                    "arguments": {"cmd": "true 2>&1"}
+                })
+                .to_string(),
+                truncated: false,
+            },
+            scripted_final("raw command passed"),
+        ];
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(&request, completions, tmp.path(), &mut |event| {
+            events.push(event)
+        })
+        .unwrap();
+
+        assert_eq!(outcome.contract_status, ContractStatus::Unsatisfied);
+        assert!(!outcome.verified_completed);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolResult { tool, result, .. }
+                    if tool == "run_command"
+                        && result.contains("run_command cannot satisfy named check 'logic'")
+                        && result.contains(r#"{"id":"logic"}"#)
+            )),
+            "events: {events:#?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult { check_id, .. } if check_id == "logic"
+        )));
+    }
+
+    #[test]
     fn named_check_timeout_terminates_the_command_group() {
         let tmp = init_contract_test_repo();
         let mut contract = normalized_test_contract("sleep 5");
@@ -22377,6 +22546,7 @@ the next imagined action"#;
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
+            workflow_action_first_turn: false,
             workflow_checkpoint: None,
             conversation_handoff: None,
             legacy_prompt_owned_delivery: false,
@@ -22451,6 +22621,7 @@ the next imagined action"#;
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
+            workflow_action_first_turn: false,
             workflow_checkpoint: None,
             conversation_handoff: None,
             legacy_prompt_owned_delivery: false,
