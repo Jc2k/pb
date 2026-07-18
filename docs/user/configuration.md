@@ -44,6 +44,11 @@ FlashMoe already reuses an exact prompt-prefix KV and recurrent-state snapshot f
 session. Its state is currently memory-only; serializing FlashMoe's mixed CPU/Metal and recurrent
 state remains a design item rather than an implied restart guarantee.
 
+For llama.cpp text sessions, pb probes the requested context after loading an accelerated model.
+If Metal can load the weights but cannot create that context, pb reports the degradation and
+reloads the model CPU-only instead of failing before the first token. A CPU-only context failure is
+still terminal rather than being hidden behind retries.
+
 ## GLM-5.2 with FlashMoe
 
 **Configurable.** On Apple Silicon, pb can import GLM-5.2 checkpoints and run the baseline decoder

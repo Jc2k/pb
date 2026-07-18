@@ -99,6 +99,50 @@ stops loops deterministically.
 When a model response is truncated before producing a valid action, pb can retry with thinking
 disabled and, within the same global budget, use a larger output cap. These recovery mechanics help
 the model express an allowed action; they never expose a new capability or waive a transition gate.
+Retries consume model-invocation and generated-token budgets, but remain part of the same visible
+stage step. Stage-step accounting is checkpointed at the `StepStarted` boundary, so an action-only
+retry cannot prematurely terminalize a workflow while its result is still being recorded.
+
+Compatibility tool turns are single-action boundaries. Implementation prompts tell the model to
+stop after the action and never imitate pb's transcript or invent later results. If a local model
+still emits a fenced action followed by fabricated `Tool calls:` or role entries, pb executes only
+the validated action and omits that untrusted pseudo-transcript from subsequent model context. The
+real tool result and content fingerprint remain the only mutation evidence.
+
+Implementation guidance gives symmetric concrete actions for missing and existing paths. Missing
+paths use `write_file`; existing paths use a separate `read_file` turn followed by
+`replace_file`, `edit_file`, or `apply_patch`. An attempted overwrite keeps failing closed but now
+returns that exact recovery sequence instead of a generic suggestion.
+
+The step-limit monitor parses explicit negative boolean fields as values, not keywords. A healthy
+checkpoint containing `off_track: no` or `blocked: no` can therefore grant its bounded extra step;
+actual loop evidence, a blocked/off-track status, or an explicit no-grant decision still stops.
+
+A newly started workflow plans from the current invocation baseline. This is normally identical to
+the task baseline, but on a persistent scratch resume it includes explicitly adopted partial work.
+The original task baseline remains available for final task-delta ownership, while the current
+snapshot prevents planning from receiving an impossible stale fingerprint.
+
+During a strict workflow stage, pb may recover a complete unwrapped JSON object (plain or in one
+JSON code fence) when the exposed schemas identify exactly one intended tool. The only ambiguity it
+resolves is `write_file` versus `replace_file`, using whether the bounded workspace target already
+exists. The recovered call still passes ordinary path, policy, schema, stage, and artifact
+validation. Prose, partial JSON, arrays, and any other ambiguous object are not coerced. Stage
+prompts prefer native function calls but also state the exact compatibility action shape for model
+runtimes that cannot emit them.
+
+Implementation and repair turns keep their edit tools after a rejected prose final. They are not
+narrowed to `submit_implementation` before the model has had another chance to make the repository
+change that the correction requires.
+
+Plan paths are validated in step order. `create` makes a missing path available to later `modify`
+or `delete` steps, and `delete` removes it from the subsequent plan state. A modification before
+creation and a duplicate creation while the path exists remain invalid. This lets a plan express
+several conceptual phases on one new file without weakening filesystem-state checks.
+
+When a trusted harness contract restricts paths, planning validates every proposed path against
+that allowlist before implementation. Prompt examples use workspace-relative paths and explicitly
+warn that `repo/` is not a magic prefix, so an impossible plan is corrected before any write turn.
 
 ## Context compaction and inference reuse
 

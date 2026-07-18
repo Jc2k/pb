@@ -154,6 +154,7 @@ impl PlanArtifact {
         debug_assert_eq!(acceptance_ids.len(), self.acceptance.len());
 
         let mut requirements_with_steps = HashSet::new();
+        let mut planned_paths = snapshot.paths.keys().cloned().collect::<HashSet<_>>();
         for step in &self.steps {
             non_empty("plan step description", &step.description)?;
             if step.requirement_ids.is_empty() {
@@ -177,20 +178,29 @@ impl PlanArtifact {
             }
             for planned in &step.paths {
                 validate_repository_path("plan path", &planned.path)?;
-                let exists = snapshot.paths.contains_key(&planned.path);
+                let exists = planned_paths.contains(&planned.path);
                 match planned.change {
                     PlannedChange::Create if exists => bail!(
-                        "plan step '{}' marks existing path '{}' as create",
+                        "plan step '{}' marks path '{}' as create after it already exists in the ordered plan state",
                         step.id,
                         planned.path
                     ),
                     PlannedChange::Modify | PlannedChange::Delete if !exists => bail!(
-                        "plan step '{}' marks missing path '{}' as {:?}",
+                        "plan step '{}' marks path '{}' as {:?} before it exists in the ordered plan state",
                         step.id,
                         planned.path,
                         planned.change
                     ),
                     _ => {}
+                }
+                match planned.change {
+                    PlannedChange::Create => {
+                        planned_paths.insert(planned.path.clone());
+                    }
+                    PlannedChange::Delete => {
+                        planned_paths.remove(&planned.path);
+                    }
+                    PlannedChange::Modify => {}
                 }
             }
         }
@@ -790,6 +800,73 @@ mod tests {
         let mut missing = plan;
         missing.steps[0].requirement_ids.clear();
         assert!(missing.validate(&graph(), &snapshot()).is_err());
+    }
+
+    #[test]
+    fn plan_path_validation_follows_ordered_create_modify_delete_state() {
+        let mut ordered = plan();
+        ordered.steps = vec![
+            PlanStep {
+                id: "s1".to_string(),
+                requirement_ids: vec!["r1".to_string()],
+                component_ids: vec!["repository".to_string()],
+                paths: vec![PlanPath {
+                    path: "new.js".to_string(),
+                    change: PlannedChange::Create,
+                }],
+                description: "create the module".to_string(),
+            },
+            PlanStep {
+                id: "s2".to_string(),
+                requirement_ids: vec!["r1".to_string()],
+                component_ids: vec!["repository".to_string()],
+                paths: vec![PlanPath {
+                    path: "new.js".to_string(),
+                    change: PlannedChange::Modify,
+                }],
+                description: "add the behavior".to_string(),
+            },
+            PlanStep {
+                id: "s3".to_string(),
+                requirement_ids: vec!["r1".to_string()],
+                component_ids: vec!["repository".to_string()],
+                paths: vec![PlanPath {
+                    path: "new.js".to_string(),
+                    change: PlannedChange::Delete,
+                }],
+                description: "remove the temporary module".to_string(),
+            },
+        ];
+        ordered.validate(&graph(), &snapshot()).unwrap();
+
+        let mut modify_before_create = ordered.clone();
+        modify_before_create.steps.swap(0, 1);
+        assert!(
+            modify_before_create
+                .validate(&graph(), &snapshot())
+                .unwrap_err()
+                .to_string()
+                .contains("before it exists in the ordered plan state")
+        );
+
+        let mut modify_after_delete = ordered;
+        modify_after_delete.steps.push(PlanStep {
+            id: "s4".to_string(),
+            requirement_ids: vec!["r1".to_string()],
+            component_ids: vec!["repository".to_string()],
+            paths: vec![PlanPath {
+                path: "new.js".to_string(),
+                change: PlannedChange::Modify,
+            }],
+            description: "invalid late edit".to_string(),
+        });
+        assert!(
+            modify_after_delete
+                .validate(&graph(), &snapshot())
+                .unwrap_err()
+                .to_string()
+                .contains("before it exists in the ordered plan state")
+        );
     }
 
     #[test]

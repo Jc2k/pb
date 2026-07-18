@@ -217,6 +217,10 @@ The journal is an initial audit aid, not a substitute for review. A supervising 
 5. Replace or extend the scaffold with a concrete plan for non-blocking improvements after the task
    succeeds.
 
+The automatic missing-commit observation applies only to a `ready` delivery. Engine errors,
+exhausted repairs, failed checks, and other incomplete outcomes retain their actual terminal cause
+without being mislabeled as completed work.
+
 FlashMoe inference, benchmark, and cache-clean utilities also live beneath the hidden harness, for
 example `pb harness infer ...`. `infer` and `bench` accept
 `--metal-working-set-limit-mib <MiB>` to lower the device-derived safety limit. The override can
@@ -312,6 +316,43 @@ call keeps the existing terminal-only schema on that retry. If the result is sti
 may grow the cap once within the request limit; existing parse-loop thresholds remain authoritative.
 Every attempt reserves an invocation and records generated tokens before another retry is allowed,
 so the global invocation and token budgets cannot be bypassed by recovery.
+An action-only retry remains within its original stage step: durable stage-step accounting advances
+once per visible `step_started`, while every backend attempt is still charged to the separate model
+invocation and generated-token limits.
+
+Each compatibility edit action ends its model turn. The prompt forbids invented tool results, and
+pb does not replay fenced compatibility actions followed by fabricated transcript markers into the
+next model context. Only the validated first action is executed; its real result and harness content
+fingerprint determine the next state.
+
+Implementation prompts include exact compatibility examples for both creation and replacement.
+`write_file` still refuses an existing target; its failure directs the model to call `read_file`,
+wait for the authoritative result, and only then use `replace_file` in a later turn. The
+read-before-write gate is unchanged.
+
+Step-limit monitor decisions distinguish explicit false fields such as `off_track: no` and
+`blocked: no` from an actual unhealthy status. A healthy `grant more steps: yes` checkpoint can use
+the configured bounded extension, while loop evidence and explicit no-grant decisions still stop.
+
+When a persistent scratch directory starts a new workflow over adopted partial work, its planning
+snapshot is the current invocation baseline rather than the original empty task baseline. The
+original baseline still defines the task-owned delta, but plan submission is checked against the
+workspace the model can actually inspect.
+
+During a strict workflow stage, pb can recover a complete unwrapped JSON object, either plain or in
+one JSON code fence, when the exposed schemas identify exactly one tool. The sole special-case tie
+is `write_file` versus `replace_file`, selected from whether the bounded target currently exists.
+The recovered action still goes through normal path, policy, schema, capability, and artifact
+validation. Prose, partial JSON, arrays, and other ambiguous objects are not coerced. Implementation
+and repair also retain their edit tools after a rejected prose final instead of exposing only a
+submission that cannot truthfully advance.
+
+Plan paths are checked in step order. Creating a missing path makes it available to later modify or
+delete steps, while modification before creation and duplicate creation of an existing path remain
+invalid. This ordered state is deterministic and the artifact validator remains the authority.
+Contract `allowed_paths` are also checked when the plan is submitted, not only when an edit is
+executed. All examples and corrections use workspace-relative paths; `repo/` has no special
+meaning.
 
 On each of the final two ordinary turns of planning, plan review, plan revision, or code review, pb
 adds a bounded JSON `workflow_closure_checkpoint` derived from harness state. It reports ordinary

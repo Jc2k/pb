@@ -1314,7 +1314,7 @@ fn add_run_observations(
     let committed =
         require_git_success(workspace, &["log", "--oneline", "main..HEAD"]).unwrap_or_default();
     if matches!(result, Ok(result) if result.reached_final
-        && matches!(result.handoff_outcome, Some(outcome) if outcome != crate::events::HandoffOutcome::NoChange))
+        && result.handoff_outcome == Some(crate::events::HandoffOutcome::Ready))
         && committed.trim().is_empty()
     {
         observations.push(Observation {
@@ -2253,6 +2253,41 @@ mod tests {
         });
         let summary = CapturedSummary {
             summary: "Discussion answer.".to_string(),
+            ..CapturedSummary::default()
+        };
+        let mut observations = Vec::new();
+
+        add_run_observations(&mut observations, &result, &layout.workspace, &summary);
+
+        assert!(
+            !observations
+                .iter()
+                .any(|observation| observation.title == "completed run produced no commits")
+        );
+    }
+
+    #[test]
+    fn incomplete_delivery_does_not_report_a_missing_commit_problem() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        let layout = prepare_scratch(Some(&root)).unwrap();
+        let result = Ok(AgentRunResult {
+            branch: "main".to_string(),
+            workspace_root: layout.workspace.clone(),
+            focus_root: layout.workspace.clone(),
+            repository_context: None,
+            workspace_graph: None,
+            reached_final: true,
+            contract_status: crate::events::ContractStatus::Unspecified,
+            verified_completed: false,
+            termination_reason: crate::events::TerminationReason::EngineError,
+            handoff_outcome: Some(crate::events::HandoffOutcome::Incomplete),
+            workflow: None,
+            delivery_proposal: None,
+            requested_delivery: None,
+        });
+        let summary = CapturedSummary {
+            summary: "Model setup failed before delivery began.".to_string(),
             ..CapturedSummary::default()
         };
         let mut observations = Vec::new();

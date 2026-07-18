@@ -143,6 +143,52 @@ pub fn load_from_file(path: &Path, gpu_layers: u32) -> Result<LlamaCppBackend> {
     })
 }
 
+/// Load a text backend and prove that it can create the requested context.
+///
+/// Some llama.cpp/Metal combinations can load offloaded weights but fail before the first token
+/// when the context graph is created. Retrying only K/Q/V on the CPU is not sufficient in that
+/// case because the model itself is still attached to the failing accelerator. Probe while the
+/// accelerated model can still be dropped cleanly, then reload the model CPU-only as a bounded
+/// correctness fallback.
+pub fn load_text_from_file(
+    path: &Path,
+    gpu_layers: u32,
+    ctx_size: u32,
+    threads: Option<i32>,
+    threads_batch: Option<i32>,
+) -> Result<(LlamaCppBackend, Option<String>)> {
+    let settings = LlamaSessionSettings {
+        ctx_size,
+        threads,
+        threads_batch,
+    };
+    let accelerated = load_from_file(path, gpu_layers)?;
+    let accelerated_probe = accelerated.new_text_context(settings).map(drop);
+    match accelerated_probe {
+        Ok(()) => Ok((accelerated, None)),
+        Err(accelerated_error) if gpu_layers > 0 => {
+            drop(accelerated);
+            let cpu = load_from_file(path, 0).with_context(|| {
+                format!(
+                    "failed to reload llama.cpp model CPU-only after accelerated context setup failed: {accelerated_error:#}"
+                )
+            })?;
+            cpu.new_text_context(settings).map(drop).with_context(|| {
+                format!(
+                    "failed to create CPU-only llama.cpp context after accelerated context setup failed: {accelerated_error:#}"
+                )
+            })?;
+            Ok((
+                cpu,
+                Some(format!(
+                    "Accelerated llama.cpp context setup failed; reloaded the model CPU-only for this session. Original error: {accelerated_error:#}"
+                )),
+            ))
+        }
+        Err(error) => Err(error).context("failed to validate CPU-only llama.cpp context setup"),
+    }
+}
+
 fn model_params(gpu_layers: u32) -> Result<LlamaModelParams> {
     let mut model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
     if gpu_layers == 0 {

@@ -162,6 +162,10 @@ pub trait EventSink {
 
     /// Strict delivery uses these hooks to durably reserve workflow-wide resources at the same
     /// boundary as the in-memory budget. Default sinks retain legacy, non-workflow behavior.
+    fn workflow_stage_step_started(&mut self, _nesting_depth: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn workflow_model_invocation_started(&mut self, _nesting_depth: usize) -> Result<()> {
         Ok(())
     }
@@ -630,6 +634,7 @@ pub struct AgentRunResult {
 
 #[derive(Debug, Default, Clone)]
 struct RunMetrics {
+    workflow_stage_steps: usize,
     llm_invocations: usize,
     llm_runtime_ms: u64,
     prompt_tokens: usize,
@@ -645,6 +650,9 @@ struct RunMetrics {
 
 impl RunMetrics {
     fn add(&mut self, other: &RunMetrics) {
+        self.workflow_stage_steps = self
+            .workflow_stage_steps
+            .saturating_add(other.workflow_stage_steps);
         self.llm_invocations = self.llm_invocations.saturating_add(other.llm_invocations);
         self.llm_runtime_ms = self.llm_runtime_ms.saturating_add(other.llm_runtime_ms);
         self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
@@ -2267,8 +2275,24 @@ fn run_agent_inner<S: EventSink>(
     let mut llamacpp_backend: Option<LlamaCppBackend> = None;
     if flashmoe_engine.is_none() {
         let path = find_model_in_cache_in(models_root, &args.model);
-        match path.and_then(|p| llamacpp::load_from_file(&p, args.gpu_layers)) {
-            Ok(backend) => {
+        match path.and_then(|p| {
+            llamacpp::load_text_from_file(
+                &p,
+                args.gpu_layers,
+                args.ctx_size,
+                args.threads,
+                args.threads_batch,
+            )
+        }) {
+            Ok((backend, cpu_fallback)) => {
+                if let Some(message) = cpu_fallback {
+                    sink.emit(AgentEvent::Correction {
+                        message,
+                        summary: "using CPU-only llama.cpp fallback for this session".to_string(),
+                        nesting_depth: Some(0),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                }
                 llamacpp_backend = Some(backend);
             }
             Err(error) => {
@@ -4871,6 +4895,10 @@ fn run_agent_steps(
                 gate_state: gate_state.into_inner(),
             });
         }
+        sink.workflow_stage_step_started(nesting_depth)?;
+        if nesting_depth == 0 {
+            metrics.workflow_stage_steps = metrics.workflow_stage_steps.saturating_add(1);
+        }
         sink.emit(AgentEvent::StepStarted {
             step,
             max_steps: effective_max_steps,
@@ -4978,6 +5006,7 @@ fn run_agent_steps(
         let generated = match generate_and_parse_action_with_retries(
             generator,
             args,
+            workspace_root,
             generation_messages,
             generation_tools,
             workflow_completion_enable_thinking(suppress_thinking, terminal_only_turn),
@@ -5161,7 +5190,11 @@ fn run_agent_steps(
                         "Workflow stage submission required",
                         &feedback,
                     ));
-                    terminal_submission_only = workflow_terminal_precondition_feedback(
+                    terminal_submission_only = !matches!(
+                        stage,
+                        crate::workflow::WorkflowStage::Implementing
+                            | crate::workflow::WorkflowStage::Repairing
+                    ) && workflow_terminal_precondition_feedback(
                         args,
                         &gate_state.borrow(),
                         workspace_root,
@@ -6492,11 +6525,29 @@ fn truncate_for_monitor(text: &str) -> String {
 
 fn monitor_recommends_more_steps(audit: &str) -> bool {
     let normalized = audit.to_ascii_lowercase();
-    let negative_recommendation = normalized.contains("off_track")
-        || normalized.contains("blocked")
-        || normalized.contains("loop")
-        || normalized.contains("repeated")
-        || normalized.contains("circular")
+    let diagnostic = normalized
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !matches!(
+                line,
+                "off_track: no"
+                    | "off track: no"
+                    | "blocked: no"
+                    | "loop: no"
+                    | "repeated: no"
+                    | "circular: no"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let negative_recommendation = normalized.contains("status: off_track")
+        || normalized.contains("status: off track")
+        || normalized.contains("status: blocked")
+        || diagnostic.contains("loop")
+        || diagnostic.contains("repeated")
+        || diagnostic.contains("circular")
+        || diagnostic.contains("blocked")
         || normalized.contains("grant more steps: no")
         || normalized.contains("grant more: no")
         || normalized.contains("more steps: no")
@@ -7067,6 +7118,17 @@ fn execute_tool_calls(
     {
         if !success && !agent_tool_errors::is_tool_failure_envelope(&result) {
             let reason = agent_tool_errors::classify_error(&result);
+            let suggested_next_action = if tool == "write_file"
+                && result.contains("write_file refuses to overwrite existing file")
+            {
+                "The path already exists. Call read_file(path) now; after pb returns its contents, call replace_file(path, content) in a later turn. Do not retry write_file."
+            } else if matches!(tool.as_str(), "replace_file" | "edit_file" | "apply_patch")
+                && result.contains("read-before-write gate blocked write")
+            {
+                "Call read_file(path) now, wait for the real result, then retry this edit tool in a later turn with its valid signature."
+            } else {
+                "Use the valid signature to correct the call, choose a different exposed action, or report the blocker truthfully."
+            };
             result = render_call_failure(
                 &env,
                 &tool,
@@ -7076,7 +7138,7 @@ fn execute_tool_calls(
                     reason,
                     ToolFailureReason::PolicyDenied | ToolFailureReason::ApprovalDenied
                 ),
-                "Use the valid signature to correct the call, choose a different exposed action, or report the blocker truthfully.",
+                suggested_next_action,
                 false,
             );
         }
@@ -7716,7 +7778,7 @@ fn run_stage(
     )?;
     let budget_after = run_budget.borrow();
     let usage = crate::workflow::WorkflowUsage {
-        stage_steps: outcome.metrics.llm_invocations,
+        stage_steps: outcome.metrics.workflow_stage_steps,
         model_invocations: budget_after
             .model_invocations
             .saturating_sub(budget_before.1),
@@ -7791,12 +7853,17 @@ impl EventSink for WorkflowCheckpointingSink<'_> {
         self.sink.should_cancel()
     }
 
-    fn workflow_model_invocation_started(&mut self, nesting_depth: usize) -> Result<()> {
+    fn workflow_stage_step_started(&mut self, nesting_depth: usize) -> Result<()> {
         self.record_usage(crate::workflow::WorkflowUsage {
             stage_steps: usize::from(nesting_depth == 0),
+            ..crate::workflow::WorkflowUsage::default()
+        })
+    }
+
+    fn workflow_model_invocation_started(&mut self, _nesting_depth: usize) -> Result<()> {
+        self.record_usage(crate::workflow::WorkflowUsage {
             model_invocations: 1,
-            generated_tokens: 0,
-            advisory_calls: 0,
+            ..crate::workflow::WorkflowUsage::default()
         })
     }
 
@@ -8347,6 +8414,7 @@ fn run_delivery_workflow(
             ) => plan
                 .validate_digest()
                 .and_then(|_| plan.artifact.validate(graph, run.planning_content()))
+                .and_then(|_| validate_plan_contract_paths(args, &plan.artifact))
                 .and_then(|_| {
                     run.apply(crate::workflow::WorkflowEvent::PlanSubmitted { plan: plan.clone() })
                 })
@@ -9017,24 +9085,25 @@ fn run_delivery_commit(
 
 const PLAN_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan function exactly once with arguments shaped as:
-{"id":"plan-1","plan":{"summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"component_ids":["real-component-id"],"paths":[{"path":"repo/relative/path","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["real-check-id"],"description":"..."}],"risks":[],"assumptions":[],"open_questions":[],"resolved_challenge_ids":[]}}
-Use the native function-call interface described by the system tool schema; do not wrap these arguments in a pb compatibility {"type":"tool_call",...} object. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. Use [] for component_ids or check_ids only when the normalized graph genuinely has none. Do not return the arguments as prose or a final action."#;
+{"id":"plan-1","plan":{"summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"component_ids":["real-component-id"],"paths":[{"path":"path/to/file.ext","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["real-check-id"],"description":"..."}],"risks":[],"assumptions":[],"open_questions":[],"resolved_challenge_ids":[]}}
+Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Paths are evaluated in step order: use create before a later modify when the path is currently missing, never modify or delete it before that create, and never create it again while it exists. Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. Use [] for component_ids or check_ids only when the normalized graph genuinely has none. Do not return the arguments as prose or a final action."#;
 
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan_review function exactly once with arguments shaped as:
 {"id":"plan-review-1","review":{"plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","assessments":[{"kind":"requirement_coverage","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"component_impact","status":"pass","evidence":[],"explanation":"..."},{"kind":"test_strategy","status":"pass","evidence":[],"explanation":"..."},{"kind":"failure_modes","status":"pass","evidence":[],"explanation":"..."},{"kind":"assumptions","status":"pass","evidence":[],"explanation":"..."}],"challenges":[],"verdict":"pass"}}
-Use the native function-call interface described by the system tool schema; do not wrap these arguments in a pb compatibility {"type":"tool_call",...} object. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]} and set verdict to revise. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, include no p0/p1 challenge. Do not return prose or a final action."#;
+Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]} and set verdict to revise. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, include no p0/p1 challenge. Do not return prose or a final action."#;
 
 const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
-When the plan creates a file, first call the provided write_file function with arguments such as {"path":"repo/relative/path","content":"exact contents"}. For an existing file, use read_file followed by replace_file, edit_file, or apply_patch. Use the native function-call interface described by the system tool schema. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
+When the plan creates a missing file, call write_file with arguments such as {"path":"path/to/file.ext","content":"exact contents"}. Never call write_file for a path that already exists. For an existing file, first call read_file as one turn with {"path":"path/to/file.ext"}; after pb returns the real contents, call replace_file in a later turn with {"path":"path/to/file.ext","content":"complete replacement contents"}, or use edit_file/apply_patch with their declared schemas. Paths are relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Use the native function-call interface described by the system tool schema. If native calls are unavailable, use exactly one compatibility action with no markdown or surrounding prose, for example {"type":"tool_call","tool":"write_file","arguments":{"path":"...","content":"..."}}, {"type":"tool_call","tool":"read_file","arguments":{"path":"..."}}, or {"type":"tool_call","tool":"replace_file","arguments":{"path":"...","content":"..."}}. Never return an argument object by itself. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
+One action ends the current turn. After closing a compatibility JSON object, stop generating immediately. Never imitate pb's transcript or invent later tool results: do not output `Tool calls:`, `[tool]`, or `[assistant]`, and do not act as though a file changed until pb returns the real tool result and content fingerprint.
 After the last build-stage tool result, copy its exact "Harness current content fingerprint" into content_fingerprint. Required terminal action: call the provided submit_implementation function exactly once with arguments shaped as:
-{"id":"implementation-1","implementation":{"plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","content_fingerprint":"<exact latest harness fingerprint>","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","touched_paths":["repo/relative/path"],"summary":"..."}],"summary":"...","no_change":false,"semantic_commit_subject":"feat: concise semantic subject"}}
-Do not wrap these arguments in a pb compatibility {"type":"tool_call",...} object. For a genuine no-change result, use status no_change, empty touched_paths, no_change true, and an empty semantic_commit_subject. Do not return prose or a final action."#;
+{"id":"implementation-1","implementation":{"plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","content_fingerprint":"<exact latest harness fingerprint>","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","touched_paths":["path/to/file.ext"],"summary":"..."}],"summary":"...","no_change":false,"semantic_commit_subject":"feat: concise semantic subject"}}
+Call submit_implementation natively or use exactly {"type":"tool_call","tool":"submit_implementation","arguments":<the argument object above>} with no markdown or surrounding prose. For a genuine no-change result, use status no_change, empty touched_paths, no_change true, and an empty semantic_commit_subject. Do not return an argument object, prose, or a final action."#;
 
 const CODE_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_code_review function exactly once with arguments shaped as:
 {"id":"code-review-1","review":{"content_fingerprint":"<exact checked fingerprint>","assessments":[{"kind":"correctness","status":"pass","evidence":[],"explanation":"..."},{"kind":"requirements","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"tests","status":"pass","evidence":[],"explanation":"..."},{"kind":"regressions","status":"pass","evidence":[],"explanation":"..."},{"kind":"maintainability","status":"pass","evidence":[],"explanation":"..."}],"findings":[],"verdict":"pass"}}
-Use the native function-call interface described by the system tool schema; do not wrap these arguments in a pb compatibility {"type":"tool_call",...} object. For revise, use a finding shaped exactly as {"id":"finding-1","severity":"p1","path":"repo/relative/path","line":1,"requirement_ids":["r1"],"plan_step_ids":["s1"],"evidence":[{"path":"repo/relative/path","line":1,"description":"..."}],"explanation":"..."} and set verdict to revise. The field is severity with lowercase p1, not kind. For pass, include no p0/p1 finding. Do not return prose or a final action."#;
+Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_code_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a finding shaped exactly as {"id":"finding-1","severity":"p1","path":"path/to/file.ext","line":1,"requirement_ids":["r1"],"plan_step_ids":["s1"],"evidence":[{"path":"path/to/file.ext","line":1,"description":"..."}],"explanation":"..."} and set verdict to revise. The field is severity with lowercase p1, not kind. For pass, include no p0/p1 finding. Do not return prose or a final action."#;
 
 fn workflow_terminal_submission_guidance(stage: crate::workflow::WorkflowStage) -> &'static str {
     match stage {
@@ -10131,6 +10200,7 @@ fn flashmoe_structured_request(
 fn generate_and_parse_action_with_retries(
     generator: &mut dyn CompletionEngine,
     args: &AgentRequest,
+    workspace_root: &Path,
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
@@ -10234,6 +10304,15 @@ fn generate_and_parse_action_with_retries(
         match parse_action(&completion.content) {
             Ok(action) => return Ok(Ok((completion.content, action))),
             Err(error) => {
+                if let Some(action) = recover_unwrapped_workflow_tool_call(
+                    args,
+                    attempt_tools,
+                    completion.finish_reason,
+                    &completion.content,
+                    workspace_root,
+                ) {
+                    return Ok(Ok((completion.content, action)));
+                }
                 if completion.finish_reason != CompletionFinishReason::MaxTokens {
                     return Ok(Ok((
                         completion.content.clone(),
@@ -10310,6 +10389,72 @@ fn generate_and_parse_action_with_retries(
             }
         }
     }
+}
+
+fn recover_unwrapped_workflow_tool_call(
+    args: &AgentRequest,
+    tools: &[BuiltInToolSchema],
+    finish_reason: CompletionFinishReason,
+    output: &str,
+    workspace_root: &Path,
+) -> Option<AgentAction> {
+    if finish_reason != CompletionFinishReason::EndOfGeneration || args.workflow_stage.is_none() {
+        return None;
+    }
+    let arguments = parse_unwrapped_argument_object(output)?;
+    let matches = tools
+        .iter()
+        .filter(|tool| {
+            agent_tool_errors::validate_arguments(&tool.input_schema, &arguments).is_none()
+        })
+        .collect::<Vec<_>>();
+    let tool = if matches.len() == 1 {
+        matches[0].name.as_str()
+    } else if matches.len() == 2
+        && matches
+            .iter()
+            .all(|tool| matches!(tool.name.as_str(), "write_file" | "replace_file"))
+    {
+        let path = arguments.get("path")?.as_str()?;
+        let resolved = resolve_workspace_path(workspace_root, path, false).ok()?;
+        if resolved.exists() {
+            "replace_file"
+        } else {
+            "write_file"
+        }
+    } else {
+        return None;
+    };
+    tracing::info!(
+        tool,
+        "bound an unwrapped JSON argument object to one exposed workflow tool"
+    );
+    Some(AgentAction::ToolCall {
+        tool: tool.to_string(),
+        arguments,
+        thinking: None,
+    })
+}
+
+fn parse_unwrapped_argument_object(output: &str) -> Option<Value> {
+    let trimmed = output.trim();
+    let candidate = if let Some(inner) = trimmed
+        .strip_prefix("```json\n")
+        .and_then(|inner| inner.strip_suffix("\n```"))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("```\n")
+                .and_then(|inner| inner.strip_suffix("\n```"))
+        }) {
+        if inner.contains("```") {
+            return None;
+        }
+        inner.trim()
+    } else {
+        trimmed
+    };
+    let value = serde_json::from_str::<Value>(candidate).ok()?;
+    value.is_object().then_some(value)
 }
 
 fn truncation_action_retry_messages(
@@ -10637,7 +10782,17 @@ fn parse_model_tool_arguments(value: &Value) -> Result<Value> {
 }
 
 fn assistant_content_for_tool_action(output: &str) -> &str {
-    if output.trim_start().starts_with('{') {
+    let trimmed = output.trim_start();
+    if trimmed.starts_with('{')
+        || trimmed.starts_with("```json")
+        || trimmed.starts_with("```JSON")
+        || output.lines().any(|line| {
+            matches!(
+                line.trim(),
+                "Tool calls:" | "[tool]" | "[assistant]" | "[user]" | "[system]"
+            )
+        })
+    {
         ""
     } else {
         output
@@ -12571,6 +12726,18 @@ fn ensure_contract_paths_allowed<'a>(
             contract.allowed_paths.join(", ")
         )
     }
+}
+
+fn validate_plan_contract_paths(
+    request: &AgentRequest,
+    plan: &crate::workflow::PlanArtifact,
+) -> Result<()> {
+    ensure_contract_paths_allowed(
+        request,
+        plan.steps
+            .iter()
+            .flat_map(|step| step.paths.iter().map(|path| path.path.as_str())),
+    )
 }
 
 fn ensure_file_was_read(
@@ -15342,8 +15509,17 @@ mod tests {
             6
         );
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("resolved_challenge_ids"));
+        assert!(PLAN_SUBMISSION_GUIDANCE.contains("evaluated in step order"));
+        assert!(PLAN_SUBMISSION_GUIDANCE.contains("never modify or delete it before that create"));
         assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("submit_plan_review"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Harness current content fingerprint"));
+        assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Never imitate pb's transcript"));
+        assert!(
+            IMPLEMENTATION_SUBMISSION_GUIDANCE
+                .contains("Never call write_file for a path that already exists")
+        );
+        assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("call read_file as one turn"));
+        assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("call replace_file in a later turn"));
         assert!(CODE_REVIEW_SUBMISSION_GUIDANCE.contains("submit_code_review"));
         for guidance in [
             PLAN_SUBMISSION_GUIDANCE,
@@ -15352,8 +15528,49 @@ mod tests {
             CODE_REVIEW_SUBMISSION_GUIDANCE,
         ] {
             assert!(guidance.contains("native function-call interface"));
+            assert!(guidance.contains("compatibility action"));
             assert!(!guidance.contains("return exactly one pb tool-call JSON object"));
         }
+    }
+
+    #[test]
+    fn compatibility_tool_transcripts_are_not_replayed_into_model_context() {
+        let fabricated = r#"```json
+{"type":"tool_call","tool":"write_file","arguments":{"path":"game.js","content":"ok"}}
+```
+Tool calls:
+tool=write_file args={"path":"game.js","content":"ok"}
+
+[tool]
+created game.js
+
+[assistant]
+the next imagined action"#;
+        assert_eq!(assistant_content_for_tool_action(fabricated), "");
+        assert_eq!(
+            assistant_content_for_tool_action("I inspected the real result before this call."),
+            "I inspected the real result before this call."
+        );
+    }
+
+    #[test]
+    fn trusted_contract_rejects_forbidden_paths_during_plan_validation() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.contract = Some(normalized_test_contract("true"));
+        let allowed = delivery_plan(
+            Some(("game.js", crate::workflow::PlannedChange::Create)),
+            Vec::new(),
+        );
+        validate_plan_contract_paths(&request, &allowed.artifact).unwrap();
+
+        let forbidden = delivery_plan(
+            Some(("repo/game.js", crate::workflow::PlannedChange::Create)),
+            Vec::new(),
+        );
+        let error = validate_plan_contract_paths(&request, &forbidden.artifact).unwrap_err();
+        assert!(error.to_string().contains("repo/game.js"));
+        assert!(error.to_string().contains("Allowed paths: game.js"));
     }
 
     #[test]
@@ -16983,6 +17200,12 @@ mod tests {
         let mut generator = ScriptedCompletionEngine {
             completions: VecDeque::from([
                 ScriptedCompletion {
+                    content:
+                        "native call cut off: <tool_call>\n{\"name\":\"submit_plan\",\"arguments\":"
+                            .to_string(),
+                    truncated: true,
+                },
+                ScriptedCompletion {
                     content: plan_submission(),
                     truncated: false,
                 },
@@ -17024,6 +17247,16 @@ mod tests {
             outcome.checkpoint.run.stage,
             crate::workflow::WorkflowStage::Implementing
         );
+        assert_eq!(
+            outcome
+                .checkpoint
+                .run
+                .counters
+                .stage_steps
+                .get(&crate::workflow::WorkflowStage::Planning),
+            Some(&1)
+        );
+        assert_eq!(outcome.checkpoint.run.counters.model_invocations, 3);
         assert!(outcome.checkpoint.run.plan.is_some());
         assert_eq!(
             outcome
@@ -17036,11 +17269,15 @@ mod tests {
                 .verdict,
             crate::workflow::ReviewVerdict::Pass
         );
-        assert_eq!(generator.generation_tool_names.len(), 2);
+        assert_eq!(generator.generation_tool_names.len(), 3);
         assert!(generator.generation_tool_names[0].contains(&"submit_plan".to_string()));
         assert!(!generator.generation_tool_names[0].contains(&"write_file".to_string()));
-        assert!(generator.generation_tool_names[1].contains(&"submit_plan_review".to_string()));
-        assert!(!generator.generation_tool_names[1].contains(&"write_file".to_string()));
+        assert_eq!(
+            generator.generation_tool_names[1],
+            vec!["submit_plan".to_string()]
+        );
+        assert!(generator.generation_tool_names[2].contains(&"submit_plan_review".to_string()));
+        assert!(!generator.generation_tool_names[2].contains(&"write_file".to_string()));
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::WorkflowStageStarted {
@@ -17134,6 +17371,8 @@ mod tests {
             outcome.stage.submission,
             Some(crate::workflow::StageSubmission::Plan { .. })
         ));
+        assert_eq!(outcome.stage.usage.stage_steps, 1);
+        assert_eq!(outcome.stage.usage.model_invocations, 2);
         assert!(outcome.generation_tool_names[0].contains(&"read_file".to_string()));
         assert_eq!(
             outcome.generation_tool_names[1],
@@ -17478,6 +17717,134 @@ mod tests {
             outcome.stage.submission,
             Some(crate::workflow::StageSubmission::Replan { .. })
         ));
+    }
+
+    #[test]
+    fn terminal_only_turn_binds_bare_json_to_its_sole_workflow_tool() {
+        let repo = init_contract_test_repo();
+        let request = workflow_request(AgentProfile::Plan, repo.path());
+        let mut contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Planning,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        contract.max_steps = 1;
+        let wrapped: Value = serde_json::from_str(&plan_submission()).unwrap();
+        let bare_arguments = format!("```json\n{}\n```", wrapped["arguments"]);
+
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            vec![ScriptedCompletion {
+                content: bare_arguments,
+                truncated: false,
+            }],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.stage.submission,
+            Some(crate::workflow::StageSubmission::Plan { .. })
+        ));
+        assert_eq!(
+            outcome.generation_tool_names,
+            vec![vec!["submit_plan".to_string()]]
+        );
+    }
+
+    #[test]
+    fn implementation_keeps_edit_tools_after_a_rejected_prose_final() {
+        let repo = init_contract_test_repo();
+        let request = workflow_request(AgentProfile::Build, repo.path());
+        let mut contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Implementing,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        contract.max_steps = 2;
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            vec![
+                ScriptedCompletion {
+                    content: "I am done without editing.".to_string(),
+                    truncated: false,
+                },
+                tool_completion(
+                    "request_replan",
+                    json!({"reason": "The accepted plan needs another path"}),
+                ),
+            ],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.stage.submission,
+            Some(crate::workflow::StageSubmission::Replan { .. })
+        ));
+        assert!(outcome.generation_tool_names[1].contains(&"write_file".to_string()));
+        assert!(outcome.generation_tool_names[1].contains(&"submit_implementation".to_string()));
+    }
+
+    #[test]
+    fn unwrapped_edit_arguments_bind_only_when_the_exposed_schema_is_unambiguous() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        let tools = available_tool_specs(
+            AgentProfile::Build,
+            Some(CommandBackendKind::Local),
+            true,
+            false,
+            &McpToolRegistry::default(),
+            &LspToolRegistry::default(),
+        );
+        let output = "```json\n{\"path\":\"new.txt\",\"content\":\"hello\\n\"}\n```";
+
+        let created = recover_unwrapped_workflow_tool_call(
+            &request,
+            &tools,
+            CompletionFinishReason::EndOfGeneration,
+            output,
+            repo.path(),
+        )
+        .unwrap();
+        assert!(matches!(
+            created,
+            AgentAction::ToolCall { ref tool, .. } if tool == "write_file"
+        ));
+
+        std::fs::write(repo.path().join("new.txt"), "old\n").unwrap();
+        let replaced = recover_unwrapped_workflow_tool_call(
+            &request,
+            &tools,
+            CompletionFinishReason::EndOfGeneration,
+            output,
+            repo.path(),
+        )
+        .unwrap();
+        assert!(matches!(
+            replaced,
+            AgentAction::ToolCall { ref tool, .. } if tool == "replace_file"
+        ));
+        assert!(
+            recover_unwrapped_workflow_tool_call(
+                &request,
+                &tools,
+                CompletionFinishReason::EndOfGeneration,
+                "Here are arguments: {\"path\":\"new.txt\",\"content\":\"no\"}",
+                repo.path(),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -18812,6 +19179,52 @@ mod tests {
     }
 
     #[test]
+    fn existing_write_failure_directs_a_read_then_replace() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("existing.txt"), "keep me\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 2;
+        let mut events = Vec::new();
+        let _ = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion(
+                    "write_file",
+                    json!({"path": "existing.txt", "content": "replacement\n"}),
+                ),
+                scripted_final("reported the blocked overwrite"),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("existing.txt")).unwrap(),
+            "keep me\n"
+        );
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { tool, result, .. } if tool == "write_file" => Some(result),
+                _ => None,
+            })
+            .expect("blocked overwrite result");
+        let envelope: agent_tool_errors::ToolFailureEnvelope =
+            serde_json::from_str(result).unwrap();
+        assert!(
+            envelope
+                .suggested_next_action
+                .contains("Call read_file(path) now")
+        );
+        assert!(
+            envelope
+                .suggested_next_action
+                .contains("Do not retry write_file")
+        );
+    }
+
+    #[test]
     fn ar3_truncated_action_retries_once_at_the_same_cap_with_thinking_off() {
         let tmp = init_contract_test_repo();
         std::fs::write(tmp.path().join("probe.txt"), "probe evidence\n").unwrap();
@@ -20128,6 +20541,9 @@ mod tests {
         ));
         assert!(!monitor_recommends_more_steps(
             "status: on_track\nevidence: progress is bounded\ngrant more steps: no"
+        ));
+        assert!(monitor_recommends_more_steps(
+            "status: on_track\nneeds_more_steps: yes\noff_track: no\nblocked: no\nevidence: all planned files now exist\ngrant more steps: yes\nstop conditions: none"
         ));
     }
 

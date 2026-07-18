@@ -128,7 +128,7 @@ impl WorkflowRun {
             policy_sha256: policy.sha256.clone(),
             workspace_graph_sha256: String::new(),
             policy,
-            planning_snapshot: Some(repository.task_baseline.content.clone()),
+            planning_snapshot: Some(repository.invocation_baseline.content.clone()),
             repository,
             git_control: None,
             paused_stage: None,
@@ -590,6 +590,33 @@ mod tests {
             repository,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn new_workflow_plans_from_the_current_invocation_baseline() {
+        let (dir, initial) = repository();
+        std::fs::write(dir.path().join("adopted.txt"), "partial work\n").unwrap();
+        let resumed =
+            RepositoryContext::resume(dir.path(), dir.path(), initial.task_baseline.clone())
+                .unwrap();
+        assert_ne!(
+            resumed.task_baseline.content.fingerprint,
+            resumed.invocation_baseline.content.fingerprint
+        );
+
+        let run = WorkflowRun::start(
+            "workflow-resumed-scratch",
+            "turn-resumed-scratch",
+            "repair adopted work",
+            WorkflowConfigDocument::default().compile().unwrap(),
+            resumed.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            run.planning_content().fingerprint,
+            resumed.invocation_baseline.content.fingerprint
+        );
     }
 
     fn plan() -> ArtifactEnvelope<PlanArtifact> {
