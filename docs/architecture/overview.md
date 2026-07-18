@@ -124,10 +124,12 @@ DeepSeek state is request-scoped for now. pb resets its raw/compressed/indexer K
 hyperconnection state before each request and deliberately declines existing FlashMoe session and
 shared-prefix snapshots because those snapshots cannot yet represent the complete typed state.
 Source/cache/graph/routing/ABI tests and local compilation of the specialized Metal library are
-recorded; a full published-checkpoint cache build, official logit/continuation parity, and real
-DeepSeek smoke are still outstanding. DSA sparse attention and the MTP speculative head likewise
-remain GLM follow-on implementations, and GLM requests beyond `index_topk` remain explicit
-unsupported paths. The detailed implementation and evidence boundary lives in the
+recorded. The published 86.72 GB imatrix GGUF has also completed canonical cache publication and
+real Metal load/prefill/decode, including a 233-token request that crosses the ratio-128 compression
+boundary. Independent logit/continuation parity, complete-state snapshots, and real structured-tool
+evidence remain outstanding. DSA sparse attention and the MTP speculative head likewise remain GLM
+follow-on implementations, and GLM requests beyond `index_topk` remain explicit unsupported paths.
+The detailed implementation and evidence boundary lives in the
 [FlashMoe architecture parity plan](../flashmoe-architecture-parity-plan.md).
 
 ## Deliberate seams

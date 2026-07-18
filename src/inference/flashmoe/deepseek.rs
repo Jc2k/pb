@@ -164,7 +164,7 @@ impl DeepSeekV4Config {
                 "DeepSeek V4 Flash GGUF declares architecture {architecture:?}, expected \"deepseek4\""
             );
         }
-        let config = Self {
+        let mut config = Self {
             architecture,
             block_count: required_usize(gguf, "deepseek4.block_count")?,
             embedding_length: required_usize(gguf, "deepseek4.embedding_length")?,
@@ -224,6 +224,11 @@ impl DeepSeekV4Config {
                 .context("GGUF metadata deepseek4.expert_weights_norm must be bool")?,
         };
         config.validate_flash_profile(gguf)?;
+        // Published Flash GGUFs may append one MTP entry to per-layer metadata.
+        // The resolved base graph has exactly block_count layers, so normalize
+        // the already-validated prefix before serializing the runtime config.
+        config.compress_ratios.truncate(config.block_count);
+        config.swiglu_clamp_exp.truncate(config.block_count);
         config.validate_cached_flash_profile()?;
         Ok(config)
     }
@@ -291,18 +296,23 @@ impl DeepSeekV4Config {
                 }
             })
             .collect();
-        if self.compress_ratios != expected_ratios {
+        if self.compress_ratios.len() < self.block_count
+            || self.compress_ratios[..self.block_count] != expected_ratios
+        {
             bail!(
-                "DeepSeek V4 Flash attention.compress_ratios does not match the fixed 43-layer Flash graph"
+                "DeepSeek V4 Flash attention.compress_ratios does not contain the fixed 43-layer Flash graph prefix: got {:?}, expected prefix {:?}",
+                self.compress_ratios,
+                expected_ratios
             );
         }
-        if self.swiglu_clamp_exp.len() != 43
+        if self.swiglu_clamp_exp.len() < self.block_count
             || self
                 .swiglu_clamp_exp
                 .iter()
+                .take(self.block_count)
                 .any(|value| !float_matches(*value, 10.0))
         {
-            bail!("DeepSeek V4 Flash swiglu_clamp_exp must contain 43 values equal to 10");
+            bail!("DeepSeek V4 Flash swiglu_clamp_exp must contain a 43-layer prefix equal to 10");
         }
         for (name, actual, wanted) in [
             ("rope.freq_base", self.rope_freq_base, 10_000.0),
@@ -2087,6 +2097,30 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_trailing_mtp_metadata_after_validating_the_base_graph() {
+        let mut metadata = valid_metadata();
+        let GgufValue::Array { values, .. } = metadata
+            .get_mut("deepseek4.attention.compress_ratios")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        values.push(GgufValue::Uint32(0));
+        let GgufValue::Array { values, .. } =
+            metadata.get_mut("deepseek4.swiglu_clamp_exp").unwrap()
+        else {
+            unreachable!()
+        };
+        values.push(GgufValue::Float32(0.0));
+
+        let config = DeepSeekV4Config::from_gguf(&gguf_with_metadata(metadata)).unwrap();
+
+        assert_eq!(config.compress_ratios.len(), 43);
+        assert_eq!(config.swiglu_clamp_exp.len(), 43);
+        config.validate_cached_flash_profile().unwrap();
+    }
+
+    #[test]
     fn rejects_shape_and_schedule_drift_before_graph_binding() {
         let mut shape = valid_metadata();
         shape.insert("deepseek4.expert_used_count".to_string(), value_u32(2));
@@ -2107,6 +2141,21 @@ mod tests {
         values[2] = GgufValue::Uint32(128);
         assert!(
             DeepSeekV4Config::from_gguf(&gguf_with_metadata(schedule))
+                .unwrap_err()
+                .to_string()
+                .contains("compress_ratios")
+        );
+
+        let mut short_schedule = valid_metadata();
+        let GgufValue::Array { values, .. } = short_schedule
+            .get_mut("deepseek4.attention.compress_ratios")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        values.pop();
+        assert!(
+            DeepSeekV4Config::from_gguf(&gguf_with_metadata(short_schedule))
                 .unwrap_err()
                 .to_string()
                 .contains("compress_ratios")

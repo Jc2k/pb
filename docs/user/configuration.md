@@ -122,15 +122,20 @@ shape, quantization, compression-schedule, expert, and JoyAI tokenizer contract 
 publishing a source-independent FlashMoe cache. Resident tensors stay in one mmap-backed store.
 Each layer's 256 routed experts are split into fixed, page-aligned whole-expert slots so the shared
 scheduler can stream the selected six from SSD with parallel positioned reads and let the operating
-system page cache remain authoritative.
+system page cache remain authoritative. The published source is 86.72 GB; retaining both it and the
+prepared resident/expert cache used about 162 GiB in the 2026-07-18 validation run, so check free
+space before pulling.
 
 Load resolves the complete graph and required fused Metal kernels before the first token. Top-6 is
 part of the checkpoint contract: `--flashmoe-active-experts` cannot reduce it. There is no llama.cpp
 fallback, CPU component fallback, DS4 process, hidden top-2 mode, or alternate generation loop.
 DeepSeek is text-only in this profile, and existing FlashMoe session/prefix reuse is disabled as
 described above. The implementation has local graph, routing, ABI, all-target, and Metal shader
-compilation evidence, but this repository has not yet recorded a full published-checkpoint build or
-real-model continuation smoke; treat output validation as provisional until that evidence lands.
+compilation evidence plus a complete published-checkpoint cache build and real-model Metal
+load/prefill/decode. A one-token raw arithmetic smoke emitted `4`, a 16-token run exercised repeated
+decode, and a 233-token prompt crossed ratio-4/ratio-128 compression and the raw sliding-window
+boundary. Treat numerical parity as provisional until independent continuation/logit vectors and
+structured-tool evidence land.
 
 ## Project configuration
 
