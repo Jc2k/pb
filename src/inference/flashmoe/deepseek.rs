@@ -769,6 +769,12 @@ pub(crate) struct DeepSeekResidentTensor {
     pub(crate) byte_len: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeepSeekResidentRange {
+    pub(crate) byte_offset: u64,
+    pub(crate) byte_len: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DeepSeekV4CompressorGraph {
     pub(crate) ratio: usize,
@@ -822,6 +828,13 @@ pub(crate) struct DeepSeekV4LayerGraph {
 #[derive(Debug, Clone)]
 pub(crate) struct DeepSeekV4ExecutionGraph {
     pub(crate) config: DeepSeekV4Config,
+    /// Batch geometry at or above this loaded expert count uses the fixed
+    /// one-layer-ahead positioned-read preparation schedule.
+    pub(crate) prefill_layer_prepare_min_tokens: usize,
+    /// Exact resident tensor ranges prepared one layer ahead alongside the
+    /// scheduler-owned routed-expert stream. These ranges are resolved once
+    /// from the bound graph and never rediscovered by token execution.
+    pub(crate) prefill_resident_layer_ranges: Vec<Box<[DeepSeekResidentRange]>>,
     pub(crate) embedding: DeepSeekResidentTensor,
     pub(crate) output_hc_base: DeepSeekResidentTensor,
     pub(crate) output_hc_fn: DeepSeekResidentTensor,
@@ -1053,8 +1066,15 @@ impl DeepSeekV4ExecutionGraph {
                 token_hash_routes,
             });
         }
+        let prefill_layer_prepare_min_tokens = config.expert_count;
+        let prefill_resident_layer_ranges = layers
+            .iter()
+            .map(deepseek_layer_resident_ranges)
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             config,
+            prefill_layer_prepare_min_tokens,
+            prefill_resident_layer_ranges,
             embedding,
             output_hc_base,
             output_hc_fn,
@@ -1064,6 +1084,100 @@ impl DeepSeekV4ExecutionGraph {
             layers,
         })
     }
+}
+
+fn deepseek_layer_resident_ranges(
+    layer: &DeepSeekV4LayerGraph,
+) -> Result<Box<[DeepSeekResidentRange]>> {
+    let mut tensors = vec![
+        &layer.hc_attn_fn,
+        &layer.hc_attn_scale,
+        &layer.hc_attn_base,
+        &layer.attn_norm,
+        &layer.attn_q_a,
+        &layer.attn_q_a_norm,
+        &layer.attn_q_b,
+        &layer.attn_kv,
+        &layer.attn_kv_a_norm,
+        &layer.attn_sinks,
+        &layer.attn_output_a,
+        &layer.attn_output_b,
+        &layer.hc_ffn_fn,
+        &layer.hc_ffn_scale,
+        &layer.hc_ffn_base,
+        &layer.ffn_norm,
+        &layer.router,
+        &layer.shared_gate,
+        &layer.shared_up,
+        &layer.shared_down,
+    ];
+    tensors.extend(layer.router_bias.iter());
+    tensors.extend(layer.token_hash_routes.iter());
+    if let Some(compressor) = &layer.compressor {
+        tensors.extend([
+            &compressor.ape,
+            &compressor.kv,
+            &compressor.gate,
+            &compressor.norm,
+        ]);
+    }
+    if let Some(indexer) = &layer.indexer {
+        tensors.extend([
+            &indexer.q_b,
+            &indexer.projection,
+            &indexer.compressor_ape,
+            &indexer.compressor_kv,
+            &indexer.compressor_gate,
+            &indexer.compressor_norm,
+        ]);
+    }
+    coalesce_deepseek_resident_ranges(tensors.into_iter().map(|tensor| DeepSeekResidentRange {
+        byte_offset: tensor.byte_offset,
+        byte_len: tensor.byte_len,
+    }))
+}
+
+fn coalesce_deepseek_resident_ranges(
+    ranges: impl IntoIterator<Item = DeepSeekResidentRange>,
+) -> Result<Box<[DeepSeekResidentRange]>> {
+    let mut ranges = ranges.into_iter().collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| range.byte_offset);
+    let mut coalesced = Vec::<DeepSeekResidentRange>::with_capacity(ranges.len());
+    for range in ranges {
+        if range.byte_len == 0 {
+            bail!("DeepSeek resident preparation range cannot be empty");
+        }
+        let end = range
+            .byte_offset
+            .checked_add(range.byte_len)
+            .context("DeepSeek resident preparation range overflow")?;
+        if let Some(previous) = coalesced.last_mut() {
+            let previous_end = previous
+                .byte_offset
+                .checked_add(previous.byte_len)
+                .context("DeepSeek coalesced resident preparation range overflow")?;
+            if range.byte_offset < previous_end {
+                bail!(
+                    "DeepSeek resident preparation ranges overlap at {}..{} and {}..{}",
+                    previous.byte_offset,
+                    previous_end,
+                    range.byte_offset,
+                    end
+                );
+            }
+            if range.byte_offset == previous_end {
+                previous.byte_len = end
+                    .checked_sub(previous.byte_offset)
+                    .context("DeepSeek resident preparation merge underflow")?;
+                continue;
+            }
+        }
+        coalesced.push(range);
+    }
+    if coalesced.is_empty() {
+        bail!("DeepSeek layer has no resident ranges to prepare");
+    }
+    Ok(coalesced.into_boxed_slice())
 }
 
 fn bind_deepseek_tensor(
@@ -2170,5 +2284,54 @@ mod tests {
             "hf://antirez/deepseek-v4-gguf/DeepSeek-V4-Pro-Q4_K_M.gguf"
         ));
         assert!(!is_deepseek_v4_flash("hf://other/deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn resident_prepare_ranges_are_sorted_exact_and_only_merge_adjacency() {
+        let ranges = coalesce_deepseek_resident_ranges([
+            DeepSeekResidentRange {
+                byte_offset: 128,
+                byte_len: 32,
+            },
+            DeepSeekResidentRange {
+                byte_offset: 0,
+                byte_len: 64,
+            },
+            DeepSeekResidentRange {
+                byte_offset: 64,
+                byte_len: 32,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            &*ranges,
+            &[
+                DeepSeekResidentRange {
+                    byte_offset: 0,
+                    byte_len: 96,
+                },
+                DeepSeekResidentRange {
+                    byte_offset: 128,
+                    byte_len: 32,
+                },
+            ]
+        );
+
+        assert!(
+            coalesce_deepseek_resident_ranges([
+                DeepSeekResidentRange {
+                    byte_offset: 0,
+                    byte_len: 65,
+                },
+                DeepSeekResidentRange {
+                    byte_offset: 64,
+                    byte_len: 1,
+                },
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("overlap")
+        );
     }
 }

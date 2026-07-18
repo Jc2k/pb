@@ -224,6 +224,7 @@ pub struct ExpertIoPolicy {
     pub lz4_expert_compression: bool,
     pub speculative_routing: bool,
     pub broad_ssd_gpu_overlap: bool,
+    pub layer_ahead_request_staging: bool,
 }
 
 // Expert scheduler policy guardrails:
@@ -231,7 +232,9 @@ pub struct ExpertIoPolicy {
 // - do not add an application-level expert LRU/cache;
 // - do not add LZ4 expert compression;
 // - do not speculate future expert routes;
-// - avoid broad SSD/GPU overlap beyond the existing narrow deferred expert phase.
+// - avoid broad or speculative SSD/GPU overlap;
+// - permit the graph-resolved one-layer-ahead positioned read directly into
+//   request-scoped staging for saturated DeepSeek batch geometry.
 //
 // These choices follow Flash-MoE's "Trust the OS" result: the OS page cache plus
 // parallel pread won over custom expert caches, mmap expert files, LZ4, prefetch
@@ -244,6 +247,7 @@ pub const FLASHMOE_EXPERT_IO_POLICY: ExpertIoPolicy = ExpertIoPolicy {
     lz4_expert_compression: false,
     speculative_routing: false,
     broad_ssd_gpu_overlap: false,
+    layer_ahead_request_staging: true,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2702,6 +2706,114 @@ pub(crate) struct ExpertRawReadResponse {
     pub(crate) result: Result<ExpertRawRead>,
 }
 
+#[derive(Debug)]
+pub(crate) struct DirectExpertReadSummary {
+    pub(crate) read_latencies: Vec<Duration>,
+    #[cfg(test)]
+    pub(crate) positioned_runs: usize,
+    #[cfg(test)]
+    pub(crate) bytes_read: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingExpertLayerPrepare {
+    layer: usize,
+    bytes: u64,
+    workers: Vec<thread::JoinHandle<Result<ExpertLayerPrepareWorkerSummary>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpertLayerPrepareWorkerSummary {
+    bytes_read: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpertLayerPrepareSummary {
+    pub(crate) layer: usize,
+    #[cfg(test)]
+    pub(crate) bytes_read: u64,
+}
+
+impl PendingExpertLayerPrepare {
+    pub(crate) fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn finish(mut self) -> Result<ExpertLayerPrepareSummary> {
+        let mut bytes_read = 0u64;
+        let mut first_error = None;
+        for worker in self.workers.drain(..) {
+            match worker.join() {
+                Ok(Ok(summary)) => {
+                    bytes_read = bytes_read
+                        .checked_add(summary.bytes_read)
+                        .context("prepared expert layer byte count overflow")?;
+                }
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!(
+                            "expert layer {} preparation worker panicked",
+                            self.layer
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if bytes_read != self.bytes {
+            bail!(
+                "prepared expert layer {} read {bytes_read} bytes, expected {}",
+                self.layer,
+                self.bytes
+            );
+        }
+        Ok(ExpertLayerPrepareSummary {
+            layer: self.layer,
+            #[cfg(test)]
+            bytes_read,
+        })
+    }
+}
+
+impl Drop for PendingExpertLayerPrepare {
+    fn drop(&mut self) {
+        // Direct request staging is caller-owned. A primary execution error
+        // may unwind before the explicit finish point, so never let a worker
+        // outlive the Metal allocation it is filling.
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DirectExpertWritePtr(*mut u8);
+
+unsafe impl Send for DirectExpertWritePtr {}
+unsafe impl Sync for DirectExpertWritePtr {}
+
+impl DirectExpertWritePtr {
+    unsafe fn slice_at<'a>(self, offset: usize, len: usize) -> &'a mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(offset), len) }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectExpertReadRun {
+    first_index: usize,
+    end_index: usize,
+    file_offset: u64,
+    destination_offset: usize,
+    len: usize,
+}
+
 fn resolve_fixed_dense_metadata_dtype(
     metadata: &ExpertLayerPackMetadata,
 ) -> Result<DenseExpertDtype> {
@@ -2986,9 +3098,152 @@ impl ExpertSlotStore {
         let mut layers = self.layers.lock().expect("expert layer cache poisoned");
         Ok(layers.entry(layer).or_insert_with(|| reader).clone())
     }
+
+    pub(crate) fn read_unique_into(
+        &self,
+        layer: usize,
+        experts: &[usize],
+        destination: &mut [u8],
+        slot_stride: usize,
+        workers: usize,
+    ) -> Result<DirectExpertReadSummary> {
+        self.layer_reader(layer)?
+            .read_unique_into(experts, destination, slot_stride, workers)
+    }
+
+    pub(crate) unsafe fn issue_layer_prepare_into(
+        &self,
+        layer: usize,
+        destination: &mut [u8],
+        workers: usize,
+    ) -> Result<PendingExpertLayerPrepare> {
+        unsafe {
+            ExpertLayerReader::issue_layer_prepare_into(
+                self.layer_reader(layer)?,
+                destination,
+                workers,
+            )
+        }
+    }
 }
 
 impl ExpertLayerReader {
+    /// Start a fixed whole-layer positioned read directly into caller-owned
+    /// request staging. The caller must keep the destination alive and avoid
+    /// all access until the returned handle is finished.
+    unsafe fn issue_layer_prepare_into(
+        reader: Arc<Self>,
+        destination: &mut [u8],
+        workers: usize,
+    ) -> Result<PendingExpertLayerPrepare> {
+        let (slot_bytes, layer_bytes) = reader.validate_layer_prepare()?;
+        if destination.len() != layer_bytes {
+            bail!(
+                "expert layer {} preparation destination has {} bytes, expected complete fixed layer {layer_bytes}",
+                reader.metadata.layer,
+                destination.len()
+            );
+        }
+
+        let worker_count = workers.max(1).min(reader.metadata.experts);
+        let experts_per_worker = reader.metadata.experts.div_ceil(worker_count);
+        let target = DirectExpertWritePtr(destination.as_mut_ptr());
+        let ranges = (0..worker_count)
+            .map(|worker| {
+                let first_expert = worker
+                    .checked_mul(experts_per_worker)
+                    .context("expert layer staging worker range overflow")?;
+                if first_expert >= reader.metadata.experts {
+                    return Ok(None);
+                }
+                let end_expert = first_expert
+                    .saturating_add(experts_per_worker)
+                    .min(reader.metadata.experts);
+                let offset = first_expert
+                    .checked_mul(slot_bytes)
+                    .context("expert layer staging offset overflow")?;
+                let len = (end_expert - first_expert)
+                    .checked_mul(slot_bytes)
+                    .context("expert layer staging range overflow")?;
+                Ok(Some((offset, len)))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let mut handles = Vec::with_capacity(ranges.len());
+        for (offset, len) in ranges {
+            let worker_reader = Arc::clone(&reader);
+            handles.push(thread::spawn(move || {
+                let destination = unsafe { target.slice_at(offset, len) };
+                read_exact_at_positioned(&worker_reader.file, destination, u64::try_from(offset)?)
+                    .with_context(|| {
+                        format!(
+                            "failed to prepare expert layer {} directly into request staging from {}",
+                            worker_reader.metadata.layer,
+                            worker_reader.path.display()
+                        )
+                    })?;
+                Ok(ExpertLayerPrepareWorkerSummary {
+                    bytes_read: u64::try_from(len)?,
+                })
+            }));
+        }
+        Ok(PendingExpertLayerPrepare {
+            layer: reader.metadata.layer,
+            bytes: u64::try_from(layer_bytes)?,
+            workers: handles,
+        })
+    }
+
+    fn validate_layer_prepare(&self) -> Result<(usize, usize)> {
+        let slot_bytes = usize::try_from(self.metadata.expert_size)
+            .context("expert layer preparation slot size does not fit usize")?;
+        if slot_bytes == 0 || self.metadata.experts == 0 {
+            bail!(
+                "expert layer {} preparation requires non-empty fixed whole slots",
+                self.metadata.layer
+            );
+        }
+        for expert in 0..self.metadata.experts {
+            let pack = self.metadata.pack_for(expert).with_context(|| {
+                format!(
+                    "expert layer {} preparation is missing expert {expert}",
+                    self.metadata.layer
+                )
+            })?;
+            if usize::try_from(pack.packed_bytes)? != slot_bytes {
+                bail!(
+                    "expert layer {} preparation requires whole slots, but expert {expert} has {} of {slot_bytes} bytes",
+                    self.metadata.layer,
+                    pack.packed_bytes
+                );
+            }
+        }
+        let layer_bytes = slot_bytes
+            .checked_mul(self.metadata.experts)
+            .context("expert layer preparation byte count overflow")?;
+        let actual_bytes = usize::try_from(
+            self.file
+                .metadata()
+                .with_context(|| {
+                    format!(
+                        "failed to stat expert layer {} before preparation",
+                        self.path.display()
+                    )
+                })?
+                .len(),
+        )
+        .context("expert layer preparation file length does not fit usize")?;
+        if actual_bytes != layer_bytes {
+            bail!(
+                "expert layer {} preparation file has {actual_bytes} bytes, expected {layer_bytes}",
+                self.metadata.layer
+            );
+        }
+        Ok((slot_bytes, layer_bytes))
+    }
+
     pub(crate) fn open(
         root: &Path,
         layer: usize,
@@ -3112,6 +3367,159 @@ impl ExpertLayerReader {
             payload,
             read_latency,
             read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+        })
+    }
+
+    fn read_unique_into(
+        &self,
+        experts: &[usize],
+        destination: &mut [u8],
+        slot_stride: usize,
+        workers: usize,
+    ) -> Result<DirectExpertReadSummary> {
+        if experts.is_empty() {
+            bail!("direct batch expert read requires at least one expert");
+        }
+        let expected_stride = usize::try_from(self.metadata.expert_size)
+            .context("expert slot size does not fit usize")?;
+        if slot_stride != expected_stride {
+            bail!(
+                "direct batch expert destination stride {slot_stride} does not match resolved whole-slot size {expected_stride}"
+            );
+        }
+        let expected_len = self
+            .metadata
+            .experts
+            .checked_mul(slot_stride)
+            .context("direct batch expert destination size overflow")?;
+        if destination.len() != expected_len {
+            bail!(
+                "direct batch expert destination has {} bytes, expected graph-declared whole-layer staging size {expected_len}",
+                destination.len()
+            );
+        }
+        if experts.windows(2).any(|pair| pair[0] >= pair[1]) {
+            bail!("direct batch expert ids must be sorted and unique");
+        }
+
+        let mut plans = Vec::with_capacity(experts.len());
+        for &expert in experts {
+            let plan = self.prepare_read(expert)?;
+            if plan.packed_len != slot_stride || plan.slot_capacity != slot_stride {
+                bail!(
+                    "direct batch expert {}/{} is not one complete resolved whole slot: packed={} capacity={} stride={slot_stride}",
+                    self.metadata.layer,
+                    expert,
+                    plan.packed_len,
+                    plan.slot_capacity
+                );
+            }
+            plans.push(plan);
+        }
+
+        let mut runs = Vec::new();
+        let mut first_index = 0usize;
+        for index in 1..=experts.len() {
+            let continues =
+                index < experts.len() && experts[index] == experts[index - 1].saturating_add(1);
+            if continues {
+                continue;
+            }
+            let first_expert = experts[first_index];
+            let expert_count = index - first_index;
+            runs.push(DirectExpertReadRun {
+                first_index,
+                end_index: index,
+                file_offset: plans[first_index].offset,
+                destination_offset: first_expert
+                    .checked_mul(slot_stride)
+                    .context("direct batch expert destination offset overflow")?,
+                len: expert_count
+                    .checked_mul(slot_stride)
+                    .context("direct batch expert run size overflow")?,
+            });
+            first_index = index;
+        }
+
+        let worker_count = workers.max(1).min(runs.len());
+        let target = DirectExpertWritePtr(destination.as_mut_ptr());
+        let latencies = Mutex::new(vec![None; experts.len()]);
+        let error = Mutex::new(None);
+        thread::scope(|scope| {
+            for worker in 0..worker_count {
+                let runs = &runs;
+                let latencies = &latencies;
+                let error = &error;
+                scope.spawn(move || {
+                    for run_index in (worker..runs.len()).step_by(worker_count) {
+                        if error.lock().expect("direct expert read error lock poisoned").is_some() {
+                            return;
+                        }
+                        let run = runs[run_index];
+                        let started = Instant::now();
+                        // The scheduler validates a strictly increasing expert set, and each run
+                        // therefore owns a disjoint whole-slot destination range for the lifetime
+                        // of this scoped worker.
+                        let result = read_exact_at_positioned(
+                            &self.file,
+                            unsafe { target.slice_at(run.destination_offset, run.len) },
+                            run.file_offset,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed direct batch expert run for layer {} experts {}..{} from {}",
+                                self.metadata.layer,
+                                experts[run.first_index],
+                                experts[run.end_index - 1],
+                                self.path.display()
+                            )
+                        });
+                        let elapsed = started.elapsed();
+                        if let Err(read_error) = result {
+                            let mut slot = error
+                                .lock()
+                                .expect("direct expert read error lock poisoned");
+                            if slot.is_none() {
+                                *slot = Some(read_error);
+                            }
+                            return;
+                        }
+                        let mut values = latencies
+                            .lock()
+                            .expect("direct expert read latency lock poisoned");
+                        for value in &mut values[run.first_index..run.end_index] {
+                            *value = Some(elapsed);
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(error) = error
+            .into_inner()
+            .expect("direct expert read error lock poisoned")
+        {
+            return Err(error);
+        }
+        let read_latencies = latencies
+            .into_inner()
+            .expect("direct expert read latency lock poisoned")
+            .into_iter()
+            .enumerate()
+            .map(|(index, latency)| {
+                latency.with_context(|| {
+                    format!(
+                        "direct batch expert {}/{} did not produce read timing",
+                        self.metadata.layer, experts[index]
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DirectExpertReadSummary {
+            read_latencies,
+            #[cfg(test)]
+            positioned_runs: runs.len(),
+            #[cfg(test)]
+            bytes_read: u64::try_from(experts.len().saturating_mul(slot_stride))?,
         })
     }
 }
@@ -7831,6 +8239,34 @@ mod tests {
         assert!(!FLASHMOE_EXPERT_IO_POLICY.lz4_expert_compression);
         assert!(!FLASHMOE_EXPERT_IO_POLICY.speculative_routing);
         assert!(!FLASHMOE_EXPERT_IO_POLICY.broad_ssd_gpu_overlap);
+        assert!(FLASHMOE_EXPERT_IO_POLICY.layer_ahead_request_staging);
+    }
+
+    #[test]
+    fn pending_layer_prepare_drop_joins_direct_destination_workers() {
+        let (worker_started_tx, worker_started_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            worker_started_tx.send(()).unwrap();
+            release_worker_rx.recv().unwrap();
+            Ok(ExpertLayerPrepareWorkerSummary { bytes_read: 0 })
+        });
+        let pending = PendingExpertLayerPrepare {
+            layer: 0,
+            bytes: 0,
+            workers: vec![worker],
+        };
+        let (drop_finished_tx, drop_finished_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(pending);
+            drop_finished_tx.send(()).unwrap();
+        });
+
+        worker_started_rx.recv().unwrap();
+        assert!(drop_finished_rx.try_recv().is_err());
+        release_worker_tx.send(()).unwrap();
+        drop_finished_rx.recv().unwrap();
+        dropper.join().unwrap();
     }
 
     #[test]

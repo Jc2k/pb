@@ -1,17 +1,18 @@
 use std::mem::size_of;
 use std::ptr;
 use std::sync::Arc;
+use std::thread;
 
 use anyhow::{Context, Result, bail};
 
 use super::super::deepseek::{
-    DeepSeekResidentDtype, DeepSeekResidentTensor, DeepSeekV4ExecutionGraph, DeepSeekV4LayerGraph,
-    deepseek_v4_router_probabilities, deepseek_v4_select_routes,
+    DeepSeekResidentDtype, DeepSeekResidentRange, DeepSeekResidentTensor, DeepSeekV4ExecutionGraph,
+    DeepSeekV4LayerGraph, deepseek_v4_router_probabilities, deepseek_v4_select_routes,
 };
 use super::super::experts::{DeepSeekGgufExpertSlotSpec, ExpertMlpProjection};
 use super::super::scheduler::{
-    FlashMoeExecutionScheduler, ScheduledDeepSeekGgufExpertPhaseMlpPayload,
-    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet, ScheduledExpertSlot,
+    FlashMoeExecutionScheduler, PendingScheduledExpertLayerPrepare,
+    ScheduledDeepSeekGgufExpertPhaseMlpPayload, ScheduledExpertPhaseMlpPayload, ScheduledExpertSet,
 };
 use super::*;
 
@@ -36,6 +37,26 @@ const INDEX_WIDTH: usize = INDEX_HEADS * INDEX_HEAD_DIM;
 const INDEX_TOP_K: usize = 512;
 const RMS_EPS: f32 = 1.0e-6;
 const HC_EPS: f32 = 1.0e-6;
+const RESIDENT_LAYER_PREPARE_WORKERS: usize = 1;
+
+#[derive(Debug, Clone, Copy)]
+struct DeepSeekResidentPageRange {
+    byte_offset: usize,
+    byte_len: usize,
+}
+
+#[derive(Debug)]
+struct PendingDeepSeekResidentLayerPrepare {
+    layer: usize,
+    bytes: usize,
+    workers: Vec<thread::JoinHandle<Result<usize>>>,
+}
+
+#[derive(Debug)]
+struct PendingDeepSeekLayerPrepare {
+    expert: PendingScheduledExpertLayerPrepare,
+    resident: PendingDeepSeekResidentLayerPrepare,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -891,6 +912,7 @@ struct DeepSeekBatchScratch {
     routed_out: MetalObjcId,
     moe_map: MetalObjcId,
     expert_staging: MetalObjcId,
+    expert_staging_alternate: Option<MetalObjcId>,
     expert_spec: DeepSeekGgufExpertSlotSpec,
     comp_kv: MetalObjcId,
     comp_score: MetalObjcId,
@@ -3265,48 +3287,6 @@ unsafe fn encode_batch_pre_expert_layer(
             EXPERTS,
             batch.tokens,
         )?;
-        encode_batch_matmul(
-            pipelines,
-            encoder,
-            dense,
-            &graph_layer.shared_gate,
-            0,
-            batch.ffn_norm,
-            0,
-            batch.shared_gate,
-            0,
-            HIDDEN,
-            EXPERT_WIDTH,
-            batch.tokens,
-        )?;
-        encode_batch_matmul(
-            pipelines,
-            encoder,
-            dense,
-            &graph_layer.shared_up,
-            0,
-            batch.ffn_norm,
-            0,
-            batch.shared_up,
-            0,
-            HIDDEN,
-            EXPERT_WIDTH,
-            batch.tokens,
-        )?;
-        let swiglu = SwigluBatchArgs {
-            elements: u32::try_from(batch.tokens * EXPERT_WIDTH)?,
-            clamp: 10.0,
-        };
-        set_pipeline(encoder, pipelines.require("kernel_pb_dsv4_swiglu_batch")?);
-        set_bytes(encoder, bytes_of(&swiglu), 0);
-        set_buffer(encoder, batch.shared_gate, 1);
-        set_buffer(encoder, batch.shared_up, 2);
-        set_buffer(encoder, batch.shared_mid, 3);
-        dispatch_groups(
-            encoder,
-            (usize::try_from(swiglu.elements)?.div_ceil(256) as u64, 1, 1),
-            (256, 1, 1),
-        );
     }
     Ok(())
 }
@@ -3359,6 +3339,184 @@ fn read_hash_routes(
         *slot = i32::from_le_bytes(value.try_into().expect("four-byte chunk"));
     }
     Ok(selected)
+}
+
+fn deepseek_resident_page_ranges(
+    ranges: &[DeepSeekResidentRange],
+    mmap_len: usize,
+    page_size: usize,
+) -> Result<Vec<DeepSeekResidentPageRange>> {
+    if ranges.is_empty() || mmap_len == 0 || page_size == 0 || !page_size.is_power_of_two() {
+        bail!(
+            "DeepSeek resident layer preparation requires non-empty ranges, mmap bytes, and a power-of-two page size"
+        );
+    }
+    let mut pages = Vec::<DeepSeekResidentPageRange>::with_capacity(ranges.len());
+    for range in ranges {
+        let start = usize::try_from(range.byte_offset)?;
+        let len = usize::try_from(range.byte_len)?;
+        let end = start
+            .checked_add(len)
+            .context("DeepSeek resident layer preparation range overflow")?;
+        if len == 0 || end > mmap_len {
+            bail!(
+                "DeepSeek resident layer preparation range {start}..{end} is outside {mmap_len}-byte mmap"
+            );
+        }
+        let page_start = start & !(page_size - 1);
+        let page_end = end
+            .checked_add(page_size - 1)
+            .context("DeepSeek resident layer preparation page alignment overflow")?
+            & !(page_size - 1);
+        let page_end = page_end.min(mmap_len);
+        if let Some(previous) = pages.last_mut() {
+            let previous_end = previous
+                .byte_offset
+                .checked_add(previous.byte_len)
+                .context("DeepSeek resident layer preparation page range overflow")?;
+            if page_start <= previous_end {
+                previous.byte_len = page_end
+                    .max(previous_end)
+                    .checked_sub(previous.byte_offset)
+                    .context("DeepSeek resident layer preparation page merge underflow")?;
+                continue;
+            }
+        }
+        pages.push(DeepSeekResidentPageRange {
+            byte_offset: page_start,
+            byte_len: page_end - page_start,
+        });
+    }
+    Ok(pages)
+}
+
+fn touch_deepseek_resident_pages(
+    mmap: &memmap2::Mmap,
+    ranges: &[DeepSeekResidentPageRange],
+    page_size: usize,
+) -> Result<usize> {
+    let mut sink = 0u8;
+    let mut bytes = 0usize;
+    for range in ranges {
+        let end = range
+            .byte_offset
+            .checked_add(range.byte_len)
+            .context("DeepSeek resident layer preparation worker range overflow")?;
+        if range.byte_len == 0 || end > mmap.len() {
+            bail!(
+                "DeepSeek resident layer preparation worker range {}..{end} is outside {}-byte mmap",
+                range.byte_offset,
+                mmap.len()
+            );
+        }
+        let mut offset = range.byte_offset;
+        while offset < end {
+            // A volatile read from each file-backed VM page synchronously
+            // establishes residency without retaining an application buffer.
+            sink ^= unsafe { ptr::read_volatile(mmap.as_ptr().add(offset)) };
+            offset = offset
+                .checked_add(page_size)
+                .context("DeepSeek resident layer preparation page step overflow")?;
+        }
+        bytes = bytes
+            .checked_add(range.byte_len)
+            .context("DeepSeek resident layer preparation byte count overflow")?;
+    }
+    std::hint::black_box(sink);
+    Ok(bytes)
+}
+
+fn issue_deepseek_resident_layer_prepare(
+    dense: &MetalDenseWeights,
+    graph: &DeepSeekV4ExecutionGraph,
+    layer: usize,
+) -> Result<PendingDeepSeekResidentLayerPrepare> {
+    let declared = graph
+        .prefill_resident_layer_ranges
+        .get(layer)
+        .with_context(|| format!("DeepSeek resident preparation layer {layer} is not resolved"))?;
+    let page_size = metal_page_size();
+    let ranges = deepseek_resident_page_ranges(declared, dense.len, page_size)?;
+    let bytes = ranges.iter().try_fold(0usize, |total, range| {
+        total
+            .checked_add(range.byte_len)
+            .context("DeepSeek resident layer preparation byte count overflow")
+    })?;
+    let mmap = Arc::clone(&dense._mmap);
+    let workers = vec![thread::spawn(move || {
+        touch_deepseek_resident_pages(&mmap, &ranges, page_size)
+    })];
+    debug_assert_eq!(workers.len(), RESIDENT_LAYER_PREPARE_WORKERS);
+    Ok(PendingDeepSeekResidentLayerPrepare {
+        layer,
+        bytes,
+        workers,
+    })
+}
+
+fn finish_deepseek_resident_layer_prepare(
+    pending: PendingDeepSeekResidentLayerPrepare,
+) -> Result<()> {
+    let mut bytes = 0usize;
+    for worker in pending.workers {
+        let worker_bytes = worker.join().map_err(|_| {
+            anyhow::anyhow!(
+                "DeepSeek resident layer preparation worker panicked on layer {}",
+                pending.layer
+            )
+        })??;
+        bytes = bytes
+            .checked_add(worker_bytes)
+            .context("DeepSeek resident layer preparation completed byte count overflow")?;
+    }
+    if bytes != pending.bytes {
+        bail!(
+            "DeepSeek resident layer preparation completed {bytes} bytes for layer {}, expected {}",
+            pending.layer,
+            pending.bytes
+        );
+    }
+    Ok(())
+}
+
+fn issue_deepseek_layer_prepare(
+    dense: &MetalDenseWeights,
+    graph: &DeepSeekV4ExecutionGraph,
+    scheduler: &mut FlashMoeExecutionScheduler,
+    layer: usize,
+    expert_staging: MetalObjcId,
+    expert_bytes: usize,
+) -> Result<PendingDeepSeekLayerPrepare> {
+    let resident = issue_deepseek_resident_layer_prepare(dense, graph, layer)?;
+    let staging_len = EXPERTS
+        .checked_mul(expert_bytes)
+        .context("DeepSeek saturated expert staging length overflow")?;
+    let destination =
+        unsafe { std::slice::from_raw_parts_mut(buffer_contents(expert_staging), staging_len) };
+    match unsafe { scheduler.issue_expert_layer_prepare_into(layer, destination) } {
+        Ok(expert) => Ok(PendingDeepSeekLayerPrepare { expert, resident }),
+        Err(expert_error) => match finish_deepseek_resident_layer_prepare(resident) {
+            Ok(()) => Err(expert_error),
+            Err(resident_error) => bail!(
+                "DeepSeek layer {layer} expert preparation issue failed: {expert_error:#}; resident preparation cleanup also failed: {resident_error:#}"
+            ),
+        },
+    }
+}
+
+fn finish_deepseek_layer_prepare(
+    scheduler: &mut FlashMoeExecutionScheduler,
+    pending: PendingDeepSeekLayerPrepare,
+) -> Result<()> {
+    let expert_result = scheduler.finish_expert_layer_prepare(pending.expert);
+    let resident_result = finish_deepseek_resident_layer_prepare(pending.resident);
+    match (expert_result, resident_result) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(expert_error), Err(resident_error)) => bail!(
+            "DeepSeek layer preparation failed for expert stream: {expert_error:#}; resident stream also failed: {resident_error:#}"
+        ),
+    }
 }
 
 unsafe fn commit_deepseek_command(
@@ -3552,25 +3710,83 @@ fn batch_routes_and_weights(
         .as_ref()
         .map(|tensor| read_resident_f32(dense, tensor))
         .transpose()?;
-    let mut selected = Vec::with_capacity(tokens.len() * ACTIVE_EXPERTS);
-    let mut weights = Vec::with_capacity(tokens.len() * ACTIVE_EXPERTS);
-    let mut unique = std::collections::BTreeSet::new();
-    for (token_index, (&token, logits)) in tokens
-        .iter()
-        .zip(router_logits.chunks_exact(EXPERTS))
-        .enumerate()
+    if graph_layer.token_hash_routes.is_none() && tokens.len() >= 512 {
+        const ROUTE_WORKERS: usize = 8;
+        const ROWS_PER_WORKER: usize = 256;
+
+        let worker_count = tokens.len().div_ceil(ROWS_PER_WORKER).min(ROUTE_WORKERS);
+        let chunk_rows = tokens.len().div_ceil(worker_count);
+        return thread::scope(|scope| -> Result<_> {
+            let mut workers = Vec::with_capacity(worker_count);
+            for worker in 0..worker_count {
+                let first = worker * chunk_rows;
+                if first >= tokens.len() {
+                    break;
+                }
+                let end = first.saturating_add(chunk_rows).min(tokens.len());
+                let logits = &router_logits[first * EXPERTS..end * EXPERTS];
+                let correction_bias = correction_bias.as_deref();
+                workers.push(
+                    scope.spawn(move || batch_route_rows(first, logits, correction_bias, None)),
+                );
+            }
+
+            let mut selected = Vec::with_capacity(tokens.len() * ACTIVE_EXPERTS);
+            let mut weights = Vec::with_capacity(tokens.len() * ACTIVE_EXPERTS);
+            let mut unique = std::collections::BTreeSet::new();
+            for worker in workers {
+                let (chunk_selected, chunk_weights, chunk_unique) = worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("DeepSeek batch route worker panicked"))??;
+                selected.extend(chunk_selected);
+                weights.extend(chunk_weights);
+                unique.extend(chunk_unique);
+            }
+            Ok((selected, weights, unique.into_iter().collect()))
+        });
+    }
+
+    let hash_rows = graph_layer
+        .token_hash_routes
+        .as_ref()
+        .map(|tensor| {
+            tokens
+                .iter()
+                .map(|token| read_hash_routes(dense, tensor, *token))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    batch_route_rows(
+        0,
+        router_logits,
+        correction_bias.as_deref(),
+        hash_rows.as_deref(),
+    )
+}
+
+fn batch_route_rows(
+    first_token_index: usize,
+    router_logits: &[f32],
+    correction_bias: Option<&[f32]>,
+    hash_rows: Option<&[[i32; ACTIVE_EXPERTS]]>,
+) -> Result<(Vec<i32>, Vec<f32>, Vec<usize>)> {
+    let row_count = router_logits.len() / EXPERTS;
+    if router_logits.len() != row_count * EXPERTS
+        || hash_rows.is_some_and(|rows| rows.len() != row_count)
     {
+        bail!("DeepSeek batch route chunk has inconsistent row geometry");
+    }
+    let mut selected = Vec::with_capacity(row_count * ACTIVE_EXPERTS);
+    let mut weights = Vec::with_capacity(row_count * ACTIVE_EXPERTS);
+    let mut unique = std::collections::BTreeSet::new();
+    for (row, logits) in router_logits.chunks_exact(EXPERTS).enumerate() {
+        let token_index = first_token_index + row;
         let probabilities = deepseek_v4_router_probabilities(logits)
             .with_context(|| format!("DeepSeek batch router token {token_index}"))?;
-        let hash_selected = graph_layer
-            .token_hash_routes
-            .as_ref()
-            .map(|tensor| read_hash_routes(dense, tensor, token))
-            .transpose()?;
         let routes = deepseek_v4_select_routes(
             &probabilities,
-            correction_bias.as_deref(),
-            hash_selected.as_ref().map(|values| values.as_slice()),
+            correction_bias,
+            hash_rows.map(|rows| rows[row].as_slice()),
         )?;
         let sum = routes.iter().map(|route| route.1).sum::<f32>();
         if !(sum.is_finite() && sum >= 0.0) {
@@ -3633,48 +3849,80 @@ unsafe fn diagnose_batch_nonfinite(
         .collect()
 }
 
-unsafe fn stage_batch_experts(
+unsafe fn encode_batch_shared_expert_layer(
+    context: &MetalExecutionContext,
+    encoding: &mut MetalCommandEncoding,
+    dense: &MetalDenseWeights,
+    graph_layer: &DeepSeekV4LayerGraph,
     batch: &DeepSeekBatchScratch,
-    scheduler: &mut FlashMoeExecutionScheduler,
-    layer: usize,
-    unique: &[usize],
 ) -> Result<()> {
-    let slots = scheduler.read_unique_experts(layer, unique)?;
-    if slots.len() != unique.len() {
-        bail!(
-            "DeepSeek V4 batch scheduler returned {} slots for {} unique experts",
-            slots.len(),
-            unique.len()
+    let pipelines = context.deepseek_pipelines()?;
+    unsafe {
+        encode_batch_matmul(
+            pipelines,
+            encoding.encoder(),
+            dense,
+            &graph_layer.shared_gate,
+            0,
+            batch.ffn_norm,
+            0,
+            batch.shared_gate,
+            0,
+            HIDDEN,
+            EXPERT_WIDTH,
+            batch.tokens,
+        )?;
+        encode_batch_matmul(
+            pipelines,
+            encoding.encoder(),
+            dense,
+            &graph_layer.shared_up,
+            0,
+            batch.ffn_norm,
+            0,
+            batch.shared_up,
+            0,
+            HIDDEN,
+            EXPERT_WIDTH,
+            batch.tokens,
+        )?;
+        let swiglu = SwigluBatchArgs {
+            elements: u32::try_from(batch.tokens * EXPERT_WIDTH)?,
+            clamp: 10.0,
+        };
+        set_pipeline(
+            encoding.encoder(),
+            pipelines.require("kernel_pb_dsv4_swiglu_batch")?,
         );
+        set_bytes(encoding.encoder(), bytes_of(&swiglu), 0);
+        set_buffer(encoding.encoder(), batch.shared_gate, 1);
+        set_buffer(encoding.encoder(), batch.shared_up, 2);
+        set_buffer(encoding.encoder(), batch.shared_mid, 3);
+        dispatch_groups(
+            encoding.encoder(),
+            (usize::try_from(swiglu.elements)?.div_ceil(256) as u64, 1, 1),
+            (256, 1, 1),
+        );
+        encode_batch_matmul(
+            pipelines,
+            encoding.encoder(),
+            dense,
+            &graph_layer.shared_down,
+            0,
+            batch.shared_mid,
+            0,
+            batch.shared_out,
+            0,
+            EXPERT_WIDTH,
+            HIDDEN,
+            batch.tokens,
+        )
     }
-    for (&expert, slot) in unique.iter().zip(&slots) {
-        if slot.layer() != layer || slot.expert() != expert {
-            bail!(
-                "DeepSeek V4 batch scheduler returned layer/expert {}/{} for requested {layer}/{expert}",
-                slot.layer(),
-                slot.expert()
-            );
-        }
-        let (spec, bytes) = slot.deepseek_gguf_slot()?;
-        if spec != batch.expert_spec || bytes.as_slice().len() != spec.expert_bytes {
-            bail!("DeepSeek V4 batch expert {layer}/{expert} has an inconsistent GGUF slot layout");
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(
-                bytes.as_slice().as_ptr(),
-                buffer_contents(batch.expert_staging).add(expert * batch.expert_spec.expert_bytes),
-                batch.expert_spec.expert_bytes,
-            );
-        }
-    }
-    Ok(())
 }
 
 unsafe fn encode_batch_expert_layer(
     context: &MetalExecutionContext,
     encoding: &mut MetalCommandEncoding,
-    dense: &MetalDenseWeights,
-    graph_layer: &DeepSeekV4LayerGraph,
     batch: &mut DeepSeekBatchScratch,
 ) -> Result<()> {
     let pipelines = context.deepseek_pipelines()?;
@@ -3802,20 +4050,6 @@ unsafe fn encode_batch_expert_layer(
         set_buffer(encoder, batch.routed_out, 2);
         dispatch_groups(encoder, (batch.tokens as u64, 1, 1), (256, 1, 1));
 
-        encode_batch_matmul(
-            pipelines,
-            encoder,
-            dense,
-            &graph_layer.shared_down,
-            0,
-            batch.shared_mid,
-            0,
-            batch.shared_out,
-            0,
-            EXPERT_WIDTH,
-            HIDDEN,
-            batch.tokens,
-        )?;
         let mut hc = HcExpandArgs::batch(batch.tokens);
         hc.has_add = 1;
         set_pipeline(encoder, pipelines.require("kernel_dsv4_hc_expand4")?);
@@ -3946,6 +4180,7 @@ impl DeepSeekBatchScratch {
         context: &MetalExecutionContext,
         tokens: usize,
         pos0: usize,
+        double_expert_staging: bool,
     ) -> Result<Self> {
         if tokens == 0 {
             bail!("DeepSeek V4 batch prefill requires at least one token");
@@ -4118,6 +4353,9 @@ impl DeepSeekBatchScratch {
                 )?,
                 moe_map: alloc_bytes(moe_map_bytes, "batch MoE expert map")?,
                 expert_staging: alloc_bytes(expert_staging_bytes, "batch expert staging")?,
+                expert_staging_alternate: double_expert_staging
+                    .then(|| alloc_bytes(expert_staging_bytes, "batch alternate expert staging"))
+                    .transpose()?,
                 expert_spec,
                 comp_kv: alloc_bytes(
                     f32_bytes(tokens, 1024, "compressor KV")?,
@@ -4166,6 +4404,18 @@ impl DeepSeekBatchScratch {
             }
         }
         allocation
+    }
+
+    fn alternate_expert_staging(&self) -> Result<MetalObjcId> {
+        self.expert_staging_alternate
+            .context("DeepSeek saturated batch graph did not allocate alternate expert staging")
+    }
+
+    fn advance_expert_staging(&mut self) -> Result<()> {
+        let alternate = self.alternate_expert_staging()?;
+        self.expert_staging_alternate = Some(self.expert_staging);
+        self.expert_staging = alternate;
+        Ok(())
     }
 }
 
@@ -4459,7 +4709,21 @@ impl MetalExecutionContext {
                 state.capacity
             );
         }
-        let mut batch = unsafe { DeepSeekBatchScratch::allocate(self, tokens.len(), pos0)? };
+        let prepare_layers = tokens.len() >= graph.prefill_layer_prepare_min_tokens;
+        let mut batch =
+            unsafe { DeepSeekBatchScratch::allocate(self, tokens.len(), pos0, prepare_layers)? };
+        let mut pending_layer_prepare = if prepare_layers {
+            Some(issue_deepseek_layer_prepare(
+                dense,
+                graph,
+                scheduler,
+                0,
+                batch.expert_staging,
+                batch.expert_spec.expert_bytes,
+            )?)
+        } else {
+            None
+        };
         unsafe {
             ptr::copy_nonoverlapping(
                 tokens.as_ptr(),
@@ -4504,6 +4768,20 @@ impl MetalExecutionContext {
         }
 
         for (layer, graph_layer) in graph.layers.iter().enumerate() {
+            pending_layer_prepare
+                .take()
+                .map(|pending| finish_deepseek_layer_prepare(scheduler, pending))
+                .transpose()?;
+            if prepare_layers && layer + 1 < graph.layers.len() {
+                pending_layer_prepare = Some(issue_deepseek_layer_prepare(
+                    dense,
+                    graph,
+                    scheduler,
+                    layer + 1,
+                    batch.alternate_expert_staging()?,
+                    batch.expert_spec.expert_bytes,
+                )?);
+            }
             let ratio = state.layers[layer].ratio;
             if ratio != 0 {
                 let old_comp = pos0 / ratio;
@@ -4564,20 +4842,73 @@ impl MetalExecutionContext {
                     buffer_contents(batch.route_weights).cast::<f32>(),
                     weights.len(),
                 );
-                stage_batch_experts(&batch, scheduler, layer, &unique)?;
+                let run_shared = || -> Result<()> {
+                    let mut encoding = MetalCommandEncoding::new(
+                        self.runtime.command_queue,
+                        Arc::clone(&self.resources),
+                        "failed to create DeepSeek V4 batch shared-expert command buffer",
+                        "failed to create DeepSeek V4 batch shared-expert encoder",
+                    )?;
+                    encode_batch_shared_expert_layer(
+                        self,
+                        &mut encoding,
+                        dense,
+                        graph_layer,
+                        &batch,
+                    )?;
+                    commit_deepseek_command(
+                        encoding,
+                        "deepseek_batch_shared_expert",
+                        tokens.len() - 1,
+                        Some(layer),
+                    )
+                };
+                if prepare_layers {
+                    run_shared()?;
+                } else {
+                    let staging_len = EXPERTS
+                        .checked_mul(batch.expert_spec.expert_bytes)
+                        .context("DeepSeek V4 batch expert staging size overflow")?;
+                    let staging = std::slice::from_raw_parts_mut(
+                        buffer_contents(batch.expert_staging),
+                        staging_len,
+                    );
+                    thread::scope(|scope| -> Result<()> {
+                        let read = scope.spawn(|| {
+                            scheduler.read_unique_experts_into(
+                                layer,
+                                &unique,
+                                staging,
+                                batch.expert_spec.expert_bytes,
+                            )
+                        });
+                        let shared_result = run_shared();
+                        let read_result = read.join().map_err(|_| {
+                            anyhow::anyhow!(
+                                "DeepSeek V4 direct batch expert read thread panicked on layer {layer}"
+                            )
+                        })?;
+                        shared_result?;
+                        read_result?;
+                        Ok(())
+                    })?;
+                }
                 let mut encoding = MetalCommandEncoding::new(
                     self.runtime.command_queue,
                     Arc::clone(&self.resources),
                     "failed to create DeepSeek V4 batch streamed-expert command buffer",
                     "failed to create DeepSeek V4 batch streamed-expert encoder",
                 )?;
-                encode_batch_expert_layer(self, &mut encoding, dense, graph_layer, &mut batch)?;
+                encode_batch_expert_layer(self, &mut encoding, &mut batch)?;
                 commit_deepseek_command(
                     encoding,
                     "deepseek_batch_streamed_experts",
                     tokens.len() - 1,
                     Some(layer),
                 )?;
+            }
+            if prepare_layers && layer + 1 < graph.layers.len() {
+                batch.advance_expert_staging()?;
             }
         }
 
@@ -4978,5 +5309,87 @@ mod tests {
         assert_eq!(multi.parts, 2);
         assert_eq!(multi.block_top, INDEX_TOP_K);
         assert_eq!(multi.work_width, INDEX_TOP_K + 1);
+    }
+
+    #[test]
+    fn resident_prepare_geometry_page_aligns_and_coalesces_declared_tensors() {
+        let ranges = deepseek_resident_page_ranges(
+            &[
+                DeepSeekResidentRange {
+                    byte_offset: 4_096,
+                    byte_len: 4_096,
+                },
+                DeepSeekResidentRange {
+                    byte_offset: 12_288,
+                    byte_len: 8_192,
+                },
+                DeepSeekResidentRange {
+                    byte_offset: 40_960,
+                    byte_len: 4_096,
+                },
+            ],
+            65_536,
+            16_384,
+        )
+        .unwrap();
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].byte_offset, 0);
+        assert_eq!(ranges[0].byte_len, 49_152);
+    }
+
+    #[test]
+    fn parallel_batch_route_chunks_preserve_scalar_row_order_and_bits() {
+        let rows = 1_025usize;
+        let logits = (0..rows * EXPERTS)
+            .map(|index| ((index.wrapping_mul(17) % 101) as f32 - 50.0) / 7.0)
+            .collect::<Vec<_>>();
+        let correction = (0..EXPERTS)
+            .map(|expert| ((expert * 13 % 31) as f32 - 15.0) / 100.0)
+            .collect::<Vec<_>>();
+        let scalar = batch_route_rows(0, &logits, Some(&correction), None).unwrap();
+
+        let worker_count = rows.div_ceil(256).min(8);
+        let chunk_rows = rows.div_ceil(worker_count);
+        let parallel = thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker in 0..worker_count {
+                let first = worker * chunk_rows;
+                if first >= rows {
+                    break;
+                }
+                let end = first.saturating_add(chunk_rows).min(rows);
+                let chunk = &logits[first * EXPERTS..end * EXPERTS];
+                let correction = correction.as_slice();
+                workers.push(
+                    scope.spawn(move || batch_route_rows(first, chunk, Some(correction), None)),
+                );
+            }
+            let mut selected = Vec::new();
+            let mut weights = Vec::new();
+            let mut unique = std::collections::BTreeSet::new();
+            for worker in workers {
+                let (chunk_selected, chunk_weights, chunk_unique) = worker.join().unwrap().unwrap();
+                selected.extend(chunk_selected);
+                weights.extend(chunk_weights);
+                unique.extend(chunk_unique);
+            }
+            (selected, weights, unique.into_iter().collect::<Vec<_>>())
+        });
+
+        assert_eq!(parallel.0, scalar.0);
+        assert_eq!(
+            parallel
+                .1
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            scalar
+                .1
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(parallel.2, scalar.2);
     }
 }

@@ -488,12 +488,23 @@ direct batch-KV path. This threshold is a pure prompt-geometry calculation and n
 an execution error.
 
 The layer-major router calculates every token's exact top six on the host after the Metal router
-projection, reduces those routes to a sorted unique layer working set, and submits that set to the
-existing scheduler. The scheduler issues at most eight parallel positioned reads and returns the
-same reusable whole-expert slots used by decode. A request-scoped Metal buffer stages each unique
-expert once for the layer, then fused IQ2_XXS pair-SwiGLU and Q2_K down kernels consume all routed
-rows. The staging buffer is scratch state, not an application cache; no cache migration, hidden
-toggle, alternate runtime, or speculative expert overlap was introduced.
+projection. Non-hash rows are divided into bounded independent CPU chunks, but each row retains the
+same scalar probability, selection, normalization, and bitwise weight order; results are joined in
+token order and reduced to one sorted unique layer working set. The scheduler issues at most eight
+parallel positioned reads directly into a request-scoped whole-layer Metal staging buffer, with
+contiguous selected expert ids coalesced into disjoint ranges. For batch geometry at least as large
+as the loaded expert count, the graph allocates two request-scoped whole-layer Metal buffers and a
+fixed one-layer-ahead scheduler command streams the next complete expert file directly into the
+alternate buffer while the current layer runs. Exact load-resolved resident tensor ranges are
+page-touched by a bounded worker on the same schedule, so cold dense faults are not first discovered
+inside the Metal command. This is a prompt-geometry dispatch fixed by the loaded graph, not a route
+prediction or error fallback.
+Resident shared gate/up/SwiGLU/down executes while selected reads finish, then fused IQ2_XXS
+pair-SwiGLU and Q2_K down kernels consume all routed rows. Short batches retain selected-only reads,
+and decode retains reusable whole-expert slots. The saturated path has no second selected-expert
+copy: its fused kernel consumes the completed current whole-layer buffer. Staging is request scratch,
+not an application cache; no cache migration, mmap expert path, hidden toggle, alternate runtime, or
+speculative routing was introduced.
 
 The DeepSeek source adapter validates bounded GGUF metadata and tensor directories before
 atomically publishing a source-independent runtime manifest. Routed records keep their typed
@@ -537,19 +548,34 @@ Both engines used the same no-thinking chat text, greedy sampling, and 3,844-tok
 `long_code_audit` frontier. The ds4 control was the pinned `80ebbc3` build with Metal,
 `--ssd-streaming --ssd-streaming-cold --ssd-streaming-cache-experts 1`; its prefill result was
 234.26 tok/s and its four-token decode result was 1.07 tok/s. pb has no application expert-cache
-setting: scheduler-owned `pread` plus the OS page cache is the supported policy.
+setting: scheduler-owned `pread` plus the OS page cache is the supported policy. In ds4,
+`--ssd-streaming-cold` disables application expert preload; it does not purge the shared OS page
+cache, so the record distinguishes ordinary repeats from an explicit cross-engine memory-pressure
+sequence.
 
 | Engine/path | Prompt tokens | Prefill or TTFT | Prefill tok/s | Decode tok/s | Continuation |
 | --- | ---: | ---: | ---: | ---: | --- |
 | pb before layer-major migration | 3,844 | 872.48 s | 4.41 | 6.76 | exact |
-| pb final layer-major path | 3,844 | 24.99 s | 153.80 | 3.95 | `The most important code` |
+| pb original layer-major path | 3,844 | 24.99 s | 153.80 | 3.95 | `The most important code` |
 | pinned ds4, one-expert cold streaming | 3,844 | 16.41 s | 234.26 | 1.07 | exact |
 | pinned ds4, 18 GB streaming-cache control | 3,844 | 16.23 s | 236.83 | 4.40 | exact |
+| pinned ds4, rebuilt one-expert control | 3,844 | 15.43 s | 249.19 | 1.65 | exact |
+| pinned ds4, final paired control | 3,844 | 15.959 s | 240.87 | 1.55 | `The most important code` |
+| pb direct ping-pong staging, ordinary repeat | 3,844 | 13.934 s | 275.87 | 5.42 | `The most important code` |
+| pb direct ping-pong staging, immediately after ds4 pressure | 3,844 | 16.903 s | 227.42 | 5.46 | `The most important code` |
 
-The final pb path is 34.9 times faster than its token-major baseline and reduces the fresh
-multiplicative prefill gap to 1.52 times. The large-cache ds4 row is a decode upper control, not
-pb's memory policy. On the 21-token Italian control, pb measured 5.36 prefill and 8.23 decode tok/s;
-ds4 measured 3.62 and 6.72 tok/s, respectively.
+The ordinary completed pb path is 62.6 times faster than its token-major baseline, reduces latency
+by 44.2 percent from the original layer-major implementation, and is 12.7 percent lower-latency
+than the final paired ds4 control. It is also 9.7 percent lower-latency than the fastest recorded
+15.43 s pinned-ds4 run. The deliberately adversarial sequence that runs the separate 81 GB ds4
+source immediately before pb evicts pb's resident dense pages; that first pb request is 5.9 percent
+slower than the paired ds4 control, then the identical pb repeat returns to 13.934 s. This remaining
+cold-resident sensitivity is recorded rather than hidden, but no longer reflects duplicate expert
+copies: system time fell from roughly 15.5 s on the throwaway-preparation path to 10.4-10.8 s on
+direct ping-pong staging. The large-cache ds4 row is a decode upper control, not pb's memory policy.
+On the historical 21-token Italian control, pb measured 5.36 prefill and 8.23 decode tok/s; ds4
+measured 3.62 and 6.72 tok/s, respectively. Batches shorter than the graph's 256-token preparation
+threshold keep the selected-only pb schedule.
 
 The complete-state session extension was measured separately on the same 3,844-token official
 vector after its implementation. A cold session pass spent 26.620 seconds in prefill/TTFT and
@@ -558,9 +584,9 @@ inside the same loaded engine restored all 3,844 tokens in 1 ms and reduced pref
 no prompt tokens were re-prefilled. The two-pass cumulative pb TTFT was therefore 26.625 seconds,
 versus 32.46 seconds for two independent runs at the pinned ds4 16.23-second fresh-request control.
 That comparison measures the agent workload benefit of reuse, not fresh-prefill parity or a claim
-about a separately configured ds4 session. The current cold pb run was 144.5 tok/s, leaving a 1.62x
-fresh-prefill gap to ds4; the performance goal remains active for fused batch-kernel and CPU/GPU
-handoff work inside this graph.
+about a separately configured ds4 session. Its 144.5 tok/s cold run predates the scheduler overlap
+and exact parallel-routing work recorded below; it is retained as session-migration history, not the
+current fresh-prefill result.
 
 A strict agent regression then exercised changing structured transcripts rather than identical raw
 prompts. Planning restored a 2,578-token stable base across ordinary tool results, a generation-cap
@@ -576,10 +602,46 @@ Two plausible follow-ups were rejected rather than hidden behind toggles. A Meta
 about nine percent faster on the long case, but its accumulated numerical drift changed the
 official fenced-code continuation from lowercase `c` to uppercase `C`. A fully parallel
 zero-prefix compressor preserved the tested outputs but did not improve the measured long run.
-The shipped result therefore retains exact host routing and recurrent compression. The remaining
-long-prefill gap belongs to fused batch-kernel and CPU/GPU handoff work inside this same graph and
-scheduler; it is not grounds for a ds4 subprocess, mmap-only expert path, application cache, or
-second runtime.
+The shipped result therefore retains exact host routing (parallel only across independent token
+rows) and recurrent compression. No ds4 subprocess, mmap-only expert path, application cache, or
+second runtime was needed.
+
+**Prefill-performance closure (design and benchmark record).** Profiling the exact 3,844-token
+vector showed that the batch working set covers roughly 188-248 of 256 experts per layer. The first
+migration removed the duplicate reusable-slot copy: the scheduler validates a graph-declared
+whole-slot destination and fills its disjoint expert ranges directly with bounded parallel
+positioned reads. Contiguous selected ranges are coalesced from the calculated working set, but the
+graph never switches to mmap expert access, retains the destination after the request, or retries
+through the reusable-slot path. Decode and model families without a compatible batch destination
+retain the existing whole-slot command; compatible future Qwen batch commands should use this same
+scheduler API rather than add a family-local I/O path.
+
+The direct destination reduced the exact vector to 23.444 seconds, and moving the complete resident
+shared expert behind routing reduced it again to 22.645 seconds. A one-layer pinned-ds4 stage profile
+then showed that pb and ds4 already agree on the material Metal costs: on layer 4, attention plus
+HC/router was 192 ms in pb versus about 195 ms in ds4, while routed MoE was 118 ms versus 117 ms.
+The remaining gate was therefore scheduler I/O overlap. The final fixed graph migration adds
+one-layer-ahead whole-layer preparation for batch geometry large enough to cover the expert set
+(`tokens >= experts_per_layer`, resolved from the loaded graph). Eight bounded positioned-read
+workers stream the next fixed expert file directly into the alternate request-scoped whole-layer
+Metal buffer while the current buffer is consumed. A separate bounded worker page-touches only the
+next layer's exact load-resolved resident ranges. The buffers swap after the current fused expert
+command completes, eliminating the former page-cache-to-staging selected-expert copy. Shorter
+batches keep selected-only coalesced reads into one buffer; preparation errors are terminal and
+never retry through mmap, an application cache, or another runtime. Pending direct-write handles
+join during error unwinding so no worker can outlive its Metal destination. This is a deterministic
+dispatch from loaded graph geometry and runtime token count, not a route prediction or failure
+fallback.
+
+Direct staging produced 23.444 s, full shared-expert overlap produced 22.645 s, layer-ahead
+preparation produced 17.813 s on its first cold pipeline run, and exact row-parallel host routing
+produced a 14.304 s warm intermediate. That number was not treated as final after a post-Qwen run
+exposed cold resident-page variance. Direct ping-pong staging then produced 13.934 s on the ordinary
+repeat and 16.903 s under the explicit post-ds4 memory-pressure sequence described above. A
+1,025-row unit vector proves parallel selected ids, sorted unique experts, and every normalized
+weight bit equal to scalar routing. Scheduler coverage proves an exact full fixed-layer destination,
+bounded direct workers, and selected-only validation. The official continuation remained
+`The most important code`; existing-family and full-suite gates below remain mandatory.
 
 ## Scheduled Graph
 
