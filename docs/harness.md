@@ -191,7 +191,8 @@ surfaced instead of reporting verified completion.
 Resume restores the original task baseline, captures a new invocation baseline, and treats earlier
 scratch work as part of the same task. Prior successful evidence is restored from cumulative
 events and reused only while all current fingerprints match; externally edited resumed content is
-appended to `adoptions.jsonl`.
+appended to `adoptions.jsonl`. An active workflow resumes on its existing task branch; allocating a
+new run ID does not create or switch to another branch before checkpoint validation.
 
 Finished journals and run-index records include the handoff outcome, both baseline identifiers,
 workspace-config provenance, affected components, planned/executed/reused/failed/skipped checks,
@@ -201,6 +202,11 @@ repository remote. The full evidence bundle remains in the durable workflow chec
 the commit to its accepted plan, fresh code review, and selected check evidence. No publisher or
 network operation is invoked by the harness. Raw process output stays in event JSONL. A valid
 no-change run does not produce the old misleading no-commit observation.
+
+Failed local `run_command` actions return the exit status and bounded combined stdout/stderr to the
+model, including diagnostics that the command redirected to stdout. This is the same bounded output
+recorded in the event stream, so a failed compiler or test invocation remains actionable without
+granting it completion evidence.
 
 The workspace starts on `main` with one empty baseline commit. The agent receives the same
 conversation/workflow engine as web and queue, a local command backend rooted in the scratch

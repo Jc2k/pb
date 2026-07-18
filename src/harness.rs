@@ -596,6 +596,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
             args.task
         );
     }
+    let resumed_branch = resumable_workflow_branch(&layout.workspace, resumed_workflow.as_ref())?;
     let request = AgentRequest {
         task: args.task.clone(),
         turn_id: resumed_workflow
@@ -615,7 +616,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
             .unwrap_or_else(|| user_config.effective_model()),
         model_dir,
         workdir: Some(layout.workspace.clone()),
-        branch: None,
+        branch: resumed_branch,
         max_steps: args
             .max_steps
             .unwrap_or_else(|| user_config.effective_max_steps()),
@@ -866,6 +867,20 @@ fn load_resumable_workflow_checkpoint(
     } else {
         Ok(Some(checkpoint))
     }
+}
+
+fn resumable_workflow_branch(
+    workspace: &Path,
+    checkpoint: Option<&crate::workflow::WorkflowCheckpoint>,
+) -> Result<Option<String>> {
+    if checkpoint.is_none() {
+        return Ok(None);
+    }
+    let branch = require_git_success(workspace, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        bail!("active harness workflow cannot resume from a detached HEAD");
+    }
+    Ok(Some(branch))
 }
 
 fn harness_outcome_succeeded(result: &AgentRunResult) -> bool {
@@ -1837,6 +1852,39 @@ mod tests {
             load_resumable_workflow_checkpoint(&layout.workflow_checkpoint)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn active_workflow_resume_reuses_the_checkpoint_workspace_branch() {
+        let parent = tempfile::tempdir().unwrap();
+        let layout = prepare_scratch(Some(&parent.path().join("run"))).unwrap();
+        require_git_success(
+            &layout.workspace,
+            &["checkout", "-b", "pb/interrupted-task"],
+        )
+        .unwrap();
+        let repository = harness_repository_context(&layout).unwrap();
+        let policy = crate::workflow::WorkflowConfigDocument::default()
+            .compile()
+            .unwrap();
+        let run = crate::workflow::WorkflowRun::start(
+            "workflow-interrupted-task",
+            "turn-interrupted-task",
+            "resume safely",
+            policy,
+            repository,
+        )
+        .unwrap();
+        let checkpoint = crate::workflow::WorkflowCheckpoint::new(run).unwrap();
+
+        assert_eq!(
+            resumable_workflow_branch(&layout.workspace, Some(&checkpoint)).unwrap(),
+            Some("pb/interrupted-task".to_string())
+        );
+        assert_eq!(
+            resumable_workflow_branch(&layout.workspace, None).unwrap(),
+            None
         );
     }
 

@@ -88,7 +88,9 @@ evidence tied to the earlier state. This makes “reviewed” mean reviewed at t
 not merely that a review-shaped conversation occurred somewhere in the session.
 
 The same rule applies during recovery. Persisted structured artifacts and fingerprints can restore
-a stage; discarded or truncated prose cannot become a substitute source of authority.
+a stage; discarded or truncated prose cannot become a substitute source of authority. Resuming an
+active durable workflow also reuses its current task branch before validating Git control state, so
+a new invocation identifier cannot itself alter the checkpoint's refs fingerprint.
 
 ## Bounded failure and recovery
 
@@ -113,6 +115,10 @@ Implementation guidance gives symmetric concrete actions for missing and existin
 paths use `write_file`; existing paths use a separate `read_file` turn followed by
 `replace_file`, `edit_file`, or `apply_patch`. An attempted overwrite keeps failing closed but now
 returns that exact recovery sequence instead of a generic suggestion.
+
+Local command failures retain their exit status and bounded stdout/stderr in structured tool
+feedback. Output redirected from stderr to stdout is still preserved. A failed command therefore
+provides actionable diagnostics while receiving no check or completion credit.
 
 The step-limit monitor parses explicit negative boolean fields as values, not keywords. A healthy
 checkpoint containing `off_track: no` or `blocked: no` can therefore grant its bounded extra step;

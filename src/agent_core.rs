@@ -1943,8 +1943,9 @@ fn run_local_shell_command(cmd: &str, workdir: &Path) -> Result<String> {
         .output()
         .with_context(|| format!("failed to spawn local shell for command: {cmd}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("local command failed: {stderr}");
+        let exit_status = output.status.code().unwrap_or(-1);
+        let output = format_check_output(&output.stdout, &output.stderr);
+        bail!("local command failed with exit status {exit_status}:\n{output}");
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -15917,6 +15918,28 @@ the next imagined action"#;
         );
     }
 
+    #[test]
+    fn explicit_existing_delivery_branch_does_not_change_git_control_refs() {
+        let workspace = init_contract_test_repo();
+        git_run(
+            &["checkout", "-b", "pb/interrupted-delivery"],
+            workspace.path(),
+        )
+        .unwrap();
+        let before = git_control_state(workspace.path()).unwrap();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.intent = Some(crate::workflow::TurnIntent::Deliver);
+        request.branch = Some("pb/interrupted-delivery".to_string());
+        request.session_id = "new-harness-run-id".to_string();
+
+        let (reported, continuation) =
+            prepare_branch_for_request(&request, workspace.path()).unwrap();
+
+        assert!(continuation);
+        assert_eq!(reported, "pb/interrupted-delivery");
+        assert_eq!(git_control_state(workspace.path()).unwrap(), before);
+    }
+
     fn plan_submission() -> String {
         json!({
             "type": "tool_call",
@@ -22210,6 +22233,23 @@ the next imagined action"#;
         std::fs::write(tmp.path().join("marker.txt"), "ok").unwrap();
         let output = run_local_shell_command("cat marker.txt", tmp.path()).unwrap();
         assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn local_shell_command_failure_preserves_redirected_diagnostics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let error = run_local_shell_command(
+            "printf 'diagnostic on redirected stdout' && exit 7",
+            tmp.path(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("exit status 7"), "error was: {error}");
+        assert!(
+            error.contains("diagnostic on redirected stdout"),
+            "error was: {error}"
+        );
     }
 
     #[test]
