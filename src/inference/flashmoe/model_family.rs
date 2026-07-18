@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, de};
 
+use super::deepseek::is_deepseek_v4_flash;
 use super::types::{
     ACTIVE_EXPERTS_PER_TOKEN, DEFAULT_MROPE_SECTION, FOUR_BIT_EXPERT_SIZE, FULL_ATTN_INTERVAL,
     FlashMoeLayerKind, GLM52_MODEL_MARKER, GROUP_SIZE, LEGACY_QWEN_CODER_MARKER, NUM_EXPERTS,
@@ -65,6 +66,7 @@ pub enum QwenMoeFamily {
     Qwen3Moe,
     Qwen3VlMoe,
     Glm52,
+    DeepSeekV4Flash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,11 +94,13 @@ impl From<QwenMoeLayerKind> for FlashMoeLayerKind {
 pub enum QwenMoeRoutingPlacement {
     CpuSoftmaxTopK,
     CpuSigmoidNoAuxTopK,
+    CpuDeepSeekV4HashOrNoAuxTopK,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QwenMoeRoutingWeightNormalization {
     RenormalizeSelected,
+    DeepSeekRenormalizeSelectedWithFloor,
     PreserveFullSoftmax,
 }
 
@@ -143,6 +147,15 @@ impl QwenMoeExecutionPolicy {
     pub const GLM52_PARITY: Self = Self {
         architecture: QwenMoeExecutionArchitecture::UnifiedFlashMoe,
         routing: QwenMoeRoutingPlacement::CpuSigmoidNoAuxTopK,
+        expert_reads: QwenMoeExpertReadStrategy::ParallelPositionedReads,
+        expert_cache: QwenMoeExpertCachePolicy::OsPageCacheOnly,
+        expert_buffer_ownership: QwenMoeExpertBufferOwnership::SchedulerReusableWholeExpertSlots,
+        command_topology: QwenMoeCommandTopology::UpstreamCmd1Cmd2Cmd3,
+    };
+
+    pub const DEEPSEEK_V4_FLASH_PARITY: Self = Self {
+        architecture: QwenMoeExecutionArchitecture::UnifiedFlashMoe,
+        routing: QwenMoeRoutingPlacement::CpuDeepSeekV4HashOrNoAuxTopK,
         expert_reads: QwenMoeExpertReadStrategy::ParallelPositionedReads,
         expert_cache: QwenMoeExpertCachePolicy::OsPageCacheOnly,
         expert_buffer_ownership: QwenMoeExpertBufferOwnership::SchedulerReusableWholeExpertSlots,
@@ -423,15 +436,18 @@ impl QwenModelConfig {
             .to_ascii_lowercase();
         if !(model_type.contains("qwen")
             || model_type.contains("glm")
+            || model_type == "deepseek_v4_flash"
             || self.architectures.as_ref().is_some_and(|items| {
                 items.iter().any(|item| {
                     let item = item.to_ascii_lowercase();
-                    item.contains("qwen") || item.contains("glm")
+                    item.contains("qwen")
+                        || item.contains("glm")
+                        || item == "deepseekv4flashforcausallm"
                 })
             }))
         {
             bail!(
-                "Flash-MoE only supports declared Qwen/GLM MoE configs, found model_type={:?} architectures={:?}",
+                "Flash-MoE only supports declared Qwen/GLM/DeepSeek V4 Flash MoE configs, found model_type={:?} architectures={:?}",
                 self.model_type,
                 self.architectures
             );
@@ -1122,11 +1138,16 @@ impl QwenMoeModelLayout {
             QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe | QwenMoeFamily::Glm52 => {
                 configured_active_experts
             }
+            QwenMoeFamily::DeepSeekV4Flash => configured_active_experts,
         };
-        let routed_expert_scale = config
-            .glm
-            .as_ref()
-            .map_or(1.0, |glm| glm.routed_scaling_factor);
+        let routed_expert_scale = if family == QwenMoeFamily::DeepSeekV4Flash {
+            1.5
+        } else {
+            config
+                .glm
+                .as_ref()
+                .map_or(1.0, |glm| glm.routed_scaling_factor)
+        };
         let routing_weight_normalization = match family {
             QwenMoeFamily::Qwen35A17B => {
                 Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
@@ -1141,13 +1162,18 @@ impl QwenMoeModelLayout {
                 })
             }
             QwenMoeFamily::Glm52 => Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected),
+            QwenMoeFamily::DeepSeekV4Flash => {
+                Some(QwenMoeRoutingWeightNormalization::DeepSeekRenormalizeSelectedWithFloor)
+            }
         };
         let layout = Self {
             family,
-            execution: if family == QwenMoeFamily::Glm52 {
-                QwenMoeExecutionPolicy::GLM52_PARITY
-            } else {
-                QwenMoeExecutionPolicy::UPSTREAM_PARITY
+            execution: match family {
+                QwenMoeFamily::Glm52 => QwenMoeExecutionPolicy::GLM52_PARITY,
+                QwenMoeFamily::DeepSeekV4Flash => QwenMoeExecutionPolicy::DEEPSEEK_V4_FLASH_PARITY,
+                QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => {
+                    QwenMoeExecutionPolicy::UPSTREAM_PARITY
+                }
             },
             layers: config.num_hidden_layers,
             first_sparse_layer: config.first_sparse_layer(),
@@ -1187,6 +1213,7 @@ impl QwenMoeModelLayout {
             }
             QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => QwenMoeLayerKind::FullAttention,
             QwenMoeFamily::Glm52 => QwenMoeLayerKind::FullAttention,
+            QwenMoeFamily::DeepSeekV4Flash => QwenMoeLayerKind::FullAttention,
         }
     }
 
@@ -1234,6 +1261,14 @@ impl QwenMoeModelLayout {
 
 impl QwenMoeFamily {
     pub fn from_model_and_config(model: &str, config: &QwenModelConfig) -> Result<Self> {
+        if is_deepseek_v4_flash(model)
+            && config
+                .model_type
+                .as_deref()
+                .is_some_and(|model_type| model_type == "deepseek_v4_flash")
+        {
+            return Ok(Self::DeepSeekV4Flash);
+        }
         if is_glm52(model) || config_is_glm52(config) {
             return Ok(Self::Glm52);
         }
@@ -1247,7 +1282,7 @@ impl QwenMoeFamily {
             return Ok(Self::Qwen3Moe);
         }
         bail!(
-            "FlashMoe only supports declared Qwen/GLM MoE models, found model={model:?} model_type={:?} architectures={:?}",
+            "FlashMoe only supports declared Qwen/GLM/DeepSeek V4 Flash MoE models, found model={model:?} model_type={:?} architectures={:?}",
             config.model_type,
             config.architectures
         );

@@ -2523,12 +2523,15 @@ pub(crate) enum ExpertStorageLayout {
     FixedMxfp4,
     FixedBf16,
     FixedF16,
+    FixedDeepSeekGguf,
 }
 
 impl ExpertStorageLayout {
     fn quantization(self) -> ExpertQuantization {
         match self {
-            Self::FixedQ4 | Self::FixedMxfp4 => ExpertQuantization::FourBitProduction,
+            Self::FixedQ4 | Self::FixedMxfp4 | Self::FixedDeepSeekGguf => {
+                ExpertQuantization::FourBitProduction
+            }
             Self::FixedBf16 => ExpertQuantization::Bf16,
             Self::FixedF16 => ExpertQuantization::F16,
         }
@@ -2540,6 +2543,7 @@ impl ExpertStorageLayout {
             Self::FixedMxfp4 => "fixed-MXFP4",
             Self::FixedBf16 => "fixed-BF16",
             Self::FixedF16 => "fixed-F16",
+            Self::FixedDeepSeekGguf => "fixed-DeepSeek-IQ2_XXS/Q2_K",
         }
     }
 }
@@ -2761,6 +2765,7 @@ impl ExpertSlotStore {
                     DenseExpertDtype::F16 => ExpertStorageLayout::FixedF16,
                 }
             }
+            FIXED_DEEPSEEK_GGUF_EXPERT_LAYER_FORMAT_V1 => ExpertStorageLayout::FixedDeepSeekGguf,
             format => {
                 bail!("FlashMoe unsupported expert storage format {format} in layer 0 metadata")
             }
@@ -2775,6 +2780,11 @@ impl ExpertSlotStore {
                 ExpertSlotSpec::from_model_layout(layout, resolved_layout)?,
                 0,
             ),
+            FIXED_DEEPSEEK_GGUF_EXPERT_LAYER_FORMAT_V1 => {
+                let spec = DeepSeekGgufExpertSlotSpec::from_model_layout(layout)?;
+                spec.validate_metadata(&metadata)?;
+                (ExpertSlotSpec::FixedDeepSeekGguf(spec), 0)
+            }
             PBQ4_EXPERT_LAYER_FORMAT_V1 | PBQ4_EXPERT_LAYER_FORMAT_V2 => {
                 let slot_spec =
                     ExpertSlotSpec::from_model_layout(layout, ExpertStorageLayout::FixedQ4)?;
@@ -2889,6 +2899,9 @@ impl ExpertSlotStore {
                         expected.dtype.as_str()
                     );
                 }
+            }
+            if let Some(expected) = self.slot_spec.fixed_deepseek_gguf() {
+                expected.validate_metadata(&metadata)?;
             }
             if metadata.expert_size != slot_bytes as u64 {
                 bail!(
@@ -3081,6 +3094,13 @@ impl ExpertLayerReader {
                         Some(Arc::clone(&self.buffer_pool)),
                     )?)
                 }
+                ExpertSlotSpec::FixedDeepSeekGguf(spec) => ExpertRawPayload::FixedDeepSeekGguf(
+                    DeepSeekGgufExpertPayload::from_reusable_whole_slot(
+                        spec,
+                        scratch.take_payload(),
+                        Some(Arc::clone(&self.buffer_pool)),
+                    )?,
+                ),
             }
         };
         Ok(ExpertRawRead {
@@ -3122,6 +3142,7 @@ pub(crate) enum ExpertRawPayload {
     Pbq4(Vec<u8>),
     FixedQ4(FixedQ4ExpertPayload),
     FixedDense(FixedDenseExpertPayload),
+    FixedDeepSeekGguf(DeepSeekGgufExpertPayload),
 }
 
 pub(crate) fn expert_slot_offset(expert: usize, expert_size: u64) -> Result<u64> {
@@ -3389,9 +3410,215 @@ impl FixedDenseExpertSlotSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeepSeekGgufExpertDtype {
+    Iq2Xxs,
+    Q2K,
+}
+
+impl DeepSeekGgufExpertDtype {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Iq2Xxs => "IQ2_XXS",
+            Self::Q2K => "Q2_K",
+        }
+    }
+
+    const fn block_elements(self) -> usize {
+        256
+    }
+
+    const fn block_bytes(self) -> usize {
+        match self {
+            Self::Iq2Xxs => 66,
+            Self::Q2K => 84,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeepSeekGgufExpertProjectionSpec {
+    pub(crate) offset: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) bytes: usize,
+    pub(crate) dtype: DeepSeekGgufExpertDtype,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeepSeekGgufExpertSlotSpec {
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) gate: DeepSeekGgufExpertProjectionSpec,
+    pub(crate) up: DeepSeekGgufExpertProjectionSpec,
+    pub(crate) down: DeepSeekGgufExpertProjectionSpec,
+    pub(crate) expert_bytes: usize,
+}
+
+impl DeepSeekGgufExpertSlotSpec {
+    fn aligned(value: usize) -> Result<usize> {
+        value
+            .checked_add(EXPERT_COMPONENT_ALIGNMENT - 1)
+            .map(|value| value / EXPERT_COMPONENT_ALIGNMENT * EXPERT_COMPONENT_ALIGNMENT)
+            .context("DeepSeek GGUF expert component alignment overflow")
+    }
+
+    fn projection_bytes(rows: usize, cols: usize, dtype: DeepSeekGgufExpertDtype) -> Result<usize> {
+        let values = rows
+            .checked_mul(cols)
+            .context("DeepSeek GGUF expert projection element count overflow")?;
+        if values % dtype.block_elements() != 0 {
+            bail!(
+                "DeepSeek GGUF {} expert projection {}x{} is not block aligned to {} elements",
+                dtype.as_str(),
+                rows,
+                cols,
+                dtype.block_elements()
+            );
+        }
+        values
+            .checked_div(dtype.block_elements())
+            .and_then(|blocks| blocks.checked_mul(dtype.block_bytes()))
+            .context("DeepSeek GGUF expert projection byte length overflow")
+    }
+
+    pub(crate) fn new(hidden_size: usize, intermediate_size: usize) -> Result<Self> {
+        if hidden_size == 0 || intermediate_size == 0 {
+            bail!(
+                "DeepSeek GGUF expert slot spec requires non-zero dimensions, hidden_size={hidden_size}, intermediate_size={intermediate_size}"
+            );
+        }
+        let gate_bytes = Self::projection_bytes(
+            intermediate_size,
+            hidden_size,
+            DeepSeekGgufExpertDtype::Iq2Xxs,
+        )?;
+        let down_bytes =
+            Self::projection_bytes(hidden_size, intermediate_size, DeepSeekGgufExpertDtype::Q2K)?;
+        let gate = DeepSeekGgufExpertProjectionSpec {
+            offset: 0,
+            rows: intermediate_size,
+            cols: hidden_size,
+            bytes: gate_bytes,
+            dtype: DeepSeekGgufExpertDtype::Iq2Xxs,
+        };
+        let up = DeepSeekGgufExpertProjectionSpec {
+            offset: Self::aligned(gate.bytes)?,
+            ..gate
+        };
+        let down = DeepSeekGgufExpertProjectionSpec {
+            offset: Self::aligned(
+                up.offset
+                    .checked_add(up.bytes)
+                    .context("DeepSeek GGUF expert up component end overflow")?,
+            )?,
+            rows: hidden_size,
+            cols: intermediate_size,
+            bytes: down_bytes,
+            dtype: DeepSeekGgufExpertDtype::Q2K,
+        };
+        let expert_bytes = Self::aligned(
+            down.offset
+                .checked_add(down.bytes)
+                .context("DeepSeek GGUF expert down component end overflow")?,
+        )?;
+        Ok(Self {
+            hidden_size,
+            intermediate_size,
+            gate,
+            up,
+            down,
+            expert_bytes,
+        })
+    }
+
+    pub(crate) fn from_model_layout(layout: &QwenMoeModelLayout) -> Result<Self> {
+        Self::new(layout.hidden_size, layout.moe_intermediate_size).with_context(|| {
+            format!(
+                "FlashMoe unsupported {:?} fixed DeepSeek GGUF expert storage dimensions",
+                layout.family
+            )
+        })
+    }
+
+    pub(crate) const fn projection(
+        self,
+        projection: ExpertMlpProjection,
+    ) -> DeepSeekGgufExpertProjectionSpec {
+        match projection {
+            ExpertMlpProjection::Gate => self.gate,
+            ExpertMlpProjection::Up => self.up,
+            ExpertMlpProjection::Down => self.down,
+        }
+    }
+
+    fn validate_metadata(self, metadata: &ExpertLayerPackMetadata) -> Result<()> {
+        if metadata.format != FIXED_DEEPSEEK_GGUF_EXPERT_LAYER_FORMAT_V1 {
+            bail!(
+                "DeepSeek GGUF expert layer {} declares format {}, expected {}",
+                metadata.layer,
+                metadata.format,
+                FIXED_DEEPSEEK_GGUF_EXPERT_LAYER_FORMAT_V1
+            );
+        }
+        if metadata.expert_size != self.expert_bytes as u64 {
+            bail!(
+                "DeepSeek GGUF expert layer {} has slot size {}, expected {}",
+                metadata.layer,
+                metadata.expert_size,
+                self.expert_bytes
+            );
+        }
+        for pack in &metadata.packs {
+            if pack.packed_bytes != self.expert_bytes as u64 || pack.records.len() != 3 {
+                bail!(
+                    "DeepSeek GGUF expert layer {} expert {} must contain one whole slot and exactly gate/up/down records",
+                    metadata.layer,
+                    pack.expert
+                );
+            }
+            for (suffix, expected) in [
+                ("ffn_gate_exps.weight", self.gate),
+                ("ffn_up_exps.weight", self.up),
+                ("ffn_down_exps.weight", self.down),
+            ] {
+                let record = pack
+                    .records
+                    .iter()
+                    .find(|record| record.tensor.ends_with(suffix))
+                    .with_context(|| {
+                        format!(
+                            "DeepSeek GGUF expert layer {} expert {} is missing {suffix}",
+                            metadata.layer, pack.expert
+                        )
+                    })?;
+                if !record.dtype.eq_ignore_ascii_case(expected.dtype.as_str())
+                    || record.shape != [expected.cols, expected.rows]
+                    || record.record_offset != expected.offset as u64
+                    || record.packed_bytes != expected.bytes as u64
+                    || record.group_size != expected.dtype.block_elements()
+                    || !record.scale_bias_dtype.eq_ignore_ascii_case("GGUF_NATIVE")
+                {
+                    bail!(
+                        "DeepSeek GGUF expert layer {} expert {} tensor {} does not match resolved {} {}x{} block layout",
+                        metadata.layer,
+                        pack.expert,
+                        record.tensor,
+                        expected.dtype.as_str(),
+                        expected.rows,
+                        expected.cols
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpertSlotSpec {
     FixedQ4(FixedQ4ExpertSlotSpec),
     FixedDense(FixedDenseExpertSlotSpec),
+    FixedDeepSeekGguf(DeepSeekGgufExpertSlotSpec),
 }
 
 impl ExpertSlotSpec {
@@ -3414,6 +3641,9 @@ impl ExpertSlotSpec {
                 FixedDenseExpertSlotSpec::from_model_layout(layout, DenseExpertDtype::F16)
                     .map(Self::FixedDense)
             }
+            ExpertStorageLayout::FixedDeepSeekGguf => {
+                DeepSeekGgufExpertSlotSpec::from_model_layout(layout).map(Self::FixedDeepSeekGguf)
+            }
         }
     }
 
@@ -3427,6 +3657,7 @@ impl ExpertSlotSpec {
                 DenseExpertDtype::Bf16 => ExpertStorageLayout::FixedBf16,
                 DenseExpertDtype::F16 => ExpertStorageLayout::FixedF16,
             },
+            Self::FixedDeepSeekGguf(_) => ExpertStorageLayout::FixedDeepSeekGguf,
         }
     }
 
@@ -3434,6 +3665,7 @@ impl ExpertSlotSpec {
         match self {
             Self::FixedQ4(spec) => spec.layout.expert_bytes,
             Self::FixedDense(spec) => spec.expert_bytes,
+            Self::FixedDeepSeekGguf(spec) => spec.expert_bytes,
         }
     }
 
@@ -3441,20 +3673,28 @@ impl ExpertSlotSpec {
         match self {
             Self::FixedQ4(spec) => spec.metadata_format(),
             Self::FixedDense(_) => FIXED_DENSE_EXPERT_LAYER_FORMAT_V1,
+            Self::FixedDeepSeekGguf(_) => FIXED_DEEPSEEK_GGUF_EXPERT_LAYER_FORMAT_V1,
         }
     }
 
     pub(crate) const fn fixed_q4(self) -> Option<FixedQ4ExpertSlotSpec> {
         match self {
             Self::FixedQ4(spec) => Some(spec),
-            Self::FixedDense(_) => None,
+            Self::FixedDense(_) | Self::FixedDeepSeekGguf(_) => None,
         }
     }
 
     pub(crate) const fn fixed_dense(self) -> Option<FixedDenseExpertSlotSpec> {
         match self {
             Self::FixedDense(spec) => Some(spec),
-            Self::FixedQ4(_) => None,
+            Self::FixedQ4(_) | Self::FixedDeepSeekGguf(_) => None,
+        }
+    }
+
+    pub(crate) const fn fixed_deepseek_gguf(self) -> Option<DeepSeekGgufExpertSlotSpec> {
+        match self {
+            Self::FixedDeepSeekGguf(spec) => Some(spec),
+            Self::FixedQ4(_) | Self::FixedDense(_) => None,
         }
     }
 }
@@ -3824,6 +4064,64 @@ impl FixedDenseExpertPayload {
                 byte_offset: component.offset,
                 reusable_bytes: Some(&self.bytes),
             },
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DeepSeekGgufExpertPayload {
+    pub(crate) spec: DeepSeekGgufExpertSlotSpec,
+    pub(crate) bytes: ReusableExpertBytes,
+    pub(crate) recycle_pool: Option<ReusableExpertBytePool>,
+}
+
+impl Clone for DeepSeekGgufExpertPayload {
+    fn clone(&self) -> Self {
+        Self {
+            spec: self.spec,
+            bytes: self.bytes.clone(),
+            recycle_pool: None,
+        }
+    }
+}
+
+impl PartialEq for DeepSeekGgufExpertPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec && self.bytes == other.bytes
+    }
+}
+
+impl Eq for DeepSeekGgufExpertPayload {}
+
+impl Drop for DeepSeekGgufExpertPayload {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.recycle_pool {
+            recycle_reusable_expert_bytes(
+                pool,
+                std::mem::take(&mut self.bytes),
+                self.spec.expert_bytes,
+            );
+        }
+    }
+}
+
+impl DeepSeekGgufExpertPayload {
+    fn from_reusable_whole_slot(
+        spec: DeepSeekGgufExpertSlotSpec,
+        bytes: ReusableExpertBytes,
+        recycle_pool: Option<ReusableExpertBytePool>,
+    ) -> Result<Self> {
+        if bytes.len() != spec.expert_bytes {
+            bail!(
+                "DeepSeek GGUF expert whole-slot payload length {} does not match resolved layout size {}",
+                bytes.len(),
+                spec.expert_bytes
+            );
+        }
+        Ok(Self {
+            spec,
+            bytes,
+            recycle_pool,
         })
     }
 }
@@ -7343,6 +7641,9 @@ mod tests {
             }
             ExpertRawPayload::Pbq4(_) => panic!("fixed slot classified as PBQ4"),
             ExpertRawPayload::FixedDense(_) => panic!("Q4 slot classified as fixed dense"),
+            ExpertRawPayload::FixedDeepSeekGguf(_) => {
+                panic!("Q4 slot classified as DeepSeek GGUF")
+            }
         }
     }
 
@@ -7381,6 +7682,9 @@ mod tests {
             ExpertRawPayload::Pbq4(bytes) => assert_eq!(bytes, payload),
             ExpertRawPayload::FixedQ4(_) => panic!("PBQ4 slot classified as fixed Q4"),
             ExpertRawPayload::FixedDense(_) => panic!("PBQ4 slot classified as fixed dense"),
+            ExpertRawPayload::FixedDeepSeekGguf(_) => {
+                panic!("PBQ4 slot classified as DeepSeek GGUF")
+            }
         }
     }
 
@@ -7436,6 +7740,9 @@ mod tests {
             }
             ExpertRawPayload::Pbq4(_) => panic!("fixed slot classified as PBQ4"),
             ExpertRawPayload::FixedDense(_) => panic!("Q4 slot classified as fixed dense"),
+            ExpertRawPayload::FixedDeepSeekGguf(_) => {
+                panic!("Q4 slot classified as DeepSeek GGUF")
+            }
         }
     }
 

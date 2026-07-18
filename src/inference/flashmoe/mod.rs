@@ -6,6 +6,7 @@
 mod cache;
 mod capabilities;
 mod deepseek;
+mod deepseek_metal;
 mod experts;
 mod gguf;
 mod math;

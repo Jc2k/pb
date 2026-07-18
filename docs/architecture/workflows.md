@@ -164,7 +164,10 @@ restartable state. The service keeps FlashMoe model/Metal runtimes resident acro
 bounded LRU of logical sessions retains both a safe prompt checkpoint and an exact generated-token
 head, while the stable first-system-message prefix is content-addressed for cross-session reuse.
 FlashMoe also persists full-attention KV or MLA KV, linear-attention recurrence, the final hidden
-state, and token ids in a model-fingerprinted local cache.
+state, and token ids in a model-fingerprinted local cache. The provisional DeepSeek V4 Flash path
+does not use those snapshots: its four-stream hyperconnection and raw/compressed/indexer KV state
+is reset as one request-scoped allocation, rather than partially restoring a snapshot whose schema
+was designed for Qwen/GLM state.
 
 Dynamic branch, recent-commit, environment-evidence, and per-turn discussion authority are rendered
 as a second system message. The first system message and its authorized native-tool schema therefore

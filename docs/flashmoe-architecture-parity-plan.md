@@ -421,16 +421,18 @@ remain diagnostic lower bounds; GLM's configured K=8 is still the only supported
 
 ## DeepSeek V4 Flash Extension Contract
 
-Status: **Design record; not shipped.** DeepSeek V4 Flash must remain outside
-`is_flashmoe_hf_model` and normal FlashMoe planning until Gate 8 closes. This is an explicit
-unsupported capability, not a llama.cpp fallback or a partially supported family.
+Status: **Configurable implementation; full-checkpoint validation pending.** The pinned DeepSeek V4
+Flash profile is now selected by normal FlashMoe planning on Apple Silicon. It resolves a complete
+typed graph and fails unsupported source, graph, device, or kernel combinations before inference;
+it is never a llama.cpp fallback. Promotion from provisional validation status still requires the
+real-checkpoint and independent-vector evidence listed under Gate 8.
 
 The reviewed references are `danveloper/flash-pi-dsv4` at
 `3f4741838b567a7b2e562333f90ea6e48637ab2a` and its upstream MIT `antirez/ds4` engine at
 `80ebbc396aee40eedc1d829222f3362d10fa4c6c`. The published runtime checkpoint is
 `antirez/deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`.
-Reference hashes pin the analysis; pb must still validate against the current published checkpoint
-and official continuation/logit vectors before claiming support.
+Reference hashes pin the implementation audit. pb still needs a full cache build against the
+published checkpoint plus independent continuation/logit vectors before claiming parity evidence.
 
 DeepSeek V4 Flash is not a GLM MLA adapter. Its production graph requires all of these semantics:
 
@@ -458,23 +460,28 @@ or use it as correctness evidence. Gate 8 targets top-6 model semantics first. A
 experiment needs an explicit non-production policy, its own quality evidence, and no effect on the
 supported graph.
 
-The target remains one FlashMoe-owned scheduler and layer lifecycle. DeepSeek may add typed source,
-state, attention, routing, expert-layout, and command implementations; it may not shell out to
-`ds4`, depend on a separately running HTTP server, or place a second engine behind
+The implementation remains one FlashMoe-owned scheduler and layer lifecycle. DeepSeek adds typed
+source, state, attention, routing, expert-layout, and command implementations; it does not shell out
+to `ds4`, depend on a separately running HTTP server, or place a second engine behind
 `FlashMoeEngine`. The reference runtime is an oracle and design input, not a vendored production
-backend.
+backend. Its MIT Metal primitives are pinned and compiled into the existing load-selected Metal
+execution context alongside pb-owned fused decode glue.
 
-The DeepSeek source adapter will validate GGUF metadata and tensor directories before publishing a
-source-independent runtime manifest. Routed records keep their typed IQ2_XXS/Q2_K or Q4 layouts in
-fixed, page-aligned per-layer expert files so scheduler-owned parallel positioned reads, reusable
-whole-expert slots, and the OS page cache remain authoritative. Resident tensors enter one aligned
-dense store. Runtime code must never rediscover GGUF types or offsets after graph resolution.
+The DeepSeek source adapter validates bounded GGUF metadata and tensor directories before
+atomically publishing a source-independent runtime manifest. Routed records keep their typed
+IQ2_XXS/Q2_K layout in fixed, page-aligned per-layer expert files so scheduler-owned parallel
+positioned reads, reusable whole-expert slots, and the OS page cache remain authoritative. Resident
+tensors enter one aligned dense store. Runtime code receives typed offsets from the graph and does
+not rediscover GGUF types or source-container offsets after graph resolution. Q4 expert checkpoints
+remain a distinct unsupported layout rather than a substitution fallback.
 
-DeepSeek state extends the scheduler declaration with four residual streams plus raw/compressed KV
-records and indexer state. Prefix snapshots must capture all of that state atomically. Reusing only
-attention KV while rebuilding hyperconnections or compressor state is invalid. Disk persistence is
-a follow-on after the in-memory state passes official-vector and prefix-reuse parity; it must not be
-inferred from llama.cpp or the reference DS4 server's separate cache implementation.
+DeepSeek state extends the request declaration with four residual streams plus raw/compressed KV
+records, compressor frontiers, and indexer state. The current implementation allocates and resets
+that complete state for the request's resolved context capacity. Existing Qwen/GLM prefix snapshots
+are disabled for DeepSeek because reusing only attention KV while rebuilding hyperconnections or
+compressor state is invalid. Any future memory or disk snapshot must capture the complete typed
+state atomically and pass official-vector plus prefix-reuse parity; it cannot be inferred from
+llama.cpp or the reference DS4 server's separate cache implementation.
 
 ## Scheduled Graph
 
@@ -1293,7 +1300,7 @@ Current capability matrix:
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
 | Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes; load requires the selected policy to equal metadata-resolved slots before capability resolution | Cross-family 12-combination graph matrix, CLI/planning selection and 3x3 policy/layout rejection coverage, storage, scheduler, and local-Metal fixtures; real checkpoint pending |
 | GLM-5.2 | Canonical resident Q4 plus BF16 Colibri input/output / fixed native-MXFP4 or affine-Q4 slots from layer 3 | Shipped baseline through the unified runtime and expert scheduler; indexed MLX preserves typed E2M1/E8M0 expert storage while unindexed Colibri adapts to affine Q4, full causal MLA is bounded by `index_topk`, and DSA/MTP are unimplemented | Native MXFP4 import/storage/capability/CPU/local-Metal parity plus Colibri import, MLA/RoPE/KV, routing, expert-boundary, all-target, release, complete 75-layer native cache build, and real text/performance evidence |
-| DeepSeek V4 Flash | GGUF Q8/F16/F32 resident tensors / fixed IQ2_XXS+Q2_K top-6 expert slots | Design record only; deliberately excluded from FlashMoe model selection until Gate 8 closes | Reference shape/data-flow audit only; no pb runtime, cache, vector, or real-checkpoint evidence yet |
+| DeepSeek V4 Flash | GGUF Q8/F16/F32/I32 resident tensors / fixed IQ2_XXS+Q2_K top-6 expert slots | Configurable provisional path on Apple Silicon: bounded exact-profile import, source-independent cache, load-resolved 43-layer graph, request-scoped typed state, native tokenizer/chat/tools, fused Metal stages, and shared scheduler SSD reads; session/prefix snapshots disabled | Source/profile/cache-publication fixtures, exact graph and routing policy coverage, host/Metal ABI checks, local compilation of every specialized pipeline, and all-target preservation; full published-checkpoint cache, independent vectors, long-context run, and real DeepSeek smoke pending |
 
 Completion evidence:
 
@@ -1313,6 +1320,12 @@ Completion evidence:
   smokes matched upstream, and Qwen3-VL text and image requests exited successfully.
 - Unsupported family/layout/dtype/device/kernel/adapter combinations remain named load-time or
   graph-resolution errors; no CPU/component/layout/scheduler fallback was restored.
+- DeepSeek resolves the same nine scheduled stages with a family-typed attention/state command and
+  fixed IQ2_XXS/Q2_K expert payload. The first three layers use token hash routes; later layers use
+  biased sqrt-softplus top-6 selection, unbiased weights, the reference `2^-14` denominator floor,
+  and the fixed 1.5 scale. Six whole slots are read through the existing parallel positioned-read
+  coordinator. Its full-checkpoint numerical evidence remains deliberately separate from these
+  implementation and integration checks.
 
 ### Gate 7: Legacy Removal And Benchmarking
 
@@ -1352,44 +1365,55 @@ Exit criteria:
 
 ### Gate 8: DeepSeek V4 Flash Typed Extension
 
-Status: **Active design gate; implementation not started.** The preceding Qwen and GLM gates remain
-closed and their supported paths must not change while this family is added.
+Status: **Implementation complete; full-checkpoint validation gate active.** The preceding Qwen and
+GLM gates remain closed and their supported paths are unchanged. The exact DeepSeek graph is now a
+provisional configurable path; the gate remains open for independent vectors, a full cache build,
+real decode/tool/long-context evidence, and complete-state snapshot parity.
 
 Objective: support DeepSeek V4 Flash through the existing resolved graph and scheduler without
 claiming that superficially similar hidden width or MoE tensors make it a Qwen/GLM variant.
 
 Required ownership slices, in order:
 
-1. Add a bounded GGUF directory reader and DeepSeek source adapter that validates every semantic
-   metadata field, tensor name, type, dimension, compression-ratio entry, and per-layer SwiGLU
-   clamp before publishing canonical resident and fixed-expert stores. Partial or arbitrary GGUF
-   files fail before graph construction.
-2. Extend model-family, manifest, state, and capability resolution for the four-stream
+1. [x] Add a bounded GGUF directory reader and DeepSeek source adapter that validates every
+   semantic metadata field, tensor name, type, dimension, compression-ratio entry, and per-layer
+   SwiGLU clamp before atomically publishing canonical resident and fixed-expert stores. Partial or
+   arbitrary GGUF files fail before graph construction.
+2. [x] Extend model-family, manifest, request state, and capability resolution for the four-stream
    hyperconnection lifecycle; dense/ratio-4/ratio-128 attention schedule; raw/compressed/indexer KV;
-   hash and scored routing modes; shared expert; and typed IQ2_XXS/Q2_K expert slots. Qwen and GLM
-   capability matrices must gain direct regression rows proving unchanged resolution.
-3. Add owner-local CPU reference fixtures for hyperconnection split/collapse, compression,
-   indexer selection, sink attention, RoPE, both routing modes, mixed-quant expert math, and complete
-   single-layer state transitions. Reference code is diagnostic only.
-4. Add Metal stage implementations inside the existing CMD/scheduler topology. Routed expert reads
-   remain top-6 parallel positioned reads into scheduler slots. No DS4 subprocess, application
-   expert cache, alternate generation loop, or CPU fallback is permitted.
-5. Bind tokenizer/chat/tool-call rendering and exact prompt preflight to the same production path,
-   then prove prompt-boundary session reuse captures all hyperconnection and compressed-attention
-   state.
-6. Validate tiny deterministic fixtures, official continuation/logit vectors, a full Q2 imatrix
-   cache build, real load/prefill/decode, structured tool use, long-context compression boundaries,
-   all-target tests, release build, the existing Qwen/GLM smokes, and a DeepSeek smoke.
+   hash and scored routing modes; shared expert; and typed IQ2_XXS/Q2_K expert slots. Direct
+   capability coverage resolves DeepSeek without changing the existing Qwen/GLM policies.
+3. [x] Bind the reference-owned numerical primitives and explicit host ABI to one load-selected
+   Metal pipeline set, with owner-local fixtures for exact profile/schedule validation, routing,
+   denominator-floor semantics, RoPE specialization, fixed six-slot arguments, and host structure
+   sizes. The complete official-vector suite remains validation work below, not runtime fallback
+   code.
+4. [x] Add fused Metal stage implementations inside the existing command/scheduler topology.
+   Routed expert reads remain top-6 parallel positioned reads into scheduler slots. No DS4
+   subprocess, application expert cache, alternate generation loop, or CPU component fallback is
+   present.
+5. [x] Bind the native JoyAI tokenizer, chat/DSML tool rendering, output parsing, and exact prompt
+   preflight to the production path. Prompt/session reuse is intentionally disabled rather than
+   restoring incomplete state; a future snapshot must atomically capture all hyperconnection,
+   compressor, raw/compressed KV, and indexer state.
+6. [ ] Complete external validation: official continuation/logit vectors, a full Q2 imatrix cache
+   build, real load/prefill/decode, structured tool use, long-context compression boundaries, and a
+   DeepSeek smoke. On 2026-07-18, local verification recorded 1,077 passing all-target tests with 19
+   environment-gated tests ignored, 47 passing web tests, all 34 documentation pages validated, a
+   successful optimized arm64 build, and on-device compilation of every specialized DeepSeek Metal
+   pipeline. Cached Qwen3.5, Qwen3, Qwen3-VL text, and GLM one-token smokes all loaded their
+   existing graphs and exited zero. The exact DeepSeek checkpoint was not present locally, so this
+   evidence does not substitute for the outstanding real-checkpoint work above.
 
 Exit criteria:
 
-- DeepSeek resolves a complete concrete graph before inference; unsupported GGUF types, shapes,
+- [x] DeepSeek resolves a complete concrete graph before inference; unsupported GGUF types, shapes,
   kernels, devices, or state layouts produce named capability errors.
-- The live path uses the shared scheduler/layer lifecycle and has no hidden top-2 profile, second
+- [x] The live path uses the shared scheduler/layer lifecycle and has no hidden top-2 profile, second
   runtime, runtime tensor probing, or source-container dependency.
-- Top-6 routes/weights, hyperconnection state, raw/compressed/indexer KV, layer outputs, final
+- [ ] Top-6 routes/weights, hyperconnection state, raw/compressed/indexer KV, layer outputs, final
   collapse, logits, and generated continuations match independent reference evidence.
-- Existing Qwen3.5, Qwen3, Qwen3-VL, and GLM capability/parity suites, real smokes, and cache
+- [x] Existing Qwen3.5, Qwen3, Qwen3-VL, and GLM capability/parity suites and cache
   namespaces remain green and unchanged in meaning.
 
 The first implementation commit must complete source validation plus canonical cache publication;
@@ -1398,8 +1422,8 @@ make `is_flashmoe_hf_model` return true.
 
 ## Goal Execution System
 
-This system governed the migration. Gates 1-7 are closed. Gate 8 is the active DeepSeek extension
-and must not change the shipped meaning of those earlier gates or create a second runtime or
+This system governed the migration. Gates 1-7 are closed. Gate 8 is in its external-validation
+phase and must not change the shipped meaning of those earlier gates or create a second runtime or
 speculative fast path.
 
 For a future active gate, completion is a checkpoint rather than permission to weaken the target.
@@ -1520,7 +1544,9 @@ If a correctness check fails after an architecture-aligned move, debug math/logi
 the resolved graph. Do not restore the fallback or revert the ownership change to make the symptom
 disappear.
 
-The Qwen/GLM goal is complete. DeepSeek remains an unsupported combination until Gate 8's typed
-stage implementations and evidence are complete; all other unsupported combinations must likewise
-remain precise capability errors.
+The Qwen/GLM goal is complete. The pinned DeepSeek V4 Flash IQ2_XXS/Q2_K profile has complete typed
+stage implementations and is a provisional configurable combination on Apple Silicon; promotion to
+parity-validated status waits for Gate 8's outstanding independent-vector and real-checkpoint
+evidence. Other DeepSeek variants and every other unsupported combination remain precise load-time
+capability errors.
 ```

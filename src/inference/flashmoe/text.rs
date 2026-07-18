@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
+use super::deepseek::DeepSeekV4Tokenizer;
 use super::math::{compare_scored_tokens, softmax_in_place};
 use super::runtime::GenerationProgress;
 use super::types::*;
@@ -78,7 +79,7 @@ fn vector_rms_max_finite(values: &[f32]) -> (f32, f32, bool) {
 
 #[derive(Debug, Clone)]
 pub(super) struct QwenTokenizer {
-    tokenizer: Tokenizer,
+    tokenizer: TokenizerBackend,
     config: QwenTokenizerConfig,
     eos_tokens: BTreeSet<u32>,
     primary_eos_token: u32,
@@ -87,6 +88,12 @@ pub(super) struct QwenTokenizer {
     vocab_size: usize,
     #[cfg(test)]
     candidate_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+enum TokenizerBackend {
+    HuggingFace(Tokenizer),
+    DeepSeekV4(DeepSeekV4Tokenizer),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -119,11 +126,53 @@ impl QwenTokenizer {
                 config_path.display()
             );
         }
+        let bytes = fs::read(tokenizer_path)
+            .with_context(|| format!("failed to read tokenizer {}", tokenizer_path.display()))?;
+        if serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some("PB_DEEPSEEK_V4_JOYAI_BPE_V1")
+        {
+            let tokenizer = DeepSeekV4Tokenizer::from_cache_bytes(&bytes)?;
+            let config_value: Value =
+                serde_json::from_slice(&fs::read(config_path).with_context(|| {
+                    format!("failed to read tokenizer config {}", config_path.display())
+                })?)
+                .with_context(|| {
+                    format!("failed to parse tokenizer config {}", config_path.display())
+                })?;
+            if config_value.get("format").and_then(Value::as_str)
+                != Some("PB_DEEPSEEK_V4_JOYAI_BPE_V1")
+            {
+                bail!("DeepSeek V4 Flash tokenizer config does not match its native cache format");
+            }
+            let eos = tokenizer.eos_id();
+            let vocab_size = tokenizer.vocab_size();
+            #[cfg(test)]
+            let candidate_ids = (0..u32::try_from(vocab_size)
+                .context("DeepSeek tokenizer vocabulary exceeds u32")?)
+                .collect();
+            return Ok(Self {
+                tokenizer: TokenizerBackend::DeepSeekV4(tokenizer),
+                config: QwenTokenizerConfig::default(),
+                eos_tokens: BTreeSet::from([eos]),
+                primary_eos_token: eos,
+                im_start: None,
+                im_end: None,
+                vocab_size,
+                #[cfg(test)]
+                candidate_ids,
+            });
+        }
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|err| anyhow::anyhow!("{err}"))
             .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
-        let bytes = fs::read(tokenizer_path)
-            .with_context(|| format!("failed to read tokenizer {}", tokenizer_path.display()))?;
         let config_bytes = fs::read(config_path).with_context(|| {
             format!("failed to read tokenizer config {}", config_path.display())
         })?;
@@ -262,7 +311,7 @@ impl QwenTokenizer {
             ids
         };
         Ok(Self {
-            tokenizer,
+            tokenizer: TokenizerBackend::HuggingFace(tokenizer),
             config,
             eos_tokens,
             primary_eos_token,
@@ -276,6 +325,15 @@ impl QwenTokenizer {
 
     #[cfg(test)]
     pub(super) fn apply_chat_template(&self, prompt: &str) -> String {
+        if matches!(&self.tokenizer, TokenizerBackend::DeepSeekV4(_)) {
+            return render_deepseek_v4_chat(
+                &[ChatMessage::text(ChatRole::User, prompt)],
+                &[],
+                true,
+                true,
+            )
+            .unwrap_or_else(|_| prompt.to_string());
+        }
         if prompt.contains("<|im_start|>") {
             return prompt.to_string();
         }
@@ -322,6 +380,14 @@ impl QwenTokenizer {
         add_generation_prompt: bool,
         enable_thinking: bool,
     ) -> Result<String> {
+        if matches!(&self.tokenizer, TokenizerBackend::DeepSeekV4(_)) {
+            return render_deepseek_v4_chat(
+                messages,
+                tools,
+                add_generation_prompt,
+                enable_thinking,
+            );
+        }
         if messages.len() == 1
             && tools.is_empty()
             && let ChatMessageContent::Text(prompt) = &messages[0].content
@@ -368,8 +434,13 @@ impl QwenTokenizer {
     }
 
     pub(super) fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self
-            .tokenizer
+        let TokenizerBackend::HuggingFace(tokenizer) = &self.tokenizer else {
+            let TokenizerBackend::DeepSeekV4(tokenizer) = &self.tokenizer else {
+                unreachable!()
+            };
+            return tokenizer.encode(text);
+        };
+        let encoding = tokenizer
             .encode(text, false)
             .map_err(|err| anyhow::anyhow!("{err}"))
             .with_context(|| format!("failed to encode text with tokenizer.json"))?;
@@ -379,7 +450,7 @@ impl QwenTokenizer {
                 .config
                 .bos_token
                 .as_deref()
-                .and_then(|token| self.tokenizer.token_to_id(token))
+                .and_then(|token| tokenizer.token_to_id(token))
             && ids.first().copied() != Some(bos)
         {
             ids.insert(0, bos);
@@ -393,10 +464,13 @@ impl QwenTokenizer {
             .copied()
             .take_while(|token| !self.is_eos(*token))
             .collect();
-        self.tokenizer
-            .decode(&tokens, true)
-            .map_err(|err| anyhow::anyhow!("{err}"))
-            .context("failed to decode tokens with tokenizer.json")
+        match &self.tokenizer {
+            TokenizerBackend::HuggingFace(tokenizer) => tokenizer
+                .decode(&tokens, true)
+                .map_err(|err| anyhow::anyhow!("{err}"))
+                .context("failed to decode tokens with tokenizer.json"),
+            TokenizerBackend::DeepSeekV4(tokenizer) => tokenizer.decode(&tokens),
+        }
     }
 
     pub(super) fn is_eos(&self, token: u32) -> bool {
@@ -409,7 +483,10 @@ impl QwenTokenizer {
 
     /// Look up a token string and return its ID, or `None` if not present.
     pub(super) fn token_id(&self, token: &str) -> Option<u32> {
-        self.tokenizer.token_to_id(token)
+        match &self.tokenizer {
+            TokenizerBackend::HuggingFace(tokenizer) => tokenizer.token_to_id(token),
+            TokenizerBackend::DeepSeekV4(tokenizer) => tokenizer.token_id(token),
+        }
     }
 
     pub(super) fn vocab_size(&self) -> usize {
@@ -554,6 +631,209 @@ fn render_tokenizer_chat_template(
             ..ChatTemplateOptions::default()
         },
     )
+}
+
+const DEEPSEEK_BOS: &str = "<｜begin▁of▁sentence｜>";
+const DEEPSEEK_EOS: &str = "<｜end▁of▁sentence｜>";
+const DEEPSEEK_USER: &str = "<｜User｜>";
+const DEEPSEEK_ASSISTANT: &str = "<｜Assistant｜>";
+const DEEPSEEK_DSML_CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
+const DEEPSEEK_DSML_CALLS_CLOSE: &str = "</｜DSML｜tool_calls>";
+const DEEPSEEK_DSML_INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
+const DEEPSEEK_DSML_PARAMETER_CLOSE: &str = "</｜DSML｜parameter>";
+
+fn render_deepseek_v4_chat(
+    messages: &[ChatMessage],
+    tools: &[ChatTool],
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+) -> Result<String> {
+    let mut system = render_deepseek_tool_instructions(tools)?;
+    for message in messages {
+        if message.role != ChatRole::System {
+            continue;
+        }
+        let content = render_deepseek_text_content(&message.content)?;
+        if !system.is_empty() && !content.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(&content);
+    }
+
+    let tool_context = !tools.is_empty()
+        || messages
+            .iter()
+            .any(|message| message.role == ChatRole::Tool || !message.tool_calls.is_empty());
+    let last_user = messages
+        .iter()
+        .rposition(|message| matches!(message.role, ChatRole::User | ChatRole::Tool));
+    let mut out = String::from(DEEPSEEK_BOS);
+    out.push_str(&system);
+    let mut pending_assistant = false;
+    let mut pending_tool_result = false;
+    for (index, message) in messages.iter().enumerate() {
+        match message.role {
+            ChatRole::System => {}
+            ChatRole::User => {
+                out.push_str(DEEPSEEK_USER);
+                out.push_str(&render_deepseek_text_content(&message.content)?);
+                pending_assistant = true;
+                pending_tool_result = false;
+            }
+            ChatRole::Tool => {
+                if !pending_tool_result {
+                    out.push_str(DEEPSEEK_USER);
+                }
+                out.push_str("<tool_result>");
+                out.push_str(&escape_deepseek_tool_result(&render_deepseek_text_content(
+                    &message.content,
+                )?));
+                out.push_str("</tool_result>");
+                pending_assistant = true;
+                pending_tool_result = true;
+            }
+            ChatRole::Assistant => {
+                if pending_assistant {
+                    out.push_str(DEEPSEEK_ASSISTANT);
+                    let content = render_deepseek_text_content(&message.content)?;
+                    if !content.starts_with("<think>") && !content.starts_with("</think>") {
+                        // Historical assistant reasoning is only retained when
+                        // the caller supplies the model-native think wrapper.
+                        // Otherwise this is an ordinary non-thinking answer.
+                        let retain_thinking = enable_thinking
+                            && tool_context
+                            && last_user.is_some_and(|last| index > last);
+                        out.push_str(if retain_thinking {
+                            "<think>"
+                        } else {
+                            "</think>"
+                        });
+                    }
+                    out.push_str(&content);
+                } else {
+                    out.push_str(&render_deepseek_text_content(&message.content)?);
+                }
+                render_deepseek_dsml_calls(&mut out, &message.tool_calls)?;
+                out.push_str(DEEPSEEK_EOS);
+                pending_assistant = false;
+                pending_tool_result = false;
+            }
+        }
+    }
+    if add_generation_prompt && (pending_assistant || messages.is_empty()) {
+        out.push_str(DEEPSEEK_ASSISTANT);
+        out.push_str(if enable_thinking {
+            "<think>"
+        } else {
+            "</think>"
+        });
+    }
+    Ok(out)
+}
+
+fn render_deepseek_text_content(content: &ChatMessageContent) -> Result<String> {
+    match content {
+        ChatMessageContent::Text(text) => Ok(text.clone()),
+        ChatMessageContent::Parts(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                match part {
+                    ChatContentPart::Text { text } => out.push_str(text),
+                    ChatContentPart::Image { .. } => {
+                        bail!("DeepSeek V4 Flash is a text-only execution graph")
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn render_deepseek_tool_instructions(tools: &[ChatTool]) -> Result<String> {
+    if tools.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = String::from(
+        "## Tools\n\nYou have access to a set of tools to help answer the user question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as raw text and set `string=\"true\"`. Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. Only if a string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n",
+    );
+    for tool in tools {
+        let mut schema = serde_json::Map::new();
+        schema.insert("name".to_string(), Value::String(tool.name.clone()));
+        if let Some(description) = &tool.description {
+            schema.insert(
+                "description".to_string(),
+                Value::String(description.clone()),
+            );
+        }
+        schema.insert("parameters".to_string(), tool.input_schema.clone());
+        out.push_str(&serde_json::to_string(&Value::Object(schema))?);
+        out.push('\n');
+    }
+    out.push_str(
+        "\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. Use the exact parameter names from the schemas.",
+    );
+    Ok(out)
+}
+
+fn escape_deepseek_tool_result(content: &str) -> String {
+    content.replace("</tool_result>", "&lt;/tool_result>")
+}
+
+fn render_deepseek_dsml_calls(out: &mut String, calls: &[ChatToolCall]) -> Result<()> {
+    if calls.is_empty() {
+        return Ok(());
+    }
+    out.push_str("\n\n");
+    out.push_str(DEEPSEEK_DSML_CALLS_OPEN);
+    out.push('\n');
+    for call in calls {
+        out.push_str("<｜DSML｜invoke name=\"");
+        out.push_str(&escape_dsml_attribute(&call.name));
+        out.push_str("\">\n");
+        let arguments = match &call.arguments {
+            Value::Object(arguments) => arguments.clone(),
+            Value::String(arguments) => serde_json::from_str::<Value>(arguments)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_else(|| {
+                    serde_json::Map::from_iter([(
+                        "arguments".to_string(),
+                        Value::String(arguments.clone()),
+                    )])
+                }),
+            other => serde_json::Map::from_iter([("arguments".to_string(), other.clone())]),
+        };
+        for (name, value) in arguments {
+            out.push_str("<｜DSML｜parameter name=\"");
+            out.push_str(&escape_dsml_attribute(&name));
+            match value {
+                Value::String(value) => {
+                    out.push_str("\" string=\"true\">");
+                    out.push_str(
+                        &value.replace(DEEPSEEK_DSML_PARAMETER_CLOSE, "&lt;/｜DSML｜parameter>"),
+                    );
+                }
+                value => {
+                    out.push_str("\" string=\"false\">");
+                    out.push_str(&serde_json::to_string(&value)?);
+                }
+            }
+            out.push_str(DEEPSEEK_DSML_PARAMETER_CLOSE);
+            out.push('\n');
+        }
+        out.push_str(DEEPSEEK_DSML_INVOKE_CLOSE);
+        out.push('\n');
+    }
+    out.push_str(DEEPSEEK_DSML_CALLS_CLOSE);
+    Ok(())
+}
+
+fn escape_dsml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn render_qwen_chatml(
@@ -856,6 +1136,130 @@ pub(super) fn parse_qwen_tool_call_output_with_incomplete(
     }
     text.push_str(remaining);
     Ok((text.trim().to_string(), tool_calls))
+}
+
+pub(super) fn parse_deepseek_tool_call_output_with_incomplete(
+    content: &str,
+    allow_incomplete: bool,
+) -> Result<(String, Vec<ChatToolCall>)> {
+    let mut remaining = content;
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    while let Some(start) = remaining.find(DEEPSEEK_DSML_CALLS_OPEN) {
+        text.push_str(&remaining[..start]);
+        let block_start = start + DEEPSEEK_DSML_CALLS_OPEN.len();
+        let Some(relative_end) = remaining[block_start..].find(DEEPSEEK_DSML_CALLS_CLOSE) else {
+            if allow_incomplete {
+                text.push_str(&remaining[start..]);
+                return Ok((text.trim().to_string(), calls));
+            }
+            bail!("DeepSeek DSML tool call is missing {DEEPSEEK_DSML_CALLS_CLOSE}");
+        };
+        let block_end = block_start + relative_end;
+        calls.extend(parse_deepseek_dsml_block(
+            &remaining[block_start..block_end],
+        )?);
+        remaining = &remaining[block_end + DEEPSEEK_DSML_CALLS_CLOSE.len()..];
+    }
+    text.push_str(remaining);
+    Ok((text.trim().to_string(), calls))
+}
+
+fn parse_deepseek_dsml_block(mut block: &str) -> Result<Vec<ChatToolCall>> {
+    const INVOKE_OPEN: &str = "<｜DSML｜invoke";
+    const PARAMETER_OPEN: &str = "<｜DSML｜parameter";
+    let mut calls = Vec::new();
+    loop {
+        let Some(start) = block.find(INVOKE_OPEN) else {
+            if !block.trim().is_empty() {
+                bail!("DeepSeek DSML tool_calls contains text outside an invoke block");
+            }
+            break;
+        };
+        if !block[..start].trim().is_empty() {
+            bail!("DeepSeek DSML tool_calls contains text before an invoke block");
+        }
+        let header_start = start + INVOKE_OPEN.len();
+        let header_end = block[header_start..]
+            .find('>')
+            .map(|offset| header_start + offset)
+            .context("DeepSeek DSML invoke opening tag is incomplete")?;
+        let name = parse_dsml_attribute(&block[header_start..header_end], "name")
+            .context("DeepSeek DSML invoke is missing name")?;
+        let body_start = header_end + 1;
+        let body_end = block[body_start..]
+            .find(DEEPSEEK_DSML_INVOKE_CLOSE)
+            .map(|offset| body_start + offset)
+            .context("DeepSeek DSML invoke is missing its closing tag")?;
+        let mut body = &block[body_start..body_end];
+        let mut arguments = serde_json::Map::new();
+        loop {
+            let Some(parameter_start) = body.find(PARAMETER_OPEN) else {
+                if !body.trim().is_empty() {
+                    bail!("DeepSeek DSML invoke contains text outside a parameter block");
+                }
+                break;
+            };
+            if !body[..parameter_start].trim().is_empty() {
+                bail!("DeepSeek DSML invoke contains text before a parameter block");
+            }
+            let parameter_header_start = parameter_start + PARAMETER_OPEN.len();
+            let parameter_header_end = body[parameter_header_start..]
+                .find('>')
+                .map(|offset| parameter_header_start + offset)
+                .context("DeepSeek DSML parameter opening tag is incomplete")?;
+            let header = &body[parameter_header_start..parameter_header_end];
+            let parameter_name = parse_dsml_attribute(header, "name")
+                .context("DeepSeek DSML parameter is missing name")?;
+            let string_value = parse_dsml_attribute(header, "string")
+                .context("DeepSeek DSML parameter is missing string=true|false")?;
+            let value_start = parameter_header_end + 1;
+            let value_end = body[value_start..]
+                .find(DEEPSEEK_DSML_PARAMETER_CLOSE)
+                .map(|offset| value_start + offset)
+                .context("DeepSeek DSML parameter is missing its closing tag")?;
+            let raw = &body[value_start..value_end];
+            let value = match string_value.as_str() {
+                "true" => Value::String(
+                    raw.replace("&lt;/｜DSML｜parameter>", DEEPSEEK_DSML_PARAMETER_CLOSE),
+                ),
+                "false" => serde_json::from_str(raw).with_context(|| {
+                    format!(
+                        "DeepSeek DSML non-string parameter {parameter_name:?} is not valid JSON"
+                    )
+                })?,
+                other => bail!(
+                    "DeepSeek DSML parameter {parameter_name:?} has invalid string attribute {other:?}"
+                ),
+            };
+            if arguments.insert(parameter_name.clone(), value).is_some() {
+                bail!("DeepSeek DSML invoke repeats parameter {parameter_name:?}");
+            }
+            body = &body[value_end + DEEPSEEK_DSML_PARAMETER_CLOSE.len()..];
+        }
+        calls.push(ChatToolCall {
+            id: None,
+            name: unescape_dsml_attribute(&name),
+            arguments: Value::Object(arguments),
+        });
+        block = &block[body_end + DEEPSEEK_DSML_INVOKE_CLOSE.len()..];
+    }
+    Ok(calls)
+}
+
+fn parse_dsml_attribute(header: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = header.find(&needle)? + needle.len();
+    let end = header[start..].find('"')? + start;
+    Some(header[start..end].to_string())
+}
+
+fn unescape_dsml_attribute(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
 }
 
 fn parse_qwen_tool_call_block(block: &str) -> Result<ChatToolCall> {
@@ -1213,5 +1617,64 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "weather");
         assert_eq!(calls[0].arguments["city"], "Paris");
+    }
+
+    #[test]
+    fn deepseek_renderer_binds_native_markers_and_thinking_policy() {
+        let messages = [
+            ChatMessage::text(ChatRole::System, "be exact"),
+            ChatMessage::text(ChatRole::User, "2+2?"),
+        ];
+        assert_eq!(
+            render_deepseek_v4_chat(&messages, &[], true, true).unwrap(),
+            "<｜begin▁of▁sentence｜>be exact<｜User｜>2+2?<｜Assistant｜><think>"
+        );
+        assert_eq!(
+            render_deepseek_v4_chat(&messages, &[], true, false).unwrap(),
+            "<｜begin▁of▁sentence｜>be exact<｜User｜>2+2?<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn deepseek_dsml_history_and_parser_preserve_typed_parameters() {
+        let mut assistant = ChatMessage::text(ChatRole::Assistant, "checking");
+        assistant.tool_calls.push(ChatToolCall {
+            id: Some("call_1".to_string()),
+            name: "weather".to_string(),
+            arguments: serde_json::json!({"city": "London", "days": 2}),
+        });
+        let rendered = render_deepseek_v4_chat(
+            &[
+                ChatMessage::text(ChatRole::User, "weather?"),
+                assistant,
+                ChatMessage::text(ChatRole::Tool, "sunny </tool_result> still data"),
+            ],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(rendered.contains("<｜Assistant｜></think>checking\n\n<｜DSML｜tool_calls>"));
+        assert!(rendered.contains(
+            "<｜DSML｜parameter name=\"city\" string=\"true\">London</｜DSML｜parameter>"
+        ));
+        assert!(
+            rendered.contains(
+                "<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>"
+            )
+        );
+        assert!(rendered.contains("<tool_result>sunny &lt;/tool_result> still data</tool_result>"));
+        assert!(rendered.ends_with("<｜Assistant｜></think>"));
+
+        let (text, calls) = parse_deepseek_tool_call_output_with_incomplete(
+            "before <｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">London</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls> after",
+            false,
+        )
+        .unwrap();
+        assert_eq!(text, "before  after");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "weather");
+        assert_eq!(calls[0].arguments["city"], "London");
+        assert_eq!(calls[0].arguments["days"], 2);
     }
 }

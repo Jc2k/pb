@@ -9,6 +9,7 @@ use objc2::rc::autoreleasepool;
 use tracing::{debug, info, trace, trace_span};
 
 use super::capabilities::{FlashMoeAttentionMathCapability, FlashMoeCapabilityPlan};
+use super::deepseek::{DeepSeekV4Config, DeepSeekV4ExecutionGraph, is_deepseek_v4_flash};
 use super::experts::ExpertSlotStore;
 use super::math::*;
 use super::metal::*;
@@ -138,6 +139,7 @@ pub struct FlashMoeEngine {
     pub(super) model_layout: QwenMoeModelLayout,
     pub(super) routing_policy: ResolvedRoutingPolicy,
     pub(super) runtime: DenseTransformerRuntime,
+    pub(super) deepseek_graph: Option<Arc<DeepSeekV4ExecutionGraph>>,
     pub(super) linear_attention_weights: LinearAttentionWeightTable,
     pub(super) shared_expert_weights: SharedExpertWeightTable,
     pub(super) input_adapter_executor: FlashMoeInputAdapterExecutor,
@@ -157,7 +159,7 @@ where
     progress("cache_status", phase_started.elapsed());
     if !status.ready {
         bail!(
-            "Flash-MoE cache is not ready for {}. Missing: {}. Found {} expert files totaling {} bytes. Run `pb pull {}` on ARM macOS to download and prepare the Qwen3.5 cache.",
+            "Flash-MoE cache is not ready for {}. Missing: {}. Found {} expert files totaling {} bytes. Run `pb pull {}` on ARM macOS to download and prepare the FlashMoe cache.",
             plan.model,
             format_missing(&status.missing),
             status.expert_files,
@@ -166,7 +168,15 @@ where
         );
     }
     phase_started = Instant::now();
-    let config = QwenModelConfig::from_file(&plan.model_config)?;
+    let deepseek_config = if is_deepseek_v4_flash(&plan.model) {
+        Some(DeepSeekV4Config::from_file(&plan.model_config)?)
+    } else {
+        None
+    };
+    let config = match &deepseek_config {
+        Some(config) => config.shared_runtime_config(),
+        None => QwenModelConfig::from_file(&plan.model_config)?,
+    };
     progress("config", phase_started.elapsed());
     phase_started = Instant::now();
     let routing_policy = plan.routing_policy.resolve(&plan.model, &config)?;
@@ -196,31 +206,60 @@ where
     )?;
     progress("dense_store", phase_started.elapsed());
     phase_started = Instant::now();
-    validate_required_tensor_manifest(&config, dense.registry())?;
+    let deepseek_graph = deepseek_config
+        .map(|config| DeepSeekV4ExecutionGraph::from_registry(config, dense.registry(), dense.len))
+        .transpose()?
+        .map(Arc::new);
+    if deepseek_graph.is_none() {
+        validate_required_tensor_manifest(&config, dense.registry())?;
+    }
     progress("manifest_validation", phase_started.elapsed());
     phase_started = Instant::now();
-    let runtime = DenseTransformerRuntime::from_registry(&config, dense.registry())?;
-    let attention_layers = runtime.resolved_attention_layers()?;
+    let runtime = if deepseek_graph.is_some() {
+        DenseTransformerRuntime::new(&config)
+    } else {
+        DenseTransformerRuntime::from_registry(&config, dense.registry())?
+    };
+    let attention_layers = if deepseek_graph.is_some() {
+        vec![super::model_family::QwenMoeLayerKind::FullAttention; config.num_hidden_layers]
+    } else {
+        runtime.resolved_attention_layers()?
+    };
     progress("runtime_layout", phase_started.elapsed());
     phase_started = Instant::now();
-    let linear_attention_weights = dense.resolve_linear_attention_weight_table(
-        &runtime.linear_attention,
-        config.hidden_size,
-        model_layout.experts_per_layer,
-    )?;
+    let linear_attention_weights = if deepseek_graph.is_some() {
+        LinearAttentionWeightTable::empty(config.num_hidden_layers)
+    } else {
+        dense.resolve_linear_attention_weight_table(
+            &runtime.linear_attention,
+            config.hidden_size,
+            model_layout.experts_per_layer,
+        )?
+    };
     progress("linear_attention_weights", phase_started.elapsed());
     phase_started = Instant::now();
-    let shared_expert_weights = dense.resolve_shared_expert_weight_table_from(
-        config.num_hidden_layers,
-        config.hidden_size,
-        config.shared_experts(),
-        config.shared_expert_intermediate_size(),
-        config.first_sparse_layer(),
-        config.glm.is_none(),
-    )?;
+    let shared_expert_weights = if deepseek_graph.is_some() {
+        SharedExpertWeightTable::none(config.num_hidden_layers)
+    } else {
+        dense.resolve_shared_expert_weight_table_from(
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.shared_experts(),
+            config.shared_expert_intermediate_size(),
+            config.first_sparse_layer(),
+            config.glm.is_none(),
+        )?
+    };
     progress("shared_expert_weights", phase_started.elapsed());
     phase_started = Instant::now();
-    let dense_layout = dense.registry().resolve_resident_dense_layout()?;
+    let dense_layout = if deepseek_graph.is_some() {
+        // DeepSeek's typed graph validates its exact F16/F32/I32/Q8 GGUF
+        // mixture above. This legacy field is not consulted by its execution
+        // implementation.
+        ResidentDenseLayout::F16
+    } else {
+        dense.registry().resolve_resident_dense_layout()?
+    };
     if matches!(
         model_layout.family,
         QwenMoeFamily::Qwen35A17B
@@ -251,13 +290,16 @@ where
     let expert_storage = resolved_experts.descriptor;
     progress("expert_store", phase_started.elapsed());
     phase_started = Instant::now();
-    let attention_math = if model_layout.family == QwenMoeFamily::Glm52
+    let attention_math = if model_layout.family == QwenMoeFamily::DeepSeekV4Flash {
+        FlashMoeAttentionMathCapability::DeepSeekV4HyperconnectionCompressedAttentionMetal
+    } else if model_layout.family == QwenMoeFamily::Glm52
         && runtime.mla_attention.iter().all(|layout| {
             matches!(
                 layout.map(|layout| layout.kv_projection),
                 Some(MlaKvProjectionLayout::AbsorbedMultiLinear)
             )
-        }) {
+        })
+    {
         FlashMoeAttentionMathCapability::GlmMlaMetalQ4AbsorbedAttention
     } else if model_layout.family == QwenMoeFamily::Glm52 {
         FlashMoeAttentionMathCapability::GlmMlaCpuWeightAbsorption
@@ -296,6 +338,7 @@ where
         model_layout,
         routing_policy,
         runtime,
+        deepseek_graph,
         linear_attention_weights,
         shared_expert_weights,
         session_cache,
@@ -351,6 +394,7 @@ fn generation_finish_reason(generated_tokens: usize, max_tokens: usize) -> Gener
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+    use crate::inference::flashmoe::deepseek::DEEPSEEK_V4_FLASH_MODEL;
     use crate::inference::flashmoe::planning::plan_unchecked;
     use crate::inference::flashmoe::types::QWEN35_MODEL;
 
@@ -368,6 +412,21 @@ mod ownership_tests {
             "{error:#}"
         );
         assert!(!error.to_string().contains("Metal executor"), "{error:#}");
+    }
+
+    #[test]
+    fn missing_deepseek_cache_diagnostic_is_family_neutral() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan_unchecked(DEEPSEEK_V4_FLASH_MODEL, root.path());
+
+        let error = load(&plan).unwrap_err();
+        let diagnostic = error.to_string();
+
+        assert!(
+            diagnostic.contains("prepare the FlashMoe cache"),
+            "{error:#}"
+        );
+        assert!(!diagnostic.contains("Qwen3.5 cache"), "{error:#}");
     }
 
     #[test]
@@ -409,11 +468,12 @@ impl MetalExecutionFacade {
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            let inner = MetalExecutionContext::compile(
+            let inner = MetalExecutionContext::compile_resolved(
                 dense.mmap.clone(),
                 dense.len,
                 &runtime.linear_attention,
                 config.rms_norm_epsilon(),
+                super::deepseek::is_deepseek_v4_flash(&plan.model),
             )?;
             tracing::info!(
                 model = %plan.model,
@@ -436,7 +496,14 @@ impl MetalExecutionFacade {
     }
 
     pub(super) fn runtime_capabilities(&self) -> MetalRuntimeCapabilities {
-        MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.runtime_capabilities()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
+        }
     }
 
     pub(super) fn reset_linear_attention_state(&self) -> Result<()> {
@@ -449,6 +516,57 @@ impl MetalExecutionFacade {
             bail!(
                 "FlashMoe unsupported recurrent-state reset: the resolved graph requires Apple Silicon Metal"
             )
+        }
+    }
+
+    pub(super) fn prepare_deepseek_v4_state(
+        &self,
+        graph: &DeepSeekV4ExecutionGraph,
+        capacity: usize,
+    ) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.prepare_deepseek_v4_state(graph, capacity)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (graph, capacity);
+            bail!("DeepSeek V4 Flash requires Apple Silicon Metal")
+        }
+    }
+
+    pub(super) fn deepseek_v4_forward_token(
+        &self,
+        graph: &DeepSeekV4ExecutionGraph,
+        scheduler: &mut FlashMoeExecutionScheduler,
+        token: u32,
+        position: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .deepseek_v4_forward_token(graph, scheduler, token, position)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (graph, scheduler, token, position);
+            bail!("DeepSeek V4 Flash requires Apple Silicon Metal")
+        }
+    }
+
+    pub(super) fn deepseek_v4_logits(
+        &self,
+        graph: &DeepSeekV4ExecutionGraph,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.deepseek_v4_logits(graph, hidden)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (graph, hidden);
+            bail!("DeepSeek V4 Flash requires Apple Silicon Metal")
         }
     }
 
@@ -845,6 +963,28 @@ impl FlashMoeEngine {
             record_generated
         );
         let _token_span = token_span.enter();
+        if let Some(graph) = self.deepseek_graph.clone() {
+            if input.precomputed_embedding(runtime.width)?.is_some() {
+                bail!(
+                    "DeepSeek V4 Flash does not declare a precomputed/vision embedding input graph"
+                );
+            }
+            let hidden = self.metal.deepseek_v4_forward_token(
+                &graph,
+                &mut self.scheduler,
+                previous,
+                position,
+            )?;
+            if record_generated {
+                kv_cache.record_generated_token_record(FlashMoeGeneratedTokenRecord::new(
+                    position, previous,
+                ))?;
+            }
+            if let Some(timing) = timing {
+                timing.buckets.total_wall = token_started.elapsed();
+            }
+            return Ok(hidden);
+        }
         let hidden_values = match input.precomputed_embedding(runtime.width)? {
             Some(values) => values.to_vec(),
             None => self.dense.embedding(previous, runtime.width)?,
@@ -2354,9 +2494,28 @@ impl FlashMoeEngine {
         let encode_started = Instant::now();
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let encode_elapsed = encode_started.elapsed();
-        let base_prefix_len = self.stable_base_prefix_len(request, &prompt_tokens)?;
+        let deepseek_v4 = self.deepseek_graph.is_some();
+        let base_prefix_len = if deepseek_v4 {
+            0
+        } else {
+            self.stable_base_prefix_len(request, &prompt_tokens)?
+        };
         let max_tokens = request.max_tokens.max(0) as usize;
         validate_context_capacity(prompt_tokens.len(), max_tokens, request.context_size)?;
+        if let Some(graph) = self.deepseek_graph.as_ref() {
+            let capacity = prompt_tokens
+                .len()
+                .checked_add(max_tokens)
+                .context("DeepSeek V4 request context capacity overflow")?
+                .max(1);
+            self.metal.prepare_deepseek_v4_state(graph, capacity)?;
+        }
+        // The existing session snapshot is intentionally limited to linear-
+        // attention state. DeepSeek's raw/compressed/index caches have a
+        // different typed layout, so this family starts from its freshly
+        // prepared request state instead of silently restoring an incomplete
+        // legacy snapshot.
+        let session_id = if deepseek_v4 { None } else { session_id };
         if let Some(glm) = self.config.glm.as_ref()
             && glm.index_topk > 0
         {
@@ -2639,7 +2798,7 @@ impl FlashMoeEngine {
         let generated = generation.into_generated();
         let decoded = self.tokenizer.decode(&generated)?;
         let finish_reason = generation_finish_reason(generated.len(), max_tokens);
-        let (content, tool_calls) = parse_qwen_tool_call_output_with_incomplete(
+        let (content, tool_calls) = self.parse_native_tool_output(
             &decoded,
             finish_reason == GenerationFinishReason::MaxTokens,
         )?;
@@ -2972,7 +3131,7 @@ impl FlashMoeEngine {
 
         let decoded = self.tokenizer.decode(&generated)?;
         let finish_reason = generation_finish_reason(generated.len(), max_tokens);
-        let (content, tool_calls) = parse_qwen_tool_call_output_with_incomplete(
+        let (content, tool_calls) = self.parse_native_tool_output(
             &decoded,
             finish_reason == GenerationFinishReason::MaxTokens,
         )?;
@@ -3005,6 +3164,18 @@ impl FlashMoeEngine {
             &mut weight,
         );
         Ok(Some(weight))
+    }
+
+    fn parse_native_tool_output(
+        &self,
+        content: &str,
+        allow_incomplete: bool,
+    ) -> Result<(String, Vec<ChatToolCall>)> {
+        if self.deepseek_graph.is_some() {
+            parse_deepseek_tool_call_output_with_incomplete(content, allow_incomplete)
+        } else {
+            parse_qwen_tool_call_output_with_incomplete(content, allow_incomplete)
+        }
     }
 
     pub(super) fn rms_norm_with_model_weight(
@@ -3118,6 +3289,19 @@ impl FlashMoeEngine {
         trace_candidates: bool,
         progress: &GenerationProgress<'_>,
     ) -> Result<u32> {
+        if let Some(graph) = self.deepseek_graph.as_ref() {
+            let logits = self.metal.deepseek_v4_logits(graph, hidden)?;
+            let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+            trace_sampling_candidates(
+                progress,
+                &self.tokenizer,
+                prompt_tokens.len(),
+                generated,
+                &candidates,
+                trace_candidates.then_some((hidden, logits.as_slice())),
+            );
+            return sampler.sample_candidates(candidates);
+        }
         if trace_candidates {
             let logits = self.dense.lm_head_logits_with_metal(
                 Some(&self.metal),

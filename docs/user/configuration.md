@@ -50,6 +50,11 @@ Full-attention KV, compressed MLA KV, linear-attention conv/SSM state, final hid
 ids are stored together, so hybrid Qwen and GLM checkpoints restore the state their forward graph
 actually needs.
 
+DeepSeek V4 Flash is deliberately excluded from that reuse for now. Its four hyperconnection
+streams plus raw, compressed, and indexer KV form one typed state that the current snapshot format
+cannot represent. Every DeepSeek request therefore starts from a freshly reset request-scoped
+state; pb does not restore a partial Qwen/GLM snapshot or advertise cached prompt tokens for it.
+
 The web/service path retains loaded FlashMoe runtimes across managed turns. It retains up to two
 idle models by default and reaps an unused runtime after 15 minutes. Set
 `PB_FLASHMOE_RESIDENT_MODELS` or `PB_FLASHMOE_IDLE_SECONDS` to change those process-memory bounds.
@@ -101,6 +106,31 @@ remains Configurable because it requires an explicitly selected local checkpoint
 The baseline supports requests through the checkpoint's `index_topk` boundary (2,048 tokens in the
 published snapshot). Longer contexts require GLM's DSA indexer and are rejected explicitly; DSA and
 the optional MTP speculative head are not currently implemented.
+
+## DeepSeek V4 Flash with FlashMoe
+
+**Configurable, with provisional validation status.** On Apple Silicon, pb recognizes exactly the
+published DeepSeek V4 Flash IQ2_XXS/Q2_K checkpoint:
+
+```bash
+pb pull hf://antirez/deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+pb config set model.model hf://antirez/deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+```
+
+Pull rejects other repository files and validates the complete 43-layer metadata, tensor, dtype,
+shape, quantization, compression-schedule, expert, and JoyAI tokenizer contract before atomically
+publishing a source-independent FlashMoe cache. Resident tensors stay in one mmap-backed store.
+Each layer's 256 routed experts are split into fixed, page-aligned whole-expert slots so the shared
+scheduler can stream the selected six from SSD with parallel positioned reads and let the operating
+system page cache remain authoritative.
+
+Load resolves the complete graph and required fused Metal kernels before the first token. Top-6 is
+part of the checkpoint contract: `--flashmoe-active-experts` cannot reduce it. There is no llama.cpp
+fallback, CPU component fallback, DS4 process, hidden top-2 mode, or alternate generation loop.
+DeepSeek is text-only in this profile, and existing FlashMoe session/prefix reuse is disabled as
+described above. The implementation has local graph, routing, ABI, all-target, and Metal shader
+compilation evidence, but this repository has not yet recorded a full published-checkpoint build or
+real-model continuation smoke; treat output validation as provisional until that evidence lands.
 
 ## Project configuration
 

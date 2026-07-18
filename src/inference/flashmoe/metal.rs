@@ -11,6 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod deepseek_execution;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::deepseek_metal::DEEPSEEK_V4_METAL_SHADERS;
+use super::deepseek_metal::DEEPSEEK_V4_REQUIRED_METAL_KERNELS;
 use super::state::{FlashMoeExpertPhaseOutput, FlashMoeGpuBufferDescriptor};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::types::FlashMoeMetalResourceSnapshot;
@@ -1162,6 +1168,9 @@ const DEFAULT_FLASHMOE_METAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120
 const DEFAULT_FLASHMOE_METAL_COMMAND_POLL_INTERVAL: Duration = Duration::from_micros(100);
 
 pub(crate) mod kernels {
+    pub(crate) const DEEPSEEK_IQ2_XXS_PAIR_SWIGLU: &str =
+        "kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32";
+    pub(crate) const DEEPSEEK_Q2_K_SUM6: &str = "kernel_mul_mv_slots6_q2_K_sum6_f32";
     pub(crate) const Q4_FMA_MATVEC: &str = "q4_fma_matvec";
     pub(crate) const Q4_FMA_MATVEC_BF16_SCALE_BIAS: &str = "q4_fma_matvec_bf16_scale_bias";
     pub(crate) const MXFP4_FMA_MATVEC_E8M0: &str = "mxfp4_fma_matvec_e8m0";
@@ -1218,6 +1227,11 @@ impl MetalRuntimeCapabilities {
 
     pub(crate) fn supports(&self, kernel: &str) -> bool {
         self.kernels.contains(kernel)
+    }
+
+    pub(crate) fn with_additional(mut self, kernels: &'static [&'static str]) -> Self {
+        self.kernels.extend(kernels.iter().copied());
+        self
     }
 
     #[cfg(test)]
@@ -1753,10 +1767,87 @@ impl Drop for MetalRuntime {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
+pub(crate) struct DeepSeekMetalPipelineSet {
+    pipelines: BTreeMap<&'static str, MetalObjcId>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for DeepSeekMetalPipelineSet {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Sync for DeepSeekMetalPipelineSet {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl DeepSeekMetalPipelineSet {
+    unsafe fn compile(device: MetalObjcId) -> anyhow::Result<Self> {
+        unsafe {
+            let source = OwnedMetalObject::new(ns_string(DEEPSEEK_V4_METAL_SHADERS))?;
+            let mut compile_error = ptr::null_mut();
+            let library_id = msg_send_id2_id_error(
+                device,
+                sel("newLibraryWithSource:options:error:"),
+                source.id(),
+                ptr::null_mut(),
+                &mut compile_error,
+            );
+            if library_id.is_null() {
+                let error = ns_error_localized_description(compile_error)
+                    .unwrap_or_else(|| "unknown Metal compiler error".to_string());
+                anyhow::bail!(
+                    "failed to compile required DeepSeek V4 Flash Metal shader library: {error}"
+                );
+            }
+            let library = OwnedMetalObject::new(library_id)?;
+            let mut pipelines = BTreeMap::new();
+            for &name in DEEPSEEK_V4_REQUIRED_METAL_KERNELS {
+                let constants: &[(u64, u64, &[u8])] = match name {
+                    "kernel_mul_mv_q8_0_f32"
+                    | "kernel_mul_mv_f16_f32"
+                    | "kernel_dsv4_shared_gate_up_swiglu_q8_0"
+                    | "kernel_dsv4_shared_down_hc_expand4_q8_0"
+                    | "kernel_dsv4_q8_hc_expand4_q8_0" => &[(600, 37, &4i16.to_ne_bytes())],
+                    "kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32"
+                    | "kernel_mul_mv_slots6_q2_K_sum6_f32" => &[(600, 37, &2i16.to_ne_bytes())],
+                    "kernel_sum_rows_f32_f32" => &[(1400, 37, &10i16.to_ne_bytes())],
+                    _ => &[],
+                };
+                let pipeline = OwnedMetalObject::new(if constants.is_empty() {
+                    compile_pipeline(device, library.id(), name)?
+                } else {
+                    compile_pipeline_with_constants(device, library.id(), name, constants)?
+                })?;
+                pipelines.insert(name, pipeline.into_raw());
+            }
+            Ok(Self { pipelines })
+        }
+    }
+
+    pub(crate) fn require(&self, name: &'static str) -> anyhow::Result<MetalObjcId> {
+        self.pipelines.get(name).copied().with_context(|| {
+            format!("DeepSeek V4 Flash Metal graph is missing compiled kernel {name}")
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for DeepSeekMetalPipelineSet {
+    fn drop(&mut self) {
+        unsafe {
+            for pipeline in self.pipelines.values().copied() {
+                release(pipeline);
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
 pub(crate) struct MetalExecutionContext {
     runtime: MetalRuntime,
+    deepseek_pipelines: Option<DeepSeekMetalPipelineSet>,
     dense_weights: Option<MetalDenseWeights>,
     linear_attention_state: Mutex<MetalLinearAttentionStateCache>,
+    deepseek_state: Mutex<Option<deepseek_execution::DeepSeekV4MetalState>>,
     buffers: Arc<MetalBufferPool>,
     resources: Arc<MetalResourceLedger>,
     norm_epsilon: f32,
@@ -1778,6 +1869,11 @@ impl Drop for MetalExecutionContext {
             if let Ok(linear_state) = self.linear_attention_state.get_mut() {
                 release_linear_attention_state(linear_state);
             }
+            if let Ok(deepseek_state) = self.deepseek_state.get_mut()
+                && let Some(mut state) = deepseek_state.take()
+            {
+                state.release();
+            }
             self.resources.record_resident_resources(0, 0);
         }
     }
@@ -1785,13 +1881,27 @@ impl Drop for MetalExecutionContext {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalExecutionContext {
+    #[allow(dead_code)]
     pub(crate) fn compile(
         dense_mmap: Arc<memmap2::Mmap>,
         dense_len: u64,
         linear_layouts: &[Option<LinearAttentionLayout>],
         norm_epsilon: f32,
     ) -> anyhow::Result<Self> {
+        Self::compile_resolved(dense_mmap, dense_len, linear_layouts, norm_epsilon, false)
+    }
+
+    pub(crate) fn compile_resolved(
+        dense_mmap: Arc<memmap2::Mmap>,
+        dense_len: u64,
+        linear_layouts: &[Option<LinearAttentionLayout>],
+        norm_epsilon: f32,
+        deepseek_v4_flash: bool,
+    ) -> anyhow::Result<Self> {
         let runtime = MetalRuntime::compile(METAL_SHADERS, MetalPipelineNameSet::new())?;
+        let deepseek_pipelines = deepseek_v4_flash
+            .then(|| unsafe { DeepSeekMetalPipelineSet::compile(runtime.device) })
+            .transpose()?;
         let resources = Arc::new(unsafe { MetalResourceLedger::from_device(runtime.device) });
         let dense_weights = wrap_dense_mmap_as_metal_buffer(runtime.device, dense_mmap, dense_len)?;
         let linear_attention_state =
@@ -1805,12 +1915,30 @@ impl MetalExecutionContext {
         }
         Ok(Self {
             runtime,
+            deepseek_pipelines,
             dense_weights,
             linear_attention_state: Mutex::new(linear_attention_state),
+            deepseek_state: Mutex::new(None),
             buffers: Arc::new(MetalBufferPool::new(Arc::clone(&resources))),
             resources,
             norm_epsilon,
         })
+    }
+
+    pub(crate) fn runtime_capabilities(&self) -> MetalRuntimeCapabilities {
+        let capabilities =
+            MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new());
+        if self.deepseek_pipelines.is_some() {
+            capabilities.with_additional(DEEPSEEK_V4_REQUIRED_METAL_KERNELS)
+        } else {
+            capabilities
+        }
+    }
+
+    pub(crate) fn deepseek_pipelines(&self) -> anyhow::Result<&DeepSeekMetalPipelineSet> {
+        self.deepseek_pipelines
+            .as_ref()
+            .context("DeepSeek V4 Flash Metal pipelines were not selected by the load-time graph")
     }
 
     pub(crate) fn runtime(&self) -> &MetalRuntime {
@@ -2990,6 +3118,11 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                                 &mut phase_buffers,
                                 &mut source_buffers,
                             )?;
+                        }
+                        ScheduledExpertPhaseMlpPayload::DeepSeekGguf(_) => {
+                            bail!(
+                                "DeepSeek GGUF expert payload reached the Qwen/GLM CMD3 builder instead of its load-resolved fused Metal builder"
+                            );
                         }
                     }
                 }
@@ -6617,6 +6750,7 @@ pub(crate) struct MetalCmd3ActiveExpertPlan {
 pub(crate) enum MetalCmd3ActiveExpertSource {
     Q4,
     Dense,
+    DeepSeekGguf,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6719,6 +6853,15 @@ impl MetalCmd3ActiveExpertPlan {
                 payload.up.cols,
                 payload.down.rows,
                 payload.down.cols,
+            ),
+            ScheduledExpertPhaseMlpPayload::DeepSeekGguf(payload) => (
+                MetalCmd3ActiveExpertSource::DeepSeekGguf,
+                payload.spec.gate.rows,
+                payload.spec.gate.cols,
+                payload.spec.up.rows,
+                payload.spec.up.cols,
+                payload.spec.down.rows,
+                payload.spec.down.cols,
             ),
         };
         if gate_rows == 0 {
@@ -7042,6 +7185,45 @@ pub(crate) unsafe fn compile_pipeline(
         let pipeline = new_compute_pipeline(device, function)
             .with_context(|| format!("failed to create {name} Metal pipeline"))?;
         release(function);
+        Ok(pipeline)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn compile_pipeline_with_constants(
+    device: MetalObjcId,
+    library: MetalObjcId,
+    name: &str,
+    constants: &[(u64, u64, &[u8])],
+) -> anyhow::Result<MetalObjcId> {
+    unsafe {
+        let alloc = msg_send_id0(class("MTLFunctionConstantValues"), sel("alloc"));
+        let values = OwnedMetalObject::new(msg_send_id0(alloc, sel("init")))?;
+        for &(index, data_type, bytes) in constants {
+            msg_send_void3_ptr_u64_u64(
+                values.id(),
+                sel("setConstantValue:type:atIndex:"),
+                bytes.as_ptr().cast(),
+                data_type,
+                index,
+            );
+        }
+        let function_name = OwnedMetalObject::new(ns_string(name))?;
+        let mut error = ptr::null_mut();
+        let function = OwnedMetalObject::new(msg_send_id2_id_error(
+            library,
+            sel("newFunctionWithName:constantValues:error:"),
+            function_name.id(),
+            values.id(),
+            &mut error,
+        ))
+        .with_context(|| {
+            let detail = ns_error_localized_description(error)
+                .unwrap_or_else(|| "unknown Metal specialization error".to_string());
+            format!("failed to specialize DeepSeek V4 Flash Metal kernel {name}: {detail}")
+        })?;
+        let pipeline = new_compute_pipeline(device, function.id())
+            .with_context(|| format!("failed to create specialized {name} Metal pipeline"))?;
         Ok(pipeline)
     }
 }
@@ -7715,6 +7897,21 @@ pub(crate) unsafe fn msg_send_void3_ptr_usize_u64(
         let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, *const c_void, usize, u64) =
             std::mem::transmute(objc_msgSend as *const ());
         f(receiver, selector, bytes, len, index);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn msg_send_void3_ptr_u64_u64(
+    receiver: MetalObjcId,
+    selector: MetalSelector,
+    value: *const c_void,
+    data_type: u64,
+    index: u64,
+) {
+    unsafe {
+        let f: unsafe extern "C" fn(MetalObjcId, MetalSelector, *const c_void, u64, u64) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(receiver, selector, value, data_type, index);
     }
 }
 
@@ -9993,6 +10190,37 @@ mod tests {
         required.dedup();
 
         assert_eq!(compiled, required);
+    }
+
+    #[test]
+    fn deepseek_shader_source_defines_load_resolved_kernel_surface() {
+        for kernel in DEEPSEEK_V4_REQUIRED_METAL_KERNELS {
+            assert!(
+                super::super::deepseek_metal::DEEPSEEK_V4_METAL_SHADERS.contains(kernel),
+                "missing DeepSeek V4 Metal kernel {kernel}"
+            );
+        }
+        assert!(
+            super::super::deepseek_metal::DEEPSEEK_V4_METAL_SHADERS
+                .contains("kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32")
+        );
+        assert!(
+            super::super::deepseek_metal::DEEPSEEK_V4_METAL_SHADERS
+                .contains("kernel_mul_mv_slots6_q2_K_sum6_f32")
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires a local Metal device"]
+    fn deepseek_shader_library_compiles_every_required_pipeline() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let device = OwnedMetalObject::new(metal_default_device()).unwrap();
+            let pipelines = DeepSeekMetalPipelineSet::compile(device.id()).unwrap();
+            for &kernel in DEEPSEEK_V4_REQUIRED_METAL_KERNELS {
+                pipelines.require(kernel).unwrap();
+            }
+        });
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

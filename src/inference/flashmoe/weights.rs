@@ -3708,6 +3708,12 @@ pub(crate) struct LinearAttentionWeightTable {
 }
 
 impl LinearAttentionWeightTable {
+    pub(crate) fn empty(layers: usize) -> Self {
+        Self {
+            layers: vec![None; layers],
+        }
+    }
+
     pub(crate) fn require(&self, layer: usize) -> Result<&LinearAttentionResidentBindings> {
         self.layers
             .get(layer)
@@ -4061,6 +4067,12 @@ pub(crate) struct SharedExpertWeightTable {
 }
 
 impl SharedExpertWeightTable {
+    pub(crate) fn none(layers: usize) -> Self {
+        Self {
+            layers: vec![SharedExpertLayerWeights::None; layers],
+        }
+    }
+
     pub(crate) fn layer(&self, layer: usize) -> Result<&SharedExpertLayerWeights> {
         self.layers.get(layer).with_context(|| {
             format!("FlashMoe scheduled shared-expert weight table has no entry for layer {layer}")

@@ -206,6 +206,7 @@ pub(crate) struct GgufTensorInfo {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct GgufFile {
     pub(crate) path: PathBuf,
     pub(crate) version: u32,

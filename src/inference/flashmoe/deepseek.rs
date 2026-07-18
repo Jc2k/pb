@@ -20,9 +20,11 @@ use super::experts::{
 };
 use super::gguf::{GgufFile, GgufMetadataType, GgufTensorInfo, GgufTensorType, GgufValue};
 use super::metal::METAL_SHADERS;
+use super::model_family::QwenModelConfig;
 use super::planning::{FlashMoePlan, FlashMoeRoutingPolicy, plan_unchecked_with_cache_version};
 use super::weights::{
-    DenseTensorRef, ExpertTensorRef, FlashMoeManifest, TENSOR_ALIGNMENT, TensorQuantization,
+    DenseTensorRef, ExpertTensorRef, FlashMoeManifest, RuntimeTensorEntry, TENSOR_ALIGNMENT,
+    TensorQuantization, TensorRegistry,
 };
 
 pub const DEEPSEEK_V4_FLASH_REPOSITORY: &str = "hf://antirez/deepseek-v4-gguf";
@@ -86,6 +88,75 @@ pub struct DeepSeekV4Config {
 }
 
 impl DeepSeekV4Config {
+    pub(crate) fn from_file(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read DeepSeek config {}", path.display()))?;
+        let config: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse DeepSeek config {}", path.display()))?;
+        config.validate_cached_flash_profile()?;
+        Ok(config)
+    }
+
+    pub(crate) fn expected_flash_profile() -> Self {
+        Self {
+            architecture: "deepseek4".to_string(),
+            block_count: 43,
+            embedding_length: 4096,
+            vocab_size: 129_280,
+            attention_head_count: 64,
+            attention_head_count_kv: 1,
+            attention_key_length: 512,
+            attention_value_length: 512,
+            rope_dimension_count: 64,
+            q_lora_rank: 1024,
+            output_lora_rank: 1024,
+            output_group_count: 8,
+            expert_count: 256,
+            expert_used_count: 6,
+            expert_feed_forward_length: 2048,
+            expert_shared_count: 1,
+            hash_layer_count: 3,
+            sliding_window: 128,
+            indexer_head_count: 64,
+            indexer_key_length: 128,
+            indexer_top_k: 512,
+            hyper_connection_count: 4,
+            hyper_connection_sinkhorn_iterations: 20,
+            compress_ratios: (0..43)
+                .map(|layer| {
+                    if layer < 2 {
+                        0
+                    } else if layer % 2 == 0 {
+                        4
+                    } else {
+                        128
+                    }
+                })
+                .collect(),
+            swiglu_clamp_exp: vec![10.0; 43],
+            rope_original_context_length: 65_536,
+            rope_freq_base: 10_000.0,
+            rope_scaling_factor: 16.0,
+            rope_yarn_beta_fast: 32.0,
+            rope_yarn_beta_slow: 1.0,
+            compress_rope_freq_base: 160_000.0,
+            expert_weights_scale: 1.5,
+            attention_layer_norm_rms_epsilon: 1.0e-6,
+            hyper_connection_epsilon: 1.0e-6,
+            expert_weights_norm: true,
+        }
+    }
+
+    pub(crate) fn validate_cached_flash_profile(&self) -> Result<()> {
+        let expected = Self::expected_flash_profile();
+        if self != &expected {
+            bail!(
+                "DeepSeek V4 Flash cached config does not match the pinned 43-layer IQ2_XXS/Q2_K execution profile"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let architecture = required_string(gguf, "general.architecture")?;
         if architecture != "deepseek4" {
@@ -153,6 +224,7 @@ impl DeepSeekV4Config {
                 .context("GGUF metadata deepseek4.expert_weights_norm must be bool")?,
         };
         config.validate_flash_profile(gguf)?;
+        config.validate_cached_flash_profile()?;
         Ok(config)
     }
 
@@ -267,6 +339,42 @@ impl DeepSeekV4Config {
         }
         Ok(())
     }
+
+    /// Adapts the family-neutral dimensions consumed by the shared FlashMoe
+    /// scheduler. DeepSeek-only graph/state semantics stay in the typed
+    /// DeepSeek execution descriptor and are never inferred from this view.
+    pub(crate) fn shared_runtime_config(&self) -> QwenModelConfig {
+        QwenModelConfig {
+            model_type: Some("deepseek_v4_flash".to_string()),
+            architectures: Some(vec!["DeepSeekV4FlashForCausalLM".to_string()]),
+            num_hidden_layers: self.block_count,
+            hidden_size: self.embedding_length,
+            num_attention_heads: self.attention_head_count,
+            head_dim: Some(self.attention_key_length),
+            num_key_value_heads: Some(self.attention_head_count_kv),
+            vocab_size: self.vocab_size,
+            rope_theta: Some(self.rope_freq_base as f64),
+            partial_rotary_factor: Some(
+                self.rope_dimension_count as f64 / self.attention_key_length as f64,
+            ),
+            torch_dtype: Some("float16".to_string()),
+            num_experts: Some(self.expert_count),
+            num_experts_per_tok: Some(self.expert_used_count),
+            norm_topk_prob: Some(self.expert_weights_norm),
+            moe_intermediate_size: Some(self.expert_feed_forward_length),
+            intermediate_size: Some(self.expert_feed_forward_length),
+            max_position_embeddings: Some(
+                self.rope_original_context_length
+                    .saturating_mul(self.rope_scaling_factor as usize),
+            ),
+            mrope_section: None,
+            tie_word_embeddings: Some(false),
+            num_shared_experts: Some(self.expert_shared_count),
+            shared_expert_intermediate_size: Some(self.expert_feed_forward_length),
+            vision_config: None,
+            glm: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -277,6 +385,851 @@ pub(crate) struct DeepSeekV4TokenizerCache {
     tokens: Vec<String>,
     merges: Vec<String>,
     special_tokens: BTreeMap<String, u32>,
+}
+
+/// Native tokenizer bound from the DeepSeek cache artifact.  This remains an
+/// input adapter of the existing FlashMoe engine; it is not a second inference
+/// runtime.  The implementation mirrors the pinned `joyai-llm` GPT-2
+/// byte-level BPE profile used by the reference model.
+#[derive(Debug, Clone)]
+pub(crate) struct DeepSeekV4Tokenizer {
+    tokens: Vec<String>,
+    token_to_id: BTreeMap<String, u32>,
+    merge_rank: BTreeMap<String, usize>,
+    special_tokens: BTreeMap<String, u32>,
+    eos_id: u32,
+}
+
+impl DeepSeekV4Tokenizer {
+    pub(crate) fn from_cache_bytes(bytes: &[u8]) -> Result<Self> {
+        let cache: DeepSeekV4TokenizerCache = serde_json::from_slice(bytes)
+            .context("DeepSeek V4 Flash tokenizer cache JSON is invalid")?;
+        if cache.format != DEEPSEEK_TOKENIZER_FORMAT
+            || cache.model != "gpt2"
+            || cache.pre_tokenizer != "joyai-llm"
+        {
+            bail!(
+                "DeepSeek V4 Flash tokenizer cache does not declare the pinned joyai-llm GPT-2 byte-BPE profile"
+            );
+        }
+        if cache.tokens.len() != DeepSeekV4Config::expected_flash_profile().vocab_size {
+            bail!(
+                "DeepSeek V4 Flash tokenizer cache contains {} tokens, expected {}",
+                cache.tokens.len(),
+                DeepSeekV4Config::expected_flash_profile().vocab_size
+            );
+        }
+        let mut token_to_id = BTreeMap::new();
+        for (index, token) in cache.tokens.iter().enumerate() {
+            let id = u32::try_from(index).context("DeepSeek tokenizer token id exceeds u32")?;
+            if token_to_id.insert(token.clone(), id).is_some() {
+                bail!("DeepSeek V4 Flash tokenizer contains duplicate token {token:?}");
+            }
+        }
+        let merge_rank = cache
+            .merges
+            .iter()
+            .enumerate()
+            .map(|(rank, merge)| (merge.clone(), rank))
+            .collect::<BTreeMap<_, _>>();
+        for (token, id) in &cache.special_tokens {
+            if cache.tokens.get(*id as usize) != Some(token) {
+                bail!(
+                    "DeepSeek V4 Flash tokenizer special token {token:?} points at invalid id {id}"
+                );
+            }
+        }
+        for required in [
+            "<｜begin▁of▁sentence｜>",
+            "<｜end▁of▁sentence｜>",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "<think>",
+            "</think>",
+            "｜DSML｜",
+        ] {
+            if !cache.special_tokens.contains_key(required) {
+                bail!("DeepSeek V4 Flash tokenizer cache is missing special token {required}");
+            }
+        }
+        let eos_id = cache.special_tokens["<｜end▁of▁sentence｜>"];
+        Ok(Self {
+            tokens: cache.tokens,
+            token_to_id,
+            merge_rank,
+            special_tokens: cache.special_tokens,
+            eos_id,
+        })
+    }
+
+    pub(crate) fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        let bytes = text.as_bytes();
+        let mut span_start = 0usize;
+        let mut position = 0usize;
+        while position < bytes.len() {
+            let matched = self.special_tokens.iter().find_map(|(special, id)| {
+                bytes[position..]
+                    .starts_with(special.as_bytes())
+                    .then_some((special.len(), *id))
+            });
+            if let Some((len, id)) = matched {
+                self.encode_text_bytes(&bytes[span_start..position], &mut out)?;
+                out.push(id);
+                position += len;
+                span_start = position;
+            } else {
+                position += 1;
+            }
+        }
+        self.encode_text_bytes(&bytes[span_start..], &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn decode(&self, token_ids: &[u32]) -> Result<String> {
+        let mut bytes = Vec::new();
+        for id in token_ids {
+            let token = self.tokens.get(*id as usize).with_context(|| {
+                format!("DeepSeek V4 Flash tokenizer token id {id} is out of range")
+            })?;
+            if token.contains('｜') {
+                bytes.extend_from_slice(token.as_bytes());
+                continue;
+            }
+            for ch in token.chars() {
+                if let Some(byte) = gpt2_codepoint_to_byte(ch as u32) {
+                    bytes.push(byte);
+                }
+            }
+        }
+        String::from_utf8(bytes).context("DeepSeek V4 Flash tokenizer produced invalid UTF-8")
+    }
+
+    pub(crate) fn token_id(&self, token: &str) -> Option<u32> {
+        self.token_to_id.get(token).copied()
+    }
+
+    pub(crate) fn eos_id(&self) -> u32 {
+        self.eos_id
+    }
+
+    pub(crate) fn vocab_size(&self) -> usize {
+        self.tokens.len()
+    }
+
+    fn encode_text_bytes(&self, text: &[u8], out: &mut Vec<u32>) -> Result<()> {
+        let mut position = 0usize;
+        while position < text.len() {
+            let start = position;
+            let byte = text[position];
+            if byte.is_ascii_digit() {
+                let mut digits = 0;
+                while position < text.len() && text[position].is_ascii_digit() && digits < 3 {
+                    position += 1;
+                    digits += 1;
+                }
+            } else if joyai_cjk_at(text, position) {
+                loop {
+                    position = next_utf8_char(text, position);
+                    if position >= text.len() || !joyai_cjk_at(text, position) {
+                        break;
+                    }
+                }
+            } else if joyai_ascii_punct_symbol(byte)
+                && position + 1 < text.len()
+                && text[position + 1].is_ascii_alphabetic()
+            {
+                position += 1;
+                while position < text.len() && text[position].is_ascii_alphabetic() {
+                    position += 1;
+                }
+            } else if joyai_letter_like_at(text, position) {
+                position = joyai_consume_letters(text, position);
+            } else if !ascii_newline(byte)
+                && !joyai_ascii_punct_symbol(byte)
+                && position + 1 < text.len()
+                && joyai_letter_like_at(text, position + 1)
+            {
+                position += 1;
+                position = joyai_consume_letters(text, position);
+            } else if byte == b' '
+                && position + 1 < text.len()
+                && joyai_ascii_punct_symbol(text[position + 1])
+            {
+                position += 1;
+                while position < text.len() && joyai_ascii_punct_symbol(text[position]) {
+                    position += 1;
+                }
+                while position < text.len() && ascii_newline(text[position]) {
+                    position += 1;
+                }
+            } else if joyai_ascii_punct_symbol(byte) {
+                while position < text.len() && joyai_ascii_punct_symbol(text[position]) {
+                    position += 1;
+                }
+                while position < text.len() && ascii_newline(text[position]) {
+                    position += 1;
+                }
+            } else if byte.is_ascii_whitespace() {
+                let mut cursor = position;
+                let mut last_newline_end = None;
+                while cursor < text.len() && text[cursor].is_ascii_whitespace() {
+                    let current = text[cursor];
+                    cursor += 1;
+                    if ascii_newline(current) {
+                        last_newline_end = Some(cursor);
+                    }
+                }
+                position = if let Some(last_newline_end) = last_newline_end {
+                    last_newline_end
+                } else if cursor < text.len()
+                    && cursor > position + 1
+                    && (joyai_letter_like_at(text, cursor)
+                        || joyai_ascii_punct_symbol(text[cursor]))
+                {
+                    cursor - 1
+                } else {
+                    cursor
+                };
+            } else {
+                position = next_utf8_char(text, position);
+            }
+            if position == start {
+                position = next_utf8_char(text, position);
+            }
+            self.emit_bpe_piece(&text[start..position], out)?;
+        }
+        Ok(())
+    }
+
+    fn emit_bpe_piece(&self, raw: &[u8], out: &mut Vec<u32>) -> Result<()> {
+        let mut symbols = raw
+            .iter()
+            .map(|byte| {
+                char::from_u32(gpt2_byte_to_codepoint(*byte))
+                    .expect("GPT-2 byte alphabet always maps to a Unicode scalar")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        loop {
+            let best = symbols
+                .windows(2)
+                .enumerate()
+                .filter_map(|(index, pair)| {
+                    let key = format!("{} {}", pair[0], pair[1]);
+                    self.merge_rank.get(&key).copied().map(|rank| (rank, index))
+                })
+                .min_by_key(|(rank, _)| *rank);
+            let Some((_, index)) = best else {
+                break;
+            };
+            let right = symbols.remove(index + 1);
+            symbols[index].push_str(&right);
+        }
+        for symbol in symbols {
+            if let Some(id) = self.token_to_id.get(&symbol) {
+                out.push(*id);
+                continue;
+            }
+            // Matches the reference's defensive byte-symbol fallback.  A
+            // valid pinned vocabulary should always take the direct path.
+            for ch in symbol.chars() {
+                let single = ch.to_string();
+                let id = self.token_to_id.get(&single).with_context(|| {
+                    format!("DeepSeek tokenizer cannot encode BPE symbol {single:?}")
+                })?;
+                out.push(*id);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn gpt2_byte_to_codepoint(byte: u8) -> u32 {
+    if (33..=126).contains(&byte) || (161..=172).contains(&byte) || byte >= 174 {
+        return u32::from(byte);
+    }
+    let mut mapped = 256u32;
+    for candidate in 0u16..=255 {
+        let candidate = candidate as u8;
+        if (33..=126).contains(&candidate) || (161..=172).contains(&candidate) || candidate >= 174 {
+            continue;
+        }
+        if candidate == byte {
+            return mapped;
+        }
+        mapped += 1;
+    }
+    u32::from(byte)
+}
+
+fn gpt2_codepoint_to_byte(codepoint: u32) -> Option<u8> {
+    if (33..=126).contains(&codepoint)
+        || (161..=172).contains(&codepoint)
+        || (174..=255).contains(&codepoint)
+    {
+        return Some(codepoint as u8);
+    }
+    let mut mapped = 256u32;
+    for candidate in 0u16..=255 {
+        let candidate = candidate as u8;
+        if (33..=126).contains(&candidate) || (161..=172).contains(&candidate) || candidate >= 174 {
+            continue;
+        }
+        if mapped == codepoint {
+            return Some(candidate);
+        }
+        mapped += 1;
+    }
+    None
+}
+
+fn next_utf8_char(text: &[u8], position: usize) -> usize {
+    let width = match text.get(position).copied().unwrap_or_default() {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    };
+    position.saturating_add(width).min(text.len())
+}
+
+fn utf8_codepoint_at(text: &[u8], position: usize) -> Option<u32> {
+    let end = next_utf8_char(text, position);
+    std::str::from_utf8(text.get(position..end)?)
+        .ok()?
+        .chars()
+        .next()
+        .map(|ch| ch as u32)
+}
+
+fn joyai_cjk_at(text: &[u8], position: usize) -> bool {
+    matches!(
+        utf8_codepoint_at(text, position),
+        Some(0x4e00..=0x9fa5 | 0x3040..=0x309f | 0x30a0..=0x30ff)
+    )
+}
+
+fn joyai_letter_like_at(text: &[u8], position: usize) -> bool {
+    text.get(position)
+        .is_some_and(|byte| !byte.is_ascii() || byte.is_ascii_alphabetic())
+}
+
+fn joyai_consume_letters(text: &[u8], mut position: usize) -> usize {
+    while position < text.len() && joyai_letter_like_at(text, position) {
+        position = next_utf8_char(text, position);
+    }
+    position
+}
+
+fn joyai_ascii_punct_symbol(byte: u8) -> bool {
+    byte.is_ascii_punctuation()
+}
+
+fn ascii_newline(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeepSeekResidentDtype {
+    F16,
+    F32,
+    I32,
+    Q8_0,
+}
+
+impl DeepSeekResidentDtype {
+    const fn gguf(self) -> GgufTensorType {
+        match self {
+            Self::F16 => GgufTensorType::F16,
+            Self::F32 => GgufTensorType::F32,
+            Self::I32 => GgufTensorType::I32,
+            Self::Q8_0 => GgufTensorType::Q8_0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeepSeekResidentTensor {
+    pub(crate) name: String,
+    pub(crate) dtype: DeepSeekResidentDtype,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) byte_offset: u64,
+    pub(crate) byte_len: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeepSeekV4CompressorGraph {
+    pub(crate) ratio: usize,
+    pub(crate) ape: DeepSeekResidentTensor,
+    pub(crate) kv: DeepSeekResidentTensor,
+    pub(crate) gate: DeepSeekResidentTensor,
+    pub(crate) norm: DeepSeekResidentTensor,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeepSeekV4IndexerGraph {
+    pub(crate) q_b: DeepSeekResidentTensor,
+    pub(crate) projection: DeepSeekResidentTensor,
+    pub(crate) compressor_ape: DeepSeekResidentTensor,
+    pub(crate) compressor_kv: DeepSeekResidentTensor,
+    pub(crate) compressor_gate: DeepSeekResidentTensor,
+    pub(crate) compressor_norm: DeepSeekResidentTensor,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeepSeekV4LayerGraph {
+    pub(crate) hc_attn_fn: DeepSeekResidentTensor,
+    pub(crate) hc_attn_scale: DeepSeekResidentTensor,
+    pub(crate) hc_attn_base: DeepSeekResidentTensor,
+    pub(crate) attn_norm: DeepSeekResidentTensor,
+    pub(crate) attn_q_a: DeepSeekResidentTensor,
+    pub(crate) attn_q_a_norm: DeepSeekResidentTensor,
+    pub(crate) attn_q_b: DeepSeekResidentTensor,
+    pub(crate) attn_kv: DeepSeekResidentTensor,
+    pub(crate) attn_kv_a_norm: DeepSeekResidentTensor,
+    pub(crate) attn_sinks: DeepSeekResidentTensor,
+    pub(crate) attn_output_a: DeepSeekResidentTensor,
+    pub(crate) attn_output_b: DeepSeekResidentTensor,
+    pub(crate) hc_ffn_fn: DeepSeekResidentTensor,
+    pub(crate) hc_ffn_scale: DeepSeekResidentTensor,
+    pub(crate) hc_ffn_base: DeepSeekResidentTensor,
+    pub(crate) ffn_norm: DeepSeekResidentTensor,
+    pub(crate) router: DeepSeekResidentTensor,
+    pub(crate) router_bias: Option<DeepSeekResidentTensor>,
+    pub(crate) shared_gate: DeepSeekResidentTensor,
+    pub(crate) shared_up: DeepSeekResidentTensor,
+    pub(crate) shared_down: DeepSeekResidentTensor,
+    pub(crate) compressor: Option<DeepSeekV4CompressorGraph>,
+    pub(crate) indexer: Option<DeepSeekV4IndexerGraph>,
+    pub(crate) token_hash_routes: Option<DeepSeekResidentTensor>,
+}
+
+/// Fully resolved, family-typed graph descriptor.  Every tensor, compression
+/// mode, routing mode, and kernel-relevant shape is fixed once during load.
+/// Token execution never probes the registry or selects an alternative graph.
+#[derive(Debug, Clone)]
+pub(crate) struct DeepSeekV4ExecutionGraph {
+    pub(crate) config: DeepSeekV4Config,
+    pub(crate) embedding: DeepSeekResidentTensor,
+    pub(crate) output_hc_base: DeepSeekResidentTensor,
+    pub(crate) output_hc_fn: DeepSeekResidentTensor,
+    pub(crate) output_hc_scale: DeepSeekResidentTensor,
+    pub(crate) output_norm: DeepSeekResidentTensor,
+    pub(crate) output: DeepSeekResidentTensor,
+    pub(crate) layers: Vec<DeepSeekV4LayerGraph>,
+}
+
+impl DeepSeekV4ExecutionGraph {
+    pub(crate) fn from_registry(
+        config: DeepSeekV4Config,
+        registry: &TensorRegistry,
+        store_len: u64,
+    ) -> Result<Self> {
+        config.validate_cached_flash_profile()?;
+        let tensor = |name: &str, dtype, shape: &[usize]| {
+            bind_deepseek_tensor(registry, store_len, name, dtype, shape)
+        };
+        let embedding = tensor(
+            "token_embd.weight",
+            DeepSeekResidentDtype::F16,
+            &[4096, 129_280],
+        )?;
+        let output_hc_base = tensor("output_hc_base.weight", DeepSeekResidentDtype::F32, &[4])?;
+        let output_hc_fn = tensor(
+            "output_hc_fn.weight",
+            DeepSeekResidentDtype::F16,
+            &[16_384, 4],
+        )?;
+        let output_hc_scale = tensor("output_hc_scale.weight", DeepSeekResidentDtype::F32, &[1])?;
+        let output_norm = tensor("output_norm.weight", DeepSeekResidentDtype::F32, &[4096])?;
+        let output = tensor(
+            "output.weight",
+            DeepSeekResidentDtype::Q8_0,
+            &[4096, 129_280],
+        )?;
+        let mut layers = Vec::with_capacity(config.block_count);
+        for layer in 0..config.block_count {
+            let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+            let ratio = config.compress_ratios[layer];
+            let compressor = if ratio == 0 {
+                None
+            } else {
+                let width = if ratio == 4 { 1024 } else { 512 };
+                Some(DeepSeekV4CompressorGraph {
+                    ratio,
+                    ape: tensor(
+                        &name("attn_compressor_ape.weight"),
+                        DeepSeekResidentDtype::F16,
+                        &[width, ratio],
+                    )?,
+                    kv: tensor(
+                        &name("attn_compressor_kv.weight"),
+                        DeepSeekResidentDtype::F16,
+                        &[4096, width],
+                    )?,
+                    gate: tensor(
+                        &name("attn_compressor_gate.weight"),
+                        DeepSeekResidentDtype::F16,
+                        &[4096, width],
+                    )?,
+                    norm: tensor(
+                        &name("attn_compressor_norm.weight"),
+                        DeepSeekResidentDtype::F32,
+                        &[512],
+                    )?,
+                })
+            };
+            let indexer = if ratio == 4 {
+                let q_b_entry = registry.require(&name("indexer.attn_q_b.weight"))?;
+                let q_b_dtype = match q_b_entry.dtype.as_str() {
+                    "F16" => DeepSeekResidentDtype::F16,
+                    "Q8_0" => DeepSeekResidentDtype::Q8_0,
+                    other => bail!(
+                        "DeepSeek indexer q_b layer {layer} has unsupported resident dtype {other}"
+                    ),
+                };
+                Some(DeepSeekV4IndexerGraph {
+                    q_b: bind_deepseek_entry(store_len, q_b_entry, q_b_dtype, &[1024, 8192])?,
+                    projection: tensor(
+                        &name("indexer.proj.weight"),
+                        DeepSeekResidentDtype::F16,
+                        &[4096, 64],
+                    )?,
+                    compressor_ape: tensor(
+                        &name("indexer_compressor_ape.weight"),
+                        DeepSeekResidentDtype::F16,
+                        &[256, 4],
+                    )?,
+                    compressor_kv: tensor(
+                        &name("indexer_compressor_kv.weight"),
+                        DeepSeekResidentDtype::F16,
+                        &[4096, 256],
+                    )?,
+                    compressor_gate: tensor(
+                        &name("indexer_compressor_gate.weight"),
+                        DeepSeekResidentDtype::F16,
+                        &[4096, 256],
+                    )?,
+                    compressor_norm: tensor(
+                        &name("indexer_compressor_norm.weight"),
+                        DeepSeekResidentDtype::F32,
+                        &[128],
+                    )?,
+                })
+            } else {
+                None
+            };
+            let token_hash_routes = if layer < config.hash_layer_count {
+                Some(tensor(
+                    &name("ffn_gate_tid2eid.weight"),
+                    DeepSeekResidentDtype::I32,
+                    &[6, 129_280],
+                )?)
+            } else {
+                None
+            };
+            let router_bias = registry
+                .tensor(&name("exp_probs_b.bias"))
+                .map(|entry| {
+                    bind_deepseek_entry(store_len, entry, DeepSeekResidentDtype::F32, &[256])
+                })
+                .transpose()?;
+            layers.push(DeepSeekV4LayerGraph {
+                hc_attn_fn: tensor(
+                    &name("hc_attn_fn.weight"),
+                    DeepSeekResidentDtype::F16,
+                    &[16_384, 24],
+                )?,
+                hc_attn_scale: tensor(
+                    &name("hc_attn_scale.weight"),
+                    DeepSeekResidentDtype::F32,
+                    &[3],
+                )?,
+                hc_attn_base: tensor(
+                    &name("hc_attn_base.weight"),
+                    DeepSeekResidentDtype::F32,
+                    &[24],
+                )?,
+                attn_norm: tensor(
+                    &name("attn_norm.weight"),
+                    DeepSeekResidentDtype::F32,
+                    &[4096],
+                )?,
+                attn_q_a: tensor(
+                    &name("attn_q_a.weight"),
+                    DeepSeekResidentDtype::Q8_0,
+                    &[4096, 1024],
+                )?,
+                attn_q_a_norm: tensor(
+                    &name("attn_q_a_norm.weight"),
+                    DeepSeekResidentDtype::F32,
+                    &[1024],
+                )?,
+                attn_q_b: tensor(
+                    &name("attn_q_b.weight"),
+                    DeepSeekResidentDtype::Q8_0,
+                    &[1024, 32_768],
+                )?,
+                attn_kv: tensor(
+                    &name("attn_kv.weight"),
+                    DeepSeekResidentDtype::Q8_0,
+                    &[4096, 512],
+                )?,
+                attn_kv_a_norm: tensor(
+                    &name("attn_kv_a_norm.weight"),
+                    DeepSeekResidentDtype::F32,
+                    &[512],
+                )?,
+                attn_sinks: tensor(
+                    &name("attn_sinks.weight"),
+                    DeepSeekResidentDtype::F32,
+                    &[64],
+                )?,
+                attn_output_a: tensor(
+                    &name("attn_output_a.weight"),
+                    DeepSeekResidentDtype::Q8_0,
+                    &[4096, 8192],
+                )?,
+                attn_output_b: tensor(
+                    &name("attn_output_b.weight"),
+                    DeepSeekResidentDtype::Q8_0,
+                    &[8192, 4096],
+                )?,
+                hc_ffn_fn: tensor(
+                    &name("hc_ffn_fn.weight"),
+                    DeepSeekResidentDtype::F16,
+                    &[16_384, 24],
+                )?,
+                hc_ffn_scale: tensor(
+                    &name("hc_ffn_scale.weight"),
+                    DeepSeekResidentDtype::F32,
+                    &[3],
+                )?,
+                hc_ffn_base: tensor(
+                    &name("hc_ffn_base.weight"),
+                    DeepSeekResidentDtype::F32,
+                    &[24],
+                )?,
+                ffn_norm: tensor(
+                    &name("ffn_norm.weight"),
+                    DeepSeekResidentDtype::F32,
+                    &[4096],
+                )?,
+                router: tensor(
+                    &name("ffn_gate_inp.weight"),
+                    DeepSeekResidentDtype::F16,
+                    &[4096, 256],
+                )?,
+                router_bias,
+                shared_gate: tensor(
+                    &name("ffn_gate_shexp.weight"),
+                    DeepSeekResidentDtype::Q8_0,
+                    &[4096, 2048],
+                )?,
+                shared_up: tensor(
+                    &name("ffn_up_shexp.weight"),
+                    DeepSeekResidentDtype::Q8_0,
+                    &[4096, 2048],
+                )?,
+                shared_down: tensor(
+                    &name("ffn_down_shexp.weight"),
+                    DeepSeekResidentDtype::Q8_0,
+                    &[2048, 4096],
+                )?,
+                compressor,
+                indexer,
+                token_hash_routes,
+            });
+        }
+        Ok(Self {
+            config,
+            embedding,
+            output_hc_base,
+            output_hc_fn,
+            output_hc_scale,
+            output_norm,
+            output,
+            layers,
+        })
+    }
+}
+
+fn bind_deepseek_tensor(
+    registry: &TensorRegistry,
+    store_len: u64,
+    name: &str,
+    dtype: DeepSeekResidentDtype,
+    shape: &[usize],
+) -> Result<DeepSeekResidentTensor> {
+    bind_deepseek_entry(store_len, registry.require(name)?, dtype, shape)
+}
+
+fn bind_deepseek_entry(
+    store_len: u64,
+    entry: &RuntimeTensorEntry,
+    dtype: DeepSeekResidentDtype,
+    shape: &[usize],
+) -> Result<DeepSeekResidentTensor> {
+    let expected = dtype.gguf();
+    if entry.dtype != expected.name || entry.shape != shape {
+        bail!(
+            "DeepSeek resident tensor {} has dtype/shape {}/{:?}, expected {}/{shape:?}",
+            entry.name,
+            entry.dtype,
+            entry.shape,
+            expected.name
+        );
+    }
+    let elements = shape.iter().try_fold(1u64, |product, dimension| {
+        product
+            .checked_mul(*dimension as u64)
+            .context("DeepSeek tensor element count overflow")
+    })?;
+    let expected_bytes = elements
+        .div_ceil(expected.block_elements)
+        .checked_mul(expected.block_bytes)
+        .context("DeepSeek tensor byte count overflow")?;
+    if entry.byte_len != expected_bytes
+        || entry.byte_offset % TENSOR_ALIGNMENT != 0
+        || entry
+            .byte_offset
+            .checked_add(entry.byte_len)
+            .is_none_or(|end| end > store_len)
+    {
+        bail!(
+            "DeepSeek resident tensor {} has invalid store range offset={} bytes={} expected_bytes={} store_bytes={store_len}",
+            entry.name,
+            entry.byte_offset,
+            entry.byte_len,
+            expected_bytes
+        );
+    }
+    match (&entry.quantization, dtype) {
+        (
+            TensorQuantization::None,
+            DeepSeekResidentDtype::F16 | DeepSeekResidentDtype::F32 | DeepSeekResidentDtype::I32,
+        ) => {}
+        (
+            TensorQuantization::Gguf {
+                tensor_type,
+                block_elements,
+                block_bytes,
+            },
+            DeepSeekResidentDtype::Q8_0,
+        ) if *tensor_type == expected.id
+            && *block_elements == expected.block_elements
+            && *block_bytes == expected.block_bytes => {}
+        _ => bail!(
+            "DeepSeek resident tensor {} has incompatible quantization descriptor {:?}",
+            entry.name,
+            entry.quantization
+        ),
+    }
+    Ok(DeepSeekResidentTensor {
+        name: entry.name.clone(),
+        dtype,
+        shape: entry.shape.clone(),
+        byte_offset: entry.byte_offset,
+        byte_len: entry.byte_len,
+    })
+}
+
+pub(crate) fn deepseek_v4_router_probabilities(logits: &[f32]) -> Result<Vec<f32>> {
+    if logits.len() != 256 {
+        bail!(
+            "DeepSeek V4 router received {} logits, expected 256",
+            logits.len()
+        );
+    }
+    logits
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(expert, logit)| {
+            if !logit.is_finite() {
+                bail!("DeepSeek V4 router logit for expert {expert} is not finite");
+            }
+            let softplus = if logit > 20.0 {
+                logit
+            } else if logit < -20.0 {
+                logit.exp()
+            } else {
+                logit.exp().ln_1p()
+            };
+            Ok(softplus.sqrt())
+        })
+        .collect()
+}
+
+/// Selects the exact six DeepSeek routes.  Returned scores are deliberately
+/// unbiased and unnormalised; the shared scheduler performs the declared
+/// selected-route renormalisation and 1.5 scale exactly once while issuing the
+/// positioned expert reads.
+pub(crate) fn deepseek_v4_select_routes(
+    probabilities: &[f32],
+    correction_bias: Option<&[f32]>,
+    hash_selected: Option<&[i32]>,
+) -> Result<Vec<(usize, f32)>> {
+    if probabilities.len() != 256 {
+        bail!(
+            "DeepSeek V4 route selection received {} probabilities, expected 256",
+            probabilities.len()
+        );
+    }
+    if probabilities
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        bail!("DeepSeek V4 route probabilities must be finite and non-negative");
+    }
+    let selected = if let Some(selected) = hash_selected {
+        if selected.len() != 6 {
+            bail!(
+                "DeepSeek V4 hash routing received {} expert ids, expected 6",
+                selected.len()
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        selected
+            .iter()
+            .copied()
+            .map(|expert| {
+                let expert = usize::try_from(expert)
+                    .context("DeepSeek V4 hash routing contains a negative expert id")?;
+                if expert >= 256 || !seen.insert(expert) {
+                    bail!("DeepSeek V4 hash routing expert {expert} is out of range or duplicated");
+                }
+                Ok(expert)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let bias = correction_bias.unwrap_or(&[]);
+        if !bias.is_empty() && bias.len() != 256 {
+            bail!(
+                "DeepSeek V4 correction bias has {} values, expected 256",
+                bias.len()
+            );
+        }
+        if bias.iter().any(|value| !value.is_finite()) {
+            bail!("DeepSeek V4 correction bias must be finite");
+        }
+        let mut candidates = (0..256usize).collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            let left_score = probabilities[*left] + bias.get(*left).copied().unwrap_or(0.0);
+            let right_score = probabilities[*right] + bias.get(*right).copied().unwrap_or(0.0);
+            right_score
+                .total_cmp(&left_score)
+                .then_with(|| left.cmp(right))
+        });
+        candidates.truncate(6);
+        candidates
+    };
+    Ok(selected
+        .into_iter()
+        .map(|expert| (expert, probabilities[expert]))
+        .collect())
 }
 
 struct ValidatedDeepSeekV4Source<'a> {

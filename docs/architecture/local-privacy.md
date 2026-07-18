@@ -30,6 +30,12 @@ directories and files are owner-only on Unix; writes use temporary files and ato
 `PB_LLAMA_SESSION_CACHE=off` and `PB_FLASHMOE_SESSION_CACHE=off` independently disable disk
 persistence without disabling in-process reuse.
 
+The DeepSeek V4 Flash extension keeps its model, resident tensors, streamed expert packs, tokenizer,
+Metal state, and prompts on the same local path. Its typed hyperconnection/compressed-attention state
+is not currently written to the FlashMoe session cache or reused across requests; the state is reset
+in process when a request begins. Pulling the checkpoint is still an explicit external download,
+after which inference and SSD expert reads require no hosted model service.
+
 No hosted model API is required by the core workflow.
 
 ## Explicit external edges

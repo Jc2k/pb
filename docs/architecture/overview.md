@@ -110,14 +110,25 @@ completes. Fused Colibri `kv_b_proj` weights retain their CPU transpose implemen
 routing uses the correction bias only for expert selection and keeps the checkpoint's routed scaling
 factor.
 
-**Design record.** DSA sparse attention and the MTP speculative head remain GLM follow-on typed
-implementations. DeepSeek V4 Flash is also an active design gate, not shipped support: its
-four-stream hyperconnections, alternating compressed-attention/indexer schedule, hash plus scored
-top-6 routing, and mixed IQ2/Q2 expert layout require new typed stages in the shared graph. pb does
-not substitute the reference Pi runtime's reduced top-2 profile or hide a second engine behind the
-FlashMoe name. Until each capability closes, GLM requests beyond `index_topk` and every DeepSeek V4
-Flash request remain explicit unsupported paths. The detailed target and validation status live in
-the [FlashMoe architecture parity plan](../flashmoe-architecture-parity-plan.md).
+**Configurable, with provisional validation status.** On Apple Silicon, the exact published
+DeepSeek V4 Flash IQ2_XXS/Q2_K GGUF profile extends the same FlashMoe runtime. Pull validates the
+bounded GGUF directory and publishes one resident tensor store plus 43 page-aligned expert packs.
+Load binds a fixed 43-layer graph before inference and compiles its specialized Metal surface:
+four-stream hyperconnections, dense/ratio-4/ratio-128 attention, raw and compressed KV, the ratio-4
+indexer, grouped output, native JoyAI tokenization, and the output head. The shared scheduler issues
+six parallel positioned reads per layer; fused Metal kernels consume the IQ2_XXS gate/up and Q2_K
+down records together with the resident shared expert. There is no top-2 quality profile, runtime
+tensor probing, CPU fallback, DS4 subprocess, or second inference engine.
+
+DeepSeek state is request-scoped for now. pb resets its raw/compressed/indexer KV and
+hyperconnection state before each request and deliberately declines existing FlashMoe session and
+shared-prefix snapshots because those snapshots cannot yet represent the complete typed state.
+Source/cache/graph/routing/ABI tests and local compilation of the specialized Metal library are
+recorded; a full published-checkpoint cache build, official logit/continuation parity, and real
+DeepSeek smoke are still outstanding. DSA sparse attention and the MTP speculative head likewise
+remain GLM follow-on implementations, and GLM requests beyond `index_topk` remain explicit
+unsupported paths. The detailed implementation and evidence boundary lives in the
+[FlashMoe architecture parity plan](../flashmoe-architecture-parity-plan.md).
 
 ## Deliberate seams
 

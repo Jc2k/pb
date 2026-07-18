@@ -14,7 +14,9 @@ sandbox.
 - command, check, LSP, research, and MCP output, including browser MCP results;
 - advisory-agent responses;
 - stale evidence produced before the latest mutation;
-- project configuration until it passes parsing, path, and authority validation.
+- project configuration until it passes parsing, path, and authority validation;
+- downloaded model containers and metadata until their selected backend validates the exact
+  bounded source contract.
 
 These inputs can supply facts. Rust-owned gates decide whether the facts satisfy the current
 contract.
@@ -60,6 +62,15 @@ gain check or commit credit.
 Step, invocation, token, advisory, plan, and repair budgets cap model-driven work. The no-progress
 guard fingerprints repeated failed operations against unchanged workspace/evidence state and can
 block a call or terminate the run without spending another model turn.
+
+### Bounded model-source resolution
+
+FlashMoe does not let a model filename select arbitrary tensor behavior during inference. The
+DeepSeek V4 source adapter accepts one pinned GGUF profile, bounds metadata and tensor-directory
+parsing, validates every required tensor/type/shape and the full compression schedule, and
+atomically publishes a source-independent cache. Load then binds the complete typed graph and Metal
+kernel surface before inference. Unsupported containers or missing stages fail at that boundary;
+the runtime does not probe tensors, invoke a reference executable, or fall back to CPU components.
 
 ## Environment isolation
 

@@ -3,10 +3,10 @@ use super::capabilities::{
     FlashMoeStageImplementation, FlashMoeStagePlacement, FlashMoeUnsupportedCapability,
 };
 use super::experts::{
-    DenseMatvecPayload, EXPERT_SCALE_BIAS_DTYPE_BF16, ExpertMlpProjection, ExpertRawPayload,
-    ExpertRawRead, ExpertRawReadResponse, ExpertReadPath, ExpertReadWorkerPool,
-    ExpertSlotDescriptor, ExpertSlotStore, ExpertStorageLayout, FLASHMOE_EXPERT_IO_POLICY,
-    Q4MatvecPayload, Q4MatvecSource,
+    DeepSeekGgufExpertSlotSpec, DenseMatvecPayload, EXPERT_SCALE_BIAS_DTYPE_BF16,
+    ExpertMlpProjection, ExpertRawPayload, ExpertRawRead, ExpertRawReadResponse, ExpertReadPath,
+    ExpertReadWorkerPool, ExpertSlotDescriptor, ExpertSlotStore, ExpertStorageLayout,
+    FLASHMOE_EXPERT_IO_POLICY, Q4MatvecPayload, Q4MatvecSource, ReusableExpertBytes,
 };
 use super::math::routing_softmax_top_k;
 #[cfg(test)]
@@ -545,6 +545,28 @@ impl FlashMoeExecutionScheduler {
         routes: &[(usize, f32)],
     ) -> Result<ScheduledRoutingCommand> {
         cmd2.command_from_post_attention_prep_routes(&self.graph, state, routes)
+    }
+
+    /// DeepSeek's router is already fully selected by its typed graph (token
+    /// hash for layers 0..2, biased sqrt-softplus top-k afterwards).  This
+    /// enters the same scheduler-owned positioned-read lifecycle used by every
+    /// other FlashMoe family and returns reusable whole-expert slots.
+    pub(crate) fn read_preselected_experts(
+        &mut self,
+        layer: usize,
+        routes: &[(usize, f32)],
+    ) -> Result<ScheduledExpertSet<Arc<ScheduledExpertSlot>>> {
+        let routing = self
+            .graph
+            .build_routing_topk(
+                layer,
+                self.graph.experts_per_layer(),
+                self.graph.active_experts(),
+                ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+            )?
+            .command_from_preselected(routes)?;
+        let pending = self.expert_reads.issue_routing_command(&routing)?;
+        self.expert_reads.finish_routes(pending)
     }
 
     pub(crate) fn resolve_router_score_projection(
@@ -2333,6 +2355,7 @@ where
 pub enum ScheduledExpertPhaseMlpPayload<'a> {
     Q4(ScheduledQ4ExpertPhaseMlpPayload<'a>),
     Dense(ScheduledDenseExpertPhaseMlpPayload<'a>),
+    DeepSeekGguf(ScheduledDeepSeekGgufExpertPhaseMlpPayload<'a>),
 }
 
 impl<'a> ScheduledExpertPhaseMlpPayload<'a> {
@@ -2340,7 +2363,9 @@ impl<'a> ScheduledExpertPhaseMlpPayload<'a> {
     pub(crate) fn q4(&self) -> &ScheduledQ4ExpertPhaseMlpPayload<'a> {
         match self {
             Self::Q4(payload) => payload,
-            Self::Dense(_) => panic!("scheduled expert payload is dense, not Q4"),
+            Self::Dense(_) | Self::DeepSeekGguf(_) => {
+                panic!("scheduled expert payload is not Q4")
+            }
         }
     }
 
@@ -2361,7 +2386,41 @@ impl<'a> ScheduledExpertPhaseMlpPayload<'a> {
                 super::experts::DenseExpertDtype::Bf16 => ExpertStorageLayout::FixedBf16,
                 super::experts::DenseExpertDtype::F16 => ExpertStorageLayout::FixedF16,
             },
+            Self::DeepSeekGguf(_) => ExpertStorageLayout::FixedDeepSeekGguf,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScheduledDeepSeekGgufExpertPhaseMlpPayload<'a> {
+    pub(crate) layer: usize,
+    pub(crate) expert: usize,
+    pub(crate) spec: DeepSeekGgufExpertSlotSpec,
+    pub(crate) bytes: &'a ReusableExpertBytes,
+}
+
+impl<'a> ScheduledDeepSeekGgufExpertPhaseMlpPayload<'a> {
+    fn new(
+        layer: usize,
+        expert: usize,
+        spec: DeepSeekGgufExpertSlotSpec,
+        bytes: &'a ReusableExpertBytes,
+        width: usize,
+    ) -> Result<Self> {
+        if width != spec.hidden_size || bytes.len() != spec.expert_bytes {
+            bail!(
+                "FlashMoe unsupported DeepSeek active expert CMD3 slot layer {layer} expert {expert}: width/bytes {width}/{} do not match resolved {}/{}",
+                bytes.len(),
+                spec.hidden_size,
+                spec.expert_bytes
+            );
+        }
+        Ok(Self {
+            layer,
+            expert,
+            spec,
+            bytes,
+        })
     }
 }
 
@@ -3031,6 +3090,22 @@ impl ScheduledExpertRoutes {
                     *weight *= inverse_sum;
                 }
             }
+            QwenMoeRoutingWeightNormalization::DeepSeekRenormalizeSelectedWithFloor => {
+                const DEEPSEEK_SELECTED_SUM_FLOOR: f32 = 6.103515625e-5;
+                let sum = weights.iter().sum::<f32>();
+                if !(sum.is_finite() && sum >= 0.0) {
+                    bail!(
+                        "DeepSeek selected expert probabilities must have a finite non-negative sum"
+                    );
+                }
+                let inverse_sum = sum.max(DEEPSEEK_SELECTED_SUM_FLOOR).recip();
+                for weight in &mut weights {
+                    if *weight < 0.0 {
+                        bail!("DeepSeek selected expert probabilities must be non-negative");
+                    }
+                    *weight *= inverse_sum;
+                }
+            }
             QwenMoeRoutingWeightNormalization::PreserveFullSoftmax => bail!(
                 "FlashMoe unsupported routing weights: preserving probabilities from the full expert softmax requires a declared scheduler implementation"
             ),
@@ -3282,6 +3357,7 @@ impl ScheduledExpertSlot {
             ExpertRawPayload::Pbq4(bytes) => bytes.as_slice(),
             ExpertRawPayload::FixedQ4(fixed_q4) => fixed_q4.bytes.as_slice(),
             ExpertRawPayload::FixedDense(fixed_dense) => fixed_dense.bytes.as_slice(),
+            ExpertRawPayload::FixedDeepSeekGguf(deepseek) => deepseek.bytes.as_slice(),
         };
         for byte in prefix.iter().take(4096) {
             hash = hash.rotate_left(5) ^ u64::from(*byte);
@@ -3365,6 +3441,17 @@ impl ScheduledCmd3ExpertPayload for ScheduledExpertSlot {
                         gate,
                         up,
                         down,
+                    )?,
+                ))
+            }
+            ExpertRawPayload::FixedDeepSeekGguf(deepseek) => {
+                Ok(ScheduledExpertPhaseMlpPayload::DeepSeekGguf(
+                    ScheduledDeepSeekGgufExpertPhaseMlpPayload::new(
+                        self.layer(),
+                        self.expert(),
+                        deepseek.spec,
+                        &deepseek.bytes,
+                        width,
                     )?,
                 ))
             }
@@ -7962,6 +8049,30 @@ mod tests {
         for (actual, expected) in scheduled.weights.iter().zip(expected.iter()) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn deepseek_routes_apply_the_fixed_selected_sum_floor_without_affecting_standard_routes() {
+        let routes = ExpertRoute::from_scores(&[(7, 1.0e-6), (3, 2.0e-6)]).unwrap();
+        let deepseek = ScheduledExpertRoutes::from_routes_with_policy(
+            12,
+            routes.clone(),
+            QwenMoeRoutingWeightNormalization::DeepSeekRenormalizeSelectedWithFloor,
+            1.5,
+        )
+        .unwrap();
+        let standard = ScheduledExpertRoutes::from_routes_with_policy(
+            12,
+            routes,
+            QwenMoeRoutingWeightNormalization::RenormalizeSelected,
+            1.5,
+        )
+        .unwrap();
+
+        assert!((deepseek.weights[0] - 1.5e-6 / 6.103515625e-5).abs() < 1.0e-7);
+        assert!((deepseek.weights[1] - 3.0e-6 / 6.103515625e-5).abs() < 1.0e-7);
+        assert!((standard.weights[0] - 0.5).abs() < 1.0e-6);
+        assert!((standard.weights[1] - 1.0).abs() < 1.0e-6);
     }
 
     #[test]

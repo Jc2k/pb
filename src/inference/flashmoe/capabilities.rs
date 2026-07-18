@@ -1,8 +1,9 @@
 use std::error::Error;
 use std::fmt;
 
+use super::deepseek_metal::DEEPSEEK_V4_REQUIRED_METAL_KERNELS;
 #[cfg(test)]
-use super::experts::FixedQ4ExpertSlotSpec;
+use super::experts::{DeepSeekGgufExpertSlotSpec, FixedQ4ExpertSlotSpec};
 use super::experts::{ExpertSlotSpec, ExpertStorageLayout, ExpertStoreExecutionDescriptor};
 #[cfg(test)]
 use super::metal::MetalPipelineNameSet;
@@ -89,6 +90,7 @@ impl FlashMoeStagePlacement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashMoeStageImplementation {
     QwenTextInput,
+    DeepSeekV4TextInput,
     QwenVlTypedInput,
     DeferredMetalCmd3,
     MetalResidentAttentionProjections,
@@ -96,11 +98,14 @@ pub enum FlashMoeStageImplementation {
     QwenFullAttentionCpuKv,
     GlmMlaCpuWeightAbsorption,
     GlmMlaMetalQ4AbsorbedAttention,
+    DeepSeekV4HyperconnectionCompressedAttentionMetal,
     MetalResidentPostAttention,
     CpuSoftmaxTopK,
     CpuSigmoidNoAuxTopK,
+    CpuDeepSeekV4HashOrNoAuxTopK,
     ParallelPositionedWholeExpertReads,
     MetalTypedExpertResidentSharedCombine,
+    MetalDeepSeekV4Iq2Q2ExpertSharedCombine,
     MetalResidentLmHeadSampler,
 }
 
@@ -108,6 +113,7 @@ impl FlashMoeStageImplementation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::QwenTextInput => "Qwen text token/position adapter",
+            Self::DeepSeekV4TextInput => "DeepSeek V4 Flash text token/position adapter",
             Self::QwenVlTypedInput => "Qwen-VL typed token/position/embedding/DeepStack adapter",
             Self::DeferredMetalCmd3 => "deferred Metal CMD3 handoff",
             Self::MetalResidentAttentionProjections => {
@@ -119,16 +125,25 @@ impl FlashMoeStageImplementation {
             Self::GlmMlaMetalQ4AbsorbedAttention => {
                 "GLM compressed-KV MLA with Metal resident-Q4 absorbed attention"
             }
+            Self::DeepSeekV4HyperconnectionCompressedAttentionMetal => {
+                "DeepSeek V4 four-stream hyperconnection and compressed attention on Metal"
+            }
             Self::MetalResidentPostAttention => {
                 "Metal resident Q4/BF16/F16/F32 post-attention and router projection"
             }
             Self::CpuSoftmaxTopK => "Qwen-family CPU softmax/topK",
             Self::CpuSigmoidNoAuxTopK => "GLM CPU sigmoid/noaux topK",
+            Self::CpuDeepSeekV4HashOrNoAuxTopK => {
+                "DeepSeek V4 token-hash or sqrt-softplus/noaux topK"
+            }
             Self::ParallelPositionedWholeExpertReads => {
                 "parallel positioned reads into typed fixed Q4/BF16/F16 whole-expert slots"
             }
             Self::MetalTypedExpertResidentSharedCombine => {
                 "Metal typed Q4/BF16/F16 active experts and resident Q4/BF16/F16/F32 shared/no-shared combine"
+            }
+            Self::MetalDeepSeekV4Iq2Q2ExpertSharedCombine => {
+                "Metal fused IQ2_XXS gate/up, Q2_K down, shared expert, and hyperconnection combine"
             }
             Self::MetalResidentLmHeadSampler => {
                 "Metal resident Q4/BF16/F16/F32 LM-head and sampler"
@@ -142,6 +157,7 @@ pub(crate) enum FlashMoeAttentionMathCapability {
     QwenFullAttentionCpuKv,
     GlmMlaCpuWeightAbsorption,
     GlmMlaMetalQ4AbsorbedAttention,
+    DeepSeekV4HyperconnectionCompressedAttentionMetal,
 }
 
 impl fmt::Display for FlashMoeStageImplementation {
@@ -219,10 +235,14 @@ impl FlashMoeCapabilityPlan {
         manifest_attention_layers: &[QwenMoeLayerKind],
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
-        let attention_math = if layout.family == QwenMoeFamily::Glm52 {
-            FlashMoeAttentionMathCapability::GlmMlaCpuWeightAbsorption
-        } else {
-            FlashMoeAttentionMathCapability::QwenFullAttentionCpuKv
+        let attention_math = match layout.family {
+            QwenMoeFamily::Glm52 => FlashMoeAttentionMathCapability::GlmMlaCpuWeightAbsorption,
+            QwenMoeFamily::DeepSeekV4Flash => {
+                FlashMoeAttentionMathCapability::DeepSeekV4HyperconnectionCompressedAttentionMetal
+            }
+            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => {
+                FlashMoeAttentionMathCapability::QwenFullAttentionCpuKv
+            }
         };
         Self::resolve_with_attention_math(
             layout,
@@ -248,6 +268,18 @@ impl FlashMoeCapabilityPlan {
         validate_upstream_execution_policy(layout)?;
         let input_implementation = resolve_input_adapter(layout, input_adapter)?;
         let attention_layers = resolve_attention_layers(layout, manifest_attention_layers)?;
+        if layout.family == QwenMoeFamily::DeepSeekV4Flash {
+            return Self::resolve_deepseek_graph(
+                layout,
+                input_adapter,
+                input_implementation,
+                dense_layout,
+                expert_storage,
+                attention_layers,
+                attention_math,
+                metal,
+            );
+        }
         Self::resolve_qwen_graph(
             layout,
             input_adapter,
@@ -258,6 +290,130 @@ impl FlashMoeCapabilityPlan {
             attention_math,
             metal,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_deepseek_graph(
+        layout: &QwenMoeModelLayout,
+        input_adapter: FlashMoeInputAdapterCapability,
+        input_implementation: FlashMoeStageImplementation,
+        dense_layout: ResidentDenseLayout,
+        expert_storage: ExpertStoreExecutionDescriptor,
+        attention_layers: Box<[QwenMoeLayerKind]>,
+        attention_math: FlashMoeAttentionMathCapability,
+        metal: Option<MetalRuntimeCapabilities>,
+    ) -> Result<Self, FlashMoeUnsupportedCapability> {
+        if input_implementation != FlashMoeStageImplementation::DeepSeekV4TextInput
+            || attention_math
+                != FlashMoeAttentionMathCapability::DeepSeekV4HyperconnectionCompressedAttentionMetal
+            || layout.execution.routing
+                != QwenMoeRoutingPlacement::CpuDeepSeekV4HashOrNoAuxTopK
+        {
+            return Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::TokenPositionInputPreparation,
+                "DeepSeek V4 Flash requires its native text, hyperconnection/compressed-attention, and hash/noaux routing graph",
+            ));
+        }
+        let expected_slot_spec = ExpertSlotSpec::from_model_layout(layout, expert_storage.layout)
+            .map_err(|error| {
+            FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::ActiveExpertReads,
+                format!("DeepSeek expert layout cannot be resolved: {error}"),
+            )
+        })?;
+        if expert_storage.layout != ExpertStorageLayout::FixedDeepSeekGguf
+            || expert_storage.slot_spec != expected_slot_spec
+            || expert_storage.layers != layout.layers
+            || expert_storage.first_expert_layer != 0
+            || expert_storage.experts_per_layer != 256
+            || layout.scheduled_active_experts != 6
+        {
+            return Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::ActiveExpertReads,
+                "DeepSeek V4 Flash requires 43 fixed IQ2_XXS/Q2_K expert packs with scheduler-owned K=6 slots",
+            ));
+        }
+        let metal = metal.ok_or_else(|| {
+            FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::DeferredPreviousCmd3,
+                "DeepSeek V4 Flash requires the load-specialized Apple Silicon Metal graph",
+            )
+        })?;
+        require_stage_kernels(
+            layout.family,
+            &metal,
+            FlashMoeGraphStage::Cmd1AttentionProjections,
+            DEEPSEEK_V4_REQUIRED_METAL_KERNELS,
+        )?;
+        let routing_weight_normalization = require_deepseek_route_renormalization(layout)?;
+        let stages = vec![
+            FlashMoeStageCapability::new(
+                FlashMoeGraphStage::TokenPositionInputPreparation,
+                FlashMoeStagePlacement::InputAdapter,
+                FlashMoeStageImplementation::DeepSeekV4TextInput,
+            ),
+            FlashMoeStageCapability::new(
+                FlashMoeGraphStage::DeferredPreviousCmd3,
+                FlashMoeStagePlacement::Metal,
+                FlashMoeStageImplementation::DeferredMetalCmd3,
+            ),
+            FlashMoeStageCapability::new(
+                FlashMoeGraphStage::Cmd1AttentionProjections,
+                FlashMoeStagePlacement::Metal,
+                FlashMoeStageImplementation::DeepSeekV4HyperconnectionCompressedAttentionMetal,
+            ),
+            FlashMoeStageCapability::new(
+                FlashMoeGraphStage::AttentionMath,
+                FlashMoeStagePlacement::Metal,
+                FlashMoeStageImplementation::DeepSeekV4HyperconnectionCompressedAttentionMetal,
+            ),
+            FlashMoeStageCapability::new(
+                FlashMoeGraphStage::Cmd2PostAttentionAndRoutingProjection,
+                FlashMoeStagePlacement::Metal,
+                FlashMoeStageImplementation::DeepSeekV4HyperconnectionCompressedAttentionMetal,
+            ),
+            FlashMoeStageCapability::new(
+                FlashMoeGraphStage::RoutingSoftmaxTopK,
+                FlashMoeStagePlacement::CpuDeclared,
+                FlashMoeStageImplementation::CpuDeepSeekV4HashOrNoAuxTopK,
+            ),
+            FlashMoeStageCapability::new(
+                FlashMoeGraphStage::ActiveExpertReads,
+                FlashMoeStagePlacement::SchedulerIo,
+                FlashMoeStageImplementation::ParallelPositionedWholeExpertReads,
+            ),
+            FlashMoeStageCapability::new(
+                FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
+                FlashMoeStagePlacement::Metal,
+                FlashMoeStageImplementation::MetalDeepSeekV4Iq2Q2ExpertSharedCombine,
+            ),
+            FlashMoeStageCapability::new(
+                FlashMoeGraphStage::LmHeadAndSampling,
+                FlashMoeStagePlacement::Sampler,
+                FlashMoeStageImplementation::MetalResidentLmHeadSampler,
+            ),
+        ];
+        let plan = Self {
+            family: layout.family,
+            input_adapter,
+            dense_layout,
+            expert_storage,
+            device: FlashMoeDeviceCapability { metal },
+            routing: layout.execution.routing,
+            experts_per_layer: layout.experts_per_layer,
+            active_experts: layout.scheduled_active_experts,
+            routing_weight_normalization,
+            routed_expert_scale: layout.routed_expert_scale,
+            state_policy: FlashMoeStatePolicy::DeferredGpuNextLayer,
+            attention_layers,
+            stages,
+        };
+        plan.validate_complete()?;
+        Ok(plan)
     }
 
     fn resolve_qwen_graph(
@@ -452,6 +608,10 @@ impl FlashMoeCapabilityPlan {
             ExpertStorageLayout::FixedF16 => {
                 &[kernels::DENSE_MMAP_FMA_MATVEC_F16, kernels::SILU_PRODUCT]
             }
+            ExpertStorageLayout::FixedDeepSeekGguf => &[
+                kernels::DEEPSEEK_IQ2_XXS_PAIR_SWIGLU,
+                kernels::DEEPSEEK_Q2_K_SUM6,
+            ],
         };
         require_stage_kernels(
             layout.family,
@@ -543,6 +703,9 @@ impl FlashMoeCapabilityPlan {
                     QwenMoeRoutingPlacement::CpuSigmoidNoAuxTopK => {
                         FlashMoeStageImplementation::CpuSigmoidNoAuxTopK
                     }
+                    QwenMoeRoutingPlacement::CpuDeepSeekV4HashOrNoAuxTopK => {
+                        FlashMoeStageImplementation::CpuDeepSeekV4HashOrNoAuxTopK
+                    }
                 },
             ),
             FlashMoeStageCapability::new(
@@ -588,15 +751,22 @@ impl FlashMoeCapabilityPlan {
         let attention_layers = (0..layout.layers)
             .map(|layer| layout.layer_kind(layer))
             .collect::<Vec<_>>();
+        let metal = MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new());
         Self::resolve(
             layout,
             FlashMoeInputAdapterCapability::QwenText,
-            ResidentDenseLayout::Q4,
+            if layout.family == QwenMoeFamily::DeepSeekV4Flash {
+                ResidentDenseLayout::F16
+            } else {
+                ResidentDenseLayout::Q4
+            },
             test_expert_storage(layout)?,
             &attention_layers,
-            Some(MetalRuntimeCapabilities::from_pipeline_names(
-                MetalPipelineNameSet::new(),
-            )),
+            Some(if layout.family == QwenMoeFamily::DeepSeekV4Flash {
+                metal.with_additional(DEEPSEEK_V4_REQUIRED_METAL_KERNELS)
+            } else {
+                metal
+            }),
         )
     }
 
@@ -659,6 +829,9 @@ fn resolve_input_adapter(
             QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Glm52,
             FlashMoeInputAdapterCapability::QwenText,
         ) => Ok(FlashMoeStageImplementation::QwenTextInput),
+        (QwenMoeFamily::DeepSeekV4Flash, FlashMoeInputAdapterCapability::QwenText) => {
+            Ok(FlashMoeStageImplementation::DeepSeekV4TextInput)
+        }
         (
             QwenMoeFamily::Qwen3VlMoe,
             FlashMoeInputAdapterCapability::QwenVl {
@@ -712,6 +885,22 @@ fn resolve_input_adapter(
 fn test_expert_storage(
     layout: &QwenMoeModelLayout,
 ) -> Result<ExpertStoreExecutionDescriptor, FlashMoeUnsupportedCapability> {
+    if layout.family == QwenMoeFamily::DeepSeekV4Flash {
+        let spec = DeepSeekGgufExpertSlotSpec::from_model_layout(layout).map_err(|error| {
+            FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::ActiveExpertReads,
+                format!("model family has no fixed DeepSeek test layout: {error}"),
+            )
+        })?;
+        return Ok(ExpertStoreExecutionDescriptor {
+            layout: ExpertStorageLayout::FixedDeepSeekGguf,
+            slot_spec: ExpertSlotSpec::FixedDeepSeekGguf(spec),
+            layers: layout.layers,
+            first_expert_layer: layout.first_sparse_layer,
+            experts_per_layer: layout.experts_per_layer,
+        });
+    }
     let fixed_q4 = match layout.family {
         QwenMoeFamily::Glm52 => FixedQ4ExpertSlotSpec::mxfp4_from_model_layout(layout),
         _ => FixedQ4ExpertSlotSpec::from_model_layout(layout),
@@ -763,7 +952,9 @@ fn validate_upstream_execution_policy(
     }
     if !matches!(
         execution.routing,
-        QwenMoeRoutingPlacement::CpuSoftmaxTopK | QwenMoeRoutingPlacement::CpuSigmoidNoAuxTopK
+        QwenMoeRoutingPlacement::CpuSoftmaxTopK
+            | QwenMoeRoutingPlacement::CpuSigmoidNoAuxTopK
+            | QwenMoeRoutingPlacement::CpuDeepSeekV4HashOrNoAuxTopK
     ) {
         return Err(FlashMoeUnsupportedCapability::new(
             layout.family,
@@ -799,6 +990,13 @@ fn require_selected_route_renormalization(
         Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected) => {
             Ok(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
         }
+        Some(QwenMoeRoutingWeightNormalization::DeepSeekRenormalizeSelectedWithFloor) => {
+            Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::RoutingSoftmaxTopK,
+                "the DeepSeek selected-route denominator floor is only valid for the typed DeepSeek graph",
+            ))
+        }
         Some(QwenMoeRoutingWeightNormalization::PreserveFullSoftmax) => {
             Err(FlashMoeUnsupportedCapability::new(
                 layout.family,
@@ -810,6 +1008,21 @@ fn require_selected_route_renormalization(
             layout.family,
             FlashMoeGraphStage::RoutingSoftmaxTopK,
             "the model config does not declare norm_topk_prob, so routing-weight normalization cannot be resolved",
+        )),
+    }
+}
+
+fn require_deepseek_route_renormalization(
+    layout: &QwenMoeModelLayout,
+) -> Result<QwenMoeRoutingWeightNormalization, FlashMoeUnsupportedCapability> {
+    match layout.routing_weight_normalization {
+        Some(QwenMoeRoutingWeightNormalization::DeepSeekRenormalizeSelectedWithFloor) => {
+            Ok(QwenMoeRoutingWeightNormalization::DeepSeekRenormalizeSelectedWithFloor)
+        }
+        _ => Err(FlashMoeUnsupportedCapability::new(
+            layout.family,
+            FlashMoeGraphStage::RoutingSoftmaxTopK,
+            "DeepSeek V4 Flash requires selected-route renormalization with its fixed 2^-14 denominator floor",
         )),
     }
 }
@@ -854,7 +1067,10 @@ mod tests {
     use crate::inference::flashmoe::scheduler::{
         FlashMoeScheduledGraph, ScheduledAttentionMathImplementation,
     };
-    use crate::inference::flashmoe::{GLM52_MODEL, QWEN3_VL_MODEL, QWEN35_MODEL, QwenModelConfig};
+    use crate::inference::flashmoe::{
+        DEEPSEEK_V4_FLASH_MODEL, DeepSeekV4Config, GLM52_MODEL, QWEN3_VL_MODEL, QWEN35_MODEL,
+        QwenModelConfig,
+    };
 
     fn config(json: &[u8]) -> QwenModelConfig {
         serde_json::from_slice(json).unwrap()
@@ -970,6 +1186,11 @@ mod tests {
         QwenMoeModelLayout::from_config(GLM52_MODEL, &config).unwrap()
     }
 
+    fn deepseek_v4_layout() -> QwenMoeModelLayout {
+        let config = DeepSeekV4Config::expected_flash_profile().shared_runtime_config();
+        QwenMoeModelLayout::from_config(DEEPSEEK_V4_FLASH_MODEL, &config).unwrap()
+    }
+
     fn attention_layers(layout: &QwenMoeModelLayout) -> Vec<QwenMoeLayerKind> {
         (0..layout.layers)
             .map(|layer| layout.layer_kind(layer))
@@ -999,6 +1220,55 @@ mod tests {
 
     fn full_metal() -> MetalRuntimeCapabilities {
         MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
+    }
+
+    fn deepseek_metal() -> MetalRuntimeCapabilities {
+        full_metal().with_additional(DEEPSEEK_V4_REQUIRED_METAL_KERNELS)
+    }
+
+    #[test]
+    fn deepseek_v4_resolves_a_complete_fixed_metal_and_streaming_graph() {
+        let layout = deepseek_v4_layout();
+        let plan = FlashMoeCapabilityPlan::resolve_with_attention_math(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::F16,
+            test_expert_storage(&layout).unwrap(),
+            &attention_layers(&layout),
+            FlashMoeAttentionMathCapability::DeepSeekV4HyperconnectionCompressedAttentionMetal,
+            Some(deepseek_metal()),
+        )
+        .unwrap();
+
+        plan.validate_complete().unwrap();
+        assert_eq!(plan.family, QwenMoeFamily::DeepSeekV4Flash);
+        assert_eq!(plan.active_experts, 6);
+        assert_eq!(
+            plan.expert_storage.layout,
+            ExpertStorageLayout::FixedDeepSeekGguf
+        );
+        assert_eq!(
+            plan.routing_weight_normalization,
+            QwenMoeRoutingWeightNormalization::DeepSeekRenormalizeSelectedWithFloor
+        );
+        assert_eq!(
+            plan.stage(FlashMoeGraphStage::AttentionMath)
+                .unwrap()
+                .implementation,
+            FlashMoeStageImplementation::DeepSeekV4HyperconnectionCompressedAttentionMetal
+        );
+        assert_eq!(
+            plan.stage(FlashMoeGraphStage::ActiveExpertReads)
+                .unwrap()
+                .placement,
+            FlashMoeStagePlacement::SchedulerIo
+        );
+        assert_eq!(
+            plan.stage(FlashMoeGraphStage::Cmd3ExpertAndSharedCombine)
+                .unwrap()
+                .implementation,
+            FlashMoeStageImplementation::MetalDeepSeekV4Iq2Q2ExpertSharedCombine
+        );
     }
 
     fn text_adapter() -> FlashMoeInputAdapterCapability {

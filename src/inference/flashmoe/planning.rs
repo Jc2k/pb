@@ -38,7 +38,21 @@ impl FlashMoeRoutingPolicy {
         config: &QwenModelConfig,
     ) -> Result<ResolvedRoutingPolicy> {
         let qwen35_profile = is_qwen35_or_legacy_alias(model);
-        let (source, active_experts) = if let Some(active_experts) = self.active_experts_override {
+        let deepseek_profile = is_deepseek_v4_flash(model);
+        let (source, active_experts) = if deepseek_profile {
+            if let Some(active_experts) = self.active_experts_override
+                && active_experts != config.config_active_experts()
+            {
+                bail!(
+                    "DeepSeek V4 Flash uses checkpoint-exact top-{} routing; K={active_experts} is unsupported even when forced",
+                    config.config_active_experts()
+                );
+            }
+            (
+                ActiveExpertsSource::DeepSeekV4FlashProfile,
+                config.config_active_experts(),
+            )
+        } else if let Some(active_experts) = self.active_experts_override {
             (ActiveExpertsSource::UserOverride, active_experts)
         } else if qwen35_profile {
             (
@@ -83,6 +97,7 @@ impl FlashMoeRoutingPolicy {
 pub(crate) enum ActiveExpertsSource {
     ModelConfig,
     Qwen35FlashMoeProfile,
+    DeepSeekV4FlashProfile,
     UserOverride,
 }
 
@@ -680,6 +695,22 @@ mod tests {
             .unwrap();
         assert_eq!(forced.active_experts, 3);
         assert!(forced.force_active_experts);
+    }
+
+    #[test]
+    fn routing_policy_keeps_deepseek_at_checkpoint_exact_top_six_even_when_forced() {
+        let config = super::super::deepseek::DeepSeekV4Config::expected_flash_profile()
+            .shared_runtime_config();
+        let resolved = FlashMoeRoutingPolicy::default()
+            .resolve(DEEPSEEK_V4_FLASH_MODEL, &config)
+            .unwrap();
+        assert_eq!(resolved.active_experts, 6);
+        assert_eq!(resolved.source, ActiveExpertsSource::DeepSeekV4FlashProfile);
+
+        let error = FlashMoeRoutingPolicy::new(Some(2), true)
+            .resolve(DEEPSEEK_V4_FLASH_MODEL, &config)
+            .unwrap_err();
+        assert!(error.to_string().contains("top-6 routing"), "{error:#}");
     }
 
     #[test]
