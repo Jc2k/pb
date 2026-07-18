@@ -10137,7 +10137,12 @@ impl CompletionEngine for FlashMoeCompletionEngine {
     }
 
     fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
-        self.runtime.lock()?.persist_session_cache(session_id)
+        let mut engine = self.runtime.lock()?;
+        if engine.supports_session_snapshots() {
+            engine.persist_session_cache(session_id)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -10167,7 +10172,11 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
     }
 
     fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
-        self.engine.persist_session_cache(session_id)
+        if self.engine.supports_session_snapshots() {
+            self.engine.persist_session_cache(session_id)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -10180,10 +10189,12 @@ fn generate_flashmoe_completion(
 ) -> Result<CompletionOutput> {
     let energy_start = energy::sample();
     let started = Instant::now();
-    let output = engine.generate_structured_in_session(
-        &args.session_id,
-        &flashmoe_structured_request(args, messages, tools, enable_thinking)?,
-    )?;
+    let request = flashmoe_structured_request(args, messages, tools, enable_thinking)?;
+    let output = if engine.supports_session_snapshots() {
+        engine.generate_structured_in_session(&args.session_id, &request)?
+    } else {
+        engine.generate_structured(&request)?
+    };
     let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
     Ok(CompletionOutput {
         content: output.content,

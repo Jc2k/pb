@@ -33,7 +33,8 @@ persistence without disabling in-process reuse.
 The DeepSeek V4 Flash extension keeps its model, resident tensors, streamed expert packs, tokenizer,
 Metal state, and prompts on the same local path. Its typed hyperconnection/compressed-attention state
 is not currently written to the FlashMoe session cache or reused across requests; the state is reset
-in process when a request begins. Pulling the checkpoint is still an explicit external download,
+in process when a request begins, and requests for logical session reuse are rejected explicitly.
+Pulling the checkpoint is still an explicit external download,
 after which inference and SSD expert reads require no hosted model service.
 
 No hosted model API is required by the core workflow.

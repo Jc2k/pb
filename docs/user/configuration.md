@@ -50,10 +50,13 @@ Full-attention KV, compressed MLA KV, linear-attention conv/SSM state, final hid
 ids are stored together, so hybrid Qwen and GLM checkpoints restore the state their forward graph
 actually needs.
 
-DeepSeek V4 Flash is deliberately excluded from that reuse for now. Its four hyperconnection
+DeepSeek V4 Flash is deliberately excluded from that reuse. Its four hyperconnection
 streams plus raw, compressed, and indexer KV form one typed state that the current snapshot format
-cannot represent. Every DeepSeek request therefore starts from a freshly reset request-scoped
-state; pb does not restore a partial Qwen/GLM snapshot or advertise cached prompt tokens for it.
+cannot represent. Every ordinary DeepSeek request therefore starts from a freshly reset
+request-scoped state. Supplying `--session-id` is a named capability error; pb does not silently
+restore a partial Qwen/GLM snapshot, downgrade to uncached session execution, or advertise cached
+prompt tokens for it. The managed agent backend recognizes the load-resolved capability and sends
+ordinary request-scoped turns, preserving multi-turn tool execution without claiming cache reuse.
 
 The web/service path retains loaded FlashMoe runtimes across managed turns. It retains up to two
 idle models by default and reaps an unused runtime after 15 minutes. Set
@@ -109,7 +112,7 @@ the optional MTP speculative head are not currently implemented.
 
 ## DeepSeek V4 Flash with FlashMoe
 
-**Configurable, with provisional validation status.** On Apple Silicon, pb recognizes exactly the
+**Shipped for the pinned request-scoped profile.** On Apple Silicon, pb recognizes exactly the
 published DeepSeek V4 Flash IQ2_XXS/Q2_K checkpoint:
 
 ```bash
@@ -129,13 +132,15 @@ space before pulling.
 Load resolves the complete graph and required fused Metal kernels before the first token. Top-6 is
 part of the checkpoint contract: `--flashmoe-active-experts` cannot reduce it. There is no llama.cpp
 fallback, CPU component fallback, DS4 process, hidden top-2 mode, or alternate generation loop.
-DeepSeek is text-only in this profile, and existing FlashMoe session/prefix reuse is disabled as
-described above. The implementation has local graph, routing, ABI, all-target, and Metal shader
-compilation evidence plus a complete published-checkpoint cache build and real-model Metal
-load/prefill/decode. A one-token raw arithmetic smoke emitted `4`, a 16-token run exercised repeated
-decode, and a 233-token prompt crossed ratio-4/ratio-128 compression and the raw sliding-window
-boundary. Treat numerical parity as provisional until independent continuation/logit vectors and
-structured-tool evidence land.
+DeepSeek is text-only in this profile, and requests for existing FlashMoe session/prefix reuse fail
+explicitly as described above. The implementation has local graph, routing, ABI, all-target, and
+Metal shader compilation evidence plus a complete published-checkpoint cache build and real-model
+Metal load/prefill/decode. A raw arithmetic smoke emitted `4`; all four continuation cases enforced
+by the pinned upstream reference match exactly, including a 3,844-token prompt that crosses the
+top-512 indexed-attention frontier; and a real two-turn DSML request executed a native tool call.
+The upstream reference excludes its `long_memory_archive` case because the hosted API and official
+graph disagree after the official Hadamard and FP4-indexer path, so pb does not count that excluded
+case as a supported-graph failure or as parity evidence.
 
 ## Project configuration
 

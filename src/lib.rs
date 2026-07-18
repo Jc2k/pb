@@ -546,7 +546,7 @@ impl FlashMoeExpertStorageArg {
 
 #[derive(Args, Debug, Clone)]
 pub struct FlashMoeInferArgs {
-    /// Prompt to send to Qwen3.5-397B-A17B
+    /// Prompt to send to the selected FlashMoe model
     pub prompt: String,
 
     /// FlashMoe model identifier to load

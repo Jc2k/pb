@@ -110,7 +110,7 @@ completes. Fused Colibri `kv_b_proj` weights retain their CPU transpose implemen
 routing uses the correction bias only for expert selection and keeps the checkpoint's routed scaling
 factor.
 
-**Configurable, with provisional validation status.** On Apple Silicon, the exact published
+**Shipped for the pinned request-scoped profile.** On Apple Silicon, the exact published
 DeepSeek V4 Flash IQ2_XXS/Q2_K GGUF profile extends the same FlashMoe runtime. Pull validates the
 bounded GGUF directory and publishes one resident tensor store plus 43 page-aligned expert packs.
 Load binds a fixed 43-layer graph before inference and compiles its specialized Metal surface:
@@ -120,15 +120,20 @@ six parallel positioned reads per layer; fused Metal kernels consume the IQ2_XXS
 down records together with the resident shared expert. There is no top-2 quality profile, runtime
 tensor probing, CPU fallback, DS4 subprocess, or second inference engine.
 
-DeepSeek state is request-scoped for now. pb resets its raw/compressed/indexer KV and
-hyperconnection state before each request and deliberately declines existing FlashMoe session and
-shared-prefix snapshots because those snapshots cannot yet represent the complete typed state.
+DeepSeek state is request-scoped. pb resets its raw/compressed/indexer KV and hyperconnection state
+before each request. A request that asks for a logical FlashMoe session fails with a named
+capability error because the existing Qwen/GLM snapshot cannot represent the complete typed state;
+pb never silently restores a partial snapshot or downgrades a session request. The agent backend
+reads that load-resolved capability and issues ordinary request-scoped DeepSeek turns, so native
+tool loops do not falsely request session restoration.
 Source/cache/graph/routing/ABI tests and local compilation of the specialized Metal library are
-recorded. The published 86.72 GB imatrix GGUF has also completed canonical cache publication and
-real Metal load/prefill/decode, including a 233-token request that crosses the ratio-128 compression
-boundary. Independent logit/continuation parity, complete-state snapshots, and real structured-tool
-evidence remain outstanding. DSA sparse attention and the MTP speculative head likewise remain GLM
-follow-on implementations, and GLM requests beyond `index_topk` remain explicit unsupported paths.
+recorded. The published 86.72 GB imatrix GGUF has completed canonical cache publication and real
+Metal load/prefill/decode. All four enforced upstream continuation vectors match, including a
+3,844-token case that crosses the top-512 indexed-attention frontier, and a real two-turn DSML loop
+executed a native tool call. Complete-state DeepSeek snapshots remain a separate unsupported future
+capability rather than part of this request-scoped profile. DSA sparse attention and the MTP
+speculative head likewise remain GLM follow-on implementations, and GLM requests beyond
+`index_topk` remain explicit unsupported paths.
 The detailed implementation and evidence boundary lives in the
 [FlashMoe architecture parity plan](../flashmoe-architecture-parity-plan.md).
 

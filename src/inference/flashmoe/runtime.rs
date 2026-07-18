@@ -2230,6 +2230,10 @@ impl FlashMoeEngine {
         Ok(self.generate_structured_inner(request, None, false)?.output)
     }
 
+    pub(crate) fn supports_session_snapshots(&self) -> bool {
+        self.deepseek_graph.is_none()
+    }
+
     /// Render and tokenize the exact prompt used by structured generation.
     pub fn measure_structured_prompt(
         &self,
@@ -2495,6 +2499,11 @@ impl FlashMoeEngine {
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let encode_elapsed = encode_started.elapsed();
         let deepseek_v4 = self.deepseek_graph.is_some();
+        if deepseek_v4 && session_id.is_some() {
+            bail!(
+                "DeepSeek V4 Flash sessions are unsupported: its resolved request-scoped graph cannot restore a partial legacy KV snapshot; omit --session-id"
+            );
+        }
         let base_prefix_len = if deepseek_v4 {
             0
         } else {
@@ -2510,12 +2519,6 @@ impl FlashMoeEngine {
                 .max(1);
             self.metal.prepare_deepseek_v4_state(graph, capacity)?;
         }
-        // The existing session snapshot is intentionally limited to linear-
-        // attention state. DeepSeek's raw/compressed/index caches have a
-        // different typed layout, so this family starts from its freshly
-        // prepared request state instead of silently restoring an incomplete
-        // legacy snapshot.
-        let session_id = if deepseek_v4 { None } else { session_id };
         if let Some(glm) = self.config.glm.as_ref()
             && glm.index_topk > 0
         {

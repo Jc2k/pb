@@ -87,6 +87,7 @@ pub(crate) const DEEPSEEK_V4_REQUIRED_METAL_KERNELS: &[&str] = &[
     "kernel_dsv4_router_weights_one",
     "kernel_dsv4_router_finalize_one",
     "kernel_dsv4_indexed_mixed_attention_heads8",
+    "kernel_dsv4_indexed_mixed_attention_heads8_rb16",
     "kernel_dsv4_indexer_scores_tiled_f32",
     "kernel_dsv4_indexer_weighted_sum",
     "kernel_dsv4_softmax_pool",

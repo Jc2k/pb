@@ -236,6 +236,31 @@ struct AttentionArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct IndexedAttentionArgs {
+    n_tokens: u32,
+    n_head: u32,
+    n_raw: u32,
+    raw_cap: u32,
+    raw_start: u32,
+    n_comp: u32,
+    top_k: u32,
+    pos0: u32,
+    window: u32,
+    ratio: u32,
+    comp_kv_f16: u32,
+    pad0: u32,
+    q_token_stride: u64,
+    q_head_stride: u64,
+    raw_row_stride: u64,
+    comp_row_stride: u64,
+    topk_token_stride: u64,
+    dst_token_stride: u64,
+    dst_head_stride: u64,
+    scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct OutputCollapseArgs {
     hidden: u32,
     eps: f32,
@@ -1059,6 +1084,53 @@ unsafe fn encode_attention(
     let n_raw = (position + 1).min(RAW_CAP);
     let raw_start = (position + 1 - n_raw) % RAW_CAP;
     let use_top_k = layer_state.ratio == 4 && n_comp > INDEX_TOP_K;
+    if use_top_k {
+        let row_stride = (HEAD_DIM * size_of::<f32>()) as u64;
+        let args = IndexedAttentionArgs {
+            n_tokens: 1,
+            n_head: HEADS as u32,
+            n_raw: n_raw as u32,
+            raw_cap: RAW_CAP as u32,
+            raw_start: raw_start as u32,
+            n_comp: n_comp as u32,
+            top_k: INDEX_TOP_K as u32,
+            pos0: position as u32,
+            window: RAW_CAP as u32,
+            ratio: layer_state.ratio as u32,
+            comp_kv_f16: 0,
+            pad0: 0,
+            q_token_stride: (HEADS as u64) * row_stride,
+            q_head_stride: row_stride,
+            raw_row_stride: row_stride,
+            comp_row_stride: row_stride,
+            topk_token_stride: (INDEX_TOP_K * size_of::<i32>()) as u64,
+            dst_token_stride: (HEADS as u64) * row_stride,
+            dst_head_stride: row_stride,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+        };
+        unsafe {
+            set_pipeline(
+                encoder,
+                pipelines.require("kernel_dsv4_indexed_mixed_attention_heads8_rb16")?,
+            );
+            set_bytes(encoder, bytes_of(&args), 0);
+            set_buffer(encoder, scratch.q, 1);
+            set_buffer(encoder, layer_state.raw, 2);
+            set_buffer(
+                encoder,
+                layer_state
+                    .comp
+                    .context("indexed DeepSeek attention is missing compressed KV")?,
+                3,
+            );
+            set_buffer(encoder, scratch.index_selected, 4);
+            set_buffer_with_offset(encoder, sinks.0.buffer, sinks.1.byte_offset, 5);
+            set_buffer(encoder, scratch.heads, 6);
+            set_threadgroup_memory(encoder, 16 * 128 * size_of::<[u16; 4]>(), 0);
+            dispatch_groups(encoder, (1, HEADS.div_ceil(8) as u64, 1), (32, 8, 1));
+        }
+        return Ok(());
+    }
     let args = AttentionArgs {
         n_head: HEADS as u32,
         head_dim: HEAD_DIM as u32,
@@ -1066,8 +1138,8 @@ unsafe fn encode_attention(
         raw_cap: RAW_CAP as u32,
         raw_start: raw_start as u32,
         n_comp: n_comp as u32,
-        top_k: if use_top_k { INDEX_TOP_K as u32 } else { 0 },
-        use_top_k: u32::from(use_top_k),
+        top_k: 0,
+        use_top_k: 0,
         position: position as u32,
         window: RAW_CAP as u32,
         ratio: layer_state.ratio as u32,
@@ -2178,6 +2250,7 @@ mod tests {
         assert_eq!(size_of::<EmbeddingArgs>(), 12);
         assert_eq!(size_of::<CompressorArgs>(), 20);
         assert_eq!(size_of::<AttentionArgs>(), 48);
+        assert_eq!(size_of::<IndexedAttentionArgs>(), 112);
         assert_eq!(size_of::<OutputCollapseArgs>(), 12);
         assert_eq!(size_of::<KvStoreArgs>(), 12);
         assert_eq!(size_of::<Fp8Args>(), 104);
