@@ -30,6 +30,8 @@ use std::fmt;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+const BATCH_EXPERT_READ_WORKERS: usize = 8;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlashMoeScheduledGraph {
     family: QwenMoeFamily,
@@ -567,6 +569,45 @@ impl FlashMoeExecutionScheduler {
             .command_from_preselected(routes)?;
         let pending = self.expert_reads.issue_routing_command(&routing)?;
         self.expert_reads.finish_routes(pending)
+    }
+
+    /// Read the unique expert working set for one layer-major prefill batch.
+    ///
+    /// The caller supplies sorted unique ids so each whole expert is streamed
+    /// exactly once into request-scoped batch storage. The reads still enter
+    /// the scheduler's positioned-I/O metrics and reusable-slot lifecycle; no
+    /// application expert cache is introduced.
+    pub(crate) fn read_unique_experts(
+        &mut self,
+        layer: usize,
+        experts: &[usize],
+    ) -> Result<Vec<Arc<ScheduledExpertSlot>>> {
+        if layer >= self.graph.attention_layers.len() {
+            bail!(
+                "FlashMoe batch expert layer {layer} is outside resolved layer count {}",
+                self.graph.attention_layers.len()
+            );
+        }
+        if experts.is_empty() {
+            bail!("FlashMoe batch expert read requires at least one expert");
+        }
+        let mut previous = None;
+        for &expert in experts {
+            if expert >= self.graph.experts_per_layer() {
+                bail!(
+                    "FlashMoe batch expert {expert} is outside resolved expert count {} for layer {layer}",
+                    self.graph.experts_per_layer()
+                );
+            }
+            if previous.is_some_and(|previous| expert <= previous) {
+                bail!(
+                    "FlashMoe batch expert ids must be sorted and unique, got {previous:?} then {expert}"
+                );
+            }
+            previous = Some(expert);
+        }
+        let pending = self.expert_reads.issue_experts(layer, experts)?;
+        self.expert_reads.finish(pending)
     }
 
     pub(crate) fn resolve_router_score_projection(
@@ -3351,6 +3392,21 @@ impl ScheduledExpertSlot {
         self.raw.slot
     }
 
+    pub(crate) fn deepseek_gguf_slot(
+        &self,
+    ) -> Result<(DeepSeekGgufExpertSlotSpec, &ReusableExpertBytes)> {
+        match &self.raw.payload {
+            ExpertRawPayload::FixedDeepSeekGguf(payload) => Ok((payload.spec, &payload.bytes)),
+            ExpertRawPayload::Pbq4(_)
+            | ExpertRawPayload::FixedQ4(_)
+            | ExpertRawPayload::FixedDense(_) => bail!(
+                "FlashMoe batch DeepSeek staging received a non-DeepSeek expert slot at layer {} expert {}",
+                self.layer(),
+                self.expert()
+            ),
+        }
+    }
+
     pub(crate) fn mix_hash(&self) -> u64 {
         let mut hash = ((self.layer() as u64) << 32) ^ self.expert() as u64;
         let prefix = match &self.raw.payload {
@@ -3683,8 +3739,7 @@ impl ScheduledExpertReadCoordinator {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn issue(
+    pub(crate) fn issue_experts(
         &mut self,
         layer: usize,
         experts: &[usize],
@@ -3692,7 +3747,8 @@ impl ScheduledExpertReadCoordinator {
         if experts.is_empty() {
             return Ok(Vec::new());
         }
-        self.pool.ensure_workers(experts.len().max(1));
+        self.pool
+            .ensure_workers(experts.len().min(BATCH_EXPERT_READ_WORKERS).max(1));
         let reader = self.store.layer_reader(layer)?;
         let mut pending = Vec::with_capacity(experts.len());
         for expert in experts {
@@ -8179,7 +8235,7 @@ mod tests {
         assert_eq!(first.read_failures, 0);
         assert_eq!(first.warm_reads, 0);
 
-        let pending = coordinator.issue(0, &[3]).unwrap();
+        let pending = coordinator.issue_experts(0, &[3]).unwrap();
         let repeated = coordinator.finish(pending).unwrap();
         assert_eq!(repeated[0].expert(), 3);
         let second = coordinator.snapshot();
@@ -8187,6 +8243,31 @@ mod tests {
         assert_eq!(second.positioned_reads, 4);
         assert_eq!(second.warm_reads, 1);
         assert!(second.warm_bytes_read > 0);
+    }
+
+    #[test]
+    fn execution_scheduler_streams_one_sorted_unique_batch_working_set() {
+        let (_temp, store) = pbq4_import_store(&[1, 3, 7]);
+        let mut layout = qwen35_layout();
+        layout.layers = 1;
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let mut scheduler = FlashMoeExecutionScheduler::new(graph, store).unwrap();
+
+        let slots = scheduler.read_unique_experts(0, &[1, 3, 7]).unwrap();
+
+        assert_eq!(
+            slots.iter().map(|slot| slot.expert()).collect::<Vec<_>>(),
+            vec![1, 3, 7]
+        );
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.issued_reads, 3);
+        assert_eq!(snapshot.positioned_reads, 3);
+
+        let duplicate = scheduler.read_unique_experts(0, &[1, 1]).unwrap_err();
+        assert!(duplicate.to_string().contains("sorted and unique"));
+        let descending = scheduler.read_unique_experts(0, &[3, 1]).unwrap_err();
+        assert!(descending.to_string().contains("sorted and unique"));
     }
 
     #[test]
@@ -8200,7 +8281,7 @@ mod tests {
             .unwrap();
         let mut coordinator = ScheduledExpertReadCoordinator::new(store);
 
-        let pending = coordinator.issue(0, &[2]).unwrap();
+        let pending = coordinator.issue_experts(0, &[2]).unwrap();
         let error = coordinator.finish(pending).unwrap_err();
 
         assert!(

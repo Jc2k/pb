@@ -477,6 +477,21 @@ Metal attention kernel. This is an algorithmic boundary derived from the live fr
 runtime fallback or model probe; dense and ratio-128 layers retain their load-resolved attention
 commands.
 
+DeepSeek prompt prefill has two concrete commands in that same load-resolved graph. Fewer than 32
+tokens retain the validated token command and its official-vector accumulation order. At one full
+32-row matrix tile, a zero-prefix request uses layer-major Metal prefill: dense projections,
+compression, FlashAttention or calculated top-512 indexed attention, hyperconnections, shared and
+routed experts, and final collapse execute as batched graph stages. This threshold is a pure prompt
+geometry calculation and never changes after an execution error.
+
+The layer-major router calculates every token's exact top six on the host after the Metal router
+projection, reduces those routes to a sorted unique layer working set, and submits that set to the
+existing scheduler. The scheduler issues at most eight parallel positioned reads and returns the
+same reusable whole-expert slots used by decode. A request-scoped Metal buffer stages each unique
+expert once for the layer, then fused IQ2_XXS pair-SwiGLU and Q2_K down kernels consume all routed
+rows. The staging buffer is scratch state, not an application cache; no cache migration, hidden
+toggle, alternate runtime, or speculative expert overlap was introduced.
+
 The DeepSeek source adapter validates bounded GGUF metadata and tensor directories before
 atomically publishing a source-independent runtime manifest. Routed records keep their typed
 IQ2_XXS/Q2_K layout in fixed, page-aligned per-layer expert files so scheduler-owned parallel
@@ -494,6 +509,40 @@ silently starting over. The managed agent backend consumes that load-resolved ca
 request-scoped turns without a session claim. Any future memory or disk snapshot must capture the
 complete typed state atomically and pass official-vector plus prefix-reuse parity; it cannot be
 inferred from llama.cpp or the reference DS4 server's separate cache implementation.
+
+### DeepSeek V4 prefill benchmark, 2026-07-18
+
+The comparison used the published 86.72 GB imatrix checkpoint named above on an Apple M4 Max with
+64 GB unified memory and 40 GPU cores. The checkpoint was already the pinned correctness profile,
+so the experiment reused its source plus canonical FlashMoe cache instead of pulling a second large
+model. Those files occupied 162 GiB together and the final filesystem check left 328 GiB free.
+
+Both engines used the same no-thinking chat text, greedy sampling, and 3,844-token
+`long_code_audit` frontier. The ds4 control was the pinned `80ebbc3` build with Metal,
+`--ssd-streaming --ssd-streaming-cold --ssd-streaming-cache-experts 1`; its prefill result was
+234.26 tok/s and its four-token decode result was 1.07 tok/s. pb has no application expert-cache
+setting: scheduler-owned `pread` plus the OS page cache is the supported policy.
+
+| Engine/path | Prompt tokens | Prefill or TTFT | Prefill tok/s | Decode tok/s | Continuation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| pb before layer-major migration | 3,844 | 872.48 s | 4.41 | 6.76 | exact |
+| pb final layer-major path | 3,844 | 24.99 s | 153.80 | 3.95 | `The most important code` |
+| pinned ds4, one-expert cold streaming | 3,844 | 16.41 s | 234.26 | 1.07 | exact |
+| pinned ds4, 18 GB streaming-cache control | 3,844 | 16.23 s | 236.83 | 4.40 | exact |
+
+The final pb path is 34.9 times faster than its token-major baseline and reduces the fresh
+multiplicative prefill gap to 1.52 times. The large-cache ds4 row is a decode upper control, not
+pb's memory policy. On the 21-token Italian control, pb measured 5.36 prefill and 8.23 decode tok/s;
+ds4 measured 3.62 and 6.72 tok/s, respectively.
+
+Two plausible follow-ups were rejected rather than hidden behind toggles. A Metal batch router was
+about nine percent faster on the long case, but its accumulated numerical drift changed the
+official fenced-code continuation from lowercase `c` to uppercase `C`. A fully parallel
+zero-prefix compressor preserved the tested outputs but did not improve the measured long run.
+The shipped result therefore retains exact host routing and recurrent compression. The remaining
+long-prefill gap belongs to fused batch-kernel and CPU/GPU handoff work inside this same graph and
+scheduler; it is not grounds for a ds4 subprocess, mmap-only expert path, application cache, or
+second runtime.
 
 ## Scheduled Graph
 
@@ -1332,11 +1381,13 @@ Completion evidence:
   smokes matched upstream, and Qwen3-VL text and image requests exited successfully.
 - Unsupported family/layout/dtype/device/kernel/adapter combinations remain named load-time or
   graph-resolution errors; no CPU/component/layout/scheduler fallback was restored.
-- DeepSeek resolves the same nine scheduled stages with a family-typed attention/state command and
+- DeepSeek resolves the same nine scheduled stages with family-typed token and layer-major
+  attention/state commands and
   fixed IQ2_XXS/Q2_K expert payload. The first three layers use token hash routes; later layers use
   biased sqrt-softplus top-6 selection, unbiased weights, the reference `2^-14` denominator floor,
-  and the fixed 1.5 scale. Six whole slots are read through the existing parallel positioned-read
-  coordinator. The published imatrix checkpoint emitted `4` for the raw `2+2=` smoke, sustained
+  and the fixed 1.5 scale. Decode reads six whole slots; layer-major prefill reads one sorted unique
+  layer working set through the existing positioned-read coordinator. The published imatrix
+  checkpoint emitted `4` for the raw `2+2=` smoke, sustained
   about 6.45 decode tokens/s across a 16-token run, and completed a 233-token compression-boundary
   request. The four continuation vectors enforced by the pinned reference match exactly: `Ada
   Lovelace`, a fenced C `return`, `16`, and `The most important code`; the last uses 3,844 prompt
@@ -1405,15 +1456,16 @@ Required ownership slices, in order:
    denominator-floor semantics, RoPE specialization, fixed six-slot arguments, and host structure
    sizes. Official-vector validation is evidence below, not runtime fallback code.
 4. [x] Add fused Metal stage implementations inside the existing command/scheduler topology.
-   Routed expert reads remain top-6 parallel positioned reads into scheduler slots. No DS4
-   subprocess, application expert cache, alternate generation loop, or CPU component fallback is
+   Decode retains top-6 parallel positioned reads into scheduler slots; layer-major prefill submits
+   a sorted unique layer working set through the same coordinator and request-scoped staging. No
+   DS4 subprocess, application expert cache, alternate runtime, or CPU component fallback is
    present.
 5. [x] Bind the native JoyAI tokenizer, chat/DSML tool rendering, output parsing, and exact prompt
    preflight to the production path. Prompt/session reuse is intentionally rejected rather than
    restoring incomplete state; a future snapshot must atomically capture all hyperconnection,
    compressor, raw/compressed KV, and indexer state.
 6. [x] Complete external validation for the supported request-scoped contract. On 2026-07-18,
-   local verification recorded 1,078 passing all-target tests with 19 environment-gated tests
+   local verification recorded 1,081 passing all-target tests with 19 environment-gated tests
    ignored, 47 passing web tests, all 34 documentation pages validated, a successful optimized
    arm64 build, and on-device compilation of every specialized DeepSeek Metal pipeline. Cached
    Qwen3.5, Qwen3, Qwen3-VL text, and GLM smokes retained their existing behavior. The exact 86.72

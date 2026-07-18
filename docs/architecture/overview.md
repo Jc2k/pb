@@ -115,10 +115,14 @@ DeepSeek V4 Flash IQ2_XXS/Q2_K GGUF profile extends the same FlashMoe runtime. P
 bounded GGUF directory and publishes one resident tensor store plus 43 page-aligned expert packs.
 Load binds a fixed 43-layer graph before inference and compiles its specialized Metal surface:
 four-stream hyperconnections, dense/ratio-4/ratio-128 attention, raw and compressed KV, the ratio-4
-indexer, grouped output, native JoyAI tokenization, and the output head. The shared scheduler issues
-six parallel positioned reads per layer; fused Metal kernels consume the IQ2_XXS gate/up and Q2_K
-down records together with the resident shared expert. There is no top-2 quality profile, runtime
-tensor probing, CPU fallback, DS4 subprocess, or second inference engine.
+indexer, grouped output, native JoyAI tokenization, and the output head. Prompt geometry selects one
+of two commands in that already-resolved graph: prompts shorter than one 32-row matrix tile retain
+the exact token accumulation order, while longer zero-prefix prompts execute layer-major Metal
+prefill. The batch command routes every prompt row, reduces the result to one sorted unique expert
+working set per layer, and asks the shared scheduler for at most eight parallel positioned reads;
+each expert is staged once for that layer and the OS page cache remains authoritative. Decode keeps
+the ordinary six-slot scheduled read path. There is no top-2 quality profile, runtime error
+fallback, tensor probing, DS4 subprocess, application expert cache, or second inference engine.
 
 DeepSeek state is request-scoped. pb resets its raw/compressed/indexer KV and hyperconnection state
 before each request. A request that asks for a logical FlashMoe session fails with a named
@@ -129,7 +133,9 @@ tool loops do not falsely request session restoration.
 Source/cache/graph/routing/ABI tests and local compilation of the specialized Metal library are
 recorded. The published 86.72 GB imatrix GGUF has completed canonical cache publication and real
 Metal load/prefill/decode. All four enforced upstream continuation vectors match, including a
-3,844-token case that crosses the top-512 indexed-attention frontier, and a real two-turn DSML loop
+3,844-token case that crosses the top-512 indexed-attention frontier. On an M4 Max, that exact long
+case improved from 4.41 to 153.8 prefill tok/s after layer-major migration; pinned `antirez/ds4`
+recorded 234.3 tok/s under its one-expert cold SSD-streaming control. A real two-turn DSML loop
 executed a native tool call. Complete-state DeepSeek snapshots remain a separate unsupported future
 capability rather than part of this request-scoped profile. DSA sparse attention and the MTP
 speculative head likewise remain GLM follow-on implementations, and GLM requests beyond

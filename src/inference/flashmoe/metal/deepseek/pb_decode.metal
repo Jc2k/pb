@@ -19,6 +19,226 @@ kernel void kernel_pb_dsv4_embedding_hc4(
     hc[gid] = float(embedding[(ulong)args.token * args.hidden + gid % args.hidden]);
 }
 
+struct pb_dsv4_embedding_batch_args {
+    uint tokens;
+    uint hidden;
+    uint hc;
+};
+
+// Long prompts enter the fixed DeepSeek graph as one [token, HC, hidden]
+// tensor. Token ids remain request-scoped shared storage; model embeddings are
+// the same resident mmap-backed F16 tensor used by decode.
+kernel void kernel_pb_dsv4_embedding_hc4_batch(
+        constant pb_dsv4_embedding_batch_args &args,
+        device const uint *tokens,
+        device const half *embedding,
+        device float *hc,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong row = (ulong)args.hidden * args.hc;
+    const ulong count = (ulong)args.tokens * row;
+    if ((ulong)gid >= count) return;
+    const uint token_row = uint((ulong)gid / row);
+    const uint hidden_col = uint((ulong)gid % args.hidden);
+    hc[gid] = float(embedding[(ulong)tokens[token_row] * args.hidden + hidden_col]);
+}
+
+struct pb_dsv4_copy_args {
+    uint elements;
+};
+
+kernel void kernel_pb_dsv4_f32_to_f16(
+        constant pb_dsv4_copy_args &args,
+        device const float *src,
+        device half *dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < args.elements) dst[gid] = half(src[gid]);
+}
+
+struct pb_dsv4_swiglu_args {
+    uint elements;
+    float clamp;
+};
+
+kernel void kernel_pb_dsv4_swiglu_batch(
+        constant pb_dsv4_swiglu_args &args,
+        device const float *gate,
+        device const float *up,
+        device float *mid,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.elements) return;
+    const float g = clamp(gate[gid], -args.clamp, args.clamp);
+    const float u = clamp(up[gid], -args.clamp, args.clamp);
+    mid[gid] = (g / (1.0f + exp(-g))) * u;
+}
+
+struct pb_dsv4_raw_store_batch_args {
+    uint tokens;
+    uint raw_cap;
+    uint head_dim;
+    uint pos0;
+};
+
+// Only the final logical SWA window is material after a zero-prefix batch.
+// Restricting the copy to those rows also avoids write races when tokens exceed
+// the ring capacity. DS4 rounds raw-cache values through F16 on store.
+kernel void kernel_pb_dsv4_raw_store_batch(
+        constant pb_dsv4_raw_store_batch_args &args,
+        device const float *kv,
+        device float *raw,
+        uint gid [[thread_position_in_grid]]) {
+    const uint kept = min(args.tokens, args.raw_cap);
+    const ulong count = (ulong)kept * args.head_dim;
+    if ((ulong)gid >= count) return;
+    const uint local_row = gid / args.head_dim;
+    const uint col = gid % args.head_dim;
+    const uint token = args.tokens - kept + local_row;
+    const uint raw_row = (args.pos0 + token) % args.raw_cap;
+    raw[(ulong)raw_row * args.head_dim + col] = float(half(kv[(ulong)token * args.head_dim + col]));
+}
+
+struct pb_dsv4_group_copy_args {
+    uint tokens;
+    uint groups;
+    uint group;
+    uint group_width;
+    uint rank;
+};
+
+kernel void kernel_pb_dsv4_gather_attention_group(
+        constant pb_dsv4_group_copy_args &args,
+        device const float *heads,
+        device float *group_rows,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong count = (ulong)args.tokens * args.group_width;
+    if ((ulong)gid >= count) return;
+    const uint token = gid / args.group_width;
+    const uint col = gid % args.group_width;
+    const ulong source_stride = (ulong)args.groups * args.group_width;
+    heads += (ulong)token * source_stride + (ulong)args.group * args.group_width;
+    group_rows[gid] = heads[col];
+}
+
+kernel void kernel_pb_dsv4_scatter_attention_rank(
+        constant pb_dsv4_group_copy_args &args,
+        device const float *rank_rows,
+        device float *all_ranks,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong count = (ulong)args.tokens * args.rank;
+    if ((ulong)gid >= count) return;
+    const uint token = gid / args.rank;
+    const uint col = gid % args.rank;
+    all_ranks[(ulong)token * args.groups * args.rank + (ulong)args.group * args.rank + col] = rank_rows[gid];
+}
+
+struct pb_dsv4_compressor_prefill_args {
+    uint tokens;
+    uint width;
+    uint head_dim;
+    uint ratio;
+    uint pos0;
+};
+
+// The compressor is recurrent across prompt rows. One threadgroup advances the
+// exact decode frontier, synchronizing the full projected row before a ratio-4
+// pool reads its second half. This removes thousands of one-token dispatches
+// without introducing a cross-threadgroup dependency.
+kernel void kernel_pb_dsv4_compressor_prefill(
+        constant pb_dsv4_compressor_prefill_args &args,
+        device const float *kv,
+        device const float *score,
+        device const half *ape,
+        device float *state_kv,
+        device float *state_score,
+        device float *compressed,
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    const uint coff = args.ratio == 4u ? 2u : 1u;
+    const uint state_rows = coff * args.ratio;
+    for (uint token = 0; token < args.tokens; ++token) {
+        const uint position = args.pos0 + token;
+        const uint pos_mod = position % args.ratio;
+        const uint dst_row = args.ratio == 4u ? args.ratio + pos_mod : pos_mod;
+        for (uint d = tid; d < args.width; d += ntg) {
+            const ulong src = (ulong)token * args.width + d;
+            const ulong dst = (ulong)dst_row * args.width + d;
+            state_kv[dst] = kv[src];
+            state_score[dst] = score[src] + float(ape[(ulong)pos_mod * args.width + d]);
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        if ((position + 1u) % args.ratio != 0u) continue;
+
+        for (uint d = tid; d < args.head_dim; d += ntg) {
+            float maximum = -INFINITY;
+            if (args.ratio == 4u) {
+                for (uint row = 0; row < 4u; ++row) {
+                    maximum = max(maximum, state_score[(ulong)row * args.width + d]);
+                    maximum = max(maximum, state_score[(ulong)(row + 4u) * args.width + args.head_dim + d]);
+                }
+            } else {
+                for (uint row = 0; row < state_rows; ++row) {
+                    maximum = max(maximum, state_score[(ulong)row * args.width + d]);
+                }
+            }
+            float denominator = 0.0f;
+            float value = 0.0f;
+            if (args.ratio == 4u) {
+                for (uint row = 0; row < 4u; ++row) {
+                    const ulong first = (ulong)row * args.width + d;
+                    const ulong second = (ulong)(row + 4u) * args.width + args.head_dim + d;
+                    const float w0 = exp(state_score[first] - maximum);
+                    const float w1 = exp(state_score[second] - maximum);
+                    denominator += w0 + w1;
+                    value += state_kv[first] * w0 + state_kv[second] * w1;
+                }
+            } else {
+                for (uint row = 0; row < state_rows; ++row) {
+                    const ulong index = (ulong)row * args.width + d;
+                    const float weight = exp(state_score[index] - maximum);
+                    denominator += weight;
+                    value += state_kv[index] * weight;
+                }
+            }
+            const uint emit = (position + 1u) / args.ratio - 1u;
+            compressed[(ulong)emit * args.head_dim + d] = value / denominator;
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        if (args.ratio == 4u) {
+            const ulong half_rows = 4ul * args.width;
+            for (ulong index = tid; index < half_rows; index += ntg) {
+                state_kv[index] = state_kv[half_rows + index];
+                state_score[index] = state_score[half_rows + index];
+            }
+            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+struct pb_dsv4_attention_mask_args {
+    uint tokens;
+    uint compressed;
+    uint window;
+    uint ratio;
+};
+
+kernel void kernel_pb_dsv4_prefill_attention_mask(
+        constant pb_dsv4_attention_mask_args &args,
+        device half *mask,
+        uint gid [[thread_position_in_grid]]) {
+    const uint keys = args.tokens + args.compressed;
+    const ulong count = (ulong)args.tokens * keys;
+    if ((ulong)gid >= count) return;
+    const uint query = gid / keys;
+    const uint key = gid % keys;
+    bool visible;
+    if (key < args.tokens) {
+        visible = key <= query && (args.window == 0u || query - key < args.window);
+    } else {
+        visible = args.ratio != 0u && key - args.tokens < (query + 1u) / args.ratio;
+    }
+    mask[gid] = visible ? half(0.0f) : -INFINITY;
+}
+
 struct pb_dsv4_rms_norm_args {
     uint width;
     uint rows;

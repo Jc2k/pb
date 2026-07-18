@@ -123,13 +123,19 @@ pb config set model.model hf://antirez/deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS
 Pull rejects other repository files and validates the complete 43-layer metadata, tensor, dtype,
 shape, quantization, compression-schedule, expert, and JoyAI tokenizer contract before atomically
 publishing a source-independent FlashMoe cache. Resident tensors stay in one mmap-backed store.
-Each layer's 256 routed experts are split into fixed, page-aligned whole-expert slots so the shared
-scheduler can stream the selected six from SSD with parallel positioned reads and let the operating
-system page cache remain authoritative. The published source is 86.72 GB; retaining both it and the
+Each layer's 256 routed experts is split into a fixed, page-aligned whole-expert slot. Decode asks
+the shared scheduler to stream the selected six from SSD. Layer-major prompt prefill instead reads
+each sorted unique expert selected anywhere in that layer's prompt once, using at most eight
+parallel positioned reads and request-scoped Metal staging. Neither path creates an application
+expert cache; the operating system page cache remains authoritative. The published source is 86.72
+GB; retaining both it and the
 prepared resident/expert cache used about 162 GiB in the 2026-07-18 validation run, so check free
 space before pulling.
 
-Load resolves the complete graph and required fused Metal kernels before the first token. Top-6 is
+Load resolves the complete graph and required fused Metal kernels before the first token. Prompts
+below 32 tokens retain the exact token command; prompts of 32 tokens or more use the graph's
+layer-major Metal prefill command. This fixed matrix-tile calculation is not an error fallback.
+Top-6 is
 part of the checkpoint contract: `--flashmoe-active-experts` cannot reduce it. There is no llama.cpp
 fallback, CPU component fallback, DS4 process, hidden top-2 mode, or alternate generation loop.
 DeepSeek is text-only in this profile, and requests for existing FlashMoe session/prefix reuse fail
@@ -138,6 +144,9 @@ Metal shader compilation evidence plus a complete published-checkpoint cache bui
 Metal load/prefill/decode. A raw arithmetic smoke emitted `4`; all four continuation cases enforced
 by the pinned upstream reference match exactly, including a 3,844-token prompt that crosses the
 top-512 indexed-attention frontier; and a real two-turn DSML request executed a native tool call.
+On the validation M4 Max, the final 3,844-token prefill measured 153.8 tok/s versus 234.3 tok/s for
+the pinned ds4 one-expert cold SSD-streaming control. The same short Italian control measured 5.36
+prefill and 8.23 decode tok/s in pb versus 3.62 and 6.72 in ds4.
 The upstream reference excludes its `long_memory_archive` case because the hosted API and official
 graph disagree after the official Hadamard and FP4-indexer path, so pb does not count that excluded
 case as a supported-graph failure or as parity evidence.

@@ -26,6 +26,30 @@ use super::vision::{
 };
 use super::weights::*;
 
+// Short DeepSeek prompts retain the validated token graph's accumulation order;
+// layer-major prefill starts once it can fill one 32-row matrix tile. This is a
+// prompt-geometry calculation, never an error fallback.
+const DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS: usize = 32;
+
+fn deepseek_v4_uses_batch_prefill(tokens: usize) -> bool {
+    tokens >= DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS
+}
+
+#[cfg(test)]
+mod deepseek_prefill_tests {
+    use super::*;
+
+    #[test]
+    fn batch_prefill_selection_is_a_fixed_prompt_geometry_calculation() {
+        assert!(!deepseek_v4_uses_batch_prefill(
+            DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS - 1
+        ));
+        assert!(deepseek_v4_uses_batch_prefill(
+            DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS
+        ));
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::metal::MetalObjcId as ObjcId;
 use super::scheduler::ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef;
@@ -550,6 +574,27 @@ impl MetalExecutionFacade {
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             let _ = (graph, scheduler, token, position);
+            bail!("DeepSeek V4 Flash requires Apple Silicon Metal")
+        }
+    }
+
+    pub(super) fn deepseek_v4_prefill(
+        &self,
+        graph: &DeepSeekV4ExecutionGraph,
+        scheduler: &mut FlashMoeExecutionScheduler,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let hidden =
+                autoreleasepool(|_| self.inner.deepseek_v4_prefill(graph, scheduler, tokens))?;
+            self.inner
+                .finish_token_boundary(tokens.len().saturating_sub(1))?;
+            Ok(hidden)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (graph, scheduler, tokens);
             bail!("DeepSeek V4 Flash requires Apple Silicon Metal")
         }
     }
@@ -2858,6 +2903,50 @@ impl FlashMoeEngine {
                 "prefill range {start_position}..{end_position} exceeds prompt length {}",
                 prompt_tokens.len()
             );
+        }
+        if let Some(graph) = self.deepseek_graph.clone()
+            && deepseek_v4_uses_batch_prefill(end_position)
+        {
+            if start_position != 0 {
+                bail!(
+                    "DeepSeek V4 load-resolved batch prefill requires a zero-prefix graph, got start position {start_position}"
+                );
+            }
+            if end_position == 0 {
+                bail!("cannot generate from an empty DeepSeek V4 prompt");
+            }
+            let started = Instant::now();
+            report_generation_progress(&progress, || {
+                format!("prefill batch begin tokens={end_position}")
+            });
+            for (position, token) in prompt_tokens[..end_position].iter().copied().enumerate() {
+                kv_cache
+                    .record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
+            }
+            let hidden = self.metal.deepseek_v4_prefill(
+                &graph,
+                &mut self.scheduler,
+                &prompt_tokens[..end_position],
+            )?;
+            let elapsed = started.elapsed();
+            report_generation_progress(&progress, || {
+                format!(
+                    "prefill batch complete processed={end_position} remaining=0 position={} elapsed_ms={}",
+                    end_position - 1,
+                    elapsed.as_millis()
+                )
+            });
+            if let Some(timing) = timing.as_deref_mut() {
+                let mut token_timing = FlashMoeTokenTiming::new(
+                    end_position - 1,
+                    end_position - 1,
+                    FlashMoeTokenPhase::Prefill,
+                    prompt_tokens[end_position - 1],
+                );
+                token_timing.buckets.total_wall = elapsed;
+                timing.tokens.push(token_timing);
+            }
+            return Ok(hidden);
         }
         let mut last_hidden = None;
         let report_prefill_progress = progress.is_some()

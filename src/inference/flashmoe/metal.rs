@@ -1809,6 +1809,30 @@ impl DeepSeekMetalPipelineSet {
                     "kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32"
                     | "kernel_mul_mv_slots6_q2_K_sum6_f32" => &[(600, 37, &2i16.to_ne_bytes())],
                     "kernel_sum_rows_f32_f32" => &[(1400, 37, &10i16.to_ne_bytes())],
+                    "kernel_mul_mm_q8_0_f32" | "kernel_mul_mm_f16_f32" => {
+                        &[(700, 53, &[0]), (701, 53, &[1])]
+                    }
+                    "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16" | "kernel_mul_mm_id_q2_K_f16" => {
+                        &[(700, 53, &[0])]
+                    }
+                    "kernel_flash_attn_ext_pad" => {
+                        &[(100, 53, &[1]), (125, 29, &64i32.to_ne_bytes())]
+                    }
+                    "kernel_flash_attn_ext_blk" => &[
+                        (224, 29, &8i32.to_ne_bytes()),
+                        (225, 29, &64i32.to_ne_bytes()),
+                    ],
+                    "kernel_flash_attn_ext_f16_dk512_dv512" => &[
+                        (300, 53, &[1]),
+                        (301, 53, &[1]),
+                        (302, 53, &[0]),
+                        (303, 53, &[0]),
+                        (304, 53, &[1]),
+                        (310, 53, &[1]),
+                        (320, 29, &512i32.to_ne_bytes()),
+                        (321, 29, &512i32.to_ne_bytes()),
+                        (322, 29, &8i32.to_ne_bytes()),
+                    ],
                     _ => &[],
                 };
                 let pipeline = OwnedMetalObject::new(if constants.is_empty() {
@@ -1818,6 +1842,27 @@ impl DeepSeekMetalPipelineSet {
                 })?;
                 pipelines.insert(name, pipeline.into_raw());
             }
+            let no_pad_constants: &[(u64, u64, &[u8])] = &[
+                (300, 53, &[1]),
+                (301, 53, &[1]),
+                (302, 53, &[0]),
+                (303, 53, &[0]),
+                (304, 53, &[0]),
+                (310, 53, &[1]),
+                (320, 29, &512i32.to_ne_bytes()),
+                (321, 29, &512i32.to_ne_bytes()),
+                (322, 29, &8i32.to_ne_bytes()),
+            ];
+            let no_pad = OwnedMetalObject::new(compile_pipeline_with_constants(
+                device,
+                library.id(),
+                "kernel_flash_attn_ext_f16_dk512_dv512",
+                no_pad_constants,
+            )?)?;
+            pipelines.insert(
+                "kernel_flash_attn_ext_f16_dk512_dv512_nopad",
+                no_pad.into_raw(),
+            );
             Ok(Self { pipelines })
         }
     }

@@ -8,7 +8,7 @@ use super::super::deepseek::{
     DeepSeekResidentDtype, DeepSeekResidentTensor, DeepSeekV4ExecutionGraph, DeepSeekV4LayerGraph,
     deepseek_v4_router_probabilities, deepseek_v4_select_routes,
 };
-use super::super::experts::ExpertMlpProjection;
+use super::super::experts::{DeepSeekGgufExpertSlotSpec, ExpertMlpProjection};
 use super::super::scheduler::{
     FlashMoeExecutionScheduler, ScheduledDeepSeekGgufExpertPhaseMlpPayload,
     ScheduledExpertPhaseMlpPayload, ScheduledExpertSet, ScheduledExpertSlot,
@@ -100,6 +100,276 @@ impl MatvecArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct MulMmArgs {
+    ne00: i32,
+    ne02: i32,
+    nb01: u64,
+    nb02: u64,
+    nb03: u64,
+    ne12: i32,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    nb13: u64,
+    ne0: i32,
+    ne1: i32,
+    r2: i16,
+    r3: i16,
+}
+
+impl MulMmArgs {
+    fn new(input: usize, output: usize, tokens: usize, row_bytes: usize) -> Result<Self> {
+        Ok(Self {
+            ne00: i32::try_from(input)?,
+            ne02: 1,
+            nb01: row_bytes as u64,
+            nb02: u64::try_from(
+                row_bytes
+                    .checked_mul(output)
+                    .context("batch weight size overflow")?,
+            )?,
+            nb03: u64::try_from(
+                row_bytes
+                    .checked_mul(output)
+                    .context("batch weight size overflow")?,
+            )?,
+            ne12: 1,
+            nb10: size_of::<f32>() as u64,
+            nb11: (input * size_of::<f32>()) as u64,
+            nb12: (input * tokens * size_of::<f32>()) as u64,
+            nb13: (input * tokens * size_of::<f32>()) as u64,
+            ne0: i32::try_from(output)?,
+            ne1: i32::try_from(tokens)?,
+            r2: 1,
+            r3: 1,
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EmbeddingBatchArgs {
+    tokens: u32,
+    hidden: u32,
+    hc: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CopyArgs {
+    elements: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SwigluBatchArgs {
+    elements: u32,
+    clamp: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawStoreBatchArgs {
+    tokens: u32,
+    raw_cap: u32,
+    head_dim: u32,
+    pos0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GroupCopyArgs {
+    tokens: u32,
+    groups: u32,
+    group: u32,
+    group_width: u32,
+    rank: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CompressorPrefillArgs {
+    tokens: u32,
+    width: u32,
+    head_dim: u32,
+    ratio: u32,
+    pos0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttentionMaskArgs {
+    tokens: u32,
+    compressed: u32,
+    window: u32,
+    ratio: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlashAttentionPadArgs {
+    ne11: i32,
+    ne_12_2: i32,
+    ne_12_3: i32,
+    nb11: u64,
+    nb12: u64,
+    nb13: u64,
+    nb21: u64,
+    nb22: u64,
+    nb23: u64,
+    ne31: i32,
+    ne32: i32,
+    ne33: i32,
+    nb31: u64,
+    nb32: u64,
+    nb33: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlashAttentionBlockArgs {
+    ne01: i32,
+    ne30: i32,
+    ne31: i32,
+    ne32: i32,
+    ne33: i32,
+    nb31: u64,
+    nb32: u64,
+    nb33: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlashAttentionArgs {
+    ne01: i32,
+    ne02: i32,
+    ne03: i32,
+    nb01: u64,
+    nb02: u64,
+    nb03: u64,
+    ne11: i32,
+    ne_12_2: i32,
+    ne_12_3: i32,
+    ns10: i32,
+    nb11: u64,
+    nb12: u64,
+    nb13: u64,
+    ns20: i32,
+    nb21: u64,
+    nb22: u64,
+    nb23: u64,
+    ne31: i32,
+    ne32: i32,
+    ne33: i32,
+    nb31: u64,
+    nb32: u64,
+    nb33: u64,
+    ne1: i32,
+    ne2: i32,
+    ne3: i32,
+    scale: f32,
+    max_bias: f32,
+    m0: f32,
+    m1: f32,
+    n_head_log2: i32,
+    logit_softcap: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TopkMaskArgs {
+    ne00: i64,
+    ne01: i64,
+    nb00: u64,
+    nb01: u64,
+    ne0: i64,
+    ne1: i64,
+    nb0: u64,
+    nb1: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeMapArgs {
+    ne02: i32,
+    ne10: i32,
+    ne11: i32,
+    nb11: u64,
+    nb12: u64,
+    ne21: i32,
+    ne20: i32,
+    nb21: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeBatchMmArgs {
+    ne00: i32,
+    ne02: i32,
+    nb01: u64,
+    nb02: u64,
+    nb03: u64,
+    ne11: i32,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    nb13: u64,
+    ne20: i32,
+    ne21: i32,
+    ne0: i32,
+    ne1: i32,
+    r2: i16,
+    r3: i16,
+}
+
+impl MoeBatchMmArgs {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        input: usize,
+        output: usize,
+        total_experts: usize,
+        row_bytes: usize,
+        expert_bytes: usize,
+        input_rows: usize,
+        selected: usize,
+        tokens: usize,
+        input_element_bytes: usize,
+    ) -> Result<Self> {
+        let rhs_row_bytes = input
+            .checked_mul(input_element_bytes)
+            .context("batch MoE RHS row size overflow")?;
+        Ok(Self {
+            ne00: i32::try_from(input)?,
+            ne02: i32::try_from(total_experts)?,
+            nb01: row_bytes as u64,
+            nb02: expert_bytes as u64,
+            nb03: (total_experts * expert_bytes) as u64,
+            ne11: i32::try_from(input_rows)?,
+            nb10: input_element_bytes as u64,
+            nb11: rhs_row_bytes as u64,
+            nb12: (input_rows * rhs_row_bytes) as u64,
+            nb13: (tokens * input_rows * rhs_row_bytes) as u64,
+            ne20: i32::try_from(selected)?,
+            ne21: i32::try_from(tokens)?,
+            ne0: i32::try_from(output)?,
+            ne1: i32::try_from(selected)?,
+            r2: 1,
+            r3: 1,
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeSum6Args {
+    width: u32,
+    tokens: u32,
+    src_token_stride: u64,
+    dst_token_stride: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct HcSplitNormArgs {
     n_embd: i64,
     n_hc: i32,
@@ -120,11 +390,15 @@ struct HcSplitNormArgs {
 
 impl HcSplitNormArgs {
     fn one() -> Self {
+        Self::batch(1)
+    }
+
+    fn batch(rows: usize) -> Self {
         Self {
             n_embd: HIDDEN as i64,
             n_hc: HC as i32,
             sinkhorn_iters: 20,
-            n_rows: 1,
+            n_rows: rows as i64,
             mix_hc: 24,
             nb_mix1: (24 * size_of::<f32>()) as u64,
             nb_split1: (24 * size_of::<f32>()) as u64,
@@ -166,10 +440,14 @@ struct HcExpandArgs {
 
 impl HcExpandArgs {
     fn one() -> Self {
+        Self::batch(1)
+    }
+
+    fn batch(tokens: usize) -> Self {
         Self {
             n_embd: HIDDEN as i64,
             n_hc: HC as i64,
-            n_tokens: 1,
+            n_tokens: tokens as i64,
             nb_block0: size_of::<f32>() as u64,
             nb_block1: (HIDDEN * size_of::<f32>()) as u64,
             nb_add0: size_of::<f32>() as u64,
@@ -178,10 +456,10 @@ impl HcExpandArgs {
             nb_res1: (HIDDEN * size_of::<f32>()) as u64,
             nb_res2: (HC_WIDTH * size_of::<f32>()) as u64,
             nb_post0: size_of::<f32>() as u64,
-            nb_post1: (HC * size_of::<f32>()) as u64,
+            nb_post1: (24 * size_of::<f32>()) as u64,
             nb_comb0: size_of::<f32>() as u64,
             nb_comb1: (HC * size_of::<f32>()) as u64,
-            nb_comb2: (HC * HC * size_of::<f32>()) as u64,
+            nb_comb2: (24 * size_of::<f32>()) as u64,
             nb0: size_of::<f32>() as u64,
             nb1: (HIDDEN * size_of::<f32>()) as u64,
             nb2: (HC_WIDTH * size_of::<f32>()) as u64,
@@ -323,6 +601,16 @@ struct RopeArgs {
 
 impl RopeArgs {
     fn one(heads: usize, width: usize, compressed: bool, inverse: bool) -> Result<Self> {
+        Self::batch(1, heads, width, compressed, inverse)
+    }
+
+    fn batch(
+        tokens: usize,
+        heads: usize,
+        width: usize,
+        compressed: bool,
+        inverse: bool,
+    ) -> Result<Self> {
         let freq_scale = if compressed { 1.0 / 16.0 } else { 1.0 };
         let ext_factor = if compressed { 1.0 } else { 0.0 };
         let attn_factor = if compressed {
@@ -333,16 +621,16 @@ impl RopeArgs {
         Ok(Self {
             ne00: i64::try_from(width)?,
             ne01: i64::try_from(heads)?,
-            ne02: 1,
+            ne02: i64::try_from(tokens)?,
             ne03: 1,
             nb00: size_of::<f32>() as u64,
             nb01: (width * size_of::<f32>()) as u64,
             nb02: (heads * width * size_of::<f32>()) as u64,
-            nb03: (heads * width * size_of::<f32>()) as u64,
+            nb03: (tokens * heads * width * size_of::<f32>()) as u64,
             nb0: size_of::<f32>() as u64,
             nb1: (width * size_of::<f32>()) as u64,
             nb2: (heads * width * size_of::<f32>()) as u64,
-            nb3: (heads * width * size_of::<f32>()) as u64,
+            nb3: (tokens * heads * width * size_of::<f32>()) as u64,
             n_dims: 64,
             mode: 0,
             n_ctx_orig: if compressed { 65_536 } else { 0 },
@@ -555,6 +843,70 @@ struct DeepSeekScratch {
 }
 
 #[derive(Debug)]
+struct DeepSeekBatchScratch {
+    tokens: usize,
+    token_ids: MetalObjcId,
+    cur_hc: MetalObjcId,
+    next_hc: MetalObjcId,
+    flat_hc: MetalObjcId,
+    hc_mix: MetalObjcId,
+    hc_split: MetalObjcId,
+    attn_cur: MetalObjcId,
+    attn_norm: MetalObjcId,
+    qr: MetalObjcId,
+    qr_norm: MetalObjcId,
+    kv_raw: MetalObjcId,
+    kv: MetalObjcId,
+    q: MetalObjcId,
+    heads: MetalObjcId,
+    attn_group: MetalObjcId,
+    attn_rank: MetalObjcId,
+    attn_low: MetalObjcId,
+    attn_out: MetalObjcId,
+    after_attn_hc: MetalObjcId,
+    ffn_cur: MetalObjcId,
+    ffn_norm: MetalObjcId,
+    router: MetalObjcId,
+    shared_gate: MetalObjcId,
+    shared_up: MetalObjcId,
+    shared_mid: MetalObjcId,
+    shared_out: MetalObjcId,
+    route_selected: MetalObjcId,
+    route_weights: MetalObjcId,
+    routed_mid: MetalObjcId,
+    routed_down: MetalObjcId,
+    routed_out: MetalObjcId,
+    moe_map: MetalObjcId,
+    expert_staging: MetalObjcId,
+    expert_spec: DeepSeekGgufExpertSlotSpec,
+    comp_kv: MetalObjcId,
+    comp_score: MetalObjcId,
+    index_q: MetalObjcId,
+    index_weights: MetalObjcId,
+    index_scores: MetalObjcId,
+    index_selected: MetalObjcId,
+    index_sorted: MetalObjcId,
+    index_topk_scratch: MetalObjcId,
+    rope_positions: MetalObjcId,
+    comp_rope_positions: MetalObjcId,
+    flash_mask: MetalObjcId,
+    flash_kv: MetalObjcId,
+    flash_pad: MetalObjcId,
+    flash_blocks: MetalObjcId,
+    owned: Vec<MetalObjcId>,
+}
+
+impl Drop for DeepSeekBatchScratch {
+    fn drop(&mut self) {
+        unsafe {
+            for buffer in self.owned.drain(..) {
+                super::release(buffer);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct DeepSeekV4MetalState {
     capacity: usize,
     next_position: usize,
@@ -652,6 +1004,88 @@ unsafe fn encode_matvec(
         set_buffer_with_offset(encoder, output, output_offset as u64, 3);
         set_threadgroup_memory(encoder, 256, 0);
         dispatch_groups(encoder, (rows.div_ceil(2) as u64, 1, 1), (32, 4, 1));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_batch_matmul(
+    pipelines: &DeepSeekMetalPipelineSet,
+    encoder: MetalObjcId,
+    dense: &MetalDenseWeights,
+    tensor: &DeepSeekResidentTensor,
+    weight_extra_offset: usize,
+    input: MetalObjcId,
+    input_offset: usize,
+    output: MetalObjcId,
+    output_offset: usize,
+    cols: usize,
+    rows: usize,
+    tokens: usize,
+) -> Result<()> {
+    let (kernel, row_bytes) = match tensor.dtype {
+        DeepSeekResidentDtype::Q8_0 => (
+            "kernel_mul_mm_q8_0_f32",
+            cols.checked_div(32)
+                .and_then(|blocks| blocks.checked_mul(34))
+                .context("DeepSeek Q8_0 batch row size overflow")?,
+        ),
+        DeepSeekResidentDtype::F16 => (
+            "kernel_mul_mm_f16_f32",
+            cols.checked_mul(size_of::<u16>())
+                .context("DeepSeek F16 batch row size overflow")?,
+        ),
+        dtype => bail!(
+            "DeepSeek V4 tensor {} has unsupported {:?} batch-matmul dtype",
+            tensor.name,
+            dtype
+        ),
+    };
+    if cols == 0 || rows == 0 || tokens == 0 || weight_extra_offset % row_bytes != 0 {
+        bail!(
+            "DeepSeek batch matmul tensor {} has invalid shape {cols}x{rows}x{tokens} or offset {weight_extra_offset}",
+            tensor.name
+        );
+    }
+    let required_bytes = row_bytes
+        .checked_mul(rows)
+        .context("DeepSeek batch weight byte size overflow")?;
+    let tensor_end = weight_extra_offset
+        .checked_add(required_bytes)
+        .context("DeepSeek batch weight range overflow")?;
+    if tensor_end > usize::try_from(tensor.byte_len)? {
+        bail!(
+            "DeepSeek batch tensor {} submatrix {}..{} exceeds its payload",
+            tensor.name,
+            weight_extra_offset,
+            tensor_end
+        );
+    }
+    let weight_offset = usize::try_from(tensor.byte_offset)?
+        .checked_add(weight_extra_offset)
+        .context("DeepSeek batch weight offset overflow")?;
+    if weight_offset
+        .checked_add(required_bytes)
+        .is_none_or(|end| end > dense.len)
+    {
+        bail!(
+            "DeepSeek batch tensor {} lies outside resident storage",
+            tensor.name
+        );
+    }
+    let args = MulMmArgs::new(cols, rows, tokens, row_bytes)?;
+    unsafe {
+        set_pipeline(encoder, pipelines.require(kernel)?);
+        set_bytes(encoder, bytes_of(&args), 0);
+        set_buffer_with_offset(encoder, dense.buffer, weight_offset as u64, 1);
+        set_buffer_with_offset(encoder, input, input_offset as u64, 2);
+        set_buffer_with_offset(encoder, output, output_offset as u64, 3);
+        set_threadgroup_memory(encoder, 8192, 0);
+        dispatch_groups(
+            encoder,
+            (tokens.div_ceil(32) as u64, rows.div_ceil(64) as u64, 1),
+            (128, 1, 1),
+        );
     }
     Ok(())
 }
@@ -790,6 +1224,111 @@ unsafe fn encode_hc_pre(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_batch_hc_pre(
+    pipelines: &DeepSeekMetalPipelineSet,
+    encoder: MetalObjcId,
+    dense: &MetalDenseWeights,
+    batch: &DeepSeekBatchScratch,
+    input_hc: MetalObjcId,
+    layer: &DeepSeekV4LayerGraph,
+    attention: bool,
+) -> Result<()> {
+    let (function, scale, base, norm, current, normalized) = if attention {
+        (
+            &layer.hc_attn_fn,
+            &layer.hc_attn_scale,
+            &layer.hc_attn_base,
+            &layer.attn_norm,
+            batch.attn_cur,
+            batch.attn_norm,
+        )
+    } else {
+        (
+            &layer.hc_ffn_fn,
+            &layer.hc_ffn_scale,
+            &layer.hc_ffn_base,
+            &layer.ffn_norm,
+            batch.ffn_cur,
+            batch.ffn_norm,
+        )
+    };
+    unsafe {
+        encode_rms(
+            pipelines,
+            encoder,
+            dense,
+            input_hc,
+            0,
+            None,
+            batch.flat_hc,
+            0,
+            HC_WIDTH,
+            batch.tokens,
+        )?;
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            function,
+            0,
+            batch.flat_hc,
+            0,
+            batch.hc_mix,
+            0,
+            HC_WIDTH,
+            24,
+            batch.tokens,
+        )?;
+        set_pipeline(
+            encoder,
+            pipelines.require("kernel_dsv4_hc_split_weighted_sum_norm4")?,
+        );
+        set_bytes(encoder, bytes_of(&HcSplitNormArgs::batch(batch.tokens)), 0);
+        set_buffer(encoder, batch.hc_mix, 1);
+        set_buffer_with_offset(encoder, dense.buffer, scale.byte_offset, 2);
+        set_buffer_with_offset(encoder, dense.buffer, base.byte_offset, 3);
+        set_buffer(encoder, input_hc, 4);
+        set_buffer(encoder, batch.hc_split, 5);
+        set_buffer(encoder, current, 6);
+        set_buffer_with_offset(encoder, dense.buffer, norm.byte_offset, 7);
+        set_buffer(encoder, normalized, 8);
+        set_threadgroup_memory(encoder, (HIDDEN + 4 + 32) * size_of::<f32>(), 0);
+        dispatch_groups(encoder, (batch.tokens as u64, 1, 1), (1024, 1, 1));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_batch_rope(
+    pipelines: &DeepSeekMetalPipelineSet,
+    encoder: MetalObjcId,
+    positions: MetalObjcId,
+    buffer: MetalObjcId,
+    offset: usize,
+    tokens: usize,
+    heads: usize,
+    width: usize,
+    compressed: bool,
+    inverse: bool,
+) -> Result<()> {
+    let args = RopeArgs::batch(tokens, heads, width, compressed, inverse)?;
+    unsafe {
+        set_pipeline(encoder, pipelines.require("kernel_dsv4_rope_tail_f32")?);
+        set_bytes(encoder, bytes_of(&args), 0);
+        set_buffer_with_offset(encoder, buffer, offset as u64, 1);
+        set_buffer(encoder, positions, 2);
+        set_buffer_with_offset(encoder, buffer, offset as u64, 3);
+        set_buffer_with_offset(encoder, buffer, offset as u64, 4);
+        dispatch_groups(
+            encoder,
+            (heads as u64, tokens as u64, 1),
+            (width.min(256) as u64, 1, 1),
+        );
+    }
+    Ok(())
+}
+
 unsafe fn encode_fp8_row(
     pipelines: &DeepSeekMetalPipelineSet,
     encoder: MetalObjcId,
@@ -822,6 +1361,46 @@ unsafe fn encode_fp8_row(
         set_buffer_with_offset(encoder, buffer, offset as u64, 2);
         set_threadgroup_memory(encoder, 64 * size_of::<f32>(), 0);
         dispatch_groups(encoder, (1, 1, 1), (64, 1, 1));
+    }
+    Ok(())
+}
+
+unsafe fn encode_fp8_rows(
+    pipelines: &DeepSeekMetalPipelineSet,
+    encoder: MetalObjcId,
+    buffer: MetalObjcId,
+    offset: usize,
+    width: usize,
+    rows: usize,
+) -> Result<()> {
+    let row_bytes = width
+        .checked_mul(size_of::<f32>())
+        .context("DeepSeek FP8 batch row size overflow")?;
+    let args = Fp8Args {
+        ne00: i64::try_from(width)?,
+        ne01: i64::try_from(rows)?,
+        ne02: 1,
+        ne03: 1,
+        nb00: size_of::<f32>() as u64,
+        nb01: row_bytes as u64,
+        nb02: (row_bytes * rows) as u64,
+        nb03: (row_bytes * rows) as u64,
+        nb0: size_of::<f32>() as u64,
+        nb1: row_bytes as u64,
+        nb2: (row_bytes * rows) as u64,
+        nb3: (row_bytes * rows) as u64,
+        n_rot: 64,
+    };
+    unsafe {
+        set_pipeline(
+            encoder,
+            pipelines.require("kernel_dsv4_fp8_kv_quantize_f32")?,
+        );
+        set_bytes(encoder, bytes_of(&args), 0);
+        set_buffer_with_offset(encoder, buffer, offset as u64, 1);
+        set_buffer_with_offset(encoder, buffer, offset as u64, 2);
+        set_threadgroup_memory(encoder, 64 * size_of::<f32>(), 0);
+        dispatch_groups(encoder, (rows as u64, 1, 1), (64, 1, 1));
     }
     Ok(())
 }
@@ -938,6 +1517,136 @@ unsafe fn encode_compressor(
         }
     }
     Ok(n_comp)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_batch_compressor(
+    pipelines: &DeepSeekMetalPipelineSet,
+    encoder: MetalObjcId,
+    dense: &MetalDenseWeights,
+    batch: &DeepSeekBatchScratch,
+    source: MetalObjcId,
+    kv_projection: &DeepSeekResidentTensor,
+    gate_projection: &DeepSeekResidentTensor,
+    ape: &DeepSeekResidentTensor,
+    norm: &DeepSeekResidentTensor,
+    ratio: usize,
+    width: usize,
+    head_dim: usize,
+    cache: MetalObjcId,
+    state_kv: MetalObjcId,
+    state_score: MetalObjcId,
+    projected_kv: MetalObjcId,
+    projected_score: MetalObjcId,
+    quantize_fp8: bool,
+) -> Result<usize> {
+    let n_comp = batch.tokens / ratio;
+    unsafe {
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            kv_projection,
+            0,
+            source,
+            0,
+            projected_kv,
+            0,
+            HIDDEN,
+            width,
+            batch.tokens,
+        )?;
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            gate_projection,
+            0,
+            source,
+            0,
+            projected_score,
+            0,
+            HIDDEN,
+            width,
+            batch.tokens,
+        )?;
+        let args = CompressorPrefillArgs {
+            tokens: u32::try_from(batch.tokens)?,
+            width: u32::try_from(width)?,
+            head_dim: u32::try_from(head_dim)?,
+            ratio: u32::try_from(ratio)?,
+            pos0: 0,
+        };
+        set_pipeline(
+            encoder,
+            pipelines.require("kernel_pb_dsv4_compressor_prefill")?,
+        );
+        set_bytes(encoder, bytes_of(&args), 0);
+        set_buffer(encoder, projected_kv, 1);
+        set_buffer(encoder, projected_score, 2);
+        set_buffer_with_offset(encoder, dense.buffer, ape.byte_offset, 3);
+        set_buffer(encoder, state_kv, 4);
+        set_buffer(encoder, state_score, 5);
+        set_buffer(encoder, cache, 6);
+        dispatch_groups(encoder, (1, 1, 1), (256, 1, 1));
+        if n_comp == 0 {
+            return Ok(0);
+        }
+        encode_rms(
+            pipelines,
+            encoder,
+            dense,
+            cache,
+            0,
+            Some(norm),
+            cache,
+            0,
+            head_dim,
+            n_comp,
+        )?;
+        encode_batch_rope(
+            pipelines,
+            encoder,
+            batch.comp_rope_positions,
+            cache,
+            0,
+            n_comp,
+            1,
+            head_dim,
+            true,
+            false,
+        )?;
+        if quantize_fp8 {
+            encode_fp8_rows(pipelines, encoder, cache, 0, head_dim, n_comp)?;
+        } else {
+            encode_index_qat_rows(pipelines, encoder, cache, n_comp)?;
+        }
+    }
+    Ok(n_comp)
+}
+
+unsafe fn encode_index_qat_rows(
+    pipelines: &DeepSeekMetalPipelineSet,
+    encoder: MetalObjcId,
+    buffer: MetalObjcId,
+    rows: usize,
+) -> Result<()> {
+    let args = IndexQatArgs {
+        n_rows: u32::try_from(rows)?,
+        head_dim: INDEX_HEAD_DIM as u32,
+        row_stride: (INDEX_HEAD_DIM * size_of::<f32>()) as u64,
+    };
+    unsafe {
+        set_pipeline(
+            encoder,
+            pipelines.require("kernel_dsv4_indexer_hadamard_fp4_f32")?,
+        );
+        set_bytes(encoder, bytes_of(&args), 0);
+        set_buffer(encoder, buffer, 1);
+        set_threadgroup_memory(encoder, 256 * size_of::<f32>(), 0);
+        dispatch_groups(encoder, (rows as u64, 1, 1), (128, 1, 1));
+    }
+    Ok(())
 }
 
 unsafe fn pipeline_max_threads(pipeline: MetalObjcId) -> usize {
@@ -1068,6 +1777,371 @@ unsafe fn encode_index_topk(
             std::mem::swap(&mut current_offset, &mut next_offset);
             len <<= 1;
         }
+    }
+    Ok(())
+}
+
+unsafe fn encode_batch_index_topk(
+    pipelines: &DeepSeekMetalPipelineSet,
+    encoder: MetalObjcId,
+    batch: &DeepSeekBatchScratch,
+    n_comp: usize,
+) -> Result<()> {
+    if n_comp <= INDEX_TOP_K {
+        return Ok(());
+    }
+    let argsort_pipeline = pipelines.require("kernel_argsort_f32_i32_desc")?;
+    let geometry = index_topk_geometry(n_comp, unsafe { pipeline_max_threads(argsort_pipeline) });
+    let nth = geometry.threads;
+    let npr = geometry.parts;
+    let block_top = geometry.block_top;
+    let work_width = geometry.work_width;
+    let score_plane_bytes = n_comp
+        .checked_mul(batch.tokens)
+        .and_then(|values| values.checked_mul(size_of::<f32>()))
+        .context("DeepSeek batch index score plane overflow")?;
+    let args = ArgsortArgs {
+        ne00: i32::try_from(n_comp)?,
+        ne01: i32::try_from(batch.tokens)?,
+        ne02: 1,
+        ne03: 1,
+        nb00: size_of::<f32>() as u64,
+        nb01: (n_comp * size_of::<f32>()) as u64,
+        nb02: score_plane_bytes as u64,
+        nb03: score_plane_bytes as u64,
+        ne0: i32::try_from(work_width)?,
+        ne1: i32::try_from(batch.tokens)?,
+        ne2: 1,
+        ne3: 1,
+        top_k: i32::try_from(block_top)?,
+    };
+    let scratch_plane_bytes = work_width
+        .checked_mul(batch.tokens)
+        .and_then(|values| values.checked_mul(size_of::<i32>()))
+        .context("DeepSeek batch top-k scratch plane overflow")?;
+    let mut current_offset = 0usize;
+    let mut next_offset = scratch_plane_bytes;
+    let single_pass = npr == 1;
+    unsafe {
+        set_pipeline(encoder, argsort_pipeline);
+        set_bytes(encoder, bytes_of(&args), 0);
+        set_buffer(encoder, batch.index_scores, 1);
+        if single_pass {
+            set_buffer(encoder, batch.index_selected, 2);
+        } else {
+            set_buffer_with_offset(encoder, batch.index_topk_scratch, 0, 2);
+        }
+        set_threadgroup_memory(encoder, (nth * size_of::<i32>()).next_multiple_of(16), 0);
+        dispatch_groups(
+            encoder,
+            ((npr * batch.tokens) as u64, 1, 1),
+            (nth as u64, 1, 1),
+        );
+        if !single_pass {
+            let merge_pipeline = pipelines.require("kernel_argsort_merge_f32_i32_desc")?;
+            let mut len = block_top;
+            while len < work_width {
+                let nm = work_width.div_ceil(2 * len);
+                let final_merge = nm == 1;
+                let merge_threads = pipeline_max_threads(merge_pipeline).clamp(1, 512).min(len);
+                let merge_args = ArgsortMergeArgs {
+                    ne00: i64::try_from(n_comp)?,
+                    ne01: i64::try_from(batch.tokens)?,
+                    ne02: 1,
+                    ne03: 1,
+                    nb00: size_of::<f32>() as u64,
+                    nb01: (n_comp * size_of::<f32>()) as u64,
+                    nb02: score_plane_bytes as u64,
+                    nb03: score_plane_bytes as u64,
+                    ne0: i32::try_from(work_width)?,
+                    ne1: i32::try_from(batch.tokens)?,
+                    ne2: 1,
+                    ne3: 1,
+                    top_k: i32::try_from(if final_merge { INDEX_TOP_K } else { work_width })?,
+                    len: i32::try_from(len)?,
+                };
+                set_pipeline(encoder, merge_pipeline);
+                set_bytes(encoder, bytes_of(&merge_args), 0);
+                set_buffer(encoder, batch.index_scores, 1);
+                set_buffer_with_offset(encoder, batch.index_topk_scratch, current_offset as u64, 2);
+                if final_merge {
+                    set_buffer(encoder, batch.index_selected, 3);
+                } else {
+                    set_buffer_with_offset(
+                        encoder,
+                        batch.index_topk_scratch,
+                        next_offset as u64,
+                        3,
+                    );
+                }
+                dispatch_groups(
+                    encoder,
+                    ((nm * batch.tokens) as u64, 1, 1),
+                    (merge_threads as u64, 1, 1),
+                );
+                std::mem::swap(&mut current_offset, &mut next_offset);
+                len <<= 1;
+            }
+        }
+
+        let sort = TopkMaskArgs {
+            ne00: INDEX_TOP_K as i64,
+            ne01: i64::try_from(batch.tokens)?,
+            nb00: size_of::<i32>() as u64,
+            nb01: (INDEX_TOP_K * size_of::<i32>()) as u64,
+            ne0: INDEX_TOP_K as i64,
+            ne1: i64::try_from(batch.tokens)?,
+            nb0: size_of::<i32>() as u64,
+            nb1: (INDEX_TOP_K * size_of::<i32>()) as u64,
+        };
+        set_pipeline(encoder, pipelines.require("kernel_dsv4_sort_i32_rows_asc")?);
+        set_bytes(encoder, bytes_of(&sort), 0);
+        set_buffer(encoder, batch.index_selected, 1);
+        set_buffer(encoder, batch.index_sorted, 2);
+        set_threadgroup_memory(encoder, INDEX_TOP_K * size_of::<i32>(), 0);
+        dispatch_groups(
+            encoder,
+            (batch.tokens as u64, 1, 1),
+            (INDEX_TOP_K as u64, 1, 1),
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_batch_indexed_attention(
+    pipelines: &DeepSeekMetalPipelineSet,
+    encoder: MetalObjcId,
+    dense: &MetalDenseWeights,
+    batch: &DeepSeekBatchScratch,
+    sinks: &DeepSeekResidentTensor,
+    comp: MetalObjcId,
+    n_comp: usize,
+    top_k: usize,
+    ratio: usize,
+) -> Result<()> {
+    let args = IndexedAttentionArgs {
+        n_tokens: u32::try_from(batch.tokens)?,
+        n_head: HEADS as u32,
+        n_raw: u32::try_from(batch.tokens)?,
+        raw_cap: u32::try_from(batch.tokens)?,
+        raw_start: 0,
+        n_comp: u32::try_from(n_comp)?,
+        top_k: u32::try_from(top_k)?,
+        pos0: 0,
+        window: RAW_CAP as u32,
+        ratio: u32::try_from(ratio)?,
+        comp_kv_f16: 0,
+        pad0: 0,
+        q_token_stride: (Q_WIDTH * size_of::<f32>()) as u64,
+        q_head_stride: (HEAD_DIM * size_of::<f32>()) as u64,
+        raw_row_stride: (HEAD_DIM * size_of::<f32>()) as u64,
+        comp_row_stride: (HEAD_DIM * size_of::<f32>()) as u64,
+        topk_token_stride: (top_k * size_of::<i32>()) as u64,
+        dst_token_stride: (Q_WIDTH * size_of::<f32>()) as u64,
+        dst_head_stride: (HEAD_DIM * size_of::<f32>()) as u64,
+        scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+    };
+    unsafe {
+        set_pipeline(
+            encoder,
+            pipelines.require("kernel_dsv4_indexed_mixed_attention_heads8")?,
+        );
+        set_bytes(encoder, bytes_of(&args), 0);
+        set_buffer(encoder, batch.q, 1);
+        set_buffer(encoder, batch.kv, 2);
+        set_buffer(encoder, comp, 3);
+        set_buffer(encoder, batch.index_sorted, 4);
+        set_buffer_with_offset(encoder, dense.buffer, sinks.byte_offset, 5);
+        set_buffer(encoder, batch.heads, 6);
+        set_threadgroup_memory(encoder, 128 * 4 * size_of::<u16>(), 0);
+        dispatch_groups(
+            encoder,
+            (batch.tokens as u64, HEADS.div_ceil(8) as u64, 1),
+            (32, 8, 1),
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_batch_flash_attention(
+    pipelines: &DeepSeekMetalPipelineSet,
+    encoder: MetalObjcId,
+    dense: &MetalDenseWeights,
+    batch: &DeepSeekBatchScratch,
+    sinks: &DeepSeekResidentTensor,
+    compressed_cache: Option<MetalObjcId>,
+    n_comp: usize,
+    ratio: usize,
+) -> Result<()> {
+    let tokens = batch.tokens;
+    let n_keys = tokens
+        .checked_add(n_comp)
+        .context("DeepSeek FlashAttention key count overflow")?;
+    let row_f32 = HEAD_DIM * size_of::<f32>();
+    let row_f16 = HEAD_DIM * size_of::<u16>();
+    let mask_bytes = tokens
+        .checked_mul(n_keys)
+        .and_then(|values| values.checked_mul(size_of::<u16>()))
+        .context("DeepSeek FlashAttention mask size overflow")?;
+    let nqptg = 8usize;
+    let ncpsg = 64usize;
+    let nblk0 = n_keys.div_ceil(ncpsg);
+    let nblk1 = tokens.div_ceil(nqptg);
+    let has_kvpad = !n_keys.is_multiple_of(ncpsg);
+    unsafe {
+        let copy = CopyArgs {
+            elements: u32::try_from(
+                tokens
+                    .checked_mul(HEAD_DIM)
+                    .context("raw KV copy overflow")?,
+            )?,
+        };
+        set_pipeline(encoder, pipelines.require("kernel_pb_dsv4_f32_to_f16")?);
+        set_bytes(encoder, bytes_of(&copy), 0);
+        set_buffer(encoder, batch.kv, 1);
+        set_buffer(encoder, batch.flash_kv, 2);
+        dispatch_groups(
+            encoder,
+            (usize::try_from(copy.elements)?.div_ceil(256) as u64, 1, 1),
+            (256, 1, 1),
+        );
+        if n_comp != 0 {
+            let cache = compressed_cache
+                .context("DeepSeek compressed FlashAttention is missing its layer cache")?;
+            let copy = CopyArgs {
+                elements: u32::try_from(
+                    n_comp
+                        .checked_mul(HEAD_DIM)
+                        .context("compressed KV copy overflow")?,
+                )?,
+            };
+            set_pipeline(encoder, pipelines.require("kernel_pb_dsv4_f32_to_f16")?);
+            set_bytes(encoder, bytes_of(&copy), 0);
+            set_buffer(encoder, cache, 1);
+            set_buffer_with_offset(encoder, batch.flash_kv, (tokens * row_f16) as u64, 2);
+            dispatch_groups(
+                encoder,
+                (usize::try_from(copy.elements)?.div_ceil(256) as u64, 1, 1),
+                (256, 1, 1),
+            );
+        }
+
+        let mask = AttentionMaskArgs {
+            tokens: u32::try_from(tokens)?,
+            compressed: u32::try_from(n_comp)?,
+            window: RAW_CAP as u32,
+            ratio: u32::try_from(ratio)?,
+        };
+        set_pipeline(
+            encoder,
+            pipelines.require("kernel_pb_dsv4_prefill_attention_mask")?,
+        );
+        set_bytes(encoder, bytes_of(&mask), 0);
+        set_buffer(encoder, batch.flash_mask, 1);
+        dispatch_groups(
+            encoder,
+            (tokens.saturating_mul(n_keys).div_ceil(256) as u64, 1, 1),
+            (256, 1, 1),
+        );
+
+        if has_kvpad {
+            let args = FlashAttentionPadArgs {
+                ne11: i32::try_from(n_keys)?,
+                ne_12_2: 1,
+                ne_12_3: 1,
+                nb11: row_f16 as u64,
+                nb12: (n_keys * row_f16) as u64,
+                nb13: (n_keys * row_f16) as u64,
+                nb21: row_f16 as u64,
+                nb22: (n_keys * row_f16) as u64,
+                nb23: (n_keys * row_f16) as u64,
+                ne31: i32::try_from(tokens)?,
+                ne32: 1,
+                ne33: 1,
+                nb31: (n_keys * size_of::<u16>()) as u64,
+                nb32: mask_bytes as u64,
+                nb33: mask_bytes as u64,
+            };
+            set_pipeline(encoder, pipelines.require("kernel_flash_attn_ext_pad")?);
+            set_bytes(encoder, bytes_of(&args), 0);
+            set_buffer(encoder, batch.flash_kv, 1);
+            set_buffer(encoder, batch.flash_kv, 2);
+            set_buffer(encoder, batch.flash_mask, 3);
+            set_buffer(encoder, batch.flash_pad, 4);
+            dispatch_groups(encoder, (ncpsg as u64, 1, 1), (32, 1, 1));
+        }
+
+        let block = FlashAttentionBlockArgs {
+            ne01: i32::try_from(tokens)?,
+            ne30: i32::try_from(n_keys)?,
+            ne31: i32::try_from(tokens)?,
+            ne32: 1,
+            ne33: 1,
+            nb31: (n_keys * size_of::<u16>()) as u64,
+            nb32: mask_bytes as u64,
+            nb33: mask_bytes as u64,
+        };
+        set_pipeline(encoder, pipelines.require("kernel_flash_attn_ext_blk")?);
+        set_bytes(encoder, bytes_of(&block), 0);
+        set_buffer(encoder, batch.flash_mask, 1);
+        set_buffer(encoder, batch.flash_blocks, 2);
+        dispatch_groups(encoder, (nblk0 as u64, nblk1 as u64, 1), (32, 1, 1));
+
+        let args = FlashAttentionArgs {
+            ne01: i32::try_from(tokens)?,
+            ne02: HEADS as i32,
+            ne03: 1,
+            nb01: (HEADS * row_f32) as u64,
+            nb02: row_f32 as u64,
+            nb03: (tokens * HEADS * row_f32) as u64,
+            ne11: i32::try_from(n_keys)?,
+            ne_12_2: 1,
+            ne_12_3: 1,
+            ns10: HEAD_DIM as i32,
+            nb11: row_f16 as u64,
+            nb12: (n_keys * row_f16) as u64,
+            nb13: (n_keys * row_f16) as u64,
+            ns20: HEAD_DIM as i32,
+            nb21: row_f16 as u64,
+            nb22: (n_keys * row_f16) as u64,
+            nb23: (n_keys * row_f16) as u64,
+            ne31: i32::try_from(tokens)?,
+            ne32: 1,
+            ne33: 1,
+            nb31: (n_keys * size_of::<u16>()) as u64,
+            nb32: mask_bytes as u64,
+            nb33: mask_bytes as u64,
+            ne1: HEADS as i32,
+            ne2: i32::try_from(tokens)?,
+            ne3: 1,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            max_bias: 0.0,
+            m0: 0.0,
+            m1: 0.0,
+            n_head_log2: 0,
+            logit_softcap: 0.0,
+        };
+        let pipeline = if has_kvpad {
+            "kernel_flash_attn_ext_f16_dk512_dv512"
+        } else {
+            "kernel_flash_attn_ext_f16_dk512_dv512_nopad"
+        };
+        set_pipeline(encoder, pipelines.require(pipeline)?);
+        set_bytes(encoder, bytes_of(&args), 0);
+        set_buffer(encoder, batch.q, 1);
+        set_buffer(encoder, batch.flash_kv, 2);
+        set_buffer(encoder, batch.flash_kv, 3);
+        set_buffer(encoder, batch.flash_mask, 4);
+        set_buffer_with_offset(encoder, dense.buffer, sinks.byte_offset, 5);
+        set_buffer(encoder, batch.flash_pad, 6);
+        set_buffer(encoder, batch.flash_blocks, 7);
+        set_buffer(encoder, batch.heads, 8);
+        let shared_elements = nqptg * (HEAD_DIM + 2 * HEAD_DIM + 2 * (2 * ncpsg));
+        let shared_bytes = (shared_elements * size_of::<u16>()).next_multiple_of(16);
+        set_threadgroup_memory(encoder, shared_bytes, 0);
+        dispatch_groups(encoder, (nblk1 as u64, HEADS as u64, 1), (32, 8, 1));
     }
     Ok(())
 }
@@ -1520,6 +2594,496 @@ unsafe fn encode_layer_pre_expert(
     Ok(())
 }
 
+unsafe fn encode_batch_pre_expert_layer(
+    context: &MetalExecutionContext,
+    encoding: &mut MetalCommandEncoding,
+    dense: &MetalDenseWeights,
+    graph_layer: &DeepSeekV4LayerGraph,
+    layer_state: &DeepSeekLayerState,
+    batch: &DeepSeekBatchScratch,
+) -> Result<()> {
+    let pipelines = context.deepseek_pipelines()?;
+    let encoder = encoding.encoder();
+    let compressed = layer_state.ratio != 0;
+    unsafe {
+        encode_batch_hc_pre(
+            pipelines,
+            encoder,
+            dense,
+            batch,
+            batch.cur_hc,
+            graph_layer,
+            true,
+        )?;
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            &graph_layer.attn_q_a,
+            0,
+            batch.attn_norm,
+            0,
+            batch.qr,
+            0,
+            HIDDEN,
+            Q_RANK,
+            batch.tokens,
+        )?;
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            &graph_layer.attn_kv,
+            0,
+            batch.attn_norm,
+            0,
+            batch.kv_raw,
+            0,
+            HIDDEN,
+            HEAD_DIM,
+            batch.tokens,
+        )?;
+        encode_rms(
+            pipelines,
+            encoder,
+            dense,
+            batch.qr,
+            0,
+            Some(&graph_layer.attn_q_a_norm),
+            batch.qr_norm,
+            0,
+            Q_RANK,
+            batch.tokens,
+        )?;
+        encode_rms(
+            pipelines,
+            encoder,
+            dense,
+            batch.kv_raw,
+            0,
+            Some(&graph_layer.attn_kv_a_norm),
+            batch.kv,
+            0,
+            HEAD_DIM,
+            batch.tokens,
+        )?;
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            &graph_layer.attn_q_b,
+            0,
+            batch.qr_norm,
+            0,
+            batch.q,
+            0,
+            Q_RANK,
+            Q_WIDTH,
+            batch.tokens,
+        )?;
+        encode_rms(
+            pipelines,
+            encoder,
+            dense,
+            batch.q,
+            0,
+            None,
+            batch.q,
+            0,
+            HEAD_DIM,
+            batch.tokens * HEADS,
+        )?;
+        encode_batch_rope(
+            pipelines,
+            encoder,
+            batch.rope_positions,
+            batch.q,
+            0,
+            batch.tokens,
+            HEADS,
+            HEAD_DIM,
+            compressed,
+            false,
+        )?;
+        encode_batch_rope(
+            pipelines,
+            encoder,
+            batch.rope_positions,
+            batch.kv,
+            0,
+            batch.tokens,
+            1,
+            HEAD_DIM,
+            compressed,
+            false,
+        )?;
+        encode_fp8_rows(pipelines, encoder, batch.kv, 0, HEAD_DIM, batch.tokens)?;
+
+        let n_comp = if let Some(compressor) = &graph_layer.compressor {
+            let cache = layer_state
+                .comp
+                .context("compressed batch layer is missing attention cache")?;
+            let n_comp = encode_batch_compressor(
+                pipelines,
+                encoder,
+                dense,
+                batch,
+                batch.attn_norm,
+                &compressor.kv,
+                &compressor.gate,
+                &compressor.ape,
+                &compressor.norm,
+                compressor.ratio,
+                if compressor.ratio == 4 { 1024 } else { 512 },
+                HEAD_DIM,
+                cache,
+                layer_state
+                    .comp_state_kv
+                    .context("compressed batch layer is missing KV frontier")?,
+                layer_state
+                    .comp_state_score
+                    .context("compressed batch layer is missing score frontier")?,
+                batch.comp_kv,
+                batch.comp_score,
+                true,
+            )?;
+            if n_comp > layer_state.comp_cap {
+                bail!(
+                    "DeepSeek V4 batch compressed cache count {n_comp} exceeds capacity {}",
+                    layer_state.comp_cap
+                );
+            }
+            n_comp
+        } else {
+            0
+        };
+
+        if let Some(indexer) = &graph_layer.indexer {
+            encode_batch_matmul(
+                pipelines,
+                encoder,
+                dense,
+                &indexer.q_b,
+                0,
+                batch.qr_norm,
+                0,
+                batch.index_q,
+                0,
+                Q_RANK,
+                INDEX_WIDTH,
+                batch.tokens,
+            )?;
+            encode_batch_rope(
+                pipelines,
+                encoder,
+                batch.rope_positions,
+                batch.index_q,
+                0,
+                batch.tokens,
+                INDEX_HEADS,
+                INDEX_HEAD_DIM,
+                true,
+                false,
+            )?;
+            encode_index_qat_rows(
+                pipelines,
+                encoder,
+                batch.index_q,
+                batch.tokens * INDEX_HEADS,
+            )?;
+            encode_batch_matmul(
+                pipelines,
+                encoder,
+                dense,
+                &indexer.projection,
+                0,
+                batch.attn_norm,
+                0,
+                batch.index_weights,
+                0,
+                HIDDEN,
+                INDEX_HEADS,
+                batch.tokens,
+            )?;
+            let index_n_comp = encode_batch_compressor(
+                pipelines,
+                encoder,
+                dense,
+                batch,
+                batch.attn_norm,
+                &indexer.compressor_kv,
+                &indexer.compressor_gate,
+                &indexer.compressor_ape,
+                &indexer.compressor_norm,
+                4,
+                256,
+                INDEX_HEAD_DIM,
+                layer_state
+                    .index_comp
+                    .context("batch indexer layer is missing compressed cache")?,
+                layer_state
+                    .index_state_kv
+                    .context("batch indexer layer is missing KV frontier")?,
+                layer_state
+                    .index_state_score
+                    .context("batch indexer layer is missing score frontier")?,
+                batch.comp_kv,
+                batch.comp_score,
+                false,
+            )?;
+            if index_n_comp != n_comp {
+                bail!("DeepSeek V4 batch attention/index compressor frontiers diverged");
+            }
+            if n_comp > INDEX_TOP_K {
+                let scores = IndexScoresArgs {
+                    n_comp: u32::try_from(n_comp)?,
+                    n_tokens: u32::try_from(batch.tokens)?,
+                    n_head: INDEX_HEADS as u32,
+                    head_dim: INDEX_HEAD_DIM as u32,
+                    pos0: 0,
+                    ratio: 4,
+                    q_token_stride: (INDEX_WIDTH * size_of::<f32>()) as u64,
+                    q_head_stride: (INDEX_HEAD_DIM * size_of::<f32>()) as u64,
+                    weights_token_stride: (INDEX_HEADS * size_of::<f32>()) as u64,
+                    index_row_stride: (INDEX_HEAD_DIM * size_of::<f32>()) as u64,
+                    score_token_stride: (n_comp * size_of::<f32>()) as u64,
+                    scale: 1.0 / (INDEX_WIDTH as f32).sqrt(),
+                };
+                set_pipeline(
+                    encoder,
+                    pipelines.require("kernel_dsv4_indexer_scores_tiled")?,
+                );
+                set_bytes(encoder, bytes_of(&scores), 0);
+                set_buffer(encoder, batch.index_q, 1);
+                set_buffer(encoder, batch.index_weights, 2);
+                set_buffer(
+                    encoder,
+                    layer_state.index_comp.expect("validated batch index cache"),
+                    3,
+                );
+                set_buffer(encoder, batch.index_scores, 4);
+                let shared = (8 * INDEX_HEAD_DIM + 32 * INDEX_HEAD_DIM) * size_of::<u16>()
+                    + 8 * 32 * size_of::<f32>();
+                set_threadgroup_memory(encoder, shared, 0);
+                dispatch_groups(
+                    encoder,
+                    (
+                        n_comp.div_ceil(32) as u64,
+                        batch.tokens.div_ceil(8) as u64,
+                        1,
+                    ),
+                    (32, 4, 1),
+                );
+                encode_batch_index_topk(pipelines, encoder, batch, n_comp)?;
+            }
+        }
+
+        if layer_state.ratio == 4 && n_comp > INDEX_TOP_K {
+            encode_batch_indexed_attention(
+                pipelines,
+                encoder,
+                dense,
+                batch,
+                &graph_layer.attn_sinks,
+                layer_state.comp.context("validated compressed cache")?,
+                n_comp,
+                n_comp.min(INDEX_TOP_K),
+                layer_state.ratio,
+            )?;
+        } else {
+            encode_batch_flash_attention(
+                pipelines,
+                encoder,
+                dense,
+                batch,
+                &graph_layer.attn_sinks,
+                layer_state.comp,
+                n_comp,
+                layer_state.ratio,
+            )?;
+        }
+
+        let store = RawStoreBatchArgs {
+            tokens: u32::try_from(batch.tokens)?,
+            raw_cap: RAW_CAP as u32,
+            head_dim: HEAD_DIM as u32,
+            pos0: 0,
+        };
+        set_pipeline(
+            encoder,
+            pipelines.require("kernel_pb_dsv4_raw_store_batch")?,
+        );
+        set_bytes(encoder, bytes_of(&store), 0);
+        set_buffer(encoder, batch.kv, 1);
+        set_buffer(encoder, layer_state.raw, 2);
+        dispatch_groups(
+            encoder,
+            (
+                (batch.tokens.min(RAW_CAP) * HEAD_DIM).div_ceil(256) as u64,
+                1,
+                1,
+            ),
+            (256, 1, 1),
+        );
+
+        encode_batch_rope(
+            pipelines,
+            encoder,
+            batch.rope_positions,
+            batch.heads,
+            0,
+            batch.tokens,
+            HEADS,
+            HEAD_DIM,
+            compressed,
+            true,
+        )?;
+        for group in 0..OUTPUT_GROUPS {
+            let copy = GroupCopyArgs {
+                tokens: u32::try_from(batch.tokens)?,
+                groups: OUTPUT_GROUPS as u32,
+                group: group as u32,
+                group_width: GROUP_WIDTH as u32,
+                rank: OUTPUT_RANK as u32,
+            };
+            set_pipeline(
+                encoder,
+                pipelines.require("kernel_pb_dsv4_gather_attention_group")?,
+            );
+            set_bytes(encoder, bytes_of(&copy), 0);
+            set_buffer(encoder, batch.heads, 1);
+            set_buffer(encoder, batch.attn_group, 2);
+            dispatch_groups(
+                encoder,
+                ((batch.tokens * GROUP_WIDTH).div_ceil(256) as u64, 1, 1),
+                (256, 1, 1),
+            );
+            let q8_row_bytes = (GROUP_WIDTH / 32) * 34;
+            encode_batch_matmul(
+                pipelines,
+                encoder,
+                dense,
+                &graph_layer.attn_output_a,
+                group * OUTPUT_RANK * q8_row_bytes,
+                batch.attn_group,
+                0,
+                batch.attn_rank,
+                0,
+                GROUP_WIDTH,
+                OUTPUT_RANK,
+                batch.tokens,
+            )?;
+            set_pipeline(
+                encoder,
+                pipelines.require("kernel_pb_dsv4_scatter_attention_rank")?,
+            );
+            set_bytes(encoder, bytes_of(&copy), 0);
+            set_buffer(encoder, batch.attn_rank, 1);
+            set_buffer(encoder, batch.attn_low, 2);
+            dispatch_groups(
+                encoder,
+                ((batch.tokens * OUTPUT_RANK).div_ceil(256) as u64, 1, 1),
+                (256, 1, 1),
+            );
+        }
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            &graph_layer.attn_output_b,
+            0,
+            batch.attn_low,
+            0,
+            batch.attn_out,
+            0,
+            OUTPUT_LOW,
+            HIDDEN,
+            batch.tokens,
+        )?;
+        let hc = HcExpandArgs::batch(batch.tokens);
+        set_pipeline(encoder, pipelines.require("kernel_dsv4_hc_expand4")?);
+        set_bytes(encoder, bytes_of(&hc), 0);
+        set_buffer(encoder, batch.attn_out, 1);
+        set_buffer(encoder, batch.cur_hc, 2);
+        set_buffer_with_offset(encoder, batch.hc_split, (4 * size_of::<f32>()) as u64, 3);
+        set_buffer_with_offset(encoder, batch.hc_split, (8 * size_of::<f32>()) as u64, 4);
+        set_buffer(encoder, batch.attn_out, 5);
+        set_buffer(encoder, batch.after_attn_hc, 6);
+        dispatch_groups(
+            encoder,
+            ((batch.tokens * HIDDEN).div_ceil(256) as u64, 1, 1),
+            (256, 1, 1),
+        );
+
+        encode_batch_hc_pre(
+            pipelines,
+            encoder,
+            dense,
+            batch,
+            batch.after_attn_hc,
+            graph_layer,
+            false,
+        )?;
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            &graph_layer.router,
+            0,
+            batch.ffn_norm,
+            0,
+            batch.router,
+            0,
+            HIDDEN,
+            EXPERTS,
+            batch.tokens,
+        )?;
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            &graph_layer.shared_gate,
+            0,
+            batch.ffn_norm,
+            0,
+            batch.shared_gate,
+            0,
+            HIDDEN,
+            EXPERT_WIDTH,
+            batch.tokens,
+        )?;
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            &graph_layer.shared_up,
+            0,
+            batch.ffn_norm,
+            0,
+            batch.shared_up,
+            0,
+            HIDDEN,
+            EXPERT_WIDTH,
+            batch.tokens,
+        )?;
+        let swiglu = SwigluBatchArgs {
+            elements: u32::try_from(batch.tokens * EXPERT_WIDTH)?,
+            clamp: 10.0,
+        };
+        set_pipeline(encoder, pipelines.require("kernel_pb_dsv4_swiglu_batch")?);
+        set_bytes(encoder, bytes_of(&swiglu), 0);
+        set_buffer(encoder, batch.shared_gate, 1);
+        set_buffer(encoder, batch.shared_up, 2);
+        set_buffer(encoder, batch.shared_mid, 3);
+        dispatch_groups(
+            encoder,
+            (usize::try_from(swiglu.elements)?.div_ceil(256) as u64, 1, 1),
+            (256, 1, 1),
+        );
+    }
+    Ok(())
+}
+
 fn read_resident_f32(
     dense: &MetalDenseWeights,
     tensor: &DeepSeekResidentTensor,
@@ -1743,6 +3307,308 @@ unsafe fn encode_layer_experts(
     Ok(())
 }
 
+fn batch_routes_and_weights(
+    dense: &MetalDenseWeights,
+    graph_layer: &DeepSeekV4LayerGraph,
+    tokens: &[u32],
+    router_logits: &[f32],
+) -> Result<(Vec<i32>, Vec<f32>, Vec<usize>)> {
+    if router_logits.len() != tokens.len() * EXPERTS {
+        bail!(
+            "DeepSeek V4 batch router produced {} values for {} tokens",
+            router_logits.len(),
+            tokens.len()
+        );
+    }
+    let correction_bias = graph_layer
+        .router_bias
+        .as_ref()
+        .map(|tensor| read_resident_f32(dense, tensor))
+        .transpose()?;
+    let mut selected = Vec::with_capacity(tokens.len() * ACTIVE_EXPERTS);
+    let mut weights = Vec::with_capacity(tokens.len() * ACTIVE_EXPERTS);
+    let mut unique = std::collections::BTreeSet::new();
+    for (token_index, (&token, logits)) in tokens
+        .iter()
+        .zip(router_logits.chunks_exact(EXPERTS))
+        .enumerate()
+    {
+        let probabilities = deepseek_v4_router_probabilities(logits)
+            .with_context(|| format!("DeepSeek batch router token {token_index}"))?;
+        let hash_selected = graph_layer
+            .token_hash_routes
+            .as_ref()
+            .map(|tensor| read_hash_routes(dense, tensor, token))
+            .transpose()?;
+        let routes = deepseek_v4_select_routes(
+            &probabilities,
+            correction_bias.as_deref(),
+            hash_selected.as_ref().map(|values| values.as_slice()),
+        )?;
+        let sum = routes.iter().map(|route| route.1).sum::<f32>();
+        if !(sum.is_finite() && sum >= 0.0) {
+            bail!("DeepSeek V4 batch selected-route sum is invalid at token {token_index}");
+        }
+        let inverse = sum.max(6.103_515_6e-5).recip();
+        for (expert, score) in routes {
+            unique.insert(expert);
+            selected.push(i32::try_from(expert)?);
+            weights.push(score * inverse * 1.5);
+        }
+    }
+    Ok((selected, weights, unique.into_iter().collect()))
+}
+
+unsafe fn diagnose_batch_nonfinite(
+    batch: &DeepSeekBatchScratch,
+    layer_state: &DeepSeekLayerState,
+) -> Vec<&'static str> {
+    let mut checks = vec![
+        ("cur_hc", batch.cur_hc, batch.tokens * HC_WIDTH),
+        ("attn_cur", batch.attn_cur, batch.tokens * HIDDEN),
+        ("attn_norm", batch.attn_norm, batch.tokens * HIDDEN),
+        ("qr", batch.qr, batch.tokens * Q_RANK),
+        ("qr_norm", batch.qr_norm, batch.tokens * Q_RANK),
+        ("kv", batch.kv, batch.tokens * HEAD_DIM),
+        ("q", batch.q, batch.tokens * Q_WIDTH),
+        ("heads", batch.heads, batch.tokens * Q_WIDTH),
+        ("attn_out", batch.attn_out, batch.tokens * HIDDEN),
+        (
+            "after_attn_hc",
+            batch.after_attn_hc,
+            batch.tokens * HC_WIDTH,
+        ),
+        ("ffn_norm", batch.ffn_norm, batch.tokens * HIDDEN),
+        ("router", batch.router, batch.tokens * EXPERTS),
+    ];
+    if let Some(comp) = layer_state.comp {
+        checks.push((
+            "compressed_cache",
+            comp,
+            batch.tokens / layer_state.ratio * HEAD_DIM,
+        ));
+    }
+    if let Some(comp) = layer_state.index_comp {
+        checks.push((
+            "index_cache",
+            comp,
+            batch.tokens / layer_state.ratio * INDEX_HEAD_DIM,
+        ));
+    }
+    checks
+        .into_iter()
+        .filter_map(|(label, buffer, len)| unsafe {
+            std::slice::from_raw_parts(buffer_contents(buffer).cast::<f32>(), len)
+                .iter()
+                .any(|value| !value.is_finite())
+                .then_some(label)
+        })
+        .collect()
+}
+
+unsafe fn stage_batch_experts(
+    batch: &DeepSeekBatchScratch,
+    scheduler: &mut FlashMoeExecutionScheduler,
+    layer: usize,
+    unique: &[usize],
+) -> Result<()> {
+    let slots = scheduler.read_unique_experts(layer, unique)?;
+    if slots.len() != unique.len() {
+        bail!(
+            "DeepSeek V4 batch scheduler returned {} slots for {} unique experts",
+            slots.len(),
+            unique.len()
+        );
+    }
+    for (&expert, slot) in unique.iter().zip(&slots) {
+        if slot.layer() != layer || slot.expert() != expert {
+            bail!(
+                "DeepSeek V4 batch scheduler returned layer/expert {}/{} for requested {layer}/{expert}",
+                slot.layer(),
+                slot.expert()
+            );
+        }
+        let (spec, bytes) = slot.deepseek_gguf_slot()?;
+        if spec != batch.expert_spec || bytes.as_slice().len() != spec.expert_bytes {
+            bail!("DeepSeek V4 batch expert {layer}/{expert} has an inconsistent GGUF slot layout");
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(
+                bytes.as_slice().as_ptr(),
+                buffer_contents(batch.expert_staging).add(expert * batch.expert_spec.expert_bytes),
+                batch.expert_spec.expert_bytes,
+            );
+        }
+    }
+    Ok(())
+}
+
+unsafe fn encode_batch_expert_layer(
+    context: &MetalExecutionContext,
+    encoding: &mut MetalCommandEncoding,
+    dense: &MetalDenseWeights,
+    graph_layer: &DeepSeekV4LayerGraph,
+    batch: &mut DeepSeekBatchScratch,
+) -> Result<()> {
+    let pipelines = context.deepseek_pipelines()?;
+    let encoder = encoding.encoder();
+    let gate = batch.expert_spec.projection(ExpertMlpProjection::Gate);
+    let up = batch.expert_spec.projection(ExpertMlpProjection::Up);
+    let down = batch.expert_spec.projection(ExpertMlpProjection::Down);
+    let map = MoeMapArgs {
+        ne02: EXPERTS as i32,
+        ne10: HIDDEN as i32,
+        ne11: 1,
+        nb11: (HIDDEN * size_of::<f32>()) as u64,
+        nb12: (HIDDEN * size_of::<f32>()) as u64,
+        ne21: i32::try_from(batch.tokens)?,
+        ne20: ACTIVE_EXPERTS as i32,
+        nb21: (ACTIVE_EXPERTS * size_of::<i32>()) as u64,
+    };
+    let gate_args = MoeBatchMmArgs::new(
+        HIDDEN,
+        EXPERT_WIDTH,
+        EXPERTS,
+        gate.bytes / EXPERT_WIDTH,
+        batch.expert_spec.expert_bytes,
+        1,
+        ACTIVE_EXPERTS,
+        batch.tokens,
+        size_of::<f32>(),
+    )?;
+    let activation = MoeActivationArgs {
+        width: EXPERT_WIDTH as u32,
+        rows: u32::try_from(batch.tokens * ACTIVE_EXPERTS)?,
+        gate_row_stride: (EXPERT_WIDTH * size_of::<f32>()) as u64,
+        up_row_stride: (EXPERT_WIDTH * size_of::<f32>()) as u64,
+        mid_row_stride: (EXPERT_WIDTH * size_of::<u16>()) as u64,
+        weight_stride: size_of::<f32>() as u64,
+        write_clamped: 0,
+        clamp_value: 10.0,
+    };
+    unsafe {
+        set_pipeline(encoder, pipelines.require("kernel_mul_mm_id_map0_ne20_6")?);
+        set_bytes(encoder, bytes_of(&map), 0);
+        set_buffer(encoder, batch.route_selected, 1);
+        set_buffer(encoder, batch.moe_map, 2);
+        set_buffer_with_offset(
+            encoder,
+            batch.moe_map,
+            (EXPERTS * size_of::<i32>()) as u64,
+            3,
+        );
+        set_threadgroup_memory(encoder, EXPERTS * ACTIVE_EXPERTS * size_of::<u16>(), 0);
+        dispatch_groups(encoder, (1, 1, 1), (EXPERTS as u64, 1, 1));
+
+        set_pipeline(
+            encoder,
+            pipelines.require("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16")?,
+        );
+        set_bytes(encoder, bytes_of(&gate_args), 0);
+        set_bytes(encoder, bytes_of(&activation), 1);
+        set_buffer_with_offset(encoder, batch.expert_staging, gate.offset as u64, 2);
+        set_buffer_with_offset(encoder, batch.expert_staging, up.offset as u64, 3);
+        set_buffer(encoder, batch.ffn_norm, 4);
+        set_buffer(encoder, batch.moe_map, 5);
+        set_buffer_with_offset(
+            encoder,
+            batch.moe_map,
+            (EXPERTS * size_of::<i32>()) as u64,
+            6,
+        );
+        set_buffer(encoder, batch.routed_mid, 7);
+        set_buffer(encoder, batch.route_weights, 8);
+        set_threadgroup_memory(encoder, 16_384, 0);
+        dispatch_groups(
+            encoder,
+            (
+                batch.tokens.div_ceil(32) as u64,
+                EXPERT_WIDTH.div_ceil(64) as u64,
+                EXPERTS as u64,
+            ),
+            (128, 1, 1),
+        );
+
+        let down_args = MoeBatchMmArgs::new(
+            EXPERT_WIDTH,
+            HIDDEN,
+            EXPERTS,
+            down.bytes / HIDDEN,
+            batch.expert_spec.expert_bytes,
+            ACTIVE_EXPERTS,
+            ACTIVE_EXPERTS,
+            batch.tokens,
+            size_of::<u16>(),
+        )?;
+        set_pipeline(encoder, pipelines.require("kernel_mul_mm_id_q2_K_f16")?);
+        set_bytes(encoder, bytes_of(&down_args), 0);
+        set_buffer_with_offset(encoder, batch.expert_staging, down.offset as u64, 1);
+        set_buffer(encoder, batch.routed_mid, 2);
+        set_buffer(encoder, batch.moe_map, 3);
+        set_buffer_with_offset(
+            encoder,
+            batch.moe_map,
+            (EXPERTS * size_of::<i32>()) as u64,
+            4,
+        );
+        set_buffer(encoder, batch.routed_down, 5);
+        set_threadgroup_memory(encoder, 8192, 0);
+        dispatch_groups(
+            encoder,
+            (
+                batch.tokens.div_ceil(32) as u64,
+                HIDDEN.div_ceil(64) as u64,
+                EXPERTS as u64,
+            ),
+            (128, 1, 1),
+        );
+
+        let sum = MoeSum6Args {
+            width: HIDDEN as u32,
+            tokens: u32::try_from(batch.tokens)?,
+            src_token_stride: (ACTIVE_EXPERTS * HIDDEN * size_of::<f32>()) as u64,
+            dst_token_stride: (HIDDEN * size_of::<f32>()) as u64,
+        };
+        set_pipeline(encoder, pipelines.require("kernel_dsv4_moe_sum6_f32")?);
+        set_bytes(encoder, bytes_of(&sum), 0);
+        set_buffer(encoder, batch.routed_down, 1);
+        set_buffer(encoder, batch.routed_out, 2);
+        dispatch_groups(encoder, (batch.tokens as u64, 1, 1), (256, 1, 1));
+
+        encode_batch_matmul(
+            pipelines,
+            encoder,
+            dense,
+            &graph_layer.shared_down,
+            0,
+            batch.shared_mid,
+            0,
+            batch.shared_out,
+            0,
+            EXPERT_WIDTH,
+            HIDDEN,
+            batch.tokens,
+        )?;
+        let mut hc = HcExpandArgs::batch(batch.tokens);
+        hc.has_add = 1;
+        set_pipeline(encoder, pipelines.require("kernel_dsv4_hc_expand4")?);
+        set_bytes(encoder, bytes_of(&hc), 0);
+        set_buffer(encoder, batch.routed_out, 1);
+        set_buffer(encoder, batch.after_attn_hc, 2);
+        set_buffer_with_offset(encoder, batch.hc_split, (4 * size_of::<f32>()) as u64, 3);
+        set_buffer_with_offset(encoder, batch.hc_split, (8 * size_of::<f32>()) as u64, 4);
+        set_buffer(encoder, batch.shared_out, 5);
+        set_buffer(encoder, batch.next_hc, 6);
+        dispatch_groups(
+            encoder,
+            ((batch.tokens * HIDDEN).div_ceil(256) as u64, 1, 1),
+            (256, 1, 1),
+        );
+    }
+    std::mem::swap(&mut batch.cur_hc, &mut batch.next_hc);
+    Ok(())
+}
+
 fn bytes_of<T>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }
@@ -1817,6 +3683,242 @@ unsafe fn allocate_owned_buffer(
             .sample_device(context.runtime.device, false);
         owned.push(buffer);
         Ok(buffer)
+    }
+}
+
+unsafe fn allocate_owned_buffer_uninitialized(
+    context: &MetalExecutionContext,
+    owned: &mut Vec<MetalObjcId>,
+    bytes: usize,
+    label: &str,
+) -> Result<MetalObjcId> {
+    let bytes = bytes.max(size_of::<f32>());
+    unsafe {
+        context
+            .buffers
+            .ensure_allocation_capacity(context.runtime.device, bytes)?;
+        let buffer = msg_send_id2_usize_u64(
+            context.runtime.device,
+            sel("newBufferWithLength:options:"),
+            bytes,
+            0,
+        );
+        if buffer.is_null() {
+            bail!("failed to allocate DeepSeek V4 Metal {label} buffer ({bytes} bytes)");
+        }
+        context
+            .resources
+            .sample_device(context.runtime.device, false);
+        owned.push(buffer);
+        Ok(buffer)
+    }
+}
+
+impl DeepSeekBatchScratch {
+    unsafe fn allocate(context: &MetalExecutionContext, tokens: usize) -> Result<Self> {
+        if tokens == 0 {
+            bail!("DeepSeek V4 batch prefill requires at least one token");
+        }
+        let expert_spec = DeepSeekGgufExpertSlotSpec::new(HIDDEN, EXPERT_WIDTH)?;
+        let mut owned = Vec::new();
+        let allocation = (|| -> Result<Self> {
+            let mut alloc_bytes = |bytes: usize, label: &str| unsafe {
+                allocate_owned_buffer_uninitialized(context, &mut owned, bytes, label)
+            };
+            let f32_bytes = |rows: usize, width: usize, label: &str| -> Result<usize> {
+                rows.checked_mul(width)
+                    .and_then(|values| values.checked_mul(size_of::<f32>()))
+                    .with_context(|| format!("DeepSeek V4 batch {label} size overflow"))
+            };
+            let hc_mix_width = 2 * HC + HC * HC;
+            let max_comp = tokens.div_ceil(4).max(1);
+            let max_flash_keys = tokens
+                .checked_add(tokens.div_ceil(4))
+                .context("DeepSeek V4 FlashAttention key count overflow")?;
+            let flash_mask_bytes = tokens
+                .checked_mul(max_flash_keys)
+                .and_then(|values| values.checked_mul(size_of::<u16>()))
+                .context("DeepSeek V4 FlashAttention mask size overflow")?;
+            let flash_kv_bytes = max_flash_keys
+                .checked_mul(HEAD_DIM)
+                .and_then(|values| values.checked_mul(size_of::<u16>()))
+                .context("DeepSeek V4 FlashAttention KV staging size overflow")?;
+            let flash_pad_bytes = 64usize
+                .checked_mul(
+                    2usize
+                        .checked_mul(HEAD_DIM * size_of::<u16>())
+                        .and_then(|bytes| bytes.checked_add(tokens * size_of::<u16>()))
+                        .context("DeepSeek V4 FlashAttention pad row overflow")?,
+                )
+                .context("DeepSeek V4 FlashAttention pad size overflow")?;
+            let flash_block_bytes = max_flash_keys
+                .div_ceil(64)
+                .checked_mul(tokens.div_ceil(8))
+                .map(|bytes| bytes.next_multiple_of(32))
+                .context("DeepSeek V4 FlashAttention block-map size overflow")?;
+            let index_scratch_bytes = 2usize
+                .checked_mul(tokens)
+                .and_then(|values| values.checked_mul(max_comp.max(INDEX_TOP_K)))
+                .and_then(|values| values.checked_mul(size_of::<i32>()))
+                .context("DeepSeek V4 index top-k scratch size overflow")?;
+            let moe_map_bytes = EXPERTS
+                .checked_add(
+                    EXPERTS
+                        .checked_mul(tokens)
+                        .context("MoE map size overflow")?,
+                )
+                .and_then(|values| values.checked_mul(size_of::<i32>()))
+                .context("DeepSeek V4 MoE map byte size overflow")?;
+            let expert_staging_bytes = EXPERTS
+                .checked_mul(expert_spec.expert_bytes)
+                .context("DeepSeek V4 expert staging size overflow")?;
+
+            Ok(Self {
+                tokens,
+                token_ids: alloc_bytes(tokens * size_of::<u32>(), "batch token ids")?,
+                cur_hc: alloc_bytes(
+                    f32_bytes(tokens, HC_WIDTH, "current HC")?,
+                    "batch current HC",
+                )?,
+                next_hc: alloc_bytes(f32_bytes(tokens, HC_WIDTH, "next HC")?, "batch next HC")?,
+                flat_hc: alloc_bytes(f32_bytes(tokens, HC_WIDTH, "flat HC")?, "batch flat HC")?,
+                hc_mix: alloc_bytes(f32_bytes(tokens, hc_mix_width, "HC mix")?, "batch HC mix")?,
+                hc_split: alloc_bytes(
+                    f32_bytes(tokens, hc_mix_width, "HC split")?,
+                    "batch HC split",
+                )?,
+                attn_cur: alloc_bytes(
+                    f32_bytes(tokens, HIDDEN, "attention current")?,
+                    "batch attention current",
+                )?,
+                attn_norm: alloc_bytes(
+                    f32_bytes(tokens, HIDDEN, "attention norm")?,
+                    "batch attention norm",
+                )?,
+                qr: alloc_bytes(f32_bytes(tokens, Q_RANK, "query rank")?, "batch query rank")?,
+                qr_norm: alloc_bytes(
+                    f32_bytes(tokens, Q_RANK, "normalized query rank")?,
+                    "batch normalized query rank",
+                )?,
+                kv_raw: alloc_bytes(f32_bytes(tokens, HEAD_DIM, "raw KV")?, "batch raw KV")?,
+                kv: alloc_bytes(f32_bytes(tokens, HEAD_DIM, "KV")?, "batch KV")?,
+                q: alloc_bytes(f32_bytes(tokens, Q_WIDTH, "query")?, "batch query")?,
+                heads: alloc_bytes(
+                    f32_bytes(tokens, Q_WIDTH, "attention heads")?,
+                    "batch attention heads",
+                )?,
+                attn_group: alloc_bytes(
+                    f32_bytes(tokens, GROUP_WIDTH, "attention group")?,
+                    "batch attention group",
+                )?,
+                attn_rank: alloc_bytes(
+                    f32_bytes(tokens, OUTPUT_RANK, "attention rank")?,
+                    "batch attention rank",
+                )?,
+                attn_low: alloc_bytes(
+                    f32_bytes(tokens, OUTPUT_LOW, "attention low rank")?,
+                    "batch attention low rank",
+                )?,
+                attn_out: alloc_bytes(
+                    f32_bytes(tokens, HIDDEN, "attention output")?,
+                    "batch attention output",
+                )?,
+                after_attn_hc: alloc_bytes(
+                    f32_bytes(tokens, HC_WIDTH, "post-attention HC")?,
+                    "batch post-attention HC",
+                )?,
+                ffn_cur: alloc_bytes(
+                    f32_bytes(tokens, HIDDEN, "FFN current")?,
+                    "batch FFN current",
+                )?,
+                ffn_norm: alloc_bytes(f32_bytes(tokens, HIDDEN, "FFN norm")?, "batch FFN norm")?,
+                router: alloc_bytes(f32_bytes(tokens, EXPERTS, "router")?, "batch router")?,
+                shared_gate: alloc_bytes(
+                    f32_bytes(tokens, EXPERT_WIDTH, "shared gate")?,
+                    "batch shared gate",
+                )?,
+                shared_up: alloc_bytes(
+                    f32_bytes(tokens, EXPERT_WIDTH, "shared up")?,
+                    "batch shared up",
+                )?,
+                shared_mid: alloc_bytes(
+                    f32_bytes(tokens, EXPERT_WIDTH, "shared mid")?,
+                    "batch shared mid",
+                )?,
+                shared_out: alloc_bytes(
+                    f32_bytes(tokens, HIDDEN, "shared output")?,
+                    "batch shared output",
+                )?,
+                route_selected: alloc_bytes(
+                    tokens * ACTIVE_EXPERTS * size_of::<i32>(),
+                    "batch selected experts",
+                )?,
+                route_weights: alloc_bytes(
+                    f32_bytes(tokens, ACTIVE_EXPERTS, "route weights")?,
+                    "batch route weights",
+                )?,
+                routed_mid: alloc_bytes(
+                    tokens * ACTIVE_EXPERTS * EXPERT_WIDTH * size_of::<u16>(),
+                    "batch routed mid",
+                )?,
+                routed_down: alloc_bytes(
+                    f32_bytes(tokens * ACTIVE_EXPERTS, HIDDEN, "routed down")?,
+                    "batch routed down",
+                )?,
+                routed_out: alloc_bytes(
+                    f32_bytes(tokens, HIDDEN, "routed output")?,
+                    "batch routed output",
+                )?,
+                moe_map: alloc_bytes(moe_map_bytes, "batch MoE expert map")?,
+                expert_staging: alloc_bytes(expert_staging_bytes, "batch expert staging")?,
+                expert_spec,
+                comp_kv: alloc_bytes(
+                    f32_bytes(tokens, 1024, "compressor KV")?,
+                    "batch compressor KV",
+                )?,
+                comp_score: alloc_bytes(
+                    f32_bytes(tokens, 1024, "compressor score")?,
+                    "batch compressor score",
+                )?,
+                index_q: alloc_bytes(
+                    f32_bytes(tokens, INDEX_WIDTH, "index query")?,
+                    "batch index query",
+                )?,
+                index_weights: alloc_bytes(
+                    f32_bytes(tokens, INDEX_HEADS, "index weights")?,
+                    "batch index weights",
+                )?,
+                index_scores: alloc_bytes(
+                    f32_bytes(tokens, max_comp, "index scores")?,
+                    "batch index scores",
+                )?,
+                index_selected: alloc_bytes(
+                    tokens * INDEX_TOP_K * size_of::<i32>(),
+                    "batch index selection",
+                )?,
+                index_sorted: alloc_bytes(
+                    tokens * INDEX_TOP_K * size_of::<i32>(),
+                    "batch sorted index selection",
+                )?,
+                index_topk_scratch: alloc_bytes(index_scratch_bytes, "batch index top-k scratch")?,
+                rope_positions: alloc_bytes(tokens * size_of::<i32>(), "batch RoPE positions")?,
+                comp_rope_positions: alloc_bytes(
+                    max_comp * size_of::<i32>(),
+                    "batch compressed RoPE positions",
+                )?,
+                flash_mask: alloc_bytes(flash_mask_bytes, "batch FlashAttention mask")?,
+                flash_kv: alloc_bytes(flash_kv_bytes, "batch FlashAttention KV")?,
+                flash_pad: alloc_bytes(flash_pad_bytes.max(1), "batch FlashAttention padding")?,
+                flash_blocks: alloc_bytes(flash_block_bytes.max(1), "batch FlashAttention blocks")?,
+                owned: std::mem::take(&mut owned),
+            })
+        })();
+        if allocation.is_err() {
+            for buffer in owned.drain(..) {
+                unsafe { release(buffer) };
+            }
+        }
+        allocation
     }
 }
 
@@ -1988,6 +4090,222 @@ impl MetalExecutionContext {
             recurrent_bytes.saturating_add(state_bytes),
         );
         Ok(())
+    }
+
+    pub(crate) fn deepseek_v4_prefill(
+        &self,
+        graph: &DeepSeekV4ExecutionGraph,
+        scheduler: &mut FlashMoeExecutionScheduler,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            bail!("DeepSeek V4 batch prefill requires at least one prompt token");
+        }
+        let dense = self
+            .dense_weights
+            .as_ref()
+            .context("DeepSeek V4 requires resident mmap-backed Metal weights")?;
+        let mut state_guard = self.deepseek_state.lock().map_err(|_| {
+            anyhow::anyhow!("DeepSeek V4 Metal state lock is poisoned during batch prefill")
+        })?;
+        let state = state_guard
+            .as_mut()
+            .context("DeepSeek V4 Metal state was not prepared before batch prefill")?;
+        if state.next_position != 0 {
+            bail!(
+                "DeepSeek V4 batch prefill requires a zero-prefix state, found frontier {}",
+                state.next_position
+            );
+        }
+        if tokens.len() > state.capacity {
+            bail!(
+                "DeepSeek V4 batch prompt length {} exceeds prepared context capacity {}",
+                tokens.len(),
+                state.capacity
+            );
+        }
+        let mut batch = unsafe { DeepSeekBatchScratch::allocate(self, tokens.len())? };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                tokens.as_ptr(),
+                buffer_contents(batch.token_ids).cast::<u32>(),
+                tokens.len(),
+            );
+            let positions = std::slice::from_raw_parts_mut(
+                buffer_contents(batch.rope_positions).cast::<i32>(),
+                tokens.len(),
+            );
+            for (position, value) in positions.iter_mut().enumerate() {
+                *value = i32::try_from(position)?;
+            }
+
+            let embedding = EmbeddingBatchArgs {
+                tokens: u32::try_from(tokens.len())?,
+                hidden: HIDDEN as u32,
+                hc: HC as u32,
+            };
+            let encoding = MetalCommandEncoding::new(
+                self.runtime.command_queue,
+                Arc::clone(&self.resources),
+                "failed to create DeepSeek V4 batch embedding command buffer",
+                "failed to create DeepSeek V4 batch embedding encoder",
+            )?;
+            let encoder = encoding.encoder();
+            set_pipeline(
+                encoder,
+                self.deepseek_pipelines()?
+                    .require("kernel_pb_dsv4_embedding_hc4_batch")?,
+            );
+            set_bytes(encoder, bytes_of(&embedding), 0);
+            set_buffer(encoder, batch.token_ids, 1);
+            set_buffer_with_offset(encoder, dense.buffer, graph.embedding.byte_offset, 2);
+            set_buffer(encoder, batch.cur_hc, 3);
+            dispatch_groups(
+                encoder,
+                ((tokens.len() * HC_WIDTH).div_ceil(256) as u64, 1, 1),
+                (256, 1, 1),
+            );
+            commit_deepseek_command(encoding, "deepseek_batch_embedding", 0, None)?;
+        }
+
+        for (layer, graph_layer) in graph.layers.iter().enumerate() {
+            let ratio = state.layers[layer].ratio;
+            if ratio != 0 {
+                let n_comp = tokens.len() / ratio;
+                unsafe {
+                    let positions = std::slice::from_raw_parts_mut(
+                        buffer_contents(batch.comp_rope_positions).cast::<i32>(),
+                        n_comp.max(1),
+                    );
+                    for (row, value) in positions.iter_mut().take(n_comp).enumerate() {
+                        *value = i32::try_from(row * ratio)?;
+                    }
+                }
+            }
+            unsafe {
+                let mut encoding = MetalCommandEncoding::new(
+                    self.runtime.command_queue,
+                    Arc::clone(&self.resources),
+                    "failed to create DeepSeek V4 batch pre-expert command buffer",
+                    "failed to create DeepSeek V4 batch pre-expert encoder",
+                )?;
+                encode_batch_pre_expert_layer(
+                    self,
+                    &mut encoding,
+                    dense,
+                    graph_layer,
+                    &state.layers[layer],
+                    &batch,
+                )?;
+                commit_deepseek_command(
+                    encoding,
+                    "deepseek_batch_pre_expert",
+                    tokens.len() - 1,
+                    Some(layer),
+                )?;
+            }
+
+            let router = unsafe { read_f32_buffer(batch.router, tokens.len() * EXPERTS) };
+            if router.iter().any(|value| !value.is_finite()) {
+                let stages = unsafe { diagnose_batch_nonfinite(&batch, &state.layers[layer]) };
+                bail!(
+                    "DeepSeek V4 batch layer {layer} produced non-finite values in stages: {}",
+                    stages.join(", ")
+                );
+            }
+            let (selected, weights, unique) =
+                batch_routes_and_weights(dense, graph_layer, tokens, &router)?;
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    selected.as_ptr(),
+                    buffer_contents(batch.route_selected).cast::<i32>(),
+                    selected.len(),
+                );
+                ptr::copy_nonoverlapping(
+                    weights.as_ptr(),
+                    buffer_contents(batch.route_weights).cast::<f32>(),
+                    weights.len(),
+                );
+                stage_batch_experts(&batch, scheduler, layer, &unique)?;
+                let mut encoding = MetalCommandEncoding::new(
+                    self.runtime.command_queue,
+                    Arc::clone(&self.resources),
+                    "failed to create DeepSeek V4 batch streamed-expert command buffer",
+                    "failed to create DeepSeek V4 batch streamed-expert encoder",
+                )?;
+                encode_batch_expert_layer(self, &mut encoding, dense, graph_layer, &mut batch)?;
+                commit_deepseek_command(
+                    encoding,
+                    "deepseek_batch_streamed_experts",
+                    tokens.len() - 1,
+                    Some(layer),
+                )?;
+            }
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                buffer_contents(batch.cur_hc)
+                    .cast::<f32>()
+                    .add((tokens.len() - 1) * HC_WIDTH),
+                buffer_contents(state.scratch.cur_hc).cast::<f32>(),
+                HC_WIDTH,
+            );
+            let pipelines = self.deepseek_pipelines()?;
+            let encoding = MetalCommandEncoding::new(
+                self.runtime.command_queue,
+                Arc::clone(&self.resources),
+                "failed to create DeepSeek V4 batch output command buffer",
+                "failed to create DeepSeek V4 batch output encoder",
+            )?;
+            let encoder = encoding.encoder();
+            encode_rms(
+                pipelines,
+                encoder,
+                dense,
+                state.scratch.cur_hc,
+                0,
+                None,
+                state.scratch.flat_hc,
+                0,
+                HC_WIDTH,
+                1,
+            )?;
+            encode_matvec(
+                pipelines,
+                encoder,
+                dense,
+                &graph.output_hc_fn,
+                0,
+                state.scratch.flat_hc,
+                0,
+                state.scratch.output_pre,
+                0,
+                HC_WIDTH,
+                HC,
+            )?;
+            let args = OutputCollapseArgs {
+                hidden: HIDDEN as u32,
+                eps: RMS_EPS,
+                hc_eps: HC_EPS,
+            };
+            set_pipeline(
+                encoder,
+                pipelines.require("kernel_pb_dsv4_output_collapse_norm4")?,
+            );
+            set_bytes(encoder, bytes_of(&args), 0);
+            set_buffer(encoder, state.scratch.cur_hc, 1);
+            set_buffer(encoder, state.scratch.output_pre, 2);
+            set_buffer_with_offset(encoder, dense.buffer, graph.output_hc_scale.byte_offset, 3);
+            set_buffer_with_offset(encoder, dense.buffer, graph.output_hc_base.byte_offset, 4);
+            set_buffer_with_offset(encoder, dense.buffer, graph.output_norm.byte_offset, 5);
+            set_buffer(encoder, state.scratch.output_hidden, 6);
+            set_threadgroup_memory(encoder, 32, 0);
+            dispatch_groups(encoder, (1, 1, 1), (256, 1, 1));
+            commit_deepseek_command(encoding, "deepseek_batch_output", tokens.len() - 1, None)?;
+        }
+        state.next_position = tokens.len();
+        Ok(unsafe { read_f32_buffer(state.scratch.output_hidden, HIDDEN) })
     }
 
     pub(crate) fn deepseek_v4_forward_token(
@@ -2299,6 +4617,13 @@ mod tests {
         assert_eq!(down.ne10, 2048);
         assert_eq!(down.ne11, 6);
         assert_eq!(down.nr0, 4);
+    }
+
+    #[test]
+    fn batch_hc_expand_uses_the_split_row_stride_for_post_and_combined_views() {
+        let args = HcExpandArgs::batch(3);
+        assert_eq!(args.nb_post1, 24 * size_of::<f32>() as u64);
+        assert_eq!(args.nb_comb2, 24 * size_of::<f32>() as u64);
     }
 
     #[test]
