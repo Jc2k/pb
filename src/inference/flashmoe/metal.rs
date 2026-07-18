@@ -15,6 +15,13 @@ use std::time::{Duration, Instant};
 mod deepseek_execution;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) use deepseek_execution::DeepSeekV4SessionSnapshot;
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Debug)]
+pub(super) struct DeepSeekV4SessionSnapshot;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::deepseek_metal::DEEPSEEK_V4_METAL_SHADERS;
 use super::deepseek_metal::DEEPSEEK_V4_REQUIRED_METAL_KERNELS;
 use super::state::{FlashMoeExpertPhaseOutput, FlashMoeGpuBufferDescriptor};

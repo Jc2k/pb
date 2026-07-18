@@ -10,6 +10,7 @@ use tracing::{debug, info, trace, trace_span};
 
 use super::capabilities::{FlashMoeAttentionMathCapability, FlashMoeCapabilityPlan};
 use super::deepseek::{DeepSeekV4Config, DeepSeekV4ExecutionGraph, is_deepseek_v4_flash};
+use super::deepseek_session::{DeepSeekV4SessionCheckpoint, DeepSeekV4SessionStore};
 use super::experts::ExpertSlotStore;
 use super::math::*;
 use super::metal::*;
@@ -168,6 +169,7 @@ pub struct FlashMoeEngine {
     pub(super) shared_expert_weights: SharedExpertWeightTable,
     pub(super) input_adapter_executor: FlashMoeInputAdapterExecutor,
     pub(super) session_cache: FlashMoeSessionCache,
+    pub(super) deepseek_sessions: DeepSeekV4SessionStore<DeepSeekV4SessionSnapshot>,
 }
 
 pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
@@ -366,6 +368,7 @@ where
         linear_attention_weights,
         shared_expert_weights,
         session_cache,
+        deepseek_sessions: DeepSeekV4SessionStore::default(),
     })
 }
 
@@ -476,6 +479,81 @@ mod ownership_tests {
             GenerationFinishReason::MaxTokens
         );
     }
+
+    #[test]
+    #[ignore = "requires the pinned local DeepSeek V4 cache and an Apple Silicon Metal device"]
+    fn deepseek_session_snapshot_restores_a_b_and_nonzero_batch_suffix_exactly() {
+        let plan = plan_unchecked(DEEPSEEK_V4_FLASH_MODEL, &crate::default_models_dir());
+        let mut engine = load(&plan).unwrap();
+        let full_prompt = format!(
+            "Audit this dependency-free browser game and identify the most important invariant.\n\n{}\nThe most important invariant is",
+            "function tick(state) { state.score += state.alive ? 1 : 0; return state; }\n"
+                .repeat(18)
+        );
+        let full_tokens = engine.tokenizer.encode(&full_prompt).unwrap();
+        let (prefix_prompt, prefix_tokens) = full_prompt
+            .char_indices()
+            .map(|(index, _)| &full_prompt[..index])
+            .filter_map(|prefix| {
+                let tokens = engine.tokenizer.encode(prefix).ok()?;
+                (tokens.len() >= 32
+                    && full_tokens.len().saturating_sub(tokens.len()) >= 32
+                    && full_tokens.starts_with(&tokens))
+                .then_some((prefix.to_string(), tokens.len()))
+            })
+            .next()
+            .expect("fixture must expose an exact prefix with a batched suffix");
+        let raw = |prompt: String| {
+            let mut request = StructuredGenerationRequest::from_prompt(&GenerationRequest {
+                prompt,
+                max_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                seed: 7,
+            });
+            request.raw_prompt = true;
+            request.add_generation_prompt = false;
+            request
+        };
+
+        engine
+            .generate_structured_in_session("session-a", &raw(prefix_prompt))
+            .unwrap();
+        engine
+            .generate_structured_in_session("session-b", &raw("2+2=".to_string()))
+            .unwrap();
+
+        let reused = engine
+            .generate_structured_in_session("session-a", &raw(full_prompt.clone()))
+            .unwrap();
+        assert_eq!(reused.prompt_cache.source, PromptCacheSource::MemorySession);
+        assert_eq!(reused.prompt_cache.cached_tokens, prefix_tokens);
+        assert_eq!(
+            reused.prompt_cache.prefilled_tokens,
+            full_tokens.len() - prefix_tokens
+        );
+
+        let fresh = engine
+            .generate_structured_in_session("session-c", &raw(full_prompt.clone()))
+            .unwrap();
+        assert_eq!(fresh.prompt_cache.source, PromptCacheSource::None);
+        assert_eq!(reused.content, fresh.content);
+        assert_eq!(reused.tool_calls, fresh.tool_calls);
+
+        let mismatch = engine
+            .generate_structured_in_session("session-a", &raw("unrelated".to_string()))
+            .unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("DeepSeek V4 session prefix mismatch")
+        );
+        let restored = engine
+            .generate_structured_in_session("session-a", &raw(full_prompt))
+            .unwrap();
+        assert_eq!(restored.prompt_cache.cached_tokens, full_tokens.len());
+        assert_eq!(restored.content, fresh.content);
+    }
 }
 
 impl MetalExecutionFacade {
@@ -559,6 +637,34 @@ impl MetalExecutionFacade {
         }
     }
 
+    pub(super) fn capture_deepseek_v4_session_state(
+        &self,
+    ) -> Result<super::metal::DeepSeekV4SessionSnapshot> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.capture_deepseek_v4_session_state()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            bail!("DeepSeek V4 Flash requires Apple Silicon Metal")
+        }
+    }
+
+    pub(super) fn restore_deepseek_v4_session_state(
+        &self,
+        snapshot: &super::metal::DeepSeekV4SessionSnapshot,
+    ) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.restore_deepseek_v4_session_state(snapshot)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = snapshot;
+            bail!("DeepSeek V4 Flash requires Apple Silicon Metal")
+        }
+    }
+
     pub(super) fn deepseek_v4_forward_token(
         &self,
         graph: &DeepSeekV4ExecutionGraph,
@@ -583,18 +689,21 @@ impl MetalExecutionFacade {
         graph: &DeepSeekV4ExecutionGraph,
         scheduler: &mut FlashMoeExecutionScheduler,
         tokens: &[u32],
+        pos0: usize,
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            let hidden =
-                autoreleasepool(|_| self.inner.deepseek_v4_prefill(graph, scheduler, tokens))?;
+            let hidden = autoreleasepool(|_| {
+                self.inner
+                    .deepseek_v4_prefill(graph, scheduler, tokens, pos0)
+            })?;
             self.inner
-                .finish_token_boundary(tokens.len().saturating_sub(1))?;
+                .finish_token_boundary(pos0 + tokens.len().saturating_sub(1))?;
             Ok(hidden)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = (graph, scheduler, tokens);
+            let _ = (graph, scheduler, tokens, pos0);
             bail!("DeepSeek V4 Flash requires Apple Silicon Metal")
         }
     }
@@ -952,6 +1061,9 @@ impl MetalExecutionFacade {
 impl FlashMoeEngine {
     pub fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
         if session_id.trim().is_empty() {
+            return Ok(());
+        }
+        if self.deepseek_graph.is_some() {
             return Ok(());
         }
         self.session_cache.persist_session(session_id)
@@ -2276,7 +2388,11 @@ impl FlashMoeEngine {
     }
 
     pub(crate) fn supports_session_snapshots(&self) -> bool {
-        self.deepseek_graph.is_none()
+        true
+    }
+
+    pub(crate) fn requires_exact_session_prefix(&self) -> bool {
+        self.deepseek_graph.is_some()
     }
 
     /// Render and tokenize the exact prompt used by structured generation.
@@ -2544,11 +2660,6 @@ impl FlashMoeEngine {
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let encode_elapsed = encode_started.elapsed();
         let deepseek_v4 = self.deepseek_graph.is_some();
-        if deepseek_v4 && session_id.is_some() {
-            bail!(
-                "DeepSeek V4 Flash sessions are unsupported: its resolved request-scoped graph cannot restore a partial legacy KV snapshot; omit --session-id"
-            );
-        }
         let base_prefix_len = if deepseek_v4 {
             0
         } else {
@@ -2564,6 +2675,27 @@ impl FlashMoeEngine {
                 .max(1);
             self.metal.prepare_deepseek_v4_state(graph, capacity)?;
         }
+        let deepseek_restore_started = Instant::now();
+        let deepseek_reuse = if deepseek_v4 {
+            session_id
+                .map(|session_id| {
+                    self.deepseek_sessions
+                        .reusable_checkpoint(session_id, &prompt_tokens)
+                        .and_then(|checkpoint| {
+                            checkpoint
+                                .map(|(prefix, checkpoint)| {
+                                    self.metal
+                                        .restore_deepseek_v4_session_state(checkpoint.state())?;
+                                    Ok((prefix, checkpoint.last_hidden().to_vec()))
+                                })
+                                .transpose()
+                        })
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         if let Some(glm) = self.config.glm.as_ref()
             && glm.index_topk > 0
         {
@@ -2606,13 +2738,37 @@ impl FlashMoeEngine {
             request.tools.len(),
             session_id.unwrap_or("<none>")
         );
-        let mut generation = self.session_cache.begin_generation_with_base(
-            session_id,
-            prompt_tokens,
-            base_prefix_len,
-            max_tokens,
-            self.config.num_hidden_layers,
-        );
+        let mut generation = if deepseek_v4 {
+            let (prefill_start, cached_last_hidden, cache_source, restore_ms) =
+                if let Some((prefix, hidden)) = deepseek_reuse {
+                    (
+                        prefix,
+                        (prefix == prompt_tokens.len()).then_some(hidden),
+                        PromptCacheSource::MemorySession,
+                        u64::try_from(deepseek_restore_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                    )
+                } else {
+                    (0, None, PromptCacheSource::None, 0)
+                };
+            FlashMoeSessionCache::begin_external_prefix_generation(
+                prompt_tokens,
+                prefill_start,
+                cached_last_hidden,
+                max_tokens,
+                self.config.num_hidden_layers,
+                cache_source,
+                restore_ms,
+            )?
+        } else {
+            self.session_cache.begin_generation_with_base(
+                session_id,
+                prompt_tokens,
+                base_prefix_len,
+                max_tokens,
+                self.config.num_hidden_layers,
+            )
+        };
         let prefill_start = generation.prefill_start();
         let prompt_len = generation.prompt_len();
         let prompt_cache_source = generation.cache_source();
@@ -2624,14 +2780,16 @@ impl FlashMoeEngine {
                 prefill_start, prompt_len
             );
         }
-        if prefill_start == 0 {
-            self.metal.reset_linear_attention_state()?;
-        } else {
-            let recurrent = generation
-                .take_cached_recurrent()
-                .context("session cache entry is missing the Metal recurrent-state snapshot")?;
-            self.metal
-                .restore_linear_attention_session_state(&recurrent)?;
+        if !deepseek_v4 {
+            if prefill_start == 0 {
+                self.metal.reset_linear_attention_state()?;
+            } else {
+                let recurrent = generation
+                    .take_cached_recurrent()
+                    .context("session cache entry is missing the Metal recurrent-state snapshot")?;
+                self.metal
+                    .restore_linear_attention_session_state(&recurrent)?;
+            }
         }
         let prefill_or_ttft_started = Instant::now();
         let prefill_hidden = if prefill_start == prompt_len {
@@ -2722,7 +2880,17 @@ impl FlashMoeEngine {
             );
             hidden
         };
-        if generation.requires_prompt_snapshot() {
+        if deepseek_v4 {
+            if let Some(session_id) = session_id {
+                let checkpoint = DeepSeekV4SessionCheckpoint::new(
+                    generation.checkpoint_tokens(0),
+                    prefill_hidden.clone(),
+                    self.metal.capture_deepseek_v4_session_state()?,
+                );
+                self.deepseek_sessions
+                    .replace_prompt(session_id, checkpoint);
+            }
+        } else if generation.requires_prompt_snapshot() {
             let recurrent = self.metal.capture_linear_attention_session_state()?;
             generation.capture_prompt_cache(prefill_hidden.clone(), recurrent);
         }
@@ -2834,14 +3002,30 @@ impl FlashMoeEngine {
         }
         let decode_wall = decode_phase_started.elapsed();
 
-        if let Some(last_hidden) = generated_head_hidden
-            && generation.requires_prompt_snapshot()
-        {
-            let recurrent = self.metal.capture_linear_attention_session_state()?;
-            generation.capture_generated_cache(evaluated_generated_tokens, last_hidden, recurrent);
+        if let Some(last_hidden) = generated_head_hidden {
+            if deepseek_v4 {
+                if let Some(session_id) = session_id {
+                    let checkpoint = DeepSeekV4SessionCheckpoint::new(
+                        generation.checkpoint_tokens(evaluated_generated_tokens),
+                        last_hidden,
+                        self.metal.capture_deepseek_v4_session_state()?,
+                    );
+                    self.deepseek_sessions
+                        .push_generated(session_id, checkpoint);
+                }
+            } else if generation.requires_prompt_snapshot() {
+                let recurrent = self.metal.capture_linear_attention_session_state()?;
+                generation.capture_generated_cache(
+                    evaluated_generated_tokens,
+                    last_hidden,
+                    recurrent,
+                );
+            }
         }
 
-        self.session_cache.commit_generation(&mut generation)?;
+        if !deepseek_v4 {
+            self.session_cache.commit_generation(&mut generation)?;
+        }
 
         let generated = generation.into_generated();
         let decoded = self.tokenizer.decode(&generated)?;
@@ -2904,34 +3088,37 @@ impl FlashMoeEngine {
                 prompt_tokens.len()
             );
         }
+        let batch_tokens = end_position.saturating_sub(start_position);
         if let Some(graph) = self.deepseek_graph.clone()
-            && deepseek_v4_uses_batch_prefill(end_position)
+            && deepseek_v4_uses_batch_prefill(batch_tokens)
         {
-            if start_position != 0 {
-                bail!(
-                    "DeepSeek V4 load-resolved batch prefill requires a zero-prefix graph, got start position {start_position}"
-                );
-            }
             if end_position == 0 {
                 bail!("cannot generate from an empty DeepSeek V4 prompt");
             }
             let started = Instant::now();
             report_generation_progress(&progress, || {
-                format!("prefill batch begin tokens={end_position}")
+                format!("prefill batch begin start={start_position} tokens={batch_tokens}")
             });
-            for (position, token) in prompt_tokens[..end_position].iter().copied().enumerate() {
-                kv_cache
-                    .record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
+            for (position, token) in prompt_tokens[start_position..end_position]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(
+                    start_position + position,
+                    token,
+                ))?;
             }
             let hidden = self.metal.deepseek_v4_prefill(
                 &graph,
                 &mut self.scheduler,
-                &prompt_tokens[..end_position],
+                &prompt_tokens[start_position..end_position],
+                start_position,
             )?;
             let elapsed = started.elapsed();
             report_generation_progress(&progress, || {
                 format!(
-                    "prefill batch complete processed={end_position} remaining=0 position={} elapsed_ms={}",
+                    "prefill batch complete processed={batch_tokens} remaining=0 position={} elapsed_ms={}",
                     end_position - 1,
                     elapsed.as_millis()
                 )

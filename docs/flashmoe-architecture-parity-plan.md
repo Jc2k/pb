@@ -421,7 +421,7 @@ remain diagnostic lower bounds; GLM's configured K=8 is still the only supported
 
 ## DeepSeek V4 Flash Extension Contract
 
-Status: **Complete for the pinned request-scoped profile.** The pinned
+Status: **Complete for the pinned request-scoped and bounded in-memory session profile.** The pinned
 DeepSeek V4 Flash profile is selected by normal FlashMoe planning on Apple Silicon. It resolves a
 complete typed graph and fails unsupported source, graph, device, or kernel combinations before
 inference; it is never a llama.cpp fallback. The full published checkpoint now has cache and live
@@ -479,10 +479,13 @@ commands.
 
 DeepSeek prompt prefill has two concrete commands in that same load-resolved graph. Fewer than 32
 tokens retain the validated token command and its official-vector accumulation order. At one full
-32-row matrix tile, a zero-prefix request uses layer-major Metal prefill: dense projections,
-compression, FlashAttention or calculated top-512 indexed attention, hyperconnections, shared and
-routed experts, and final collapse execute as batched graph stages. This threshold is a pure prompt
-geometry calculation and never changes after an execution error.
+32-row matrix tile, either a zero-prefix request or an exact restored-prefix suffix uses
+layer-major Metal prefill: dense projections, compression, FlashAttention or calculated top-512
+indexed attention, hyperconnections, shared and routed experts, and final collapse execute as
+batched graph stages. The nonzero-prefix command materializes the restored raw ring in logical
+order and continues the resident compressor/indexer frontiers; the zero-prefix command retains its
+direct batch-KV path. This threshold is a pure prompt-geometry calculation and never changes after
+an execution error.
 
 The layer-major router calculates every token's exact top six on the host after the Metal router
 projection, reduces those routes to a sorted unique layer working set, and submits that set to the
@@ -501,14 +504,22 @@ not rediscover GGUF types or source-container offsets after graph resolution. Q4
 remain a distinct unsupported layout rather than a substitution fallback.
 
 DeepSeek state extends the request declaration with four residual streams plus raw/compressed KV
-records, compressor frontiers, and indexer state. The current implementation allocates and resets
-that complete state for the request's resolved context capacity. Existing Qwen/GLM prefix snapshots
-are unsupported for DeepSeek because reusing only attention KV while rebuilding hyperconnections
-or compressor state is invalid. A logical-session request fails before inference instead of
-silently starting over. The managed agent backend consumes that load-resolved capability and sends
-request-scoped turns without a session claim. Any future memory or disk snapshot must capture the
-complete typed state atomically and pass official-vector plus prefix-reuse parity; it cannot be
-inferred from llama.cpp or the reference DS4 server's separate cache implementation.
+records, compressor frontiers, and indexer state. Request-scoped inference allocates and resets that
+complete state for the resolved context capacity. The active session extension adds a separate,
+bounded, in-memory DeepSeek checkpoint owner inside the same Metal execution context; it does not
+reuse the Qwen/GLM shallow-KV or disk formats. A checkpoint binds exact rendered tokens and the
+complete per-layer raw ring, compressed caches, compressor KV/score frontiers, ratio-4 index caches
+and frontiers, Metal token frontier, final four-stream boundary, and sampled hidden state. Capture
+and restore use Metal buffer copies and preserve the existing scheduler and expert I/O topology.
+
+Reuse is valid only when one cached checkpoint is a complete token prefix of the new rendered
+prompt. A logical session with resident checkpoints but no exact prefix fails with the named
+`DeepSeek V4 session prefix mismatch` error; it never resets silently or falls back to fresh
+prefill. The zero-prefix and nonzero-prefix batch commands are fixed graph implementations selected
+from calculated prefix length and prompt geometry. Session storage is LRU-bounded to two logical
+sessions and two prompt/generated checkpoints per session. It contains no expert identity, expert
+payload, alternate runtime, or hidden environment policy. Disk persistence remains unsupported
+until a separate versioned complete-state format is designed and verified.
 
 ### DeepSeek V4 prefill benchmark, 2026-07-18
 
@@ -534,6 +545,17 @@ The final pb path is 34.9 times faster than its token-major baseline and reduces
 multiplicative prefill gap to 1.52 times. The large-cache ds4 row is a decode upper control, not
 pb's memory policy. On the 21-token Italian control, pb measured 5.36 prefill and 8.23 decode tok/s;
 ds4 measured 3.62 and 6.72 tok/s, respectively.
+
+The complete-state session extension was measured separately on the same 3,844-token official
+vector after its implementation. A cold session pass spent 26.620 seconds in prefill/TTFT and
+emitted the exact `The most important code` continuation. Repeating the identical rendered prompt
+inside the same loaded engine restored all 3,844 tokens in 1 ms and reduced prefill/TTFT to 5 ms;
+no prompt tokens were re-prefilled. The two-pass cumulative pb TTFT was therefore 26.625 seconds,
+versus 32.46 seconds for two independent runs at the pinned ds4 16.23-second fresh-request control.
+That comparison measures the agent workload benefit of reuse, not fresh-prefill parity or a claim
+about a separately configured ds4 session. The current cold pb run was 144.5 tok/s, leaving a 1.62x
+fresh-prefill gap to ds4; the performance goal remains active for fused batch-kernel and CPU/GPU
+handoff work inside this graph.
 
 Two plausible follow-ups were rejected rather than hidden behind toggles. A Metal batch router was
 about nine percent faster on the long case, but its accumulated numerical drift changed the
@@ -748,10 +770,10 @@ Baseline reviewed on 2026-07-11:
   long-prefill VM profile showed that unbounded ordinary release left one 2,654,208-byte
   IOAccelerator mapping per expert projection binding; separating and bounding the copied fallback
   limits that mapping set while the aligned path avoids the second whole-expert memory copy.
-  The session cache removes a non-prefix-matching entry before allocating the replacement KV cache.
-  Harness workflow stages intentionally share a logical session id while changing their system
-  prompts, so stale planning/review state cannot remain resident throughout a fresh stage prefill
-  and transiently double CPU KV memory. Structured agent requests also enforce their declared
+  The Qwen/GLM session cache removes a non-prefix-matching entry before allocating the replacement
+  KV cache. DeepSeek requires exact prefixes and derives a stage-local checkpoint id from the
+  harness's stable logical session, so a changed planning/review system prompt cannot silently
+  reset state while repeated turns inside one stage can still extend it. Structured agent requests also enforce their declared
   `ctx_size` against prompt plus generation capacity before allocating KV state.
   Structured FlashMoe output carries the actual rendered prompt-token count and distinguishes EOS
   from exhaustion of the requested generation cap. Capped, unparsable workflow turns therefore
@@ -1361,7 +1383,7 @@ Current capability matrix:
 | Qwen3.5 hybrid | Resident BF16/F16/F32 dense / fixed-Q4, fixed-BF16, or fixed-F16 slots | Resolved unified graph through metadata-selected typed active and resident shared CMD3; explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes | Load-resolved expert metadata, linear/shared tables, typed whole-slot offsets, scheduler leases, and Q4/BF16/F16 active plus Q4/BF16/F16/F32 shared-CMD3 local-Metal parity; real checkpoint pending |
 | Qwen3/Qwen3-VL | BF16/F16 expert slots with BF16/F16/F32 dense | Explicit storage policy emits fixed-BF16/F16 slots from matching source dtypes; load requires the selected policy to equal metadata-resolved slots before capability resolution | Cross-family 12-combination graph matrix, CLI/planning selection and 3x3 policy/layout rejection coverage, storage, scheduler, and local-Metal fixtures; real checkpoint pending |
 | GLM-5.2 | Canonical resident Q4 plus BF16 Colibri input/output / fixed native-MXFP4 or affine-Q4 slots from layer 3 | Shipped baseline through the unified runtime and expert scheduler; indexed MLX preserves typed E2M1/E8M0 expert storage while unindexed Colibri adapts to affine Q4, full causal MLA is bounded by `index_topk`, and DSA/MTP are unimplemented | Native MXFP4 import/storage/capability/CPU/local-Metal parity plus Colibri import, MLA/RoPE/KV, routing, expert-boundary, all-target, release, complete 75-layer native cache build, and real text/performance evidence |
-| DeepSeek V4 Flash | GGUF Q8/F16/F32/I32 resident tensors / fixed IQ2_XXS+Q2_K top-6 expert slots | Supported pinned request-scoped path on Apple Silicon: bounded exact-profile import, source-independent cache, load-resolved 43-layer graph, request-scoped typed state, native tokenizer/chat/tools, fused Metal stages, and shared scheduler SSD reads; session/prefix snapshots explicitly unsupported | Source/profile/cache-publication fixtures, exact graph and routing policy coverage, host/Metal ABI checks, local compilation of every specialized pipeline, all-target preservation, full 86.72 GB published-checkpoint cache, exact matches for all four upstream-enforced continuation vectors including a 3,844-token indexed-attention case, and real two-turn DSML tool execution |
+| DeepSeek V4 Flash | GGUF Q8/F16/F32/I32 resident tensors / fixed IQ2_XXS+Q2_K top-6 expert slots | Supported pinned request-scoped path plus bounded exact in-memory session reuse on Apple Silicon inside the same load-resolved graph and shared scheduler SSD-read path | Source/profile/cache/Metal/official-vector evidence plus live A/B complete-state restore, nonzero-prefix batch parity, mismatch retention, prompt-cache telemetry, and cumulative-TTFT evidence |
 
 Completion evidence:
 
@@ -1433,10 +1455,9 @@ Exit criteria:
 
 ### Gate 8: DeepSeek V4 Flash Typed Extension
 
-Status: **Complete for the pinned request-scoped profile.** The preceding Qwen and GLM gates remain
-closed and their supported paths are unchanged. Complete-state DeepSeek session snapshots remain an
-explicitly unsupported future capability; they are not silently approximated and do not qualify the
-supported request-scoped graph.
+Status: **Closed for the pinned request-scoped and bounded exact in-memory session profile.** The
+preceding Qwen and GLM gates remain closed and their supported paths are unchanged. DeepSeek disk
+sessions and incomplete KV-only checkpoints remain unsupported.
 
 Objective: support DeepSeek V4 Flash through the existing resolved graph and scheduler without
 claiming that superficially similar hidden width or MoE tensors make it a Qwen/GLM variant.
@@ -1461,9 +1482,9 @@ Required ownership slices, in order:
    DS4 subprocess, application expert cache, alternate runtime, or CPU component fallback is
    present.
 5. [x] Bind the native JoyAI tokenizer, chat/DSML tool rendering, output parsing, and exact prompt
-   preflight to the production path. Prompt/session reuse is intentionally rejected rather than
-   restoring incomplete state; a future snapshot must atomically capture all hyperconnection,
-   compressor, raw/compressed KV, and indexer state.
+   preflight to the production path. The request-scoped milestone rejected session reuse rather
+   than restoring incomplete state; item 7 replaces that rejection only with atomic complete-state
+   snapshots covering hyperconnection, compressor, raw/compressed KV, and indexer state.
 6. [x] Complete external validation for the supported request-scoped contract. On 2026-07-18,
    local verification recorded 1,081 passing all-target tests with 19 environment-gated tests
    ignored, 47 passing web tests, all 34 documentation pages validated, a successful optimized
@@ -1473,8 +1494,14 @@ Required ownership slices, in order:
    a raw arithmetic smoke that emitted `4`, exact matches for all four upstream-enforced
    continuation vectors, a 3,844-token top-512 indexed-attention run, and a real two-turn native
    DSML tool call. The reference excludes `long_memory_archive` because its hosted-API expectation
-   disagrees with its official graph; complete-state snapshots remain explicitly unsupported and
-   require their own future implementation and parity gate.
+   disagrees with its official graph. Complete-state snapshots were still unsupported at that
+   request-scoped milestone and were completed under the separate parity gate below.
+7. [x] Add exact in-memory prompt-prefix reuse without changing the runtime graph: Metal-owned
+   complete-state snapshots, calculated nonzero-prefix batch prefill, a two-session/two-checkpoint
+   bound, explicit mismatch errors, prompt-cache telemetry, A/B switching tests, official-vector
+   parity below/above 32 tokens and across ratio-4/ratio-128/top-512 frontiers, cumulative TTFT
+   evidence, and unchanged Qwen/GLM/vision behavior. No expert cache or disk session format is part
+   of this slice.
 
 Exit criteria:
 
@@ -1488,6 +1515,12 @@ Exit criteria:
   contexts.
 - [x] Existing Qwen3.5, Qwen3, Qwen3-VL, and GLM capability/parity suites and cache
   namespaces remain green and unchanged in meaning.
+- [x] A live Metal integration switches A/B sessions, restores an exact prefix, batch-prefills a
+  nonzero suffix of at least 32 tokens, matches a fresh continuation, retains checkpoints across a
+  named mismatch, and reports exact cached/prefilled counts. The 3,844-token official top-512
+  vector remains exact and repeated-session TTFT falls from 26.620 seconds to 5 ms. The final
+  suite records 1,094 passing all-target tests with 20 environment-gated tests ignored, 47 web
+  tests, 34 validated documentation pages, and a successful optimized arm64 build.
 
 The first implementation commit must complete source validation plus canonical cache publication;
 adding only a family enum, descriptor, or optimistic model-name match is not progress and must not
@@ -1617,8 +1650,8 @@ If a correctness check fails after an architecture-aligned move, debug math/logi
 the resolved graph. Do not restore the fallback or revert the ownership change to make the symptom
 disappear.
 
-The Qwen/GLM goal is complete. The pinned DeepSeek V4 Flash IQ2_XXS/Q2_K profile is also complete as
-a request-scoped Apple Silicon graph, with official continuation and real structured-tool evidence.
-DeepSeek session snapshots, other DeepSeek variants, and every other unsupported combination remain
-precise capability errors rather than fallback paths.
+The Qwen/GLM goal is complete. The pinned DeepSeek V4 Flash IQ2_XXS/Q2_K profile is complete as a
+request-scoped Apple Silicon graph with bounded exact in-memory sessions, official continuation,
+and real structured-tool evidence. Disk DeepSeek sessions, other DeepSeek variants, and every
+other unsupported combination remain precise capability errors rather than fallback paths.
 ```

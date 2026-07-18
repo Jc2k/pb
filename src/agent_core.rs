@@ -10228,7 +10228,12 @@ fn generate_flashmoe_completion(
     let started = Instant::now();
     let request = flashmoe_structured_request(args, messages, tools, enable_thinking)?;
     let output = if engine.supports_session_snapshots() {
-        engine.generate_structured_in_session(&args.session_id, &request)?
+        let session_id = flashmoe_generation_session_id(
+            &args.session_id,
+            args.workflow_stage,
+            engine.requires_exact_session_prefix(),
+        );
+        engine.generate_structured_in_session(&session_id, &request)?
     } else {
         engine.generate_structured(&request)?
     };
@@ -10266,6 +10271,18 @@ fn generate_flashmoe_completion(
         duration_ms: duration_millis(started),
         energy,
     })
+}
+
+fn flashmoe_generation_session_id(
+    session_id: &str,
+    stage: Option<crate::workflow::WorkflowStage>,
+    exact_prefix: bool,
+) -> String {
+    if exact_prefix && let Some(stage) = stage {
+        format!("{session_id}:workflow:{stage:?}")
+    } else {
+        session_id.to_string()
+    }
 }
 
 fn measure_flashmoe_prompt(
@@ -20811,6 +20828,42 @@ the next imagined action"#;
         args.workflow_stage = Some(crate::workflow::WorkflowStage::Repairing);
         args.workflow_action_first_turn = false;
         assert!(workflow_completion_enable_thinking(&args, 1, false, false));
+    }
+
+    #[test]
+    fn exact_prefix_flashmoe_sessions_are_isolated_by_workflow_stage() {
+        assert_eq!(
+            flashmoe_generation_session_id(
+                "agent-1",
+                Some(crate::workflow::WorkflowStage::Planning),
+                true,
+            ),
+            "agent-1:workflow:Planning"
+        );
+        assert_eq!(
+            flashmoe_generation_session_id(
+                "agent-1",
+                Some(crate::workflow::WorkflowStage::CodeReview),
+                true,
+            ),
+            "agent-1:workflow:CodeReview"
+        );
+    }
+
+    #[test]
+    fn other_flashmoe_sessions_preserve_the_existing_stable_id() {
+        assert_eq!(
+            flashmoe_generation_session_id(
+                "agent-1",
+                Some(crate::workflow::WorkflowStage::Planning),
+                false,
+            ),
+            "agent-1"
+        );
+        assert_eq!(
+            flashmoe_generation_session_id("agent-1", None, true),
+            "agent-1"
+        );
     }
 
     #[test]

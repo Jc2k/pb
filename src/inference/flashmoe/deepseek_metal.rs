@@ -117,6 +117,7 @@ pub(crate) const DEEPSEEK_V4_REQUIRED_METAL_KERNELS: &[&str] = &[
     "kernel_pb_dsv4_f32_to_f16",
     "kernel_pb_dsv4_swiglu_batch",
     "kernel_pb_dsv4_raw_store_batch",
+    "kernel_pb_dsv4_raw_context_batch",
     "kernel_pb_dsv4_gather_attention_group",
     "kernel_pb_dsv4_scatter_attention_rank",
     "kernel_pb_dsv4_compressor_prefill",

@@ -178,6 +178,16 @@ struct RawStoreBatchArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct RawContextBatchArgs {
+    tokens: u32,
+    prefix_raw: u32,
+    raw_cap: u32,
+    head_dim: u32,
+    pos0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct GroupCopyArgs {
     tokens: u32,
     groups: u32,
@@ -200,9 +210,11 @@ struct CompressorPrefillArgs {
 #[derive(Clone, Copy)]
 struct AttentionMaskArgs {
     tokens: u32,
+    raw_rows: u32,
     compressed: u32,
     window: u32,
     ratio: u32,
+    pos0: u32,
 }
 
 #[repr(C)]
@@ -857,6 +869,7 @@ struct DeepSeekBatchScratch {
     qr_norm: MetalObjcId,
     kv_raw: MetalObjcId,
     kv: MetalObjcId,
+    raw_context: MetalObjcId,
     q: MetalObjcId,
     heads: MetalObjcId,
     attn_group: MetalObjcId,
@@ -916,6 +929,28 @@ pub(super) struct DeepSeekV4MetalState {
     bytes: usize,
 }
 
+#[derive(Debug)]
+pub(in crate::inference::flashmoe) struct DeepSeekV4SessionSnapshot {
+    frontier: usize,
+    buffers: Vec<(MetalObjcId, usize)>,
+    _bytes: usize,
+}
+
+// MTLBuffer objects are retained for the snapshot lifetime and Metal permits
+// command encoding and release from threads other than the allocating thread.
+// Access remains serialized by the resident FlashMoe engine mutex.
+unsafe impl Send for DeepSeekV4SessionSnapshot {}
+
+impl Drop for DeepSeekV4SessionSnapshot {
+    fn drop(&mut self) {
+        unsafe {
+            for (buffer, _) in self.buffers.drain(..) {
+                release(buffer);
+            }
+        }
+    }
+}
+
 impl DeepSeekV4MetalState {
     pub(super) unsafe fn release(&mut self) {
         unsafe {
@@ -924,6 +959,127 @@ impl DeepSeekV4MetalState {
             }
         }
         self.bytes = 0;
+    }
+
+    fn session_buffer_specs(&self, frontier: usize) -> Result<Vec<(MetalObjcId, usize)>> {
+        let mut buffers = Vec::with_capacity(self.layers.len() * 7 + 2);
+        for layer in &self.layers {
+            buffers.push((layer.raw, unsafe {
+                msg_send_usize0(layer.raw, sel("length"))
+            }));
+            if let Some(comp) = layer.comp {
+                let rows = frontier / layer.ratio;
+                let bytes = rows
+                    .checked_mul(HEAD_DIM * size_of::<f32>())
+                    .context("DeepSeek V4 compressed session snapshot size overflow")?
+                    .max(size_of::<f32>());
+                buffers.push((comp, bytes));
+                buffers.push((
+                    layer.comp_state_kv.expect("compressed KV frontier"),
+                    unsafe {
+                        msg_send_usize0(
+                            layer.comp_state_kv.expect("compressed KV frontier"),
+                            sel("length"),
+                        )
+                    },
+                ));
+                buffers.push((
+                    layer.comp_state_score.expect("compressed score frontier"),
+                    unsafe {
+                        msg_send_usize0(
+                            layer.comp_state_score.expect("compressed score frontier"),
+                            sel("length"),
+                        )
+                    },
+                ));
+            }
+            if let Some(index_comp) = layer.index_comp {
+                let rows = frontier / layer.ratio;
+                let bytes = rows
+                    .checked_mul(INDEX_HEAD_DIM * size_of::<f32>())
+                    .context("DeepSeek V4 index session snapshot size overflow")?
+                    .max(size_of::<f32>());
+                buffers.push((index_comp, bytes));
+                buffers.push((layer.index_state_kv.expect("index KV frontier"), unsafe {
+                    msg_send_usize0(
+                        layer.index_state_kv.expect("index KV frontier"),
+                        sel("length"),
+                    )
+                }));
+                buffers.push((
+                    layer.index_state_score.expect("index score frontier"),
+                    unsafe {
+                        msg_send_usize0(
+                            layer.index_state_score.expect("index score frontier"),
+                            sel("length"),
+                        )
+                    },
+                ));
+            }
+        }
+        for buffer in [self.scratch.cur_hc, self.scratch.output_hidden] {
+            buffers.push((buffer, unsafe { msg_send_usize0(buffer, sel("length")) }));
+        }
+        for (buffer, bytes) in &buffers {
+            let available = unsafe { msg_send_usize0(*buffer, sel("length")) };
+            if *bytes > available {
+                bail!(
+                    "DeepSeek V4 session snapshot needs {bytes} bytes from a {available}-byte buffer"
+                );
+            }
+        }
+        Ok(buffers)
+    }
+}
+
+unsafe fn blit_deepseek_session_buffers(
+    context: &MetalExecutionContext,
+    copies: &[(MetalObjcId, MetalObjcId, usize)],
+    phase: &'static str,
+) -> Result<()> {
+    unsafe {
+        let command_buffer = retain_autoreleased_return_value(msg_send_id0(
+            context.runtime.command_queue,
+            sel("commandBufferWithUnretainedReferences"),
+        ));
+        if command_buffer.is_null() {
+            bail!("failed to create DeepSeek V4 session {phase} command buffer");
+        }
+        let encoder = retain_autoreleased_return_value(msg_send_id0(
+            command_buffer,
+            sel("blitCommandEncoder"),
+        ));
+        if encoder.is_null() {
+            release(command_buffer);
+            bail!("failed to create DeepSeek V4 session {phase} blit encoder");
+        }
+        for &(source, destination, bytes) in copies {
+            let function: unsafe extern "C" fn(
+                MetalObjcId,
+                MetalSelector,
+                MetalObjcId,
+                usize,
+                MetalObjcId,
+                usize,
+                usize,
+            ) = std::mem::transmute(objc_msgSend as *const ());
+            function(
+                encoder,
+                sel("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"),
+                source,
+                0,
+                destination,
+                0,
+                bytes,
+            );
+        }
+        msg_send_void0(encoder, sel("endEncoding"));
+        let result =
+            commit_and_wait_metal_command_buffer(command_buffer, &MetalCommandContext::new(phase));
+        release(encoder);
+        release(command_buffer);
+        result?;
+        Ok(())
     }
 }
 
@@ -1539,8 +1695,17 @@ unsafe fn encode_batch_compressor(
     projected_kv: MetalObjcId,
     projected_score: MetalObjcId,
     quantize_fp8: bool,
+    pos0: usize,
 ) -> Result<usize> {
-    let n_comp = batch.tokens / ratio;
+    let old_comp = pos0 / ratio;
+    let n_comp = pos0
+        .checked_add(batch.tokens)
+        .context("DeepSeek V4 batch compressor frontier overflow")?
+        / ratio;
+    let new_comp = n_comp.saturating_sub(old_comp);
+    let row_offset = old_comp
+        .checked_mul(head_dim * size_of::<f32>())
+        .context("DeepSeek V4 batch compressor row offset overflow")?;
     unsafe {
         encode_batch_matmul(
             pipelines,
@@ -1575,7 +1740,7 @@ unsafe fn encode_batch_compressor(
             width: u32::try_from(width)?,
             head_dim: u32::try_from(head_dim)?,
             ratio: u32::try_from(ratio)?,
-            pos0: 0,
+            pos0: u32::try_from(pos0)?,
         };
         set_pipeline(
             encoder,
@@ -1589,37 +1754,37 @@ unsafe fn encode_batch_compressor(
         set_buffer(encoder, state_score, 5);
         set_buffer(encoder, cache, 6);
         dispatch_groups(encoder, (1, 1, 1), (256, 1, 1));
-        if n_comp == 0 {
-            return Ok(0);
+        if new_comp == 0 {
+            return Ok(n_comp);
         }
         encode_rms(
             pipelines,
             encoder,
             dense,
             cache,
-            0,
+            row_offset,
             Some(norm),
             cache,
-            0,
+            row_offset,
             head_dim,
-            n_comp,
+            new_comp,
         )?;
         encode_batch_rope(
             pipelines,
             encoder,
             batch.comp_rope_positions,
             cache,
-            0,
-            n_comp,
+            row_offset,
+            new_comp,
             1,
             head_dim,
             true,
             false,
         )?;
         if quantize_fp8 {
-            encode_fp8_rows(pipelines, encoder, cache, 0, head_dim, n_comp)?;
+            encode_fp8_rows(pipelines, encoder, cache, row_offset, head_dim, new_comp)?;
         } else {
-            encode_index_qat_rows(pipelines, encoder, cache, n_comp)?;
+            encode_index_qat_rows(pipelines, encoder, cache, row_offset, new_comp)?;
         }
     }
     Ok(n_comp)
@@ -1629,6 +1794,7 @@ unsafe fn encode_index_qat_rows(
     pipelines: &DeepSeekMetalPipelineSet,
     encoder: MetalObjcId,
     buffer: MetalObjcId,
+    offset: usize,
     rows: usize,
 ) -> Result<()> {
     let args = IndexQatArgs {
@@ -1642,7 +1808,7 @@ unsafe fn encode_index_qat_rows(
             pipelines.require("kernel_dsv4_indexer_hadamard_fp4_f32")?,
         );
         set_bytes(encoder, bytes_of(&args), 0);
-        set_buffer(encoder, buffer, 1);
+        set_buffer_with_offset(encoder, buffer, offset as u64, 1);
         set_threadgroup_memory(encoder, 256 * size_of::<f32>(), 0);
         dispatch_groups(encoder, (rows as u64, 1, 1), (128, 1, 1));
     }
@@ -1919,16 +2085,21 @@ unsafe fn encode_batch_indexed_attention(
     n_comp: usize,
     top_k: usize,
     ratio: usize,
+    pos0: usize,
 ) -> Result<()> {
+    let raw_rows = pos0
+        .min(RAW_CAP)
+        .checked_add(batch.tokens)
+        .context("DeepSeek indexed raw context overflow")?;
     let args = IndexedAttentionArgs {
         n_tokens: u32::try_from(batch.tokens)?,
         n_head: HEADS as u32,
-        n_raw: u32::try_from(batch.tokens)?,
-        raw_cap: u32::try_from(batch.tokens)?,
+        n_raw: u32::try_from(raw_rows)?,
+        raw_cap: u32::try_from(raw_rows)?,
         raw_start: 0,
         n_comp: u32::try_from(n_comp)?,
         top_k: u32::try_from(top_k)?,
-        pos0: 0,
+        pos0: u32::try_from(pos0)?,
         window: RAW_CAP as u32,
         ratio: u32::try_from(ratio)?,
         comp_kv_f16: 0,
@@ -1949,7 +2120,15 @@ unsafe fn encode_batch_indexed_attention(
         );
         set_bytes(encoder, bytes_of(&args), 0);
         set_buffer(encoder, batch.q, 1);
-        set_buffer(encoder, batch.kv, 2);
+        set_buffer(
+            encoder,
+            if pos0 == 0 {
+                batch.kv
+            } else {
+                batch.raw_context
+            },
+            2,
+        );
         set_buffer(encoder, comp, 3);
         set_buffer(encoder, batch.index_sorted, 4);
         set_buffer_with_offset(encoder, dense.buffer, sinks.byte_offset, 5);
@@ -1974,9 +2153,14 @@ unsafe fn encode_batch_flash_attention(
     compressed_cache: Option<MetalObjcId>,
     n_comp: usize,
     ratio: usize,
+    pos0: usize,
 ) -> Result<()> {
     let tokens = batch.tokens;
-    let n_keys = tokens
+    let raw_rows = pos0
+        .min(RAW_CAP)
+        .checked_add(tokens)
+        .context("DeepSeek FlashAttention raw context overflow")?;
+    let n_keys = raw_rows
         .checked_add(n_comp)
         .context("DeepSeek FlashAttention key count overflow")?;
     let row_f32 = HEAD_DIM * size_of::<f32>();
@@ -1993,14 +2177,22 @@ unsafe fn encode_batch_flash_attention(
     unsafe {
         let copy = CopyArgs {
             elements: u32::try_from(
-                tokens
+                raw_rows
                     .checked_mul(HEAD_DIM)
                     .context("raw KV copy overflow")?,
             )?,
         };
         set_pipeline(encoder, pipelines.require("kernel_pb_dsv4_f32_to_f16")?);
         set_bytes(encoder, bytes_of(&copy), 0);
-        set_buffer(encoder, batch.kv, 1);
+        set_buffer(
+            encoder,
+            if pos0 == 0 {
+                batch.kv
+            } else {
+                batch.raw_context
+            },
+            1,
+        );
         set_buffer(encoder, batch.flash_kv, 2);
         dispatch_groups(
             encoder,
@@ -2020,7 +2212,7 @@ unsafe fn encode_batch_flash_attention(
             set_pipeline(encoder, pipelines.require("kernel_pb_dsv4_f32_to_f16")?);
             set_bytes(encoder, bytes_of(&copy), 0);
             set_buffer(encoder, cache, 1);
-            set_buffer_with_offset(encoder, batch.flash_kv, (tokens * row_f16) as u64, 2);
+            set_buffer_with_offset(encoder, batch.flash_kv, (raw_rows * row_f16) as u64, 2);
             dispatch_groups(
                 encoder,
                 (usize::try_from(copy.elements)?.div_ceil(256) as u64, 1, 1),
@@ -2030,9 +2222,11 @@ unsafe fn encode_batch_flash_attention(
 
         let mask = AttentionMaskArgs {
             tokens: u32::try_from(tokens)?,
+            raw_rows: u32::try_from(raw_rows)?,
             compressed: u32::try_from(n_comp)?,
             window: RAW_CAP as u32,
             ratio: u32::try_from(ratio)?,
+            pos0: u32::try_from(pos0)?,
         };
         set_pipeline(
             encoder,
@@ -2601,6 +2795,7 @@ unsafe fn encode_batch_pre_expert_layer(
     graph_layer: &DeepSeekV4LayerGraph,
     layer_state: &DeepSeekLayerState,
     batch: &DeepSeekBatchScratch,
+    pos0: usize,
 ) -> Result<()> {
     let pipelines = context.deepseek_pipelines()?;
     let encoder = encoding.encoder();
@@ -2746,6 +2941,7 @@ unsafe fn encode_batch_pre_expert_layer(
                 batch.comp_kv,
                 batch.comp_score,
                 true,
+                pos0,
             )?;
             if n_comp > layer_state.comp_cap {
                 bail!(
@@ -2789,6 +2985,7 @@ unsafe fn encode_batch_pre_expert_layer(
                 pipelines,
                 encoder,
                 batch.index_q,
+                0,
                 batch.tokens * INDEX_HEADS,
             )?;
             encode_batch_matmul(
@@ -2830,6 +3027,7 @@ unsafe fn encode_batch_pre_expert_layer(
                 batch.comp_kv,
                 batch.comp_score,
                 false,
+                pos0,
             )?;
             if index_n_comp != n_comp {
                 bail!("DeepSeek V4 batch attention/index compressor frontiers diverged");
@@ -2840,7 +3038,7 @@ unsafe fn encode_batch_pre_expert_layer(
                     n_tokens: u32::try_from(batch.tokens)?,
                     n_head: INDEX_HEADS as u32,
                     head_dim: INDEX_HEAD_DIM as u32,
-                    pos0: 0,
+                    pos0: u32::try_from(pos0)?,
                     ratio: 4,
                     q_token_stride: (INDEX_WIDTH * size_of::<f32>()) as u64,
                     q_head_stride: (INDEX_HEAD_DIM * size_of::<f32>()) as u64,
@@ -2878,6 +3076,33 @@ unsafe fn encode_batch_pre_expert_layer(
             }
         }
 
+        if pos0 != 0 {
+            let prefix_raw = pos0.min(RAW_CAP);
+            let raw_rows = prefix_raw
+                .checked_add(batch.tokens)
+                .context("DeepSeek batch raw context overflow")?;
+            let raw_context = RawContextBatchArgs {
+                tokens: u32::try_from(batch.tokens)?,
+                prefix_raw: u32::try_from(prefix_raw)?,
+                raw_cap: RAW_CAP as u32,
+                head_dim: HEAD_DIM as u32,
+                pos0: u32::try_from(pos0)?,
+            };
+            set_pipeline(
+                encoder,
+                pipelines.require("kernel_pb_dsv4_raw_context_batch")?,
+            );
+            set_bytes(encoder, bytes_of(&raw_context), 0);
+            set_buffer(encoder, layer_state.raw, 1);
+            set_buffer(encoder, batch.kv, 2);
+            set_buffer(encoder, batch.raw_context, 3);
+            dispatch_groups(
+                encoder,
+                ((raw_rows * HEAD_DIM).div_ceil(256) as u64, 1, 1),
+                (256, 1, 1),
+            );
+        }
+
         if layer_state.ratio == 4 && n_comp > INDEX_TOP_K {
             encode_batch_indexed_attention(
                 pipelines,
@@ -2889,6 +3114,7 @@ unsafe fn encode_batch_pre_expert_layer(
                 n_comp,
                 n_comp.min(INDEX_TOP_K),
                 layer_state.ratio,
+                pos0,
             )?;
         } else {
             encode_batch_flash_attention(
@@ -2900,6 +3126,7 @@ unsafe fn encode_batch_pre_expert_layer(
                 layer_state.comp,
                 n_comp,
                 layer_state.ratio,
+                pos0,
             )?;
         }
 
@@ -2907,7 +3134,7 @@ unsafe fn encode_batch_pre_expert_layer(
             tokens: u32::try_from(batch.tokens)?,
             raw_cap: RAW_CAP as u32,
             head_dim: HEAD_DIM as u32,
-            pos0: 0,
+            pos0: u32::try_from(pos0)?,
         };
         set_pipeline(
             encoder,
@@ -3715,7 +3942,11 @@ unsafe fn allocate_owned_buffer_uninitialized(
 }
 
 impl DeepSeekBatchScratch {
-    unsafe fn allocate(context: &MetalExecutionContext, tokens: usize) -> Result<Self> {
+    unsafe fn allocate(
+        context: &MetalExecutionContext,
+        tokens: usize,
+        pos0: usize,
+    ) -> Result<Self> {
         if tokens == 0 {
             bail!("DeepSeek V4 batch prefill requires at least one token");
         }
@@ -3731,9 +3962,17 @@ impl DeepSeekBatchScratch {
                     .with_context(|| format!("DeepSeek V4 batch {label} size overflow"))
             };
             let hc_mix_width = 2 * HC + HC * HC;
-            let max_comp = tokens.div_ceil(4).max(1);
-            let max_flash_keys = tokens
-                .checked_add(tokens.div_ceil(4))
+            let prefix_raw = pos0.min(RAW_CAP);
+            let raw_rows = prefix_raw
+                .checked_add(tokens)
+                .context("DeepSeek V4 raw batch context size overflow")?;
+            let max_comp = pos0
+                .checked_add(tokens)
+                .context("DeepSeek V4 compressed frontier overflow")?
+                / 4;
+            let max_comp = max_comp.max(1);
+            let max_flash_keys = raw_rows
+                .checked_add(max_comp)
                 .context("DeepSeek V4 FlashAttention key count overflow")?;
             let flash_mask_bytes = tokens
                 .checked_mul(max_flash_keys)
@@ -3802,6 +4041,14 @@ impl DeepSeekBatchScratch {
                 )?,
                 kv_raw: alloc_bytes(f32_bytes(tokens, HEAD_DIM, "raw KV")?, "batch raw KV")?,
                 kv: alloc_bytes(f32_bytes(tokens, HEAD_DIM, "KV")?, "batch KV")?,
+                raw_context: alloc_bytes(
+                    f32_bytes(
+                        if pos0 == 0 { 1 } else { raw_rows },
+                        HEAD_DIM,
+                        "raw context",
+                    )?,
+                    "batch raw context",
+                )?,
                 q: alloc_bytes(f32_bytes(tokens, Q_WIDTH, "query")?, "batch query")?,
                 heads: alloc_bytes(
                     f32_bytes(tokens, Q_WIDTH, "attention heads")?,
@@ -4092,11 +4339,97 @@ impl MetalExecutionContext {
         Ok(())
     }
 
+    pub(crate) fn capture_deepseek_v4_session_state(&self) -> Result<DeepSeekV4SessionSnapshot> {
+        let state_guard = self.deepseek_state.lock().map_err(|_| {
+            anyhow::anyhow!("DeepSeek V4 Metal state lock is poisoned during session capture")
+        })?;
+        let state = state_guard
+            .as_ref()
+            .context("DeepSeek V4 Metal state was not prepared before session capture")?;
+        let specs = state.session_buffer_specs(state.next_position)?;
+        let mut owned = Vec::with_capacity(specs.len());
+        let allocation = (|| -> Result<DeepSeekV4SessionSnapshot> {
+            let mut copies = Vec::with_capacity(specs.len());
+            let mut bytes = 0usize;
+            for (index, (source, len)) in specs.iter().copied().enumerate() {
+                let destination = unsafe {
+                    allocate_owned_buffer_uninitialized(
+                        self,
+                        &mut owned,
+                        len,
+                        &format!("session snapshot {index}"),
+                    )?
+                };
+                copies.push((source, destination, len));
+                bytes = bytes
+                    .checked_add(len)
+                    .context("DeepSeek V4 session snapshot byte count overflow")?;
+            }
+            unsafe { blit_deepseek_session_buffers(self, &copies, "deepseek_session_capture")? };
+            Ok(DeepSeekV4SessionSnapshot {
+                frontier: state.next_position,
+                buffers: owned
+                    .drain(..)
+                    .zip(specs.iter().map(|(_, len)| *len))
+                    .collect(),
+                _bytes: bytes,
+            })
+        })();
+        if allocation.is_err() {
+            for buffer in owned.drain(..) {
+                unsafe { release(buffer) };
+            }
+        }
+        allocation
+    }
+
+    pub(crate) fn restore_deepseek_v4_session_state(
+        &self,
+        snapshot: &DeepSeekV4SessionSnapshot,
+    ) -> Result<()> {
+        let mut state_guard = self.deepseek_state.lock().map_err(|_| {
+            anyhow::anyhow!("DeepSeek V4 Metal state lock is poisoned during session restore")
+        })?;
+        let state = state_guard
+            .as_mut()
+            .context("DeepSeek V4 Metal state was not prepared before session restore")?;
+        if snapshot.frontier > state.capacity {
+            bail!(
+                "DeepSeek V4 session frontier {} exceeds prepared context capacity {}",
+                snapshot.frontier,
+                state.capacity
+            );
+        }
+        let destinations = state.session_buffer_specs(snapshot.frontier)?;
+        if destinations.len() != snapshot.buffers.len() {
+            bail!(
+                "DeepSeek V4 session state layout changed: snapshot buffers={} resident buffers={}",
+                snapshot.buffers.len(),
+                destinations.len()
+            );
+        }
+        let mut copies = Vec::with_capacity(destinations.len());
+        for ((source, source_len), (destination, destination_len)) in
+            snapshot.buffers.iter().copied().zip(destinations)
+        {
+            if source_len != destination_len {
+                bail!(
+                    "DeepSeek V4 session buffer layout changed: snapshot bytes={source_len} resident bytes={destination_len}"
+                );
+            }
+            copies.push((source, destination, source_len));
+        }
+        unsafe { blit_deepseek_session_buffers(self, &copies, "deepseek_session_restore")? };
+        state.next_position = snapshot.frontier;
+        Ok(())
+    }
+
     pub(crate) fn deepseek_v4_prefill(
         &self,
         graph: &DeepSeekV4ExecutionGraph,
         scheduler: &mut FlashMoeExecutionScheduler,
         tokens: &[u32],
+        pos0: usize,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             bail!("DeepSeek V4 batch prefill requires at least one prompt token");
@@ -4111,20 +4444,22 @@ impl MetalExecutionContext {
         let state = state_guard
             .as_mut()
             .context("DeepSeek V4 Metal state was not prepared before batch prefill")?;
-        if state.next_position != 0 {
+        if state.next_position != pos0 {
             bail!(
-                "DeepSeek V4 batch prefill requires a zero-prefix state, found frontier {}",
-                state.next_position
+                "DeepSeek V4 batch prefill position {pos0} does not match resident state frontier {}",
+                state.next_position,
             );
         }
-        if tokens.len() > state.capacity {
+        let end_position = pos0
+            .checked_add(tokens.len())
+            .context("DeepSeek V4 batch prompt frontier overflow")?;
+        if end_position > state.capacity {
             bail!(
-                "DeepSeek V4 batch prompt length {} exceeds prepared context capacity {}",
-                tokens.len(),
+                "DeepSeek V4 batch prompt frontier {end_position} exceeds prepared context capacity {}",
                 state.capacity
             );
         }
-        let mut batch = unsafe { DeepSeekBatchScratch::allocate(self, tokens.len())? };
+        let mut batch = unsafe { DeepSeekBatchScratch::allocate(self, tokens.len(), pos0)? };
         unsafe {
             ptr::copy_nonoverlapping(
                 tokens.as_ptr(),
@@ -4136,7 +4471,7 @@ impl MetalExecutionContext {
                 tokens.len(),
             );
             for (position, value) in positions.iter_mut().enumerate() {
-                *value = i32::try_from(position)?;
+                *value = i32::try_from(pos0 + position)?;
             }
 
             let embedding = EmbeddingBatchArgs {
@@ -4171,14 +4506,16 @@ impl MetalExecutionContext {
         for (layer, graph_layer) in graph.layers.iter().enumerate() {
             let ratio = state.layers[layer].ratio;
             if ratio != 0 {
-                let n_comp = tokens.len() / ratio;
+                let old_comp = pos0 / ratio;
+                let n_comp = end_position / ratio;
+                let new_comp = n_comp.saturating_sub(old_comp);
                 unsafe {
                     let positions = std::slice::from_raw_parts_mut(
                         buffer_contents(batch.comp_rope_positions).cast::<i32>(),
-                        n_comp.max(1),
+                        new_comp.max(1),
                     );
-                    for (row, value) in positions.iter_mut().take(n_comp).enumerate() {
-                        *value = i32::try_from(row * ratio)?;
+                    for (row, value) in positions.iter_mut().take(new_comp).enumerate() {
+                        *value = i32::try_from((old_comp + row) * ratio)?;
                     }
                 }
             }
@@ -4196,6 +4533,7 @@ impl MetalExecutionContext {
                     graph_layer,
                     &state.layers[layer],
                     &batch,
+                    pos0,
                 )?;
                 commit_deepseek_command(
                     encoding,
@@ -4304,7 +4642,7 @@ impl MetalExecutionContext {
             dispatch_groups(encoder, (1, 1, 1), (256, 1, 1));
             commit_deepseek_command(encoding, "deepseek_batch_output", tokens.len() - 1, None)?;
         }
-        state.next_position = tokens.len();
+        state.next_position = end_position;
         Ok(unsafe { read_f32_buffer(state.scratch.output_hidden, HIDDEN) })
     }
 
@@ -4575,6 +4913,8 @@ mod tests {
         assert_eq!(size_of::<RopeArgs>(), 144);
         assert_eq!(size_of::<IndexQatArgs>(), 16);
         assert_eq!(size_of::<IndexScoresArgs>(), 72);
+        assert_eq!(size_of::<RawContextBatchArgs>(), 20);
+        assert_eq!(size_of::<AttentionMaskArgs>(), 24);
         assert_eq!(size_of::<ArgsortArgs>(), 72);
         assert_eq!(size_of::<ArgsortMergeArgs>(), 88);
         assert_eq!(size_of::<MoeMatvecArgs>(), 120);

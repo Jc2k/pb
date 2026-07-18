@@ -1930,6 +1930,52 @@ impl FlashMoeSessionCache {
         }
     }
 
+    pub(crate) fn begin_external_prefix_generation(
+        prompt_tokens: Vec<u32>,
+        prefill_start: usize,
+        cached_last_hidden: Option<Vec<f32>>,
+        max_tokens: usize,
+        layers: usize,
+        cache_source: PromptCacheSource,
+        cache_restore_ms: u64,
+    ) -> Result<FlashMoeGenerationState> {
+        if prefill_start > prompt_tokens.len() {
+            bail!(
+                "external FlashMoe prefix {prefill_start} exceeds prompt length {}",
+                prompt_tokens.len()
+            );
+        }
+        let mut kv_cache = KvCache::new(layers, prompt_tokens.len() + max_tokens);
+        for (position, token) in prompt_tokens
+            .iter()
+            .copied()
+            .enumerate()
+            .take(prefill_start)
+        {
+            kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(position, token))?;
+        }
+        Ok(FlashMoeGenerationState {
+            session_id: None,
+            prompt_tokens,
+            kv_cache,
+            prefill_start,
+            cached_last_hidden,
+            prompt_cache: None,
+            cached_recurrent: None,
+            prompt_recurrent: None,
+            generated_cache: None,
+            generated_recurrent: None,
+            cache_source,
+            cache_restore_ms,
+            base_prefix_len: 0,
+            base_cache: None,
+            base_recurrent: None,
+            generated: Vec::new(),
+            max_tokens,
+            stopped: false,
+        })
+    }
+
     pub(crate) fn commit_generation(
         &mut self,
         generation: &mut FlashMoeGenerationState,
@@ -2070,6 +2116,14 @@ pub(super) struct FlashMoeGenerationState {
 impl FlashMoeGenerationState {
     pub(crate) fn prompt_len(&self) -> usize {
         self.prompt_tokens.len()
+    }
+
+    pub(crate) fn checkpoint_tokens(&self, evaluated_generated_tokens: usize) -> Vec<u32> {
+        let mut tokens = stable_session_cache_tokens(&self.prompt_tokens);
+        tokens.extend_from_slice(
+            &self.generated[..evaluated_generated_tokens.min(self.generated.len())],
+        );
+        tokens
     }
 
     pub(crate) fn prefill_start(&self) -> usize {

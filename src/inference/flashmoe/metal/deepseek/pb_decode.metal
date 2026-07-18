@@ -96,6 +96,38 @@ kernel void kernel_pb_dsv4_raw_store_batch(
     raw[(ulong)raw_row * args.head_dim + col] = float(half(kv[(ulong)token * args.head_dim + col]));
 }
 
+struct pb_dsv4_raw_context_batch_args {
+    uint tokens;
+    uint prefix_raw;
+    uint raw_cap;
+    uint head_dim;
+    uint pos0;
+};
+
+// Materialize the restored raw ring followed by the new suffix as one logical
+// sequence. Batch attention can then apply its causal window to every suffix
+// query without changing the scheduler-owned resident ring.
+kernel void kernel_pb_dsv4_raw_context_batch(
+        constant pb_dsv4_raw_context_batch_args &args,
+        device const float *raw,
+        device const float *kv,
+        device float *context,
+        uint gid [[thread_position_in_grid]]) {
+    const uint rows = args.prefix_raw + args.tokens;
+    const ulong count = (ulong)rows * args.head_dim;
+    if ((ulong)gid >= count) return;
+    const uint row = gid / args.head_dim;
+    const uint col = gid % args.head_dim;
+    if (row < args.prefix_raw) {
+        const uint first_pos = args.pos0 - args.prefix_raw;
+        const uint raw_row = (first_pos + row) % args.raw_cap;
+        context[gid] = raw[(ulong)raw_row * args.head_dim + col];
+    } else {
+        const uint token = row - args.prefix_raw;
+        context[gid] = kv[(ulong)token * args.head_dim + col];
+    }
+}
+
 struct pb_dsv4_group_copy_args {
     uint tokens;
     uint groups;
@@ -216,25 +248,43 @@ kernel void kernel_pb_dsv4_compressor_prefill(
 
 struct pb_dsv4_attention_mask_args {
     uint tokens;
+    uint raw_rows;
     uint compressed;
     uint window;
     uint ratio;
+    uint pos0;
 };
 
 kernel void kernel_pb_dsv4_prefill_attention_mask(
         constant pb_dsv4_attention_mask_args &args,
         device half *mask,
         uint gid [[thread_position_in_grid]]) {
-    const uint keys = args.tokens + args.compressed;
+    const uint keys = args.raw_rows + args.compressed;
     const ulong count = (ulong)args.tokens * keys;
     if ((ulong)gid >= count) return;
     const uint query = gid / keys;
     const uint key = gid % keys;
     bool visible;
-    if (key < args.tokens) {
-        visible = key <= query && (args.window == 0u || query - key < args.window);
+    if (args.pos0 == 0u && args.raw_rows == args.tokens) {
+        if (key < args.tokens) {
+            visible = key <= query &&
+                (args.window == 0u || query - key < args.window);
+        } else {
+            visible = args.ratio != 0u &&
+                key - args.tokens < (query + 1u) / args.ratio;
+        }
+        mask[gid] = visible ? half(0.0f) : -INFINITY;
+        return;
+    }
+    const uint qpos = args.pos0 + query;
+    if (key < args.raw_rows) {
+        const uint first_raw_pos = args.pos0 + args.tokens - args.raw_rows;
+        const uint key_pos = first_raw_pos + key;
+        visible = key_pos <= qpos &&
+            (args.window == 0u || qpos - key_pos < args.window);
     } else {
-        visible = args.ratio != 0u && key - args.tokens < (query + 1u) / args.ratio;
+        visible = args.ratio != 0u &&
+            key - args.raw_rows < (qpos + 1u) / args.ratio;
     }
     mask[gid] = visible ? half(0.0f) : -INFINITY;
 }

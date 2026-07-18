@@ -112,7 +112,7 @@ the optional MTP speculative head are not currently implemented.
 
 ## DeepSeek V4 Flash with FlashMoe
 
-**Shipped for the pinned request-scoped profile.** On Apple Silicon, pb recognizes exactly the
+**Shipped for the pinned profile and bounded live sessions.** On Apple Silicon, pb recognizes exactly the
 published DeepSeek V4 Flash IQ2_XXS/Q2_K checkpoint:
 
 ```bash
@@ -134,12 +134,17 @@ space before pulling.
 
 Load resolves the complete graph and required fused Metal kernels before the first token. Prompts
 below 32 tokens retain the exact token command; prompts of 32 tokens or more use the graph's
-layer-major Metal prefill command. This fixed matrix-tile calculation is not an error fallback.
+layer-major Metal prefill command. A live session with an exact cached token prefix restores its
+complete Metal state and applies the same calculation to the appended suffix. This fixed
+matrix-tile calculation is not an error fallback.
 Top-6 is
 part of the checkpoint contract: `--flashmoe-active-experts` cannot reduce it. There is no llama.cpp
 fallback, CPU component fallback, DS4 process, hidden top-2 mode, or alternate generation loop.
-DeepSeek is text-only in this profile, and requests for existing FlashMoe session/prefix reuse fail
-explicitly as described above. The implementation has local graph, routing, ABI, all-target, and
+DeepSeek is text-only in this profile. Exact prompt-prefix reuse is memory-only and LRU-bounded to
+two logical sessions with two prompt/generated checkpoints each. A reused session whose rendered
+tokens do not extend any retained checkpoint fails with `DeepSeek V4 session prefix mismatch`;
+there is no silent fresh-prefill fallback. DeepSeek checkpoints are not written to the Qwen/GLM
+disk-session format. The implementation has local graph, routing, ABI, all-target, and
 Metal shader compilation evidence plus a complete published-checkpoint cache build and real-model
 Metal load/prefill/decode. A raw arithmetic smoke emitted `4`; all four continuation cases enforced
 by the pinned upstream reference match exactly, including a 3,844-token prompt that crosses the
