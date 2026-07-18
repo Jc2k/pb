@@ -43,6 +43,8 @@ pub(crate) const PBQ4_EXPERT_LAYER_FORMAT_V2: &str = "PBQ4EXPERT_LAYER_V2";
 pub(crate) const FIXED_Q4_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_Q4_EXPERT_LAYER_V1";
 pub(crate) const FIXED_MXFP4_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_MXFP4_EXPERT_LAYER_V1";
 pub(crate) const FIXED_DENSE_EXPERT_LAYER_FORMAT_V1: &str = "FIXED_DENSE_EXPERT_LAYER_V1";
+pub(crate) const FIXED_DEEPSEEK_GGUF_EXPERT_LAYER_FORMAT_V1: &str =
+    "FIXED_DEEPSEEK_GGUF_EXPERT_LAYER_V1";
 const EXPERT_COMPONENT_ALIGNMENT: usize = 4096;
 pub(crate) const EXPERT_SCALE_BIAS_DTYPE_F32: &str = "F32";
 pub(crate) const EXPERT_SCALE_BIAS_DTYPE_BF16: &str = "BF16";
@@ -314,6 +316,21 @@ impl ExpertLayerPackMetadata {
         }
     }
 
+    pub(crate) fn new_fixed_deepseek_gguf(
+        layer: usize,
+        expert_size: u64,
+        experts: usize,
+        packs: Vec<ExpertPackMetadata>,
+    ) -> Self {
+        Self {
+            format: FIXED_DEEPSEEK_GGUF_EXPERT_LAYER_FORMAT_V1.to_string(),
+            layer,
+            expert_size,
+            experts,
+            packs,
+        }
+    }
+
     pub(crate) fn pack_for(&self, expert: usize) -> Option<&ExpertPackMetadata> {
         self.packs.iter().find(|metadata| metadata.expert == expert)
     }
@@ -324,6 +341,7 @@ impl ExpertLayerPackMetadata {
             && self.format != FIXED_Q4_EXPERT_LAYER_FORMAT_V1
             && self.format != FIXED_MXFP4_EXPERT_LAYER_FORMAT_V1
             && self.format != FIXED_DENSE_EXPERT_LAYER_FORMAT_V1
+            && self.format != FIXED_DEEPSEEK_GGUF_EXPERT_LAYER_FORMAT_V1
         {
             bail!(
                 "expert metadata {} has unsupported format {}",

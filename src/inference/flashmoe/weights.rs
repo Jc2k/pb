@@ -629,6 +629,11 @@ pub(super) fn write_dense_tensor_store(
                     out.write_all(&bias.to_le_bytes())?;
                 }
             }
+            TensorQuantization::Gguf { .. } => {
+                out.write_all(raw).with_context(|| {
+                    format!("failed to write native GGUF tensor {}", tensor.tensor)
+                })?;
+            }
         }
         current = current.saturating_add(tensor.byte_len);
     }
@@ -2009,6 +2014,31 @@ pub(super) fn ensure_runtime_tensor_storage_supported(
                     format!("Flash-MoE q4 tensor {canonical_name} has unsupported runtime layout")
                 })?;
         }
+        TensorQuantization::Gguf {
+            block_elements,
+            block_bytes,
+            ..
+        } => {
+            if *block_elements == 0 || *block_bytes == 0 {
+                bail!(
+                    "Flash-MoE GGUF tensor {canonical_name} has an invalid zero-sized block layout"
+                );
+            }
+            let elements = tensor.shape.iter().try_fold(1u64, |count, dimension| {
+                count.checked_mul(*dimension as u64)
+            });
+            let expected = elements
+                .and_then(|elements| elements.checked_add(*block_elements - 1))
+                .map(|elements| elements / *block_elements)
+                .and_then(|blocks| blocks.checked_mul(*block_bytes))
+                .context("Flash-MoE GGUF tensor byte length overflow")?;
+            if expected != tensor.byte_len {
+                bail!(
+                    "Flash-MoE GGUF tensor {canonical_name} has {} bytes, expected {expected}",
+                    tensor.byte_len
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2167,6 +2197,14 @@ pub enum TensorQuantization {
         #[serde(default = "default_dense_q4_scale_bias_dtype")]
         scale_bias_dtype: String,
     },
+    /// Source GGUF blocks are preserved verbatim in the canonical resident
+    /// store. The graph binder resolves the matching Metal implementation at
+    /// load time from these typed fields; inference never probes encodings.
+    Gguf {
+        tensor_type: u32,
+        block_elements: u64,
+        block_bytes: u64,
+    },
 }
 
 impl Default for TensorQuantization {
@@ -2292,6 +2330,10 @@ impl TensorRegistry {
             found_matrix = true;
             match tensor.quantization {
                 TensorQuantization::Q4 { .. } => found_q4 = true,
+                TensorQuantization::Gguf { .. } => bail!(
+                    "FlashMoe generic dense layout resolver cannot bind native GGUF tensor {}; a model-family graph binder is required",
+                    tensor.name
+                ),
                 TensorQuantization::None => {
                     let layout =
                         resident_dense_layout_for_dtype(&tensor.dtype).with_context(|| {
@@ -2605,6 +2647,9 @@ impl RouterScoreProjectionDescriptor {
                     binding: RouterScoreProjectionBinding::ResidentQ4(projection),
                 })
             }
+            TensorQuantization::Gguf { .. } => bail!(
+                "Flash-MoE router tensor {tensor_name} requires a model-family GGUF graph binding"
+            ),
         }
     }
 
@@ -3598,6 +3643,9 @@ impl ResidentMmapMatvecProjection {
                     element_size,
                 )?))
             }
+            TensorQuantization::Gguf { .. } => bail!(
+                "resident projection {tensor_name} requires a model-family GGUF graph binding"
+            ),
         }
     }
 

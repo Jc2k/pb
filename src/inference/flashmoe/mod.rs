@@ -5,7 +5,9 @@
 
 mod cache;
 mod capabilities;
+mod deepseek;
 mod experts;
+mod gguf;
 mod math;
 mod metal;
 mod model_family;
@@ -32,6 +34,7 @@ pub use cache::{
     expected_hf_files, expected_vl_hf_files,
 };
 pub use capabilities::*;
+pub use deepseek::*;
 pub use experts::*;
 pub use math::*;
 pub use metal::METAL_SHADERS;

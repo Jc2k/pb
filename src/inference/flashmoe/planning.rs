@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use super::deepseek::{
+    DEEPSEEK_V4_FLASH_CACHE_VERSION, DEEPSEEK_V4_FLASH_MODEL, canonical_deepseek_v4_flash_model,
+    is_deepseek_v4_flash,
+};
 use super::experts::first_missing_expert_pack_for_shape_from;
 use super::model_family::{
     QwenModelConfig, is_glm52, is_qwen3_moe, is_qwen3_vl, is_qwen35_or_legacy_alias,
@@ -127,6 +131,9 @@ pub fn is_arm_macos() -> bool {
 }
 
 fn is_flashmoe_model_name(model: &str) -> bool {
+    if is_deepseek_v4_flash(model) {
+        return true;
+    }
     let normalized = model.to_ascii_lowercase();
     if normalized.contains("gguf") {
         return false;
@@ -139,7 +146,9 @@ pub fn is_flashmoe_hf_model(model: &str) -> bool {
 }
 
 pub fn canonical_model(model: &str) -> String {
-    if model
+    if let Some(model) = canonical_deepseek_v4_flash_model(model) {
+        model.to_string()
+    } else if model
         .to_ascii_lowercase()
         .contains(LEGACY_QWEN_CODER_MARKER)
     {
@@ -150,7 +159,9 @@ pub fn canonical_model(model: &str) -> String {
 }
 
 pub fn cache_version_for_model(model: &str) -> &'static str {
-    if is_glm52(model) {
+    if is_deepseek_v4_flash(model) {
+        DEEPSEEK_V4_FLASH_CACHE_VERSION
+    } else if is_glm52(model) {
         super::types::GLM52_CACHE_VERSION
     } else {
         default_expert_quantization(model).cache_version()
@@ -218,7 +229,9 @@ pub fn plan_unchecked_with_routing_and_quantization(
         model,
         models_root,
         routing_policy,
-        if is_glm52(model) && quantization == ExpertQuantization::FourBitProduction {
+        if is_deepseek_v4_flash(model) {
+            DEEPSEEK_V4_FLASH_CACHE_VERSION
+        } else if is_glm52(model) && quantization == ExpertQuantization::FourBitProduction {
             super::types::GLM52_CACHE_VERSION
         } else {
             quantization.cache_version()
@@ -303,17 +316,36 @@ impl FlashMoePlan {
 
         let (expert_files, expert_bytes) = expert_store_size(&self.experts_dir)?;
         if self.experts_dir.is_dir() && self.model_config.is_file() {
-            let config = QwenModelConfig::from_file(&self.model_config).with_context(|| {
-                format!(
-                    "cannot resolve expert cache coverage from {}",
-                    self.model_config.display()
+            let (layers, experts, first_sparse_layer) = if is_deepseek_v4_flash(&self.model) {
+                let config: super::deepseek::DeepSeekV4Config =
+                    serde_json::from_slice(&fs::read(&self.model_config).with_context(|| {
+                        format!("failed to read {}", self.model_config.display())
+                    })?)
+                    .with_context(|| {
+                        format!(
+                            "cannot resolve DeepSeek expert cache coverage from {}",
+                            self.model_config.display()
+                        )
+                    })?;
+                (config.block_count, config.expert_count, 0)
+            } else {
+                let config = QwenModelConfig::from_file(&self.model_config).with_context(|| {
+                    format!(
+                        "cannot resolve expert cache coverage from {}",
+                        self.model_config.display()
+                    )
+                })?;
+                (
+                    config.num_hidden_layers,
+                    config.experts(),
+                    config.first_sparse_layer(),
                 )
-            })?;
+            };
             if let Some(missing_expert) = first_missing_expert_pack_for_shape_from(
                 &self.experts_dir,
-                config.num_hidden_layers,
-                config.experts(),
-                config.first_sparse_layer(),
+                layers,
+                experts,
+                first_sparse_layer,
             )? {
                 missing.push(missing_expert);
             }
@@ -328,6 +360,32 @@ impl FlashMoePlan {
     }
 
     pub fn describe(&self) -> String {
+        if is_deepseek_v4_flash(&self.model) {
+            let config = fs::read(&self.model_config).ok().and_then(|bytes| {
+                serde_json::from_slice::<super::deepseek::DeepSeekV4Config>(&bytes).ok()
+            });
+            let value = |value: Option<usize>| {
+                value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            };
+            let expert_store_gib = expert_store_size(&self.experts_dir)
+                .ok()
+                .map(|(_, bytes)| format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0)))
+                .unwrap_or_else(|| "unknown".to_string());
+            return format!(
+                "Flash-MoE {} for {}: {} layers, {} experts/layer, K={}, hidden={}, cache={}, expert store={} (~{} GiB)",
+                DEEPSEEK_V4_FLASH_CACHE_VERSION,
+                DEEPSEEK_V4_FLASH_MODEL,
+                value(config.as_ref().map(|config| config.block_count)),
+                value(config.as_ref().map(|config| config.expert_count)),
+                value(config.as_ref().map(|config| config.expert_used_count)),
+                value(config.as_ref().map(|config| config.embedding_length)),
+                self.runtime_dir.display(),
+                self.experts_dir.display(),
+                expert_store_gib,
+            );
+        }
         let config = QwenModelConfig::from_file(&self.model_config).ok();
         let describe_value = |value: Option<usize>| {
             value
@@ -688,10 +746,15 @@ mod tests {
         assert!(is_flashmoe_hf_model(GLM52_MODEL));
         assert!(is_flashmoe_hf_model(GLM52_COLIBRI_MODEL));
         assert_eq!(GLM52_MODEL, GLM52_MXFP4_MODEL);
-        assert!(
-            !is_flashmoe_hf_model("hf://antirez/deepseek-v4-gguf"),
-            "DeepSeek V4 must remain an explicit unsupported capability until Gate 8 closes"
+        assert!(is_flashmoe_hf_model("hf://antirez/deepseek-v4-gguf"));
+        assert!(is_flashmoe_hf_model(DEEPSEEK_V4_FLASH_MODEL));
+        assert_eq!(
+            canonical_model("hf://antirez/deepseek-v4-gguf"),
+            DEEPSEEK_V4_FLASH_MODEL
         );
+        assert!(!is_flashmoe_hf_model(
+            "hf://antirez/deepseek-v4-gguf/DeepSeek-V4-Pro-Q4_K_M.gguf"
+        ));
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-8B-Instruct"));
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-8B"));
         assert!(!is_flashmoe_hf_model("qwen3-30b-a3b"));

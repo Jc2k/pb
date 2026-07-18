@@ -399,6 +399,7 @@ fn build_manifest_from_resolved(
                     )?
                     .total_bytes as u64
                 }
+                TensorQuantization::Gguf { .. } => source_byte_len,
             };
             runtime_offset = align_to(runtime_offset, TENSOR_ALIGNMENT);
             dense_tensor_refs.push(DenseTensorRef {

@@ -3155,6 +3155,82 @@ async fn pull_flashmoe_from_hf(
     Ok(())
 }
 
+async fn pull_deepseek_v4_flash_from_hf(
+    client: &reqwest::Client,
+    hf_uri: &str,
+    output_root: &Path,
+    retries: u32,
+    prune_source: bool,
+    expert_storage: Option<FlashMoeExpertStorageArg>,
+) -> Result<()> {
+    if expert_storage.is_some() {
+        bail!(
+            "DeepSeek V4 Flash uses the pinned IQ2_XXS/Q2_K GGUF expert layout; --flashmoe-expert-storage cannot override it"
+        );
+    }
+    let canonical = crate::inference::flashmoe::canonical_model(hf_uri);
+    let (owner, repo, explicit_filename) = parse_hf_uri(&canonical)
+        .with_context(|| format!("invalid DeepSeek V4 Flash Hugging Face URI: {canonical}"))?;
+    let filename = explicit_filename.context("DeepSeek V4 Flash URI must resolve one GGUF file")?;
+    if filename != crate::inference::flashmoe::DEEPSEEK_V4_FLASH_FILENAME {
+        bail!(
+            "DeepSeek V4 Flash requires {}, got {filename}",
+            crate::inference::flashmoe::DEEPSEEK_V4_FLASH_FILENAME
+        );
+    }
+    let siblings = list_hf_files(client, &owner, &repo).await?;
+    let sibling = siblings
+        .iter()
+        .find(|sibling| sibling.rfilename == filename)
+        .with_context(|| format!("GGUF file {filename} not found in {owner}/{repo}"))?;
+    let size = match hf_sibling_size(sibling) {
+        size @ Some(_) => size,
+        None => {
+            let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{filename}");
+            fetch_content_length(client, &url).await
+        }
+    };
+    let cache_dir = output_root.join(cache_dir_name(&canonical));
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
+    let source = cache_dir.join(&filename);
+    let initial = existing_bytes(&source, size)?;
+    let progress = build_progress_bar(size.unwrap_or(0), initial)?;
+    let url = format!("{HF_ENDPOINT}/{owner}/{repo}/resolve/main/{filename}");
+    download_file_with_retry(client, &url, &source, size, &progress, &filename, retries).await?;
+    progress.finish_with_message("download complete");
+
+    let plan = crate::inference::flashmoe::build_deepseek_v4_flash_cache_from_gguf(
+        &canonical,
+        &source,
+        output_root,
+    )?;
+    let status = plan.cache_status()?;
+    if !status.ready {
+        bail!(
+            "DeepSeek V4 Flash cache publication finished without complete runtime coverage: {}",
+            status
+                .missing
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if prune_source {
+        std::fs::remove_file(&source).with_context(|| {
+            format!("failed to prune validated GGUF source {}", source.display())
+        })?;
+        println!("Flash-MoE source pruning removed {}", source.display());
+    }
+    println!(
+        "Pull complete: DeepSeek V4 Flash GGUF validated and canonical Flash-MoE cache prepared at {}",
+        plan.runtime_dir.display()
+    );
+    Ok(())
+}
+
 fn flashmoe_hf_file_is_wanted(model: &str, file_name: &str) -> bool {
     if crate::inference::flashmoe::is_glm52(model)
         && (file_name.starts_with("out-mtp-") || file_name.starts_with("out-idx-"))
@@ -3177,6 +3253,17 @@ async fn pull_from_hf(
     flashmoe_prune_source_shards: bool,
     flashmoe_expert_storage: Option<FlashMoeExpertStorageArg>,
 ) -> Result<()> {
+    if crate::inference::flashmoe::is_deepseek_v4_flash(hf_uri) {
+        return pull_deepseek_v4_flash_from_hf(
+            client,
+            hf_uri,
+            output_root,
+            retries,
+            flashmoe_prune_source_shards,
+            flashmoe_expert_storage,
+        )
+        .await;
+    }
     if crate::inference::flashmoe::is_flashmoe_hf_model(hf_uri) {
         let flashmoe_hf_uri = crate::inference::flashmoe::canonical_model(hf_uri);
         let (owner, repo, _) = parse_hf_uri(&flashmoe_hf_uri)
