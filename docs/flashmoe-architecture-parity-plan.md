@@ -517,8 +517,13 @@ prompt. A logical session with resident checkpoints but no exact prefix fails wi
 `DeepSeek V4 session prefix mismatch` error; it never resets silently or falls back to fresh
 prefill. The zero-prefix and nonzero-prefix batch commands are fixed graph implementations selected
 from calculated prefix length and prompt geometry. Session storage is LRU-bounded to two logical
-sessions and two prompt/generated checkpoints per session. It contains no expert identity, expert
-payload, alternate runtime, or hidden environment policy. Disk persistence remains unsupported
+sessions and two exact checkpoints per session. Structured stages retain a stable checkpoint after
+the first rendered message and a checkpoint at the latest complete prompt; raw sessions retain the
+prompt and evaluated generated-token head. The harness derives a stage-local session identity from
+the stable logical session, system prompt, and tool schema. This makes ordinary tool-result growth,
+validation corrections, and truncation retries extensions of a retained base while keeping stages
+isolated. The store contains no expert identity, expert payload, alternate runtime, or hidden
+environment policy. Disk persistence remains unsupported
 until a separate versioned complete-state format is designed and verified.
 
 ### DeepSeek V4 prefill benchmark, 2026-07-18
@@ -556,6 +561,16 @@ That comparison measures the agent workload benefit of reuse, not fresh-prefill 
 about a separately configured ds4 session. The current cold pb run was 144.5 tok/s, leaving a 1.62x
 fresh-prefill gap to ds4; the performance goal remains active for fused batch-kernel and CPU/GPU
 handoff work inside this graph.
+
+A strict agent regression then exercised changing structured transcripts rather than identical raw
+prompts. Planning restored a 2,578-token stable base across ordinary tool results, a generation-cap
+retry, validator correction, and a restarted planning attempt; PlanReview independently restored
+its 2,379-token stage base. Implementation first restored the complete 6,000-token prior prompt,
+then the 3,210-token stable base after a longer write no longer extended that complete prompt. All
+restores took 2-10 ms and every remaining suffix was explicitly prefilled. The run reached scoped
+file writes without a session-prefix error. It was stopped after the model repeated the same
+oversized invalid write twice; that is model/action-budget evidence, not a FlashMoe mismatch or a
+claim that the generated game completed.
 
 Two plausible follow-ups were rejected rather than hidden behind toggles. A Metal batch router was
 about nine percent faster on the long case, but its accumulated numerical drift changed the
@@ -772,8 +787,10 @@ Baseline reviewed on 2026-07-11:
   limits that mapping set while the aligned path avoids the second whole-expert memory copy.
   The Qwen/GLM session cache removes a non-prefix-matching entry before allocating the replacement
   KV cache. DeepSeek requires exact prefixes and derives a stage-local checkpoint id from the
-  harness's stable logical session, so a changed planning/review system prompt cannot silently
-  reset state while repeated turns inside one stage can still extend it. Structured agent requests also enforce their declared
+  harness's stable logical session, system prompt, and tool schema, so a changed planning/review
+  contract cannot silently reset state. Within a stage, a retained first-message base remains an
+  exact prefix across tool results, validation corrections, and truncation retries. Structured
+  agent requests also enforce their declared
   `ctx_size` against prompt plus generation capacity before allocating KV state.
   Structured FlashMoe output carries the actual rendered prompt-token count and distinguishes EOS
   from exhaustion of the requested generation cap. Capped, unparsable workflow turns therefore

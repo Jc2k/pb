@@ -260,7 +260,10 @@ reasoning; it cannot be combined with `--raw`, which bypasses the chat template 
 prints cached and actually-prefilled token counts for each pass, and persists the final checkpoint
 for families with a versioned disk-session format. `--repeat 2` verifies live reuse without a
 second model load. The pinned DeepSeek V4 profile uses bounded complete-state Metal checkpoints in
-memory only; a second process starts fresh because DeepSeek has no partial or alternate disk
+memory only. Structured agent stages retain an exact first-message base and current-prompt
+checkpoint under a stage identity that includes the system prompt and tool schema, allowing tool
+results and bounded correction retries to extend the base without silently resetting or crossing
+stage contracts. A second process starts fresh because DeepSeek has no partial or alternate disk
 format.
 
 The agent/evaluation handoff plumbing does not apply to `pb harness infer`, `pb harness bench`, or

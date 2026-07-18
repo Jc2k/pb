@@ -141,8 +141,12 @@ Top-6 is
 part of the checkpoint contract: `--flashmoe-active-experts` cannot reduce it. There is no llama.cpp
 fallback, CPU component fallback, DS4 process, hidden top-2 mode, or alternate generation loop.
 DeepSeek is text-only in this profile. Exact prompt-prefix reuse is memory-only and LRU-bounded to
-two logical sessions with two prompt/generated checkpoints each. A reused session whose rendered
-tokens do not extend any retained checkpoint fails with `DeepSeek V4 session prefix mismatch`;
+two logical sessions with two exact checkpoints each. Structured stages retain the first rendered
+message as their stable base plus the latest complete prompt; raw sessions retain the prompt plus
+an evaluated generated-token head. Stage identity also binds the system prompt and tool schema, so
+tool results, validation corrections, and truncation retries can extend the stable base without
+sharing state across different workflow stages. A reused session whose rendered tokens do not
+extend any retained checkpoint fails with `DeepSeek V4 session prefix mismatch`;
 there is no silent fresh-prefill fallback. DeepSeek checkpoints are not written to the Qwen/GLM
 disk-session format. The implementation has local graph, routing, ABI, all-target, and
 Metal shader compilation evidence plus a complete published-checkpoint cache build and real-model

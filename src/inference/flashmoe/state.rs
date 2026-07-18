@@ -2126,6 +2126,10 @@ impl FlashMoeGenerationState {
         tokens
     }
 
+    pub(crate) fn prompt_tokens_through(&self, prefix_len: usize) -> Vec<u32> {
+        self.prompt_tokens[..prefix_len.min(self.prompt_tokens.len())].to_vec()
+    }
+
     pub(crate) fn prefill_start(&self) -> usize {
         self.prefill_start
     }

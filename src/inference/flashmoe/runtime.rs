@@ -10,7 +10,9 @@ use tracing::{debug, info, trace, trace_span};
 
 use super::capabilities::{FlashMoeAttentionMathCapability, FlashMoeCapabilityPlan};
 use super::deepseek::{DeepSeekV4Config, DeepSeekV4ExecutionGraph, is_deepseek_v4_flash};
-use super::deepseek_session::{DeepSeekV4SessionCheckpoint, DeepSeekV4SessionStore};
+use super::deepseek_session::{
+    DeepSeekV4CheckpointKind, DeepSeekV4SessionCheckpoint, DeepSeekV4SessionStore,
+};
 use super::experts::ExpertSlotStore;
 use super::math::*;
 use super::metal::*;
@@ -2465,6 +2467,25 @@ impl FlashMoeEngine {
         Ok(common_token_prefix_len(prompt_tokens, &rendered_base))
     }
 
+    fn deepseek_stable_prompt_prefix_len(
+        &self,
+        request: &StructuredGenerationRequest,
+        prompt_tokens: &[u32],
+    ) -> Result<usize> {
+        if request.raw_prompt || !request.add_generation_prompt {
+            return Ok(prompt_tokens.len());
+        }
+        if request.messages.is_empty() {
+            return Ok(0);
+        }
+        let mut stable = request.clone();
+        stable.messages.truncate(1);
+        stable.add_generation_prompt = false;
+        stable.max_tokens = 0;
+        let (_, stable_tokens) = self.structured_prompt_tokens(&stable)?;
+        Ok(common_token_prefix_len(prompt_tokens, &stable_tokens))
+    }
+
     pub fn generate_in_session(
         &mut self,
         session_id: &str,
@@ -2660,6 +2681,11 @@ impl FlashMoeEngine {
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let encode_elapsed = encode_started.elapsed();
         let deepseek_v4 = self.deepseek_graph.is_some();
+        let deepseek_stable_prefix_len = if deepseek_v4 {
+            self.deepseek_stable_prompt_prefix_len(request, &prompt_tokens)?
+        } else {
+            0
+        };
         let base_prefix_len = if deepseek_v4 {
             0
         } else {
@@ -2792,6 +2818,7 @@ impl FlashMoeEngine {
             }
         }
         let prefill_or_ttft_started = Instant::now();
+        let mut deepseek_stable_checkpoint = None;
         let prefill_hidden = if prefill_start == prompt_len {
             debug!(
                 target: "flashmoe::lifecycle",
@@ -2846,6 +2873,38 @@ impl FlashMoeEngine {
                 );
                 cursor = base_prefix_len;
             }
+            if deepseek_v4
+                && session_id.is_some()
+                && cursor < deepseek_stable_prefix_len
+                && deepseek_stable_prefix_len < prompt_len
+            {
+                hidden = Some({
+                    let (prompt_tokens, _, kv_cache) = generation.prefill_inputs();
+                    let detailed = if detailed_timing {
+                        timing.as_deref_mut()
+                    } else {
+                        None
+                    };
+                    self.prefill_range(
+                        prompt_tokens,
+                        cursor,
+                        deepseek_stable_prefix_len,
+                        kv_cache,
+                        detailed,
+                        progress.clone(),
+                    )?
+                });
+                deepseek_stable_checkpoint = Some(DeepSeekV4SessionCheckpoint::new(
+                    DeepSeekV4CheckpointKind::StablePrompt,
+                    generation.prompt_tokens_through(deepseek_stable_prefix_len),
+                    hidden
+                        .as_ref()
+                        .expect("stable DeepSeek prefill produced hidden")
+                        .clone(),
+                    self.metal.capture_deepseek_v4_session_state()?,
+                ));
+                cursor = deepseek_stable_prefix_len;
+            }
             if cursor < prompt_len {
                 hidden = Some({
                     let (prompt_tokens, _, kv_cache) = generation.prefill_inputs();
@@ -2882,13 +2941,29 @@ impl FlashMoeEngine {
         };
         if deepseek_v4 {
             if let Some(session_id) = session_id {
-                let checkpoint = DeepSeekV4SessionCheckpoint::new(
-                    generation.checkpoint_tokens(0),
-                    prefill_hidden.clone(),
-                    self.metal.capture_deepseek_v4_session_state()?,
-                );
-                self.deepseek_sessions
-                    .replace_prompt(session_id, checkpoint);
+                if let Some(checkpoint) = deepseek_stable_checkpoint {
+                    self.deepseek_sessions
+                        .replace_stable_prompt(session_id, checkpoint);
+                } else if deepseek_stable_prefix_len == prompt_len {
+                    let checkpoint = DeepSeekV4SessionCheckpoint::new(
+                        DeepSeekV4CheckpointKind::StablePrompt,
+                        generation.checkpoint_tokens(0),
+                        prefill_hidden.clone(),
+                        self.metal.capture_deepseek_v4_session_state()?,
+                    );
+                    self.deepseek_sessions
+                        .replace_stable_prompt(session_id, checkpoint);
+                }
+                if deepseek_stable_prefix_len != prompt_len {
+                    let checkpoint = DeepSeekV4SessionCheckpoint::new(
+                        DeepSeekV4CheckpointKind::Prompt,
+                        generation.checkpoint_tokens(0),
+                        prefill_hidden.clone(),
+                        self.metal.capture_deepseek_v4_session_state()?,
+                    );
+                    self.deepseek_sessions
+                        .push_checkpoint(session_id, checkpoint);
+                }
             }
         } else if generation.requires_prompt_snapshot() {
             let recurrent = self.metal.capture_linear_attention_session_state()?;
@@ -3003,15 +3078,16 @@ impl FlashMoeEngine {
         let decode_wall = decode_phase_started.elapsed();
 
         if let Some(last_hidden) = generated_head_hidden {
-            if deepseek_v4 {
+            if deepseek_v4 && request.raw_prompt {
                 if let Some(session_id) = session_id {
                     let checkpoint = DeepSeekV4SessionCheckpoint::new(
+                        DeepSeekV4CheckpointKind::Generated,
                         generation.checkpoint_tokens(evaluated_generated_tokens),
                         last_hidden,
                         self.metal.capture_deepseek_v4_session_state()?,
                     );
                     self.deepseek_sessions
-                        .push_generated(session_id, checkpoint);
+                        .push_checkpoint(session_id, checkpoint);
                 }
             } else if generation.requires_prompt_snapshot() {
                 let recurrent = self.metal.capture_linear_attention_session_state()?;
