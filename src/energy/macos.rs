@@ -40,6 +40,14 @@ pub(super) struct MeasurementOwnership {
     _lock: File,
 }
 
+impl Drop for MeasurementOwnership {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 pub(super) fn begin_scope() -> Option<MeasurementOwnership> {
     let ownership = acquire_measurement_lock();
     let sampler = sampler();
