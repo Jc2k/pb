@@ -94,7 +94,7 @@ ephemeral workspaces are session-owned.
 | Broad configured task or `run_command` | Shell authority is intentionally broad within its execution environment. Review tasks and add policy where needed. |
 | Unmatched policy call | Allowed. Add explicit rules for operations that need deny or approval behavior. |
 | Public research and remote MCP | Data can leave the machine when the tool is invoked. Stage gating is not a confidentiality proof. |
-| Web listener | Loopback by default. A non-loopback listener is not automatically protected by authentication or TLS. |
+| Web listener | Loopback by default. A non-loopback listener is not automatically protected by authentication or TLS and is advertised through Bonjour for wake-on-HTTP. |
 | Container runtime | Isolation depends on the selected runtime and host configuration. Persistent images/caches remain outside the ephemeral resource lifecycle. |
 | Publication | Local Ready evidence does not authorize a push, pull request, merge, or provider-side mutation. |
 

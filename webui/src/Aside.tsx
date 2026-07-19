@@ -16,6 +16,12 @@ export const primaryNavigation = [
     icon: "bi bi-plug",
     end: false,
   },
+  {
+    to: "/settings",
+    label: "Settings",
+    icon: "bi bi-gear",
+    end: false,
+  },
 ] as const;
 
 export function PrimaryNavigationLinks(

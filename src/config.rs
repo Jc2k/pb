@@ -38,6 +38,8 @@ pub struct WebConfig {
     pub port: Option<u16>,
     /// Unix socket path used by `pb serve` for local daemon clients.
     pub socket_path: Option<PathBuf>,
+    /// Prevent idle system sleep while the work queue is actively processing.
+    pub prevent_sleep_while_working: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -92,6 +94,10 @@ impl UserConfig {
             "web.listen" => self.web.listen.clone(),
             "web.port" => self.web.port.map(|value| value.to_string()),
             "web.socket_path" => self.web.socket_path.as_ref().map(|path| display_path(path)),
+            "web.prevent_sleep_while_working" => self
+                .web
+                .prevent_sleep_while_working
+                .map(|value| value.to_string()),
             "model.model" => self.model.model.clone(),
             "model.model_dir" => self.model.model_dir.as_ref().map(|path| display_path(path)),
             "model.workdir" => self.model.workdir.as_ref().map(|path| display_path(path)),
@@ -119,6 +125,9 @@ impl UserConfig {
             "web.listen" => self.web.listen = Some(value.to_string()),
             "web.port" => self.web.port = Some(parse_value(key, value)?),
             "web.socket_path" => self.web.socket_path = Some(PathBuf::from(value)),
+            "web.prevent_sleep_while_working" => {
+                self.web.prevent_sleep_while_working = Some(parse_value(key, value)?)
+            }
             "model.model" => self.model.model = Some(value.to_string()),
             "model.model_dir" => self.model.model_dir = Some(PathBuf::from(value)),
             "model.workdir" => self.model.workdir = Some(PathBuf::from(value)),
@@ -164,6 +173,12 @@ impl UserConfig {
             .socket_path
             .clone()
             .unwrap_or_else(daemon_client::default_socket_path)
+    }
+
+    pub fn effective_prevent_sleep_while_working(&self) -> bool {
+        self.web
+            .prevent_sleep_while_working
+            .unwrap_or(cfg!(target_os = "macos"))
     }
 
     pub fn effective_model(&self) -> String {
@@ -247,7 +262,7 @@ where
 
 fn bail_unknown_key<T>(key: &str) -> Result<T> {
     bail!(
-        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, capabilities, and disabled fields. Container MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, and secret_env. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
+        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, capabilities, and disabled fields. Container MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, and secret_env. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
     )
 }
 
@@ -268,6 +283,9 @@ mod tests {
         let mut config = UserConfig::default();
         config.set("web.listen", "0.0.0.0").unwrap();
         config.set("web.port", "9999").unwrap();
+        config
+            .set("web.prevent_sleep_while_working", "false")
+            .unwrap();
         config.set("model.temperature", "0.7").unwrap();
         config.set("model.profile", "review").unwrap();
         config.save_to_path(&path).unwrap();
@@ -278,6 +296,10 @@ mod tests {
             Some("0.0.0.0".to_string())
         );
         assert_eq!(loaded.get("web.port").unwrap(), Some("9999".to_string()));
+        assert_eq!(
+            loaded.get("web.prevent_sleep_while_working").unwrap(),
+            Some("false".to_string())
+        );
         assert_eq!(loaded.model.temperature, Some(0.7));
         assert_eq!(loaded.model.profile, Some(AgentProfile::Review));
     }
@@ -288,10 +310,14 @@ mod tests {
         config.set("web.listen", "0.0.0.0").unwrap();
         config.set("web.port", "9999").unwrap();
         config.set("model.max_steps", "3").unwrap();
+        config
+            .set("web.prevent_sleep_while_working", "false")
+            .unwrap();
 
         assert_eq!(config.effective_web_listen(), "0.0.0.0");
         assert_eq!(config.effective_web_port(), 9999);
         assert_eq!(config.effective_max_steps(), 3);
+        assert!(!config.effective_prevent_sleep_while_working());
         assert_eq!(
             UserConfig::default().effective_max_steps(),
             DEFAULT_AGENT_MAX_STEPS

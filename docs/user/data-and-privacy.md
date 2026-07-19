@@ -48,7 +48,8 @@ pb config set web.port 8311
 ```
 
 If you bind to `0.0.0.0`, place pb behind a trusted network boundary. The current server does not
-add user authentication or HTTPS for you.
+add user authentication or HTTPS for you. On macOS, a non-loopback listener is also advertised as
+an HTTP service through Bonjour so supported Wake on Demand infrastructure can find and wake it.
 
 ## Reduce external exposure
 

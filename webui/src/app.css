@@ -1776,6 +1776,42 @@ body {
   transform: translateX(26px);
 }
 
+.settings-page-wrap {
+  width: min(100%, 920px);
+}
+
+.settings-hero > p {
+  max-width: 620px;
+  margin: 0.8rem 0 0;
+  color: #59677f;
+}
+
+.power-settings-card > div {
+  min-width: 0;
+}
+
+.power-setting-status {
+  font-weight: 700;
+}
+
+.power-setting-status.is-active {
+  color: #087b56;
+}
+
+.power-setting-error {
+  color: #b42318 !important;
+}
+
+.notification-switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.settings-loading {
+  padding: 1.35rem 1.55rem;
+  color: #59677f;
+}
+
 .mcp-store-card {
   padding: 1.45rem;
 }
@@ -2439,6 +2475,14 @@ textarea {
 
   .notification-card {
     align-items: flex-start;
+  }
+
+  .power-settings-card {
+    flex-direction: column;
+  }
+
+  .power-settings-card .notification-switch {
+    align-self: flex-end;
   }
 
   .integration-modal-backdrop {

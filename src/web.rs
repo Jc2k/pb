@@ -33,6 +33,7 @@ use crate::projects::{
     self, AddProjectRequest, ProjectEntry, RemoveProjectRequest, UpdateProjectNotificationsRequest,
 };
 use crate::session_store::{self, PersistedSession, SessionStatus, latest_session_title};
+use crate::sleep_prevention::{SleepPrevention, SleepPreventionStatus};
 
 const MAX_HISTORY_EVENTS: usize = 1_000;
 const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
@@ -271,6 +272,20 @@ pub struct StatusResponse {
     pub total_sessions: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSettingsResponse {
+    pub prevent_sleep_while_working: bool,
+    pub prevent_sleep_supported: bool,
+    pub prevent_sleep_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prevent_sleep_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateWebSettingsRequest {
+    pub prevent_sleep_while_working: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
     id: u64,
@@ -340,6 +355,30 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     projects: Arc<Mutex<Vec<ProjectEntry>>>,
     project_usage: Arc<Mutex<HashMap<String, ProjectUsageStats>>>,
+    sleep_prevention: Arc<StdMutex<SleepPrevention>>,
+}
+
+impl AppState {
+    fn update_sleep_prevention_working(&self, working: bool) {
+        self.sleep_prevention
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_working(working);
+    }
+
+    fn update_sleep_prevention_enabled(&self, enabled: bool) {
+        self.sleep_prevention
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_enabled(enabled);
+    }
+
+    fn sleep_prevention_status(&self) -> SleepPreventionStatus {
+        self.sleep_prevention
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .status()
+    }
 }
 
 #[derive(RustEmbed)]
@@ -365,6 +404,13 @@ pub async fn run_server_with_ready(
     };
     let restored_sessions = restore_sessions(&project_entries);
     let project_usage = build_project_usage_cache(&restored_sessions);
+    let user_config = match crate::config::UserConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            notify_ready(&mut ready, Err(error.to_string()));
+            return Err(error);
+        }
+    };
     if let Err(error) = crate::session_environment::initialize_global_supervisor()
         .context("failed to reconcile session environments at startup")
     {
@@ -401,6 +447,9 @@ pub async fn run_server_with_ready(
         sessions: Arc::new(Mutex::new(restored_sessions)),
         projects: Arc::new(Mutex::new(project_entries)),
         project_usage: Arc::new(Mutex::new(project_usage)),
+        sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(
+            user_config.effective_prevent_sleep_while_working(),
+        ))),
     };
 
     let app = Router::new()
@@ -444,6 +493,7 @@ pub async fn run_server_with_ready(
             "/api/projects/{name}/notifications",
             patch(update_project_notifications),
         )
+        .route("/api/settings", get(get_settings).patch(update_settings))
         .route("/api/status", get(status))
         .route("/api/current-user.png", get(crate::user::avatar_png))
         .route("/api/current-user", get(crate::user::user_info))
@@ -458,23 +508,37 @@ pub async fn run_server_with_ready(
         return Err(err);
     }
 
-    let addr: SocketAddr = match format!("{}:{}", args.host, args.port).parse() {
+    let addr: SocketAddr = match crate::http_listener::socket_addr(&args.host, args.port) {
         Ok(addr) => addr,
         Err(err) => {
             notify_ready(&mut ready, Err(err.to_string()));
-            return Err(err.into());
+            return Err(err);
         }
     };
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => listener,
+    let acquired = match crate::http_listener::acquire(addr).await {
+        Ok(acquired) => acquired,
         Err(err) => {
             notify_ready(&mut ready, Err(err.to_string()));
-            return Err(err.into());
+            return Err(err);
         }
     };
-    println!("pb serve listening on http://{}", addr);
-    notify_ready(&mut ready, Ok(addr));
-    axum::serve(listener, app).await?;
+    let bound_addr = acquired
+        .listener
+        .local_addr()
+        .context("failed to inspect the pb HTTP listener")?;
+    let source = match acquired.source {
+        crate::http_listener::ListenerSource::Direct => "direct bind",
+        crate::http_listener::ListenerSource::Launchd => "launchd socket activation",
+    };
+    println!("pb serve listening on http://{bound_addr} ({source})");
+    if acquired.wake_advertised {
+        println!(
+            "pb wake-on-HTTP advertised through Bonjour as {}",
+            crate::http_listener::BONJOUR_SERVICE_TYPE
+        );
+    }
+    notify_ready(&mut ready, Ok(bound_addr));
+    axum::serve(acquired.listener, app).await?;
     Ok(())
 }
 
@@ -1130,59 +1194,63 @@ async fn answer_question_inner(
     id: String,
     req: AnswerQuestionRequest,
 ) -> Result<SessionResponse> {
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions.get_mut(&id).ok_or(AnswerQuestionError::NotFound)?;
-    let Some(pending) = session.pending_question.take() else {
-        anyhow::bail!(AnswerQuestionError::Conflict);
-    };
-    if pending.question_id != req.question_id {
-        session.pending_question = Some(pending);
-        anyhow::bail!(AnswerQuestionError::Conflict);
-    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions.get_mut(&id).ok_or(AnswerQuestionError::NotFound)?;
+        let Some(pending) = session.pending_question.take() else {
+            anyhow::bail!(AnswerQuestionError::Conflict);
+        };
+        if pending.question_id != req.question_id {
+            session.pending_question = Some(pending);
+            anyhow::bail!(AnswerQuestionError::Conflict);
+        }
 
-    let answer = req.answer.trim().to_string();
-    if answer.is_empty() || (!pending.choices.is_empty() && !pending.choices.contains(&answer)) {
-        session.pending_question = Some(pending);
-        anyhow::bail!(AnswerQuestionError::Conflict);
-    }
+        let answer = req.answer.trim().to_string();
+        if answer.is_empty() || (!pending.choices.is_empty() && !pending.choices.contains(&answer))
+        {
+            session.pending_question = Some(pending);
+            anyhow::bail!(AnswerQuestionError::Conflict);
+        }
 
-    let sender = session.sender.clone();
-    let history = Arc::clone(&session.history);
-    let usage_records = Arc::clone(&session.usage_records);
-    let request_template = session.request_template.clone();
-    let branch = session.branch.clone();
-    let workdir = session.workdir.clone();
-    let workflow = session.workflow.clone();
-    let completed_workflows = session.completed_workflows.clone();
-    let question_id = req.question_id.clone();
-    pending
-        .responder
-        .send(answer.clone())
-        .map_err(|_| AnswerQuestionError::Gone)?;
-    session.paused = false;
-    session.running = true;
-    session.status = SessionStatus::Running;
-    session.updated_at_ms = now_millis();
-    publish_event(
-        &sender,
-        &history,
-        AgentEvent::UserAnswer {
-            question_id,
-            answer,
-            timestamp_ms: Some(now_millis()),
-        },
-    );
-    persist_session_snapshot(
-        &id,
-        &request_template,
-        branch,
-        workdir,
-        SessionStatus::Running,
-        &history,
-        &usage_records,
-        workflow,
-        completed_workflows,
-    );
+        let sender = session.sender.clone();
+        let history = Arc::clone(&session.history);
+        let usage_records = Arc::clone(&session.usage_records);
+        let request_template = session.request_template.clone();
+        let branch = session.branch.clone();
+        let workdir = session.workdir.clone();
+        let workflow = session.workflow.clone();
+        let completed_workflows = session.completed_workflows.clone();
+        let question_id = req.question_id.clone();
+        pending
+            .responder
+            .send(answer.clone())
+            .map_err(|_| AnswerQuestionError::Gone)?;
+        session.paused = false;
+        session.running = true;
+        session.status = SessionStatus::Running;
+        session.updated_at_ms = now_millis();
+        publish_event(
+            &sender,
+            &history,
+            AgentEvent::UserAnswer {
+                question_id,
+                answer,
+                timestamp_ms: Some(now_millis()),
+            },
+        );
+        persist_session_snapshot(
+            &id,
+            &request_template,
+            branch,
+            workdir,
+            SessionStatus::Running,
+            &history,
+            &usage_records,
+            workflow,
+            completed_workflows,
+        );
+    }
+    state.update_sleep_prevention_working(true);
     Ok(SessionResponse { session_id: id })
 }
 
@@ -1426,6 +1494,45 @@ async fn update_project_notifications(
     Ok(Json(updated))
 }
 
+async fn get_settings(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Json<WebSettingsResponse> {
+    Json(web_settings_snapshot(&state))
+}
+
+async fn update_settings(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<UpdateWebSettingsRequest>,
+) -> Result<Json<WebSettingsResponse>, StatusCode> {
+    let previous_enabled = state.sleep_prevention_status().enabled;
+    state.update_sleep_prevention_enabled(req.prevent_sleep_while_working);
+
+    let enabled = req.prevent_sleep_while_working;
+    let persisted = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut config = crate::config::UserConfig::load()?;
+        config.web.prevent_sleep_while_working = Some(enabled);
+        config.save()
+    })
+    .await;
+
+    if !matches!(persisted, Ok(Ok(()))) {
+        state.update_sleep_prevention_enabled(previous_enabled);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok(Json(web_settings_snapshot(&state)))
+}
+
+fn web_settings_snapshot(state: &AppState) -> WebSettingsResponse {
+    let status = state.sleep_prevention_status();
+    WebSettingsResponse {
+        prevent_sleep_while_working: status.enabled,
+        prevent_sleep_supported: status.supported,
+        prevent_sleep_active: status.active,
+        prevent_sleep_error: status.error,
+    }
+}
+
 struct WebEventSink {
     state: AppState,
     session_id: String,
@@ -1577,32 +1684,35 @@ impl EventSink for WebEventSink {
         };
 
         tokio::runtime::Handle::current().block_on(async {
-            let mut sessions = self.state.sessions.lock().await;
-            let Some(session) = sessions.get_mut(&self.session_id) else {
-                anyhow::bail!("session not found: {}", self.session_id);
-            };
-            session.running = false;
-            session.paused = true;
-            session.status = SessionStatus::Paused;
-            session.pending_question = Some(PendingQuestionState {
-                question_id: question_id.clone(),
-                question: question.to_string(),
-                choices: choices.to_vec(),
-                responder: tx,
-            });
-            session.updated_at_ms = now_millis();
-            publish_event(&session.sender, &session.history, event);
-            persist_session_snapshot(
-                &self.session_id,
-                &session.request_template,
-                session.branch.clone(),
-                session.workdir.clone(),
-                SessionStatus::Paused,
-                &session.history,
-                &session.usage_records,
-                session.workflow.clone(),
-                session.completed_workflows.clone(),
-            );
+            {
+                let mut sessions = self.state.sessions.lock().await;
+                let Some(session) = sessions.get_mut(&self.session_id) else {
+                    anyhow::bail!("session not found: {}", self.session_id);
+                };
+                session.running = false;
+                session.paused = true;
+                session.status = SessionStatus::Paused;
+                session.pending_question = Some(PendingQuestionState {
+                    question_id: question_id.clone(),
+                    question: question.to_string(),
+                    choices: choices.to_vec(),
+                    responder: tx,
+                });
+                session.updated_at_ms = now_millis();
+                publish_event(&session.sender, &session.history, event);
+                persist_session_snapshot(
+                    &self.session_id,
+                    &session.request_template,
+                    session.branch.clone(),
+                    session.workdir.clone(),
+                    SessionStatus::Paused,
+                    &session.history,
+                    &session.usage_records,
+                    session.workflow.clone(),
+                    session.completed_workflows.clone(),
+                );
+            }
+            self.state.update_sleep_prevention_working(false);
             Ok::<(), anyhow::Error>(())
         })?;
 
@@ -1619,39 +1729,50 @@ impl EventSink for WebEventSink {
 
 fn dispatch_next_session(state: AppState) {
     tokio::spawn(async move {
-        let next = {
+        let (next, working) = {
             let mut sessions = state.sessions.lock().await;
             let has_active = sessions.values().any(|session| {
                 session.status == SessionStatus::Running || session.pending_question.is_some()
             });
             if has_active {
-                return;
-            }
-            let Some(session_id) = sessions
+                let working = sessions
+                    .values()
+                    .any(|session| session.status == SessionStatus::Running);
+                (None, working)
+            } else if let Some(session_id) = sessions
                 .iter()
                 .filter(|(_, session)| session.status == SessionStatus::Queued)
                 .min_by_key(|(_, session)| session.updated_at_ms)
                 .map(|(session_id, _)| session_id.clone())
-            else {
-                return;
-            };
-            let session = sessions
-                .get_mut(&session_id)
-                .expect("queued session selected from sessions map");
-            session.running = true;
-            session.paused = false;
-            session.status = SessionStatus::Running;
-            session.updated_at_ms = now_millis();
-            (
-                session_id,
-                session.request_template.clone(),
-                session.branch.clone(),
-                session.workdir.clone(),
-                Arc::clone(&session.history),
-                Arc::clone(&session.usage_records),
-                session.workflow.clone(),
-                session.completed_workflows.clone(),
-            )
+            {
+                let session = sessions
+                    .get_mut(&session_id)
+                    .expect("queued session selected from sessions map");
+                session.running = true;
+                session.paused = false;
+                session.status = SessionStatus::Running;
+                session.updated_at_ms = now_millis();
+                (
+                    Some((
+                        session_id,
+                        session.request_template.clone(),
+                        session.branch.clone(),
+                        session.workdir.clone(),
+                        Arc::clone(&session.history),
+                        Arc::clone(&session.usage_records),
+                        session.workflow.clone(),
+                        session.completed_workflows.clone(),
+                    )),
+                    true,
+                )
+            } else {
+                (None, false)
+            }
+        };
+
+        state.update_sleep_prevention_working(working);
+        let Some(next) = next else {
+            return;
         };
 
         let (
@@ -2625,6 +2746,7 @@ mod workflow_tests {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
         };
         let list = session_list_snapshot(&state).await;
         assert_eq!(list.len(), 1);
@@ -2680,6 +2802,7 @@ mod workflow_tests {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
         };
         std::fs::write(repo.path().join("in-progress.txt"), "preserve me\n").unwrap();
 

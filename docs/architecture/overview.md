@@ -83,6 +83,29 @@ Environment resources have separate lease records. The supervisor reconciles aba
 at startup and reaps expired idle sessions. Persistent images and approved caches may be reused;
 task containers, services, networks, and ephemeral workspaces remain session-owned.
 
+## Host power lifecycle
+
+**Shipped.** The web service owns one process-wide macOS idle-sleep assertion. Queue dispatch marks
+it active before starting a running session and releases it only after dispatch finds no next item.
+Pausing for user input releases the assertion; answering reacquires it before model work resumes.
+The live global web preference updates the same owner, so toggling it during a task starts or stops
+a native IOKit `PreventUserIdleSystemSleep` assertion immediately instead of waiting for the next
+queue transition. pb releases the assertion by its IOPM assertion ID, while process exit provides a
+final OS-owned cleanup boundary. No helper subprocess is used.
+
+**Shipped.** The installed LaunchAgent declares one HTTP socket using the configured address and
+port. pb adopts that descriptor through `launch_activate_socket`; a direct development process
+falls back to an ordinary Tokio bind. When the configured address is not loopback, launchd
+advertises `_http._tcp` through Bonjour for the installed service, while a direct server owns an
+equivalent native `DNSServiceRegister` lease. Loopback listeners are never advertised. This keeps
+launchd out of the development request path without creating a second server implementation.
+
+**Configurable.** The Bonjour registration is eligible for the macOS Sleep Proxy path because pb
+does not set `kDNSServiceFlagsWakeOnlyService`. Actual wake-on-HTTP remains a host and network
+capability: **Wake for network access**, compatible hardware and power state, and a reachable Sleep
+Proxy or local-subnet wake path are outside pb's control. Network-visible HTTP also crosses the
+default trust boundary because pb does not add authentication or TLS.
+
 ## Local MoE inference
 
 **Shipped.** FlashMoe runs supported Qwen MoE families through one typed runtime, resident dense

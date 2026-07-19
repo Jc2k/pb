@@ -17,7 +17,11 @@ local config + Git notes ───┘
 
 Normal prompts are generated inside the pb process and sent to the selected local inference
 backend. Session events and workflow checkpoints are persisted into repository-local Git notes.
-The web UI is embedded in the binary and served by the local Rust process.
+The web UI is embedded in the binary and served by the local Rust process. The listener stays on
+loopback by default. When the user selects a non-loopback address, an installed service advertises
+the HTTP socket through launchd and Bonjour; a direct development server creates an equivalent
+native DNS-SD registration. That advertisement reveals the service's presence on the local network
+but does not send repository or task content by itself.
 
 Inference acceleration is local as well. llama.cpp keeps a live exact-prefix context during an
 agent run and stores byte-budgeted restartable state under the platform cache root. FlashMoe keeps

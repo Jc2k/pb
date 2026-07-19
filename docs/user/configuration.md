@@ -17,7 +17,7 @@ pb config set model.profile build
 
 The user configuration file is `<config-dir>/pb/config.toml`. It covers:
 
-- web listen address, port, and Unix socket path;
+- web listen address, port, Unix socket path, and the macOS work-queue sleep preference;
 - model identifier, directory, context, sampling, and resource defaults;
 - global MCP and LSP server definitions;
 - an optional separate personal-memory repository.
@@ -25,6 +25,51 @@ The user configuration file is `<config-dir>/pb/config.toml`. It covers:
 The web server binds to `127.0.0.1:8311` by default. Changing `web.listen` to `0.0.0.0` exposes the
 interface on available networks. pb does not add authentication or TLS merely because the address
 changed, so treat non-loopback binding as an explicit trust decision.
+
+## Keep macOS awake while pb works
+
+**Shipped.** On macOS, `web.prevent_sleep_while_working` defaults to `true`. While a queued session
+is actually running, the service uses the native IOKit power-management API to hold a
+`PreventUserIdleSystemSleep` assertion. It releases that assertion by ID when no queued work remains
+or when the active session pauses for a user answer, and reacquires it when processing resumes. No
+helper process is launched. The assertion does not prevent the display from turning off.
+
+Use **Settings → Prevent sleep while working** in the web interface to change the preference. A
+change takes effect immediately, including during an active task, and is then saved to the user
+configuration. The equivalent CLI commands are:
+
+```bash
+pb config set web.prevent_sleep_while_working true
+pb config set web.prevent_sleep_while_working false
+```
+
+## Wake a Mac by opening pb
+
+**Shipped.** An installed macOS service declares its configured HTTP listener as a
+[launchd socket](https://developer.apple.com/documentation/xpc/launch_activate_socket). launchd
+opens the socket before pb starts, publishes a network-visible listener as `_http._tcp` through
+Bonjour, and hands the descriptor to pb. A direct `pb serve` development process instead binds the
+address itself and uses the native DNS-SD API to publish the same Bonjour service. It does not need
+a LaunchAgent, so the web interface and Bonjour path remain testable during development.
+
+Loopback is deliberately not advertised. To opt into LAN access and wake-on-HTTP, expose the
+otherwise unauthenticated web server and refresh an installed service after changing its socket:
+
+```bash
+pb config set web.listen 0.0.0.0
+pb self refresh-service # omit this for a direct `pb serve`
+```
+
+Then enable macOS [**Wake for network access**](https://support.apple.com/en-gb/guide/mac-help/mh27905/mac)
+and open `http://<mac-hostname>.local:8311/` from another device on the local network. A different
+configured port replaces `8311` in both the launchd socket and URL.
+
+**Configurable host dependency.** pb registers the HTTP service with the macOS mechanisms that can
+participate in Wake on Demand; it cannot guarantee that a particular sleeping Mac will wake.
+Success still depends on supported network hardware, the macOS power setting, laptop lid and power
+state, and a reachable Bonjour Sleep Proxy when the client is on another subnet. Binding to
+`0.0.0.0` also exposes task history and controls without adding authentication or TLS, so use only a
+trusted network or put pb behind an authenticated proxy.
 
 ## Inference session cache
 
