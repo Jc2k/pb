@@ -109,10 +109,14 @@ default trust boundary because pb does not add authentication or TLS.
 ## Local MoE inference
 
 **Shipped.** FlashMoe runs supported Qwen MoE families through one typed runtime, resident dense
-weights, scheduler-owned positioned expert reads, reusable whole-expert slots, Metal command
-builders, and the operating-system page cache. Metal expert staging allocations use a separate
-bounded pool whose bytes are overwritten on every checkout; it is allocation reuse rather than an
-expert-identity cache and is drained under working-set pressure.
+weights, scheduler-owned whole-expert acquisition, and Metal command builders. Graph resolution uses
+parallel positioned reads, reusable whole-expert slots, and the operating-system page cache for
+large expert corpora. When a supported Qwen/GLM variant's complete fixed-slot expert corpus fits
+beneath the sampled Metal working-set limit with explicit transient/session headroom, it instead
+maps, prefaults, and retains the complete expert table for the graph lifetime. The mode never changes
+during inference and does not introduce a partial cache or eviction policy. Metal expert staging
+allocations use a separate bounded pool whose bytes are overwritten on every checkout; it is
+allocation reuse rather than an expert-identity cache and is drained under working-set pressure.
 
 **Configurable.** GLM-5.2 extends that runtime at typed boundaries. Pull accepts indexed MLX MXFP4
 or unindexed Colibri tensors through source adapters, normalizes either representation into pb's

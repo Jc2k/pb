@@ -71,6 +71,7 @@ pub enum FlashMoeStagePlacement {
     MetalWithCpuReduction,
     CpuDeclared,
     SchedulerIo,
+    SchedulerMemory,
     Sampler,
 }
 
@@ -82,6 +83,7 @@ impl FlashMoeStagePlacement {
             Self::MetalWithCpuReduction => "Metal with declared CPU reduction",
             Self::CpuDeclared => "declared CPU",
             Self::SchedulerIo => "scheduler I/O",
+            Self::SchedulerMemory => "scheduler memory",
             Self::Sampler => "sampler",
         }
     }
@@ -104,6 +106,7 @@ pub enum FlashMoeStageImplementation {
     CpuSigmoidNoAuxTopK,
     CpuDeepSeekV4HashOrNoAuxTopK,
     ParallelPositionedWholeExpertReads,
+    ResidentMappedWholeExpertSlots,
     MetalTypedExpertResidentSharedCombine,
     MetalDeepSeekV4Iq2Q2ExpertSharedCombine,
     MetalResidentLmHeadSampler,
@@ -139,6 +142,9 @@ impl FlashMoeStageImplementation {
             Self::ParallelPositionedWholeExpertReads => {
                 "parallel positioned reads into typed fixed Q4/BF16/F16 whole-expert slots"
             }
+            Self::ResidentMappedWholeExpertSlots => {
+                "complete resident mapped typed fixed Q4/BF16/F16 whole-expert slots"
+            }
             Self::MetalTypedExpertResidentSharedCombine => {
                 "Metal typed Q4/BF16/F16 active experts and resident Q4/BF16/F16/F32 shared/no-shared combine"
             }
@@ -158,6 +164,29 @@ pub(crate) enum FlashMoeAttentionMathCapability {
     GlmMlaCpuWeightAbsorption,
     GlmMlaMetalQ4AbsorbedAttention,
     DeepSeekV4HyperconnectionCompressedAttentionMetal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlashMoeExpertAccessCapability {
+    ParallelPositionedWholeExpertReads,
+    ResidentMappedWholeExpertSlots,
+}
+
+impl FlashMoeExpertAccessCapability {
+    fn stage(self) -> FlashMoeStageCapability {
+        match self {
+            Self::ParallelPositionedWholeExpertReads => FlashMoeStageCapability::new(
+                FlashMoeGraphStage::ActiveExpertReads,
+                FlashMoeStagePlacement::SchedulerIo,
+                FlashMoeStageImplementation::ParallelPositionedWholeExpertReads,
+            ),
+            Self::ResidentMappedWholeExpertSlots => FlashMoeStageCapability::new(
+                FlashMoeGraphStage::ActiveExpertReads,
+                FlashMoeStagePlacement::SchedulerMemory,
+                FlashMoeStageImplementation::ResidentMappedWholeExpertSlots,
+            ),
+        }
+    }
 }
 
 impl fmt::Display for FlashMoeStageImplementation {
@@ -255,6 +284,7 @@ impl FlashMoeCapabilityPlan {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_with_attention_math(
         layout: &QwenMoeModelLayout,
@@ -263,6 +293,29 @@ impl FlashMoeCapabilityPlan {
         expert_storage: ExpertStoreExecutionDescriptor,
         manifest_attention_layers: &[QwenMoeLayerKind],
         attention_math: FlashMoeAttentionMathCapability,
+        metal: Option<MetalRuntimeCapabilities>,
+    ) -> Result<Self, FlashMoeUnsupportedCapability> {
+        Self::resolve_with_attention_math_and_expert_access(
+            layout,
+            input_adapter,
+            dense_layout,
+            expert_storage,
+            manifest_attention_layers,
+            attention_math,
+            FlashMoeExpertAccessCapability::ParallelPositionedWholeExpertReads,
+            metal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_with_attention_math_and_expert_access(
+        layout: &QwenMoeModelLayout,
+        input_adapter: FlashMoeInputAdapterCapability,
+        dense_layout: ResidentDenseLayout,
+        expert_storage: ExpertStoreExecutionDescriptor,
+        manifest_attention_layers: &[QwenMoeLayerKind],
+        attention_math: FlashMoeAttentionMathCapability,
+        expert_access: FlashMoeExpertAccessCapability,
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         validate_upstream_execution_policy(layout)?;
@@ -277,6 +330,7 @@ impl FlashMoeCapabilityPlan {
                 expert_storage,
                 attention_layers,
                 attention_math,
+                expert_access,
                 metal,
             );
         }
@@ -288,6 +342,7 @@ impl FlashMoeCapabilityPlan {
             expert_storage,
             attention_layers,
             attention_math,
+            expert_access,
             metal,
         )
     }
@@ -301,6 +356,7 @@ impl FlashMoeCapabilityPlan {
         expert_storage: ExpertStoreExecutionDescriptor,
         attention_layers: Box<[QwenMoeLayerKind]>,
         attention_math: FlashMoeAttentionMathCapability,
+        expert_access: FlashMoeExpertAccessCapability,
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         if input_implementation != FlashMoeStageImplementation::DeepSeekV4TextInput
@@ -313,6 +369,13 @@ impl FlashMoeCapabilityPlan {
                 layout.family,
                 FlashMoeGraphStage::TokenPositionInputPreparation,
                 "DeepSeek V4 Flash requires its native text, hyperconnection/compressed-attention, and hash/noaux routing graph",
+            ));
+        }
+        if expert_access != FlashMoeExpertAccessCapability::ParallelPositionedWholeExpertReads {
+            return Err(FlashMoeUnsupportedCapability::new(
+                layout.family,
+                FlashMoeGraphStage::ActiveExpertReads,
+                "DeepSeek V4 request-scoped layer staging requires parallel positioned expert reads",
             ));
         }
         let expected_slot_spec = ExpertSlotSpec::from_model_layout(layout, expert_storage.layout)
@@ -381,11 +444,7 @@ impl FlashMoeCapabilityPlan {
                 FlashMoeStagePlacement::CpuDeclared,
                 FlashMoeStageImplementation::CpuDeepSeekV4HashOrNoAuxTopK,
             ),
-            FlashMoeStageCapability::new(
-                FlashMoeGraphStage::ActiveExpertReads,
-                FlashMoeStagePlacement::SchedulerIo,
-                FlashMoeStageImplementation::ParallelPositionedWholeExpertReads,
-            ),
+            expert_access.stage(),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
                 FlashMoeStagePlacement::Metal,
@@ -424,6 +483,7 @@ impl FlashMoeCapabilityPlan {
         expert_storage: ExpertStoreExecutionDescriptor,
         attention_layers: Box<[QwenMoeLayerKind]>,
         attention_math: FlashMoeAttentionMathCapability,
+        expert_access: FlashMoeExpertAccessCapability,
         metal: Option<MetalRuntimeCapabilities>,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         let expected_slot_spec = ExpertSlotSpec::from_model_layout(layout, expert_storage.layout)
@@ -708,11 +768,7 @@ impl FlashMoeCapabilityPlan {
                     }
                 },
             ),
-            FlashMoeStageCapability::new(
-                FlashMoeGraphStage::ActiveExpertReads,
-                FlashMoeStagePlacement::SchedulerIo,
-                FlashMoeStageImplementation::ParallelPositionedWholeExpertReads,
-            ),
+            expert_access.stage(),
             FlashMoeStageCapability::new(
                 FlashMoeGraphStage::Cmd3ExpertAndSharedCombine,
                 FlashMoeStagePlacement::Metal,
@@ -1536,6 +1592,31 @@ mod tests {
             missing_kernel
                 .reason
                 .contains(kernels::DENSE_MMAP_FMA_MATVEC_BF16)
+        );
+    }
+
+    #[test]
+    fn fitting_qwen_graph_resolves_resident_experts_as_scheduler_memory() {
+        let layout = qwen35_layout();
+        let plan = FlashMoeCapabilityPlan::resolve_with_attention_math_and_expert_access(
+            &layout,
+            text_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&layout),
+            &attention_layers(&layout),
+            FlashMoeAttentionMathCapability::QwenFullAttentionCpuKv,
+            FlashMoeExpertAccessCapability::ResidentMappedWholeExpertSlots,
+            Some(full_metal()),
+        )
+        .unwrap();
+        let expert_stage = plan.stage(FlashMoeGraphStage::ActiveExpertReads).unwrap();
+        assert_eq!(
+            expert_stage.implementation,
+            FlashMoeStageImplementation::ResidentMappedWholeExpertSlots
+        );
+        assert_eq!(
+            expert_stage.placement,
+            FlashMoeStagePlacement::SchedulerMemory
         );
     }
 

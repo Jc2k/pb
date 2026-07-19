@@ -30,13 +30,19 @@ architectural completion.
 - Q4-specific offsets, packing, and kernels are valid inside the shared graph. They must be selected
   through typed layouts and leave the scheduler, state lifecycle, and command topology unchanged.
 - PBQ4 is an import/build compatibility format, not a runtime execution layout.
-- Production expert execution consumes scheduler-owned reusable whole-expert slots.
-- Fixed whole-expert slots use page-aligned reusable backing. On Apple Silicon, scheduled CMD3
-  lazily binds one non-owning shared Metal buffer to each backing allocation and reuses that wrapper
-  whenever the identity-free slot returns from the scheduler pool. The submission retains the slot
-  lease through GPU completion, and the wrapper is released before its backing allocation;
-  non-aligned compatibility payloads use copied staging. This handoff does not retain expert
-  identity or introduce an application expert cache.
+- Production expert execution consumes scheduler-owned whole-expert slots. The resolved active-
+  expert stage selects either reusable streamed slots or a complete resident mapped slot table;
+  both retain the same scheduler layer lifecycle and CMD3 lease contract.
+- Streamed fixed whole-expert slots use page-aligned reusable backing. On Apple Silicon, scheduled
+  CMD3 lazily binds one non-owning shared Metal buffer to each backing allocation and reuses that
+  wrapper whenever the identity-free slot returns from the scheduler pool. The submission retains
+  the slot lease through GPU completion, and the wrapper is released before its backing allocation;
+  non-aligned compatibility payloads use copied staging.
+- Resident expert execution is valid only when graph resolution proves that the complete routed-
+  expert corpus fits beneath the Metal working-set limit after the dense graph plus an explicit
+  transient/session reserve. It maps and prefaults every fixed whole-expert slot, binds persistent
+  no-copy Metal wrappers during the load transaction, and retains those identity-bearing slots for
+  the graph lifetime. It never becomes a partial tier, LRU, eviction policy, or runtime fallback.
 - Direct component-buffer execution, upload-heavy reconstruction, and fused-to-unfused substitution
   are unsupported unless each is an explicitly resolved graph-stage implementation.
 - Reference CPU implementations belong in tests, diagnostics, and explicit development tools.
@@ -57,16 +63,18 @@ The Qwen3.5 Q4 implementation must preserve these upstream-shaped properties:
 - Non-expert weights live in one 64-byte-aligned binary blob, mapped once.
 - Experts are fixed records in per-layer files. The Qwen3.5-A17B Q4 record is 7,077,888 bytes with
   fixed gate/up/down packed-weight, scale, and bias offsets.
-- Active experts are issued in parallel with positioned reads into scheduler-owned reusable
-  whole-expert slots.
+- The Qwen3.5-A17B production profile issues active experts in parallel with positioned reads into
+  scheduler-owned reusable whole-expert slots. Smaller supported variants may instead resolve the
+  complete resident-slot implementation described below when its full corpus fits safely.
 - Page-aligned fixed slots are handed directly to Metal CMD3 under their scheduler leases. Their
   non-owning Metal wrappers follow backing-allocation lifetime rather than expert identity, avoiding
   repeated VM wrapper creation while preserving the same positioned-read and lease lifecycle.
   Copied staging remains the compatibility path for payloads that cannot satisfy Metal's no-copy
   memory contract.
-- The OS page cache is the expert cache. There is no application expert LRU, LZ4 main path, mmap
-  expert read path, broad prefetch, speculative read path, `dispatch_io`, or hidden scheduling
-  toggle.
+- For the streamed implementation, the OS page cache is the expert cache. There is no application
+  expert LRU, LZ4 main path, broad prefetch, speculative read path, `dispatch_io`, or hidden
+  scheduling toggle. The complete resident implementation is a distinct load-resolved graph stage,
+  not a cache layered over streaming.
 - A layer follows this topology:
   `CMD3(previous) -> CMD1 -> declared attention math -> CMD2 -> declared routing -> expert reads -> CMD3`.
 - CMD2 performs output projection, residual update, post-attention norm, router projection, and
@@ -79,6 +87,31 @@ The Qwen3.5 Q4 implementation must preserve these upstream-shaped properties:
 - Expert Q4 matvec uses the upstream FMA dequant form.
 - Throughput comparison uses sustained decode/generation throughput. TTFT and prefill are reported
   separately.
+
+## Resident Expert Extension Contract
+
+Status: **Shipped automatic graph implementation for fitting Qwen/GLM fixed-slot variants.**
+
+The active-expert stage may resolve `ResidentMappedWholeExpertSlots` instead of
+`ParallelPositionedWholeExpertReads`. Resolution happens once after the Metal executor has mapped
+the dense graph and sampled its resource ledger, but before the scheduled graph and scheduler are
+constructed. The resident decision uses the exact sparse-layer count, experts per layer, and fixed
+slot size from expert metadata. It requires the complete corpus plus a reserve of ten percent of the
+configured Metal working-set limit, with a one-GiB minimum, to fit above the device's current
+allocation. DeepSeek's request-scoped layer staging remains on its declared streamed implementation.
+
+Resident slots are private file-backed whole-slot mappings. Loading advises and touches every page,
+validates the same typed fixed-Q4/MXFP4/BF16/F16 payload used by the streamed path, and creates the
+persistent no-copy Metal wrapper before publishing the scheduler. A failure to map, prefault,
+validate, or bind any slot fails model loading; it does not re-resolve the graph to streaming. Once
+loaded, routing clones scheduler-owned slot leases from the complete table and records no positioned
+read bytes. CMD3 retains those leases through completion exactly as it does streamed reusable slots.
+
+Automatic resolution is intentionally binary. A corpus that does not fit uses the existing parallel
+positioned-read implementation and OS page cache. There is no partial resident tier, first-use cache,
+eviction, memory-pressure transition, or route-dependent fallback. This keeps graph behavior fixed,
+prevents the duplicate-cache failure mode measured on GLM-5.2, and leaves room for transient Metal
+buffers and request/session state.
 
 ## GLM-5.2 Extension Contract
 

@@ -8,7 +8,9 @@ use anyhow::{Context, Result, bail};
 use objc2::rc::autoreleasepool;
 use tracing::{debug, info, trace, trace_span};
 
-use super::capabilities::{FlashMoeAttentionMathCapability, FlashMoeCapabilityPlan};
+use super::capabilities::{
+    FlashMoeAttentionMathCapability, FlashMoeCapabilityPlan, FlashMoeExpertAccessCapability,
+};
 use super::deepseek::{DeepSeekV4Config, DeepSeekV4ExecutionGraph, is_deepseek_v4_flash};
 use super::deepseek_session::{
     DeepSeekV4CheckpointKind, DeepSeekV4SessionCheckpoint, DeepSeekV4SessionStore,
@@ -33,9 +35,36 @@ use super::weights::*;
 // layer-major prefill starts once it can fill one 32-row matrix tile. This is a
 // prompt-geometry calculation, never an error fallback.
 const DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS: usize = 32;
+const RESIDENT_EXPERT_MINIMUM_RESERVE_BYTES: usize = 1024 * 1024 * 1024;
+const RESIDENT_EXPERT_RESERVE_DIVISOR: usize = 10;
 
 fn deepseek_v4_uses_batch_prefill(tokens: usize) -> bool {
     tokens >= DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS
+}
+
+fn resolve_expert_access(
+    family: QwenMoeFamily,
+    expert_storage: super::experts::ExpertStoreExecutionDescriptor,
+    resources: Option<&FlashMoeMetalResourceSnapshot>,
+) -> Result<FlashMoeExpertAccessCapability> {
+    if family == QwenMoeFamily::DeepSeekV4Flash {
+        return Ok(FlashMoeExpertAccessCapability::ParallelPositionedWholeExpertReads);
+    }
+    let Some(resources) = resources else {
+        return Ok(FlashMoeExpertAccessCapability::ParallelPositionedWholeExpertReads);
+    };
+    let expert_bytes = expert_storage.total_expert_bytes()?;
+    let reserve = (resources.working_set_limit_bytes / RESIDENT_EXPERT_RESERVE_DIVISOR)
+        .max(RESIDENT_EXPERT_MINIMUM_RESERVE_BYTES);
+    let resident_capacity = resources
+        .working_set_limit_bytes
+        .saturating_sub(resources.current_allocated_bytes)
+        .saturating_sub(reserve);
+    if expert_bytes <= resident_capacity {
+        Ok(FlashMoeExpertAccessCapability::ResidentMappedWholeExpertSlots)
+    } else {
+        Ok(FlashMoeExpertAccessCapability::ParallelPositionedWholeExpertReads)
+    }
 }
 
 #[cfg(test)]
@@ -334,17 +363,39 @@ where
     } else {
         FlashMoeAttentionMathCapability::QwenFullAttentionCpuKv
     };
-    let capability_plan = FlashMoeCapabilityPlan::resolve_with_attention_math(
+    let resource_snapshot = metal.resource_snapshot();
+    let expert_access = resolve_expert_access(
+        model_layout.family,
+        expert_storage,
+        resource_snapshot.as_ref(),
+    )?;
+    tracing::info!(
+        model = %plan.model,
+        implementation = ?expert_access,
+        expert_bytes = expert_storage.total_expert_bytes()?,
+        working_set_limit_bytes = resource_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.working_set_limit_bytes),
+        current_allocated_bytes = resource_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.current_allocated_bytes),
+        "resolved FlashMoe expert access implementation"
+    );
+    let capability_plan = FlashMoeCapabilityPlan::resolve_with_attention_math_and_expert_access(
         &model_layout,
         input_adapter,
         dense_layout,
         expert_storage,
         &attention_layers,
         attention_math,
+        expert_access,
         Some(metal.runtime_capabilities()),
     )?;
     let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
-    let scheduler = FlashMoeExecutionScheduler::new(scheduled_graph, experts)?;
+    let scheduler =
+        FlashMoeExecutionScheduler::new_with_resident_binding(scheduled_graph, experts, |bytes| {
+            metal.prepare_resident_expert_backing(bytes)
+        })?;
     progress("capability_graph", phase_started.elapsed());
     phase_started = Instant::now();
     let tokenizer = QwenTokenizer::from_files(
@@ -424,6 +475,10 @@ fn generation_finish_reason(generated_tokens: usize, max_tokens: usize) -> Gener
 mod ownership_tests {
     use super::*;
     use crate::inference::flashmoe::deepseek::DEEPSEEK_V4_FLASH_MODEL;
+    use crate::inference::flashmoe::experts::{
+        DenseExpertDtype, ExpertSlotSpec, ExpertStorageLayout, ExpertStoreExecutionDescriptor,
+        FixedDenseExpertSlotSpec,
+    };
     use crate::inference::flashmoe::planning::plan_unchecked;
     use crate::inference::flashmoe::types::QWEN35_MODEL;
 
@@ -479,6 +534,59 @@ mod ownership_tests {
         assert_eq!(
             generation_finish_reason(0, 0),
             GenerationFinishReason::MaxTokens
+        );
+    }
+
+    fn small_expert_storage() -> ExpertStoreExecutionDescriptor {
+        let spec = FixedDenseExpertSlotSpec::new(DenseExpertDtype::Bf16, 2, 2).unwrap();
+        ExpertStoreExecutionDescriptor {
+            layout: ExpertStorageLayout::FixedBf16,
+            slot_spec: ExpertSlotSpec::FixedDense(spec),
+            layers: 2,
+            first_expert_layer: 0,
+            experts_per_layer: 4,
+        }
+    }
+
+    #[test]
+    fn expert_access_resolution_selects_only_complete_fitting_resident_corpora() {
+        let fitting = FlashMoeMetalResourceSnapshot {
+            working_set_limit_bytes: 8 * 1024 * 1024 * 1024,
+            current_allocated_bytes: 2 * 1024 * 1024 * 1024,
+            ..FlashMoeMetalResourceSnapshot::default()
+        };
+        assert_eq!(
+            resolve_expert_access(
+                QwenMoeFamily::Qwen3Moe,
+                small_expert_storage(),
+                Some(&fitting),
+            )
+            .unwrap(),
+            FlashMoeExpertAccessCapability::ResidentMappedWholeExpertSlots
+        );
+
+        let pressured = FlashMoeMetalResourceSnapshot {
+            working_set_limit_bytes: 8 * 1024 * 1024 * 1024,
+            current_allocated_bytes: 7 * 1024 * 1024 * 1024,
+            ..FlashMoeMetalResourceSnapshot::default()
+        };
+        assert_eq!(
+            resolve_expert_access(
+                QwenMoeFamily::Qwen3Moe,
+                small_expert_storage(),
+                Some(&pressured),
+            )
+            .unwrap(),
+            FlashMoeExpertAccessCapability::ParallelPositionedWholeExpertReads
+        );
+        assert_eq!(
+            resolve_expert_access(
+                QwenMoeFamily::DeepSeekV4Flash,
+                small_expert_storage(),
+                Some(&fitting),
+            )
+            .unwrap(),
+            FlashMoeExpertAccessCapability::ParallelPositionedWholeExpertReads
         );
     }
 
@@ -607,6 +715,32 @@ impl MetalExecutionFacade {
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             MetalRuntimeCapabilities::from_pipeline_names(MetalPipelineNameSet::new())
+        }
+    }
+
+    pub(super) fn resource_snapshot(&self) -> Option<FlashMoeMetalResourceSnapshot> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Some(self.inner.resource_snapshot())
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            None
+        }
+    }
+
+    pub(super) fn prepare_resident_expert_backing(
+        &self,
+        bytes: &super::experts::ReusableExpertBytes,
+    ) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.prepare_resident_expert_backing(bytes)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = bytes;
+            bail!("resident expert mappings require Apple Silicon Metal")
         }
     }
 

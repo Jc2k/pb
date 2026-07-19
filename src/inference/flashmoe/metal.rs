@@ -2020,6 +2020,27 @@ impl MetalExecutionContext {
         self.resources.snapshot()
     }
 
+    pub(crate) fn prepare_resident_expert_backing(
+        &self,
+        bytes: &ReusableExpertBytes,
+    ) -> anyhow::Result<()> {
+        let buffer = unsafe {
+            persistent_expert_source_buffer(
+                self.runtime.device,
+                bytes.as_slice(),
+                bytes,
+                self.buffers.as_ref(),
+            )?
+        };
+        if buffer.is_none() {
+            anyhow::bail!(
+                "resident expert backing is not page-aligned for a persistent no-copy Metal buffer: bytes={}",
+                bytes.len()
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish_token_boundary(&self, position: usize) -> anyhow::Result<()> {
         let current = unsafe { self.resources.sample_device(self.runtime.device, true) };
         let mut snapshot = self.resources.snapshot();

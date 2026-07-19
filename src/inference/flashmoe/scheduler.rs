@@ -36,6 +36,8 @@ const BATCH_EXPERT_READ_WORKERS: usize = 8;
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlashMoeScheduledGraph {
     family: QwenMoeFamily,
+    layers: usize,
+    first_expert_layer: usize,
     experts_per_layer: usize,
     active_experts: usize,
     expert_storage: ExpertStorageLayout,
@@ -64,6 +66,8 @@ impl FlashMoeScheduledGraph {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             family: capabilities.family,
+            layers: capabilities.expert_storage.layers,
+            first_expert_layer: capabilities.expert_storage.first_expert_layer,
             experts_per_layer: capabilities.experts_per_layer,
             active_experts: capabilities.active_experts,
             expert_storage: capabilities.expert_storage.layout,
@@ -85,6 +89,14 @@ impl FlashMoeScheduledGraph {
 
     pub fn experts_per_layer(&self) -> usize {
         self.experts_per_layer
+    }
+
+    pub(crate) fn layers(&self) -> usize {
+        self.layers
+    }
+
+    pub(crate) fn first_expert_layer(&self) -> usize {
+        self.first_expert_layer
     }
 
     pub fn active_experts(&self) -> usize {
@@ -130,7 +142,10 @@ impl FlashMoeScheduledGraph {
     }
 
     pub fn declares_scheduler_owned_expert_reads(&self) -> bool {
-        self.active_expert_reads().placement == FlashMoeStagePlacement::SchedulerIo
+        matches!(
+            self.active_expert_reads().placement,
+            FlashMoeStagePlacement::SchedulerIo | FlashMoeStagePlacement::SchedulerMemory
+        )
     }
 
     pub fn build_cmd2_post_attention(
@@ -418,7 +433,7 @@ impl FlashMoeScheduledGraph {
 #[derive(Debug)]
 pub(crate) struct FlashMoeExecutionScheduler {
     graph: FlashMoeScheduledGraph,
-    expert_reads: ScheduledExpertReadCoordinator,
+    expert_access: ScheduledExpertAccessCoordinator,
 }
 
 #[derive(Debug)]
@@ -428,23 +443,52 @@ pub(crate) struct PendingScheduledExpertLayerPrepare {
 }
 
 impl FlashMoeExecutionScheduler {
+    #[cfg(test)]
     pub(crate) fn new(
         graph: FlashMoeScheduledGraph,
         expert_store: ExpertSlotStore,
+    ) -> Result<Self> {
+        Self::new_with_resident_binding(graph, expert_store, |_| {
+            bail!("resident expert graph construction requires a Metal backing binder")
+        })
+    }
+
+    pub(crate) fn new_with_resident_binding(
+        graph: FlashMoeScheduledGraph,
+        expert_store: ExpertSlotStore,
+        mut bind_resident: impl FnMut(&ReusableExpertBytes) -> Result<()>,
     ) -> Result<Self> {
         if graph.attention_layers.is_empty() {
             bail!(
                 "FlashMoe execution scheduler requires a resolved attention implementation for every layer"
             );
         }
-        let expert_reads = ScheduledExpertReadCoordinator::new_with_routing_policy(
-            expert_store,
-            graph.routing_weight_normalization(),
-            graph.routed_expert_scale(),
-        );
+        let expert_access = match graph.active_expert_reads().implementation {
+            FlashMoeStageImplementation::ParallelPositionedWholeExpertReads => {
+                ScheduledExpertAccessCoordinator::Streamed(
+                    ScheduledExpertReadCoordinator::new_with_routing_policy(
+                        expert_store,
+                        graph.routing_weight_normalization(),
+                        graph.routed_expert_scale(),
+                    ),
+                )
+            }
+            FlashMoeStageImplementation::ResidentMappedWholeExpertSlots => {
+                ScheduledExpertAccessCoordinator::Resident(ScheduledResidentExpertTable::new(
+                    &graph,
+                    expert_store,
+                    &mut bind_resident,
+                )?)
+            }
+            implementation => {
+                bail!(
+                    "FlashMoe active-expert stage resolved unsupported scheduler implementation {implementation:?}"
+                )
+            }
+        };
         Ok(Self {
             graph,
-            expert_reads,
+            expert_access,
         })
     }
 
@@ -574,8 +618,8 @@ impl FlashMoeExecutionScheduler {
                 ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
             )?
             .command_from_preselected(routes)?;
-        let pending = self.expert_reads.issue_routing_command(&routing)?;
-        self.expert_reads.finish_routes(pending)
+        let pending = self.expert_access.issue_routing_command(&routing)?;
+        self.expert_access.finish_routes(pending)
     }
 
     /// Read the unique expert working set for one layer-major prefill batch.
@@ -623,7 +667,7 @@ impl FlashMoeExecutionScheduler {
         slot_stride: usize,
     ) -> Result<DirectExpertReadSummary> {
         self.validate_unique_expert_ids(layer, experts)?;
-        self.expert_reads.read_experts_into(
+        self.expert_access.read_experts_into(
             layer,
             experts,
             destination,
@@ -649,7 +693,7 @@ impl FlashMoeExecutionScheduler {
         Ok(PendingScheduledExpertLayerPrepare {
             layer,
             pending: unsafe {
-                self.expert_reads.issue_layer_prepare_into(
+                self.expert_access.issue_layer_prepare_into(
                     layer,
                     destination,
                     BATCH_EXPERT_READ_WORKERS,
@@ -669,7 +713,7 @@ impl FlashMoeExecutionScheduler {
                 pending.pending.layer()
             );
         }
-        let summary = self.expert_reads.finish_layer_prepare(pending.pending)?;
+        let summary = self.expert_access.finish_layer_prepare(pending.pending)?;
         if summary.layer != pending.layer {
             bail!(
                 "FlashMoe expert layer preparation completed layer {}, expected {}",
@@ -696,9 +740,9 @@ impl FlashMoeExecutionScheduler {
     }
 
     fn issue_cmd3(&mut self, routing: &ScheduledRoutingCommand) -> Result<PendingScheduledCmd3> {
-        let before = self.expert_reads.snapshot();
+        let before = self.expert_access.snapshot();
         let issue_started = Instant::now();
-        let pending = self.expert_reads.issue_routing_command(routing)?;
+        let pending = self.expert_access.issue_routing_command(routing)?;
         Ok(PendingScheduledCmd3 {
             before,
             pending,
@@ -722,10 +766,10 @@ impl FlashMoeExecutionScheduler {
         TShared: ScheduledSharedExpert,
     {
         let finish_started = Instant::now();
-        let scheduled = self.expert_reads.finish_routes(pending.pending)?;
+        let scheduled = self.expert_access.finish_routes(pending.pending)?;
         let expert_io_elapsed = pending.issue_elapsed + finish_started.elapsed();
         let expert_delta = self
-            .expert_reads
+            .expert_access
             .snapshot()
             .saturating_delta(pending.before);
         let expert_mixes = scheduled
@@ -754,7 +798,7 @@ impl FlashMoeExecutionScheduler {
     }
 
     pub(crate) fn snapshot(&self) -> ExpertSchedulerSnapshot {
-        self.expert_reads.snapshot()
+        self.expert_access.snapshot()
     }
 }
 
@@ -1041,7 +1085,7 @@ pub(crate) struct ScheduledLayerExecution<TSubmission> {
 #[derive(Debug)]
 pub(crate) struct PendingScheduledCmd3 {
     before: ExpertSchedulerSnapshot,
-    pending: PendingScheduledExpertSet<ExpertRawReadResponse>,
+    pending: PendingScheduledExpertAccess,
     issue_elapsed: Duration,
 }
 
@@ -3367,6 +3411,12 @@ pub(crate) struct PendingScheduledExpertSet<T> {
     reads: Vec<PendingScheduledRead<T>>,
 }
 
+#[derive(Debug)]
+pub(crate) enum PendingScheduledExpertAccess {
+    Streamed(PendingScheduledExpertSet<ExpertRawReadResponse>),
+    Resident(ScheduledExpertSet<Arc<ScheduledExpertSlot>>),
+}
+
 impl<T> fmt::Debug for PendingScheduledExpertSet<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PendingScheduledExpertSet")
@@ -3475,6 +3525,26 @@ impl ScheduledExpertSlot {
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
         hash
+    }
+
+    fn resident_backing(&self) -> Result<&ReusableExpertBytes> {
+        if self.raw.read_path != ExpertReadPath::ResidentMapped {
+            bail!(
+                "FlashMoe resident expert table received non-resident layer {} expert {} payload",
+                self.layer(),
+                self.expert()
+            );
+        }
+        match &self.raw.payload {
+            ExpertRawPayload::FixedQ4(payload) => Ok(&payload.bytes),
+            ExpertRawPayload::FixedDense(payload) => Ok(&payload.bytes),
+            ExpertRawPayload::Pbq4(_) => {
+                bail!("FlashMoe resident expert table cannot retain PBQ4 compatibility payloads")
+            }
+            ExpertRawPayload::FixedDeepSeekGguf(_) => bail!(
+                "FlashMoe resident expert table is not a declared DeepSeek graph implementation"
+            ),
+        }
     }
 }
 
@@ -3669,6 +3739,7 @@ impl ActiveExpertReadScheduler {
             ExpertReadPath::PositionedRead => {
                 self.metrics.record_positioned_read();
             }
+            ExpertReadPath::ResidentMapped => {}
         }
         self.metrics.record_read_latency(response.read_latency);
         self.metrics.record_bytes_read(response.bytes_read);
@@ -3755,6 +3826,194 @@ impl ActiveExpertReadScheduler {
 
     pub(crate) fn snapshot(&self) -> ExpertSchedulerSnapshot {
         self.metrics.snapshot()
+    }
+}
+
+#[derive(Debug)]
+struct ScheduledResidentExpertTable {
+    first_expert_layer: usize,
+    experts_per_layer: usize,
+    slots: Vec<Arc<ScheduledExpertSlot>>,
+    core: ActiveExpertReadScheduler,
+}
+
+impl ScheduledResidentExpertTable {
+    fn new(
+        graph: &FlashMoeScheduledGraph,
+        store: ExpertSlotStore,
+        bind_resident: &mut impl FnMut(&ReusableExpertBytes) -> Result<()>,
+    ) -> Result<Self> {
+        if graph.expert_storage == ExpertStorageLayout::FixedDeepSeekGguf {
+            bail!("DeepSeek expert storage has no resident mapped graph implementation");
+        }
+        let raw_slots = store.map_resident_slots(
+            graph.layers(),
+            graph.first_expert_layer(),
+            graph.experts_per_layer(),
+        )?;
+        let expected_slots = graph
+            .layers()
+            .checked_sub(graph.first_expert_layer())
+            .context("resident first expert layer exceeds scheduled graph layer count")?
+            .checked_mul(graph.experts_per_layer())
+            .context("resident scheduled expert slot count overflow")?;
+        if raw_slots.len() != expected_slots {
+            bail!(
+                "resident expert table prepared {} slots, expected {expected_slots}",
+                raw_slots.len()
+            );
+        }
+        let mut slots = Vec::with_capacity(raw_slots.len());
+        for raw in raw_slots {
+            let slot = ScheduledExpertSlot::from_raw(raw);
+            bind_resident(slot.resident_backing()?)?;
+            slots.push(Arc::new(slot));
+        }
+        Ok(Self {
+            first_expert_layer: graph.first_expert_layer(),
+            experts_per_layer: graph.experts_per_layer(),
+            slots,
+            core: ActiveExpertReadScheduler::new_with_routing_policy(
+                graph.routing_weight_normalization(),
+                graph.routed_expert_scale(),
+            ),
+        })
+    }
+
+    fn slot(&self, layer: usize, expert: usize) -> Result<Arc<ScheduledExpertSlot>> {
+        let relative_layer = layer
+            .checked_sub(self.first_expert_layer)
+            .with_context(|| {
+                format!(
+                    "resident expert layer {layer} precedes first sparse layer {}",
+                    self.first_expert_layer
+                )
+            })?;
+        if expert >= self.experts_per_layer {
+            bail!(
+                "resident expert {expert} is outside resolved count {} for layer {layer}",
+                self.experts_per_layer
+            );
+        }
+        let index = relative_layer
+            .checked_mul(self.experts_per_layer)
+            .and_then(|base| base.checked_add(expert))
+            .context("resident expert table index overflow")?;
+        self.slots
+            .get(index)
+            .cloned()
+            .with_context(|| format!("resident expert table has no layer {layer} expert {expert}"))
+    }
+
+    fn acquire(
+        &mut self,
+        command: &ScheduledRoutingCommand,
+    ) -> Result<ScheduledExpertSet<Arc<ScheduledExpertSlot>>> {
+        let routes = self.core.scheduled_routes_from_command(command)?;
+        let experts = routes
+            .routes
+            .iter()
+            .map(|route| self.slot(routes.layer, route.expert))
+            .collect::<Result<Vec<_>>>()?;
+        self.core
+            .finish_routes(routes, experts, |expert| (expert.layer(), expert.expert()))
+    }
+
+    fn snapshot(&self) -> ExpertSchedulerSnapshot {
+        self.core.snapshot()
+    }
+}
+
+#[derive(Debug)]
+enum ScheduledExpertAccessCoordinator {
+    Streamed(ScheduledExpertReadCoordinator),
+    Resident(ScheduledResidentExpertTable),
+}
+
+impl ScheduledExpertAccessCoordinator {
+    fn issue_routing_command(
+        &mut self,
+        command: &ScheduledRoutingCommand,
+    ) -> Result<PendingScheduledExpertAccess> {
+        match self {
+            Self::Streamed(coordinator) => Ok(PendingScheduledExpertAccess::Streamed(
+                coordinator.issue_routing_command(command)?,
+            )),
+            Self::Resident(table) => Ok(PendingScheduledExpertAccess::Resident(
+                table.acquire(command)?,
+            )),
+        }
+    }
+
+    fn finish_routes(
+        &mut self,
+        pending: PendingScheduledExpertAccess,
+    ) -> Result<ScheduledExpertSet<Arc<ScheduledExpertSlot>>> {
+        match (self, pending) {
+            (Self::Streamed(coordinator), PendingScheduledExpertAccess::Streamed(pending)) => {
+                coordinator.finish_routes(pending)
+            }
+            (Self::Resident(_), PendingScheduledExpertAccess::Resident(scheduled)) => Ok(scheduled),
+            (Self::Streamed(_), PendingScheduledExpertAccess::Resident(_)) => {
+                bail!("resident expert result reached the streamed graph implementation")
+            }
+            (Self::Resident(_), PendingScheduledExpertAccess::Streamed(_)) => {
+                bail!("streamed expert result reached the resident graph implementation")
+            }
+        }
+    }
+
+    fn read_experts_into(
+        &mut self,
+        layer: usize,
+        experts: &[usize],
+        destination: &mut [u8],
+        slot_stride: usize,
+        workers: usize,
+    ) -> Result<DirectExpertReadSummary> {
+        match self {
+            Self::Streamed(coordinator) => {
+                coordinator.read_experts_into(layer, experts, destination, slot_stride, workers)
+            }
+            Self::Resident(_) => bail!(
+                "request-scoped batch expert staging is not declared by the resident expert graph"
+            ),
+        }
+    }
+
+    unsafe fn issue_layer_prepare_into(
+        &self,
+        layer: usize,
+        destination: &mut [u8],
+        workers: usize,
+    ) -> Result<PendingExpertLayerPrepare> {
+        match self {
+            Self::Streamed(coordinator) => unsafe {
+                coordinator.issue_layer_prepare_into(layer, destination, workers)
+            },
+            Self::Resident(_) => {
+                bail!("whole-layer expert preparation is not declared by the resident expert graph")
+            }
+        }
+    }
+
+    fn finish_layer_prepare(
+        &self,
+        pending: PendingExpertLayerPrepare,
+    ) -> Result<ExpertLayerPrepareSummary> {
+        match self {
+            Self::Streamed(coordinator) => coordinator.finish_layer_prepare(pending),
+            Self::Resident(_) => {
+                bail!("whole-layer expert preparation completion reached the resident expert graph")
+            }
+        }
+    }
+
+    fn snapshot(&self) -> ExpertSchedulerSnapshot {
+        match self {
+            Self::Streamed(coordinator) => coordinator.snapshot(),
+            Self::Resident(table) => table.snapshot(),
+        }
     }
 }
 
@@ -4889,7 +5148,7 @@ mod tests {
         .unwrap();
         let transaction = PendingScheduledCmd3 {
             before: scheduler.snapshot(),
-            pending,
+            pending: PendingScheduledExpertAccess::Streamed(pending),
             issue_elapsed: Duration::from_millis(1),
         };
         let shared = dummy_shared_expert_with_shape(
@@ -8441,6 +8700,77 @@ mod tests {
             .read_unique_experts_into(0, &[3, 1], &mut destination, stride)
             .unwrap_err();
         assert!(descending.to_string().contains("sorted and unique"));
+    }
+
+    #[test]
+    fn execution_scheduler_resident_graph_maps_complete_table_without_positioned_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        write_identity_fixed_dense_layer(temp.path(), 0, 1, DenseExpertDtype::Bf16);
+        let spec = FixedDenseExpertSlotSpec::new(DenseExpertDtype::Bf16, 2, 2).unwrap();
+        let store =
+            ExpertSlotStore::open_with_fixed_dense(temp.path().to_path_buf(), spec).unwrap();
+
+        let mut layout = qwen35_layout();
+        layout.layers = 1;
+        let mut capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+        capabilities.expert_storage = ExpertStoreExecutionDescriptor {
+            layout: ExpertStorageLayout::FixedBf16,
+            slot_spec: ExpertSlotSpec::FixedDense(spec),
+            layers: 1,
+            first_expert_layer: 0,
+            experts_per_layer: 1,
+        };
+        capabilities.experts_per_layer = 1;
+        capabilities.active_experts = 1;
+        let stage = capabilities
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::ActiveExpertReads)
+            .unwrap();
+        stage.placement = FlashMoeStagePlacement::SchedulerMemory;
+        stage.implementation = FlashMoeStageImplementation::ResidentMappedWholeExpertSlots;
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+
+        let mut bound = 0usize;
+        let mut scheduler =
+            FlashMoeExecutionScheduler::new_with_resident_binding(graph, store, |bytes| {
+                bound += 1;
+                assert_eq!(bytes.len(), spec.expert_bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(bound, 1);
+
+        let routing = scheduler
+            .graph
+            .build_routing_topk(
+                0,
+                1,
+                1,
+                ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+            )
+            .unwrap()
+            .command_from_preselected(&[(0, 1.0)])
+            .unwrap();
+        let first = scheduler
+            .expert_access
+            .issue_routing_command(&routing)
+            .unwrap();
+        let first = scheduler.expert_access.finish_routes(first).unwrap();
+        let second = scheduler
+            .expert_access
+            .issue_routing_command(&routing)
+            .unwrap();
+        let second = scheduler.expert_access.finish_routes(second).unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert!(Arc::ptr_eq(&first.experts[0], &second.experts[0]));
+        assert_eq!(
+            first.experts[0].raw.read_path,
+            ExpertReadPath::ResidentMapped
+        );
+        assert_eq!(scheduler.snapshot().positioned_reads, 0);
+        assert_eq!(scheduler.snapshot().bytes_read, 0);
     }
 
     #[test]

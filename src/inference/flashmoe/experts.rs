@@ -76,6 +76,35 @@ impl ReusableExpertBytes {
         })
     }
 
+    fn resident_file_slot(file: &fs::File, offset: u64, len: usize) -> Result<Self> {
+        if len == 0 {
+            bail!("resident expert slot cannot be empty");
+        }
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(offset)
+                .len(len)
+                .map_copy(file)
+        }
+        .with_context(|| {
+            format!("failed to map resident expert slot at offset {offset} with length {len}")
+        })?;
+        mmap.advise(memmap2::Advice::WillNeed)
+            .context("failed to advise resident expert slot pages")?;
+        let mut checksum = 0u8;
+        for byte in mmap.iter().step_by(4096) {
+            checksum ^= *byte;
+        }
+        checksum ^= mmap[len - 1];
+        std::hint::black_box(checksum);
+        Ok(Self {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            attachment: OnceLock::new(),
+            backing: ReusableExpertBytesBacking::PageAligned(mmap),
+            len,
+        })
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         match &self.backing {
             ReusableExpertBytesBacking::Heap(bytes) => &bytes[..self.len],
@@ -215,6 +244,7 @@ impl std::ops::Deref for ReusableExpertBytes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpertReadPath {
     PositionedRead,
+    ResidentMapped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2577,6 +2607,17 @@ pub(crate) struct ExpertStoreExecutionDescriptor {
     pub(crate) experts_per_layer: usize,
 }
 
+impl ExpertStoreExecutionDescriptor {
+    pub(crate) fn total_expert_bytes(self) -> Result<usize> {
+        self.layers
+            .checked_sub(self.first_expert_layer)
+            .context("first expert layer exceeds resolved layer count")?
+            .checked_mul(self.experts_per_layer)
+            .and_then(|slots| slots.checked_mul(self.slot_spec.expert_bytes()))
+            .context("resolved expert corpus byte length overflow")
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ResolvedExpertSlotStore {
     pub(crate) store: ExpertSlotStore,
@@ -3111,6 +3152,28 @@ impl ExpertSlotStore {
             .read_unique_into(experts, destination, slot_stride, workers)
     }
 
+    pub(crate) fn map_resident_slots(
+        &self,
+        layers: usize,
+        first_expert_layer: usize,
+        experts_per_layer: usize,
+    ) -> Result<Vec<ExpertRawRead>> {
+        let slot_count = layers
+            .checked_sub(first_expert_layer)
+            .context("resident first expert layer exceeds layer count")?
+            .checked_mul(experts_per_layer)
+            .context("resident expert slot count overflow")?;
+        let mut slots = Vec::with_capacity(slot_count);
+        for layer in first_expert_layer..layers {
+            let reader = self.layer_reader(layer)?;
+            for expert in 0..experts_per_layer {
+                let plan = reader.prepare_read(expert)?;
+                slots.push(reader.map_prepared_resident(expert, plan)?);
+            }
+        }
+        Ok(slots)
+    }
+
     pub(crate) unsafe fn issue_layer_prepare_into(
         &self,
         layer: usize,
@@ -3322,11 +3385,73 @@ impl ExpertLayerReader {
             )
         })?;
         let read_latency = read_started.elapsed();
-        let slot =
-            scratch.slot_view(self.metadata.layer, expert, plan.offset, plan.slot_capacity)?;
+        self.finish_whole_slot(
+            expert,
+            &plan,
+            scratch.take_payload(),
+            Some(Arc::clone(&self.buffer_pool)),
+            read_latency,
+            FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+        )
+    }
+
+    fn map_prepared_resident(&self, expert: usize, plan: ExpertReadPlan) -> Result<ExpertRawRead> {
+        if plan.packed_len != plan.slot_capacity {
+            bail!(
+                "resident expert {}/{} requires one complete fixed slot, packed={} capacity={}",
+                self.metadata.layer,
+                expert,
+                plan.packed_len,
+                plan.slot_capacity
+            );
+        }
+        let started = Instant::now();
+        let bytes =
+            ReusableExpertBytes::resident_file_slot(&self.file, plan.offset, plan.slot_capacity)
+                .with_context(|| {
+                    format!(
+                        "failed to prepare resident expert {}/{} from {}",
+                        self.metadata.layer,
+                        expert,
+                        self.path.display()
+                    )
+                })?;
+        self.finish_whole_slot(
+            expert,
+            &plan,
+            bytes,
+            None,
+            started.elapsed(),
+            ExpertReadPath::ResidentMapped,
+        )
+    }
+
+    fn finish_whole_slot(
+        &self,
+        expert: usize,
+        plan: &ExpertReadPlan,
+        bytes: ReusableExpertBytes,
+        recycle_pool: Option<ReusableExpertBytePool>,
+        read_latency: Duration,
+        read_path: ExpertReadPath,
+    ) -> Result<ExpertRawRead> {
+        let slot = ExpertSlotView::new(
+            self.metadata.layer,
+            expert,
+            plan.offset,
+            plan.slot_capacity,
+            bytes.as_slice(),
+        )?;
         let descriptor = slot.descriptor();
         let payload = if slot.payload().starts_with(PBQ4_EXPERT_MAGIC) {
-            ExpertRawPayload::Pbq4(scratch.take_payload().into_vec())
+            if read_path == ExpertReadPath::ResidentMapped {
+                bail!(
+                    "resident expert {}/{} contains PBQ4 compatibility data instead of a resolved fixed slot",
+                    self.metadata.layer,
+                    expert
+                );
+            }
+            ExpertRawPayload::Pbq4(bytes.into_vec())
         } else {
             match self.slot_spec {
                 ExpertSlotSpec::FixedQ4(spec) => {
@@ -3338,23 +3463,15 @@ impl ExpertLayerReader {
                     })?;
                     ExpertRawPayload::FixedQ4(FixedQ4ExpertPayload::from_reusable_whole_slot(
                         spec,
-                        scratch.take_payload(),
-                        Some(Arc::clone(&self.buffer_pool)),
+                        bytes,
+                        recycle_pool,
                     )?)
                 }
-                ExpertSlotSpec::FixedDense(spec) => {
-                    ExpertRawPayload::FixedDense(FixedDenseExpertPayload::from_reusable_whole_slot(
-                        spec,
-                        scratch.take_payload(),
-                        Some(Arc::clone(&self.buffer_pool)),
-                    )?)
-                }
+                ExpertSlotSpec::FixedDense(spec) => ExpertRawPayload::FixedDense(
+                    FixedDenseExpertPayload::from_reusable_whole_slot(spec, bytes, recycle_pool)?,
+                ),
                 ExpertSlotSpec::FixedDeepSeekGguf(spec) => ExpertRawPayload::FixedDeepSeekGguf(
-                    DeepSeekGgufExpertPayload::from_reusable_whole_slot(
-                        spec,
-                        scratch.take_payload(),
-                        Some(Arc::clone(&self.buffer_pool)),
-                    )?,
+                    DeepSeekGgufExpertPayload::from_reusable_whole_slot(spec, bytes, recycle_pool)?,
                 ),
             }
         };
@@ -3363,10 +3480,10 @@ impl ExpertLayerReader {
             expert,
             slot: descriptor,
             #[cfg(test)]
-            metadata: plan.metadata,
+            metadata: plan.metadata.clone(),
             payload,
             read_latency,
-            read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
+            read_path,
         })
     }
 

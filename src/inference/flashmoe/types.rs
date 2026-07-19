@@ -308,7 +308,7 @@ pub struct TimedGenerationOutput {
     pub timing: FlashMoeGenerationTiming,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FlashMoeMetalResourceSnapshot {
     pub recommended_working_set_bytes: usize,
     pub working_set_limit_bytes: usize,
