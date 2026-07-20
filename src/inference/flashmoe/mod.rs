@@ -5,6 +5,7 @@
 
 mod cache;
 mod capabilities;
+mod constraints;
 mod deepseek;
 mod deepseek_metal;
 mod deepseek_session;

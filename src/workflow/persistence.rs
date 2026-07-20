@@ -66,6 +66,7 @@ impl WorkflowCheckpoint {
                 READY_EVIDENCE_SCHEMA_VERSION
             );
         }
+        self.run.stage_evidence.validate()?;
         match &self.run.ready_evidence {
             Some(_) if self.run.ready_evidence_schema == 0 => {
                 bail!("legacy workflow checkpoint cannot contain current ready evidence");

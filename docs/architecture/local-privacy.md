@@ -18,6 +18,10 @@ local config + Git notes ───┘
 Normal prompts are generated inside the pb process and sent to the selected local inference
 backend. Session events, workflow checkpoints, and durable Goal checkpoints are persisted into
 repository-local Git notes.
+Workflow checkpoints may include a bounded bundle of exact bytes from complete small-file reads,
+together with their local path/content hashes and provenance. The bundle remains local session
+evidence, is revalidated before reuse, and follows the same session-deletion lifecycle; it is not
+model memory or a new network edge.
 The web UI is embedded in the binary and served by the local Rust process. The listener stays on
 loopback by default. When the user selects a non-loopback address, an installed service advertises
 the HTTP socket through launchd and Bonjour; a direct development server creates an equivalent

@@ -2,6 +2,7 @@ mod artifacts;
 mod capabilities;
 mod config;
 mod engine;
+mod evidence;
 mod persistence;
 mod publication;
 
@@ -9,6 +10,7 @@ pub use artifacts::*;
 pub use capabilities::*;
 pub use config::*;
 pub use engine::*;
+pub use evidence::*;
 pub use persistence::*;
 pub use publication::*;
 

@@ -43,6 +43,12 @@ A review profile receives focused evidence in a fresh context and either accepts
 returns actionable findings. Rejection returns the workflow to bounded plan revision. The reviewer
 does not inherit mutation authority.
 
+The workflow checkpoint carries a byte-bounded bundle of complete small-file reads between stages.
+pb records the exact bytes, path/content hashes, source stage and normalized read arguments; it
+revalidates every path before injecting the bundle or seeding the new stage's observed-read ledger.
+A changed or oversized/partial file therefore still requires a fresh read. Model conclusions and
+TODO prose are never promoted as evidence.
+
 ### 3. Implementation
 
 The build profile receives the accepted plan and mutation capabilities. It can use built-in edits,
@@ -139,6 +145,8 @@ its milestone, avoiding two canonical copies of workflow state.
 
 Tool schemas are derived from this matrix for every stage. A request-level allowlist and project
 policy can narrow the set further. Neither can broaden it.
+Strict stages do not expose the legacy conversational `todo` tool: the accepted plan, typed stage
+artifacts and checkpoint already own durable progress.
 
 ## Freshness is part of correctness
 
@@ -180,9 +188,12 @@ That boundary is per model completion, not one tool invocation per prompt. Nativ
 output may contain multiple calls, and the JSON compatibility protocol has an equivalent
 `tool_calls` batch. pb validates every call against the same stage, allowlist, schema, policy, and
 progress gates. Independent parallel-safe calls run concurrently and all authoritative results are
-returned before the next model pass; order-dependent calls remain sequential, and a workflow or
-delivery transition must be the only call in its batch. The prompt explicitly encourages batching
-independent discovery reads and lookups so local inference is not spent on unnecessary round trips.
+returned before the next model pass; a batch containing same-path read/write dependencies, a check
+mixed with a mutation, or opaque `run_command` dependencies is rejected atomically, and a workflow
+or delivery transition must be the only call in its batch. The prompt explicitly encourages
+batching independent discovery reads and lookups so local inference is not spent on unnecessary
+round trips. Batch events record call, parallel-safe, useful, bookkeeping-only, and dependency-
+rejection counts.
 If a max-token native completion contains complete early calls followed by an incomplete call, pb
 rejects the entire batch before execution and invokes the bounded truncation recovery. A complete
 administrative call therefore cannot mask or partially commit an oversized file mutation.
@@ -196,6 +207,11 @@ Implementation guidance gives symmetric concrete actions for missing and existin
 paths use `write_file`; existing paths use a separate `read_file` turn followed by
 `replace_file`, `edit_file`, or `apply_patch`. An attempted overwrite keeps failing closed but now
 returns that exact recovery sequence instead of a generic suggestion.
+Strict implementation schemas also derive a conservative mutation-string `maxLength` from the
+turn's generated-token cap after reserving native-envelope and closing overhead. The same bound is
+enforced again by recursive executor-side schema validation and appears in the stage anchor and
+invocation telemetry. Larger files are built from complete, loadable, atomic work units rather than
+partial JSON or partial filesystem writes.
 
 Local command failures retain their exit status and bounded stdout/stderr in structured tool
 feedback. Output redirected from stderr to stdout is still preserved. A failed command therefore
@@ -226,6 +242,14 @@ call in the transcript, and reports the normalization in the tool result. It doe
 complete, recursively decode, or invent artifact values. Prose, partial JSON, arrays, and any other
 ambiguous object are not coerced. Stage prompts prefer native function calls but also state the
 exact compatibility action shape for model runtimes that cannot emit them.
+
+The preferred terminal wire form is flat (`id` beside the artifact fields) and omits fields with
+safe empty defaults. pb reconstructs and validates the same durable `ArtifactEnvelope`; the older
+nested artifact object remains a bounded compatibility form and produces the same artifact digest.
+For native Qwen FlashMoe stages, generation-time constraints compile the actually exposed tool
+names and supported JSON-schema subset before inference. Terminal-only turns require their single
+terminal tool. Candidate filtering cannot grant authority or replace executor validation, and an
+unsupported schema fails preflight rather than silently disabling constraints.
 
 Implementation and repair turns keep their edit tools after a rejected prose final. They are not
 narrowed to `submit_implementation` before the model has had another chance to make the repository

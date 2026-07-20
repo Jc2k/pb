@@ -146,7 +146,15 @@ Qwen3-Coder-Next retains its checkpoint top-10 routing and hybrid attention sche
 non-thinking model, so pb disables thinking for both prompt measurement and generation rather than
 spending the output budget on unsupported reasoning markers. It can return several independent
 native tool calls in one assistant turn; pb validates the full batch and runs parallel-safe calls
-together before asking the model again. An explicit Qwen GGUF path continues to use llama.cpp.
+together before asking the model again. Strict native stages constrain function names and the
+supported argument-schema subset while tokens are sampled, then validate the completed call again
+at the executor boundary. Long fresh Qwen prompts are processed in resource-resolved chunks of up
+to 64 tokens so autorelease and Metal resource accounting occur at a bounded batch boundary; the
+inner token graph remains numerically identical to the scalar path while the separate layer-major
+prefill promotion gate remains open. An explicit Qwen GGUF URI continues to use llama.cpp. pb
+discovers GGUF files below the pulled model's cache directory, including Hugging Face variant
+subdirectories, and selects shard 1 for a split checkpoint; it does not mistake a larger later
+shard or `mmproj` file for the model entry point.
 Once a native FlashMoe source has been selected, a cache or graph-load failure is reported directly
 instead of silently running a different backend.
 

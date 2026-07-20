@@ -6078,7 +6078,7 @@ impl DenseStore {
         )?;
 
         let vocab_rows = tokenizer.vocab_size();
-        let top_k = sampler.top_k.min(vocab_rows).max(1);
+        let top_k = sampler.candidate_limit().min(vocab_rows).max(1);
         let repeated = sampler.repeated_tokens(prompt, generated);
         let repeated_vocab_tokens = repeated.iter().filter(|token| **token < vocab_rows).count();
         let raw_candidate_count = top_k

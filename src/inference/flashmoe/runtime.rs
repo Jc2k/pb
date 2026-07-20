@@ -11,6 +11,7 @@ use tracing::{debug, info, trace, trace_span};
 use super::capabilities::{
     FlashMoeAttentionMathCapability, FlashMoeCapabilityPlan, FlashMoeExpertAccessCapability,
 };
+use super::constraints::NativeToolConstraint;
 use super::deepseek::{DeepSeekV4Config, DeepSeekV4ExecutionGraph, is_deepseek_v4_flash};
 use super::deepseek_session::{
     DeepSeekV4CheckpointKind, DeepSeekV4SessionCheckpoint, DeepSeekV4SessionStore,
@@ -35,11 +36,38 @@ use super::weights::*;
 // layer-major prefill starts once it can fill one 32-row matrix tile. This is a
 // prompt-geometry calculation, never an error fallback.
 const DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS: usize = 32;
+const QWEN_BATCH_PREFILL_MIN_TOKENS: usize = 32;
+const QWEN_BATCH_PREFILL_MAX_CHUNK_TOKENS: usize = 64;
 const RESIDENT_EXPERT_MINIMUM_RESERVE_BYTES: usize = 1024 * 1024 * 1024;
 const RESIDENT_EXPERT_RESERVE_DIVISOR: usize = 10;
 
 fn deepseek_v4_uses_batch_prefill(tokens: usize) -> bool {
     tokens >= DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS
+}
+
+fn qwen_prefill_chunk_tokens(
+    family: QwenMoeFamily,
+    tokens: usize,
+    resources: Option<&FlashMoeMetalResourceSnapshot>,
+) -> Option<usize> {
+    if family == QwenMoeFamily::DeepSeekV4Flash || tokens < QWEN_BATCH_PREFILL_MIN_TOKENS {
+        return None;
+    }
+    let resource_bound = resources.map_or(QWEN_BATCH_PREFILL_MAX_CHUNK_TOKENS, |snapshot| {
+        let available = snapshot
+            .working_set_limit_bytes
+            .saturating_sub(snapshot.current_allocated_bytes);
+        if available < 512 * 1024 * 1024 {
+            QWEN_BATCH_PREFILL_MIN_TOKENS
+        } else {
+            QWEN_BATCH_PREFILL_MAX_CHUNK_TOKENS
+        }
+    });
+    Some(
+        tokens
+            .min(resource_bound)
+            .max(QWEN_BATCH_PREFILL_MIN_TOKENS),
+    )
 }
 
 fn resolve_expert_access(
@@ -79,6 +107,26 @@ mod deepseek_prefill_tests {
         assert!(deepseek_v4_uses_batch_prefill(
             DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS
         ));
+    }
+
+    #[test]
+    fn qwen_batch_chunk_selection_is_geometry_and_resource_resolved() {
+        assert_eq!(
+            qwen_prefill_chunk_tokens(QwenMoeFamily::Qwen3NextMoe, 31, None),
+            None
+        );
+        assert_eq!(
+            qwen_prefill_chunk_tokens(QwenMoeFamily::Qwen3NextMoe, 32, None),
+            Some(32)
+        );
+        assert_eq!(
+            qwen_prefill_chunk_tokens(QwenMoeFamily::Qwen3NextMoe, 4_354, None),
+            Some(64)
+        );
+        assert_eq!(
+            qwen_prefill_chunk_tokens(QwenMoeFamily::DeepSeekV4Flash, 4_354, None),
+            None
+        );
     }
 }
 
@@ -194,6 +242,7 @@ pub struct FlashMoeEngine {
     pub(super) config: QwenModelConfig,
     pub(super) model_layout: QwenMoeModelLayout,
     pub(super) routing_policy: ResolvedRoutingPolicy,
+    pub(super) expert_access: FlashMoeExpertAccessCapability,
     pub(super) runtime: DenseTransformerRuntime,
     pub(super) deepseek_graph: Option<Arc<DeepSeekV4ExecutionGraph>>,
     pub(super) linear_attention_weights: LinearAttentionWeightTable,
@@ -443,6 +492,7 @@ where
         config,
         model_layout,
         routing_policy,
+        expert_access,
         runtime,
         deepseek_graph,
         linear_attention_weights,
@@ -495,6 +545,19 @@ fn generation_finish_reason(generated_tokens: usize, max_tokens: usize) -> Gener
         GenerationFinishReason::EndOfGeneration
     } else {
         GenerationFinishReason::MaxTokens
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn tokens_per_second(tokens: usize, duration: Duration) -> f64 {
+    let seconds = duration.as_secs_f64();
+    if tokens == 0 || seconds <= f64::EPSILON {
+        0.0
+    } else {
+        tokens as f64 / seconds
     }
 }
 
@@ -2578,6 +2641,11 @@ impl FlashMoeEngine {
         &self,
         request: &StructuredGenerationRequest,
     ) -> Result<(String, Vec<u32>)> {
+        if self.deepseek_graph.is_none() {
+            // Compile during preflight as well as generation so unsupported schema features
+            // fail before any model work or durable invocation accounting begins.
+            let _ = NativeToolConstraint::compile(request.tool_constraint_mode, &request.tools)?;
+        }
         if !request.raw_prompt {
             return self.tokenizer.render_and_encode_chat_prompt(
                 &request.messages,
@@ -2850,6 +2918,11 @@ impl FlashMoeEngine {
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let encode_elapsed = encode_started.elapsed();
         let deepseek_v4 = self.deepseek_graph.is_some();
+        let mut tool_constraint = if deepseek_v4 {
+            None
+        } else {
+            NativeToolConstraint::compile(request.tool_constraint_mode, &request.tools)?
+        };
         let deepseek_stable_prefix_len = if deepseek_v4 {
             self.deepseek_stable_prompt_prefix_len(request, &prompt_tokens)?
         } else {
@@ -3139,7 +3212,11 @@ impl FlashMoeEngine {
             generation.capture_prompt_cache(prefill_hidden.clone(), recurrent);
         }
 
+        let prefill_wall = prefill_or_ttft_started.elapsed();
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
+        if tool_constraint.is_some() {
+            sampler.widen_candidates(128);
+        }
         if generation.should_sample_first() {
             let sample_started = Instant::now();
             report_generation_progress(&progress, || "first-token sampling begin".to_string());
@@ -3153,6 +3230,7 @@ impl FlashMoeEngine {
                     generated,
                     request.trace_candidates,
                     &progress,
+                    tool_constraint.as_mut(),
                 )?
             };
             report_generation_progress(&progress, || {
@@ -3219,6 +3297,7 @@ impl FlashMoeEngine {
                     detailed,
                     request.trace_candidates,
                     progress.clone(),
+                    tool_constraint.as_mut(),
                 )?
             };
             let token = sampled.token;
@@ -3279,6 +3358,57 @@ impl FlashMoeEngine {
             &decoded,
             finish_reason == GenerationFinishReason::MaxTokens,
         )?;
+        let tool_constraints =
+            tool_constraint
+                .as_ref()
+                .map(|constraint| NativeToolConstraintStats {
+                    mode: constraint.mode(),
+                    schema_sha256: constraint.schema_sha256().to_string(),
+                    rejected_candidates: constraint.rejected_candidates(),
+                    terminal_state: constraint.terminal_state(&decoded).to_string(),
+                });
+        let performance = NativeGenerationStats {
+            fresh_prefill_tokens: prompt_len.saturating_sub(prefill_start),
+            cached_tokens: prefill_start,
+            prefill_wall_ms: duration_millis(prefill_wall),
+            prefill_tokens_per_second: tokens_per_second(
+                prompt_len.saturating_sub(prefill_start),
+                prefill_wall,
+            ),
+            decode_tokens,
+            decode_wall_ms: duration_millis(decode_wall),
+            decode_tokens_per_second: tokens_per_second(decode_tokens, decode_wall),
+            model_family: format!("{:?}", self.model_layout.family),
+            active_experts_per_token: nonzero_usize(self.model_layout.scheduled_active_experts),
+            expert_strategy: match self.expert_access {
+                FlashMoeExpertAccessCapability::ParallelPositionedWholeExpertReads => {
+                    "streamed_parallel_pread"
+                }
+                FlashMoeExpertAccessCapability::ResidentMappedWholeExpertSlots => {
+                    "resident_complete_corpus"
+                }
+            }
+            .to_string(),
+            prefill_command_kind: if prefill_start == prompt_len {
+                "cache_only"
+            } else if deepseek_v4
+                && deepseek_v4_uses_batch_prefill(prompt_len.saturating_sub(prefill_start))
+            {
+                "deepseek_layer_major_batch"
+            } else if qwen_prefill_chunk_tokens(
+                self.model_layout.family,
+                prompt_len.saturating_sub(prefill_start),
+                self.metal_resource_snapshot().as_ref(),
+            )
+            .is_some()
+            {
+                "qwen_chunked_token_batch"
+            } else {
+                "scalar_token"
+            }
+            .to_string(),
+            thinking_enabled: request.enable_thinking && self.supports_thinking(),
+        };
         let output = GenerationOutput {
             content,
             tool_calls,
@@ -3291,6 +3421,8 @@ impl FlashMoeEngine {
                 prefilled_tokens: prompt_len.saturating_sub(prefill_start),
                 restore_ms: prompt_cache_restore_ms,
             },
+            tool_constraints,
+            performance,
         };
         let total_wall = generation_started.elapsed();
         info!(
@@ -3380,6 +3512,21 @@ impl FlashMoeEngine {
             }
             return Ok(hidden);
         }
+        if let Some(chunk_tokens) = qwen_prefill_chunk_tokens(
+            self.model_layout.family,
+            batch_tokens,
+            self.metal_resource_snapshot().as_ref(),
+        ) {
+            return self.prefill_qwen_chunks(
+                prompt_tokens,
+                start_position,
+                end_position,
+                chunk_tokens,
+                kv_cache,
+                timing,
+                progress,
+            );
+        }
         let mut last_hidden = None;
         let report_prefill_progress = progress.is_some()
             || tracing::enabled!(target: "flashmoe::lifecycle", tracing::Level::DEBUG);
@@ -3449,6 +3596,90 @@ impl FlashMoeEngine {
             }
         }
         last_hidden.context("cannot generate from an empty prompt")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_qwen_chunks(
+        &mut self,
+        prompt_tokens: &[u32],
+        start_position: usize,
+        end_position: usize,
+        chunk_tokens: usize,
+        kv_cache: &mut KvCache,
+        mut timing: Option<&mut FlashMoeGenerationTiming>,
+        progress: GenerationProgress<'_>,
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let mut last_hidden = None;
+            let mut chunk_start = start_position;
+            while chunk_start < end_position {
+                let chunk_end = chunk_start.saturating_add(chunk_tokens).min(end_position);
+                let started = Instant::now();
+                report_generation_progress(&progress, || {
+                    format!(
+                        "qwen prefill chunk begin start={chunk_start} tokens={}",
+                        chunk_end.saturating_sub(chunk_start)
+                    )
+                });
+                let hidden = autoreleasepool(|_| -> Result<Vec<f32>> {
+                    let mut chunk_hidden = None;
+                    for position in chunk_start..chunk_end {
+                        let token = prompt_tokens[position];
+                        kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(
+                            position, token,
+                        ))?;
+                        let mut token_timing = timing.as_ref().map(|_| {
+                            FlashMoeTokenTiming::new(
+                                position,
+                                position,
+                                FlashMoeTokenPhase::Prefill,
+                                token,
+                            )
+                        });
+                        chunk_hidden = Some(self.forward_token_input_in_autoreleasepool(
+                            FlashMoeTokenInput::text(token, position),
+                            kv_cache,
+                            position,
+                            false,
+                            token_timing.as_mut(),
+                            progress.clone(),
+                        )?);
+                        if let Some(token_timing) = token_timing
+                            && let Some(timing) = timing.as_deref_mut()
+                        {
+                            timing.tokens.push(token_timing);
+                        }
+                    }
+                    chunk_hidden.context("Qwen prefill chunk produced no hidden state")
+                })?;
+                self.metal.inner.finish_token_boundary(chunk_end - 1)?;
+                last_hidden = Some(hidden);
+                report_generation_progress(&progress, || {
+                    format!(
+                        "qwen prefill chunk complete processed={} remaining={} elapsed_ms={}",
+                        chunk_end.saturating_sub(start_position),
+                        end_position.saturating_sub(chunk_end),
+                        started.elapsed().as_millis()
+                    )
+                });
+                chunk_start = chunk_end;
+            }
+            return last_hidden.context("cannot generate from an empty Qwen prompt");
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (
+                prompt_tokens,
+                start_position,
+                end_position,
+                chunk_tokens,
+                kv_cache,
+                timing,
+                progress,
+            );
+            bail!("Qwen chunked prefill requires Apple Silicon Metal")
+        }
     }
 
     fn prefill_with_vision(
@@ -3626,6 +3857,7 @@ impl FlashMoeEngine {
                 &generated,
                 false,
                 &None,
+                None,
             )?;
             if !self.tokenizer.is_eos(token) {
                 generated.push(token);
@@ -3644,6 +3876,7 @@ impl FlashMoeEngine {
                 MropePosition::text(runtime_inputs.next_mrope_position() + generated.len() - 1),
                 None,
                 false,
+                None,
                 None,
             )?;
             let token = sampled.token;
@@ -3670,6 +3903,25 @@ impl FlashMoeEngine {
                 cached_tokens: 0,
                 prefilled_tokens: runtime_inputs.prompt_tokens().len(),
                 restore_ms: 0,
+            },
+            tool_constraints: None,
+            performance: NativeGenerationStats {
+                fresh_prefill_tokens: runtime_inputs.prompt_tokens().len(),
+                cached_tokens: 0,
+                model_family: format!("{:?}", self.model_layout.family),
+                active_experts_per_token: nonzero_usize(self.model_layout.scheduled_active_experts),
+                expert_strategy: match self.expert_access {
+                    FlashMoeExpertAccessCapability::ParallelPositionedWholeExpertReads => {
+                        "streamed_parallel_pread"
+                    }
+                    FlashMoeExpertAccessCapability::ResidentMappedWholeExpertSlots => {
+                        "resident_complete_corpus"
+                    }
+                }
+                .to_string(),
+                prefill_command_kind: "scalar_multimodal".to_string(),
+                thinking_enabled: false,
+                ..NativeGenerationStats::default()
             },
         })
     }
@@ -3728,6 +3980,7 @@ impl FlashMoeEngine {
         timing: Option<&mut FlashMoeGenerationTiming>,
         trace_candidates: bool,
         progress: GenerationProgress<'_>,
+        tool_constraint: Option<&mut NativeToolConstraint>,
     ) -> Result<SampledDecode> {
         let previous = generated
             .last()
@@ -3758,6 +4011,7 @@ impl FlashMoeEngine {
             generated,
             trace_candidates,
             &progress,
+            tool_constraint,
         )?;
         let elapsed = sample_started.elapsed();
         if let Some(mut token_timing) = token_timing {
@@ -3779,6 +4033,7 @@ impl FlashMoeEngine {
         generated: &[u32],
         trace_candidates: bool,
         progress: &GenerationProgress<'_>,
+        tool_constraint: Option<&mut NativeToolConstraint>,
     ) -> Result<u32> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -3790,6 +4045,7 @@ impl FlashMoeEngine {
                     generated,
                     trace_candidates,
                     progress,
+                    tool_constraint,
                 )
             });
         }
@@ -3801,6 +4057,7 @@ impl FlashMoeEngine {
             generated,
             trace_candidates,
             progress,
+            tool_constraint,
         )
     }
 
@@ -3812,6 +4069,7 @@ impl FlashMoeEngine {
         generated: &[u32],
         trace_candidates: bool,
         progress: &GenerationProgress<'_>,
+        mut tool_constraint: Option<&mut NativeToolConstraint>,
     ) -> Result<u32> {
         if let Some(graph) = self.deepseek_graph.as_ref() {
             let logits = self.metal.deepseek_v4_logits(graph, hidden)?;
@@ -3826,14 +4084,42 @@ impl FlashMoeEngine {
             );
             return sampler.sample_candidates(candidates);
         }
-        if trace_candidates {
+        if trace_candidates || tool_constraint.is_some() {
             let logits = self.dense.lm_head_logits_with_metal(
                 Some(&self.metal),
                 0,
                 hidden,
                 &self.tokenizer,
             )?;
-            let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+            let mut candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+            if let Some(constraint) = tool_constraint.as_deref_mut() {
+                loop {
+                    let filtered = constraint.filter_candidates(
+                        &self.tokenizer,
+                        generated,
+                        candidates,
+                        sampler.top_k,
+                    )?;
+                    if !filtered.is_empty() {
+                        candidates = filtered;
+                        break;
+                    }
+                    if sampler.candidate_limit() >= logits.len() {
+                        bail!(
+                            "native tool constraint rejected every vocabulary candidate at generated token {}",
+                            generated.len()
+                        );
+                    }
+                    sampler.widen_candidates(
+                        sampler
+                            .candidate_limit()
+                            .saturating_mul(4)
+                            .min(logits.len()),
+                    );
+                    candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+                }
+            }
+            sampler.truncate_for_sampling(&mut candidates);
             trace_sampling_candidates(
                 progress,
                 &self.tokenizer,

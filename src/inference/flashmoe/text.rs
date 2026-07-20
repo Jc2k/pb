@@ -1358,6 +1358,7 @@ fn parse_qwen_tool_arguments(value: &Value) -> Result<Value> {
 pub(super) struct TokenSampler {
     temperature: f32,
     pub(super) top_k: usize,
+    candidate_limit: usize,
     top_p: f32,
     pub(super) repeat_penalty: f32,
     state: u64,
@@ -1369,10 +1370,23 @@ impl TokenSampler {
         Self {
             temperature,
             top_k: usize::try_from(top_k.max(1)).unwrap_or(1),
+            candidate_limit: usize::try_from(top_k.max(1)).unwrap_or(1),
             top_p: if deterministic { 1.0 } else { 0.95 },
             repeat_penalty: if deterministic { 1.0 } else { 1.05 },
             state: u64::from(seed).max(1),
         }
+    }
+
+    pub(super) fn widen_candidates(&mut self, limit: usize) {
+        self.candidate_limit = self.candidate_limit.max(limit).max(self.top_k);
+    }
+
+    pub(super) fn candidate_limit(&self) -> usize {
+        self.candidate_limit
+    }
+
+    pub(super) fn truncate_for_sampling(&self, candidates: &mut Vec<(usize, f32)>) {
+        candidates.truncate(self.top_k.max(1));
     }
 
     #[cfg(test)]
@@ -1423,7 +1437,7 @@ impl TokenSampler {
         generated: &[u32],
     ) -> Vec<(usize, f32)> {
         let repeated = self.repeated_tokens(prompt, generated);
-        let mut candidates = TopKCandidates::new(self.top_k.min(logits.len()).max(1));
+        let mut candidates = TopKCandidates::new(self.candidate_limit.min(logits.len()).max(1));
         for (token, logit) in logits.iter().copied().enumerate() {
             candidates.push(token, self.process_logit(token, logit, &repeated));
         }

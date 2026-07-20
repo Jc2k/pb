@@ -1042,6 +1042,7 @@ async fn run_serve() -> Result<()> {
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
         workflow_action_first_turn: false,
+        workflow_stage_evidence: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: false,
@@ -2220,6 +2221,7 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
             timed.output.prompt_cache.prefilled_tokens,
             timed.output.prompt_cache.restore_ms,
         );
+        print_flashmoe_native_summary("infer", Some(pass), &timed.output)?;
         last_timed = Some(timed);
     }
     if let Some(session_id) = session_id.as_deref()
@@ -2369,6 +2371,7 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
             throughput.decode_wall.as_millis(),
             fmt_optional_tok_s(throughput.decode_tok_s())
         );
+        print_flashmoe_native_summary("bench", Some(prompt_index + 1), &timed.output)?;
         total_generated = total_generated.saturating_add(timed.output.generated_tokens);
         total_generation_wall += throughput.total_wall;
         total_prefill_or_ttft_wall += throughput.prefill_or_ttft_wall;
@@ -2480,6 +2483,23 @@ fn print_flashmoe_resource_summary(
     match prompt {
         Some(prompt) => eprintln!("flashmoe {command}: resources prompt={prompt} {json}"),
         None => eprintln!("flashmoe {command}: resources {json}"),
+    }
+    Ok(())
+}
+
+fn print_flashmoe_native_summary(
+    command: &str,
+    prompt: Option<usize>,
+    output: &inference::flashmoe::GenerationOutput,
+) -> Result<()> {
+    let json = serde_json::to_string(&serde_json::json!({
+        "generation": &output.performance,
+        "tool_constraints": &output.tool_constraints,
+    }))
+    .context("failed to encode native generation summary")?;
+    match prompt {
+        Some(prompt) => eprintln!("flashmoe {command}: native prompt={prompt} {json}"),
+        None => eprintln!("flashmoe {command}: native {json}"),
     }
     Ok(())
 }
@@ -4249,6 +4269,8 @@ mod tests {
                 prompt_tokens: 1,
                 generated_tokens: 1,
                 prompt_cache: Default::default(),
+                tool_constraints: None,
+                performance: Default::default(),
             },
             timing: crate::inference::flashmoe::FlashMoeGenerationTiming {
                 model: "test-model".to_string(),
@@ -4331,6 +4353,8 @@ mod tests {
                 prompt_tokens: 1,
                 generated_tokens: 3,
                 prompt_cache: Default::default(),
+                tool_constraints: None,
+                performance: Default::default(),
             },
             timing: crate::inference::flashmoe::FlashMoeGenerationTiming {
                 model: "test-model".to_string(),

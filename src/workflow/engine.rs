@@ -90,6 +90,8 @@ pub struct WorkflowRun {
     pub selected_checks: Vec<String>,
     #[serde(default)]
     pub checks: CheckEvidenceLedger,
+    #[serde(default)]
+    pub stage_evidence: super::StageEvidenceBundle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,6 +139,7 @@ impl WorkflowRun {
             implementation: None,
             selected_checks: Vec::new(),
             checks: CheckEvidenceLedger::default(),
+            stage_evidence: super::StageEvidenceBundle::default(),
             content_fingerprint: None,
             code_review: None,
             counters: WorkflowCounters::default(),

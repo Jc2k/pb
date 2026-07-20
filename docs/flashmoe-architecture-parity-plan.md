@@ -153,7 +153,8 @@ models and explicit GGUF paths that select it before loading.
 
 ### Qwen3-Coder-Next agent-performance follow-on
 
-Status: **Design record; not yet shipped.**
+Status: **Active migration.** Native constraints, telemetry, bounded chunk ownership, and workflow
+evidence/output shaping are shipped; layer-major Qwen prefill and qualification remain open.
 
 The preserved native agent run identified scalar fresh-prompt prefill, repeated stage evidence,
 unconstrained native tool selection, and oversized edits as the remaining path to a successful
@@ -169,9 +170,30 @@ state, linear attention preserves ordered recurrent updates, and each row retain
 semantics. The command must pass zero-prefix, restored-prefix, chunk-boundary, resident, and streamed
 parity before promotion and may not fall back to scalar after an execution failure.
 
+The current migration step groups fresh Qwen prompts of at least 32 tokens into resource-resolved
+chunks of at most 64. It drains autoreleased Metal objects and checks the working-set ledger once at
+each chunk boundary while executing the existing exact token graph inside the chunk. This removes
+per-token ownership sampling without changing attention, recurrence, routing, expert access, KV
+records, or session capture. It is reported as `qwen_chunked_token_batch`, not as the target
+layer-major command, and does not close the 5x/120-second promotion gate. The resident graph still
+issues zero expert reads and the streamed graph still obtains every selected expert through the
+same scheduler-owned positioned-read path.
+
+The locked short-control qualification measured 512 fresh resident tokens at 16.64 token/s. Even a
+linear extrapolation exceeds 261 seconds at the 4,354-token frontier, so the full agent/browser run
+remains gated until the layer-major graph exists. Decode profiling measured 6.38 token/s and placed
+83% of the wall time in the fused attention/projection bucket; no sampling-only optimization was
+promoted. The preserved commands and measurements are recorded in
+[the prefill qualification](benchmarks/qwen3-coder-next-prefill-qualification.md).
+
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by
 the deterministic agent controller; executor capability and schema validation remain authoritative.
+Qwen requests compile that subset during prompt preflight. Constrained sampling widens the resident
+LM-head frontier, validates decoded token prefixes against the native envelope and schema, and scans
+farther only when the normal frontier has no valid token. Diagnostics retain the mode, schema hash,
+rejected-candidate count, and terminal state without argument content. DeepSeek keeps its separate
+DSML parser and llama.cpp keeps its existing grammar behavior.
 Persistent stage evidence is workflow-checkpoint data keyed by content fingerprints and path hashes,
 not model memory or expert state. None of these follow-ons changes the resident/streamed decision,
 adds a hidden environment toggle, enables unsupported thinking, or permits native load failure to

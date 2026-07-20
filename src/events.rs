@@ -354,6 +354,14 @@ pub struct AgentContextUsage {
     pub read_cache_hits: usize,
     #[serde(default)]
     pub closure_checkpoints: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_payload_char_limit: Option<usize>,
+    #[serde(default)]
+    pub serialized_action_chars: usize,
+    #[serde(default)]
+    pub carried_evidence_entries: usize,
+    #[serde(default)]
+    pub carried_evidence_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +371,31 @@ pub struct PromptCacheUsage {
     pub prefilled_tokens: usize,
     #[serde(default)]
     pub restore_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NativeGenerationUsage {
+    pub fresh_prefill_tokens: usize,
+    pub cached_tokens: usize,
+    pub prefill_wall_ms: u64,
+    pub prefill_tokens_per_second: f64,
+    pub decode_tokens: usize,
+    pub decode_wall_ms: u64,
+    pub decode_tokens_per_second: f64,
+    pub model_family: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_experts_per_token: Option<usize>,
+    pub expert_strategy: String,
+    pub prefill_command_kind: String,
+    pub thinking_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_constraint_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_schema_sha256: Option<String>,
+    #[serde(default)]
+    pub rejected_constraint_candidates: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_terminal_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,6 +642,17 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    ToolBatch {
+        call_count: usize,
+        parallel_safe_count: usize,
+        useful_count: usize,
+        bookkeeping_only_count: usize,
+        rejected_as_dependent: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     ToolResult {
         tool: String,
         result: String,
@@ -796,6 +840,8 @@ pub enum AgentEvent {
         prompt_cache: Option<PromptCacheUsage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context: Option<AgentContextUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native: Option<NativeGenerationUsage>,
         #[serde(skip_serializing_if = "Option::is_none")]
         energy_joules: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1298,6 +1344,26 @@ impl EventEnvelope {
                     timestamp_ms: Some(now),
                 },
             },
+            AgentEvent::ToolBatch {
+                call_count,
+                parallel_safe_count,
+                useful_count,
+                bookkeeping_only_count,
+                rejected_as_dependent,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::ToolBatch {
+                    call_count,
+                    parallel_safe_count,
+                    useful_count,
+                    bookkeeping_only_count,
+                    rejected_as_dependent,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
             AgentEvent::ToolResult {
                 tool,
                 result,
@@ -1577,6 +1643,7 @@ impl EventEnvelope {
                 generated_tokens,
                 prompt_cache,
                 context,
+                native,
                 energy_joules,
                 energy_kwh,
                 average_power_watts,
@@ -1591,6 +1658,7 @@ impl EventEnvelope {
                     generated_tokens,
                     prompt_cache,
                     context,
+                    native,
                     energy_joules,
                     energy_kwh,
                     average_power_watts,
@@ -1909,6 +1977,10 @@ mod tests {
             omitted_tool_result_chars: 5000,
             read_cache_hits: 1,
             closure_checkpoints: 1,
+            mutation_payload_char_limit: Some(2048),
+            serialized_action_chars: 512,
+            carried_evidence_entries: 2,
+            carried_evidence_bytes: 4096,
         };
         let envelope = EventEnvelope::new(AgentEvent::LlmInvocation {
             step: 2,
@@ -1922,6 +1994,24 @@ mod tests {
                 restore_ms: 0,
             }),
             context: Some(context.clone()),
+            native: Some(NativeGenerationUsage {
+                fresh_prefill_tokens: 864,
+                cached_tokens: 4096,
+                prefill_wall_ms: 120,
+                prefill_tokens_per_second: 7200.0,
+                decode_tokens: 3,
+                decode_wall_ms: 30,
+                decode_tokens_per_second: 100.0,
+                model_family: "Qwen3NextMoe".to_string(),
+                active_experts_per_token: Some(10),
+                expert_strategy: "resident_complete_corpus".to_string(),
+                prefill_command_kind: "qwen_chunked_token_batch".to_string(),
+                thinking_enabled: false,
+                tool_constraint_mode: Some("tool_required".to_string()),
+                tool_schema_sha256: Some("abc".to_string()),
+                rejected_constraint_candidates: 4,
+                constraint_terminal_state: Some("complete_tool_call".to_string()),
+            }),
             energy_joules: None,
             energy_kwh: None,
             average_power_watts: None,
@@ -1935,6 +2025,7 @@ mod tests {
             AgentEvent::LlmInvocation {
                 context: Some(restored),
                 prompt_cache: Some(PromptCacheUsage { cached_tokens: 4096, .. }),
+                native: Some(NativeGenerationUsage { active_experts_per_token: Some(10), .. }),
                 ..
             } if restored == context
         ));

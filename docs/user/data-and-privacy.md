@@ -14,7 +14,7 @@ updates, and provider publication are explicit paths across the machine boundary
 | llama.cpp session states | `<platform-cache>/pb/llamacpp-session-v1` or `$PB_CACHE_DIR/llamacpp-session-v1` | Owner-only, byte-budgeted restart states; may contain prompt tokens and derived attention state. |
 | FlashMoe session and shared-prefix states | `<platform-cache>/pb/flashmoe-session-v1` or `$PB_CACHE_DIR/flashmoe-session-v1` | Owner-only, content-addressed and byte-budgeted KV/MLA/recurrent checkpoints; contains token ids and prompt-derived state. |
 | Project configuration | `<repository>/.pb/` | Owned by the repository; may be committed intentionally. |
-| Session history and workflow checkpoints | Repository-local Git notes under `refs/notes/pb/sessions` | Kept locally until the session is deleted; Git notes are not pushed by ordinary branch pushes. |
+| Session history and workflow checkpoints | Repository-local Git notes under `refs/notes/pb/sessions` | Kept locally until the session is deleted; may include bounded exact bytes from complete small-file reads for cross-stage evidence; Git notes are not pushed by ordinary branch pushes. |
 | Session containers, networks, workspaces, and services | Runtime-managed, session-owned resources | Reconciled and removed at terminal cleanup or expiry. |
 | Declared images and caches | Container/model runtime storage | May persist for reuse and garbage collection. |
 

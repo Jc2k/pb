@@ -199,7 +199,9 @@ impl StageCapabilities {
             "ask_user" => {
                 matches!(self.terminal_action, TerminalActionKind::SubmitPlan)
             }
-            "todo" => self.repository_mutation,
+            // Strict delivery already has durable typed stage state. Exposing the legacy,
+            // invocation-local todo protocol only adds another control loop for the model.
+            "todo" => false,
             "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm" => {
                 self.repository_mutation
             }
@@ -244,6 +246,7 @@ mod tests {
         assert!(capabilities.allows_tool("run_command"));
         assert!(capabilities.allows_tool("apply_patch"));
         assert!(capabilities.allows_tool("submit_implementation"));
+        assert!(!capabilities.allows_tool("todo"));
         assert!(!capabilities.allows_tool("git_commit"));
         assert!(!capabilities.allows_tool("submit_code_review"));
     }

@@ -208,6 +208,16 @@ export type AgentEvent =
     timestamp_ms?: number;
   }
   | {
+    type: "tool_batch";
+    call_count: number;
+    parallel_safe_count: number;
+    useful_count: number;
+    bookkeeping_only_count: number;
+    rejected_as_dependent: boolean;
+    nesting_depth?: number;
+    timestamp_ms?: number;
+  }
+  | {
     type: "tool_result";
     tool: string;
     result: string;
@@ -377,6 +387,28 @@ export type AgentEvent =
       omitted_tool_result_chars: number;
       read_cache_hits: number;
       closure_checkpoints: number;
+      mutation_payload_char_limit?: number;
+      serialized_action_chars: number;
+      carried_evidence_entries: number;
+      carried_evidence_bytes: number;
+    };
+    native?: {
+      fresh_prefill_tokens: number;
+      cached_tokens: number;
+      prefill_wall_ms: number;
+      prefill_tokens_per_second: number;
+      decode_tokens: number;
+      decode_wall_ms: number;
+      decode_tokens_per_second: number;
+      model_family: string;
+      active_experts_per_token?: number;
+      expert_strategy: string;
+      prefill_command_kind: string;
+      thinking_enabled: boolean;
+      tool_constraint_mode?: string;
+      tool_schema_sha256?: string;
+      rejected_constraint_candidates: number;
+      constraint_terminal_state?: string;
     };
     energy_joules?: number;
     energy_kwh?: number;

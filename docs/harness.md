@@ -294,6 +294,13 @@ format.
 The agent/evaluation handoff plumbing does not apply to `pb harness infer`, `pb harness bench`, or
 `pb harness cache-clean`; they remain direct diagnostic utilities rather than workflow stages.
 
+Agent `llm_invocation` events now separate native fresh-prefill and decode tokens, wall time and
+rates, and record the model family, active expert count, resident/streamed strategy, prefill command,
+effective thinking state, tool-constraint mode/digest/rejections, serialized tool-schema tokens,
+largest serialized action, mutation payload allowance, and carried-evidence bytes. `tool_batch`
+events add call, parallel-safe, useful, bookkeeping-only, and dependency-rejection counts. These
+fields are optional/defaulted so existing journals remain readable.
+
 ## Control evaluation
 
 Run the deterministic, model-free control suite with:

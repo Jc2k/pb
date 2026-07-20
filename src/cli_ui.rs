@@ -122,6 +122,22 @@ pub fn render_event(event: &AgentEvent) {
             ..
         } => print_header("reasoning", content),
         AgentEvent::ToolCall { tool, .. } => print_header("tool", tool),
+        AgentEvent::ToolBatch {
+            call_count,
+            useful_count,
+            rejected_as_dependent,
+            ..
+        } => print_header(
+            "tool batch",
+            &format!(
+                "{call_count} call(s), {useful_count} useful{}",
+                if *rejected_as_dependent {
+                    ", rejected dependency"
+                } else {
+                    ""
+                }
+            ),
+        ),
         AgentEvent::ToolResult {
             result,
             duration_ms,

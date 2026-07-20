@@ -12,6 +12,7 @@ pub(crate) enum ToolFailureReason {
     ToolNotExposed,
     MissingArgument,
     InvalidArgumentType,
+    InvalidArgumentValue,
     UnknownArgument,
     PreconditionUnmet,
     ReadRequired,
@@ -190,6 +191,117 @@ pub(crate) fn validate_arguments(schema: &Value, arguments: &Value) -> Option<Ar
                     ),
                 });
             }
+            if let Some(message) = schema_value_violation(value, field_schema, field) {
+                return Some(ArgumentIssue {
+                    reason: ToolFailureReason::InvalidArgumentValue,
+                    message,
+                    suggested_next_action: format!(
+                        "Call the same tool again with '{field}' inside the bounds and values declared by the exposed schema; the rejected action was not executed."
+                    ),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn schema_value_violation(value: &Value, schema: &Value, path: &str) -> Option<String> {
+    if let Some(values) = schema.get("enum").and_then(Value::as_array)
+        && !values.contains(value)
+    {
+        return Some(format!(
+            "argument '{path}' is not one of the declared enum values"
+        ));
+    }
+    if let Some(text) = value.as_str() {
+        let chars = text.chars().count() as u64;
+        if schema
+            .get("maxLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|maximum| chars > maximum)
+        {
+            return Some(format!(
+                "argument '{path}' has {chars} characters and exceeds maxLength {}",
+                schema["maxLength"]
+            ));
+        }
+        if schema
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|minimum| chars < minimum)
+        {
+            return Some(format!(
+                "argument '{path}' has {chars} characters and is below minLength {}",
+                schema["minLength"]
+            ));
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        if schema
+            .get("minimum")
+            .and_then(Value::as_f64)
+            .is_some_and(|minimum| number < minimum)
+        {
+            return Some(format!("argument '{path}' is below its declared minimum"));
+        }
+        if schema
+            .get("maximum")
+            .and_then(Value::as_f64)
+            .is_some_and(|maximum| number > maximum)
+        {
+            return Some(format!("argument '{path}' exceeds its declared maximum"));
+        }
+    }
+    if let Some(values) = value.as_array()
+        && let Some(items) = schema.get("items")
+    {
+        for (index, value) in values.iter().enumerate() {
+            if !value_matches_schema_type(value, items) {
+                return Some(format!(
+                    "argument '{path}[{index}]' must be {}",
+                    schema_type_label(items)
+                ));
+            }
+            if let Some(issue) = schema_value_violation(value, items, &format!("{path}[{index}]")) {
+                return Some(issue);
+            }
+        }
+    }
+    if let Some(object) = value.as_object()
+        && let Some(properties) = schema.get("properties").and_then(Value::as_object)
+    {
+        for required in schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !object.contains_key(required) {
+                return Some(format!(
+                    "argument '{path}' is missing required property '{required}'"
+                ));
+            }
+        }
+        for (field, value) in object {
+            let child_path = format!("{path}.{field}");
+            let Some(child_schema) = properties.get(field) else {
+                if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+                    return Some(format!(
+                        "argument '{path}' contains undeclared property '{field}'"
+                    ));
+                }
+                continue;
+            };
+            if !value_matches_schema_type(value, child_schema) {
+                return Some(format!(
+                    "argument '{child_path}' must be {}",
+                    schema_type_label(child_schema)
+                ));
+            }
+            if let Some(issue) = schema_value_violation(value, child_schema, &child_path) {
+                return Some(issue);
+            }
         }
     }
     None
@@ -335,6 +447,49 @@ mod tests {
                 .unwrap()
                 .reason,
             ToolFailureReason::InvalidArgumentType
+        );
+    }
+
+    #[test]
+    fn schema_validation_enforces_string_bounds_and_nested_values() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "maxLength": 4},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"status": {"type": "string", "enum": ["pass"]}},
+                        "required": ["status"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["content", "items"],
+            "additionalProperties": false
+        });
+        assert_eq!(
+            validate_arguments(&schema, &json!({"content": "large", "items": []}))
+                .unwrap()
+                .reason,
+            ToolFailureReason::InvalidArgumentValue
+        );
+        assert_eq!(
+            validate_arguments(
+                &schema,
+                &json!({"content": "okay", "items": [{"status": "fail"}]})
+            )
+            .unwrap()
+            .reason,
+            ToolFailureReason::InvalidArgumentValue
+        );
+        assert!(
+            validate_arguments(
+                &schema,
+                &json!({"content": "okay", "items": [{"status": "pass"}]})
+            )
+            .is_none()
         );
     }
 

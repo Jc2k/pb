@@ -232,6 +232,25 @@ pub struct ChatToolCall {
     pub arguments: Value,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolConstraintMode {
+    #[default]
+    Auto,
+    ToolsAllowed,
+    ToolRequired,
+}
+
+impl NativeToolConstraintMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ToolsAllowed => "tools_allowed",
+            Self::ToolRequired => "tool_required",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StructuredGenerationRequest {
     pub messages: Vec<ChatMessage>,
@@ -243,6 +262,7 @@ pub struct StructuredGenerationRequest {
     pub enable_thinking: bool,
     pub raw_prompt: bool,
     pub trace_candidates: bool,
+    pub tool_constraint_mode: NativeToolConstraintMode,
     /// Maximum combined prompt and generated-token capacity for this request.
     /// `None` retains the model/runtime default used by direct FlashMoe tools.
     pub context_size: Option<usize>,
@@ -261,6 +281,7 @@ impl StructuredGenerationRequest {
             enable_thinking: true,
             raw_prompt: false,
             trace_candidates: false,
+            tool_constraint_mode: NativeToolConstraintMode::Auto,
             context_size: None,
             max_tokens: request.max_tokens,
             temperature: request.temperature,
@@ -303,6 +324,32 @@ pub struct GenerationOutput {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub prompt_cache: PromptCacheStats,
+    pub tool_constraints: Option<NativeToolConstraintStats>,
+    pub performance: NativeGenerationStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeToolConstraintStats {
+    pub mode: NativeToolConstraintMode,
+    pub schema_sha256: String,
+    pub rejected_candidates: usize,
+    pub terminal_state: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NativeGenerationStats {
+    pub fresh_prefill_tokens: usize,
+    pub cached_tokens: usize,
+    pub prefill_wall_ms: u64,
+    pub prefill_tokens_per_second: f64,
+    pub decode_tokens: usize,
+    pub decode_wall_ms: u64,
+    pub decode_tokens_per_second: f64,
+    pub model_family: String,
+    pub active_experts_per_token: Option<usize>,
+    pub expert_strategy: String,
+    pub prefill_command_kind: String,
+    pub thinking_enabled: bool,
 }
 
 #[derive(Debug, Clone)]

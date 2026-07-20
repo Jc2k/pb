@@ -391,6 +391,7 @@ mod tests {
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
             workflow_action_first_turn: false,
+            workflow_stage_evidence: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
             legacy_prompt_owned_delivery: false,

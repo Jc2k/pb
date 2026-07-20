@@ -35,6 +35,12 @@ configured checks, independent code review, bounded repair when necessary, and a
 The active stage controls which tools are visible and which structured submission can advance the
 workflow.
 
+Small complete files read during one stage may appear in the next stage as harness-carried evidence.
+pb rechecks their hashes first; changed, partial, or oversized reads must be inspected again. Strict
+Build stages use the accepted plan and checkpoint for progress instead of exposing a second TODO
+protocol. Independent tool calls can share one model response, while dependent same-path or
+mutation/check batches are rejected before any call runs.
+
 You may see pb pause for a planning question when a missing choice would materially change the
 work. Answering that question updates the user-owned contract; it does not hand the model a general
 permission to improvise.

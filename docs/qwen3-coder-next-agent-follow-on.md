@@ -1,6 +1,11 @@
 # Qwen3-Coder-Next Agent Performance Follow-on
 
-Status: **Design record; implementation not yet shipped**
+Status: **Active implementation.** Durable stage evidence, compact terminal schemas, Qwen native
+tool constraints, output-aware mutation bounds, strict-stage TODO removal, dependency-aware batch
+rejection, and native telemetry are implemented. Qwen fresh prefill now has a bounded chunk-owner
+command, but the layer-major graph/performance gate and full qualification rerun remain open. Decode
+has been profiled; no change was promoted because the measured sampling path cannot meet the 1.5x
+gate.
 
 Evaluation: [Qwen3-Coder-Next native agent](benchmarks/qwen3-coder-next-agent.md)
 
