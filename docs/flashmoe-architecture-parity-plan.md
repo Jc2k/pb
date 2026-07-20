@@ -151,6 +151,32 @@ executor. A requested native FlashMoe model that cannot build or load its declar
 the FlashMoe diagnostic; pb does not silently substitute llama.cpp. llama.cpp remains available for
 models and explicit GGUF paths that select it before loading.
 
+### Qwen3-Coder-Next agent-performance follow-on
+
+Status: **Design record; not yet shipped.**
+
+The preserved native agent run identified scalar fresh-prompt prefill, repeated stage evidence,
+unconstrained native tool selection, and oversized edits as the remaining path to a successful
+browser-task qualification. The detailed
+[agent performance follow-on](qwen3-coder-next-agent-follow-on.md) makes the built-in runner the
+primary target while retaining explicit llama.cpp GGUF support as a regression control.
+
+The target Qwen prefill command is layer-major and selected from prompt geometry inside the same
+load-resolved graph. Complete resident experts continue to issue no expert reads; the streamed
+graph continues to use scheduler-owned parallel positioned reads and the OS page cache. Batch
+buffers are request scratch, not an application cache. Full attention updates the existing typed KV
+state, linear attention preserves ordered recurrent updates, and each row retains exact K=10 route
+semantics. The command must pass zero-prefix, restored-prefix, chunk-boundary, resident, and streamed
+parity before promotion and may not fall back to scalar after an execution failure.
+
+Native constrained tool generation is a structured-text/sampling capability rather than an expert
+scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by
+the deterministic agent controller; executor capability and schema validation remain authoritative.
+Persistent stage evidence is workflow-checkpoint data keyed by content fingerprints and path hashes,
+not model memory or expert state. None of these follow-ons changes the resident/streamed decision,
+adds a hidden environment toggle, enables unsupported thinking, or permits native load failure to
+select llama.cpp.
+
 ## GLM-5.2 Extension Contract
 
 Status: **Shipped baseline**. Indexed MLX MXFP4 and unindexed Colibri import, dense lead-in layers,

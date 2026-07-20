@@ -74,7 +74,9 @@ plan-review stage control by repeating an unexposed mutation call. Because no co
 logic test existed, browser verification was not applicable. The remaining work is performance and
 model-control improvement, not another expert scheduler: batched prompt prefill, compact persisted
 stage evidence, constrained function selection/arguments, and output-cap-aware task decomposition
-are the highest-priority path to a successful rerun.
+are the highest-priority path to a successful rerun. Their implementation order, deterministic
+gates, and locked qualification contract are defined in the
+[agent performance follow-on](qwen3-coder-next-agent-follow-on.md).
 
 ## Acceptance
 
