@@ -75,7 +75,8 @@ binds the commit OID to the workflow artifacts and check receipts.
 
 An optional trusted harness contract is an additional authority boundary, not a label applied after
 the workflow. Required or forbidden mutation and allowed paths constrain the plan and final delta;
-required checks and fresh-review reads must have current evidence; commit semantics and workspace
+required checks must be selected by plan acceptance facts, and required checks and fresh-review
+reads must have current evidence; commit semantics and workspace
 cleanliness are checked before `Ready`. A strict workflow without such a contract can still be
 locally ready, but its acceptance status remains unspecified and it is never reported as externally
 verified. An unmet explicit contract has the distinct `contract_unsatisfied` outcome.

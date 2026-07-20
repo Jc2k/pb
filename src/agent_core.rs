@@ -9740,7 +9740,7 @@ fn run_delivery_commit(
 
 const PLAN_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan function exactly once with arguments shaped as:
-{"id":"plan-1","summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":[{"path":"path/to/file.ext","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"description":"..."}]}
+{"id":"plan-1","summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":[{"path":"path/to/file.ext","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["required-check-id"],"description":"..."}]}
 Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Paths are evaluated in step order: use create before a later modify when the path is currently missing, never modify or delete it before that create, and never create it again while it exists. Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. Use [] for component_ids or check_ids only when the normalized graph genuinely has none. Do not return the arguments as prose or a final action."#;
 
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
@@ -14201,7 +14201,7 @@ fn validate_plan_contract_paths(
         required_checks.dedup();
         if !required_checks.is_empty() {
             bail!(
-                "harness contract requires the plan to select check(s): {}",
+                "harness contract requires acceptance[].check_ids to select check(s): {}",
                 required_checks.join(", ")
             );
         }
@@ -17019,6 +17019,7 @@ mod tests {
         );
         assert!(!PLAN_SUBMISSION_GUIDANCE.contains("\"plan\":{"));
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("evaluated in step order"));
+        assert!(PLAN_SUBMISSION_GUIDANCE.contains("\"check_ids\":[\"required-check-id\"]"));
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("never modify or delete it before that create"));
         assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("submit_plan_review"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Harness current content fingerprint"));
@@ -17273,7 +17274,7 @@ the next imagined action"#;
             validate_plan_contract_paths(&request, &change.artifact)
                 .unwrap_err()
                 .to_string()
-                .contains("select check(s): logic")
+                .contains("acceptance[].check_ids to select check(s): logic")
         );
     }
 

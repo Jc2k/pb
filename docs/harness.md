@@ -89,7 +89,9 @@ A contract-free `ready` or `no_change` workflow exits zero while retaining
 zero with `contract_status=satisfied` and `verified_completed=true`. Strict delivery applies the
 contract to planned and final mutation, allowed paths, required checks, named fresh-review reads and
 check evidence, semantic commit requirements, and final workspace cleanliness; attaching a contract
-does not make `Ready` verified by itself. Required mutation with no delta becomes
+does not make `Ready` verified by itself. A strict plan selects every contract-required check in an
+acceptance fact's `check_ids`; pb rejects an omitted check before implementation and names that
+field in its correction. Required mutation with no delta becomes
 `contract_unsatisfied`; persistent check failure, missing executor, repeated repair failure, and an
 unsafe required commit remain distinct nonzero `checks_failed`, `executor_unavailable`,
 `repair_exhausted`, and `commit_blocked` outcomes. Step, parse, runtime-engine, and resource-limit
