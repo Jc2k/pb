@@ -4,8 +4,11 @@ Status: **Integrated qualification active.** Durable stage evidence, compact ter
 native tool constraints, output-aware mutation bounds, strict-stage TODO removal,
 dependency-aware batch rejection, native telemetry, and true layer-major Qwen3-Coder-Next prefill
 are implemented. The prefill graph passed exact state and resource/performance promotion gates; the
-full harness/browser qualification remains open. Decode has been profiled; no change was promoted
-because the measured sampling path cannot meet the 1.5x gate.
+native runner now also stops on a semantically complete terminal submission and gives an oversized
+file mutation one schema-enforced compact same-step retry. The preserved layer-major harness rerun
+reached implementation but remained incomplete; browser qualification therefore remains open.
+Decode has been profiled; no change was promoted because the measured sampling path cannot meet the
+1.5x gate.
 
 Evaluation: [Qwen3-Coder-Next native agent](benchmarks/qwen3-coder-next-agent.md)
 
@@ -48,6 +51,9 @@ The intended order is:
 | Planning and plan review reread the same unchanged scaffold | pb context/persistence efficiency | P2 | Persist a bounded authoritative evidence bundle |
 | Plan review selected unexposed `write_file` | model stage-control limitation amplified by pb | P2 | Constrain native function names and schemas |
 | Large `game.js` output hit the generation cap | model/output-shaping limitation | P2 | Emit bounded complete edits and expose payload budgets |
+| A 4,096-token constrained call decoded to only `<tool_call>` | pb native-constraint progress defect | P1 | Require monotonic decoded growth and stop bounded mutation strings as truncated named calls |
+| An identical `replace_file` received useful mutation credit | pb tool/progress defect | P1 | Reject byte-identical replacements before diff or evidence mutation |
+| Compact recovery requested half size only in prose | pb recovery defect | P2 | Apply the half-size limit to the retry schema |
 | TODO-only batches consumed output without advancing the artifact | prompt/tool-surface inefficiency | P3 | Remove redundant bookkeeping from strict stages and measure batch value |
 | Qwen3-Coder-Next has no supported thinking mode | model contract | Accepted | Keep thinking off and retain deterministic workflow gates |
 | The final artifact was incomplete | model limitation, truthfully contained | Accepted fixture | Rerun only after the preceding deterministic improvements |
@@ -63,6 +69,9 @@ The preserved evidence that drives implementation is deliberately small:
 | `1784491831209-39233-0` | accepted plan/review, useful multi-call writes, then a capped `game.js` call | atomic truncated-batch and bounded-payload fixtures |
 | `1784500308030-56072-0` | process resume recovered path state but ended after ten invocations with only two files | checkpoint/evidence round trip and output work-unit fixtures |
 | `1784503415217-61220-0` | three slow planning turns, a slow plan-review reread, then repeated unexposed `write_file` | cold-prefill benchmark, carried-evidence fixture, and constrained-logit fixture |
+| `1784555046072-44244-0` | terminal semantic stop reduced planning to 435 generated tokens; plan review accepted on its first 367-token submission | terminal-body completion and parser-envelope fixtures |
+| `1784559198505-50026-0` | plan/review accepted, then capped CSS and JavaScript mutations consumed long retries and left only HTML/CSS | compact same-step mutation retry and bounded-string structural-close fixtures |
+| `1784569541795-68688-0` | first-turn plan/review and three files, then cut-off JavaScript, collapsed constrained output, a no-op replacement, and step-limit containment | monotonic decode, mutation-limit stop, enforced compact schema, no-op mutation, and journal-classification fixtures |
 
 No additional free-model run is needed in Phases 0–4. Phase 5 is the first justified rerun because
 it measures the integrated outcome after deterministic and native correctness gates have passed.
@@ -241,6 +250,15 @@ the final authority.
 
 ### Constraint engine
 
+**Shipped.** The built-in Qwen runner compiles exposed schemas, validates a terminal submission
+name at preflight, stops when that terminal JSON body becomes complete, and closes a missing Qwen
+tool envelope only for parsing. Ordinary independent calls remain batchable. Visible-progress,
+bounded-string closing, and 32-token repetition guards prevent constrained decoding from spending
+the remainder of a cap on a structurally finished or repeated action. After the locked rerun found
+that unequal decoded prefixes could still collapse, visible progress was tightened to monotonic
+decoded length. File-content strings now stop as truncated named mutations at their limit instead
+of being force-closed into cut-off repository files.
+
 - Add a request-level native constraint mode: `auto`, `tools_allowed`, or `tool_required`. Strict
   workflow stages pass the exact exposed tool set; terminal-only turns require the one terminal
   tool already selected by the deterministic controller.
@@ -293,6 +311,12 @@ retain exactly the same normalized artifact digest and coverage decisions as its
 ## Phase 4 — Output-cap-aware edits, useful batches, and decode
 
 ### Bounded complete edits
+
+**Shipped, with field qualification active.** Dynamic mutation bounds are enforced during
+generation and again at execution. A capped `write_file` or `replace_file` gets one compact retry
+inside the same stage step, narrowed to that tool, with half the original schema allowance, and
+without the rejected payload in context; all invocation and generated-token budgets remain charged.
+Byte-identical replacements, edits, and patches receive no mutation or progress credit.
 
 - Derive a conservative serialized-argument allowance from the remaining generated-token budget
   after reserving native envelope and JSON-closing overhead. Add `maxLength` to dynamic mutation

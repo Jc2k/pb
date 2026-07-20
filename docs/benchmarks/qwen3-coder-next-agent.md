@@ -103,21 +103,62 @@ browser-loadable artifact to verify. Browser inspection was deliberately not use
 for the failed harness acceptance. The preserved typed outcome is `incomplete` / `step_limit`, not
 a successful game evaluation.
 
+## Layer-major qualification rerun — 2026-07-20
+
+After the true layer-major graph passed its separate parity, memory, and performance gates, run
+`1784569541795-68688-0` repeated the locked four-file contract in a fresh scratch using the resident
+built-in runner. Planning completed on its first 435-token submission in 68,017 ms; plan review
+completed on its first 371-token submission in 113,230 ms. Their native prefill/decode splits were
+17,045/50,712 ms and 66,493/46,709 ms respectively. This confirms that semantic terminal stopping
+and layer-major prefill removed the former 4,096-token terminal overrun and roughly eleven-minute
+cold planning pass.
+
+Implementation created `index.html` in 498 tokens and `styles.css` in 2,306 tokens. The next
+2,425-token `game.js` call reached the dynamic 7,808-character content bound and was structurally
+closed as a valid tool call, but the file ended at `document.addEventListener('keydown',` and failed
+`deno check`. A later 4,096-token turn took 1,054,657 ms yet decoded to only `<tool_call>`; another
+4,096-token repair took 1,255,109 ms and decoded to 129 visible characters. The model then made a
+byte-identical `replace_file`, which the old progress accounting incorrectly marked useful. On the
+last outer step, a 4,096-token named write activated the compact same-step retry; that retry used
+2,283 more tokens and a smaller prompt but still selected `write_file` for the existing `game.js`,
+so the executor correctly rejected it.
+
+The run ended after 6,683,787 ms with 11 model invocations, 113,695 prompt tokens, 22,939 generated
+tokens, and an estimated 57.3 Wh. Its typed outcome was `step_limit`; the named Deno check, code
+review, managed commit, and browser inspection were never reached. The scratch preserves only
+three untracked files, `game-logic.test.mjs` is absent, and the required check fails at module
+resolution. Browser inspection was again deliberately not used as a substitute for acceptance.
+
+This rerun exposed four clear pb defects, now covered by deterministic regressions:
+
+- constrained non-EOS output must grow monotonically in decoded length, not merely differ from the
+  previous decode;
+- an open `write_file` or `replace_file` content string at `maxLength` stops as a truncated named
+  call instead of being force-closed and executed;
+- compact mutation recovery applies its half-size allowance to the retry schema as well as the
+  correction text; and
+- byte-identical edit results receive no diff, evidence invalidation, or useful-progress credit.
+
+The harness journal also now classifies dirty state preserved by an incomplete delivery as model-
+limitation evidence rather than an experiment error. It remains an experiment error after a
+claimed ready or verified result and still fails a clean-workspace contract. An explicit cached
+Qwen3-Coder-Next GGUF control independently returned `4` through llama.cpp after these native-runner
+changes; it was not used as fallback.
+
 ## Ranked follow-up
 
-1. Batch native prompt prefill so a 4–5k-token cold planning prompt does not require roughly eleven
-   minutes and a 6–7k-token turn does not require roughly twelve to twenty minutes. Prefix reuse
-   made the 80-token invalid-call correction cheap, but it does not address new processes or
-   stage-specific prefixes.
-2. Persist a compact, authoritative evidence digest across stages and process resumes. Planning
-   and plan review repeatedly reread the same two files; accepted evidence should let review begin
-   at its decision boundary without replaying large file contents.
-3. Keep workflow terminal schemas direct and compact. Prefer one plan step covering several
-   independent file creations when that preserves requirement and path coverage; fewer repeated
-   nested objects reduce local-model syntax failure.
-4. Add constrained/grammar-guided native function names and arguments or incremental schema
-   validation during generation. This should prevent a plan-review turn from selecting an
-   unexposed mutation tool while the executor continues to fail closed.
+1. Validate the new monotonic-progress, payload-limit, and compact-schema behavior with a targeted
+   native large-mutation probe before paying for another full workflow. The expected result is an
+   early named truncation and a materially shorter retry, with no cut-off file or no-op progress.
+2. Profile native decode across the shared Qwen data flow. The rerun sustained only about 3–8
+   tokens/s and spent 1,018–1,351 seconds decoding each capped action; promote a common kernel only
+   with exact greedy parity and the existing 1.5x gate.
+3. Shape implementation actions around small complete scaffolds and exact later edits. The
+   controller should expose the enforced payload allowance prominently and prefer a bounded tail
+   patch after an authoritative read rather than a whole-file replacement.
+4. Persist a compact authoritative evidence bundle and preserve stable prompt/tool prefixes across
+   recovery. The compact retry omitted the rejected payload but still spent 302,949 ms prefilling
+   its changed 13,518-token prompt.
 5. Spend model turns on high-value batches of independent reads and checks. One tool call per
    prompt is not a requirement and would make the current inference rate unnecessarily expensive;
    batching TODO bookkeeping without the intended mutation has little value.
@@ -125,6 +166,6 @@ a successful game evaluation.
    hidden thinking. For models trained with a real reasoning channel, disabling it can hurt
    ambiguous diagnosis; for Qwen3-Coder-Next the mode is unsupported, so enabling it would only
    create a misleading contract.
-7. Decompose artifact work into compact, complete edits sized below the output cap, and add faster
-   native decode kernels after batched prefill. Residency removes expert I/O but does not by itself
-   make a 7k-token agent turn interactive.
+7. Rerun the locked workflow only after the targeted mutation probe and decode gate. Browser
+   inspection remains last: it cannot substitute for all four files, the named Deno check, fresh
+   code review, semantic commit, and clean worktree.

@@ -324,6 +324,7 @@ impl SessionMetricsSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum AgentRetryReason {
     ThinkingOffAfterTruncation,
+    CompactMutationAfterTruncation,
     LargerTokenCapAfterTruncation,
 }
 

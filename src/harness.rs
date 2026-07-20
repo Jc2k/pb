@@ -1475,11 +1475,34 @@ fn add_run_observations(
     }
     let status = require_git_success(workspace, &["status", "--short"]).unwrap_or_default();
     if !status.trim().is_empty() {
+        let incomplete_delivery = matches!(result, Ok(result)
+        if !result.verified_completed
+            && result.handoff_outcome.is_some_and(|outcome| !matches!(
+                outcome,
+                crate::events::HandoffOutcome::Ready
+                    | crate::events::HandoffOutcome::NoChange
+            )));
         observations.push(Observation {
-            rank: 2,
-            classification: "experiment_error",
-            title: "workspace has uncommitted changes".to_string(),
-            detail: compact_detail(&status),
+            rank: if incomplete_delivery { 3 } else { 2 },
+            classification: if incomplete_delivery {
+                "model_limitation"
+            } else {
+                "experiment_error"
+            },
+            title: if incomplete_delivery {
+                "incomplete workspace preserves uncommitted changes"
+            } else {
+                "workspace has uncommitted changes"
+            }
+            .to_string(),
+            detail: if incomplete_delivery {
+                format!(
+                    "Expected partial state was preserved and still fails any clean-workspace contract: {}",
+                    compact_detail(&status)
+                )
+            } else {
+                compact_detail(&status)
+            },
         });
     }
     let normal_final_requires_summary = matches!(
@@ -2554,6 +2577,51 @@ mod tests {
             !observations
                 .iter()
                 .any(|observation| observation.title == "completed run produced no commits")
+        );
+    }
+
+    #[test]
+    fn incomplete_delivery_classifies_preserved_dirty_state_as_model_limitation() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        let layout = prepare_scratch(Some(&root)).unwrap();
+        std::fs::write(layout.workspace.join("partial.txt"), "partial\n").unwrap();
+        let result = Ok(AgentRunResult {
+            branch: "main".to_string(),
+            workspace_root: layout.workspace.clone(),
+            focus_root: layout.workspace.clone(),
+            repository_context: None,
+            workspace_graph: None,
+            reached_final: true,
+            contract_status: crate::events::ContractStatus::Unspecified,
+            verified_completed: false,
+            termination_reason: crate::events::TerminationReason::StepLimit,
+            handoff_outcome: Some(crate::events::HandoffOutcome::Incomplete),
+            workflow: None,
+            delivery_proposal: None,
+            requested_delivery: None,
+            goal_proposal: None,
+            requested_goal: None,
+        });
+        let summary = CapturedSummary {
+            summary: "Implementation stopped at its step limit.".to_string(),
+            ..CapturedSummary::default()
+        };
+        let mut observations = Vec::new();
+
+        add_run_observations(&mut observations, &result, &layout.workspace, &summary);
+
+        let dirty = observations
+            .iter()
+            .find(|observation| {
+                observation.title == "incomplete workspace preserves uncommitted changes"
+            })
+            .expect("preserved incomplete workspace observation");
+        assert_eq!(dirty.classification, "model_limitation");
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.title != "workspace has uncommitted changes")
         );
     }
 

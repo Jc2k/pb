@@ -106,7 +106,11 @@ not erase usage, broaden authority, or turn a partial result into success.
 Repeated capped native actions remain one bounded failure sequence while workspace and evidence
 fingerprints are unchanged, even if an intervening action parses but then fails. A successful state
 transition or executed tool result resets that sequence; a truncated file-write payload is never
-treated as a partial file.
+treated as a partial file. Native constrained generation stops before an open mutation string can
+cross its schema limit, and the same-step compact retry carries the reduced limit in the executable
+schema as well as its prompt. Repeated or collapsing decoded prefixes cannot masquerade as output
+progress. File mutation tools report success and earn progress only when repository bytes actually
+change; an identical replacement is a typed tool failure rather than fresh evidence.
 
 Goal budgets apply across all child workflows and do not reset between milestones, pause/resume, or
 amendments. A project ceiling may narrow a user's request. A model can request budget review but

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -9,19 +9,33 @@ use super::types::{ChatTool, NativeToolConstraintMode};
 
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
+const CONSTRAINED_NO_REPEAT_NGRAM: usize = 32;
 
 #[derive(Debug, Clone)]
 pub(super) struct NativeToolConstraint {
     mode: NativeToolConstraintMode,
     schemas: BTreeMap<String, Value>,
+    terminal_tool_names: BTreeSet<String>,
+    forced_tokens: VecDeque<u32>,
+    payload_limit_stop: Option<String>,
+    stopped_at_payload_limit: bool,
     schema_sha256: String,
     rejected_candidates: usize,
 }
 
 impl NativeToolConstraint {
+    #[cfg(test)]
     pub(super) fn compile(
         mode: NativeToolConstraintMode,
         tools: &[ChatTool],
+    ) -> Result<Option<Self>> {
+        Self::compile_with_terminal_tools(mode, tools, &[])
+    }
+
+    pub(super) fn compile_with_terminal_tools(
+        mode: NativeToolConstraintMode,
+        tools: &[ChatTool],
+        terminal_tool_names: &[String],
     ) -> Result<Option<Self>> {
         let active_mode = match mode {
             NativeToolConstraintMode::Auto if tools.is_empty() => return Ok(None),
@@ -47,10 +61,23 @@ impl NativeToolConstraint {
                 );
             }
         }
+        let terminal_tool_names = terminal_tool_names
+            .iter()
+            .map(|name| {
+                if !schemas.contains_key(name) {
+                    bail!("native terminal tool constraint names unexposed tool {name}");
+                }
+                Ok(name.clone())
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
         let schema_bytes = serde_json::to_vec(&schemas)?;
         Ok(Some(Self {
             mode: active_mode,
             schemas,
+            terminal_tool_names,
+            forced_tokens: VecDeque::new(),
+            payload_limit_stop: None,
+            stopped_at_payload_limit: false,
             schema_sha256: format!("{:x}", Sha256::digest(schema_bytes)),
             rejected_candidates: 0,
         }))
@@ -69,12 +96,180 @@ impl NativeToolConstraint {
     }
 
     pub(super) fn terminal_state(&self, decoded: &str) -> &'static str {
-        if decoded.contains(TOOL_CALL_CLOSE) {
+        if self.stopped_at_payload_limit {
+            "mutation_payload_limit"
+        } else if self.output_has_complete_terminal_call(decoded) {
+            "complete_terminal_tool_call"
+        } else if decoded.contains(TOOL_CALL_CLOSE) {
             "complete_tool_call"
         } else if decoded.contains(TOOL_CALL_OPEN) {
             "in_tool_call"
         } else {
             "before_tool_call"
+        }
+    }
+
+    pub(super) fn should_stop_after_token(
+        &self,
+        tokenizer: &QwenTokenizer,
+        generated: &[u32],
+        token: u32,
+    ) -> Result<bool> {
+        if self.terminal_tool_names.is_empty() {
+            return Ok(false);
+        }
+        let mut trial = Vec::with_capacity(generated.len() + 1);
+        trial.extend_from_slice(generated);
+        trial.push(token);
+        Ok(self.output_has_complete_terminal_call(&tokenizer.decode(&trial)?))
+    }
+
+    fn output_has_complete_terminal_call(&self, decoded: &str) -> bool {
+        if self.terminal_tool_names.is_empty() {
+            return false;
+        }
+        let mut remaining = decoded;
+        while let Some(open) = remaining.find(TOOL_CALL_OPEN) {
+            remaining = &remaining[open + TOOL_CALL_OPEN.len()..];
+            if let Some(close) = remaining.find(TOOL_CALL_CLOSE) {
+                if self.body_names_terminal_tool(remaining[..close].trim()) {
+                    return true;
+                }
+                remaining = &remaining[close + TOOL_CALL_CLOSE.len()..];
+                continue;
+            }
+            return match self.parse_tool_body(remaining) {
+                PrefixStatus::Complete(position)
+                    if self.close_suffix_is_valid(&remaining[position..]) =>
+                {
+                    self.body_names_terminal_tool(remaining[..position].trim())
+                }
+                _ => false,
+            };
+        }
+        false
+    }
+
+    fn body_names_terminal_tool(&self, body: &str) -> bool {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| value.get("name")?.as_str().map(str::to_owned))
+            .is_some_and(|name| self.terminal_tool_names.contains(&name))
+    }
+
+    fn close_suffix_is_valid(&self, suffix: &str) -> bool {
+        TOOL_CALL_CLOSE.starts_with(suffix)
+            || "\n</tool_call>".starts_with(suffix)
+            || "\r\n</tool_call>".starts_with(suffix)
+    }
+
+    pub(super) fn forced_next_token(
+        &mut self,
+        tokenizer: &QwenTokenizer,
+        generated: &[u32],
+    ) -> Result<Option<u32>> {
+        if self.forced_tokens.is_empty() {
+            let decoded = tokenizer.decode(generated)?;
+            if let Some(tool) = self.bounded_mutation_string_limit_tool(&decoded) {
+                self.payload_limit_stop = Some(tool);
+                self.stopped_at_payload_limit = true;
+                return Ok(Some(tokenizer.eos_token_id()));
+            }
+            let remainder = self
+                .unclosed_tool_call_close_remainder(&decoded)
+                .or_else(|| self.bounded_string_structural_remainder(&decoded));
+            if let Some(remainder) = remainder {
+                let tokens = tokenizer.encode(&remainder)?;
+                if tokens.is_empty() {
+                    bail!("native tool constraint could not tokenize forced Qwen structure");
+                }
+                let mut trial = generated.to_vec();
+                trial.extend_from_slice(&tokens);
+                let decoded = tokenizer.decode(&trial)?;
+                if !decoded.contains(TOOL_CALL_CLOSE)
+                    || !self.output_prefix_is_valid(&decoded, false)
+                {
+                    bail!("native tool constraint could not force valid Qwen structure");
+                }
+                self.forced_tokens = tokens.into();
+            }
+        }
+        Ok(self.forced_tokens.pop_front())
+    }
+
+    pub(super) fn take_payload_limit_stop(&mut self) -> Option<String> {
+        self.payload_limit_stop.take()
+    }
+
+    fn unclosed_tool_call_close_remainder(&self, decoded: &str) -> Option<String> {
+        let open = decoded.rfind(TOOL_CALL_OPEN)?;
+        let body = &decoded[open + TOOL_CALL_OPEN.len()..];
+        if body.contains(TOOL_CALL_CLOSE) {
+            return None;
+        }
+        let PrefixStatus::Complete(position) = self.parse_tool_body(body) else {
+            return None;
+        };
+        let suffix = &body[position..];
+        [TOOL_CALL_CLOSE, "\n</tool_call>", "\r\n</tool_call>"]
+            .into_iter()
+            .find_map(|target| {
+                target
+                    .strip_prefix(suffix)
+                    .map(|remainder| remainder.to_string())
+            })
+    }
+
+    fn bounded_string_structural_remainder(&self, decoded: &str) -> Option<String> {
+        let open = decoded.rfind(TOOL_CALL_OPEN)?;
+        let body = &decoded[open + TOOL_CALL_OPEN.len()..];
+        if body.contains(TOOL_CALL_CLOSE)
+            || self.parse_tool_body(&format!("{body}x")) != PrefixStatus::Invalid
+        {
+            return None;
+        }
+        ["\"}}", "\"}]}", "\"}}}", "\"}]}}", "\"}}}}"]
+            .into_iter()
+            .find(|suffix| self.tool_body_is_complete(&format!("{body}{suffix}")))
+            .map(|suffix| format!("{suffix}{TOOL_CALL_CLOSE}"))
+    }
+
+    fn bounded_mutation_string_limit_tool(&self, decoded: &str) -> Option<String> {
+        let open = decoded.rfind(TOOL_CALL_OPEN)?;
+        let body = &decoded[open + TOOL_CALL_OPEN.len()..];
+        if body.contains(TOOL_CALL_CLOSE)
+            || self.parse_tool_body(&format!("{body}x")) != PrefixStatus::Invalid
+            || !["\"}}", "\"}]}", "\"}}}", "\"}]}}", "\"}}}}"]
+                .into_iter()
+                .any(|suffix| self.tool_body_is_complete(&format!("{body}{suffix}")))
+        {
+            return None;
+        }
+        let name = self.tool_name_from_body_prefix(body)?;
+        matches!(name.as_str(), "write_file" | "replace_file").then_some(name)
+    }
+
+    fn tool_name_from_body_prefix(&self, body: &str) -> Option<String> {
+        let mut position = skip_ws(body, 0);
+        position = match consume_byte(body, position, b'{') {
+            PrefixStatus::Complete(position) => position,
+            _ => return None,
+        };
+        position = skip_ws(body, position);
+        position = match parse_fixed_string(body, position, &["name"]) {
+            StringStatus::Complete(name, position) if name == "name" => position,
+            _ => return None,
+        };
+        position = skip_ws(body, position);
+        position = match consume_byte(body, position, b':') {
+            PrefixStatus::Complete(position) => position,
+            _ => return None,
+        };
+        position = skip_ws(body, position);
+        let names = self.schemas.keys().map(String::as_str).collect::<Vec<_>>();
+        match parse_fixed_string(body, position, &names) {
+            StringStatus::Complete(name, _) => Some(name),
+            _ => None,
         }
     }
 
@@ -86,12 +281,22 @@ impl NativeToolConstraint {
         keep: usize,
     ) -> Result<Vec<(usize, f32)>> {
         let mut accepted = Vec::with_capacity(keep.min(candidates.len()));
+        let decoded_prefix = tokenizer.decode(generated)?;
+        let forbidden_repetition_tokens =
+            repeated_ngram_forbidden_tokens(generated, CONSTRAINED_NO_REPEAT_NGRAM);
         for (token, score) in candidates {
             let token = u32::try_from(token).context("candidate token id does not fit u32")?;
+            if forbidden_repetition_tokens.contains(&token) {
+                self.rejected_candidates = self.rejected_candidates.saturating_add(1);
+                continue;
+            }
             let mut trial = generated.to_vec();
             trial.push(token);
             let decoded = tokenizer.decode(&trial)?;
-            if self.output_prefix_is_valid(&decoded, tokenizer.is_eos(token)) {
+            let is_eos = tokenizer.is_eos(token);
+            if candidate_advances_visible_output(&decoded_prefix, &decoded, is_eos)
+                && self.output_prefix_is_valid(&decoded, is_eos)
+            {
                 accepted.push((token as usize, score));
                 if accepted.len() >= keep {
                     break;
@@ -141,10 +346,11 @@ impl NativeToolConstraint {
     }
 
     fn tool_body_prefix_is_valid(&self, body: &str) -> bool {
-        matches!(
-            self.parse_tool_body(body),
-            PrefixStatus::Incomplete | PrefixStatus::Complete(_)
-        )
+        match self.parse_tool_body(body) {
+            PrefixStatus::Incomplete => true,
+            PrefixStatus::Complete(position) => self.close_suffix_is_valid(&body[position..]),
+            PrefixStatus::Invalid => false,
+        }
     }
 
     fn tool_body_is_complete(&self, body: &str) -> bool {
@@ -215,6 +421,39 @@ impl NativeToolConstraint {
         position = skip_ws(body, position);
         consume_byte(body, position, b'}')
     }
+}
+
+fn candidate_advances_visible_output(prefix: &str, candidate: &str, is_eos: bool) -> bool {
+    is_eos || candidate.len() > prefix.len()
+}
+
+fn repeated_ngram_forbidden_tokens(tokens: &[u32], width: usize) -> BTreeSet<u32> {
+    if width < 2 || tokens.len() < width.saturating_sub(1) {
+        return BTreeSet::new();
+    }
+    let prefix = &tokens[tokens.len() - (width - 1)..];
+    let mut forbidden = BTreeSet::new();
+    for start in 0..tokens.len().saturating_sub(width - 1) {
+        if tokens[start..start + width - 1] == *prefix {
+            forbidden.insert(tokens[start + width - 1]);
+        }
+    }
+    forbidden
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_tool_output_is_complete(
+    tools: &[ChatTool],
+    terminal_tool: &str,
+    output: &str,
+) -> Result<bool> {
+    let constraint = NativeToolConstraint::compile_with_terminal_tools(
+        NativeToolConstraintMode::ToolsAllowed,
+        tools,
+        &[terminal_tool.to_string()],
+    )?
+    .context("test terminal constraint should be active")?;
+    Ok(constraint.output_has_complete_terminal_call(output))
 }
 
 fn validate_supported_schema(schema: &Value, location: &str) -> Result<()> {
@@ -438,11 +677,10 @@ fn parse_json_string(input: &str, position: usize) -> StringStatus {
             _ => {}
         }
     }
-    if escaped || input[position + 1..].contains('\\') {
-        StringStatus::Incomplete(None)
-    } else {
-        StringStatus::Incomplete(Some(input[position + 1..].to_string()))
-    }
+    let unterminated = &input[position..];
+    serde_json::from_str::<String>(&format!("{unterminated}\""))
+        .map(|value| StringStatus::Incomplete(Some(value)))
+        .unwrap_or(StringStatus::Incomplete(None))
 }
 
 struct JsonPrefixParser<'a> {
@@ -716,6 +954,22 @@ mod tests {
         }]
     }
 
+    fn mutation_tools() -> Vec<ChatTool> {
+        vec![ChatTool {
+            name: "write_file".to_string(),
+            description: None,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string", "maxLength": 8}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        }]
+    }
+
     #[test]
     fn required_constraint_rejects_unexposed_names_and_wrong_arguments() {
         let constraint =
@@ -746,10 +1000,158 @@ mod tests {
             "<tool_call>{\"name\":\"submit_review\",\"arguments\":{\"verdict\":\"pass\",\"notes\":[\"one\"]}}</tool_call>\n<tool_call>{\"name\":\"submit_review\",\"arguments\":{\"verdict\":\"fail\",\"notes\":[]}}</tool_call>",
             true
         ));
+        let complete_body = "<tool_call>{\"name\":\"submit_review\",\"arguments\":{\"verdict\":\"pass\",\"notes\":[]}}";
+        assert!(constraint.output_prefix_is_valid(complete_body, false));
+        assert!(constraint.output_prefix_is_valid(&format!("{complete_body}\n"), false));
+        assert!(!constraint.output_prefix_is_valid(&format!("{complete_body}\n\n"), false));
+        assert!(!constraint.output_prefix_is_valid(&format!("{complete_body} "), false));
+        assert!(constraint.output_prefix_is_valid(&format!("{complete_body}\n</tool"), false));
+        assert!(
+            !constraint.output_prefix_is_valid(&format!("{complete_body}\nPlease proceed"), false)
+        );
         assert!(!constraint.output_prefix_is_valid(
             "<tool_call>{\"name\":\"submit_review\",\"arguments\":{\"verdict\":\"pass\",\"notes\":[\"one\",]}}</tool_call>",
             true
         ));
+    }
+
+    #[test]
+    fn terminal_tool_completion_stops_only_on_the_named_workflow_submission() {
+        let mut available = tools();
+        available.push(ChatTool {
+            name: "read_file".to_string(),
+            description: None,
+            input_schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        });
+        let terminal = vec!["submit_review".to_string()];
+        let constraint = NativeToolConstraint::compile_with_terminal_tools(
+            NativeToolConstraintMode::ToolsAllowed,
+            &available,
+            &terminal,
+        )
+        .unwrap()
+        .unwrap();
+        let read =
+            "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"game.js\"}}</tool_call>";
+        assert!(!constraint.output_has_complete_terminal_call(read));
+        let submission = "<tool_call>{\"name\":\"submit_review\",\"arguments\":{\"verdict\":\"pass\",\"notes\":[]}}</tool_call>";
+        assert!(constraint.output_has_complete_terminal_call(submission));
+        let unclosed_submission = submission.strip_suffix(TOOL_CALL_CLOSE).unwrap();
+        assert!(constraint.output_has_complete_terminal_call(unclosed_submission));
+        assert!(constraint.output_has_complete_terminal_call(&format!("{unclosed_submission}\n")));
+        assert_eq!(
+            constraint.terminal_state(unclosed_submission),
+            "complete_terminal_tool_call"
+        );
+        assert!(constraint.output_has_complete_terminal_call(&format!("{read}\n{submission}")));
+
+        let unknown = vec!["write_file".to_string()];
+        assert!(
+            NativeToolConstraint::compile_with_terminal_tools(
+                NativeToolConstraintMode::ToolsAllowed,
+                &available,
+                &unknown,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn constrained_generation_rejects_invisible_non_eos_tokens() {
+        assert!(!candidate_advances_visible_output("call", "call", false));
+        assert!(!candidate_advances_visible_output("call", "all", false));
+        assert!(!candidate_advances_visible_output("call", "wall", false));
+        assert!(candidate_advances_visible_output("call", "call>", false));
+        assert!(candidate_advances_visible_output("call", "call", true));
+    }
+
+    #[test]
+    fn constrained_generation_blocks_only_the_repeated_ngram_continuation() {
+        let mut tokens = (0..40).collect::<Vec<u32>>();
+        tokens.extend(8..39);
+        let forbidden = repeated_ngram_forbidden_tokens(&tokens, 32);
+        assert_eq!(forbidden, BTreeSet::from([39]));
+        assert!(repeated_ngram_forbidden_tokens(&tokens, 1).is_empty());
+    }
+
+    #[test]
+    fn escaped_incomplete_string_prefixes_still_enforce_decoded_length() {
+        let schema = json!({"type": "string", "maxLength": 4});
+        assert_eq!(
+            JsonPrefixParser::new("\"a\\nbc").parse_string(0, &schema),
+            PrefixStatus::Incomplete
+        );
+        assert_eq!(
+            JsonPrefixParser::new("\"a\\nbcd").parse_string(0, &schema),
+            PrefixStatus::Invalid
+        );
+    }
+
+    #[test]
+    fn complete_nonterminal_tool_body_forces_only_the_missing_close_suffix() {
+        let constraint =
+            NativeToolConstraint::compile(NativeToolConstraintMode::ToolsAllowed, &tools())
+                .unwrap()
+                .unwrap();
+        let body = "<tool_call>{\"name\":\"submit_review\",\"arguments\":{\"verdict\":\"pass\",\"notes\":[]}}";
+        assert_eq!(
+            constraint.unclosed_tool_call_close_remainder(body),
+            Some(TOOL_CALL_CLOSE.to_string())
+        );
+        assert_eq!(
+            constraint.unclosed_tool_call_close_remainder(&format!("{body}\n")),
+            Some(TOOL_CALL_CLOSE.to_string())
+        );
+        assert_eq!(
+            constraint.unclosed_tool_call_close_remainder(&format!("{body}</tool")),
+            Some("_call>".to_string())
+        );
+        assert_eq!(
+            constraint.unclosed_tool_call_close_remainder(&format!("{body}{TOOL_CALL_CLOSE}")),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_string_at_its_limit_forces_a_unique_valid_structural_suffix() {
+        let constraint =
+            NativeToolConstraint::compile(NativeToolConstraintMode::ToolsAllowed, &tools())
+                .unwrap()
+                .unwrap();
+        let body = "<tool_call>{\"name\":\"submit_review\",\"arguments\":{\"verdict\":\"pass\",\"notes\":[],\"detail\":\"12345678";
+        assert_eq!(
+            constraint.bounded_string_structural_remainder(body),
+            Some("\"}}</tool_call>".to_string())
+        );
+        assert_eq!(
+            constraint.bounded_string_structural_remainder(&body.replace("12345678", "1234")),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_file_content_stops_as_a_truncated_named_mutation() {
+        let constraint = NativeToolConstraint::compile(
+            NativeToolConstraintMode::ToolsAllowed,
+            &mutation_tools(),
+        )
+        .unwrap()
+        .unwrap();
+        let body = "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"game.js\",\"content\":\"12345678";
+
+        assert_eq!(
+            constraint.bounded_mutation_string_limit_tool(body),
+            Some("write_file".to_string())
+        );
+        assert_eq!(
+            constraint.bounded_mutation_string_limit_tool(&body.replace("12345678", "1234")),
+            None
+        );
     }
 
     #[test]

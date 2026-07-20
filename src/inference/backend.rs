@@ -193,6 +193,7 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
             raw_prompt: false,
             trace_candidates: false,
             tool_constraint_mode: crate::inference::flashmoe::NativeToolConstraintMode::Auto,
+            terminal_tool_names: Vec::new(),
             prefill_mode: crate::inference::flashmoe::NativePrefillMode::Auto,
             prefill_state_summary: false,
             prefill_chunk_tokens: None,

@@ -274,6 +274,9 @@ pub struct StructuredGenerationRequest {
     pub raw_prompt: bool,
     pub trace_candidates: bool,
     pub tool_constraint_mode: NativeToolConstraintMode,
+    /// Exposed workflow submissions whose first complete constrained call
+    /// closes generation. Ordinary tool calls remain batchable.
+    pub terminal_tool_names: Vec<String>,
     /// Explicit harness qualification control. Production requests use `Auto`;
     /// `Scalar` preserves the exact token-major reference for A/B parity;
     /// `LayerMajor` is an explicit harness qualification override.
@@ -305,6 +308,7 @@ impl StructuredGenerationRequest {
             raw_prompt: false,
             trace_candidates: false,
             tool_constraint_mode: NativeToolConstraintMode::Auto,
+            terminal_tool_names: Vec::new(),
             prefill_mode: NativePrefillMode::Auto,
             prefill_state_summary: false,
             prefill_chunk_tokens: None,

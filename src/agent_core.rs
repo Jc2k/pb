@@ -4428,6 +4428,22 @@ fn mutation_payload_char_limit(max_tokens: i32) -> usize {
 
 fn apply_mutation_payload_limit(tools: &mut [BuiltInToolSchema], max_tokens: i32) -> usize {
     let limit = mutation_payload_char_limit(max_tokens);
+    set_mutation_payload_char_limit(tools, limit);
+    for tool in tools {
+        if !matches!(
+            tool.name.as_str(),
+            "write_file" | "replace_file" | "apply_patch" | "edit_file"
+        ) {
+            continue;
+        }
+        tool.description.push_str(&format!(
+            " This turn permits at most {limit} characters of serialized mutation payload; use a complete smaller work unit when the final file is larger."
+        ));
+    }
+    limit
+}
+
+fn set_mutation_payload_char_limit(tools: &mut [BuiltInToolSchema], limit: usize) {
     for tool in tools {
         let fields: &[&str] = match tool.name.as_str() {
             "write_file" | "replace_file" => &["content"],
@@ -4439,7 +4455,7 @@ fn apply_mutation_payload_limit(tools: &mut [BuiltInToolSchema], max_tokens: i32
         let field_limit = if tool.name == "edit_file" {
             (limit / 2).max(64)
         } else {
-            limit
+            limit.max(64)
         };
         for field in fields {
             if let Some(property) = tool
@@ -4449,11 +4465,7 @@ fn apply_mutation_payload_limit(tools: &mut [BuiltInToolSchema], max_tokens: i32
                 property["maxLength"] = json!(field_limit);
             }
         }
-        tool.description.push_str(&format!(
-            " This turn permits at most {limit} characters of serialized mutation payload; use a complete smaller work unit when the final file is larger."
-        ));
     }
-    limit
 }
 
 fn exposed_mutation_payload_limit(tools: &[BuiltInToolSchema]) -> Option<usize> {
@@ -10962,6 +10974,12 @@ fn flashmoe_structured_request(
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
 ) -> Result<StructuredGenerationRequest> {
+    let terminal_tool_names = args
+        .workflow_stage
+        .and_then(workflow_terminal_tool_name)
+        .filter(|terminal| tools.iter().any(|tool| tool.name == *terminal))
+        .map(|terminal| vec![terminal.to_string()])
+        .unwrap_or_default();
     Ok(StructuredGenerationRequest {
         messages: to_model_messages(messages)?,
         tools: to_model_tools(tools),
@@ -10982,6 +11000,7 @@ fn flashmoe_structured_request(
         } else {
             crate::inference::flashmoe::NativeToolConstraintMode::Auto
         },
+        terminal_tool_names,
         prefill_mode: crate::inference::flashmoe::NativePrefillMode::Auto,
         prefill_state_summary: false,
         prefill_chunk_tokens: None,
@@ -11013,6 +11032,7 @@ fn generate_and_parse_action_with_retries(
     let mut retry_messages = None;
     let mut retry_tools: Option<Vec<BuiltInToolSchema>> = None;
     let mut cap_growth_used = false;
+    let mut compact_mutation_retry_used = false;
 
     loop {
         let mut request = args.clone();
@@ -11183,6 +11203,43 @@ fn generate_and_parse_action_with_retries(
                         messages,
                         retry_scope,
                     ));
+                    continue;
+                }
+
+                let truncated_mutation = truncated_native_tool_name(&failure.output)
+                    .filter(|tool| matches!(*tool, "write_file" | "replace_file"))
+                    .filter(|tool| tools.iter().any(|schema| schema.name.as_str() == *tool));
+                if !compact_mutation_retry_used && let Some(tool) = truncated_mutation {
+                    compact_mutation_retry_used = true;
+                    retry_reason = Some(AgentRetryReason::CompactMutationAfterTruncation);
+                    let mut compact_tools = tools
+                        .iter()
+                        .filter(|schema| schema.name == tool)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let target_chars = mutation_payload_char_limit(max_tokens) / 2;
+                    set_mutation_payload_char_limit(&mut compact_tools, target_chars);
+                    if let Some(schema) = compact_tools.first_mut() {
+                        schema.description.push_str(&format!(
+                            " Compact recovery permits at most {target_chars} content characters."
+                        ));
+                    }
+                    retry_tools = Some(compact_tools);
+                    let instruction = format!(
+                        "The capped {tool} call was not executed. Retry {tool} now with one complete, syntactically loadable payload under {target_chars} characters. Keep only the smallest functional core; omit decoration, commentary, optional helpers, and repeated material. Do not include the rejected payload or read the missing target."
+                    );
+                    sink.emit(AgentEvent::Correction {
+                        message: instruction.clone(),
+                        summary: "Retrying a compact atomic mutation".to_string(),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    let mut compact_messages = messages.to_vec();
+                    compact_messages.push(correction_chat_message(
+                        "Compact atomic mutation recovery",
+                        &instruction,
+                    ));
+                    retry_messages = Some(compact_messages);
                     continue;
                 }
 
@@ -12467,6 +12524,9 @@ fn run_tool(
             ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
             let existing = std::fs::read_to_string(&resolved)
                 .with_context(|| format!("failed to read {}", resolved.display()))?;
+            if existing == content {
+                bail!("replace_file made no content change for {path}");
+            }
             std::fs::write(&resolved, content)
                 .with_context(|| format!("failed to write {}", resolved.display()))?;
             sink.emit(AgentEvent::Diff {
@@ -12504,6 +12564,9 @@ fn run_tool(
             }
 
             let updated = existing.replacen(old_text, new_text, 1);
+            if updated == existing {
+                bail!("edit_file made no content change for {path}");
+            }
             std::fs::write(&resolved, &updated)
                 .with_context(|| format!("failed to write {}", resolved.display()))?;
 
@@ -12534,15 +12597,16 @@ fn run_tool(
             }
             run_git_apply_patch(patch, workspace_root)?;
             let diff = git_diff_paths(workspace_root, &changed_paths)?;
-            if !diff.trim().is_empty() {
-                sink.emit(AgentEvent::Diff {
-                    path: "apply_patch".to_string(),
-                    diff,
-                    nesting_depth: (context.request.sub_agent_depth > 0)
-                        .then_some(context.request.sub_agent_depth),
-                    timestamp_ms: Some(now_millis()),
-                });
+            if diff.trim().is_empty() {
+                bail!("apply_patch made no content change");
             }
+            sink.emit(AgentEvent::Diff {
+                path: "apply_patch".to_string(),
+                diff,
+                nesting_depth: (context.request.sub_agent_depth > 0)
+                    .then_some(context.request.sub_agent_depth),
+                timestamp_ms: Some(now_millis()),
+            });
             context.gate_state.borrow_mut().record_content_mutation();
             Ok(format!("applied patch to {}", changed_paths.join(", ")))
         }
@@ -16779,17 +16843,43 @@ mod tests {
                 .find(|tool| tool.name == "submit_plan_review")
                 .unwrap(),
         ];
+        let evidence_request =
+            flashmoe_structured_request(&request, &messages, &all_tools, false).unwrap();
         assert_eq!(
-            flashmoe_structured_request(&request, &messages, &all_tools, false)
-                .unwrap()
-                .tool_constraint_mode,
+            evidence_request.tool_constraint_mode,
             crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed
         );
         assert_eq!(
-            flashmoe_structured_request(&request, &messages, &all_tools[1..], false)
-                .unwrap()
-                .tool_constraint_mode,
+            evidence_request.terminal_tool_names,
+            vec!["submit_plan_review"]
+        );
+        let terminal_request =
+            flashmoe_structured_request(&request, &messages, &all_tools[1..], false).unwrap();
+        assert_eq!(
+            terminal_request.tool_constraint_mode,
             crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
+        );
+        assert_eq!(
+            terminal_request.terminal_tool_names,
+            vec!["submit_plan_review"]
+        );
+    }
+
+    #[test]
+    fn native_constraint_recognizes_a_complete_real_plan_submission_body() {
+        let plan_tool = all_builtin_tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "submit_plan")
+            .unwrap();
+        let output = r#"<tool_call>{"name":"submit_plan","arguments":{"id":"plan-1","summary":"Build the game","requirements":[{"id":"r1","description":"Create the game","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":[{"path":"game.js","change":"create"}],"description":"Implement it"}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"description":"The game works"}]}}"#;
+
+        assert!(
+            crate::inference::flashmoe::terminal_tool_output_is_complete(
+                &to_model_tools(&[plan_tool]),
+                "submit_plan",
+                output,
+            )
+            .unwrap()
         );
     }
 
@@ -20806,6 +20896,127 @@ the next imagined action"#;
             contexts[1].retry_reason,
             Some(AgentRetryReason::ThinkingOffAfterTruncation)
         );
+    }
+
+    #[test]
+    fn capped_mutation_gets_one_compact_retry_inside_the_same_workflow_step() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 2;
+        request.turn_max_tokens_cap = Some(256);
+        request.workflow_action_first_turn = true;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                ScriptedCompletion {
+                    content: "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"compact.txt\",\"content\":\"unfinished".to_string(),
+                    truncated: true,
+                },
+                tool_completion(
+                    "write_file",
+                    json!({"path": "compact.txt", "content": "compact\n"}),
+                ),
+                scripted_final("completed after compact mutation recovery"),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(!outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert_eq!(outcome.llm_invocations, 3);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::StepStarted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("compact.txt")).unwrap(),
+            "compact\n"
+        );
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["write_file".to_string()]
+        );
+        let contexts = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::LlmInvocation {
+                    context: Some(context),
+                    ..
+                } => Some(context),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contexts[1].retry_reason,
+            Some(AgentRetryReason::CompactMutationAfterTruncation)
+        );
+        assert_eq!(contexts[1].mutation_payload_char_limit, Some(64));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { summary, message, .. }
+                if summary == "Retrying a compact atomic mutation"
+                    && message.contains("under 64 characters")
+        )));
+    }
+
+    #[test]
+    fn identical_replace_file_gets_no_mutation_or_progress_credit() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("same.txt"), "same\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 3;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({"path": "same.txt"})),
+                tool_completion(
+                    "replace_file",
+                    json!({"path": "same.txt", "content": "same\n"}),
+                ),
+                scripted_final("reported the unchanged replacement"),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.tool_calls, 2);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("same.txt")).unwrap(),
+            "same\n"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Diff { path, .. } if path == "same.txt"
+        )));
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { tool, result, .. } if tool == "replace_file" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .expect("identical replacement result");
+        let failure: agent_tool_errors::ToolFailureEnvelope =
+            serde_json::from_str(result.lines().next().unwrap()).unwrap();
+        assert!(failure.message.contains("made no content change"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolBatch {
+                call_count: 1,
+                useful_count: 0,
+                ..
+            }
+        )));
     }
 
     #[test]

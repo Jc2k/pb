@@ -2073,6 +2073,8 @@ impl FlashMoeSessionCache {
             generated: Vec::new(),
             max_tokens,
             stopped: false,
+            stopped_by_terminal_tool_call: false,
+            stopped_by_constraint_payload_limit: false,
         }
     }
 
@@ -2119,6 +2121,8 @@ impl FlashMoeSessionCache {
             generated: Vec::new(),
             max_tokens,
             stopped: false,
+            stopped_by_terminal_tool_call: false,
+            stopped_by_constraint_payload_limit: false,
         })
     }
 
@@ -2257,6 +2261,8 @@ pub(super) struct FlashMoeGenerationState {
     generated: Vec<u32>,
     max_tokens: usize,
     stopped: bool,
+    stopped_by_terminal_tool_call: bool,
+    stopped_by_constraint_payload_limit: bool,
 }
 
 impl FlashMoeGenerationState {
@@ -2379,12 +2385,36 @@ impl FlashMoeGenerationState {
         (&self.prompt_tokens, &self.generated)
     }
 
-    pub(crate) fn record_sampled_token(&mut self, token: u32, is_eos: bool) {
+    pub(crate) fn record_sampled_token(
+        &mut self,
+        token: u32,
+        is_eos: bool,
+        terminal_tool_call: bool,
+    ) {
         if is_eos {
             self.stopped = true;
+            self.stopped_by_terminal_tool_call = false;
+            self.stopped_by_constraint_payload_limit = false;
         } else {
             self.generated.push(token);
+            self.stopped = terminal_tool_call;
+            self.stopped_by_terminal_tool_call = terminal_tool_call;
+            self.stopped_by_constraint_payload_limit = false;
         }
+    }
+
+    pub(crate) fn stopped_by_terminal_tool_call(&self) -> bool {
+        self.stopped_by_terminal_tool_call
+    }
+
+    pub(crate) fn stop_at_constraint_payload_limit(&mut self) {
+        self.stopped = true;
+        self.stopped_by_terminal_tool_call = false;
+        self.stopped_by_constraint_payload_limit = true;
+    }
+
+    pub(crate) fn stopped_by_constraint_payload_limit(&self) -> bool {
+        self.stopped_by_constraint_payload_limit
     }
 
     pub(crate) fn should_decode(&self) -> bool {
@@ -2570,7 +2600,7 @@ mod tests {
                 .unwrap();
         }
         generation.capture_prompt_cache(vec![9.0, 9.5], recurrent_session_snapshot());
-        generation.record_sampled_token(30, false);
+        generation.record_sampled_token(30, false, false);
         assert_eq!(generation.generated, vec![30]);
         sessions.commit_generation(&mut generation).unwrap();
 
@@ -2590,7 +2620,7 @@ mod tests {
         let mut sessions = FlashMoeSessionCache::default();
         let mut generation = sessions.begin_generation(Some("chat"), vec![10, 20], 3, 1);
         generation.capture_prompt_cache(vec![2.0], recurrent_session_snapshot());
-        generation.record_sampled_token(30, false);
+        generation.record_sampled_token(30, false, false);
         generation
             .kv_cache
             .record_kv(2, 0, vec![3.0], vec![4.0])
@@ -2670,15 +2700,40 @@ mod tests {
         let mut sessions = FlashMoeSessionCache::default();
         let mut generation = sessions.begin_generation(None, vec![10, 20], 2, 1);
         assert!(generation.should_sample_first());
-        generation.record_sampled_token(30, false);
+        generation.record_sampled_token(30, false, false);
         assert!(generation.should_decode());
         let (prompt, generated, _, position) = generation.decode_inputs().unwrap();
         assert_eq!(prompt, &[10, 20]);
         assert_eq!(generated, &[30]);
         assert_eq!(position, 2);
 
-        generation.record_sampled_token(0, true);
+        generation.record_sampled_token(0, true, false);
         assert!(!generation.should_decode());
+        assert_eq!(generation.into_generated(), vec![30]);
+    }
+
+    #[test]
+    fn generation_lifecycle_keeps_the_token_that_closes_a_terminal_tool_call() {
+        let mut sessions = FlashMoeSessionCache::default();
+        let mut generation = sessions.begin_generation(None, vec![10, 20], 4, 1);
+
+        generation.record_sampled_token(30, false, true);
+
+        assert!(!generation.should_decode());
+        assert!(generation.stopped_by_terminal_tool_call());
+        assert_eq!(generation.into_generated(), vec![30]);
+    }
+
+    #[test]
+    fn generation_lifecycle_stops_before_a_constraint_payload_limit_sentinel() {
+        let mut sessions = FlashMoeSessionCache::default();
+        let mut generation = sessions.begin_generation(None, vec![10, 20], 4, 1);
+        generation.record_sampled_token(30, false, false);
+
+        generation.stop_at_constraint_payload_limit();
+
+        assert!(!generation.should_decode());
+        assert!(generation.stopped_by_constraint_payload_limit());
         assert_eq!(generation.into_generated(), vec![30]);
     }
 

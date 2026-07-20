@@ -153,9 +153,10 @@ models and explicit GGUF paths that select it before loading.
 
 ### Qwen3-Coder-Next agent-performance follow-on
 
-Status: **Layer-major prefill shipped and qualified; integrated agent rerun active.** Native
+Status: **Layer-major prefill shipped and qualified; integrated agent rerun measured.** Native
 constraints, telemetry, workflow evidence/output shaping, and the Qwen3-Coder-Next layer-major
-prefill graph are shipped. The preserved browser-agent contract remains the next integrated gate.
+prefill graph are shipped. The preserved browser-agent contract now has a complete native run and
+a bounded recovery follow-up; artifact acceptance remains open because the run stopped incomplete.
 
 The preserved native agent run identified scalar fresh-prompt prefill, repeated stage evidence,
 unconstrained native tool selection, and oversized edits as the remaining path to a successful
@@ -202,6 +203,13 @@ LM-head frontier, validates decoded token prefixes against the native envelope a
 farther only when the normal frontier has no valid token. Diagnostics retain the mode, schema hash,
 rejected-candidate count, and terminal state without argument content. DeepSeek keeps its separate
 DSML parser and llama.cpp keeps its existing grammar behavior.
+Constraint-valid non-EOS candidates must increase the visible decoded prefix. When an open
+`write_file` or `replace_file` string reaches its schema limit, generation stops before a synthetic
+close can turn a cut-off payload into an executable mutation. The agent controller sees the named,
+truncated action and may spend its single same-step compact retry; that retry halves the payload
+allowance in the actual narrowed tool schema. Complete terminal-tool JSON may end semantically
+without spending tokens on the closing Qwen envelope, while ordinary tool-call batches retain the
+shared executor path. These controls change neither graph preparation nor expert scheduling.
 Persistent stage evidence is workflow-checkpoint data keyed by content fingerprints and path hashes,
 not model memory or expert state. None of these follow-ons changes the resident/streamed decision,
 adds a hidden environment toggle, enables unsupported thinking, or permits native load failure to

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -605,6 +606,16 @@ fn generation_finish_reason(generated_tokens: usize, max_tokens: usize) -> Gener
     }
 }
 
+fn close_unclosed_qwen_terminal_tool_call(content: &str) -> Cow<'_, str> {
+    let last_open = content.rfind("<tool_call>");
+    let last_close = content.rfind("</tool_call>");
+    if last_open.is_some() && last_open > last_close {
+        Cow::Owned(format!("{content}</tool_call>"))
+    } else {
+        Cow::Borrowed(content)
+    }
+}
+
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -692,6 +703,20 @@ mod ownership_tests {
             generation_finish_reason(0, 0),
             GenerationFinishReason::MaxTokens
         );
+    }
+
+    #[test]
+    fn terminal_qwen_tool_body_is_closed_only_for_structured_parsing() {
+        let body = "<tool_call>{\"name\":\"submit_plan\",\"arguments\":{}}";
+        assert_eq!(
+            close_unclosed_qwen_terminal_tool_call(body),
+            format!("{body}</tool_call>")
+        );
+        let closed = format!("{body}</tool_call>");
+        assert!(matches!(
+            close_unclosed_qwen_terminal_tool_call(&closed),
+            Cow::Borrowed(_)
+        ));
     }
 
     fn small_expert_storage() -> ExpertStoreExecutionDescriptor {
@@ -3334,7 +3359,11 @@ impl FlashMoeEngine {
         if self.deepseek_graph.is_none() {
             // Compile during preflight as well as generation so unsupported schema features
             // fail before any model work or durable invocation accounting begins.
-            let _ = NativeToolConstraint::compile(request.tool_constraint_mode, &request.tools)?;
+            let _ = NativeToolConstraint::compile_with_terminal_tools(
+                request.tool_constraint_mode,
+                &request.tools,
+                &request.terminal_tool_names,
+            )?;
         }
         if !request.raw_prompt {
             return self.tokenizer.render_and_encode_chat_prompt(
@@ -3611,7 +3640,11 @@ impl FlashMoeEngine {
         let mut tool_constraint = if deepseek_v4 {
             None
         } else {
-            NativeToolConstraint::compile(request.tool_constraint_mode, &request.tools)?
+            NativeToolConstraint::compile_with_terminal_tools(
+                request.tool_constraint_mode,
+                &request.tools,
+                &request.terminal_tool_names,
+            )?
         };
         let deepseek_stable_prefix_len = if deepseek_v4 {
             self.deepseek_stable_prompt_prefix_len(request, &prompt_tokens)?
@@ -3978,7 +4011,25 @@ impl FlashMoeEngine {
                 last.buckets.total_wall += elapsed;
                 last.sampled_token = Some(token);
             }
-            generation.record_sampled_token(token, self.tokenizer.is_eos(token));
+            let payload_limit_stop = tool_constraint
+                .as_mut()
+                .and_then(|constraint| constraint.take_payload_limit_stop())
+                .is_some();
+            if payload_limit_stop {
+                generation.stop_at_constraint_payload_limit();
+            } else {
+                let terminal_tool_call = if let Some(constraint) = tool_constraint.as_ref() {
+                    let (_, generated) = generation.sample_inputs();
+                    constraint.should_stop_after_token(&self.tokenizer, generated, token)?
+                } else {
+                    false
+                };
+                generation.record_sampled_token(
+                    token,
+                    self.tokenizer.is_eos(token),
+                    terminal_tool_call,
+                );
+            }
         }
         let prefill_or_ttft_wall = prefill_or_ttft_started.elapsed();
         let decode_phase_started = Instant::now();
@@ -4044,7 +4095,25 @@ impl FlashMoeEngine {
                 token,
                 decode_started.elapsed().as_millis()
             );
-            generation.record_sampled_token(token, self.tokenizer.is_eos(token));
+            let payload_limit_stop = tool_constraint
+                .as_mut()
+                .and_then(|constraint| constraint.take_payload_limit_stop())
+                .is_some();
+            if payload_limit_stop {
+                generation.stop_at_constraint_payload_limit();
+            } else {
+                let terminal_tool_call = if let Some(constraint) = tool_constraint.as_ref() {
+                    let (_, generated) = generation.sample_inputs();
+                    constraint.should_stop_after_token(&self.tokenizer, generated, token)?
+                } else {
+                    false
+                };
+                generation.record_sampled_token(
+                    token,
+                    self.tokenizer.is_eos(token),
+                    terminal_tool_call,
+                );
+            }
         }
         let decode_wall = decode_phase_started.elapsed();
 
@@ -4074,11 +4143,22 @@ impl FlashMoeEngine {
             self.session_cache.commit_generation(&mut generation)?;
         }
 
+        let stopped_by_terminal_tool_call = generation.stopped_by_terminal_tool_call();
+        let stopped_by_constraint_payload_limit = generation.stopped_by_constraint_payload_limit();
         let generated = generation.into_generated();
         let decoded = self.tokenizer.decode(&generated)?;
-        let finish_reason = generation_finish_reason(generated.len(), max_tokens);
+        let finish_reason = if stopped_by_constraint_payload_limit {
+            GenerationFinishReason::MaxTokens
+        } else {
+            generation_finish_reason(generated.len(), max_tokens)
+        };
+        let parseable_decoded = if stopped_by_terminal_tool_call {
+            close_unclosed_qwen_terminal_tool_call(&decoded)
+        } else {
+            Cow::Borrowed(decoded.as_str())
+        };
         let (content, tool_calls) = self.parse_native_tool_output(
-            &decoded,
+            &parseable_decoded,
             finish_reason == GenerationFinishReason::MaxTokens,
         )?;
         let tool_constraints =
@@ -4860,6 +4940,11 @@ impl FlashMoeEngine {
         progress: &GenerationProgress<'_>,
         mut tool_constraint: Option<&mut NativeToolConstraint>,
     ) -> Result<u32> {
+        if let Some(constraint) = tool_constraint.as_deref_mut()
+            && let Some(token) = constraint.forced_next_token(&self.tokenizer, generated)?
+        {
+            return Ok(token);
+        }
         if let Some(graph) = self.deepseek_graph.as_ref() {
             let logits = self.metal.deepseek_v4_logits(graph, hidden)?;
             let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);

@@ -166,8 +166,13 @@ and repair cycles. It also detects repeated no-progress operations against uncha
 stops loops deterministically.
 
 When a model response is truncated before producing a valid action, pb can retry with thinking
-disabled and, within the same global budget, use a larger output cap. These recovery mechanics help
-the model express an allowed action; they never expose a new capability or waive a transition gate.
+disabled and, within the same global budget, use a larger output cap. A capped native `write_file`
+or `replace_file` also receives at most one compact atomic retry inside that same stage step. That
+retry exposes only the attempted mutation tool, starts from the original authoritative messages
+rather than carrying the rejected oversized payload, and requests a complete loadable payload
+below half of the ordinary mutation allowance. The retry schema enforces that smaller limit rather
+than relying on the correction text alone. These recovery mechanics help the model express an
+allowed action; they never expose a new capability or waive a transition gate.
 Retries consume model-invocation and generated-token budgets, but remain part of the same visible
 stage step. Stage-step accounting is checkpointed at the `StepStarted` boundary, so an action-only
 retry cannot prematurely terminalize a workflow while its result is still being recorded.
@@ -212,6 +217,8 @@ turn's generated-token cap after reserving native-envelope and closing overhead.
 enforced again by recursive executor-side schema validation and appears in the stage anchor and
 invocation telemetry. Larger files are built from complete, loadable, atomic work units rather than
 partial JSON or partial filesystem writes.
+An edit tool receives mutation and progress credit only when repository bytes actually change.
+Identical replacements and edits fail without emitting a diff or invalidating existing evidence.
 
 Local command failures retain their exit status and bounded stdout/stderr in structured tool
 feedback. Output redirected from stderr to stdout is still preserved. A failed command therefore
@@ -250,6 +257,17 @@ For native Qwen FlashMoe stages, generation-time constraints compile the actuall
 names and supported JSON-schema subset before inference. Terminal-only turns require their single
 terminal tool. Candidate filtering cannot grant authority or replace executor validation, and an
 unsupported schema fails preflight rather than silently disabling constraints.
+The controller also identifies an exposed stage-submission tool as terminal. Once its constrained
+JSON body is complete, native generation stops semantically; pb supplies a missing Qwen envelope
+close only to the structured parser. Ordinary tools remain batchable, so this is not a one-call-per-
+prompt policy. At constrained structural frontiers pb deterministically emits a unique validated
+closing suffix, requires every non-EOS token to increase decoded length, and blocks a repeated
+32-token continuation. A file-content string that reaches its declared limit while still open is
+instead returned as a truncated named mutation, making it eligible for compact recovery rather
+than force-closing and executing a cut-off file. Escaped string prefixes are measured after JSON
+decoding, so schema `maxLength`
+remains authoritative. These guards only select output accepted by the compiled schema; the normal
+parser, capability checks, and executor validation still run afterward.
 
 Implementation and repair turns keep their edit tools after a rejected prose final. They are not
 narrowed to `submit_implementation` before the model has had another chance to make the repository

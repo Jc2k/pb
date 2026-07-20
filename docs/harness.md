@@ -366,8 +366,8 @@ Each model-invocation record
 includes an optional backward-compatible context snapshot covering capacity, generation reserve,
 prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,
 thinking mode, retry reason, and the compaction/cache/closure counters introduced by later
-milestones. Evaluation summaries count `thinking_off_truncation_retries` and
-`larger_cap_truncation_retries` separately. Runtime
+milestones. Evaluation summaries count `thinking_off_truncation_retries`,
+`compact_mutation_truncation_retries`, and `larger_cap_truncation_retries` separately. Runtime
 setup failures are reported separately from artifact quality so a backend experiment error is not
 scored as model reasoning.
 
@@ -398,7 +398,11 @@ runtime execution, and pb does not guess, coerce, or add values.
 When a generation reaches its token cap without a valid action, pb first retries once at the same
 cap with thinking disabled and an action-only correction. A visibly truncated workflow terminal
 call keeps the existing terminal-only schema on that retry. If the result is still truncated, pb
-may grow the cap once within the request limit; existing parse-loop thresholds remain authoritative.
+gives a capped native `write_file` or `replace_file` at most one compact retry when applicable,
+with only that tool exposed and without the rejected payload in model context. The requested
+payload is below half the normal mutation allowance, the retry schema enforces that exact smaller
+bound, and the payload must remain complete and loadable. pb may
+then grow the cap once within the request limit; existing parse-loop thresholds remain authoritative.
 Every attempt reserves an invocation and records generated tokens before another retry is allowed,
 so the global invocation and token budgets cannot be bypassed by recovery.
 An action-only retry remains within its original stage step: durable stage-step accounting advances
@@ -415,6 +419,21 @@ compatibility `tool_calls` form may carry a batch; every member is validated bef
 parallel-safe members run together, and all real results return before the next inference pass.
 Calls whose outcome is needed by a later call stay in separate turns, and authority-changing
 workflow or delivery transitions must be the only call in a batch.
+
+The native runner can stop as soon as the constrained JSON body of an exposed stage-submission
+tool is complete. A missing `</tool_call>` suffix is added only to the parser input; it is not
+invented as model evidence. Non-terminal tool calls continue decoding so independent calls can
+still share a response. Constraint recovery can force only a schema-valid closing suffix, rejects
+non-EOS tokens that do not increase decoded length, and prevents a repeated 32-token continuation
+from consuming the cap. If `write_file` or `replace_file` content reaches its schema limit while
+still open, generation stops as a truncated named call instead of force-closing a cut-off file;
+the normal bounded compact recovery then applies.
+
+Successful edit transport is not sufficient for progress credit. `replace_file`, `edit_file`, and
+`apply_patch` must produce a real byte transition; an identical result returns a structured failure,
+emits no diff, and does not invalidate review evidence. A dirty workspace preserved after an
+incomplete delivery is reported as model-limitation evidence, while the same state after a claimed
+ready or verified result remains an experiment error and still fails a clean-workspace contract.
 
 Tool exposure also follows the event sink's actual interaction capability. The non-interactive
 CLI harness does not advertise `ask_user`, because it cannot deliver an answer; interactive web

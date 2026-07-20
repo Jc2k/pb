@@ -6,6 +6,8 @@
 mod cache;
 mod capabilities;
 mod constraints;
+#[cfg(test)]
+pub(crate) use constraints::terminal_tool_output_is_complete;
 mod deepseek;
 mod deepseek_metal;
 mod deepseek_session;
