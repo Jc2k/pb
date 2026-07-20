@@ -62,6 +62,7 @@ pub enum WorkflowOutcome {
     ChecksFailed,
     ReviewFailed,
     RepairCyclesExhausted,
+    ContractUnsatisfied,
     ExecutorUnavailable,
     CommitBlocked,
     StepLimit,

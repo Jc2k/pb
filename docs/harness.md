@@ -86,7 +86,10 @@ after the complete workflow passes.
 
 A contract-free `ready` or `no_change` workflow exits zero while retaining
 `contract_status=unspecified` and `verified_completed=false`. A satisfied explicit contract exits
-zero with `verified_completed=true`. Required mutation with no delta becomes
+zero with `contract_status=satisfied` and `verified_completed=true`. Strict delivery applies the
+contract to planned and final mutation, allowed paths, required checks, named fresh-review reads and
+check evidence, semantic commit requirements, and final workspace cleanliness; attaching a contract
+does not make `Ready` verified by itself. Required mutation with no delta becomes
 `contract_unsatisfied`; persistent check failure, missing executor, repeated repair failure, and an
 unsafe required commit remain distinct nonzero `checks_failed`, `executor_unavailable`,
 `repair_exhausted`, and `commit_blocked` outcomes. Step, parse, runtime-engine, and resource-limit

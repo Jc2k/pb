@@ -895,6 +895,7 @@ export function workflowOutcomeLabel(outcome?: string): string {
     case "checks_failed":
     case "review_failed":
     case "repair_cycles_exhausted":
+    case "contract_unsatisfied":
       return "Needs another pass";
     case "executor_unavailable":
     case "commit_blocked":

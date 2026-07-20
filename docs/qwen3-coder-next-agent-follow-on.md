@@ -1,12 +1,16 @@
 # Qwen3-Coder-Next Agent Performance Follow-on
 
-Status: **Integrated qualification active.** Durable stage evidence, compact terminal schemas, Qwen
+Status: **Integrated qualification ready.** Durable stage evidence, compact terminal schemas, Qwen
 native tool constraints, output-aware mutation bounds, strict-stage TODO removal,
 dependency-aware batch rejection, native telemetry, and true layer-major Qwen3-Coder-Next prefill
 are implemented. The prefill graph passed exact state and resource/performance promotion gates; the
 native runner now also stops on a semantically complete terminal submission and gives an oversized
 file mutation one schema-enforced compact same-step retry. The preserved layer-major harness rerun
 reached implementation but remained incomplete; browser qualification therefore remains open.
+The first focused mutation probe confirmed complete bounded scaffolding but exposed false external
+verification when a strict workflow reached `Ready`. Explicit contract projection and gating now
+pass an executable native qualification: the undersized artifact failed its trusted check, never
+reached review or commit, and ended unsatisfied and unverified. The locked browser run is unblocked.
 Decode has been profiled; no change was promoted because the measured sampling path cannot meet the
 1.5x gate.
 
@@ -18,12 +22,14 @@ the implementation target. Explicit GGUF requests must continue to work through 
 llama.cpp is only a compatibility smoke and regression control for this work; it is not a fallback,
 performance target, or correctness oracle for a native request.
 
-The preserved run did not expose an unresolved safety or completion-gate failure. pb rejected
+The preserved browser run did not expose an unresolved safety or completion-gate failure. pb rejected
 malformed and unavailable actions, did not execute a truncated native batch, did not claim missing
 checks or review, and stopped with `incomplete / step_limit`. The remaining findings are therefore
 primarily P2 efficiency and diagnostic-quality work plus model-control improvements. A new expert
 scheduler, an application expert cache, fake reasoning, or weaker workflow gates would not address
-the measured bottlenecks.
+the measured bottlenecks. The later focused mutation probe did expose one P1 completion-reporting
+defect: strict `Ready` was projected as verified even when explicit contract status remained
+unspecified. That defect is now in the active gate below.
 
 ## Outcome
 
@@ -57,6 +63,7 @@ The intended order is:
 | TODO-only batches consumed output without advancing the artifact | prompt/tool-surface inefficiency | P3 | Remove redundant bookkeeping from strict stages and measure batch value |
 | Qwen3-Coder-Next has no supported thinking mode | model contract | Accepted | Keep thinking off and retain deterministic workflow gates |
 | The final artifact was incomplete | model limitation, truthfully contained | Accepted fixture | Rerun only after the preceding deterministic improvements |
+| Strict `Ready` projected as verified with `contract_status=unspecified` | pb completion-reporting defect | P1 | Fixed and natively qualified with an explicit failing content contract |
 
 The direct workflow schema, one-level string compatibility decoder, atomic rejection of truncated
 native batches, durable planned-path status, and sink-aware `ask_user` exposure are already shipped
@@ -72,9 +79,13 @@ The preserved evidence that drives implementation is deliberately small:
 | `1784555046072-44244-0` | terminal semantic stop reduced planning to 435 generated tokens; plan review accepted on its first 367-token submission | terminal-body completion and parser-envelope fixtures |
 | `1784559198505-50026-0` | plan/review accepted, then capped CSS and JavaScript mutations consumed long retries and left only HTML/CSS | compact same-step mutation retry and bounded-string structural-close fixtures |
 | `1784569541795-68688-0` | first-turn plan/review and three files, then cut-off JavaScript, collapsed constrained output, a no-op replacement, and step-limit containment | monotonic decode, mutation-limit stop, enforced compact schema, no-op mutation, and journal-classification fixtures |
+| `1784586458472-40087-0` | 256-token plan review could not fit and stopped after three bounded parse failures | classify as experiment error; use the smallest cap that can express the terminal schema |
+| `1784586718611-40960-0` | bounded 290-byte scaffold followed by false implementation/review claims and `unspecified` yet verified completion | executable acceptance check plus strict contract projection/gating fixtures |
+| `1784588468585-81408-0` | trusted length check rejected a 263-character scaffold three times; bounded repair ended with no review or task commit | `unsatisfied`, unverified, non-zero terminal result plus independent byte audit |
 
-No additional free-model run is needed in Phases 0–4. Phase 5 is the first justified rerun because
-it measures the integrated outcome after deterministic and native correctness gates have passed.
+The focused contract-backed mutation gate has passed. It validated truthful acceptance and bounded
+output behavior without paying for the full browser fixture. Phase 5 is now the next justified
+integrated run.
 
 ## Architectural invariants
 
@@ -355,8 +366,8 @@ precision.
 
 ## Phase 5 — Qualification rerun
 
-Run the expensive model only after Phases 1–4 pass their deterministic and native smoke gates.
-Use the same 64 GiB host, resident Qwen3-Coder-Next source, non-thinking policy, four allowed files,
+Phases 1–4 have passed their deterministic and native smoke gates. Run the expensive model with the
+same 64 GiB host, resident Qwen3-Coder-Next source, non-thinking policy, four allowed files,
 required `deno test game-logic.test.mjs`, fresh four-file review, semantic commit, clean-worktree
 requirement, and browser interaction contract from the evaluation record.
 

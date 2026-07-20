@@ -731,6 +731,7 @@ export type WorkflowOutcome =
   | "checks_failed"
   | "review_failed"
   | "repair_cycles_exhausted"
+  | "contract_unsatisfied"
   | "executor_unavailable"
   | "commit_blocked"
   | "step_limit"

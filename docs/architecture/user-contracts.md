@@ -78,7 +78,12 @@ machine verification.
 The hidden harness surface can receive a trusted JSON contract from outside its scratch workspace.
 It is parsed before model loading and remains the source of task-specific acceptance facts. Without
 one, pb reports contract status as unspecified rather than converting a confident final answer into
-verified completion.
+verified completion. Strict delivery validates required or forbidden mutation during planning and
+against the final task delta, runs every required check, requires the named fresh-review reads and
+check evidence, verifies commit requirements, and evaluates final workspace cleanliness. Only a
+`Ready` or `NoChange` workflow with all explicit facts satisfied reports
+`contract_status=satisfied` and `verified_completed=true`; a contract-free workflow remains
+unverified, and an unmet explicit contract terminates as `contract_unsatisfied`.
 
 ## Evidence contract
 

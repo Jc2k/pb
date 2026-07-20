@@ -84,7 +84,7 @@
     {"id":"workflow_managed_commit_scope","classification":"positive_evidence","priority":"P0","evidence":"Managed commit includes only task-owned reviewed paths."},
     {"id":"workflow_no_change","classification":"positive_evidence","priority":"P0","evidence":"A validated no-change delivery invents neither check evidence nor a commit."},
     {"id":"workflow_resume_exact","classification":"positive_evidence","priority":"P0","evidence":"A persisted run resumes at its exact stage with artifacts and counters intact."},
-    {"id":"workflow_web_harness_parity","classification":"positive_evidence","priority":"P0","evidence":"Web and harness projections observe the same strict stage sequence and ready outcome."},
+    {"id":"workflow_web_harness_parity","classification":"positive_evidence","priority":"P0","evidence":"Web and harness projections observe the same strict stage sequence and ready outcome without treating a contract-free run as verified."},
     {"id":"workflow_legacy_compatibility","classification":"positive_evidence","priority":"P1","evidence":"Legacy state deserializes without claiming strict-workflow satisfaction."}
   ]
 }

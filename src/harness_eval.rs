@@ -1547,7 +1547,7 @@ fn execute_workflow_assertion_tail(
                         ]
                     && outcome.remaining_completions == 0
                     && outcome.reached_final
-                    && outcome.verified_completed
+                    && !outcome.verified_completed
                     && outcome.termination_reason == crate::events::TerminationReason::Final
                     && outcome.generation_tool_names.len() == 7,
                 "web and harness workflow projections diverged",

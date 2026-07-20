@@ -1153,6 +1153,7 @@ export function SessionCard({
     session.workflow_outcome === "checks_failed" ||
     session.workflow_outcome === "review_failed" ||
     session.workflow_outcome === "repair_cycles_exhausted" ||
+    session.workflow_outcome === "contract_unsatisfied" ||
     session.handoff_outcome === "checks_failed" ||
     session.handoff_outcome === "repair_exhausted"
   ) {

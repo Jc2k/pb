@@ -145,14 +145,58 @@ claimed ready or verified result and still fails a clean-workspace contract. An 
 Qwen3-Coder-Next GGUF control independently returned `4` through llama.cpp after these native-runner
 changes; it was not used as fallback.
 
+## Targeted mutation-bound probe — 2026-07-20
+
+The first focused run, `1784586458472-40087-0`, used a 256-token cap and therefore did not reach the
+mutation hypothesis. Planning completed in one 170-token call, but the six required plan-review
+assessments exceeded that cap three times. pb stopped the repeated incomplete submissions at the
+parse-loop bound without mutation. The 224,700 ms, four-invocation, 938-generated-token, 2.74 Wh run
+is an experiment-configuration error: 256 tokens cannot express this stage artifact.
+
+Corrected run `1784586718611-40960-0` used 512 tokens. Planning and plan review completed on their
+first 169- and 305-token submissions in 35,235 and 54,485 ms. At implementation, the normal schema
+advertised a 640-character mutation allowance against a requested 2,048-character literal. Qwen
+did not trigger compact recovery: it safely wrote one complete 290-byte module containing only 264
+`x` characters. It then falsely claimed that the file contained 2,048 characters; the isolated
+review read the exact one-line file and repeated the false claim.
+
+That run completed in 449,922 ms with seven model invocations, 33,951 prompt tokens, 1,080 generated
+tokens, and 5.62 Wh. The write path is positive containment evidence: no partial payload, cap
+overrun, no-op edit, or unbounded retry occurred. Artifact acceptance is not positive evidence. The
+probe contract omitted an executable literal-length check, so the false artifact was a supervisor
+contract error plus a model/reviewer limitation. It nevertheless exposed a separate P1 pb reporting
+defect: strict delivery emitted `contract_status=unspecified` and `verified_completed=true` merely
+because its internal workflow reached `Ready`.
+
+Strict delivery now keeps local workflow readiness separate from external verification. Required or
+forbidden mutation constrains plan validation and the final task delta; named acceptance checks,
+fresh-review reads and check evidence, semantic commit requirements, allowed paths, and final
+workspace cleanliness must all hold. A contract-free `Ready` remains unverified, and an unmet
+explicit contract terminates as `contract_unsatisfied`.
+
+Qualification run `1784588468585-81408-0` repeated the task with a trusted literal-length check,
+required fresh review and check evidence, a semantic commit, and a clean-workspace gate. Qwen again
+created a complete 290-byte module, this time with 263 literal `x` characters, and submitted it as
+implemented. The check failed before review. Across two bounded repair cycles, pb rejected two
+attempts to overwrite the existing file with `write_file`, directed the first through an
+authoritative read and replacement, rejected a later byte-identical replacement, and executed the
+trusted check three times. All three checks failed. No code review or task commit occurred, and the
+partial file remained visibly untracked.
+
+The run took 435,585 ms over 12 model invocations, 69,907 prompt tokens, 1,340 generated tokens, and
+5.30 Wh. It exited non-zero with `contract_status=unsatisfied`, `verified_completed=false`, and
+`termination_reason=step_limit`; an independent audit measured 263 literal characters and no commit
+beyond the harness baseline. This qualifies the P1 reporting fix and is positive containment
+evidence. The remaining inability to construct or count the requested literal is a model limitation,
+not a reason to weaken the acceptance contract.
+
 ## Ranked follow-up
 
-1. Validate the new monotonic-progress, payload-limit, and compact-schema behavior with a targeted
-   native large-mutation probe before paying for another full workflow. The expected result is an
-   early named truncation and a materially shorter retry, with no cut-off file or no-op progress.
-2. Profile native decode across the shared Qwen data flow. The rerun sustained only about 3–8
-   tokens/s and spent 1,018–1,351 seconds decoding each capped action; promote a common kernel only
-   with exact greedy parity and the existing 1.5x gate.
+1. Run the locked four-file workflow and browser contract. The targeted contract-backed gate now
+   rejects the false artifact truthfully, so another integrated run can produce useful evidence
+   without risking false verification.
+2. Retain the measured decode baseline and promotion gate. Profiling found no shared sampling-path
+   change capable of the required 1.5x gain; do not promote an isolated checkpoint or Q4 fast path.
 3. Shape implementation actions around small complete scaffolds and exact later edits. The
    controller should expose the enforced payload allowance prominently and prefer a bounded tail
    patch after an authoritative read rather than a whole-file replacement.
@@ -166,6 +210,5 @@ changes; it was not used as fallback.
    hidden thinking. For models trained with a real reasoning channel, disabling it can hurt
    ambiguous diagnosis; for Qwen3-Coder-Next the mode is unsupported, so enabling it would only
    create a misleading contract.
-7. Rerun the locked workflow only after the targeted mutation probe and decode gate. Browser
-   inspection remains last: it cannot substitute for all four files, the named Deno check, fresh
-   code review, semantic commit, and clean worktree.
+7. Keep browser inspection last in the locked rerun: it cannot substitute for all four files, the
+   named Deno check, fresh code review, semantic commit, and clean worktree.

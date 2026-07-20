@@ -8609,6 +8609,7 @@ fn run_delivery_workflow(
     stop_before_stage: Option<crate::workflow::WorkflowStage>,
     sink: &mut dyn EventSink,
 ) -> Result<DeliveryRunOutcome> {
+    let has_acceptance_contract = args.contract.is_some();
     let policy = args
         .workflow_policy
         .clone()
@@ -8733,7 +8734,7 @@ fn run_delivery_workflow(
 
     loop {
         if sink.should_pause() && !run.stage.is_terminal() {
-            return delivery_paused_outcome(run, metrics, sink);
+            return delivery_paused_outcome(run, metrics, has_acceptance_contract, sink);
         }
         if sink.should_cancel() && !run.stage.is_terminal() {
             run.apply(crate::workflow::WorkflowEvent::Cancelled {
@@ -8743,13 +8744,17 @@ fn run_delivery_workflow(
             checkpoint_delivery(&run, sink)?;
         }
         if run.stage.is_terminal() {
-            return delivery_terminal_outcome(run, metrics, sink);
+            return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
         }
         if stop_before_stage == Some(run.stage) {
             return Ok(DeliveryRunOutcome {
                 step: StepRunOutcome {
                     reached_final: false,
-                    contract_status: ContractStatus::Unspecified,
+                    contract_status: if has_acceptance_contract {
+                        ContractStatus::Unsatisfied
+                    } else {
+                        ContractStatus::Unspecified
+                    },
                     verified_completed: false,
                     termination_reason: TerminationReason::ContractUnsatisfied,
                     final_content: Some(format!("test observation stopped before {:?}", run.stage)),
@@ -8763,6 +8768,7 @@ fn run_delivery_workflow(
             repair_context = run_delivery_checks(
                 &mut run,
                 graph,
+                args.contract.as_ref(),
                 &mut check_runtime,
                 &workflow_control_baseline,
                 workspace_root,
@@ -8774,6 +8780,7 @@ fn run_delivery_workflow(
             run_delivery_commit(
                 &mut run,
                 graph,
+                args.contract.as_ref(),
                 &workflow_control_baseline,
                 workspace_root,
                 sink,
@@ -8801,7 +8808,7 @@ fn run_delivery_workflow(
                     policy.limits.stage_steps
                 ),
             })?;
-            return delivery_terminal_outcome(run, metrics, sink);
+            return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
         }
         sink.emit(AgentEvent::WorkflowStageStarted {
             workflow_id: run.id.clone(),
@@ -8822,14 +8829,14 @@ fn run_delivery_workflow(
                     reason: "repository content changed after harness checks and before isolated code review"
                         .to_string(),
                 })?;
-                return delivery_terminal_outcome(run, metrics, sink);
+                return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
             }
             if let Err(error) = validate_code_review_scope(&run, workspace_root) {
                 run.apply(crate::workflow::WorkflowEvent::Failed {
                     outcome: crate::workflow::WorkflowOutcome::ReviewFailed,
                     reason: format!("code review scope is unsafe: {error:#}"),
                 })?;
-                return delivery_terminal_outcome(run, metrics, sink);
+                return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
             }
         }
         let context = delivery_stage_context(
@@ -8940,7 +8947,7 @@ fn run_delivery_workflow(
                         "repository content changed while the read-only {stage:?} stage was running"
                     ),
                 })?;
-                return delivery_terminal_outcome(run, metrics, sink);
+                return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
             }
         }
         let current_control = git_control_state(workspace_root)?;
@@ -8952,7 +8959,7 @@ fn run_delivery_workflow(
                     workflow_control_baseline.difference(&current_control)
                 ),
             })?;
-            return delivery_terminal_outcome(run, metrics, sink);
+            return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
         }
         if stage == crate::workflow::WorkflowStage::CodeReview {
             let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
@@ -8962,15 +8969,15 @@ fn run_delivery_workflow(
                     reason: "repository content changed while isolated code review was running"
                         .to_string(),
                 })?;
-                return delivery_terminal_outcome(run, metrics, sink);
+                return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
             }
         }
         checkpoint_delivery(&run, sink)?;
         if run.stage.is_terminal() {
-            return delivery_terminal_outcome(run, metrics, sink);
+            return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
         }
         if sink.should_pause() {
-            return delivery_paused_outcome(run, metrics, sink);
+            return delivery_paused_outcome(run, metrics, has_acceptance_contract, sink);
         }
         if stage_outcome.control_violation.is_some() {
             run.apply(crate::workflow::WorkflowEvent::Failed {
@@ -8979,7 +8986,7 @@ fn run_delivery_workflow(
                     .control_violation
                     .unwrap_or_else(|| "workflow control state changed".to_string()),
             })?;
-            return delivery_terminal_outcome(run, metrics, sink);
+            return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
         }
         let Some(submission) = stage_outcome.submission else {
             if stage_outcome.termination_reason == TerminationReason::Cancelled {
@@ -8987,7 +8994,7 @@ fn run_delivery_workflow(
                     reason: "cancelled by user; repository content and evidence were preserved"
                         .to_string(),
                 })?;
-                return delivery_terminal_outcome(run, metrics, sink);
+                return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
             }
             let workflow_outcome =
                 workflow_outcome_for_termination(stage_outcome.termination_reason);
@@ -8998,7 +9005,7 @@ fn run_delivery_workflow(
                     stage_outcome.termination_reason
                 ),
             })?;
-            return delivery_terminal_outcome(run, metrics, sink);
+            return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
         };
 
         let previous_content_fingerprint = run.content_fingerprint.clone();
@@ -9075,6 +9082,15 @@ fn run_delivery_workflow(
             ) => {
                 let read_paths = stage_outcome.read_paths.into_iter().collect::<HashSet<_>>();
                 validate_code_review_submission(&review, &run, graph, workspace_root, &read_paths)
+                    .and_then(|_| {
+                        validate_strict_review_contract(
+                            args.contract.as_ref(),
+                            &run,
+                            graph,
+                            workspace_root,
+                            &read_paths,
+                        )
+                    })
                     .and_then(|_| {
                         run.apply(crate::workflow::WorkflowEvent::CodeReviewSubmitted {
                             review: review.clone(),
@@ -9183,7 +9199,7 @@ fn run_delivery_workflow(
                             "the same invalid {stage:?} submission was rejected {repeated_validation_failures} times: {error:#}"
                         ),
                     })?;
-                    return delivery_terminal_outcome(run, metrics, sink);
+                    return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
                 }
                 validation_feedback = Some(feedback);
                 checkpoint_delivery(&run, sink)?;
@@ -9276,6 +9292,7 @@ fn accepted_plan_check_ids(run: &crate::workflow::WorkflowRun) -> Vec<String> {
 fn run_delivery_checks(
     run: &mut crate::workflow::WorkflowRun,
     graph: &crate::workspace::WorkspaceGraph,
+    contract: Option<&crate::harness_contract::AgentContract>,
     runtime: &mut WorkspaceCheckRuntime<'_>,
     control_baseline: &GitControlState,
     workspace_root: &Path,
@@ -9338,6 +9355,29 @@ fn run_delivery_checks(
     }
     let evidence = runtime.ledger().clone();
     if summary.all_succeeded() {
+        let no_change = run
+            .implementation
+            .as_ref()
+            .is_some_and(|implementation| implementation.artifact.no_change);
+        if no_change
+            && let Some(contract) = contract
+            && let Some(feedback) = strict_delivery_contract_feedback(
+                contract,
+                run,
+                graph,
+                workspace_root,
+                &plan.checks,
+                &evidence,
+                None,
+            )?
+        {
+            run.apply(crate::workflow::WorkflowEvent::Failed {
+                outcome: crate::workflow::WorkflowOutcome::ContractUnsatisfied,
+                reason: feedback,
+            })?;
+            checkpoint_delivery(run, sink)?;
+            return Ok(None);
+        }
         run.apply(crate::workflow::WorkflowEvent::ChecksPassed {
             content_fingerprint: content_after.fingerprint,
             selected_checks: plan.checks,
@@ -9591,6 +9631,7 @@ pub(crate) fn validate_code_review_submission(
 fn run_delivery_commit(
     run: &mut crate::workflow::WorkflowRun,
     graph: &crate::workspace::WorkspaceGraph,
+    contract: Option<&crate::harness_contract::AgentContract>,
     control_baseline: &GitControlState,
     workspace_root: &Path,
     sink: &mut dyn EventSink,
@@ -9665,6 +9706,24 @@ fn run_delivery_commit(
             return Ok(());
         }
     };
+    if let Some(contract) = contract
+        && let Some(feedback) = strict_delivery_contract_feedback(
+            contract,
+            run,
+            graph,
+            workspace_root,
+            &run.selected_checks,
+            &run.checks,
+            Some(&commit),
+        )?
+    {
+        run.apply(crate::workflow::WorkflowEvent::Failed {
+            outcome: crate::workflow::WorkflowOutcome::ContractUnsatisfied,
+            reason: feedback,
+        })?;
+        checkpoint_delivery(run, sink)?;
+        return Ok(());
+    }
     run.apply(crate::workflow::WorkflowEvent::CommitCompleted {
         content_fingerprint: current.fingerprint,
         commit,
@@ -10049,6 +10108,9 @@ fn delivery_repository_brief(
 
 fn workflow_outcome_for_termination(reason: TerminationReason) -> crate::workflow::WorkflowOutcome {
     match reason {
+        TerminationReason::ContractUnsatisfied => {
+            crate::workflow::WorkflowOutcome::ContractUnsatisfied
+        }
         TerminationReason::StepLimit
         | TerminationReason::GateLoop
         | TerminationReason::ParseLoop => crate::workflow::WorkflowOutcome::StepLimit,
@@ -10066,9 +10128,27 @@ fn workflow_outcome_for_termination(reason: TerminationReason) -> crate::workflo
     }
 }
 
+fn delivery_contract_projection(
+    outcome: crate::workflow::WorkflowOutcome,
+    has_acceptance_contract: bool,
+) -> (ContractStatus, bool) {
+    if !has_acceptance_contract {
+        return (ContractStatus::Unspecified, false);
+    }
+    if matches!(
+        outcome,
+        crate::workflow::WorkflowOutcome::Ready | crate::workflow::WorkflowOutcome::NoChange
+    ) {
+        (ContractStatus::Satisfied, true)
+    } else {
+        (ContractStatus::Unsatisfied, false)
+    }
+}
+
 fn delivery_terminal_outcome(
     run: crate::workflow::WorkflowRun,
     metrics: RunMetrics,
+    has_acceptance_contract: bool,
     sink: &mut dyn EventSink,
 ) -> Result<DeliveryRunOutcome> {
     let outcome = run
@@ -10086,6 +10166,9 @@ fn delivery_terminal_outcome(
         crate::workflow::WorkflowOutcome::RepairCyclesExhausted => {
             TerminationReason::RepairExhausted
         }
+        crate::workflow::WorkflowOutcome::ContractUnsatisfied => {
+            TerminationReason::ContractUnsatisfied
+        }
         crate::workflow::WorkflowOutcome::CommitBlocked => TerminationReason::CommitBlocked,
         crate::workflow::WorkflowOutcome::Cancelled => TerminationReason::Cancelled,
         _ if matches!(
@@ -10098,6 +10181,8 @@ fn delivery_terminal_outcome(
         _ => TerminationReason::EngineError,
     };
     let reached_final = run.stage.is_terminal();
+    let (contract_status, verified_completed) =
+        delivery_contract_projection(outcome, has_acceptance_contract);
     let detail = run
         .blocked_reason
         .clone()
@@ -10132,8 +10217,8 @@ fn delivery_terminal_outcome(
     Ok(DeliveryRunOutcome {
         step: StepRunOutcome {
             reached_final,
-            contract_status: ContractStatus::Unspecified,
-            verified_completed: outcome == crate::workflow::WorkflowOutcome::Ready,
+            contract_status,
+            verified_completed,
             termination_reason,
             final_content: Some(detail),
             metrics,
@@ -10146,6 +10231,7 @@ fn delivery_terminal_outcome(
 fn delivery_paused_outcome(
     run: crate::workflow::WorkflowRun,
     metrics: RunMetrics,
+    has_acceptance_contract: bool,
     sink: &mut dyn EventSink,
 ) -> Result<DeliveryRunOutcome> {
     let checkpoint = crate::workflow::WorkflowCheckpoint::new(run)?;
@@ -10154,7 +10240,11 @@ fn delivery_paused_outcome(
     Ok(DeliveryRunOutcome {
         step: StepRunOutcome {
             reached_final: false,
-            contract_status: ContractStatus::Unspecified,
+            contract_status: if has_acceptance_contract {
+                ContractStatus::Unsatisfied
+            } else {
+                ContractStatus::Unspecified
+            },
             verified_completed: false,
             termination_reason: TerminationReason::ContractUnsatisfied,
             final_content: Some("Paused by user at a safe workflow boundary".to_string()),
@@ -11771,6 +11861,122 @@ fn contract_completion_gate_feedback(
         ContractGatePhase::HandoffComplete,
         None,
     )
+}
+
+fn validate_strict_review_contract(
+    contract: Option<&crate::harness_contract::AgentContract>,
+    run: &crate::workflow::WorkflowRun,
+    graph: &crate::workspace::WorkspaceGraph,
+    workspace_root: &Path,
+    read_paths: &HashSet<String>,
+) -> Result<()> {
+    let Some(contract) = contract.filter(|contract| contract.review.required) else {
+        return Ok(());
+    };
+    let missing_reads = contract
+        .review
+        .read_paths
+        .iter()
+        .filter(|path| !read_paths.contains(path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_reads.is_empty() {
+        bail!(
+            "fresh code review omitted contract-required path(s): {}",
+            missing_reads.join(", ")
+        );
+    }
+    for check_id in &contract.review.check_ids {
+        if !run.selected_checks.contains(check_id)
+            || !graph.checks.contains_key(check_id)
+            || !check_evidence_is_current(workspace_root, graph, &run.checks, check_id)?
+        {
+            bail!(
+                "fresh code review lacks current contract-required check evidence for '{check_id}'"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn strict_delivery_contract_feedback(
+    contract: &crate::harness_contract::AgentContract,
+    run: &crate::workflow::WorkflowRun,
+    graph: &crate::workspace::WorkspaceGraph,
+    workspace_root: &Path,
+    selected_checks: &[String],
+    checks: &CheckEvidenceLedger,
+    commit: Option<&crate::events::HandoffCommitSummary>,
+) -> Result<Option<String>> {
+    let changed_paths = run.repository.task_changed_paths()?;
+    let mut missing = Vec::new();
+    match contract.mutation {
+        crate::harness_contract::MutationRequirement::Required if changed_paths.is_empty() => {
+            missing.push("the contract requires a final repository mutation".to_string());
+        }
+        crate::harness_contract::MutationRequirement::Forbidden if !changed_paths.is_empty() => {
+            missing.push(format!(
+                "the contract forbids repository mutations, but these paths changed: {}",
+                changed_paths.join(", ")
+            ));
+        }
+        _ => {}
+    }
+    if !contract.allowed_paths.is_empty() {
+        let forbidden = changed_paths
+            .iter()
+            .filter(|path| {
+                !contract.allowed_paths.iter().any(|allowed| {
+                    path.as_str() == allowed
+                        || allowed
+                            .strip_suffix('/')
+                            .is_some_and(|directory| path.starts_with(&format!("{directory}/")))
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !forbidden.is_empty() {
+            missing.push(format!(
+                "changed paths are outside allowed_paths: {}",
+                forbidden.join(", ")
+            ));
+        }
+    }
+    for check in contract.checks.iter().filter(|check| check.required) {
+        if !selected_checks.contains(&check.id)
+            || !graph.checks.contains_key(&check.id)
+            || !check_evidence_is_current(workspace_root, graph, checks, &check.id)?
+        {
+            missing.push(format!(
+                "required check '{}' lacks current successful evidence",
+                check.id
+            ));
+        }
+    }
+    if contract.review.required && run.code_review.is_none() {
+        missing.push("the contract requires a fresh code review".to_string());
+    }
+    if contract.commit.required && commit.is_none() {
+        missing.push("the contract requires a task commit".to_string());
+    }
+    if contract.commit.semantic
+        && let Some(commit) = commit
+        && !is_semantic_commit_message(&commit.subject)
+    {
+        missing.push(format!(
+            "task commit subject is not semantic: {}",
+            commit.subject
+        ));
+    }
+    if contract.workspace_clean && !git_status_porcelain(workspace_root)?.trim().is_empty() {
+        missing.push("the contract requires a clean workspace".to_string());
+    }
+    Ok((!missing.is_empty()).then(|| {
+        format!(
+            "Harness acceptance contract is not satisfied: {}.",
+            missing.join("; ")
+        )
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13961,12 +14167,46 @@ fn validate_plan_contract_paths(
     request: &AgentRequest,
     plan: &crate::workflow::PlanArtifact,
 ) -> Result<()> {
-    ensure_contract_paths_allowed(
-        request,
-        plan.steps
+    let planned_paths = plan
+        .steps
+        .iter()
+        .flat_map(|step| step.paths.iter().map(|path| path.path.as_str()))
+        .collect::<Vec<_>>();
+    if let Some(contract) = request.contract.as_ref() {
+        match contract.mutation {
+            crate::harness_contract::MutationRequirement::Required if planned_paths.is_empty() => {
+                bail!("harness contract requires the plan to include a repository mutation")
+            }
+            crate::harness_contract::MutationRequirement::Forbidden
+                if !planned_paths.is_empty() =>
+            {
+                bail!("harness contract forbids planned repository mutations")
+            }
+            _ => {}
+        }
+        let planned_checks = plan
+            .acceptance
             .iter()
-            .flat_map(|step| step.paths.iter().map(|path| path.path.as_str())),
-    )
+            .flat_map(|acceptance| acceptance.check_ids.iter().map(String::as_str))
+            .collect::<HashSet<_>>();
+        let mut required_checks = contract
+            .checks
+            .iter()
+            .filter(|check| check.required)
+            .map(|check| check.id.as_str())
+            .chain(contract.review.check_ids.iter().map(String::as_str))
+            .filter(|check_id| !planned_checks.contains(check_id))
+            .collect::<Vec<_>>();
+        required_checks.sort_unstable();
+        required_checks.dedup();
+        if !required_checks.is_empty() {
+            bail!(
+                "harness contract requires the plan to select check(s): {}",
+                required_checks.join(", ")
+            );
+        }
+    }
+    ensure_contract_paths_allowed(request, planned_paths)
 }
 
 fn ensure_file_was_read(
@@ -16973,17 +17213,68 @@ the next imagined action"#;
         request.contract = Some(normalized_test_contract("true"));
         let allowed = delivery_plan(
             Some(("game.js", crate::workflow::PlannedChange::Create)),
-            Vec::new(),
+            vec!["logic".to_string()],
         );
         validate_plan_contract_paths(&request, &allowed.artifact).unwrap();
 
         let forbidden = delivery_plan(
             Some(("repo/game.js", crate::workflow::PlannedChange::Create)),
-            Vec::new(),
+            vec!["logic".to_string()],
         );
         let error = validate_plan_contract_paths(&request, &forbidden.artifact).unwrap_err();
         assert!(error.to_string().contains("repo/game.js"));
         assert!(error.to_string().contains("Allowed paths: game.js"));
+    }
+
+    #[test]
+    fn trusted_contract_enforces_mutation_and_checks_during_plan_validation() {
+        let repo = init_contract_test_repo();
+        let no_change = delivery_plan(None, Vec::new());
+        let change = delivery_plan(
+            Some(("game.js", crate::workflow::PlannedChange::Create)),
+            Vec::new(),
+        );
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        let mut contract = empty_test_contract();
+        contract.mutation = crate::harness_contract::MutationRequirement::Required;
+        request.contract = Some(contract);
+        assert!(
+            validate_plan_contract_paths(&request, &no_change.artifact)
+                .unwrap_err()
+                .to_string()
+                .contains("requires the plan")
+        );
+
+        request.contract.as_mut().unwrap().mutation =
+            crate::harness_contract::MutationRequirement::Forbidden;
+        assert!(
+            validate_plan_contract_paths(&request, &change.artifact)
+                .unwrap_err()
+                .to_string()
+                .contains("forbids planned")
+        );
+
+        request.contract = Some(crate::harness_contract::AgentContract {
+            version: 1,
+            mutation: crate::harness_contract::MutationRequirement::Optional,
+            allowed_paths: vec!["game.js".to_string()],
+            checks: vec![crate::harness_contract::AgentCheckContract {
+                id: "logic".to_string(),
+                command: "true".to_string(),
+                cwd: ".".to_string(),
+                required: true,
+                timeout_seconds: 2,
+            }],
+            commit: crate::harness_contract::HarnessCommitContract::default(),
+            review: crate::harness_contract::HarnessReviewContract::default(),
+            workspace_clean: false,
+        });
+        assert!(
+            validate_plan_contract_paths(&request, &change.artifact)
+                .unwrap_err()
+                .to_string()
+                .contains("select check(s): logic")
+        );
     }
 
     #[test]
@@ -18013,6 +18304,29 @@ the next imagined action"#;
             vec![check_id.clone()],
         );
         let mut request = workflow_request(AgentProfile::Build, repo.path());
+        let contract_check = graph.checks.get(&check_id).unwrap();
+        request.contract = Some(crate::harness_contract::AgentContract {
+            version: 1,
+            mutation: crate::harness_contract::MutationRequirement::Required,
+            allowed_paths: vec!["existing.txt".to_string()],
+            checks: vec![crate::harness_contract::AgentCheckContract {
+                id: check_id.clone(),
+                command: contract_check.command.clone(),
+                cwd: contract_check.cwd.clone(),
+                required: true,
+                timeout_seconds: contract_check.timeout_seconds,
+            }],
+            commit: crate::harness_contract::HarnessCommitContract {
+                required: true,
+                semantic: true,
+            },
+            review: crate::harness_contract::HarnessReviewContract {
+                required: true,
+                read_paths: vec!["existing.txt".to_string()],
+                check_ids: vec![check_id.clone()],
+            },
+            workspace_clean: false,
+        });
         request.workspace_graph = Some(graph);
         request.repository_context =
             Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
@@ -18056,6 +18370,7 @@ the next imagined action"#;
                 .unwrap_or("no blocked reason"),
             events
         );
+        assert_eq!(outcome.step.contract_status, ContractStatus::Satisfied);
         assert!(outcome.step.verified_completed);
         assert_eq!(
             outcome.checkpoint.run.selected_checks,
@@ -18127,6 +18442,30 @@ the next imagined action"#;
     }
 
     #[test]
+    fn strict_delivery_verification_requires_an_explicit_satisfied_contract() {
+        assert_eq!(
+            delivery_contract_projection(crate::workflow::WorkflowOutcome::Ready, false),
+            (ContractStatus::Unspecified, false)
+        );
+        assert_eq!(
+            delivery_contract_projection(crate::workflow::WorkflowOutcome::NoChange, false),
+            (ContractStatus::Unspecified, false)
+        );
+        assert_eq!(
+            delivery_contract_projection(crate::workflow::WorkflowOutcome::Ready, true),
+            (ContractStatus::Satisfied, true)
+        );
+        assert_eq!(
+            delivery_contract_projection(crate::workflow::WorkflowOutcome::NoChange, true),
+            (ContractStatus::Satisfied, true)
+        );
+        assert_eq!(
+            delivery_contract_projection(crate::workflow::WorkflowOutcome::ChecksFailed, true),
+            (ContractStatus::Unsatisfied, false)
+        );
+    }
+
+    #[test]
     fn strict_no_change_stops_after_harness_checks_without_review_or_commit() {
         let repo = init_contract_test_repo();
         let baseline = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
@@ -18180,6 +18519,41 @@ the next imagined action"#;
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn strict_no_change_with_an_explicit_contract_is_verified() {
+        let repo = init_contract_test_repo();
+        let baseline = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let plan = delivery_plan(None, Vec::new());
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.contract = Some(empty_test_contract());
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-strict-contracted-no-change".to_string();
+
+        let (outcome, generator, _) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                text_completion(implementation_submission(
+                    &plan,
+                    &baseline.fingerprint,
+                    Vec::new(),
+                    true,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::NoChange)
+        );
+        assert_eq!(outcome.step.contract_status, ContractStatus::Satisfied);
+        assert!(outcome.step.verified_completed);
+        assert!(generator.completions.is_empty());
     }
 
     #[test]
@@ -18703,6 +19077,7 @@ the next imagined action"#;
         run_delivery_commit(
             &mut run,
             &graph,
+            None,
             &control_baseline,
             repo.path(),
             &mut |_| {},

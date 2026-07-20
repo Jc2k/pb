@@ -108,6 +108,7 @@ Deno.test("strict workflow stages and outcomes use compact truthful labels", () 
   equal(workflowStageLabel("committing"), "Creating reviewed commit");
   equal(workflowOutcomeLabel("no_change"), "No code changes");
   equal(workflowOutcomeLabel("review_failed"), "Needs another pass");
+  equal(workflowOutcomeLabel("contract_unsatisfied"), "Needs another pass");
   equal(workflowOutcomeLabel("commit_blocked"), "Needs help");
   equal(workflowOutcomeLabel("cancelled"), "Cancelled — work preserved");
   equal(workflowProgressLabel("ready", "ready"), "Ready");
