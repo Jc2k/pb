@@ -147,6 +147,10 @@ struct WebSearchResult {
 pub trait EventSink {
     fn emit(&mut self, event: AgentEvent);
 
+    fn supports_user_questions(&self) -> bool {
+        false
+    }
+
     /// Persist a complete workflow checkpoint synchronously. Delivery calls this before any next
     /// stage/model invocation so an event stream cannot claim a transition that recovery loses.
     fn checkpoint_workflow(
@@ -2232,7 +2236,6 @@ fn run_agent_inner<S: EventSink>(
     });
 
     let mut flashmoe_runtime = None;
-    let mut flashmoe_setup_error = None;
     if let Some(plan) = flashmoe_plan.as_ref() {
         match crate::inference::flashmoe::load_shared(plan) {
             Ok(runtime) => {
@@ -2263,18 +2266,7 @@ fn run_agent_inner<S: EventSink>(
                     nesting_depth: Some(0),
                     timestamp_ms: Some(now_millis()),
                 });
-                flashmoe_setup_error = Some(message);
-                let fallback_note = format!(
-                    "Flash-MoE is the default backend for {model} on ARM macOS, \
-                     but pb is falling back to llama.cpp.",
-                    model = plan.model,
-                );
-                sink.emit(AgentEvent::Correction {
-                    message: fallback_note,
-                    summary: "using llama.cpp fallback for this session".to_string(),
-                    nesting_depth: Some(0),
-                    timestamp_ms: Some(now_millis()),
-                });
+                bail!(message);
             }
         }
     }
@@ -2303,14 +2295,7 @@ fn run_agent_inner<S: EventSink>(
                 llamacpp_backend = Some(backend);
             }
             Err(error) => {
-                let message = if let Some(flashmoe_error) = flashmoe_setup_error.as_deref() {
-                    format!(
-                        "{flashmoe_error}\n\nllama.cpp fallback setup failed for {}: {error}",
-                        args.model
-                    )
-                } else {
-                    format!("llama.cpp setup failed for {}: {error}", args.model)
-                };
+                let message = format!("llama.cpp setup failed for {}: {error}", args.model);
                 sink.emit(AgentEvent::Error {
                     message: message.clone(),
                     summary: "Model setup failed".to_string(),
@@ -4008,18 +3993,19 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
 fn artifact_submission_schema(
     field: &'static str,
     description: &'static str,
-    artifact_schema: Value,
+    mut artifact_schema: Value,
 ) -> Value {
+    artifact_schema
+        .as_object_mut()
+        .expect("workflow artifact schema must be an object")
+        .insert(
+            "description".to_string(),
+            Value::String(description.to_string()),
+        );
     object_schema(
         [
             string_property("id", "Stable artifact id for this stage submission."),
-            (
-                field,
-                json!({
-                    "description": description,
-                    "allOf": [artifact_schema],
-                }),
-            ),
+            (field, artifact_schema),
         ],
         ["id", field],
     )
@@ -4904,6 +4890,9 @@ fn run_agent_steps(
             available_tools.retain(|tool| tool.name != "start_delivery");
         }
     }
+    if !sink.supports_user_questions() {
+        available_tools.retain(|tool| tool.name != "ask_user");
+    }
 
     while step <= effective_max_steps {
         if sink.should_cancel() {
@@ -5032,13 +5021,16 @@ fn run_agent_steps(
         let generation_messages = closure_messages.as_deref().unwrap_or(messages);
         let terminal_only_turn = terminal_submission_only
             || matches!(exposure_state, ToolExposureState::TerminalOnly { .. });
+        let enable_thinking =
+            workflow_completion_enable_thinking(args, step, suppress_thinking, terminal_only_turn)
+                && generator.supports_thinking()?;
         let generated = match generate_and_parse_action_with_retries(
             generator,
             args,
             workspace_root,
             generation_messages,
             generation_tools,
-            workflow_completion_enable_thinking(args, step, suppress_thinking, terminal_only_turn),
+            enable_thinking,
             step,
             &mut metrics,
             sink,
@@ -7406,6 +7398,13 @@ fn truncated_native_tool_name(output: &str) -> Option<&str> {
             .filter(|name| !name.is_empty());
     }
 
+    if let Some((_, suffix)) = output.rsplit_once("<function=") {
+        return suffix
+            .split_once('>')
+            .map(|(name, _)| name)
+            .filter(|name| !name.is_empty());
+    }
+
     let (_, tool_call) = output.split_once("<tool_call>")?;
     let (_, after_name) = tool_call.split_once("\"name\"")?;
     let (_, value) = after_name.split_once(':')?;
@@ -7681,6 +7680,7 @@ fn repeated_tool_call_feedback(repeated: &[(&str, &Value, usize)]) -> Option<Str
 struct CompletionOutput {
     content: String,
     tool_calls: Vec<AgentToolCall>,
+    tool_parse_error: Option<String>,
     finish_reason: CompletionFinishReason,
     prompt_tokens: usize,
     generated_tokens: usize,
@@ -7750,6 +7750,10 @@ fn rejected_completion_diagnostic(output: &str, finish_reason: CompletionFinishR
 }
 
 trait CompletionEngine {
+    fn supports_thinking(&self) -> Result<bool> {
+        Ok(true)
+    }
+
     fn measure_prompt(
         &mut self,
         args: &AgentRequest,
@@ -7951,6 +7955,10 @@ impl WorkflowCheckpointingSink<'_> {
 }
 
 impl EventSink for WorkflowCheckpointingSink<'_> {
+    fn supports_user_questions(&self) -> bool {
+        self.sink.supports_user_questions()
+    }
+
     fn emit(&mut self, event: AgentEvent) {
         self.sink.emit(event);
     }
@@ -9381,7 +9389,7 @@ fn delivery_stage_context(
                 .transpose()?
                 .unwrap_or_else(|| "[]".to_string());
             Ok(StageContext {
-                system_prompt: "You are the planning stage of a harness-controlled delivery workflow. You have read-only repository tools. Produce a concrete, structurally complete plan tied to real workspace component/check ids and repository-relative paths. Resolve human ambiguity with ask_user before submission. End only by calling submit_plan; prose final responses cannot advance the workflow.".to_string(),
+                system_prompt: "You are the planning stage of a harness-controlled delivery workflow. You have read-only repository tools. Produce a concrete, structurally complete plan tied to real workspace component/check ids and repository-relative paths. Resolve genuinely blocking human ambiguity with ask_user when that tool is exposed; otherwise record a truthful open question instead of inventing an answer. End only by calling submit_plan; prose final responses cannot advance the workflow.".to_string(),
                 user_prompt: format!(
                     "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}\n\nBounded repository brief (full normalized graph SHA-256 {graph_sha256} remains the validation authority):\n{repository_brief_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{handoff_note}\n\n{PLAN_SUBMISSION_GUIDANCE}{correction}",
                     run.task,
@@ -9428,10 +9436,12 @@ fn delivery_stage_context(
                 .transpose()?
                 .unwrap_or_else(|| "[]".to_string());
             let current = crate::workspace::ContentSnapshot::capture(&run.repository.repo_root)?;
+            let planned_path_state =
+                implementation_planned_path_state_json(run, &plan.artifact, &current)?;
             Ok(StageContext {
                 system_prompt: "You are the implementation or repair stage of a harness-controlled delivery workflow. Implement exactly the accepted plan. A submit_implementation call only reports work; it never performs edits. When the plan requires a delta, first call the available write/edit tools in earlier turns, observe their results, and only then submit accounting for actual touched paths. Never report a touched path that you did not mutate. If validation reports an empty actual delta for a required change, call an edit tool next instead of repeating the submission. Built-in edits, configured run_task/run_check, and run_command are available, but run_command is only a journaled escape hatch and cannot earn check, review, or commit credit. You cannot commit. If the accepted plan is materially wrong, call request_replan. Otherwise account for every plan step and end only with submit_implementation using the exact current content fingerprint and actual touched paths.".to_string(),
                 user_prompt: format!(
-                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nPassing plan critique:\n{review_json}\n\nCurrent harness content fingerprint: {}\n\nBlocking code findings from the prior review:\n{findings}\n\n{handoff_note}\n\n{IMPLEMENTATION_SUBMISSION_GUIDANCE}{repair_note}{correction}",
+                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nPassing plan critique:\n{review_json}\n\nCurrent harness content fingerprint: {}\n\nCurrent planned-path state (authoritative for this invocation; do not call write_file for a path whose state says it already exists):\n{planned_path_state}\n\nBlocking code findings from the prior review:\n{findings}\n\n{handoff_note}\n\n{IMPLEMENTATION_SUBMISSION_GUIDANCE}{repair_note}{correction}",
                     run.task, current.fingerprint,
                 ),
                 expected_content_fingerprint: None,
@@ -9484,6 +9494,43 @@ fn delivery_stage_context(
         }
         stage => bail!("cannot build planning context for {stage:?}"),
     }
+}
+
+fn implementation_planned_path_state_json(
+    run: &crate::workflow::WorkflowRun,
+    plan: &crate::workflow::PlanArtifact,
+    current: &crate::workspace::ContentSnapshot,
+) -> Result<String> {
+    let baseline = &run.repository.task_baseline.content;
+    let mut planned = BTreeMap::<String, BTreeSet<String>>::new();
+    for path in plan.steps.iter().flat_map(|step| &step.paths) {
+        planned.entry(path.path.clone()).or_default().insert(
+            serde_json::to_value(path.change)?
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string(),
+        );
+    }
+    let state = planned
+        .into_iter()
+        .map(|(path, planned_changes)| {
+            let before = baseline.paths.get(&path);
+            let now = current.paths.get(&path);
+            let state = match (before, now) {
+                (None, None) => "missing",
+                (None, Some(_)) => "created_in_task_already_exists",
+                (Some(_), None) => "deleted_in_task",
+                (Some(before), Some(now)) if before == now => "present_unchanged",
+                (Some(_), Some(_)) => "modified_in_task_already_exists",
+            };
+            json!({
+                "path": path,
+                "planned_changes": planned_changes,
+                "state": state,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&state).context("failed to serialize planned-path state")
 }
 
 fn plan_is_unambiguous_missing_path_creation(
@@ -9682,6 +9729,7 @@ impl CompletionEngine for ScriptedCompletionEngine {
         Ok(CompletionOutput {
             content: completion.content,
             tool_calls: Vec::new(),
+            tool_parse_error: None,
             finish_reason: if completion.truncated {
                 CompletionFinishReason::MaxTokens
             } else {
@@ -10173,10 +10221,15 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
     ) -> Result<CompletionOutput> {
         let request = llama_chat_request(args, messages, tools)?;
         let mut output = self.session.generate_chat(&request)?;
-        let tool_calls = parse_model_tool_call_output(&mut output.content)?;
+        let parsed_tool_calls = parse_model_tool_call_output(&mut output.content);
+        let (tool_calls, tool_parse_error) = match parsed_tool_calls {
+            Ok(tool_calls) => (tool_calls, None),
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        };
         Ok(CompletionOutput {
             content: output.content,
             tool_calls,
+            tool_parse_error,
             finish_reason: match output.finish_reason {
                 llamacpp::FinishReason::EndOfGeneration => CompletionFinishReason::EndOfGeneration,
                 llamacpp::FinishReason::MaxTokens => CompletionFinishReason::MaxTokens,
@@ -10219,6 +10272,10 @@ struct FlashMoeCompletionEngine {
 }
 
 impl CompletionEngine for FlashMoeCompletionEngine {
+    fn supports_thinking(&self) -> Result<bool> {
+        Ok(self.runtime.lock()?.supports_thinking())
+    }
+
     fn measure_prompt(
         &mut self,
         args: &AgentRequest,
@@ -10256,6 +10313,10 @@ struct BorrowedFlashMoeCompletionEngine<'a> {
 }
 
 impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
+    fn supports_thinking(&self) -> Result<bool> {
+        Ok(self.engine.supports_thinking())
+    }
+
     fn measure_prompt(
         &mut self,
         args: &AgentRequest,
@@ -10313,6 +10374,7 @@ fn generate_flashmoe_completion(
             .into_iter()
             .map(AgentToolCall::from_model)
             .collect(),
+        tool_parse_error: None,
         finish_reason: match output.finish_reason {
             crate::inference::flashmoe::GenerationFinishReason::EndOfGeneration => {
                 CompletionFinishReason::EndOfGeneration
@@ -10490,6 +10552,26 @@ fn generate_and_parse_action_with_retries(
                 prepared.measurement.prompt_tokens,
                 completion.prompt_tokens
             );
+        }
+        if let Some(error) = completion.tool_parse_error {
+            return Ok(Err(ParseFailure {
+                output: completion.content,
+                error: anyhow::anyhow!(error),
+                finish_reason: completion.finish_reason,
+            }));
+        }
+        if completion.finish_reason == CompletionFinishReason::MaxTokens
+            && !completion.tool_calls.is_empty()
+            && let Some(tool) = truncated_native_tool_name(&completion.content)
+        {
+            return Ok(Err(ParseFailure {
+                error: anyhow::anyhow!(
+                    "native {tool} call was cut off after {} complete call(s); no call from the incomplete batch was executed",
+                    completion.tool_calls.len()
+                ),
+                output: completion.content,
+                finish_reason: completion.finish_reason,
+            }));
         }
         if !completion.tool_calls.is_empty() {
             return Ok(Ok((
@@ -12159,24 +12241,31 @@ fn run_tool(
             )
         }
         "submit_plan" => {
-            let plan = parse_submission_artifact(arguments, "plan")?;
-            accept_stage_submission(
+            let (plan, normalized_json_string) = parse_submission_artifact(arguments, "plan")?;
+            accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::Plan { plan },
+                "plan",
+                normalized_json_string,
             )
         }
         "submit_plan_review" => {
-            let review = parse_submission_artifact(arguments, "review")?;
-            accept_stage_submission(
+            let (review, normalized_json_string) = parse_submission_artifact(arguments, "review")?;
+            accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::PlanReview { review },
+                "review",
+                normalized_json_string,
             )
         }
         "submit_implementation" => {
-            let implementation = parse_submission_artifact(arguments, "implementation")?;
-            accept_stage_submission(
+            let (implementation, normalized_json_string) =
+                parse_submission_artifact(arguments, "implementation")?;
+            accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::Implementation { implementation },
+                "implementation",
+                normalized_json_string,
             )
         }
         "request_replan" => {
@@ -12196,10 +12285,12 @@ fn run_tool(
             )
         }
         "submit_code_review" => {
-            let review = parse_submission_artifact(arguments, "review")?;
-            accept_stage_submission(
+            let (review, normalized_json_string) = parse_submission_artifact(arguments, "review")?;
+            accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::CodeReview { review },
+                "review",
+                normalized_json_string,
             )
         }
         "run_task" => {
@@ -12410,7 +12501,7 @@ fn bounded_delivery_summary(arguments: &Value) -> Result<String> {
 fn parse_submission_artifact<T>(
     arguments: &Value,
     field: &str,
-) -> Result<crate::workflow::ArtifactEnvelope<T>>
+) -> Result<(crate::workflow::ArtifactEnvelope<T>, bool)>
 where
     T: serde::de::DeserializeOwned + Serialize,
 {
@@ -12422,9 +12513,37 @@ where
         .get(field)
         .cloned()
         .with_context(|| format!("workflow submission requires object argument: {field}"))?;
-    let artifact = serde_json::from_value(artifact)
-        .with_context(|| format!("invalid structured {field} artifact"))?;
-    crate::workflow::ArtifactEnvelope::new(id, artifact)
+    let (artifact, normalized_json_string) = match artifact {
+        Value::String(encoded) => (
+            serde_json::from_str(&encoded)
+                .with_context(|| format!("invalid JSON-stringified {field} artifact"))?,
+            true,
+        ),
+        artifact => (
+            serde_json::from_value(artifact)
+                .with_context(|| format!("invalid structured {field} artifact"))?,
+            false,
+        ),
+    };
+    Ok((
+        crate::workflow::ArtifactEnvelope::new(id, artifact)?,
+        normalized_json_string,
+    ))
+}
+
+fn accept_stage_artifact_submission(
+    gate_state: &RefCell<GateState>,
+    submission: crate::workflow::StageSubmission,
+    field: &str,
+    normalized_json_string: bool,
+) -> Result<String> {
+    let mut result = accept_stage_submission(gate_state, submission)?;
+    if normalized_json_string {
+        result.push_str(&format!(
+            "; parsed the JSON-stringified '{field}' artifact without changing its contents"
+        ));
+    }
+    Ok(result)
 }
 
 fn accept_stage_submission(
@@ -15721,15 +15840,17 @@ mod tests {
 
         assert_eq!(
             schema("submit_plan")
-                .pointer("/properties/plan/allOf/0/properties/steps/items/properties/paths/items/properties/change/enum")
+                .pointer("/properties/plan/properties/steps/items/properties/paths/items/properties/change/enum")
                 .unwrap(),
             &json!(["create", "modify", "delete"])
         );
         assert_eq!(
+            agent_tool_errors::schema_signature("submit_plan", schema("submit_plan")),
+            "submit_plan(id: string, plan: object)"
+        );
+        assert_eq!(
             schema("submit_plan_review")
-                .pointer(
-                    "/properties/review/allOf/0/properties/assessments/items/properties/kind/enum"
-                )
+                .pointer("/properties/review/properties/assessments/items/properties/kind/enum")
                 .unwrap()
                 .as_array()
                 .unwrap()
@@ -15738,15 +15859,13 @@ mod tests {
         );
         assert_eq!(
             schema("submit_implementation")
-                .pointer("/properties/implementation/allOf/0/properties/steps/items/properties/status/enum")
+                .pointer("/properties/implementation/properties/steps/items/properties/status/enum")
                 .unwrap(),
             &json!(["completed", "no_change", "incomplete"])
         );
         assert_eq!(
             schema("submit_code_review")
-                .pointer(
-                    "/properties/review/allOf/0/properties/assessments/items/properties/kind/enum"
-                )
+                .pointer("/properties/review/properties/assessments/items/properties/kind/enum")
                 .unwrap()
                 .as_array()
                 .unwrap()
@@ -16121,6 +16240,39 @@ the next imagined action"#;
             }
         })
         .to_string()
+    }
+
+    #[test]
+    fn workflow_submission_accepts_an_exact_json_stringified_artifact() {
+        let submission: Value = serde_json::from_str(&plan_submission()).unwrap();
+        let expected = submission["arguments"]["plan"].clone();
+        let expected_artifact: crate::workflow::PlanArtifact =
+            serde_json::from_value(expected.clone()).unwrap();
+        let arguments = json!({
+            "id": "plan-stringified",
+            "plan": expected.to_string(),
+        });
+
+        let (parsed, normalized) =
+            parse_submission_artifact::<crate::workflow::PlanArtifact>(&arguments, "plan").unwrap();
+
+        assert!(normalized);
+        assert_eq!(parsed.id, "plan-stringified");
+        assert_eq!(parsed.artifact, expected_artifact);
+
+        let gate_state = RefCell::new(GateState::default());
+        let result = accept_stage_artifact_submission(
+            &gate_state,
+            crate::workflow::StageSubmission::Plan { plan: parsed },
+            "plan",
+            normalized,
+        )
+        .unwrap();
+        assert!(result.contains("parsed the JSON-stringified 'plan' artifact"));
+        assert!(matches!(
+            gate_state.borrow().workflow_submission,
+            Some(crate::workflow::StageSubmission::Plan { .. })
+        ));
     }
 
     fn plan_review_submission(
@@ -16500,6 +16652,19 @@ the next imagined action"#;
                 && checkpoint.run.counters.generated_tokens == 1
         }));
         assert_eq!(first_sink.checkpoints.last().unwrap(), &paused.checkpoint);
+
+        let mut created_plan = plan.artifact.clone();
+        created_plan.steps[0].paths = vec![crate::workflow::PlanPath {
+            path: "created.txt".to_string(),
+            change: crate::workflow::PlannedChange::Create,
+        }];
+        std::fs::write(repo.path().join("created.txt"), "partial resume\n").unwrap();
+        let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let planned_state =
+            implementation_planned_path_state_json(&paused.checkpoint.run, &created_plan, &current)
+                .unwrap();
+        assert!(planned_state.contains("created_in_task_already_exists"));
+        std::fs::remove_file(repo.path().join("created.txt")).unwrap();
 
         request.workflow_checkpoint = Some(paused.checkpoint.clone());
         let (completed, _, events) = run_scripted_delivery_workflow(
@@ -20449,6 +20614,17 @@ the next imagined action"#;
     }
 
     #[test]
+    fn malformed_textual_native_tool_arguments_are_a_correctable_parse_failure() {
+        let mut output = "tool=read_file args={\"path\":}".to_string();
+        let error = parse_model_tool_call_output(&mut output).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse textual model tool arguments")
+        );
+    }
+
+    #[test]
     fn parse_model_tool_call_output_extracts_function_call() {
         let mut output = "checking\n<tool_call>\n<function=read_file>\n<parameter=path>\nCargo.toml\n</parameter>\n</function>\n</tool_call>".to_string();
         let calls = parse_model_tool_call_output(&mut output).unwrap();
@@ -21106,6 +21282,16 @@ the next imagined action"#;
     }
 
     #[test]
+    fn detects_a_truncated_qwen_function_tail_after_complete_batch_members() {
+        let output = concat!(
+            "<tool_call>\n<function=todo>\n<parameter=op>complete\n</tool_call>\n",
+            "<tool_call>\n<function=write_file>\n<parameter=content>partial"
+        );
+
+        assert_eq!(truncated_native_tool_name(output), Some("write_file"));
+    }
+
+    #[test]
     fn next_retry_max_tokens_doubles_until_hard_cap() {
         assert_eq!(next_retry_max_tokens(2_048, None), 4_096);
         assert_eq!(next_retry_max_tokens(4_096, None), MAX_TOKEN_RETRY_CAP);
@@ -21677,6 +21863,33 @@ the next imagined action"#;
             "string"
         );
         assert_eq!(ask_user.input_schema["required"], json!(["question"]));
+    }
+
+    #[test]
+    fn noninteractive_workflow_sink_does_not_expose_ask_user() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Planning);
+        request.max_steps = 2;
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![ScriptedCompletion {
+                content: plan_submission(),
+                truncated: false,
+            }],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(
+            outcome
+                .generation_tool_names
+                .iter()
+                .flatten()
+                .all(|tool| tool != "ask_user")
+        );
     }
 
     #[test]

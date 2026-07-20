@@ -110,12 +110,30 @@ pub(super) fn q4_aux_tensor_name(weight: &str, suffix: &str) -> String {
 }
 
 pub(super) fn logical_shape_for_mlx_q4(shape: &[usize]) -> Result<Vec<usize>> {
+    logical_shape_for_mlx_packed(shape, 8)
+}
+
+pub(super) fn logical_shape_for_mlx_source(
+    shape: &[usize],
+    source: &DenseQ4SourceRefs,
+) -> Result<Vec<usize>> {
+    logical_shape_for_mlx_packed(
+        shape,
+        if source.source_format == DenseQ4SourceFormat::MlxAffine8 {
+            4
+        } else {
+            8
+        },
+    )
+}
+
+fn logical_shape_for_mlx_packed(shape: &[usize], values_per_u32: usize) -> Result<Vec<usize>> {
     let Some((last, prefix)) = shape.split_last() else {
         bail!("native dense q4 tensor has empty shape");
     };
     let cols = last
-        .checked_mul(8)
-        .context("native dense q4 logical column count overflow")?;
+        .checked_mul(values_per_u32)
+        .context("native MLX logical column count overflow")?;
     let mut logical = prefix.to_vec();
     logical.push(cols);
     Ok(logical)
@@ -225,6 +243,7 @@ pub(super) fn dense_native_q4_sources(
                 DenseQ4SourceFormat::ColibriInt8
             },
             source_group_size: Some(source_group_size),
+            source_row_order: None,
         }));
     }
 
@@ -281,6 +300,7 @@ pub(super) fn dense_native_q4_sources(
             scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
             source_format: DenseQ4SourceFormat::MlxMxfp4,
             source_group_size: Some(source_group_size),
+            source_row_order: None,
         }));
     }
 
@@ -309,23 +329,65 @@ pub(super) fn dense_native_q4_sources(
             biases_info.dtype
         );
     }
-    let layout = dense_q4_layout_with_scale_bias_dtype(
-        &logical_shape,
-        GROUP_SIZE,
-        EXPERT_SCALE_BIAS_DTYPE_BF16,
-    )?;
     let weight_bytes = weight_offsets[1].saturating_sub(weight_offsets[0]);
     let scales_bytes = scales_offsets[1].saturating_sub(scales_offsets[0]);
     let biases_bytes = biases_info.data_offsets[1].saturating_sub(biases_info.data_offsets[0]);
-    if weight_bytes != layout.packed_bytes as u64
-        || scales_bytes != layout.scales_bytes as u64
-        || biases_bytes != layout.scales_bytes as u64
-    {
+    let source_rows = weight_shape
+        .iter()
+        .take(weight_shape.len().saturating_sub(1))
+        .try_fold(1usize, |rows, dimension| {
+            rows.checked_mul(*dimension)
+                .context("native MLX affine row count overflow")
+        })?;
+    let scale_values = usize::try_from(scales_bytes)
+        .context("native MLX affine scale byte count exceeds usize")?
+        .checked_div(2)
+        .context("native MLX affine scale byte count division failed")?;
+    if source_rows == 0 || !scale_values.is_multiple_of(source_rows) {
+        bail!("native MLX affine tensor {tensor} has {scale_values} scales for {source_rows} rows");
+    }
+    let q4_shape = logical_shape_for_mlx_packed(&weight_shape, 8)?;
+    let q8_shape = logical_shape_for_mlx_packed(&weight_shape, 4)?;
+    let q4_cols = *q4_shape
+        .last()
+        .context("native MLX affine Q4 tensor has empty logical shape")?;
+    let q8_cols = *q8_shape
+        .last()
+        .context("native MLX affine int8 tensor has empty logical shape")?;
+    let q4_scale_values = source_rows
+        .checked_mul(q4_cols.div_ceil(GROUP_SIZE))
+        .context("native MLX affine Q4 scale count overflow")?;
+    let q8_scale_values = source_rows
+        .checked_mul(q8_cols.div_ceil(GROUP_SIZE))
+        .context("native MLX affine int8 scale count overflow")?;
+    let weight_bytes = usize::try_from(weight_bytes)
+        .context("native MLX affine weight byte count exceeds usize")?;
+    let q4_weight_bytes = q4_shape.iter().try_fold(1usize, |values, dimension| {
+        values
+            .checked_mul(*dimension)
+            .context("native MLX affine Q4 logical value count overflow")
+    })? / 2;
+    let q8_weight_bytes = q8_shape.iter().try_fold(1usize, |values, dimension| {
+        values
+            .checked_mul(*dimension)
+            .context("native MLX affine int8 logical value count overflow")
+    })?;
+    let source_format = if scale_values == q4_scale_values && weight_bytes == q4_weight_bytes {
+        DenseQ4SourceFormat::MlxAffine
+    } else if scale_values == q8_scale_values && weight_bytes == q8_weight_bytes {
+        DenseQ4SourceFormat::MlxAffine8
+    } else {
         bail!(
-            "native dense q4 tensor {tensor} layout mismatch: weight/scales/biases bytes {weight_bytes}/{scales_bytes}/{biases_bytes}, expected {}/{}/{}",
-            layout.packed_bytes,
-            layout.scales_bytes,
-            layout.scales_bytes
+            "native MLX affine tensor {tensor} has {weight_bytes} weight bytes and {scale_values} scales; expected Q4 {q4_weight_bytes}/{q4_scale_values} or int8 {q8_weight_bytes}/{q8_scale_values}"
+        );
+    };
+    let expected_scale_bytes = scale_values
+        .checked_mul(2)
+        .context("native MLX affine scale byte count overflow")?
+        as u64;
+    if scales_bytes != expected_scale_bytes || biases_bytes != expected_scale_bytes {
+        bail!(
+            "native MLX affine tensor {tensor} scale/bias bytes {scales_bytes}/{biases_bytes}, expected {expected_scale_bytes}"
         );
     }
     Ok(Some(DenseQ4SourceRefs {
@@ -334,8 +396,9 @@ pub(super) fn dense_native_q4_sources(
         biases_shard: biases_shard.clone(),
         biases_offsets: biases_info.data_offsets,
         scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
-        source_format: DenseQ4SourceFormat::MlxAffine,
+        source_format,
         source_group_size: None,
+        source_row_order: None,
     }))
 }
 
@@ -345,10 +408,12 @@ pub(super) fn dense_tensor_quantization(
     native_q4: &Option<DenseQ4SourceRefs>,
 ) -> TensorQuantization {
     let _ = (canonical_tensor, tensor_dtype);
-    if native_q4
-        .as_ref()
-        .is_some_and(|source| source.source_format == DenseQ4SourceFormat::ColibriInt8)
-    {
+    if native_q4.as_ref().is_some_and(|source| {
+        matches!(
+            source.source_format,
+            DenseQ4SourceFormat::ColibriInt8 | DenseQ4SourceFormat::MlxAffine8
+        )
+    }) {
         // Colibri keeps the large embedding and LM-head matrices at int8 by
         // default. Preserve that source precision in a runtime layout the
         // existing resident dense kernels can consume instead of requantizing
@@ -358,7 +423,9 @@ pub(super) fn dense_tensor_quantization(
         TensorQuantization::Q4 {
             group_size: GROUP_SIZE,
             format: match native_q4.source_format {
-                DenseQ4SourceFormat::MlxAffine => DENSE_Q4_MLX_FORMAT,
+                DenseQ4SourceFormat::MlxAffine | DenseQ4SourceFormat::MlxAffine8 => {
+                    DENSE_Q4_MLX_FORMAT
+                }
                 DenseQ4SourceFormat::ColibriInt4 | DenseQ4SourceFormat::ColibriInt8 => {
                     DENSE_Q4_COLIBRI_FORMAT
                 }
@@ -383,6 +450,7 @@ pub(super) fn write_dense_tensor_store(
     snapshot_dir: &Path,
     destination: &Path,
     dense_tensors: &[DenseTensorRef],
+    config: Option<&QwenModelConfig>,
 ) -> Result<()> {
     let mut out = fs::File::create(destination).with_context(|| {
         format!(
@@ -432,7 +500,17 @@ pub(super) fn write_dense_tensor_store(
         let raw = &bytes[start as usize..end as usize];
         match &tensor.quantization {
             TensorQuantization::None => {
-                if let Some(q4_sources) = &tensor.q4_sources
+                if config.is_some_and(QwenModelConfig::is_qwen3_next)
+                    && tensor.tensor.ends_with(".linear_attn.A_log")
+                    && tensor.dtype.eq_ignore_ascii_case("F32")
+                {
+                    write_bf16_as_f32_tensor(
+                        &mut out,
+                        &tensor.tensor,
+                        raw,
+                        tensor.byte_len as usize,
+                    )?;
+                } else if let Some(q4_sources) = &tensor.q4_sources
                     && q4_sources.source_format == DenseQ4SourceFormat::ColibriInt8
                 {
                     let (scale_bytes, scale_shard) = shard_cache
@@ -453,6 +531,27 @@ pub(super) fn write_dense_tensor_store(
                         })?,
                         &tensor.shape,
                     )?;
+                } else if let Some(q4_sources) = &tensor.q4_sources
+                    && q4_sources.source_format == DenseQ4SourceFormat::MlxAffine8
+                {
+                    let (scale_bytes, scale_shard) = shard_cache
+                        .get(&q4_sources.scales_shard)
+                        .expect("inserted above");
+                    let scale_start = scale_shard.data_start + q4_sources.scales_offsets[0];
+                    let scale_end = scale_shard.data_start + q4_sources.scales_offsets[1];
+                    let (bias_bytes, bias_shard) = shard_cache
+                        .get(&q4_sources.biases_shard)
+                        .expect("inserted above");
+                    let bias_start = bias_shard.data_start + q4_sources.biases_offsets[0];
+                    let bias_end = bias_shard.data_start + q4_sources.biases_offsets[1];
+                    write_mlx_affine8_bf16_tensor(
+                        &mut out,
+                        &tensor.tensor,
+                        raw,
+                        &scale_bytes[scale_start as usize..scale_end as usize],
+                        &bias_bytes[bias_start as usize..bias_end as usize],
+                        &tensor.shape,
+                    )?;
                 } else {
                     out.write_all(raw).with_context(|| {
                         format!("failed to write dense tensor {}", tensor.tensor)
@@ -470,6 +569,76 @@ pub(super) fn write_dense_tensor_store(
                     scale_bias_dtype,
                 )?;
                 if let Some(q4_sources) = &tensor.q4_sources {
+                    if let Some(source_row_order) = q4_sources.source_row_order.as_deref() {
+                        if q4_sources.source_format != DenseQ4SourceFormat::MlxAffine {
+                            bail!(
+                                "row-reordered dense projection {} requires MLX affine Q4 source, found {:?}",
+                                tensor.tensor,
+                                q4_sources.source_format
+                            );
+                        }
+                        if source_row_order.len() != layout.rows
+                            || tensor.byte_len as usize != layout.total_bytes
+                        {
+                            bail!(
+                                "row-reordered dense projection {} has {} target rows and {} manifest bytes; expected {} rows and {} bytes",
+                                tensor.tensor,
+                                source_row_order.len(),
+                                tensor.byte_len,
+                                layout.rows,
+                                layout.total_bytes
+                            );
+                        }
+                        let (scale_bytes, scale_shard) = shard_cache
+                            .get(&q4_sources.scales_shard)
+                            .expect("inserted above");
+                        let scale_start = scale_shard.data_start + q4_sources.scales_offsets[0];
+                        let scale_end = scale_shard.data_start + q4_sources.scales_offsets[1];
+                        let scales = &scale_bytes[scale_start as usize..scale_end as usize];
+                        let (bias_bytes, bias_shard) = shard_cache
+                            .get(&q4_sources.biases_shard)
+                            .expect("inserted above");
+                        let bias_start = bias_shard.data_start + q4_sources.biases_offsets[0];
+                        let bias_end = bias_shard.data_start + q4_sources.biases_offsets[1];
+                        let biases = &bias_bytes[bias_start as usize..bias_end as usize];
+                        let scalar_bytes = expert_scale_bias_dtype_size(scale_bias_dtype)
+                            .with_context(|| {
+                                format!(
+                                    "row-reordered dense projection {} has unsupported scale/bias dtype {}",
+                                    tensor.tensor, scale_bias_dtype
+                                )
+                            })?;
+                        let scale_row_bytes = layout
+                            .groups_per_row
+                            .checked_mul(scalar_bytes)
+                            .context("row-reordered dense scale row byte count overflow")?;
+                        write_rows_in_order(
+                            &mut out,
+                            raw,
+                            layout.row_packed_bytes,
+                            source_row_order,
+                            &tensor.tensor,
+                            "packed weights",
+                        )?;
+                        write_rows_in_order(
+                            &mut out,
+                            scales,
+                            scale_row_bytes,
+                            source_row_order,
+                            &tensor.tensor,
+                            "scales",
+                        )?;
+                        write_rows_in_order(
+                            &mut out,
+                            biases,
+                            scale_row_bytes,
+                            source_row_order,
+                            &tensor.tensor,
+                            "biases",
+                        )?;
+                        current = current.saturating_add(tensor.byte_len);
+                        continue;
+                    }
                     if matches!(
                         q4_sources.source_format,
                         DenseQ4SourceFormat::ColibriInt4 | DenseQ4SourceFormat::ColibriInt8
@@ -640,10 +809,118 @@ pub(super) fn write_dense_tensor_store(
     Ok(())
 }
 
+fn write_rows_in_order(
+    out: &mut impl Write,
+    source: &[u8],
+    row_bytes: usize,
+    row_order: &[usize],
+    tensor_name: &str,
+    component: &str,
+) -> Result<()> {
+    if row_bytes == 0 || !source.len().is_multiple_of(row_bytes) {
+        bail!(
+            "row-reordered dense projection {tensor_name} has invalid {component} byte length {} for {row_bytes}-byte rows",
+            source.len()
+        );
+    }
+    let source_rows = source.len() / row_bytes;
+    for &source_row in row_order {
+        if source_row >= source_rows {
+            bail!(
+                "row-reordered dense projection {tensor_name} requests {component} row {source_row}, but source has {source_rows} rows"
+            );
+        }
+        let start = source_row
+            .checked_mul(row_bytes)
+            .context("row-reordered dense source byte offset overflow")?;
+        out.write_all(&source[start..start + row_bytes])
+            .with_context(|| {
+                format!("failed to write row-reordered {component} for {tensor_name}")
+            })?;
+    }
+    Ok(())
+}
+
 fn encode_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let lsb = (bits >> 16) & 1;
     ((bits.wrapping_add(0x7fff + lsb)) >> 16) as u16
+}
+
+fn decode_bf16_le(bytes: &[u8]) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(2) {
+        bail!("BF16 byte length {} is not divisible by two", bytes.len());
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|bytes| {
+            let bits = u16::from_le_bytes(bytes.try_into().expect("two-byte chunk"));
+            f32::from_bits(u32::from(bits) << 16)
+        })
+        .collect())
+}
+
+fn write_bf16_as_f32_tensor(
+    out: &mut impl Write,
+    tensor_name: &str,
+    source: &[u8],
+    expected_runtime_bytes: usize,
+) -> Result<()> {
+    if source.len().checked_mul(2) != Some(expected_runtime_bytes) {
+        bail!(
+            "BF16-to-F32 tensor {tensor_name} has {} source bytes, expected {} for a {expected_runtime_bytes}-byte runtime tensor",
+            source.len(),
+            expected_runtime_bytes / 2
+        );
+    }
+    for value in decode_bf16_le(source)? {
+        out.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_mlx_affine8_bf16_tensor(
+    out: &mut impl Write,
+    tensor_name: &str,
+    source_weights: &[u8],
+    source_scale_bytes: &[u8],
+    source_bias_bytes: &[u8],
+    shape: &[usize],
+) -> Result<()> {
+    let [rows, cols] = shape else {
+        bail!("MLX affine int8 tensor {tensor_name} must be a matrix, got {shape:?}");
+    };
+    let expected_weights = rows
+        .checked_mul(*cols)
+        .context("MLX affine int8 tensor element count overflow")?;
+    if source_weights.len() != expected_weights {
+        bail!(
+            "MLX affine int8 tensor {tensor_name} has {} source bytes, expected {expected_weights}",
+            source_weights.len()
+        );
+    }
+    let source_scales = decode_bf16_le(source_scale_bytes)?;
+    let source_biases = decode_bf16_le(source_bias_bytes)?;
+    let groups_per_row = cols.div_ceil(GROUP_SIZE);
+    let expected_groups = rows
+        .checked_mul(groups_per_row)
+        .context("MLX affine int8 scale/bias count overflow")?;
+    if source_scales.len() != expected_groups || source_biases.len() != expected_groups {
+        bail!(
+            "MLX affine int8 tensor {tensor_name} has {}/{} scales/biases, expected {expected_groups} each",
+            source_scales.len(),
+            source_biases.len()
+        );
+    }
+    for row in 0..*rows {
+        for col in 0..*cols {
+            let group = row * groups_per_row + col / GROUP_SIZE;
+            let value = source_weights[row * *cols + col] as f32 * source_scales[group]
+                + source_biases[group];
+            out.write_all(&encode_bf16_bits(value).to_le_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 fn decode_f32_le(bytes: &[u8]) -> Result<Vec<f32>> {
@@ -1233,12 +1510,12 @@ pub(super) fn validate_qwen_q4_graph_bindings(
                 )?;
             }
         } else {
-            if config.glm.is_some() {
+            if config.glm.is_some() || config.is_qwen3_next() {
                 require_resident_graph_projection(
                     family,
                     registry,
                     store_len,
-                    "CMD2 GLM router projection",
+                    "CMD2 router projection",
                     &router_tensor_name(layer),
                     config.experts(),
                     runtime.width,
@@ -2164,6 +2441,7 @@ pub struct DenseTensorRef {
 #[serde(rename_all = "snake_case")]
 pub enum DenseQ4SourceFormat {
     MlxAffine,
+    MlxAffine8,
     ColibriInt4,
     ColibriInt8,
     MlxMxfp4,
@@ -2186,6 +2464,9 @@ pub struct DenseQ4SourceRefs {
     pub source_format: DenseQ4SourceFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_group_size: Option<usize>,
+    /// Optional cache-build row permutation for a combined source projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_row_order: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -6694,6 +6975,37 @@ mod tests {
     }
 
     #[test]
+    fn mlx_affine_int8_import_preserves_affine_values_as_bf16() {
+        let mut output = Vec::new();
+        write_mlx_affine8_bf16_tensor(
+            &mut output,
+            "model.layers.0.mlp.gate.weight",
+            &[0, 1, 2, 255],
+            &encode_bf16_bits(0.5).to_le_bytes(),
+            &encode_bf16_bits(-1.0).to_le_bytes(),
+            &[1, 4],
+        )
+        .unwrap();
+
+        let decoded = decode_bf16_le(&output).unwrap();
+        assert_eq!(decoded, vec![-1.0, -0.5, 0.0, 126.5]);
+    }
+
+    #[test]
+    fn qwen3_next_static_bf16_import_widens_to_f32() {
+        let source = [
+            encode_bf16_bits(-2.0).to_le_bytes(),
+            encode_bf16_bits(0.25).to_le_bytes(),
+        ]
+        .concat();
+        let mut output = Vec::new();
+
+        write_bf16_as_f32_tensor(&mut output, "linear_attn.A_log", &source, 8).unwrap();
+
+        assert_eq!(decode_f32_le(&output).unwrap(), vec![-2.0, 0.25]);
+    }
+
+    #[test]
     fn mlx_mxfp4_import_decodes_e2m1_and_e8m0_before_runtime_q4() {
         let layout =
             dense_q4_layout_with_scale_bias_dtype(&[1, 64], 64, EXPERT_SCALE_BIAS_DTYPE_BF16)
@@ -6930,6 +7242,8 @@ mod tests {
             moe_intermediate_size: Some(16),
             intermediate_size: None,
             max_position_embeddings: Some(1024),
+            full_attention_interval: None,
+            linear_attention: None,
             mrope_section: None,
             tie_word_embeddings: Some(true),
             num_shared_experts: None,
@@ -7042,6 +7356,7 @@ mod tests {
             scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
             source_format: DenseQ4SourceFormat::MlxAffine,
             source_group_size: None,
+            source_row_order: None,
         };
 
         assert_eq!(
@@ -7056,6 +7371,43 @@ mod tests {
                 scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
             }
         );
+
+        let native_int8 = DenseQ4SourceRefs {
+            scales_shard: "scales.safetensors".to_string(),
+            scales_offsets: [0, 8],
+            biases_shard: "biases.safetensors".to_string(),
+            biases_offsets: [0, 8],
+            scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
+            source_format: DenseQ4SourceFormat::MlxAffine8,
+            source_group_size: None,
+            source_row_order: None,
+        };
+        assert_eq!(
+            logical_shape_for_mlx_source(&[3, 4], &native_int8).unwrap(),
+            vec![3, 16]
+        );
+        assert_eq!(
+            dense_tensor_quantization("model.layers.0.mlp.gate.weight", "U32", &Some(native_int8)),
+            TensorQuantization::None
+        );
+    }
+
+    #[test]
+    fn cache_writer_reorders_complete_source_rows_without_value_conversion() {
+        let source = (0u8..24).collect::<Vec<_>>();
+        let mut output = Vec::new();
+
+        write_rows_in_order(
+            &mut output,
+            &source,
+            3,
+            &[2, 0, 7, 3],
+            "combined.weight",
+            "packed weights",
+        )
+        .unwrap();
+
+        assert_eq!(output, vec![6, 7, 8, 0, 1, 2, 21, 22, 23, 9, 10, 11]);
     }
 
     fn runtime_matrix(

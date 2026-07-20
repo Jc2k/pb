@@ -7,8 +7,8 @@ use serde::{Deserialize, de};
 use super::deepseek::is_deepseek_v4_flash;
 use super::types::{
     ACTIVE_EXPERTS_PER_TOKEN, DEFAULT_MROPE_SECTION, FOUR_BIT_EXPERT_SIZE, FULL_ATTN_INTERVAL,
-    FlashMoeLayerKind, GLM52_MODEL_MARKER, GROUP_SIZE, LEGACY_QWEN_CODER_MARKER, NUM_EXPERTS,
-    QWEN3_ACTIVE_PARAMS_MARKER, QWEN3_VL_MODEL_MARKER, QWEN35_MODEL_MARKER,
+    FlashMoeLayerKind, GLM52_MODEL_MARKER, GROUP_SIZE, NUM_EXPERTS, QWEN3_ACTIVE_PARAMS_MARKER,
+    QWEN3_CODER_NEXT_MODEL_MARKER, QWEN3_VL_MODEL_MARKER, QWEN35_MODEL_MARKER,
 };
 #[cfg(test)]
 use super::types::{GLM52_COLIBRI_MODEL, GLM52_MODEL, GLM52_MXFP4_MODEL};
@@ -18,9 +18,18 @@ pub const QWEN35_Q4_EXPERT_PACKED_WEIGHT_BYTES: usize = 2_097_152;
 pub const QWEN35_Q4_EXPERT_SCALE_BYTES: usize = 131_072;
 pub const QWEN35_Q4_EXPERT_BIAS_BYTES: usize = 131_072;
 
-pub fn is_qwen35_or_legacy_alias(model: &str) -> bool {
+pub fn is_qwen35(model: &str) -> bool {
     let normalized = model.to_ascii_lowercase();
-    normalized.contains(QWEN35_MODEL_MARKER) || normalized.contains(LEGACY_QWEN_CODER_MARKER)
+    normalized.contains(QWEN35_MODEL_MARKER)
+}
+
+pub fn is_qwen3_next(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    normalized == QWEN3_CODER_NEXT_MODEL_MARKER
+        || normalized == format!("{QWEN3_CODER_NEXT_MODEL_MARKER}:latest")
+        || (normalized.starts_with("hf://")
+            && normalized.contains(QWEN3_CODER_NEXT_MODEL_MARKER)
+            && !normalized.contains("gguf"))
 }
 
 pub fn is_glm52(model: &str) -> bool {
@@ -63,6 +72,7 @@ pub enum QwenMoeExecutionArchitecture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QwenMoeFamily {
     Qwen35A17B,
+    Qwen3NextMoe,
     Qwen3Moe,
     Qwen3VlMoe,
     Glm52,
@@ -197,12 +207,22 @@ pub struct QwenModelConfig {
     pub moe_intermediate_size: Option<usize>,
     pub intermediate_size: Option<usize>,
     pub max_position_embeddings: Option<usize>,
+    pub full_attention_interval: Option<usize>,
+    pub linear_attention: Option<QwenLinearAttentionConfig>,
     pub mrope_section: Option<[usize; 3]>,
     pub tie_word_embeddings: Option<bool>,
     pub num_shared_experts: Option<usize>,
     pub shared_expert_intermediate_size: Option<usize>,
     pub vision_config: Option<Qwen3VLVisionConfig>,
     pub glm: Option<GlmMoeConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QwenLinearAttentionConfig {
+    pub key_head_dim: usize,
+    pub num_key_heads: usize,
+    pub num_value_heads: usize,
+    pub value_head_dim: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -225,6 +245,11 @@ struct RawQwenModelConfig {
     moe_intermediate_size: Option<usize>,
     intermediate_size: Option<usize>,
     max_position_embeddings: Option<usize>,
+    full_attention_interval: Option<usize>,
+    linear_key_head_dim: Option<usize>,
+    linear_num_key_heads: Option<usize>,
+    linear_num_value_heads: Option<usize>,
+    linear_value_head_dim: Option<usize>,
     tie_word_embeddings: Option<bool>,
     num_shared_experts: Option<usize>,
     shared_expert_intermediate_size: Option<usize>,
@@ -267,6 +292,11 @@ struct RawQwenTextConfig {
     moe_intermediate_size: Option<usize>,
     intermediate_size: Option<usize>,
     max_position_embeddings: Option<usize>,
+    full_attention_interval: Option<usize>,
+    linear_key_head_dim: Option<usize>,
+    linear_num_key_heads: Option<usize>,
+    linear_num_value_heads: Option<usize>,
+    linear_value_head_dim: Option<usize>,
     tie_word_embeddings: Option<bool>,
     num_shared_experts: Option<usize>,
     shared_expert_intermediate_size: Option<usize>,
@@ -296,6 +326,24 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
                 .ok_or_else(|| de::Error::missing_field(field))
         };
 
+        let linear_key_head_dim = raw.linear_key_head_dim.or(text.linear_key_head_dim);
+        let linear_num_key_heads = raw.linear_num_key_heads.or(text.linear_num_key_heads);
+        let linear_num_value_heads = raw.linear_num_value_heads.or(text.linear_num_value_heads);
+        let linear_value_head_dim = raw.linear_value_head_dim.or(text.linear_value_head_dim);
+        let linear_attention = [
+            linear_key_head_dim,
+            linear_num_key_heads,
+            linear_num_value_heads,
+            linear_value_head_dim,
+        ]
+        .iter()
+        .any(Option::is_some)
+        .then_some(QwenLinearAttentionConfig {
+            key_head_dim: linear_key_head_dim.unwrap_or(0),
+            num_key_heads: linear_num_key_heads.unwrap_or(0),
+            num_value_heads: linear_num_value_heads.unwrap_or(0),
+            value_head_dim: linear_value_head_dim.unwrap_or(0),
+        });
         Ok(Self {
             model_type: raw.model_type.or(text.model_type),
             architectures: raw.architectures.or(text.architectures),
@@ -373,6 +421,8 @@ impl<'de> Deserialize<'de> for QwenModelConfig {
             moe_intermediate_size: raw.moe_intermediate_size.or(text.moe_intermediate_size),
             intermediate_size: raw.intermediate_size.or(text.intermediate_size),
             max_position_embeddings: raw.max_position_embeddings.or(text.max_position_embeddings),
+            full_attention_interval: raw.full_attention_interval.or(text.full_attention_interval),
+            linear_attention,
             mrope_section: raw
                 .rope_parameters
                 .as_ref()
@@ -496,6 +546,27 @@ impl QwenModelConfig {
         {
             bail!("partial_rotary_factor must be in (0, 1], got {factor}");
         }
+        if self
+            .full_attention_interval
+            .is_some_and(|interval| interval == 0)
+        {
+            bail!("full_attention_interval must be positive when present");
+        }
+        if let Some(linear) = self.linear_attention
+            && (linear.key_head_dim == 0
+                || linear.num_key_heads == 0
+                || linear.num_value_heads == 0
+                || linear.value_head_dim == 0
+                || !linear.num_value_heads.is_multiple_of(linear.num_key_heads))
+        {
+            bail!(
+                "invalid linear-attention geometry: key_heads={}, key_dim={}, value_heads={}, value_dim={}",
+                linear.num_key_heads,
+                linear.key_head_dim,
+                linear.num_value_heads,
+                linear.value_head_dim
+            );
+        }
         if let Some(section) = self.mrope_section
             && section.contains(&0)
         {
@@ -606,33 +677,15 @@ impl QwenModelConfig {
     }
 
     pub(crate) fn norm_weight_semantics(&self) -> QwenNormWeightSemantics {
-        if self
-            .model_type
-            .as_deref()
-            .is_some_and(|model_type| model_type.contains("qwen3_next"))
-            || self.architectures.as_ref().is_some_and(|architectures| {
-                architectures
-                    .iter()
-                    .any(|architecture| architecture.contains("Qwen3Next"))
-            })
-        {
-            QwenNormWeightSemantics::Offset
-        } else {
-            QwenNormWeightSemantics::Multiplicative
-        }
+        // The supported Qwen3-Coder-Next source is the MLX conversion. Its
+        // decoder, final, and Q/K norm weights have already had the upstream
+        // `1 + weight` checkpoint sanitization applied, so every tensor stored
+        // in the prepared cache has direct multiplicative semantics.
+        QwenNormWeightSemantics::Multiplicative
     }
 
-    pub(super) fn linear_attention_qkv_projection_requires_reorder(&self) -> bool {
-        let is_qwen35 = self
-            .model_type
-            .as_deref()
-            .is_some_and(|model_type| model_type.contains("qwen3_5"))
-            || self.architectures.as_ref().is_some_and(|architectures| {
-                architectures
-                    .iter()
-                    .any(|architecture| architecture.contains("Qwen3_5"))
-            });
-        !is_qwen35
+    pub(crate) fn is_qwen3_next(&self) -> bool {
+        config_is_qwen3_next(self)
     }
 
     pub(crate) fn text_mrope_section(&self) -> Option<[usize; 3]> {
@@ -1120,6 +1173,7 @@ pub struct QwenMoeModelLayout {
     pub shared_expert_intermediate_size: usize,
     pub rope_theta: Option<f64>,
     pub partial_rotary_factor: Option<f64>,
+    pub full_attention_interval: Option<usize>,
     pub mrope_section: Option<[usize; 3]>,
     pub has_vision: bool,
 }
@@ -1135,9 +1189,10 @@ impl QwenMoeModelLayout {
                 ACTIVE_EXPERTS_PER_TOKEN
             }
             QwenMoeFamily::Qwen35A17B => configured_active_experts,
-            QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe | QwenMoeFamily::Glm52 => {
-                configured_active_experts
-            }
+            QwenMoeFamily::Qwen3NextMoe
+            | QwenMoeFamily::Qwen3Moe
+            | QwenMoeFamily::Qwen3VlMoe
+            | QwenMoeFamily::Glm52 => configured_active_experts,
             QwenMoeFamily::DeepSeekV4Flash => configured_active_experts,
         };
         let routed_expert_scale = if family == QwenMoeFamily::DeepSeekV4Flash {
@@ -1152,7 +1207,7 @@ impl QwenMoeModelLayout {
             QwenMoeFamily::Qwen35A17B => {
                 Some(QwenMoeRoutingWeightNormalization::RenormalizeSelected)
             }
-            QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => {
+            QwenMoeFamily::Qwen3NextMoe | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => {
                 config.norm_topk_prob.map(|normalize| {
                     if normalize {
                         QwenMoeRoutingWeightNormalization::RenormalizeSelected
@@ -1171,9 +1226,10 @@ impl QwenMoeModelLayout {
             execution: match family {
                 QwenMoeFamily::Glm52 => QwenMoeExecutionPolicy::GLM52_PARITY,
                 QwenMoeFamily::DeepSeekV4Flash => QwenMoeExecutionPolicy::DEEPSEEK_V4_FLASH_PARITY,
-                QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => {
-                    QwenMoeExecutionPolicy::UPSTREAM_PARITY
-                }
+                QwenMoeFamily::Qwen35A17B
+                | QwenMoeFamily::Qwen3NextMoe
+                | QwenMoeFamily::Qwen3Moe
+                | QwenMoeFamily::Qwen3VlMoe => QwenMoeExecutionPolicy::UPSTREAM_PARITY,
             },
             layers: config.num_hidden_layers,
             first_sparse_layer: config.first_sparse_layer(),
@@ -1195,6 +1251,7 @@ impl QwenMoeModelLayout {
             shared_expert_intermediate_size: config.shared_expert_intermediate_size(),
             rope_theta: config.rope_theta,
             partial_rotary_factor: config.partial_rotary_factor,
+            full_attention_interval: config.full_attention_interval,
             mrope_section: config.text_mrope_section(),
             has_vision: config.vision_config.is_some(),
         };
@@ -1204,8 +1261,10 @@ impl QwenMoeModelLayout {
 
     pub fn layer_kind(&self, layer: usize) -> QwenMoeLayerKind {
         match self.family {
-            QwenMoeFamily::Qwen35A17B => {
-                if (layer + 1).is_multiple_of(FULL_ATTN_INTERVAL) {
+            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3NextMoe => {
+                if (layer + 1)
+                    .is_multiple_of(self.full_attention_interval.unwrap_or(FULL_ATTN_INTERVAL))
+                {
                     QwenMoeLayerKind::FullAttention
                 } else {
                     QwenMoeLayerKind::LinearAttention
@@ -1232,6 +1291,13 @@ impl QwenMoeModelLayout {
             || self.vocab_size == 0
         {
             bail!("Qwen MoE layout contains zero-valued required dimensions");
+        }
+        if self.family == QwenMoeFamily::Qwen3NextMoe
+            && self
+                .full_attention_interval
+                .is_none_or(|interval| interval == 0)
+        {
+            bail!("Qwen3-Next requires a positive full_attention_interval");
         }
         if self.first_sparse_layer >= self.layers {
             bail!(
@@ -1260,6 +1326,11 @@ impl QwenMoeModelLayout {
 }
 
 impl QwenMoeFamily {
+    /// Whether the published chat contract supports a thinking-mode request.
+    pub const fn supports_thinking(self) -> bool {
+        !matches!(self, Self::Qwen3NextMoe)
+    }
+
     pub fn from_model_and_config(model: &str, config: &QwenModelConfig) -> Result<Self> {
         if is_deepseek_v4_flash(model)
             && config
@@ -1272,7 +1343,10 @@ impl QwenMoeFamily {
         if is_glm52(model) || config_is_glm52(config) {
             return Ok(Self::Glm52);
         }
-        if is_qwen35_or_legacy_alias(model) || config_is_qwen35(config) {
+        if is_qwen3_next(model) || config_is_qwen3_next(config) {
+            return Ok(Self::Qwen3NextMoe);
+        }
+        if is_qwen35(model) || config_is_qwen35(config) {
             return Ok(Self::Qwen35A17B);
         }
         if is_qwen3_vl(model) || config.vision_config.is_some() || config_is_qwen_vl(config) {
@@ -1298,6 +1372,10 @@ fn config_is_glm52(config: &QwenModelConfig) -> bool {
 fn config_is_qwen35(config: &QwenModelConfig) -> bool {
     config_field_contains(config.model_type.as_deref(), "qwen3_5")
         || config_architecture_contains(config, "Qwen3_5")
+}
+
+fn config_is_qwen3_next(config: &QwenModelConfig) -> bool {
+    config_field_contains(config.model_type.as_deref(), "qwen3_next")
         || config_architecture_contains(config, "Qwen3Next")
 }
 
@@ -1344,7 +1422,7 @@ pub fn default_qwen_vl_mrope_section(config: &QwenModelConfig) -> Option<[usize;
 mod tests {
     use super::*;
     use crate::inference::flashmoe::types::{
-        HIDDEN_DIM, NUM_EXPERTS, NUM_LAYERS, QWEN3_VL_MODEL, QWEN35_MODEL,
+        HIDDEN_DIM, NUM_EXPERTS, NUM_LAYERS, QWEN3_CODER_NEXT_MODEL, QWEN3_VL_MODEL, QWEN35_MODEL,
     };
 
     fn config(json: &[u8]) -> QwenModelConfig {
@@ -1457,13 +1535,18 @@ mod tests {
         );
         assert_eq!(
             qwen3_next.norm_weight_semantics(),
-            QwenNormWeightSemantics::Offset
+            QwenNormWeightSemantics::Multiplicative
         );
     }
 
     #[test]
     fn qwen_family_name_detection_is_owned_by_model_family() {
-        assert!(is_qwen35_or_legacy_alias("hf://Qwen/Qwen3.5-397B-A17B"));
+        assert!(is_qwen35("hf://Qwen/Qwen3.5-397B-A17B"));
+        assert!(is_qwen3_next("qwen3-coder-next"));
+        assert!(is_qwen3_next("hf://mlx-community/Qwen3-Coder-Next-4bit"));
+        assert!(!is_qwen3_next(
+            "hf://Qwen/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf"
+        ));
         assert!(is_qwen3_moe("hf://Qwen/Qwen3-30B-A3B"));
         assert!(is_qwen3_vl(QWEN3_VL_MODEL));
         assert!(is_qwen3_vl("hf://Qwen/Qwen3-VL-30B-A3B-Instruct"));
@@ -1510,6 +1593,55 @@ mod tests {
         assert_eq!(layout.shared_experts, 1);
         assert_eq!(layout.shared_expert_intermediate_size, 1024);
         assert!(!layout.has_vision);
+    }
+
+    #[test]
+    fn qwen3_coder_next_keeps_checkpoint_routing_and_hybrid_geometry() {
+        let config = config(
+            br#"{
+  "model_type": "qwen3_next",
+  "architectures": ["Qwen3NextForCausalLM"],
+  "num_hidden_layers": 48,
+  "hidden_size": 2048,
+  "num_attention_heads": 16,
+  "num_key_value_heads": 2,
+  "head_dim": 256,
+  "vocab_size": 151936,
+  "full_attention_interval": 4,
+  "linear_key_head_dim": 128,
+  "linear_num_key_heads": 16,
+  "linear_num_value_heads": 32,
+  "linear_value_head_dim": 128,
+  "num_experts": 512,
+  "num_experts_per_tok": 10,
+  "norm_topk_prob": true,
+  "moe_intermediate_size": 512,
+  "shared_expert_intermediate_size": 512
+}"#,
+        );
+        let layout = QwenMoeModelLayout::from_config(QWEN3_CODER_NEXT_MODEL, &config).unwrap();
+
+        assert_eq!(layout.family, QwenMoeFamily::Qwen3NextMoe);
+        assert_eq!(layout.layers, 48);
+        assert_eq!(layout.hidden_size, 2048);
+        assert_eq!(layout.experts_per_layer, 512);
+        assert_eq!(layout.configured_active_experts, 10);
+        assert_eq!(layout.scheduled_active_experts, 10);
+        assert_eq!(layout.shared_experts, 1);
+        assert_eq!(layout.shared_expert_intermediate_size, 512);
+        assert_eq!(
+            config.linear_attention,
+            Some(QwenLinearAttentionConfig {
+                key_head_dim: 128,
+                num_key_heads: 16,
+                num_value_heads: 32,
+                value_head_dim: 128,
+            })
+        );
+        assert_eq!(layout.layer_kind(0), QwenMoeLayerKind::LinearAttention);
+        assert_eq!(layout.layer_kind(2), QwenMoeLayerKind::LinearAttention);
+        assert_eq!(layout.layer_kind(3), QwenMoeLayerKind::FullAttention);
+        assert!(!layout.family.supports_thinking());
     }
 
     #[test]

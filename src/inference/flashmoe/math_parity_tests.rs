@@ -247,6 +247,8 @@ fn gated_flashmoe_rope_defaults_to_partial_split_half() {
         moe_intermediate_size: Some(1024),
         intermediate_size: None,
         max_position_embeddings: None,
+        full_attention_interval: None,
+        linear_attention: None,
         mrope_section: None,
         tie_word_embeddings: None,
         num_shared_experts: None,

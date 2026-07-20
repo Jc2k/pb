@@ -232,7 +232,7 @@ fn colibri_unindexed_manifest_preserves_int8_io_as_resident_bf16() {
     );
 
     let destination = snapshot.join("dense.bin");
-    write_dense_tensor_store(snapshot, &destination, &manifest.dense_tensors).unwrap();
+    write_dense_tensor_store(snapshot, &destination, &manifest.dense_tensors, None).unwrap();
     let bytes = std::fs::read(destination).unwrap();
     let first = u16::from_le_bytes(bytes[0..2].try_into().unwrap()) as u32;
     let second = u16::from_le_bytes(bytes[2..4].try_into().unwrap()) as u32;
@@ -290,7 +290,7 @@ fn mlx_mxfp4_manifest_and_dense_writer_build_canonical_q4() {
     );
 
     let destination = snapshot.join("dense.bin");
-    write_dense_tensor_store(snapshot, &destination, &manifest.dense_tensors).unwrap();
+    write_dense_tensor_store(snapshot, &destination, &manifest.dense_tensors, None).unwrap();
     assert_eq!(
         std::fs::metadata(destination).unwrap().len(),
         tensor.byte_len

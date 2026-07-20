@@ -1548,6 +1548,10 @@ struct WebEventSink {
 }
 
 impl EventSink for WebEventSink {
+    fn supports_user_questions(&self) -> bool {
+        true
+    }
+
     fn emit(&mut self, event: AgentEvent) {
         if let AgentEvent::Started {
             workspace,

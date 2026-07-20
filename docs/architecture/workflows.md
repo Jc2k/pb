@@ -111,11 +111,27 @@ changes the signature. For a capped file write, the correction explicitly says t
 exists and requires materially shorter complete content. The third equivalent failure at unchanged
 state terminates without another model turn.
 
-Compatibility tool turns are single-action boundaries. Implementation prompts tell the model to
+Compatibility edit actions are model-turn boundaries. Implementation prompts tell the model to
 stop after the action and never imitate pb's transcript or invent later results. If a local model
 still emits a fenced action followed by fabricated `Tool calls:` or role entries, pb executes only
 the validated action and omits that untrusted pseudo-transcript from subsequent model context. The
 real tool result and content fingerprint remain the only mutation evidence.
+
+That boundary is per model completion, not one tool invocation per prompt. Native function-call
+output may contain multiple calls, and the JSON compatibility protocol has an equivalent
+`tool_calls` batch. pb validates every call against the same stage, allowlist, schema, policy, and
+progress gates. Independent parallel-safe calls run concurrently and all authoritative results are
+returned before the next model pass; order-dependent calls remain sequential, and a workflow or
+delivery transition must be the only call in its batch. The prompt explicitly encourages batching
+independent discovery reads and lookups so local inference is not spent on unnecessary round trips.
+If a max-token native completion contains complete early calls followed by an incomplete call, pb
+rejects the entire batch before execution and invokes the bounded truncation recovery. A complete
+administrative call therefore cannot mask or partially commit an oversized file mutation.
+
+The workflow capability set is intersected with the active event sink. Non-interactive harness
+runs omit `ask_user`, while the web event sink exposes it because it can collect and return a real
+answer. This prevents a local model from entering an unanswerable question loop without weakening
+interactive workflows.
 
 Implementation guidance gives symmetric concrete actions for missing and existing paths. Missing
 paths use `write_file`; existing paths use a separate `read_file` turn followed by
@@ -135,13 +151,22 @@ the task baseline, but on a persistent scratch resume it includes explicitly ado
 The original task baseline remains available for final task-delta ownership, while the current
 snapshot prevents planning from receiving an impossible stale fingerprint.
 
+Implementation and repair prompts also include an authoritative state for every planned path:
+missing, present unchanged, created in this task, modified in this task, or deleted in this task.
+A resumed model therefore does not need volatile TODO memory to know that an earlier `create`
+already succeeded, and is explicitly told not to call `write_file` for an existing path.
+
 During a strict workflow stage, pb may recover a complete unwrapped JSON object (plain or in one
 JSON code fence) when the exposed schemas identify exactly one intended tool. The only ambiguity it
 resolves is `write_file` versus `replace_file`, using whether the bounded workspace target already
 exists. The recovered call still passes ordinary path, policy, schema, stage, and artifact
-validation. Prose, partial JSON, arrays, and any other ambiguous object are not coerced. Stage
-prompts prefer native function calls but also state the exact compatibility action shape for model
-runtimes that cannot emit them.
+validation. A workflow terminal may also accept its declared typed artifact when the outer function
+arguments are valid but the artifact field contains one complete JSON-encoded string. pb parses
+that string exactly once, validates the resulting typed artifact normally, preserves the original
+call in the transcript, and reports the normalization in the tool result. It does not repair,
+complete, recursively decode, or invent artifact values. Prose, partial JSON, arrays, and any other
+ambiguous object are not coerced. Stage prompts prefer native function calls but also state the
+exact compatibility action shape for model runtimes that cannot emit them.
 
 Implementation and repair turns keep their edit tools after a rejected prose final. They are not
 narrowed to `submit_implementation` before the model has had another chance to make the repository

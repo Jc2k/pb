@@ -203,11 +203,34 @@ pub struct FlashMoeEngine {
     pub(super) deepseek_sessions: DeepSeekV4SessionStore<DeepSeekV4SessionSnapshot>,
 }
 
-pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
-    load_with_progress(plan, |_, _| {})
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlashMoeLoadOptions {
+    pub metal_working_set_limit_bytes: Option<usize>,
 }
 
-pub fn load_with_progress<F>(plan: &FlashMoePlan, mut progress: F) -> Result<FlashMoeEngine>
+pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
+    load_with_options(plan, FlashMoeLoadOptions::default())
+}
+
+pub fn load_with_progress<F>(plan: &FlashMoePlan, progress: F) -> Result<FlashMoeEngine>
+where
+    F: FnMut(&'static str, Duration),
+{
+    load_with_options_and_progress(plan, FlashMoeLoadOptions::default(), progress)
+}
+
+pub fn load_with_options(
+    plan: &FlashMoePlan,
+    options: FlashMoeLoadOptions,
+) -> Result<FlashMoeEngine> {
+    load_with_options_and_progress(plan, options, |_, _| {})
+}
+
+pub fn load_with_options_and_progress<F>(
+    plan: &FlashMoePlan,
+    options: FlashMoeLoadOptions,
+    mut progress: F,
+) -> Result<FlashMoeEngine>
 where
     F: FnMut(&'static str, Duration),
 {
@@ -320,6 +343,7 @@ where
     if matches!(
         model_layout.family,
         QwenMoeFamily::Qwen35A17B
+            | QwenMoeFamily::Qwen3NextMoe
             | QwenMoeFamily::Qwen3Moe
             | QwenMoeFamily::Qwen3VlMoe
             | QwenMoeFamily::Glm52
@@ -341,6 +365,9 @@ where
     progress("vision_encoder", phase_started.elapsed());
     phase_started = Instant::now();
     let metal = MetalExecutionFacade::new(plan, &config, &runtime, &dense)?;
+    if let Some(limit) = options.metal_working_set_limit_bytes {
+        metal.set_working_set_limit_bytes(limit)?;
+    }
     progress("metal_executor", phase_started.elapsed());
     phase_started = Instant::now();
     let experts = resolved_experts.store;
@@ -726,6 +753,18 @@ impl MetalExecutionFacade {
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             None
+        }
+    }
+
+    pub(super) fn set_working_set_limit_bytes(&self, limit: usize) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.set_working_set_limit_bytes(limit)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = limit;
+            bail!("FlashMoe Metal resource policy requires Apple Silicon Metal")
         }
     }
 
@@ -2435,14 +2474,6 @@ impl FlashMoeEngine {
     ) -> Result<MetalPostAttentionPrep> {
         let metal = &self.metal;
         let layout = runtime.linear_attention_layout(layer)?;
-        if self
-            .config
-            .linear_attention_qkv_projection_requires_reorder()
-        {
-            bail!(
-                "FlashMoe unsupported scheduled Qwen3.5 linear-attention CMD1 path at layer {layer}: the resolved implementation does not support QKV projection reorder"
-            );
-        }
         let bindings = self.linear_attention_weights.require(layer)?;
         let residual_len = residual.len();
         if residual_len != runtime.width || residual_len != post_norm_weight.len() {
@@ -2527,6 +2558,10 @@ impl FlashMoeEngine {
         true
     }
 
+    pub(crate) fn supports_thinking(&self) -> bool {
+        self.model_layout.family.supports_thinking()
+    }
+
     pub(crate) fn requires_exact_session_prefix(&self) -> bool {
         self.deepseek_graph.is_some()
     }
@@ -2548,7 +2583,7 @@ impl FlashMoeEngine {
                 &request.messages,
                 &request.tools,
                 request.add_generation_prompt,
-                request.enable_thinking,
+                request.enable_thinking && self.supports_thinking(),
             );
         }
         let prompt = self.render_structured_prompt(request)?;
@@ -2576,7 +2611,7 @@ impl FlashMoeEngine {
                 &request.messages,
                 &request.tools,
                 request.add_generation_prompt,
-                request.enable_thinking,
+                request.enable_thinking && self.supports_thinking(),
             )
     }
 

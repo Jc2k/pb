@@ -120,6 +120,36 @@ If Metal can load the weights but cannot create that context, pb reports the deg
 reloads the model CPU-only instead of failing before the first token. A CPU-only context failure is
 still terminal rather than being hidden behind retries.
 
+## Qwen3-Coder-Next with FlashMoe
+
+**Configurable.** On Apple Silicon, the default model is the native affine-Q4 checkpoint:
+
+```bash
+pb pull
+pb config set model.model hf://mlx-community/Qwen3-Coder-Next-4bit
+```
+
+The shorter `qwen3-coder-next` name resolves to the same source. Pull builds the normal FlashMoe
+dense store and fixed whole-expert packs. The one-time import keeps the large MLX affine-Q4
+matrices quantized and expands the checkpoint's small affine-int8 routers and shared gates to
+resident BF16. At load, pb compares the complete 48-layer, 512-expert
+corpus plus transient/session headroom with the Metal working-set limit. A fitting Mac keeps every
+expert mapped and resident for the graph lifetime; a larger corpus or smaller memory budget uses
+the existing parallel positioned-read scheduler and OS page cache. There is no partial expert
+cache, first-use retention, or second scheduler.
+
+The hidden inference/benchmark harness can lower the Metal limit for experiments. That limit is
+installed before graph preparation, so it participates in the resident-versus-positioned-read
+decision rather than changing accounting after the model has already been placed.
+
+Qwen3-Coder-Next retains its checkpoint top-10 routing and hybrid attention schedule. It is a
+non-thinking model, so pb disables thinking for both prompt measurement and generation rather than
+spending the output budget on unsupported reasoning markers. It can return several independent
+native tool calls in one assistant turn; pb validates the full batch and runs parallel-safe calls
+together before asking the model again. An explicit Qwen GGUF path continues to use llama.cpp.
+Once a native FlashMoe source has been selected, a cache or graph-load failure is reported directly
+instead of silently running a different backend.
+
 ## GLM-5.2 with FlashMoe
 
 **Configurable.** On Apple Silicon, pb can import GLM-5.2 checkpoints and run the baseline decoder

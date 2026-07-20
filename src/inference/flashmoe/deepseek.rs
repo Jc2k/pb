@@ -377,6 +377,8 @@ impl DeepSeekV4Config {
                 self.rope_original_context_length
                     .saturating_mul(self.rope_scaling_factor as usize),
             ),
+            full_attention_interval: None,
+            linear_attention: None,
             mrope_section: None,
             tie_word_embeddings: Some(false),
             num_shared_experts: Some(self.expert_shared_count),

@@ -259,7 +259,9 @@ without being mislabeled as completed work.
 FlashMoe inference, benchmark, and cache-clean utilities also live beneath the hidden harness, for
 example `pb harness infer ...`. `infer` and `bench` accept
 `--metal-working-set-limit-mib <MiB>` to lower the device-derived safety limit. The override can
-only make the default policy stricter. `--resource-summary` prints the opt-in JSON resource ledger;
+only make the default policy stricter and is applied before expert-access graph resolution, so a
+lower limit can select the existing positioned-read implementation instead of resident expert
+mapping. `--resource-summary` prints the opt-in JSON resource ledger;
 normal runs keep it disabled and emit tracing only for high-water changes, pressure recovery, or a
 resource-limit abort. `infer --no-thinking` asks a checkpoint's chat template to suppress emitted
 reasoning; it cannot be combined with `--raw`, which bypasses the chat template entirely.
@@ -369,6 +371,22 @@ pb does not replay fenced compatibility actions followed by fabricated transcrip
 next model context. Only the validated first action is executed; its real result and harness content
 fingerprint determine the next state.
 
+One model turn is not limited to one independent tool. Native function-call output and the JSON
+compatibility `tool_calls` form may carry a batch; every member is validated before execution,
+parallel-safe members run together, and all real results return before the next inference pass.
+Calls whose outcome is needed by a later call stay in separate turns, and authority-changing
+workflow or delivery transitions must be the only call in a batch.
+
+Tool exposure also follows the event sink's actual interaction capability. The non-interactive
+CLI harness does not advertise `ask_user`, because it cannot deliver an answer; interactive web
+sessions do. A model therefore cannot spend bounded workflow turns waiting on an unavailable
+question channel.
+
+A native batch is atomic with respect to truncation. If generation reaches its token cap after one
+or more complete calls but leaves a later call incomplete, none of those calls execute; the same
+bounded shorter-action/larger-cap recovery used for a single truncated action runs instead. This
+prevents a small bookkeeping call from hiding a cut-off write later in the completion.
+
 Implementation prompts include exact compatibility examples for both creation and replacement.
 `write_file` still refuses an existing target; its failure directs the model to call `read_file`,
 wait for the authoritative result, and only then use `replace_file` in a later turn. The
@@ -383,13 +401,22 @@ snapshot is the current invocation baseline rather than the original empty task 
 original baseline still defines the task-owned delta, but plan submission is checked against the
 workspace the model can actually inspect.
 
+On implementation or repair, the stage prompt lists the current state of every planned path
+relative to the original task baseline. This state survives process restarts even though advisory
+TODOs do not: already-created or modified paths are explicit, missing paths remain explicit, and
+the model is warned not to retry `write_file` against an existing path.
+
 During a strict workflow stage, pb can recover a complete unwrapped JSON object, either plain or in
 one JSON code fence, when the exposed schemas identify exactly one tool. The sole special-case tie
 is `write_file` versus `replace_file`, selected from whether the bounded target currently exists.
 The recovered action still goes through normal path, policy, schema, capability, and artifact
-validation. Prose, partial JSON, arrays, and other ambiguous objects are not coerced. Implementation
-and repair also retain their edit tools after a rejected prose final instead of exposing only a
-submission that cannot truthfully advance.
+validation. For workflow terminal tools only, an otherwise valid outer argument object may contain
+its typed artifact field as one complete JSON string. pb decodes that field exactly once, applies
+the same typed artifact validation, preserves the original call, and records the normalization in
+the result. It never repairs partial JSON, recursively unwraps strings, or invents missing fields.
+Prose, arrays, and other ambiguous objects are not coerced. Implementation and repair also retain
+their edit tools after a rejected prose final instead of exposing only a submission that cannot
+truthfully advance.
 
 Plan paths are checked in step order. Creating a missing path makes it available to later modify or
 delete steps, while modification before creation and duplicate creation of an existing path remain

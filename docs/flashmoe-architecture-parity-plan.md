@@ -113,6 +113,44 @@ eviction, memory-pressure transition, or route-dependent fallback. This keeps gr
 prevents the duplicate-cache failure mode measured on GLM-5.2, and leaves room for transient Metal
 buffers and request/session state.
 
+## Qwen3-Coder-Next Extension Contract
+
+Status: **Configurable native-Q4 support.**
+
+Qwen3-Coder-Next is a distinct `Qwen3NextMoe` family in FlashMoe. The plain
+`qwen3-coder-next` alias resolves to `mlx-community/Qwen3-Coder-Next-4bit`; an explicit GGUF URI
+remains an explicit llama.cpp selection. The native family is not a legacy alias for Qwen3.5 and
+therefore does not inherit Qwen3.5's forced top-4 routing profile.
+
+The load-resolved graph takes the checkpoint's published geometry: 48 decoder layers, hidden size
+2,048, 16 query heads with head dimension 256, two full-attention KV heads, 512 routed experts,
+top-10 selected experts, one 512-wide shared expert, and full attention every fourth layer. The
+other layers use the existing typed linear-attention stage. `full_attention_interval` is validated
+as a positive model-config value, and the scheduler carries K=10 from model configuration through
+capability resolution. This reuses the existing hybrid state, fixed affine-Q4 whole-expert slots,
+CPU softmax/top-K routing, Metal command topology, and session snapshot schema.
+
+The source checkpoint's group-64 affine 4-bit tensors are imported through the normal indexed-MLX
+cache builder. Its small per-layer router and shared-gate projections use MLX affine 8-bit storage;
+the cache builder identifies those tensors from their packed and scale geometry and expands them
+once to resident BF16. It widens the recurrent `A_log` vectors from source BF16 to the existing
+resident F32 decay-kernel contract, while leaving the large dense and expert matrices in canonical
+Q4. The supported MLX conversion has already applied upstream's `(1 + weight)` sanitization to
+decoder, final, and full-attention query/key norms, so the cache and runtime consume those weights
+directly as multiplicative values; the gated recurrent norm is also multiplicative. Graph
+preparation chooses the complete resident expert implementation only when the
+exact full corpus, already-mapped dense graph, and transient/session reserve fit below the sampled
+Metal working-set limit. Otherwise it selects scheduler-owned parallel positioned reads and the OS
+page cache. Qwen3-Coder-Next does not add a partial resident tier, first-use expert cache, eviction
+policy, or alternate scheduler.
+
+The published model contract is non-thinking-only. Structured FlashMoe requests therefore clamp
+thinking off for this family before prompt measurement and generation; agent telemetry records the
+same effective setting. Native tool-call batches remain valid and are executed by the shared agent
+executor. A requested native FlashMoe model that cannot build or load its declared graph fails with
+the FlashMoe diagnostic; pb does not silently substitute llama.cpp. llama.cpp remains available for
+models and explicit GGUF paths that select it before loading.
+
 ## GLM-5.2 Extension Contract
 
 Status: **Shipped baseline**. Indexed MLX MXFP4 and unindexed Colibri import, dense lead-in layers,
@@ -1133,9 +1171,10 @@ Baseline reviewed on 2026-07-11:
   router logits, fixed-slot top-K selection, selected-route renormalization, and routed scale 1.0.
   Qwen MoE advances only when `norm_topk_prob=true`, while a missing value or `false` reports the
   routing stage as unsupported.
-- Norm-weight semantics are concrete model metadata rather than a value-based runtime probe.
-  Qwen3.5, Qwen, and Qwen-VL cache tensors are multiplicative RMSNorm weights; an actual
-  `qwen3_next` config selects the typed `1 + weight` implementation. Removing the former
+- Norm-weight semantics are concrete checkpoint-format metadata rather than a value-based runtime
+  probe. Qwen3.5, Qwen, and Qwen-VL cache tensors are multiplicative RMSNorm weights. The supported
+  Qwen3-Coder-Next MLX conversion has already applied upstream's `1 + weight` sanitization, so its
+  prepared decoder/final/QK tensors also select the multiplicative implementation. Removing the former
   mean-below-0.75 heuristic fixed the first real-checkpoint divergence at Qwen3.5 layer 35: its
   Q/K/V projections, gated attention, CMD2 residual, and generated continuation now match
   upstream.
@@ -1489,6 +1528,7 @@ Current capability matrix:
 | Family | Dense/expert layout | Graph/load status | Correctness evidence |
 | --- | --- | --- | --- |
 | Qwen3.5 MoE | Resident Q4 / fixed-Q4 slots | Supported | Linked parity, all-target, release, real smoke |
+| Qwen3-Coder-Next | Resident affine Q4 / complete resident or fixed-Q4 streamed expert slots selected at graph preparation | Supported with `mlx-community/Qwen3-Coder-Next-4bit`; explicit GGUF remains llama.cpp | Nine-shard cache build, 48-layer/512-expert/K=10 real load, resident and forced-streamed graph decisions, deterministic native inference, and upstream MLX-LM raw-token parity |
 | Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Supported through the unified graph with `mlx-community/Qwen3-30B-A3B-4bit` | Linked K=8 parity, 48-layer/128-expert cache build, real load/infer, and raw-output parity with upstream MLX-LM |
 | Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Supported through the unified graph and typed vision executor with `mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` | Adapter/capability parity, stale-index header import, 48-layer/128-expert cache build, real text inference, and real image request through the shared decoder |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |

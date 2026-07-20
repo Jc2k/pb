@@ -20,8 +20,9 @@ confirm the first launch.
 
 ## Pull a local model
 
-`pb pull` downloads the configured default model. It also accepts an Ollama-compatible model name
-or a Hugging Face URI.
+`pb pull` downloads the native affine-Q4 Qwen3-Coder-Next checkpoint used by FlashMoe by default.
+It also accepts an Ollama-compatible model name or a Hugging Face URI. An explicit GGUF URI keeps
+using llama.cpp.
 
 ```bash
 pb pull

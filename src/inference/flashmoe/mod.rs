@@ -43,7 +43,10 @@ pub use metal::METAL_SHADERS;
 pub use model_family::*;
 pub use planning::*;
 pub use pool::{FlashMoeRuntimeHandle, load_shared, reap_idle_shared_runtimes};
-pub use runtime::{FlashMoeEngine, load, load_with_progress};
+pub use runtime::{
+    FlashMoeEngine, FlashMoeLoadOptions, load, load_with_options, load_with_options_and_progress,
+    load_with_progress,
+};
 pub use scheduler::*;
 pub use types::*;
 pub use vision::{ImagePreprocessor, Qwen3VLVisionConfig, VisionEncoder, VisionEncoding};

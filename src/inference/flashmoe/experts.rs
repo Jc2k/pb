@@ -5283,11 +5283,12 @@ pub(super) fn pack_direct_expert_layer(
 ) -> Result<()> {
     let fixed_dense = fixed_dense_expert_slot_spec_for_pack(policy, config)?;
     let fixed_native_q4 = if policy.quantization == ExpertQuantization::FourBitProduction
-        && experts
-            .values()
-            .flatten()
-            .all(|tensor| tensor.q4_sources.is_some())
-    {
+        && experts.values().flatten().all(|tensor| {
+            tensor
+                .q4_sources
+                .as_ref()
+                .is_some_and(|source| source.source_format != DenseQ4SourceFormat::MlxAffine8)
+        }) {
         let config = config.context("model config is required for native Q4 expert packing")?;
         let layout = QwenMoeModelLayout::from_config(policy.model, config)?;
         let sources = experts
@@ -6753,6 +6754,8 @@ mod tests {
             moe_intermediate_size: Some(16),
             intermediate_size: None,
             max_position_embeddings: Some(1024),
+            full_attention_interval: None,
+            linear_attention: None,
             mrope_section: None,
             tie_word_embeddings: Some(true),
             num_shared_experts: None,

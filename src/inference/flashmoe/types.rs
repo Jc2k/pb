@@ -7,7 +7,10 @@ use serde_json::Value;
 pub const QWEN35_MODEL: &str = "hf://mlx-community/Qwen3.5-397B-A17B-4bit";
 pub const QWEN35_BF16_MODEL: &str = "hf://Qwen/Qwen3.5-397B-A17B";
 pub const QWEN35_MODEL_MARKER: &str = "qwen3.5-397b-a17b";
-pub const LEGACY_QWEN_CODER_MARKER: &str = "qwen3-coder-next";
+/// Production native-Q4 source for Qwen3-Coder-Next on Apple Silicon.
+pub const QWEN3_CODER_NEXT_MODEL: &str = "hf://mlx-community/Qwen3-Coder-Next-4bit";
+pub const QWEN3_CODER_NEXT_MODEL_MARKER: &str = "qwen3-coder-next";
+pub const QWEN3_NEXT_CACHE_VERSION: &str = "flashmoe-v2-qwen3-next-mlxq4";
 /// Preferred GLM-5.2 source checkpoint. The runtime cache is source-format
 /// independent; Colibri remains available through `GLM52_COLIBRI_MODEL`.
 pub const GLM52_MXFP4_MODEL: &str = "hf://mlx-community/GLM-5.2-mxfp4";

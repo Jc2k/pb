@@ -9,11 +9,14 @@ use super::deepseek::{
 };
 use super::experts::first_missing_expert_pack_for_shape_from;
 use super::model_family::{
-    QwenModelConfig, is_glm52, is_qwen3_moe, is_qwen3_vl, is_qwen35_or_legacy_alias,
+    QwenModelConfig, is_glm52, is_qwen3_moe, is_qwen3_next, is_qwen3_vl, is_qwen35,
 };
+#[cfg(test)]
+use super::types::QWEN35_MODEL;
 use super::types::{
     ACTIVE_EXPERTS_PER_TOKEN, BackendSelection, CacheStatus, ExpertQuantization,
-    LEGACY_QWEN_CODER_MARKER, QWEN35_BF16_MODEL, QWEN35_MODEL,
+    QWEN3_CODER_NEXT_MODEL, QWEN3_CODER_NEXT_MODEL_MARKER, QWEN3_NEXT_CACHE_VERSION,
+    QWEN35_BF16_MODEL,
 };
 
 const QWEN35_MIN_ACTIVE_EXPERTS: usize = 4;
@@ -37,7 +40,7 @@ impl FlashMoeRoutingPolicy {
         model: &str,
         config: &QwenModelConfig,
     ) -> Result<ResolvedRoutingPolicy> {
-        let qwen35_profile = is_qwen35_or_legacy_alias(model);
+        let qwen35_profile = is_qwen35(model);
         let deepseek_profile = is_deepseek_v4_flash(model);
         let (source, active_experts) = if deepseek_profile {
             if let Some(active_experts) = self.active_experts_override
@@ -153,7 +156,11 @@ fn is_flashmoe_model_name(model: &str) -> bool {
     if normalized.contains("gguf") {
         return false;
     }
-    is_qwen35_or_legacy_alias(model) || is_qwen3_vl(model) || is_qwen3_moe(model) || is_glm52(model)
+    is_qwen35(model)
+        || is_qwen3_next(model)
+        || is_qwen3_vl(model)
+        || is_qwen3_moe(model)
+        || is_glm52(model)
 }
 
 pub fn is_flashmoe_hf_model(model: &str) -> bool {
@@ -163,11 +170,11 @@ pub fn is_flashmoe_hf_model(model: &str) -> bool {
 pub fn canonical_model(model: &str) -> String {
     if let Some(model) = canonical_deepseek_v4_flash_model(model) {
         model.to_string()
-    } else if model
-        .to_ascii_lowercase()
-        .contains(LEGACY_QWEN_CODER_MARKER)
-    {
-        QWEN35_MODEL.to_string()
+    } else if matches!(
+        model.to_ascii_lowercase().as_str(),
+        QWEN3_CODER_NEXT_MODEL_MARKER | "qwen3-coder-next:latest"
+    ) {
+        QWEN3_CODER_NEXT_MODEL.to_string()
     } else {
         model.to_string()
     }
@@ -178,6 +185,8 @@ pub fn cache_version_for_model(model: &str) -> &'static str {
         DEEPSEEK_V4_FLASH_CACHE_VERSION
     } else if is_glm52(model) {
         super::types::GLM52_CACHE_VERSION
+    } else if is_qwen3_next(model) {
+        QWEN3_NEXT_CACHE_VERSION
     } else {
         default_expert_quantization(model).cache_version()
     }
@@ -248,6 +257,8 @@ pub fn plan_unchecked_with_routing_and_quantization(
             DEEPSEEK_V4_FLASH_CACHE_VERSION
         } else if is_glm52(model) && quantization == ExpertQuantization::FourBitProduction {
             super::types::GLM52_CACHE_VERSION
+        } else if is_qwen3_next(model) && quantization == ExpertQuantization::FourBitProduction {
+            QWEN3_NEXT_CACHE_VERSION
         } else {
             quantization.cache_version()
         },
@@ -636,7 +647,8 @@ mod tests {
     };
     use crate::inference::flashmoe::types::{
         BF16_CACHE_VERSION, CACHE_VERSION, F16_CACHE_VERSION, GLM52_CACHE_VERSION,
-        GLM52_COLIBRI_MODEL, GLM52_MODEL, GLM52_MXFP4_MODEL, QWEN3_VL_MODEL,
+        GLM52_COLIBRI_MODEL, GLM52_MODEL, GLM52_MXFP4_MODEL, QWEN3_NEXT_CACHE_VERSION,
+        QWEN3_VL_MODEL,
     };
 
     fn qwen_config(model_type: &str, active_experts: usize) -> QwenModelConfig {
@@ -649,7 +661,7 @@ mod tests {
             "num_key_value_heads": 1,
             "vocab_size": 128,
             "torch_dtype": "bfloat16",
-            "num_experts": 8,
+            "num_experts": 16,
             "num_experts_per_tok": active_experts,
             "moe_intermediate_size": 64,
             "norm_topk_prob": true
@@ -664,6 +676,12 @@ mod tests {
             .unwrap();
         assert_eq!(qwen35.active_experts, ACTIVE_EXPERTS_PER_TOKEN);
         assert_eq!(qwen35.source, ActiveExpertsSource::Qwen35FlashMoeProfile);
+
+        let coder_next = FlashMoeRoutingPolicy::default()
+            .resolve(QWEN3_CODER_NEXT_MODEL, &qwen_config("qwen3_next", 10))
+            .unwrap();
+        assert_eq!(coder_next.active_experts, 10);
+        assert_eq!(coder_next.source, ActiveExpertsSource::ModelConfig);
 
         let qwen = FlashMoeRoutingPolicy::default()
             .resolve("hf://Qwen/Qwen3-30B-A3B", &qwen_config("qwen3_moe", 6))
@@ -729,6 +747,13 @@ mod tests {
         assert!(qwen35.uses_metal);
         assert!(qwen35.streams_experts_from_nand);
         assert!(qwen35.describe().contains("397B"));
+
+        let coder_next = plan_unchecked(QWEN3_CODER_NEXT_MODEL, temp.path());
+        assert!(coder_next.runtime_dir.ends_with(QWEN3_NEXT_CACHE_VERSION));
+        assert_eq!(
+            coder_next.quantization,
+            ExpertQuantization::FourBitProduction
+        );
     }
 
     #[test]
@@ -789,9 +814,13 @@ mod tests {
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-VL-8B-Instruct"));
         assert!(!is_flashmoe_hf_model("hf://Qwen/Qwen3-8B"));
         assert!(!is_flashmoe_hf_model("qwen3-30b-a3b"));
+        assert!(is_flashmoe_hf_model(
+            "hf://mlx-community/Qwen3-Coder-Next-4bit"
+        ));
+        assert_eq!(canonical_model("qwen3-coder-next"), QWEN3_CODER_NEXT_MODEL);
         assert_eq!(
             canonical_model("hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf"),
-            QWEN35_MODEL
+            "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf"
         );
         assert_eq!(
             select_backend("qwen-vision.gguf"),
@@ -846,6 +875,10 @@ mod tests {
         );
         assert_eq!(canonical_model(QWEN35_BF16_MODEL), QWEN35_BF16_MODEL);
         assert_eq!(cache_version_for_model(QWEN35_MODEL), CACHE_VERSION);
+        assert_eq!(
+            cache_version_for_model(QWEN3_CODER_NEXT_MODEL),
+            QWEN3_NEXT_CACHE_VERSION
+        );
         assert_eq!(cache_version_for_model(GLM52_MODEL), GLM52_CACHE_VERSION);
         assert_eq!(
             cache_version_for_model(GLM52_COLIBRI_MODEL),

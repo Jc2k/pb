@@ -118,6 +118,20 @@ during inference and does not introduce a partial cache or eviction policy. Meta
 allocations use a separate bounded pool whose bytes are overwritten on every checkout; it is
 allocation reuse rather than an expert-identity cache and is drained under working-set pressure.
 
+**Configurable.** Qwen3-Coder-Next uses a distinct native FlashMoe family and the indexed
+`mlx-community/Qwen3-Coder-Next-4bit` source by default. Its graph preserves the published
+48-layer hybrid attention schedule, 512 experts, and top-10 routing instead of applying Qwen3.5's
+top-4 profile. Cache construction keeps its large affine-Q4 matrices quantized, splits grouped
+linear-attention projections into canonical row order, and expands only the small affine-int8
+router and shared-gate projections to resident BF16. It widens recurrent `A_log` vectors once to
+the existing F32 decay-kernel contract. Its prepared norm tensors are already sanitized by the MLX
+conversion and are consumed directly instead of receiving a second `1 + weight` transform. The
+same load-time memory calculation chooses complete resident expert slots when the whole corpus
+fits, or scheduler-owned positioned reads when it does not. Its chat contract is
+non-thinking-only, so prompt measurement and generation both disable thinking for this family.
+An explicit GGUF URI still selects llama.cpp; failure to load an already-selected native FlashMoe
+graph is terminal and never changes the backend behind the user's request.
+
 **Configurable.** GLM-5.2 extends that runtime at typed boundaries. Pull accepts indexed MLX MXFP4
 or unindexed Colibri tensors through source adapters, normalizes either representation into pb's
 canonical resident-dense and fixed-slot Q4 layouts, and records a source-format-independent runtime

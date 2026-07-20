@@ -733,21 +733,6 @@ fn linear_attention_key_dim_uses_qwen35_default_only_for_known_shape() {
 }
 
 #[test]
-fn qwen35_linear_attention_keeps_direct_qkv_projection_order() {
-    let qwen35: QwenModelConfig = serde_json::from_slice(
-            br#"{"model_type":"qwen3_5_moe_text","num_hidden_layers":1,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":2,"vocab_size":248320,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
-        )
-        .unwrap();
-    assert!(!qwen35.linear_attention_qkv_projection_requires_reorder());
-
-    let qwen_next: QwenModelConfig = serde_json::from_slice(
-            br#"{"model_type":"qwen3_next","num_hidden_layers":1,"hidden_size":4096,"num_attention_heads":32,"num_key_value_heads":2,"vocab_size":248320,"torch_dtype":"bfloat16","num_experts":512,"num_experts_per_tok":10}"#,
-        )
-        .unwrap();
-    assert!(qwen_next.linear_attention_qkv_projection_requires_reorder());
-}
-
-#[test]
 fn linear_attention_qk_normalization_matches_qwen35_reference_scaling() {
     let layout = LinearAttentionLayout {
         num_value_heads: 4,
@@ -1197,6 +1182,8 @@ fn router_scores_use_cached_full_tensor_matvec() {
         moe_intermediate_size: Some(4),
         intermediate_size: None,
         max_position_embeddings: Some(8),
+        full_attention_interval: None,
+        linear_attention: None,
         mrope_section: None,
         tie_word_embeddings: None,
         num_shared_experts: None,
@@ -1688,6 +1675,8 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
         moe_intermediate_size: Some(4),
         intermediate_size: None,
         max_position_embeddings: Some(4),
+        full_attention_interval: None,
+        linear_attention: None,
         mrope_section: None,
         tie_word_embeddings: None,
         num_shared_experts: None,
@@ -1855,6 +1844,8 @@ fn arm_macos_resident_dense_mmap_batch_matches_cpu_reference() {
         moe_intermediate_size: Some(4),
         intermediate_size: None,
         max_position_embeddings: Some(4),
+        full_attention_interval: None,
+        linear_attention: None,
         mrope_section: None,
         tie_word_embeddings: None,
         num_shared_experts: None,
@@ -2068,6 +2059,8 @@ fn arm_macos_post_attention_dense_prep_matches_cpu_reference() {
             moe_intermediate_size: Some(4),
             intermediate_size: None,
             max_position_embeddings: Some(4),
+            full_attention_interval: None,
+            linear_attention: None,
             mrope_section: None,
             tie_word_embeddings: None,
             num_shared_experts: None,
@@ -2239,6 +2232,8 @@ fn arm_macos_post_attention_resident_q4_prep_matches_cpu_reference() {
         moe_intermediate_size: Some(4),
         intermediate_size: None,
         max_position_embeddings: Some(4),
+        full_attention_interval: None,
+        linear_attention: None,
         mrope_section: None,
         tie_word_embeddings: None,
         num_shared_experts: None,
@@ -2508,7 +2503,7 @@ fn dense_manifest_imports_native_mlx_q4_triples() {
     assert_eq!(layout.scales_bytes, scales.len());
 
     let dense_path = snapshot.join("model_weights.bin");
-    write_dense_tensor_store(snapshot, &dense_path, &manifest.dense_tensors).unwrap();
+    write_dense_tensor_store(snapshot, &dense_path, &manifest.dense_tensors, None).unwrap();
     let mut expected_bytes = packed_word.clone();
     expected_bytes.extend_from_slice(&scales);
     expected_bytes.extend_from_slice(&biases);

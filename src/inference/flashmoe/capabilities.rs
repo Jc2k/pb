@@ -269,9 +269,10 @@ impl FlashMoeCapabilityPlan {
             QwenMoeFamily::DeepSeekV4Flash => {
                 FlashMoeAttentionMathCapability::DeepSeekV4HyperconnectionCompressedAttentionMetal
             }
-            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Qwen3VlMoe => {
-                FlashMoeAttentionMathCapability::QwenFullAttentionCpuKv
-            }
+            QwenMoeFamily::Qwen35A17B
+            | QwenMoeFamily::Qwen3NextMoe
+            | QwenMoeFamily::Qwen3Moe
+            | QwenMoeFamily::Qwen3VlMoe => FlashMoeAttentionMathCapability::QwenFullAttentionCpuKv,
         };
         Self::resolve_with_attention_math(
             layout,
@@ -882,7 +883,10 @@ fn resolve_input_adapter(
 ) -> Result<FlashMoeStageImplementation, FlashMoeUnsupportedCapability> {
     match (layout.family, input_adapter) {
         (
-            QwenMoeFamily::Qwen35A17B | QwenMoeFamily::Qwen3Moe | QwenMoeFamily::Glm52,
+            QwenMoeFamily::Qwen35A17B
+            | QwenMoeFamily::Qwen3NextMoe
+            | QwenMoeFamily::Qwen3Moe
+            | QwenMoeFamily::Glm52,
             FlashMoeInputAdapterCapability::QwenText,
         ) => Ok(FlashMoeStageImplementation::QwenTextInput),
         (QwenMoeFamily::DeepSeekV4Flash, FlashMoeInputAdapterCapability::QwenText) => {
@@ -1124,8 +1128,8 @@ mod tests {
         FlashMoeScheduledGraph, ScheduledAttentionMathImplementation,
     };
     use crate::inference::flashmoe::{
-        DEEPSEEK_V4_FLASH_MODEL, DeepSeekV4Config, GLM52_MODEL, QWEN3_VL_MODEL, QWEN35_MODEL,
-        QwenModelConfig,
+        DEEPSEEK_V4_FLASH_MODEL, DeepSeekV4Config, GLM52_MODEL, QWEN3_CODER_NEXT_MODEL,
+        QWEN3_VL_MODEL, QWEN35_MODEL, QwenModelConfig,
     };
 
     fn config(json: &[u8]) -> QwenModelConfig {
@@ -1183,6 +1187,29 @@ mod tests {
 }"#,
         );
         QwenMoeModelLayout::from_config(QWEN3_VL_MODEL, &config).unwrap()
+    }
+
+    fn qwen3_coder_next_layout() -> QwenMoeModelLayout {
+        let config = config(
+            br#"{
+  "model_type": "qwen3_next",
+  "architectures": ["Qwen3NextForCausalLM"],
+  "num_hidden_layers": 48,
+  "hidden_size": 2048,
+  "num_attention_heads": 16,
+  "num_key_value_heads": 2,
+  "head_dim": 256,
+  "vocab_size": 151936,
+  "full_attention_interval": 4,
+  "torch_dtype": "bfloat16",
+  "num_experts": 512,
+  "num_experts_per_tok": 10,
+  "norm_topk_prob": true,
+  "moe_intermediate_size": 512,
+  "shared_expert_intermediate_size": 512
+}"#,
+        );
+        QwenMoeModelLayout::from_config(QWEN3_CODER_NEXT_MODEL, &config).unwrap()
     }
 
     fn qwen3_moe_layout(norm_topk_prob: Option<bool>) -> QwenMoeModelLayout {
@@ -1426,6 +1453,26 @@ mod tests {
                 .unwrap()
                 .implementation,
             FlashMoeStageImplementation::MetalTypedExpertResidentSharedCombine
+        );
+    }
+
+    #[test]
+    fn qwen3_coder_next_q4_resolves_native_hybrid_k10_graph() {
+        let layout = qwen3_coder_next_layout();
+        let plan = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+
+        plan.validate_complete().unwrap();
+        assert_eq!(plan.family, QwenMoeFamily::Qwen3NextMoe);
+        assert_eq!(plan.dense_layout, ResidentDenseLayout::Q4);
+        assert_eq!(plan.expert_storage.layout, ExpertStorageLayout::FixedQ4);
+        assert_eq!(plan.experts_per_layer, 512);
+        assert_eq!(plan.active_experts, 10);
+        assert_eq!(plan.attention_layers.len(), 48);
+        assert_eq!(plan.attention_layers[0], QwenMoeLayerKind::LinearAttention);
+        assert_eq!(plan.attention_layers[3], QwenMoeLayerKind::FullAttention);
+        assert_eq!(
+            plan.routing_weight_normalization,
+            QwenMoeRoutingWeightNormalization::RenormalizeSelected
         );
     }
 

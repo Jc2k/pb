@@ -105,6 +105,10 @@ pub fn build_cache_from_hf_snapshot_with_quantization(
     let runtime_cache_version =
         if is_glm52(&plan.model) && plan.quantization == ExpertQuantization::FourBitProduction {
             super::types::GLM52_CACHE_VERSION
+        } else if config.as_ref().is_some_and(QwenModelConfig::is_qwen3_next)
+            && plan.quantization == ExpertQuantization::FourBitProduction
+        {
+            super::types::QWEN3_NEXT_CACHE_VERSION
         } else {
             plan.quantization.cache_version()
         };
@@ -122,6 +126,7 @@ pub fn build_cache_from_hf_snapshot_with_quantization(
         snapshot_dir,
         &plan.non_expert_weights,
         &manifest.dense_tensors,
+        config.as_ref(),
     )?;
     pack_expert_tensors(
         snapshot_dir,
@@ -135,7 +140,7 @@ pub fn build_cache_from_hf_snapshot_with_quantization(
         (plan.vision_weights.as_ref(), plan.vision_manifest.as_ref())
     {
         if !visual_tensor_refs.is_empty() {
-            write_dense_tensor_store(snapshot_dir, vision_weights, &visual_tensor_refs)?;
+            write_dense_tensor_store(snapshot_dir, vision_weights, &visual_tensor_refs, None)?;
             let vision_manifest_data = FlashMoeManifest {
                 model: canonical_model(model),
                 cache_version: runtime_cache_version.to_string(),
@@ -314,7 +319,10 @@ fn build_manifest_from_resolved(
             let runtime_shape = if native_q4.is_some() {
                 match glm_shape {
                     Some(shape) => shape,
-                    None => logical_shape_for_mlx_q4(&tensor_shape)?,
+                    None => logical_shape_for_mlx_source(
+                        &tensor_shape,
+                        native_q4.as_ref().expect("checked above"),
+                    )?,
                 }
             } else {
                 tensor_shape
@@ -366,26 +374,97 @@ fn build_manifest_from_resolved(
             let runtime_shape = if native_q4.is_some() {
                 match glm_shape {
                     Some(shape) => shape,
-                    None => logical_shape_for_mlx_q4(&tensor_shape)?,
+                    None => logical_shape_for_mlx_source(
+                        &tensor_shape,
+                        native_q4.as_ref().expect("checked above"),
+                    )?,
                 }
             } else {
                 tensor_shape.clone()
             };
-            let preserves_colibri_int8 = native_q4
-                .as_ref()
-                .is_some_and(|source| source.source_format == DenseQ4SourceFormat::ColibriInt8);
-            let runtime_dtype = if preserves_colibri_int8 {
+            if let Some(splits) =
+                qwen3_next_grouped_projection_splits(config, &canonical_tensor, &runtime_shape)?
+            {
+                let native_q4 = native_q4.with_context(|| {
+                    format!(
+                        "Qwen3-Next grouped projection {canonical_tensor} requires its native affine-Q4 scale/bias tensors"
+                    )
+                })?;
+                if native_q4.source_format != DenseQ4SourceFormat::MlxAffine {
+                    bail!(
+                        "Qwen3-Next grouped projection {canonical_tensor} requires MLX affine Q4 source, found {:?}",
+                        native_q4.source_format
+                    );
+                }
+                for split in splits {
+                    let mut split_source = native_q4.clone();
+                    split_source.source_row_order = Some(split.source_row_order);
+                    let split_sources = Some(split_source);
+                    let quantization =
+                        dense_tensor_quantization(&split.tensor, &tensor_dtype, &split_sources);
+                    let TensorQuantization::Q4 {
+                        group_size,
+                        scale_bias_dtype,
+                        ..
+                    } = &quantization
+                    else {
+                        bail!(
+                            "Qwen3-Next grouped projection {} did not resolve affine Q4 storage",
+                            split.tensor
+                        );
+                    };
+                    let byte_len = dense_q4_layout_with_scale_bias_dtype(
+                        &split.shape,
+                        *group_size,
+                        scale_bias_dtype,
+                    )?
+                    .total_bytes as u64;
+                    runtime_offset = align_to(runtime_offset, TENSOR_ALIGNMENT);
+                    dense_tensor_refs.push(DenseTensorRef {
+                        tensor: split.tensor,
+                        shard: shard.clone(),
+                        dtype: tensor_dtype.clone(),
+                        shape: split.shape,
+                        source_offsets: tensor_source_offsets,
+                        runtime_offset,
+                        byte_len,
+                        quantization,
+                        q4_sources: split_sources,
+                    });
+                    runtime_offset = runtime_offset.saturating_add(byte_len);
+                }
+                continue;
+            }
+            let preserves_affine_int8 = native_q4.as_ref().is_some_and(|source| {
+                matches!(
+                    source.source_format,
+                    DenseQ4SourceFormat::ColibriInt8 | DenseQ4SourceFormat::MlxAffine8
+                )
+            });
+            let widens_qwen3_next_a_log = config.is_some_and(QwenModelConfig::is_qwen3_next)
+                && canonical_tensor.ends_with(".linear_attn.A_log")
+                && tensor_dtype.eq_ignore_ascii_case("BF16")
+                && native_q4.is_none();
+            let runtime_dtype = if preserves_affine_int8 {
                 "BF16".to_string()
+            } else if widens_qwen3_next_a_log {
+                "F32".to_string()
             } else {
                 tensor_dtype
             };
             let byte_len = match &quantization {
-                TensorQuantization::None if preserves_colibri_int8 => runtime_shape
+                TensorQuantization::None if preserves_affine_int8 => runtime_shape
                     .iter()
                     .try_fold(2u64, |bytes, dimension| {
                         bytes.checked_mul(*dimension as u64)
                     })
                     .context("Colibri int8-to-BF16 runtime tensor byte count overflow")?,
+                TensorQuantization::None if widens_qwen3_next_a_log => runtime_shape
+                    .iter()
+                    .try_fold(4u64, |bytes, dimension| {
+                        bytes.checked_mul(*dimension as u64)
+                    })
+                    .context("Qwen3-Next A_log BF16-to-F32 runtime byte count overflow")?,
                 TensorQuantization::None => source_byte_len,
                 TensorQuantization::Q4 {
                     group_size,
@@ -428,6 +507,126 @@ fn build_manifest_from_resolved(
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Qwen3NextProjectionSplit {
+    tensor: String,
+    shape: Vec<usize>,
+    source_row_order: Vec<usize>,
+}
+
+fn qwen3_next_grouped_projection_splits(
+    config: Option<&QwenModelConfig>,
+    tensor: &str,
+    source_shape: &[usize],
+) -> Result<Option<Vec<Qwen3NextProjectionSplit>>> {
+    let Some(config) = config.filter(|config| config.is_qwen3_next()) else {
+        return Ok(None);
+    };
+    let Some(base) = tensor
+        .strip_suffix("in_proj_qkvz.weight")
+        .or_else(|| tensor.strip_suffix("in_proj_ba.weight"))
+    else {
+        return Ok(None);
+    };
+    let [source_rows, source_cols] = source_shape else {
+        bail!("Qwen3-Next grouped projection {tensor} must be a matrix, found {source_shape:?}");
+    };
+    if *source_cols != config.hidden_size {
+        bail!(
+            "Qwen3-Next grouped projection {tensor} input width {source_cols} does not match hidden size {}",
+            config.hidden_size
+        );
+    }
+    let linear = config.linear_attention.with_context(|| {
+        format!("Qwen3-Next grouped projection {tensor} is missing linear-attention geometry")
+    })?;
+    let value_heads_per_key = linear
+        .num_value_heads
+        .checked_div(linear.num_key_heads)
+        .filter(|value| *value > 0)
+        .context("Qwen3-Next value heads must be divisible by key heads")?;
+    let value_width_per_key = value_heads_per_key
+        .checked_mul(linear.value_head_dim)
+        .context("Qwen3-Next grouped value width overflow")?;
+
+    if tensor.ends_with("in_proj_qkvz.weight") {
+        let group_width = linear
+            .key_head_dim
+            .checked_mul(2)
+            .and_then(|width| width.checked_add(value_width_per_key.checked_mul(2)?))
+            .context("Qwen3-Next QKVZ group width overflow")?;
+        let expected_rows = group_width
+            .checked_mul(linear.num_key_heads)
+            .context("Qwen3-Next QKVZ row count overflow")?;
+        if *source_rows != expected_rows {
+            bail!(
+                "Qwen3-Next grouped projection {tensor} has {source_rows} rows, expected {expected_rows}"
+            );
+        }
+        let mut query_rows = Vec::new();
+        let mut key_rows = Vec::new();
+        let mut value_rows = Vec::new();
+        let mut gate_rows = Vec::new();
+        for head in 0..linear.num_key_heads {
+            let start = head * group_width;
+            let key_start = start + linear.key_head_dim;
+            let value_start = key_start + linear.key_head_dim;
+            let gate_start = value_start + value_width_per_key;
+            query_rows.extend(start..key_start);
+            key_rows.extend(key_start..value_start);
+            value_rows.extend(value_start..gate_start);
+            gate_rows.extend(gate_start..gate_start + value_width_per_key);
+        }
+        let mut qkv_rows = query_rows;
+        qkv_rows.extend(key_rows);
+        qkv_rows.extend(value_rows);
+        return Ok(Some(vec![
+            Qwen3NextProjectionSplit {
+                tensor: format!("{base}in_proj_qkv.weight"),
+                shape: vec![qkv_rows.len(), *source_cols],
+                source_row_order: qkv_rows,
+            },
+            Qwen3NextProjectionSplit {
+                tensor: format!("{base}in_proj_z.weight"),
+                shape: vec![gate_rows.len(), *source_cols],
+                source_row_order: gate_rows,
+            },
+        ]));
+    }
+
+    let group_width = value_heads_per_key
+        .checked_mul(2)
+        .context("Qwen3-Next BA group width overflow")?;
+    let expected_rows = group_width
+        .checked_mul(linear.num_key_heads)
+        .context("Qwen3-Next BA row count overflow")?;
+    if *source_rows != expected_rows {
+        bail!(
+            "Qwen3-Next grouped projection {tensor} has {source_rows} rows, expected {expected_rows}"
+        );
+    }
+    let mut beta_rows = Vec::new();
+    let mut alpha_rows = Vec::new();
+    for head in 0..linear.num_key_heads {
+        let start = head * group_width;
+        let alpha_start = start + value_heads_per_key;
+        beta_rows.extend(start..alpha_start);
+        alpha_rows.extend(alpha_start..alpha_start + value_heads_per_key);
+    }
+    Ok(Some(vec![
+        Qwen3NextProjectionSplit {
+            tensor: format!("{base}in_proj_b.weight"),
+            shape: vec![beta_rows.len(), *source_cols],
+            source_row_order: beta_rows,
+        },
+        Qwen3NextProjectionSplit {
+            tensor: format!("{base}in_proj_a.weight"),
+            shape: vec![alpha_rows.len(), *source_cols],
+            source_row_order: alpha_rows,
+        },
+    ]))
+}
+
 fn tensor_layer(name: &str) -> Option<usize> {
     let parts = name.split('.').collect::<Vec<_>>();
     parts
@@ -464,6 +663,67 @@ mod parity_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen3_next_grouped_projections_split_into_canonical_runtime_rows() {
+        let config: QwenModelConfig = serde_json::from_value(serde_json::json!({
+            "model_type": "qwen3_next",
+            "architectures": ["Qwen3NextForCausalLM"],
+            "num_hidden_layers": 1,
+            "hidden_size": 8,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "vocab_size": 32,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "linear_key_head_dim": 2,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_value_head_dim": 3
+        }))
+        .unwrap();
+
+        let qkvz = qwen3_next_grouped_projection_splits(
+            Some(&config),
+            "model.layers.0.linear_attn.in_proj_qkvz.weight",
+            &[32, 8],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            qkvz[0].tensor,
+            "model.layers.0.linear_attn.in_proj_qkv.weight"
+        );
+        assert_eq!(qkvz[0].shape, vec![20, 8]);
+        assert_eq!(
+            qkvz[0].source_row_order,
+            vec![
+                0, 1, 16, 17, // query
+                2, 3, 18, 19, // key
+                4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25 // value
+            ]
+        );
+        assert_eq!(
+            qkvz[1].tensor,
+            "model.layers.0.linear_attn.in_proj_z.weight"
+        );
+        assert_eq!(
+            qkvz[1].source_row_order,
+            vec![10, 11, 12, 13, 14, 15, 26, 27, 28, 29, 30, 31]
+        );
+
+        let ba = qwen3_next_grouped_projection_splits(
+            Some(&config),
+            "model.layers.0.linear_attn.in_proj_ba.weight",
+            &[8, 8],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ba[0].tensor, "model.layers.0.linear_attn.in_proj_b.weight");
+        assert_eq!(ba[0].source_row_order, vec![0, 1, 4, 5]);
+        assert_eq!(ba[1].tensor, "model.layers.0.linear_attn.in_proj_a.weight");
+        assert_eq!(ba[1].source_row_order, vec![2, 3, 6, 7]);
+    }
 
     #[test]
     fn cache_owner_declares_required_huggingface_artifacts() {

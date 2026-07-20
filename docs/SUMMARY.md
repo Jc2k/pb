@@ -38,6 +38,8 @@
   - [S5 · Workflow closure](benchmarks/small-model-agent-s5.md)
   - [S6 · Model evaluation](benchmarks/small-model-agent-s6.md)
   - [DeepSeek V4 Flash field run](benchmarks/deepseek-v4-flash-agent.md)
+- [Qwen3-Coder-Next native agent](qwen3-coder-next-agent-plan.md)
+  - [Native agent evaluation](benchmarks/qwen3-coder-next-agent.md)
 - [Harness reliability](harness-improvement-plan.md)
   - [Open-weight workflow evaluation](harness-workflow-model-evaluation.md)
 - [External publication follow-on](external-publication-workflow-follow-on.md)

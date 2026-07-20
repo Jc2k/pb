@@ -64,7 +64,7 @@ pub mod workspace;
 pub mod workspace_benchmark;
 pub mod workspace_discovery;
 
-pub const DEFAULT_MODEL: &str = "hf://unsloth/Qwen3-Coder-Next-GGUF/Qwen3-Coder-Next-Q4_K_M.gguf";
+pub const DEFAULT_MODEL: &str = "hf://mlx-community/Qwen3-Coder-Next-4bit";
 const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai";
 const HF_ENDPOINT: &str = "https://huggingface.co";
 const PROGRESS_BAR_WIDTH: usize = 40;
@@ -552,7 +552,7 @@ pub struct FlashMoeInferArgs {
     pub prompt: String,
 
     /// FlashMoe model identifier to load
-    #[arg(long, default_value = inference::flashmoe::QWEN35_MODEL)]
+    #[arg(long, default_value = inference::flashmoe::QWEN3_CODER_NEXT_MODEL)]
     pub model: String,
 
     /// Expert cache storage; defaults to Q4 except for the official Qwen3.5 BF16 checkpoint
@@ -1954,19 +1954,23 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
             routing_policy,
         ),
     };
+    let load_options = flashmoe_load_options(args.metal_working_set_limit_mib)?;
     let load_started = Instant::now();
     eprintln!("flashmoe infer: loading backend");
     let mut engine = if args.verbose {
-        inference::flashmoe::load_with_progress(&plan, |phase, elapsed| {
-            eprintln!(
-                "flashmoe infer: load {phase} complete in {} ms",
-                elapsed.as_millis()
-            );
-        })?
+        inference::flashmoe::load_with_options_and_progress(
+            &plan,
+            load_options,
+            |phase, elapsed| {
+                eprintln!(
+                    "flashmoe infer: load {phase} complete in {} ms",
+                    elapsed.as_millis()
+                );
+            },
+        )?
     } else {
-        inference::flashmoe::load(&plan)?
+        inference::flashmoe::load_with_options(&plan, load_options)?
     };
-    configure_flashmoe_metal_resources(&mut engine, args.metal_working_set_limit_mib)?;
     eprintln!(
         "flashmoe infer: backend loaded in {} ms",
         load_started.elapsed().as_millis()
@@ -2097,7 +2101,7 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
     let model = args
         .model
         .clone()
-        .unwrap_or_else(|| inference::flashmoe::QWEN35_MODEL.to_string());
+        .unwrap_or_else(|| inference::flashmoe::QWEN3_CODER_NEXT_MODEL.to_string());
     let models_root = args
         .model_dir
         .clone()
@@ -2123,19 +2127,23 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
             inference::flashmoe::plan_unchecked_with_routing(&model, &models_root, routing_policy)
         }
     };
+    let load_options = flashmoe_load_options(args.metal_working_set_limit_mib)?;
     let load_started = Instant::now();
     eprintln!("flashmoe bench: loading backend");
     let mut engine = if args.verbose {
-        inference::flashmoe::load_with_progress(&plan, |phase, elapsed| {
-            eprintln!(
-                "flashmoe bench: load {phase} complete in {} ms",
-                elapsed.as_millis()
-            );
-        })?
+        inference::flashmoe::load_with_options_and_progress(
+            &plan,
+            load_options,
+            |phase, elapsed| {
+                eprintln!(
+                    "flashmoe bench: load {phase} complete in {} ms",
+                    elapsed.as_millis()
+                );
+            },
+        )?
     } else {
-        inference::flashmoe::load(&plan)?
+        inference::flashmoe::load_with_options(&plan, load_options)?
     };
-    configure_flashmoe_metal_resources(&mut engine, args.metal_working_set_limit_mib)?;
     eprintln!(
         "flashmoe bench: backend loaded in {} ms",
         load_started.elapsed().as_millis()
@@ -2296,17 +2304,18 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
     Ok(())
 }
 
-fn configure_flashmoe_metal_resources(
-    engine: &mut inference::flashmoe::FlashMoeEngine,
+fn flashmoe_load_options(
     limit_mib: Option<usize>,
-) -> Result<()> {
+) -> Result<inference::flashmoe::FlashMoeLoadOptions> {
     let Some(limit_mib) = limit_mib else {
-        return Ok(());
+        return Ok(inference::flashmoe::FlashMoeLoadOptions::default());
     };
     let limit_bytes = limit_mib
         .checked_mul(1024 * 1024)
         .context("--metal-working-set-limit-mib is too large")?;
-    engine.set_metal_working_set_limit_bytes(limit_bytes)
+    Ok(inference::flashmoe::FlashMoeLoadOptions {
+        metal_working_set_limit_bytes: Some(limit_bytes),
+    })
 }
 
 fn print_flashmoe_resource_summary(
@@ -3770,15 +3779,18 @@ mod tests {
     }
 
     #[test]
-    fn default_model_pins_q4_k_m_quantization() {
+    fn default_model_selects_native_q4_flashmoe_snapshot() {
         assert_eq!(
             parse_hf_uri(DEFAULT_MODEL),
             Some((
-                "unsloth".to_owned(),
-                "Qwen3-Coder-Next-GGUF".to_owned(),
-                Some("Qwen3-Coder-Next-Q4_K_M.gguf".to_owned())
+                "mlx-community".to_owned(),
+                "Qwen3-Coder-Next-4bit".to_owned(),
+                None
             ))
         );
+        assert!(crate::inference::flashmoe::is_flashmoe_hf_model(
+            DEFAULT_MODEL
+        ));
     }
 
     #[test]
@@ -3788,7 +3800,7 @@ mod tests {
             parse_hf_uri(&canonical),
             Some((
                 "mlx-community".to_owned(),
-                "Qwen3.5-397B-A17B-4bit".to_owned(),
+                "Qwen3-Coder-Next-4bit".to_owned(),
                 None
             ))
         );
@@ -3929,6 +3941,18 @@ mod tests {
         };
         assert_eq!(infer.metal_working_set_limit_mib, Some(2048));
         assert!(infer.resource_summary);
+
+        assert_eq!(
+            flashmoe_load_options(Some(2048))
+                .unwrap()
+                .metal_working_set_limit_bytes,
+            Some(2048 * 1024 * 1024)
+        );
+        assert_eq!(
+            flashmoe_load_options(None).unwrap(),
+            inference::flashmoe::FlashMoeLoadOptions::default()
+        );
+        assert!(flashmoe_load_options(Some(usize::MAX)).is_err());
     }
 
     #[test]
