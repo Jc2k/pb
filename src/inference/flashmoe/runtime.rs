@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use objc2::rc::autoreleasepool;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, trace, trace_span};
 
 use super::capabilities::{
     FlashMoeAttentionMathCapability, FlashMoeCapabilityPlan, FlashMoeExpertAccessCapability,
+    QwenPrefillGraphCapability,
 };
 use super::constraints::NativeToolConstraint;
 use super::deepseek::{DeepSeekV4Config, DeepSeekV4ExecutionGraph, is_deepseek_v4_flash};
@@ -37,32 +39,49 @@ use super::weights::*;
 // prompt-geometry calculation, never an error fallback.
 const DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS: usize = 32;
 const QWEN_BATCH_PREFILL_MIN_TOKENS: usize = 32;
-const QWEN_BATCH_PREFILL_MAX_CHUNK_TOKENS: usize = 64;
+const QWEN_BATCH_PREFILL_MAX_CHUNK_TOKENS: usize = 8_192;
+const QWEN_LAYER_MAJOR_ESTIMATED_BYTES_PER_TOKEN: usize = 384 * 1024;
+const QWEN_LAYER_MAJOR_SAFETY_RESERVE_BYTES: usize = 512 * 1024 * 1024;
+const QWEN_LAYER_MAJOR_SESSION_RESERVE_DIVISOR: usize = 20;
 const RESIDENT_EXPERT_MINIMUM_RESERVE_BYTES: usize = 1024 * 1024 * 1024;
 const RESIDENT_EXPERT_RESERVE_DIVISOR: usize = 10;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct QwenTokenExecutionOutput {
+    hidden: Vec<f32>,
+    recurrent_value: u64,
+}
 
 fn deepseek_v4_uses_batch_prefill(tokens: usize) -> bool {
     tokens >= DEEPSEEK_V4_BATCH_PREFILL_MIN_TOKENS
 }
 
 fn qwen_prefill_chunk_tokens(
-    family: QwenMoeFamily,
+    graph: QwenPrefillGraphCapability,
     tokens: usize,
     resources: Option<&FlashMoeMetalResourceSnapshot>,
 ) -> Option<usize> {
-    if family == QwenMoeFamily::DeepSeekV4Flash || tokens < QWEN_BATCH_PREFILL_MIN_TOKENS {
+    if !graph.supports_layer_major() || tokens < QWEN_BATCH_PREFILL_MIN_TOKENS {
         return None;
     }
     let resource_bound = resources.map_or(QWEN_BATCH_PREFILL_MAX_CHUNK_TOKENS, |snapshot| {
         let available = snapshot
             .working_set_limit_bytes
-            .saturating_sub(snapshot.current_allocated_bytes);
-        if available < 512 * 1024 * 1024 {
-            QWEN_BATCH_PREFILL_MIN_TOKENS
-        } else {
-            QWEN_BATCH_PREFILL_MAX_CHUNK_TOKENS
-        }
+            .saturating_sub(snapshot.current_allocated_bytes)
+            .saturating_sub(QWEN_LAYER_MAJOR_SAFETY_RESERVE_BYTES);
+        let resident_basis = snapshot
+            .current_allocated_bytes
+            .max(snapshot.ledger_live_bytes);
+        let session_reserve = resident_basis / QWEN_LAYER_MAJOR_SESSION_RESERVE_DIVISOR;
+        available
+            .min(session_reserve)
+            .checked_div(QWEN_LAYER_MAJOR_ESTIMATED_BYTES_PER_TOKEN)
+            .unwrap_or(0)
+            .min(QWEN_BATCH_PREFILL_MAX_CHUNK_TOKENS)
     });
+    if resource_bound < QWEN_BATCH_PREFILL_MIN_TOKENS {
+        return None;
+    }
     Some(
         tokens
             .min(resource_bound)
@@ -112,19 +131,47 @@ mod deepseek_prefill_tests {
     #[test]
     fn qwen_batch_chunk_selection_is_geometry_and_resource_resolved() {
         assert_eq!(
-            qwen_prefill_chunk_tokens(QwenMoeFamily::Qwen3NextMoe, 31, None),
+            qwen_prefill_chunk_tokens(QwenPrefillGraphCapability::LayerMajorAffineQ4, 31, None),
             None
         );
         assert_eq!(
-            qwen_prefill_chunk_tokens(QwenMoeFamily::Qwen3NextMoe, 32, None),
+            qwen_prefill_chunk_tokens(QwenPrefillGraphCapability::LayerMajorAffineQ4, 32, None),
             Some(32)
         );
         assert_eq!(
-            qwen_prefill_chunk_tokens(QwenMoeFamily::Qwen3NextMoe, 4_354, None),
-            Some(64)
+            qwen_prefill_chunk_tokens(QwenPrefillGraphCapability::LayerMajorAffineQ4, 4_354, None,),
+            Some(4_354)
+        );
+        let constrained = FlashMoeMetalResourceSnapshot {
+            working_set_limit_bytes: 48 * 1024 * 1024 * 1024,
+            current_allocated_bytes: 47 * 1024 * 1024 * 1024,
+            ledger_live_bytes: 47 * 1024 * 1024 * 1024,
+            ..FlashMoeMetalResourceSnapshot::default()
+        };
+        assert_eq!(
+            qwen_prefill_chunk_tokens(
+                QwenPrefillGraphCapability::LayerMajorAffineQ4,
+                4_354,
+                Some(&constrained),
+            ),
+            Some(1_365)
         );
         assert_eq!(
-            qwen_prefill_chunk_tokens(QwenMoeFamily::DeepSeekV4Flash, 4_354, None),
+            qwen_prefill_chunk_tokens(QwenPrefillGraphCapability::ScalarToken, 4_354, None),
+            None
+        );
+        let exhausted = FlashMoeMetalResourceSnapshot {
+            working_set_limit_bytes: 48 * 1024 * 1024 * 1024,
+            current_allocated_bytes: 48 * 1024 * 1024 * 1024,
+            ledger_live_bytes: 48 * 1024 * 1024 * 1024,
+            ..FlashMoeMetalResourceSnapshot::default()
+        };
+        assert_eq!(
+            qwen_prefill_chunk_tokens(
+                QwenPrefillGraphCapability::LayerMajorAffineQ4,
+                4_354,
+                Some(&exhausted),
+            ),
             None
         );
     }
@@ -243,6 +290,7 @@ pub struct FlashMoeEngine {
     pub(super) model_layout: QwenMoeModelLayout,
     pub(super) routing_policy: ResolvedRoutingPolicy,
     pub(super) expert_access: FlashMoeExpertAccessCapability,
+    pub(super) qwen_prefill_graph: QwenPrefillGraphCapability,
     pub(super) runtime: DenseTransformerRuntime,
     pub(super) deepseek_graph: Option<Arc<DeepSeekV4ExecutionGraph>>,
     pub(super) linear_attention_weights: LinearAttentionWeightTable,
@@ -467,6 +515,14 @@ where
         expert_access,
         Some(metal.runtime_capabilities()),
     )?;
+    let qwen_prefill_graph = capability_plan.qwen_prefill_graph;
+    tracing::info!(
+        model = %plan.model,
+        implementation = qwen_prefill_graph.as_str(),
+        dense_layout = dense_layout.as_str(),
+        expert_layout = ?expert_storage.layout,
+        "prepared FlashMoe Qwen prefill graph"
+    );
     let scheduled_graph = FlashMoeScheduledGraph::from_capabilities(&capability_plan)?;
     let scheduler =
         FlashMoeExecutionScheduler::new_with_resident_binding(scheduled_graph, experts, |bytes| {
@@ -493,6 +549,7 @@ where
         model_layout,
         routing_policy,
         expert_access,
+        qwen_prefill_graph,
         runtime,
         deepseek_graph,
         linear_attention_weights,
@@ -559,6 +616,16 @@ fn tokens_per_second(tokens: usize, duration: Duration) -> f64 {
     } else {
         tokens as f64 / seconds
     }
+}
+
+fn f32_values_sha256(domain: &[u8], values: &[f32]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        digest.update(value.to_bits().to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 #[cfg(test)]
@@ -1186,6 +1253,70 @@ impl MetalExecutionFacade {
         )
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qwen_linear_attention_matrix(
+        &self,
+        layout: LinearAttentionLayout,
+        bindings: &LinearAttentionResidentBindings,
+        rows: usize,
+        qkv: &[f32],
+        z: &[f32],
+        beta: &[f32],
+        alpha: &[f32],
+    ) -> Result<Vec<f32>> {
+        self.inner
+            .qwen_linear_attention_matrix(layout, bindings, rows, qkv, z, beta, alpha)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qwen_post_attention_matrix(
+        &self,
+        out_proj: &ResidentMmapMatvecProjection,
+        router: &ResidentMmapMatvecProjection,
+        rows: usize,
+        attention_width: usize,
+        width: usize,
+        attention: &[f32],
+        residual: &[f32],
+        post_norm_weight: &[f32],
+    ) -> Result<MetalLayerMajorPostAttention> {
+        self.inner.qwen_post_attention_matrix(
+            out_proj,
+            router,
+            rows,
+            attention_width,
+            width,
+            attention,
+            residual,
+            post_norm_weight,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn qwen_layer_major_experts(
+        &self,
+        scheduled: &ScheduledLayerMajorExperts,
+        normed: &[f32],
+        residual: &[f32],
+        shared: ScheduledSharedExpertPhaseRef<'_>,
+    ) -> Result<Vec<f32>> {
+        self.inner
+            .qwen_layer_major_experts(scheduled, normed, residual, shared)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn qwen_rms_norm_rows(
+        &self,
+        input: &[f32],
+        weight: &[f32],
+        rows: usize,
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        self.inner.qwen_rms_norm_rows(input, weight, rows, width)
+    }
+
     pub(super) fn resident_mmap_matvec_batch(
         &self,
         projections: &[ResidentMmapMatvecProjection],
@@ -1203,6 +1334,69 @@ impl MetalExecutionFacade {
             bail!(
                 "FlashMoe unsupported required resident projection batch: Apple Silicon Metal is unavailable"
             )
+        }
+    }
+
+    pub(super) fn resident_mmap_projection_matrix(
+        &self,
+        projections: &[ResidentMmapMatvecProjection],
+        input_rows: usize,
+        input_cols: usize,
+        input: &[f32],
+    ) -> Result<(Vec<Vec<f32>>, MetalMatvecTiming, usize)> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner
+                .resident_projection_matrix_batch(projections, input_rows, input_cols, input)?
+                .context("FlashMoe required resident Metal projection matrix did not resolve")
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (projections, input_rows, input_cols, input);
+            bail!(
+                "FlashMoe unsupported required resident projection matrix: Apple Silicon Metal is unavailable"
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qwen_causal_attention_rows(
+        &self,
+        queries: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        query_rows: usize,
+        prefix_rows: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.qwen_causal_attention_rows(
+                queries,
+                keys,
+                values,
+                query_rows,
+                prefix_rows,
+                query_heads,
+                kv_heads,
+                head_dim,
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (
+                queries,
+                keys,
+                values,
+                query_rows,
+                prefix_rows,
+                query_heads,
+                kv_heads,
+                head_dim,
+            );
+            bail!("Qwen causal-attention rows require Apple Silicon Metal")
         }
     }
 
@@ -1332,7 +1526,7 @@ impl FlashMoeEngine {
             )
         })?;
         self.metal.inner.finish_token_boundary(position)?;
-        Ok(hidden)
+        Ok(hidden.hidden)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1344,7 +1538,7 @@ impl FlashMoeEngine {
         record_generated: bool,
         mut timing: Option<&mut FlashMoeTokenTiming>,
         progress: GenerationProgress<'_>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<QwenTokenExecutionOutput> {
         let runtime = &self.runtime;
         let record_detailed_timing = timing.is_some();
         let token_started = OptionalInstant::now(record_detailed_timing);
@@ -1378,7 +1572,10 @@ impl FlashMoeEngine {
             if let Some(timing) = timing {
                 timing.buckets.total_wall = token_started.elapsed();
             }
-            return Ok(hidden);
+            return Ok(QwenTokenExecutionOutput {
+                hidden,
+                recurrent_value: 0,
+            });
         }
         let hidden_values = match input.precomputed_embedding(runtime.width)? {
             Some(values) => values.to_vec(),
@@ -1388,6 +1585,7 @@ impl FlashMoeEngine {
             hidden_values,
             self.dense.seed(position, previous)? ^ (self.plan.model.len() as u64),
         );
+        let prepared_full_attention: Option<&[f32]> = None;
         debug_assert!(token_state.hidden().is_declared_graph_state());
         let mut deferred_expert_phase: Option<MetalScheduledCmd3Submission> = None;
 
@@ -1682,16 +1880,27 @@ impl FlashMoeEngine {
                             }
                         }
                     } else {
-                        let values = self.full_attention_output_values(
-                            layer,
-                            &normed,
-                            deferred_attention_input,
-                            kv_cache,
-                            position,
-                            rope_position,
-                            runtime,
-                            record_detailed_timing.then_some(&mut layer_timing.buckets),
-                        )?;
+                        let values = if let Some(prepared) = prepared_full_attention {
+                            let expected = runtime.full_attention_layout(layer)?.q_width;
+                            if prepared.len() != expected {
+                                bail!(
+                                    "Qwen layer-major full-attention row at layer {layer} has {} values, expected {expected}",
+                                    prepared.len()
+                                );
+                            }
+                            prepared.to_vec()
+                        } else {
+                            self.full_attention_output_values(
+                                layer,
+                                &normed,
+                                deferred_attention_input,
+                                kv_cache,
+                                position,
+                                rope_position,
+                                runtime,
+                                record_detailed_timing.then_some(&mut layer_timing.buckets),
+                            )?
+                        };
                         post_attention_values_for_prep =
                             Some((attention_tensor_name(layer, "o_proj"), values));
                     }
@@ -2045,7 +2254,11 @@ impl FlashMoeEngine {
             timing.buckets.combine_norm += combine_started.elapsed();
             timing.buckets.total_wall = token_started.elapsed();
         }
-        Ok(token_state.into_hidden_values())
+        let (hidden, recurrent_value) = token_state.into_hidden_and_recurrent();
+        Ok(QwenTokenExecutionOutput {
+            hidden,
+            recurrent_value,
+        })
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -2167,8 +2380,50 @@ impl FlashMoeEngine {
         let attention_output =
             self.resolve_full_attention_kv_state(position, layer, layout, &kv_record)?;
         kv_cache.record_kv_record(kv_record)?;
-        let mut attended =
-            self.full_attention_cached(kv_cache, position, layer, &q, layout, attention_output)?;
+        let attention_output =
+            attention_output.validate_execution_state(layer, position, layout.kv_width)?;
+        if attention_output.implementation() != ScheduledAttentionMathImplementation::CpuKvCache {
+            bail!(
+                "Qwen full attention at layer {layer} resolved an incompatible scheduled implementation"
+            );
+        }
+        let records = kv_cache.keys_values(position, layer)?;
+        if records.len() != position + 1 {
+            bail!(
+                "Qwen scalar attention layer {layer} expected {} KV rows through position {position}, found {}",
+                position + 1,
+                records.len()
+            );
+        }
+        let mut keys = Vec::with_capacity(records.len() * layout.kv_width);
+        let mut values = Vec::with_capacity(records.len() * layout.kv_width);
+        for (key, value) in records {
+            keys.extend_from_slice(key);
+            values.extend_from_slice(value);
+        }
+        // Scalar qualification and the layer-major graph deliberately share
+        // this query-independent causal-attention implementation. Each query
+        // observes the same causal KV prefix, regardless of traversal order.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let mut attended = self.metal.qwen_causal_attention_rows(
+            &q,
+            &keys,
+            &values,
+            1,
+            position,
+            layout.num_q_heads,
+            layout.kv_heads,
+            layout.head_dim,
+        )?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let mut attended = kv_cache.causal_attention(
+            position,
+            layer,
+            &q,
+            layout.num_q_heads,
+            layout.kv_heads,
+            layout.head_dim,
+        )?;
 
         if let Some(q_gate) = q_gate {
             for (value, gate) in attended.iter_mut().zip(q_gate.iter()) {
@@ -2179,6 +2434,433 @@ impl FlashMoeEngine {
             buckets.attention_kernel += subphase_started.elapsed();
         }
         Ok(attended)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn full_attention_output_matrix_values(
+        &self,
+        layer: usize,
+        rows: &[QwenTokenExecutionOutput],
+        normed: &[f32],
+        start_position: usize,
+        kv_cache: &mut KvCache,
+    ) -> Result<Vec<f32>> {
+        if rows.is_empty() {
+            bail!("Qwen layer-major full attention requires at least one row");
+        }
+        let runtime = &self.runtime;
+        let layout = runtime.full_attention_layout(layer)?;
+        for row in rows {
+            if row.hidden.len() != runtime.width {
+                bail!(
+                    "Qwen layer-major hidden row has {} values, expected {} at layer {layer}",
+                    row.hidden.len(),
+                    runtime.width
+                );
+            }
+        }
+        let expected_normed = rows
+            .len()
+            .checked_mul(runtime.width)
+            .context("Qwen layer-major normalized input size overflow")?;
+        if normed.len() != expected_normed {
+            bail!(
+                "Qwen layer-major normalized input has {} values, expected {expected_normed} at layer {layer}",
+                normed.len()
+            );
+        }
+
+        let input_requests = full_attention_input_projection_requests(
+            layer,
+            layout.q_projection_width,
+            layout.kv_width,
+        )?;
+        let input_specs = input_requests.requests();
+        let mut projections = self.dense.project_resident_tensors_from_cpu_matrix(
+            &self.metal,
+            &input_specs,
+            rows.len(),
+            runtime.width,
+            normed,
+        )?;
+        let values = projections
+            .pop()
+            .context("missing layer-major self_attn.v_proj matrix")?;
+        let keys = projections
+            .pop()
+            .context("missing layer-major self_attn.k_proj matrix")?;
+        let queries = projections
+            .pop()
+            .context("missing layer-major self_attn.q_proj matrix")?;
+        let expected_queries = rows
+            .len()
+            .checked_mul(layout.q_projection_width)
+            .context("layer-major query matrix size overflow")?;
+        let expected_kv = rows
+            .len()
+            .checked_mul(layout.kv_width)
+            .context("layer-major KV matrix size overflow")?;
+        if queries.len() != expected_queries
+            || keys.len() != expected_kv
+            || values.len() != expected_kv
+        {
+            bail!(
+                "Qwen layer-major projection geometry mismatch at layer {layer}: q={} expected={expected_queries}, k={} v={} expected_kv={expected_kv}",
+                queries.len(),
+                keys.len(),
+                values.len()
+            );
+        }
+
+        let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_norm");
+        let k_norm_name = layer_norm_tensor_name(layer, "self_attn.k_norm");
+        let q_norm_w = self
+            .model_norm_weight(&q_norm_name, layout.head_dim)?
+            .with_context(|| format!("missing Qwen layer-major Q norm {q_norm_name}"))?;
+        let k_norm_w = self
+            .model_norm_weight(&k_norm_name, layout.head_dim)?
+            .with_context(|| format!("missing Qwen layer-major K norm {k_norm_name}"))?;
+        let theta = self.config.rope_theta.unwrap_or_else(|| {
+            if layout.q_layout == FullAttentionQLayout::Gated {
+                10_000_000.0
+            } else {
+                1_000_000.0
+            }
+        });
+        let mut normalized_queries = Vec::with_capacity(rows.len() * layout.q_width);
+        let mut query_gates = Vec::with_capacity(rows.len());
+        for row_index in 0..rows.len() {
+            let position = start_position + row_index;
+            let q_start = row_index * layout.q_projection_width;
+            let kv_start = row_index * layout.kv_width;
+            let (mut q, q_gate) = split_q_projection(
+                queries[q_start..q_start + layout.q_projection_width].to_vec(),
+                layout,
+            )?;
+            let mut k = keys[kv_start..kv_start + layout.kv_width].to_vec();
+            let v = values[kv_start..kv_start + layout.kv_width].to_vec();
+            let rope_position = FlashMoeTokenInput::text(0, position).rope_position();
+            apply_full_attention_qk_norm_and_rotary(
+                &mut q,
+                &mut k,
+                layout,
+                rope_position,
+                theta,
+                self.config.text_mrope_section(),
+                Some(&q_norm_w),
+                Some(&k_norm_w),
+            )?;
+            let kv_record = FlashMoeFullAttentionKvRecord::new(position, layer, k, v);
+            self.resolve_full_attention_kv_state(position, layer, layout, &kv_record)?;
+            kv_cache.record_kv_record(kv_record)?;
+            normalized_queries.extend(q);
+            query_gates.push(q_gate);
+        }
+        let end_position = start_position + rows.len() - 1;
+        let records = kv_cache.keys_values(end_position, layer)?;
+        if records.len() != start_position + rows.len() {
+            bail!(
+                "Qwen layer-major attention layer {layer} expected {} KV rows through position {end_position}, found {}",
+                start_position + rows.len(),
+                records.len()
+            );
+        }
+        let mut all_keys = Vec::with_capacity(records.len() * layout.kv_width);
+        let mut all_values = Vec::with_capacity(records.len() * layout.kv_width);
+        for (key, value) in records {
+            if key.len() != layout.kv_width || value.len() != layout.kv_width {
+                bail!(
+                    "Qwen layer-major attention layer {layer} encountered KV widths {}/{}, expected {}",
+                    key.len(),
+                    value.len(),
+                    layout.kv_width
+                );
+            }
+            all_keys.extend_from_slice(key);
+            all_values.extend_from_slice(value);
+        }
+        let mut output = self.metal.qwen_causal_attention_rows(
+            &normalized_queries,
+            &all_keys,
+            &all_values,
+            rows.len(),
+            start_position,
+            layout.num_q_heads,
+            layout.kv_heads,
+            layout.head_dim,
+        )?;
+        for (row_index, q_gate) in query_gates.into_iter().enumerate() {
+            if let Some(q_gate) = q_gate {
+                let start = row_index * layout.q_width;
+                for (value, gate) in output[start..start + layout.q_width]
+                    .iter_mut()
+                    .zip(q_gate.iter())
+                {
+                    *value *= sigmoid(*gate);
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn linear_attention_output_matrix_values(
+        &self,
+        layer: usize,
+        rows: usize,
+        normed: &[f32],
+    ) -> Result<Vec<f32>> {
+        let layout = self.runtime.linear_attention_layout(layer)?;
+        let bindings = self.linear_attention_weights.require(layer)?;
+        let (mut projections, _, _) = self.metal.resident_mmap_projection_matrix(
+            &bindings.input_projections,
+            rows,
+            self.runtime.width,
+            normed,
+        )?;
+        if rows == 1 {
+            let (scalar_projections, _, _) = self
+                .metal
+                .resident_mmap_matvec_batch(&bindings.input_projections, normed)?;
+            if scalar_projections.len() != projections.len() {
+                bail!(
+                    "Qwen one-row linear-attention input projection counts differ at layer {layer}: matrix={} scalar={}",
+                    projections.len(),
+                    scalar_projections.len()
+                );
+            }
+            for ((projection, actual), expected) in bindings
+                .input_projections
+                .iter()
+                .zip(projections.iter())
+                .zip(scalar_projections.iter())
+            {
+                if actual.len() != expected.len() {
+                    bail!(
+                        "Qwen one-row linear-attention input projection widths differ at layer {layer} for {}: matrix={} scalar={}",
+                        projection.tensor_name(),
+                        actual.len(),
+                        expected.len()
+                    );
+                }
+                if let Some((index, (actual, expected))) = actual
+                    .iter()
+                    .zip(expected.iter())
+                    .enumerate()
+                    .find(|(_, (actual, expected))| actual.to_bits() != expected.to_bits())
+                {
+                    bail!(
+                        "Qwen one-row linear-attention input projection parity failed at layer {layer} for {} index={index}: matrix={actual} scalar={expected} delta={}",
+                        projection.tensor_name(),
+                        (actual - expected).abs()
+                    );
+                }
+            }
+        }
+        let alpha = projections
+            .pop()
+            .context("missing layer-major linear-attention alpha matrix")?;
+        let beta = projections
+            .pop()
+            .context("missing layer-major linear-attention beta matrix")?;
+        let z = projections
+            .pop()
+            .context("missing layer-major linear-attention Z matrix")?;
+        let qkv = projections
+            .pop()
+            .context("missing layer-major linear-attention QKV matrix")?;
+        self.metal
+            .qwen_linear_attention_matrix(layout, bindings, rows, &qkv, &z, &beta, &alpha)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn post_attention_output_matrix_values(
+        &self,
+        layer: usize,
+        rows: usize,
+        attention_width: usize,
+        out_proj_name: &str,
+        attention: &[f32],
+        residual: &[f32],
+    ) -> Result<MetalLayerMajorPostAttention> {
+        let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
+        let post_norm_weight = self
+            .model_norm_weight(&post_norm_name, self.runtime.width)?
+            .with_context(|| format!("missing Qwen layer-major norm {post_norm_name}"))?;
+        let projections = self.dense.layer_major_post_attention_projections(
+            layer,
+            self.scheduler.experts_per_layer(),
+            out_proj_name,
+            attention_width,
+            self.runtime.width,
+            self.scheduler.active_experts(),
+        )?;
+        self.metal.qwen_post_attention_matrix(
+            &projections.out_proj,
+            &projections.router,
+            rows,
+            attention_width,
+            self.runtime.width,
+            attention,
+            residual,
+            &post_norm_weight,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn forward_qwen_layer_major_matrix(
+        &mut self,
+        layer: usize,
+        rows: &mut [QwenTokenExecutionOutput],
+        prepared_input_norm: Option<&[f32]>,
+        start_position: usize,
+        kv_cache: &mut KvCache,
+        row_timings: &mut [Option<FlashMoeTokenTiming>],
+    ) -> Result<Option<Vec<f32>>> {
+        if rows.is_empty() || rows.len() != row_timings.len() {
+            bail!("Qwen layer-major layer requires aligned non-empty rows and timings");
+        }
+        let layer_started = Instant::now();
+        let width = self.runtime.width;
+        let hidden_values = rows
+            .len()
+            .checked_mul(width)
+            .context("Qwen layer-major hidden matrix size overflow")?;
+        let mut residual = Vec::with_capacity(hidden_values);
+        let mut normed = Vec::with_capacity(hidden_values);
+        for row in rows.iter() {
+            if row.hidden.len() != width {
+                bail!(
+                    "Qwen layer-major row width {} does not match {width} at layer {layer}",
+                    row.hidden.len()
+                );
+            }
+            residual.extend_from_slice(&row.hidden);
+        }
+        if let Some(prepared) = prepared_input_norm {
+            if prepared.len() != hidden_values {
+                bail!(
+                    "Qwen layer-major prepared input norm has {} values, expected {hidden_values} at layer {layer}",
+                    prepared.len()
+                );
+            }
+            normed.extend_from_slice(prepared);
+        } else {
+            let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
+            for row in rows.iter() {
+                normed.extend(self.rms_norm_with_model_weight(&input_norm_name, &row.hidden)?);
+            }
+        }
+        let (attention, attention_width, out_proj_name, layer_kind) =
+            if self.runtime.is_linear_attention_layer(layer) {
+                let layout = self.runtime.linear_attention_layout(layer)?;
+                (
+                    self.linear_attention_output_matrix_values(layer, rows.len(), &normed)?,
+                    layout.total_value_width,
+                    linear_attention_tensor_name(layer, "out_proj"),
+                    FlashMoeLayerKind::LinearAttention,
+                )
+            } else {
+                let layout = self.runtime.full_attention_layout(layer)?;
+                (
+                    self.full_attention_output_matrix_values(
+                        layer,
+                        rows,
+                        &normed,
+                        start_position,
+                        kv_cache,
+                    )?,
+                    layout.q_width,
+                    attention_tensor_name(layer, "o_proj"),
+                    FlashMoeLayerKind::FullAttention,
+                )
+            };
+        let post = self.post_attention_output_matrix_values(
+            layer,
+            rows.len(),
+            attention_width,
+            &out_proj_name,
+            &attention,
+            &residual,
+        )?;
+        let experts = self.scheduler.experts_per_layer();
+        let active = self.scheduler.active_experts();
+        if post.router_scores.len() != rows.len() * experts {
+            bail!(
+                "Qwen layer-major router matrix has {} values, expected {}x{experts}",
+                post.router_scores.len(),
+                rows.len()
+            );
+        }
+        let row_routes = post
+            .router_scores
+            .chunks_exact(experts)
+            .map(|scores| routing_softmax_top_k(scores, active))
+            .collect::<Vec<_>>();
+        let scheduled = self
+            .scheduler
+            .resolve_layer_major_experts(layer, &row_routes)?;
+        let shared_phase = match self.shared_expert_weights.layer(layer)? {
+            SharedExpertLayerWeights::Resident(shared) => {
+                ScheduledSharedExpertPhaseRef::Resident(shared)
+            }
+            SharedExpertLayerWeights::None => ScheduledSharedExpertPhaseRef::None,
+        };
+        let hidden = self.metal.qwen_layer_major_experts(
+            &scheduled,
+            &post.normed,
+            &post.hidden,
+            shared_phase,
+        )?;
+        if hidden.len() != hidden_values {
+            bail!(
+                "Qwen layer-major expert output has {} values, expected {hidden_values}",
+                hidden.len()
+            );
+        }
+        let next_normed = if layer + 1 < self.config.num_hidden_layers {
+            let next_norm_name = layer_norm_tensor_name(layer + 1, "input_layernorm");
+            let next_norm_weight = self
+                .model_norm_weight(&next_norm_name, width)?
+                .with_context(|| format!("missing Qwen layer-major norm {next_norm_name}"))?;
+            Some(
+                self.metal
+                    .qwen_rms_norm_rows(&hidden, &next_norm_weight, rows.len(), width)?,
+            )
+        } else {
+            None
+        };
+        let mix_hashes = scheduled.route_mix_hashes().collect::<Vec<_>>();
+        let elapsed = layer_started.elapsed();
+        let per_row_elapsed = elapsed / u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        for row_index in 0..rows.len() {
+            let mut state = FlashMoeTokenState::from_recurrent_value(
+                hidden[row_index * width..(row_index + 1) * width].to_vec(),
+                rows[row_index].recurrent_value,
+            );
+            let route_start = row_index * active;
+            for route in route_start..route_start + active {
+                state.mix_active_expert(mix_hashes[route], scheduled.weights()[route]);
+            }
+            let layer_state = state.layer_state_record(start_position + row_index, layer);
+            let (row_hidden, recurrent_value) = state.into_hidden_and_recurrent();
+            rows[row_index].hidden = row_hidden;
+            rows[row_index].recurrent_value = recurrent_value;
+            kv_cache.record_layer_state_record(layer_state)?;
+            if let Some(timing) = row_timings[row_index].as_mut() {
+                let mut layer_timing = FlashMoeLayerTiming {
+                    layer,
+                    layer_kind,
+                    active_experts: active,
+                    dimensions: self.layer_dimensions(layer),
+                    buckets: FlashMoeTimingBuckets::default(),
+                };
+                layer_timing.buckets.total_wall = per_row_elapsed;
+                timing.buckets.total_wall += per_row_elapsed;
+                timing.layers.push(layer_timing);
+            }
+        }
+        Ok(next_normed)
     }
 
     fn mla_attention_output_values(
@@ -2449,38 +3131,6 @@ impl FlashMoeEngine {
         scheduled_attention.resolve_kv_state(kv_record.state(FlashMoeStatePlacement::CpuVisible))
     }
 
-    fn full_attention_cached(
-        &self,
-        kv_cache: &KvCache,
-        position: usize,
-        layer: usize,
-        q: &[f32],
-        layout: FullAttentionLayout,
-        attention_output: ScheduledAttentionMathOutput,
-    ) -> Result<Vec<f32>> {
-        let attention_output =
-            attention_output.validate_execution_state(layer, position, layout.kv_width)?;
-
-        match attention_output.implementation() {
-            ScheduledAttentionMathImplementation::CpuKvCache => kv_cache.causal_attention(
-                position,
-                layer,
-                q,
-                layout.num_q_heads,
-                layout.kv_heads,
-                layout.head_dim,
-            ),
-            ScheduledAttentionMathImplementation::CpuGlmMlaWeightAbsorption => bail!(
-                "GLM MLA attention must execute through its compressed-KV weight-absorption stage"
-            ),
-            ScheduledAttentionMathImplementation::MetalQ4GlmMlaAbsorbedAttention => {
-                bail!(
-                    "GLM MLA attention must execute through its compressed-KV Metal weight-absorption stage"
-                )
-            }
-        }
-    }
-
     fn route_layer(
         &self,
         layer: usize,
@@ -2635,6 +3285,46 @@ impl FlashMoeEngine {
         request: &StructuredGenerationRequest,
     ) -> Result<usize> {
         Ok(self.structured_prompt_tokens(request)?.1.len())
+    }
+
+    /// Resolve a raw-text prefix whose standalone tokenization is exactly the
+    /// requested leading slice of the full prompt. This avoids treating an
+    /// arbitrary byte prefix as a reusable session boundary when a tokenizer
+    /// merge crosses that boundary.
+    pub fn exact_raw_prompt_prefix(
+        &self,
+        full_prompt: &str,
+        prefix_tokens: usize,
+    ) -> Result<(String, usize)> {
+        let full_tokens = self.tokenizer.encode(full_prompt)?;
+        if prefix_tokens == 0 || prefix_tokens >= full_tokens.len() {
+            bail!(
+                "raw prompt parity prefix tokens {prefix_tokens} must be between 1 and {}",
+                full_tokens.len().saturating_sub(1)
+            );
+        }
+        let decoded = self.tokenizer.decode(&full_tokens[..prefix_tokens])?;
+        if full_prompt.starts_with(&decoded)
+            && self.tokenizer.encode(&decoded)? == full_tokens[..prefix_tokens]
+        {
+            return Ok((decoded, prefix_tokens));
+        }
+        for end in full_prompt
+            .char_indices()
+            .skip(1)
+            .map(|(index, _)| index)
+            .chain(std::iter::once(full_prompt.len()))
+        {
+            let candidate = &full_prompt[..end];
+            let candidate_tokens = self.tokenizer.encode(candidate)?;
+            if candidate_tokens.len() == prefix_tokens && full_tokens.starts_with(&candidate_tokens)
+            {
+                return Ok((candidate.to_string(), prefix_tokens));
+            }
+        }
+        bail!(
+            "raw prompt has no exact reusable text boundary at token {prefix_tokens}; choose a different --prefill-parity-prefix-tokens value"
+        )
     }
 
     fn structured_prompt_tokens(
@@ -3101,6 +3791,8 @@ impl FlashMoeEngine {
                         cursor,
                         base_prefix_len,
                         kv_cache,
+                        request.prefill_mode,
+                        request.prefill_chunk_tokens,
                         detailed,
                         progress.clone(),
                     )?
@@ -3132,6 +3824,8 @@ impl FlashMoeEngine {
                         cursor,
                         deepseek_stable_prefix_len,
                         kv_cache,
+                        request.prefill_mode,
+                        request.prefill_chunk_tokens,
                         detailed,
                         progress.clone(),
                     )?
@@ -3160,6 +3854,8 @@ impl FlashMoeEngine {
                         cursor,
                         prompt_len,
                         kv_cache,
+                        request.prefill_mode,
+                        request.prefill_chunk_tokens,
                         detailed,
                         progress.clone(),
                     )?
@@ -3211,6 +3907,33 @@ impl FlashMoeEngine {
             let recurrent = self.metal.capture_linear_attention_session_state()?;
             generation.capture_prompt_cache(prefill_hidden.clone(), recurrent);
         }
+
+        let prefill_state = if request.prefill_state_summary {
+            if deepseek_v4 {
+                bail!(
+                    "prefill state summaries currently qualify Qwen linear/full-attention graphs only"
+                );
+            }
+            let (full_attention_kv_sha256, router_recurrent_trace_sha256) =
+                generation.prefill_state_sha256();
+            let (full_attention_kv_layer_sha256, router_recurrent_layer_sha256) =
+                generation.prefill_layer_state_sha256();
+            let recurrent = self.metal.capture_linear_attention_session_state()?;
+            Some(NativePrefillStateStats {
+                final_hidden_sha256: f32_values_sha256(
+                    b"pb.flashmoe.final-prefill-hidden.v1\0",
+                    &prefill_hidden,
+                ),
+                full_attention_kv_sha256,
+                router_recurrent_trace_sha256,
+                linear_attention_state_sha256: recurrent.state_sha256(),
+                full_attention_kv_layer_sha256,
+                router_recurrent_layer_sha256,
+                linear_attention_layer_sha256: recurrent.layer_state_sha256(),
+            })
+        } else {
+            None
+        };
 
         let prefill_wall = prefill_or_ttft_started.elapsed();
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
@@ -3395,19 +4118,23 @@ impl FlashMoeEngine {
                 && deepseek_v4_uses_batch_prefill(prompt_len.saturating_sub(prefill_start))
             {
                 "deepseek_layer_major_batch"
-            } else if qwen_prefill_chunk_tokens(
-                self.model_layout.family,
-                prompt_len.saturating_sub(prefill_start),
-                self.metal_resource_snapshot().as_ref(),
-            )
-            .is_some()
+            } else if self.qwen_prefill_graph.supports_layer_major()
+                && (request.prefill_mode == NativePrefillMode::LayerMajor
+                    || (request.prefill_mode == NativePrefillMode::Auto
+                        && qwen_prefill_chunk_tokens(
+                            self.qwen_prefill_graph,
+                            prompt_len.saturating_sub(prefill_start),
+                            self.metal_resource_snapshot().as_ref(),
+                        )
+                        .is_some()))
             {
-                "qwen_chunked_token_batch"
+                "qwen_layer_major_matrix"
             } else {
                 "scalar_token"
             }
             .to_string(),
             thinking_enabled: request.enable_thinking && self.supports_thinking(),
+            prefill_state,
         };
         let output = GenerationOutput {
             content,
@@ -3456,6 +4183,8 @@ impl FlashMoeEngine {
         start_position: usize,
         end_position: usize,
         kv_cache: &mut KvCache,
+        prefill_mode: NativePrefillMode,
+        prefill_chunk_tokens: Option<usize>,
         mut timing: Option<&mut FlashMoeGenerationTiming>,
         progress: GenerationProgress<'_>,
     ) -> Result<Vec<f32>> {
@@ -3512,11 +4241,48 @@ impl FlashMoeEngine {
             }
             return Ok(hidden);
         }
-        if let Some(chunk_tokens) = qwen_prefill_chunk_tokens(
-            self.model_layout.family,
-            batch_tokens,
-            self.metal_resource_snapshot().as_ref(),
-        ) {
+        if prefill_mode == NativePrefillMode::LayerMajor
+            && batch_tokens > 0
+            && !self.qwen_prefill_graph.supports_layer_major()
+        {
+            bail!(
+                "explicit Qwen layer-major prefill is unavailable for prepared graph {}; it requires Qwen3-Coder-Next with resident affine-Q4 dense weights and fixed affine-Q4 expert slots",
+                self.qwen_prefill_graph.as_str()
+            );
+        }
+        let qwen_chunk_tokens = if let Some(chunk_tokens) = prefill_chunk_tokens {
+            if prefill_mode != NativePrefillMode::LayerMajor {
+                bail!("explicit Qwen prefill chunks require layer-major prefill mode");
+            }
+            if chunk_tokens == 0 || self.model_layout.family == QwenMoeFamily::DeepSeekV4Flash {
+                bail!("explicit Qwen prefill chunks require positive non-DeepSeek geometry");
+            }
+            (batch_tokens > 0).then_some(chunk_tokens.min(batch_tokens))
+        } else {
+            match prefill_mode {
+                NativePrefillMode::Auto => qwen_prefill_chunk_tokens(
+                    self.qwen_prefill_graph,
+                    batch_tokens,
+                    self.metal_resource_snapshot().as_ref(),
+                ),
+                NativePrefillMode::LayerMajor if batch_tokens > 0 => qwen_prefill_chunk_tokens(
+                    self.qwen_prefill_graph,
+                    batch_tokens.max(QWEN_BATCH_PREFILL_MIN_TOKENS),
+                    self.metal_resource_snapshot().as_ref(),
+                )
+                .map(|chunk_tokens| chunk_tokens.min(batch_tokens)),
+                NativePrefillMode::LayerMajor | NativePrefillMode::Scalar => None,
+            }
+        };
+        if prefill_mode == NativePrefillMode::LayerMajor
+            && batch_tokens > 0
+            && qwen_chunk_tokens.is_none()
+        {
+            bail!(
+                "explicit Qwen layer-major prefill cannot reserve the minimum {QWEN_BATCH_PREFILL_MIN_TOKENS}-row graph within the prepared Metal working-set and session-reserve limits"
+            );
+        }
+        if let Some(chunk_tokens) = qwen_chunk_tokens {
             return self.prefill_qwen_chunks(
                 prompt_tokens,
                 start_position,
@@ -3623,35 +4389,58 @@ impl FlashMoeEngine {
                     )
                 });
                 let hidden = autoreleasepool(|_| -> Result<Vec<f32>> {
-                    let mut chunk_hidden = None;
+                    let mut rows = Vec::with_capacity(chunk_end - chunk_start);
+                    let mut row_timings = Vec::with_capacity(chunk_end - chunk_start);
                     for position in chunk_start..chunk_end {
                         let token = prompt_tokens[position];
                         kv_cache.record_prompt_token_record(FlashMoePromptTokenRecord::new(
                             position, token,
                         ))?;
-                        let mut token_timing = timing.as_ref().map(|_| {
+                        row_timings.push(timing.as_ref().map(|_| {
                             FlashMoeTokenTiming::new(
                                 position,
                                 position,
                                 FlashMoeTokenPhase::Prefill,
                                 token,
                             )
+                        }));
+                        rows.push(QwenTokenExecutionOutput {
+                            hidden: self.dense.embedding(token, self.runtime.width)?,
+                            recurrent_value: self.dense.seed(position, token)?
+                                ^ (self.plan.model.len() as u64),
                         });
-                        chunk_hidden = Some(self.forward_token_input_in_autoreleasepool(
-                            FlashMoeTokenInput::text(token, position),
+                    }
+                    let mut prepared_input_norm = None;
+                    for layer in 0..self.config.num_hidden_layers {
+                        prepared_input_norm = self.forward_qwen_layer_major_matrix(
+                            layer,
+                            &mut rows,
+                            prepared_input_norm.as_deref(),
+                            chunk_start,
                             kv_cache,
-                            position,
-                            false,
-                            token_timing.as_mut(),
-                            progress.clone(),
-                        )?);
-                        if let Some(token_timing) = token_timing
-                            && let Some(timing) = timing.as_deref_mut()
-                        {
-                            timing.tokens.push(token_timing);
+                            &mut row_timings,
+                        )?;
+                    }
+                    for (row, token_timing) in rows.iter_mut().zip(row_timings.iter_mut()) {
+                        let norm_started = OptionalInstant::now(token_timing.is_some());
+                        row.hidden =
+                            self.rms_norm_with_model_weight("model.norm.weight", &row.hidden)?;
+                        if let Some(token_timing) = token_timing {
+                            token_timing.buckets.combine_norm += norm_started.elapsed();
+                            token_timing.buckets.total_wall = token_timing
+                                .layers
+                                .iter()
+                                .map(|layer| layer.buckets.total_wall)
+                                .sum::<Duration>()
+                                + norm_started.elapsed();
                         }
                     }
-                    chunk_hidden.context("Qwen prefill chunk produced no hidden state")
+                    if let Some(timing) = timing.as_deref_mut() {
+                        timing.tokens.extend(row_timings.into_iter().flatten());
+                    }
+                    rows.pop()
+                        .map(|row| row.hidden)
+                        .context("Qwen layer-major prefill chunk produced no hidden state")
                 })?;
                 self.metal.inner.finish_token_boundary(chunk_end - 1)?;
                 last_hidden = Some(hidden);

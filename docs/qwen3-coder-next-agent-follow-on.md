@@ -1,11 +1,11 @@
 # Qwen3-Coder-Next Agent Performance Follow-on
 
-Status: **Active implementation.** Durable stage evidence, compact terminal schemas, Qwen native
-tool constraints, output-aware mutation bounds, strict-stage TODO removal, dependency-aware batch
-rejection, and native telemetry are implemented. Qwen fresh prefill now has a bounded chunk-owner
-command, but the layer-major graph/performance gate and full qualification rerun remain open. Decode
-has been profiled; no change was promoted because the measured sampling path cannot meet the 1.5x
-gate.
+Status: **Integrated qualification active.** Durable stage evidence, compact terminal schemas, Qwen
+native tool constraints, output-aware mutation bounds, strict-stage TODO removal,
+dependency-aware batch rejection, native telemetry, and true layer-major Qwen3-Coder-Next prefill
+are implemented. The prefill graph passed exact state and resource/performance promotion gates; the
+full harness/browser qualification remains open. Decode has been profiled; no change was promoted
+because the measured sampling path cannot meet the 1.5x gate.
 
 Evaluation: [Qwen3-Coder-Next native agent](benchmarks/qwen3-coder-next-agent.md)
 
@@ -124,9 +124,16 @@ model. A single native benchmark command must report prefill and decode separate
 
 ## Phase 1 — Qwen layer-major batched prompt prefill
 
-This is the highest-value work. The current Qwen path sends every fresh prompt token through the
-single-token graph. Exact in-memory prefix reuse makes short corrections cheap, but a new process
-or stage-local prefix still pays the scalar cost.
+**Implemented and promoted on 2026-07-20.** The exact affine-Q4 graph passed resident and forced
+streamed zero/restored-prefix parity, forced chunk-boundary parity, the 5% memory gate, and the
+5x/120-second frontier gates. The locked 4,354-token geometry completed in 59.685 seconds at 72.95
+token/s, 11.55x faster than the preserved scalar baseline with 3.00% additional allocation. See
+[the qualification record](benchmarks/qwen3-coder-next-prefill-qualification.md). The design below
+is retained as the implementation contract.
+
+This was the highest-value work. The prior Qwen path sent every fresh prompt token through the
+single-token graph. Exact in-memory prefix reuse made short corrections cheap, but a new process
+or stage-local prefix still paid the scalar cost.
 
 ### Graph design
 

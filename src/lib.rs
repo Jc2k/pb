@@ -590,6 +590,24 @@ impl FlashMoeExpertStorageArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum FlashMoePrefillModeArg {
+    #[default]
+    Auto,
+    Scalar,
+    LayerMajor,
+}
+
+impl From<FlashMoePrefillModeArg> for inference::flashmoe::NativePrefillMode {
+    fn from(value: FlashMoePrefillModeArg) -> Self {
+        match value {
+            FlashMoePrefillModeArg::Auto => Self::Auto,
+            FlashMoePrefillModeArg::Scalar => Self::Scalar,
+            FlashMoePrefillModeArg::LayerMajor => Self::LayerMajor,
+        }
+    }
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct FlashMoeInferArgs {
     /// Prompt to send to the selected FlashMoe model
@@ -638,6 +656,26 @@ pub struct FlashMoeInferArgs {
     /// Tokenize the CLI prompt exactly instead of applying the chat template
     #[arg(long)]
     pub raw: bool,
+
+    /// Select automatic Qwen prefill, the scalar reference, or forced layer-major qualification
+    #[arg(long, value_enum, default_value_t = FlashMoePrefillModeArg::Auto)]
+    pub prefill_mode: FlashMoePrefillModeArg,
+
+    /// Print exact prefill hidden/KV/router/recurrent fingerprints
+    #[arg(long)]
+    pub prefill_state_summary: bool,
+
+    /// Run scalar and layer-major prefill in one loaded runtime and require exact state parity
+    #[arg(long)]
+    pub prefill_parity: bool,
+
+    /// Warm each parity mode at this exact raw-token prefix before qualifying the full prompt
+    #[arg(long, value_name = "TOKENS", requires = "prefill_parity")]
+    pub prefill_parity_prefix_tokens: Option<usize>,
+
+    /// Force a layer-major graph chunk boundary for harness qualification
+    #[arg(long, value_name = "TOKENS")]
+    pub prefill_chunk_tokens: Option<usize>,
 
     /// Ask the model chat template to suppress emitted reasoning
     #[arg(long, conflicts_with = "raw")]
@@ -2063,6 +2101,29 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     if args.repeat < 1 {
         bail!("--repeat must be at least 1");
     }
+    if args.prefill_parity && (args.repeat != 1 || args.session_id.is_some()) {
+        bail!("--prefill-parity requires --repeat 1 and no --session-id");
+    }
+    if args.prefill_parity && !args.images.is_empty() {
+        bail!("--prefill-parity currently qualifies text Qwen inference only");
+    }
+    if let Some(prefix_tokens) = args.prefill_parity_prefix_tokens {
+        if !args.raw {
+            bail!("--prefill-parity-prefix-tokens requires --raw");
+        }
+        if prefix_tokens == 0 {
+            bail!("--prefill-parity-prefix-tokens must be at least 1");
+        }
+    }
+    if args.prefill_chunk_tokens == Some(0) {
+        bail!("--prefill-chunk-tokens must be at least 1");
+    }
+    if args.prefill_chunk_tokens.is_some()
+        && !args.prefill_parity
+        && args.prefill_mode != FlashMoePrefillModeArg::LayerMajor
+    {
+        bail!("--prefill-chunk-tokens requires --prefill-parity or --prefill-mode layer-major");
+    }
     if args.raw && !args.images.is_empty() {
         bail!(
             "--raw cannot be combined with --image; multimodal input requires the typed Qwen-VL chat template"
@@ -2123,6 +2184,13 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     );
     let session_id = args.session_id.clone();
     let repeat = args.repeat;
+    let prefill_parity = args.prefill_parity;
+    let prefill_parity_prefix = args
+        .prefill_parity_prefix_tokens
+        .map(|tokens| engine.exact_raw_prompt_prefix(&args.prompt, tokens))
+        .transpose()?
+        .map(|(prefix, _)| prefix);
+    let qualification_chunk_tokens = args.prefill_chunk_tokens;
     let request = inference::flashmoe::GenerationRequest {
         prompt: args.prompt,
         max_tokens: args.max_tokens,
@@ -2169,12 +2237,98 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
     structured_request.trace_candidates = args.trace_candidates;
     structured_request.enable_thinking = !args.no_thinking;
+    structured_request.prefill_mode = args.prefill_mode.into();
+    structured_request.prefill_state_summary = args.prefill_state_summary || prefill_parity;
+    structured_request.prefill_chunk_tokens = args.prefill_chunk_tokens;
     if args.raw {
         structured_request.raw_prompt = true;
         structured_request.add_generation_prompt = false;
     }
+    let mut prefix_structured_request = prefill_parity_prefix.as_ref().map(|prefix| {
+        let mut request = structured_request.clone();
+        request.messages = vec![inference::flashmoe::ChatMessage::text(
+            inference::flashmoe::ChatRole::User,
+            prefix.clone(),
+        )];
+        request
+    });
+    // pass tuple: (mode, prefix_request, session_id, parity_target)
+    // parity_target 0 is an ordinary pass, 1 is the warm prefix, and 2 is the
+    // full prompt (zero-prefix or restored-prefix, depending on the plan).
+    let prefill_passes = if prefill_parity_prefix.is_some() {
+        vec![
+            (
+                inference::flashmoe::NativePrefillMode::Scalar,
+                true,
+                Some("__pb_prefill_parity_scalar".to_string()),
+                1u8,
+            ),
+            (
+                inference::flashmoe::NativePrefillMode::Scalar,
+                false,
+                Some("__pb_prefill_parity_scalar".to_string()),
+                2u8,
+            ),
+            (
+                inference::flashmoe::NativePrefillMode::LayerMajor,
+                true,
+                Some("__pb_prefill_parity_layer_major".to_string()),
+                1u8,
+            ),
+            (
+                inference::flashmoe::NativePrefillMode::LayerMajor,
+                false,
+                Some("__pb_prefill_parity_layer_major".to_string()),
+                2u8,
+            ),
+        ]
+    } else if prefill_parity {
+        vec![
+            (
+                inference::flashmoe::NativePrefillMode::Scalar,
+                false,
+                None,
+                2u8,
+            ),
+            (
+                inference::flashmoe::NativePrefillMode::LayerMajor,
+                false,
+                None,
+                2u8,
+            ),
+        ]
+    } else {
+        (0..repeat)
+            .map(|_| {
+                (
+                    structured_request.prefill_mode,
+                    false,
+                    session_id.clone(),
+                    0u8,
+                )
+            })
+            .collect()
+    };
+    let total_passes = prefill_passes.len();
+    let mut parity_prefix_reference = None;
+    let mut parity_full_reference = None;
     let mut last_timed = None;
-    for pass in 1..=repeat {
+    for (pass_index, (prefill_mode, prefix_request, pass_session_id, parity_target)) in
+        prefill_passes.into_iter().enumerate()
+    {
+        let pass = pass_index + 1;
+        let active_request = if prefix_request {
+            prefix_structured_request
+                .as_mut()
+                .context("prefill parity prefix request is unavailable")?
+        } else {
+            &mut structured_request
+        };
+        active_request.prefill_mode = prefill_mode;
+        active_request.prefill_chunk_tokens = (prefill_mode
+            == inference::flashmoe::NativePrefillMode::LayerMajor)
+            .then_some(qualification_chunk_tokens)
+            .flatten();
         let generation_started = Instant::now();
         let timed = if args.verbose || args.trace_candidates {
             let verbose = args.verbose;
@@ -2183,31 +2337,31 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
                     eprintln!("flashmoe infer: {message}");
                 }
             };
-            if let Some(session_id) = session_id.as_deref() {
+            if let Some(session_id) = pass_session_id.as_deref() {
                 engine.generate_structured_summary_timed_in_session_with_progress(
                     session_id,
-                    &structured_request,
+                    active_request,
                     &mut progress,
                 )?
             } else {
                 engine.generate_structured_summary_timed_with_progress(
-                    &structured_request,
+                    active_request,
                     &mut progress,
                 )?
             }
-        } else if let Some(session_id) = session_id.as_deref() {
-            engine.generate_structured_summary_timed_in_session(session_id, &structured_request)?
+        } else if let Some(session_id) = pass_session_id.as_deref() {
+            engine.generate_structured_summary_timed_in_session(session_id, active_request)?
         } else {
-            engine.generate_structured_summary_timed(&structured_request)?
+            engine.generate_structured_summary_timed(active_request)?
         };
         eprintln!(
-            "flashmoe infer: pass={pass}/{repeat} generated {} tokens in {} ms",
+            "flashmoe infer: pass={pass}/{total_passes} generated {} tokens in {} ms",
             timed.output.generated_tokens,
             generation_started.elapsed().as_millis()
         );
         let throughput = flashmoe_throughput_summary(&timed);
         eprintln!(
-            "flashmoe infer: pass={pass}/{repeat} throughput total_ms={} prefill_or_ttft_ms={} decode_tokens={} decode_ms={} decode_tok_s={}",
+            "flashmoe infer: pass={pass}/{total_passes} throughput total_ms={} prefill_or_ttft_ms={} decode_tokens={} decode_ms={} decode_tok_s={}",
             throughput.total_wall.as_millis(),
             throughput.prefill_or_ttft_wall.as_millis(),
             throughput.decode_tokens,
@@ -2215,13 +2369,60 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
             fmt_optional_tok_s(throughput.decode_tok_s())
         );
         eprintln!(
-            "flashmoe infer: pass={pass}/{repeat} prompt_cache source={:?} cached_tokens={} prefilled_tokens={} restore_ms={}",
+            "flashmoe infer: pass={pass}/{total_passes} prompt_cache source={:?} cached_tokens={} prefilled_tokens={} restore_ms={}",
             timed.output.prompt_cache.source,
             timed.output.prompt_cache.cached_tokens,
             timed.output.prompt_cache.prefilled_tokens,
             timed.output.prompt_cache.restore_ms,
         );
-        print_flashmoe_native_summary("infer", Some(pass), &timed.output)?;
+        if !prefill_parity || args.prefill_state_summary {
+            print_flashmoe_native_summary("infer", Some(pass), &timed.output)?;
+        }
+        if prefill_parity {
+            if prefill_parity_prefix.is_some() && !prefix_request {
+                if timed.output.prompt_cache.cached_tokens == 0
+                    || timed.output.prompt_cache.prefilled_tokens == 0
+                {
+                    bail!(
+                        "restored-prefix prefill parity pass {pass} did not restore a non-empty prefix and prefill a non-empty suffix"
+                    );
+                }
+            }
+            let state = timed
+                .output
+                .performance
+                .prefill_state
+                .clone()
+                .context("prefill parity run did not emit state fingerprints")?;
+            let result = (timed.output.content.clone(), state);
+            let reference = match parity_target {
+                1 => &mut parity_prefix_reference,
+                2 => &mut parity_full_reference,
+                _ => bail!("prefill parity pass has no comparison target"),
+            };
+            if let Some(reference) = reference.as_ref() {
+                if let Some(details) = flashmoe_prefill_parity_mismatch(reference, &result) {
+                    let scope = if parity_target == 1 {
+                        "warm-prefix"
+                    } else if prefill_parity_prefix.is_some() {
+                        "restored-prefix"
+                    } else {
+                        "zero-prefix"
+                    };
+                    bail!("scalar/layer-major {scope} prefill parity failed: {details}");
+                }
+                let scope = if parity_target == 1 {
+                    "warm-prefix"
+                } else if prefill_parity_prefix.is_some() {
+                    "restored-prefix"
+                } else {
+                    "zero-prefix"
+                };
+                eprintln!("flashmoe infer: scalar/layer-major {scope} prefill parity exact");
+            } else {
+                *reference = Some(result);
+            }
+        }
         last_timed = Some(timed);
     }
     if let Some(session_id) = session_id.as_deref()
@@ -2502,6 +2703,87 @@ fn print_flashmoe_native_summary(
         None => eprintln!("flashmoe {command}: native {json}"),
     }
     Ok(())
+}
+
+fn flashmoe_prefill_layer_mismatch(
+    label: &str,
+    scalar: &[Option<String>],
+    layer_major: &[Option<String>],
+) -> Option<String> {
+    let layers = scalar.len().max(layer_major.len());
+    (0..layers).find_map(|layer| {
+        let scalar = scalar.get(layer).and_then(Option::as_deref);
+        let layer_major = layer_major.get(layer).and_then(Option::as_deref);
+        (scalar != layer_major).then(|| {
+            format!(
+                "{label}[{layer}] scalar={} layer_major={}",
+                scalar.unwrap_or("missing"),
+                layer_major.unwrap_or("missing")
+            )
+        })
+    })
+}
+
+fn flashmoe_prefill_parity_mismatch(
+    scalar: &(String, inference::flashmoe::NativePrefillStateStats),
+    layer_major: &(String, inference::flashmoe::NativePrefillStateStats),
+) -> Option<String> {
+    let mut mismatches = Vec::new();
+    if scalar.0 != layer_major.0 {
+        mismatches.push(format!(
+            "content scalar={:?} layer_major={:?}",
+            scalar.0, layer_major.0
+        ));
+    }
+    for mismatch in [
+        flashmoe_prefill_layer_mismatch(
+            "full_attention_kv",
+            &scalar.1.full_attention_kv_layer_sha256,
+            &layer_major.1.full_attention_kv_layer_sha256,
+        ),
+        flashmoe_prefill_layer_mismatch(
+            "router_recurrent",
+            &scalar.1.router_recurrent_layer_sha256,
+            &layer_major.1.router_recurrent_layer_sha256,
+        ),
+        flashmoe_prefill_layer_mismatch(
+            "linear_attention",
+            &scalar.1.linear_attention_layer_sha256,
+            &layer_major.1.linear_attention_layer_sha256,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        mismatches.push(mismatch);
+    }
+    for (label, scalar, layer_major) in [
+        (
+            "final_hidden",
+            scalar.1.final_hidden_sha256.as_str(),
+            layer_major.1.final_hidden_sha256.as_str(),
+        ),
+        (
+            "full_attention_kv",
+            scalar.1.full_attention_kv_sha256.as_str(),
+            layer_major.1.full_attention_kv_sha256.as_str(),
+        ),
+        (
+            "router_recurrent_trace",
+            scalar.1.router_recurrent_trace_sha256.as_str(),
+            layer_major.1.router_recurrent_trace_sha256.as_str(),
+        ),
+        (
+            "linear_attention_state",
+            scalar.1.linear_attention_state_sha256.as_str(),
+            layer_major.1.linear_attention_state_sha256.as_str(),
+        ),
+    ] {
+        if scalar != layer_major {
+            mismatches.push(format!("{label} scalar={scalar} layer_major={layer_major}"));
+        }
+    }
+    (!mismatches.is_empty()).then(|| mismatches.join("; "))
 }
 
 const FLASHMOE_TIMING_TSV_HEADER: &str = "status\trow_type\tmodel\tprompt_index\tprompt\tquality\tphase\ttoken_index\tposition\tinput_token\tsampled_token\tlayer\tlayer_kind\thidden_size\tq_width\tkv_width\thead_dim\texperts_per_layer\tactive_experts\tshared_experts\tattention_projection_ms\tattention_input_projection_ms\tattention_kernel_ms\tattention_output_projection_ms\tattention_misc_ms\trouting_ms\tdeferred_wait_ms\texpert_io_ms\texpert_queue_ms\texpert_read_ms\texpert_bytes_read\texpert_warm_reads\texpert_warm_read_ms\texpert_warm_bytes_read\texpert_compute_ms\tcombine_norm_ms\tsampling_ms\ttotal_wall_ms\tgenerated_tokens\tcontent\n";
@@ -4049,6 +4331,81 @@ mod tests {
             panic!("expected harness infer command");
         };
         assert!(no_thinking.no_thinking);
+        assert_eq!(no_thinking.prefill_mode, FlashMoePrefillModeArg::Auto);
+        let scalar =
+            Cli::try_parse_from(["pb", "harness", "infer", "2+2=", "--prefill-mode", "scalar"])
+                .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Infer(scalar),
+        } = scalar.command
+        else {
+            panic!("expected harness infer command");
+        };
+        assert_eq!(scalar.prefill_mode, FlashMoePrefillModeArg::Scalar);
+        let layer_major = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "infer",
+            "2+2=",
+            "--prefill-mode",
+            "layer-major",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Infer(layer_major),
+        } = layer_major.command
+        else {
+            panic!("expected harness infer command");
+        };
+        assert_eq!(layer_major.prefill_mode, FlashMoePrefillModeArg::LayerMajor);
+        assert!(!scalar.prefill_state_summary);
+        assert!(!scalar.prefill_parity);
+        assert!(scalar.prefill_parity_prefix_tokens.is_none());
+        assert!(scalar.prefill_chunk_tokens.is_none());
+        let parity = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "infer",
+            "prefix suffix",
+            "--raw",
+            "--prefill-parity",
+            "--prefill-parity-prefix-tokens",
+            "1",
+            "--prefill-chunk-tokens",
+            "3",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Infer(parity),
+        } = parity.command
+        else {
+            panic!("expected harness infer command");
+        };
+        assert!(parity.prefill_parity);
+        assert_eq!(parity.prefill_parity_prefix_tokens, Some(1));
+        assert_eq!(parity.prefill_chunk_tokens, Some(3));
+        assert!(
+            Cli::try_parse_from([
+                "pb",
+                "harness",
+                "infer",
+                "prefix suffix",
+                "--raw",
+                "--prefill-parity-prefix-tokens",
+                "1",
+            ])
+            .is_err()
+        );
+        let state_summary =
+            Cli::try_parse_from(["pb", "harness", "infer", "2+2=", "--prefill-state-summary"])
+                .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Infer(state_summary),
+        } = state_summary.command
+        else {
+            panic!("expected harness infer command");
+        };
+        assert!(state_summary.prefill_state_summary);
         assert!(
             Cli::try_parse_from(["pb", "harness", "infer", "2+2=", "--raw", "--no-thinking",])
                 .is_err()

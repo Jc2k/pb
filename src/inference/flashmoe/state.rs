@@ -3,10 +3,12 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 use super::math::causal_attention;
 use super::session_cache::FlashMoeDiskCache;
 use super::types::PromptCacheSource;
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub(crate) struct FlashMoeSessionState<K> {
@@ -710,6 +712,14 @@ impl FlashMoeTokenState {
         }
     }
 
+    pub(crate) fn from_recurrent_value(hidden_values: Vec<f32>, recurrent_value: u64) -> Self {
+        Self {
+            hidden: FlashMoeCpuBuffer::hidden(hidden_values),
+            next_layer_normed: None,
+            recurrent: FlashMoeRecurrentState::new(recurrent_value),
+        }
+    }
+
     pub(crate) fn hidden(&self) -> &FlashMoeCpuBuffer {
         &self.hidden
     }
@@ -792,8 +802,13 @@ impl FlashMoeTokenState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_hidden_values(self) -> Vec<f32> {
         self.hidden.into_values()
+    }
+
+    pub(crate) fn into_hidden_and_recurrent(self) -> (Vec<f32>, u64) {
+        (self.hidden.into_values(), self.recurrent.value())
     }
 }
 
@@ -1103,6 +1118,52 @@ impl FlashMoeLinearAttentionSessionSnapshot {
 
     pub(crate) fn layer(&self, layer: usize) -> Option<&FlashMoeLinearAttentionLayerSnapshot> {
         self.layers.get(layer).and_then(Option::as_ref)
+    }
+
+    pub(crate) fn state_sha256(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"pb.flashmoe.linear-attention-state.v1\0");
+        digest.update((self.layers.len() as u64).to_le_bytes());
+        for (layer, snapshot) in self.layers.iter().enumerate() {
+            digest.update((layer as u64).to_le_bytes());
+            match snapshot {
+                Some(snapshot) => {
+                    digest.update([1]);
+                    let state = snapshot.state();
+                    digest.update((state.layer() as u64).to_le_bytes());
+                    digest.update((state.conv_state_len() as u64).to_le_bytes());
+                    digest.update((state.ssm_state_len() as u64).to_le_bytes());
+                    update_f32_digest(&mut digest, snapshot.conv_state());
+                    update_f32_digest(&mut digest, snapshot.ssm_state());
+                }
+                None => digest.update([0]),
+            }
+        }
+        format!("{:x}", digest.finalize())
+    }
+
+    pub(crate) fn layer_state_sha256(&self) -> Vec<Option<String>> {
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(layer, snapshot)| {
+                snapshot.as_ref().map(|snapshot| {
+                    let mut digest = Sha256::new();
+                    digest.update(b"pb.flashmoe.linear-attention-layer.v1\0");
+                    digest.update((layer as u64).to_le_bytes());
+                    update_f32_digest(&mut digest, snapshot.conv_state());
+                    update_f32_digest(&mut digest, snapshot.ssm_state());
+                    format!("{:x}", digest.finalize())
+                })
+            })
+            .collect()
+    }
+}
+
+fn update_f32_digest(digest: &mut Sha256, values: &[f32]) {
+    digest.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        digest.update(value.to_bits().to_le_bytes());
     }
 }
 
@@ -1700,6 +1761,7 @@ impl KvCache {
             .collect())
     }
 
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub(super) fn causal_attention(
         &self,
         position: usize,
@@ -1752,6 +1814,90 @@ impl KvCache {
             );
         }
         Ok(())
+    }
+
+    pub(crate) fn prefill_state_sha256(&self) -> (String, String) {
+        let mut kv_digest = Sha256::new();
+        kv_digest.update(b"pb.flashmoe.full-attention-kv.v1\0");
+        kv_digest.update((self.layers as u64).to_le_bytes());
+        for (layer, entries) in self.kv.iter().enumerate() {
+            for (position, entry) in entries.iter().enumerate() {
+                let Some((key, value)) = entry else {
+                    continue;
+                };
+                kv_digest.update((layer as u64).to_le_bytes());
+                kv_digest.update((position as u64).to_le_bytes());
+                update_f32_digest(&mut kv_digest, key);
+                update_f32_digest(&mut kv_digest, value);
+            }
+        }
+
+        // Token-major and layer-major execution record the same states in a
+        // different traversal order. Canonicalize by graph coordinates so the
+        // digest measures state, not scheduling order.
+        let mut layer_states = self.layer_states.clone();
+        layer_states.sort_unstable_by_key(|(position, layer, _)| (*position, *layer));
+        let mut trace_digest = Sha256::new();
+        trace_digest.update(b"pb.flashmoe.router-recurrent-trace.v1\0");
+        trace_digest.update((layer_states.len() as u64).to_le_bytes());
+        for (position, layer, value) in layer_states {
+            trace_digest.update((position as u64).to_le_bytes());
+            trace_digest.update((layer as u64).to_le_bytes());
+            trace_digest.update(value.to_le_bytes());
+        }
+
+        (
+            format!("{:x}", kv_digest.finalize()),
+            format!("{:x}", trace_digest.finalize()),
+        )
+    }
+
+    pub(crate) fn prefill_layer_state_sha256(&self) -> (Vec<Option<String>>, Vec<Option<String>>) {
+        let kv = self
+            .kv
+            .iter()
+            .enumerate()
+            .map(|(layer, entries)| {
+                let present = entries.iter().any(Option::is_some);
+                present.then(|| {
+                    let mut digest = Sha256::new();
+                    digest.update(b"pb.flashmoe.full-attention-kv-layer.v1\0");
+                    digest.update((layer as u64).to_le_bytes());
+                    for (position, entry) in entries.iter().enumerate() {
+                        let Some((key, value)) = entry else {
+                            continue;
+                        };
+                        digest.update((position as u64).to_le_bytes());
+                        update_f32_digest(&mut digest, key);
+                        update_f32_digest(&mut digest, value);
+                    }
+                    format!("{:x}", digest.finalize())
+                })
+            })
+            .collect();
+        let trace = (0..self.layers)
+            .map(|layer| {
+                let mut states = self
+                    .layer_states
+                    .iter()
+                    .filter(|(_, state_layer, _)| *state_layer == layer)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if states.is_empty() {
+                    return None;
+                }
+                states.sort_unstable_by_key(|(position, _, _)| *position);
+                let mut digest = Sha256::new();
+                digest.update(b"pb.flashmoe.router-recurrent-layer.v1\0");
+                digest.update((layer as u64).to_le_bytes());
+                for (position, _, value) in states {
+                    digest.update((position as u64).to_le_bytes());
+                    digest.update(value.to_le_bytes());
+                }
+                Some(format!("{:x}", digest.finalize()))
+            })
+            .collect();
+        (kv, trace)
     }
 }
 
@@ -2160,6 +2306,14 @@ impl FlashMoeGenerationState {
         (&self.prompt_tokens, self.prefill_start, &mut self.kv_cache)
     }
 
+    pub(crate) fn prefill_state_sha256(&self) -> (String, String) {
+        self.kv_cache.prefill_state_sha256()
+    }
+
+    pub(crate) fn prefill_layer_state_sha256(&self) -> (Vec<Option<String>>, Vec<Option<String>>) {
+        self.kv_cache.prefill_layer_state_sha256()
+    }
+
     pub(crate) fn requires_prompt_snapshot(&self) -> bool {
         self.session_id.is_some()
     }
@@ -2352,6 +2506,51 @@ mod tests {
             err.to_string().contains("requires CpuVisible placement"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn prefill_state_digest_canonicalizes_token_and_layer_major_record_order() {
+        let mut token_major = KvCache::new(2, 2);
+        let mut layer_major = KvCache::new(2, 2);
+        for cache in [&mut token_major, &mut layer_major] {
+            cache.record_kv(0, 1, vec![1.0], vec![2.0]).unwrap();
+            cache.record_kv(1, 1, vec![3.0], vec![4.0]).unwrap();
+        }
+        token_major.record_layer_state(0, 0, 10).unwrap();
+        token_major.record_layer_state(0, 1, 11).unwrap();
+        token_major.record_layer_state(1, 0, 12).unwrap();
+        token_major.record_layer_state(1, 1, 13).unwrap();
+        layer_major.record_layer_state(0, 0, 10).unwrap();
+        layer_major.record_layer_state(1, 0, 12).unwrap();
+        layer_major.record_layer_state(0, 1, 11).unwrap();
+        layer_major.record_layer_state(1, 1, 13).unwrap();
+
+        assert_eq!(
+            token_major.prefill_state_sha256(),
+            layer_major.prefill_state_sha256()
+        );
+        layer_major.layer_states[3].2 ^= 1;
+        assert_ne!(
+            token_major.prefill_state_sha256(),
+            layer_major.prefill_state_sha256()
+        );
+    }
+
+    #[test]
+    fn linear_attention_state_digest_includes_exact_float_bits() {
+        let first = recurrent_session_snapshot();
+        let changed = FlashMoeLinearAttentionSessionSnapshot::new(vec![Some(
+            FlashMoeLinearAttentionLayerSnapshot::new(
+                0,
+                vec![1.0, f32::from_bits(2.0f32.to_bits() + 1)],
+                vec![3.0, 4.0, 5.0],
+                2,
+                2,
+            )
+            .unwrap(),
+        )])
+        .unwrap();
+        assert_ne!(first.state_sha256(), changed.state_sha256());
     }
 
     #[test]

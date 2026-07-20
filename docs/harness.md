@@ -281,6 +281,15 @@ mapping. `--resource-summary` prints the opt-in JSON resource ledger;
 normal runs keep it disabled and emit tracing only for high-water changes, pressure recovery, or a
 resource-limit abort. `infer --no-thinking` asks a checkpoint's chat template to suppress emitted
 reasoning; it cannot be combined with `--raw`, which bypasses the chat template entirely.
+For Qwen prefill qualification, `infer --prefill-mode auto|scalar|layer-major` selects the promoted
+policy, exact scalar reference, or an explicit layer-major request. `auto` promotes only a prepared
+Qwen3-Coder-Next affine-Q4 graph with at least 32 fresh tokens and sufficient live Metal reserve.
+`--prefill-state-summary` prints exact hidden/KV/router/recurrent fingerprints.
+`--prefill-parity` loads the model once and fails unless scalar and layer-major content and state
+match exactly; `--prefill-parity-prefix-tokens N` additionally warms and genuinely restores an
+exact raw-token prefix before comparing the remaining suffix. `--prefill-chunk-tokens N` forces a
+smaller layer-major boundary and is accepted only with parity or explicit layer-major mode. These
+are hidden harness controls, not production configuration or environment toggles.
 `infer --session-id ID --repeat N` runs text inference through the exact production session cache,
 prints cached and actually-prefilled token counts for each pass, and persists the final checkpoint
 for families with a versioned disk-session format. `--repeat 2` verifies live reuse without a

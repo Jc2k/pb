@@ -148,10 +148,16 @@ spending the output budget on unsupported reasoning markers. It can return sever
 native tool calls in one assistant turn; pb validates the full batch and runs parallel-safe calls
 together before asking the model again. Strict native stages constrain function names and the
 supported argument-schema subset while tokens are sampled, then validate the completed call again
-at the executor boundary. Long fresh Qwen prompts are processed in resource-resolved chunks of up
-to 64 tokens so autorelease and Metal resource accounting occur at a bounded batch boundary; the
-inner token graph remains numerically identical to the scalar path while the separate layer-major
-prefill promotion gate remains open. An explicit Qwen GGUF URI continues to use llama.cpp. pb
+at the executor boundary. A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
+at least 32 tokens with true layer-major Metal prefill. The live Metal working-set snapshot chooses
+a chunk of at most 8,192 rows while retaining a 512 MiB safety margin and limiting graph scratch to
+5% of the resident/session basis; shorter suffixes or insufficient headroom keep the scalar token
+command. Full-attention KV, hybrid recurrent state, row-local top-10 routes, and greedy output are
+bitwise qualified against scalar prefill across fresh, restored-prefix, and forced chunk-boundary
+runs. This does not alter expert placement: a resident graph issues no expert reads, and a streamed
+graph obtains each unique layer expert through the existing parallel positioned-read scheduler.
+There is no execution-error fallback or second expert cache. An explicit Qwen GGUF URI continues to
+use llama.cpp. pb
 discovers GGUF files below the pulled model's cache directory, including Hugging Face variant
 subdirectories, and selects shard 1 for a split checkpoint; it does not mistake a larger later
 shard or `mmproj` file for the model entry point.

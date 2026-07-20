@@ -26,7 +26,7 @@ use super::weights::{
     SharedExpertPhaseWeights,
 };
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -442,6 +442,54 @@ pub(crate) struct PendingScheduledExpertLayerPrepare {
     pending: PendingExpertLayerPrepare,
 }
 
+/// Scheduler-resolved expert working set for one layer-major token matrix.
+///
+/// Routes and weights remain in token-major/top-k order so the Metal combine
+/// stage can preserve the scalar accumulation order. `experts` is the sorted
+/// unique union acquired through the graph's resident or positioned-read
+/// implementation exactly once for this layer.
+#[derive(Debug)]
+pub(crate) struct ScheduledLayerMajorExperts {
+    layer: usize,
+    rows: usize,
+    active_experts: usize,
+    route_slots: Vec<usize>,
+    weights: Vec<f32>,
+    experts: Arc<[Arc<ScheduledExpertSlot>]>,
+}
+
+impl ScheduledLayerMajorExperts {
+    pub(crate) fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub(crate) fn active_experts(&self) -> usize {
+        self.active_experts
+    }
+
+    pub(crate) fn route_slots(&self) -> &[usize] {
+        &self.route_slots
+    }
+
+    pub(crate) fn weights(&self) -> &[f32] {
+        &self.weights
+    }
+
+    pub(crate) fn experts(&self) -> &Arc<[Arc<ScheduledExpertSlot>]> {
+        &self.experts
+    }
+
+    pub(crate) fn route_mix_hashes(&self) -> impl Iterator<Item = u64> + '_ {
+        self.route_slots
+            .iter()
+            .map(|slot| self.experts[*slot].mix_hash())
+    }
+}
+
 impl FlashMoeExecutionScheduler {
     #[cfg(test)]
     pub(crate) fn new(
@@ -620,6 +668,87 @@ impl FlashMoeExecutionScheduler {
             .command_from_preselected(routes)?;
         let pending = self.expert_access.issue_routing_command(&routing)?;
         self.expert_access.finish_routes(pending)
+    }
+
+    /// Resolve all token routes for a layer-major prefill matrix and acquire
+    /// their sorted unique expert union through the already-selected expert
+    /// access implementation. Resident graphs clone mapped slots without
+    /// issuing reads; streamed graphs issue one scheduler-owned parallel pread
+    /// for each unique expert.
+    pub(crate) fn resolve_layer_major_experts(
+        &mut self,
+        layer: usize,
+        row_routes: &[Vec<(usize, f32)>],
+    ) -> Result<ScheduledLayerMajorExperts> {
+        if row_routes.is_empty() {
+            bail!("FlashMoe layer-major routing requires at least one token row");
+        }
+        let active_experts = self.graph.active_experts();
+        let mut normalized_rows = Vec::with_capacity(row_routes.len());
+        let mut unique_ids = BTreeSet::new();
+        for routes in row_routes {
+            let command = self
+                .graph
+                .build_routing_topk(
+                    layer,
+                    self.graph.experts_per_layer(),
+                    active_experts,
+                    ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
+                )?
+                .command_from_preselected(routes)?;
+            let normalized = self.expert_access.normalize_routes(&command)?;
+            if normalized.routes.len() != active_experts
+                || normalized.weights.len() != active_experts
+            {
+                bail!(
+                    "FlashMoe layer-major row resolved {} routes and {} weights, expected K={active_experts} at layer {layer}",
+                    normalized.routes.len(),
+                    normalized.weights.len()
+                );
+            }
+            unique_ids.extend(normalized.routes.iter().map(|route| route.expert));
+            normalized_rows.push(normalized);
+        }
+        let unique_ids = unique_ids.into_iter().collect::<Vec<_>>();
+        let experts = self.expert_access.acquire_unique(layer, &unique_ids)?;
+        if experts.len() != unique_ids.len() {
+            bail!(
+                "FlashMoe layer-major expert access returned {} slots for {} unique experts at layer {layer}",
+                experts.len(),
+                unique_ids.len()
+            );
+        }
+        let slot_by_id = unique_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(slot, expert)| (expert, slot))
+            .collect::<BTreeMap<_, _>>();
+        let route_count = row_routes
+            .len()
+            .checked_mul(active_experts)
+            .context("FlashMoe layer-major route count overflow")?;
+        let mut route_slots = Vec::with_capacity(route_count);
+        let mut weights = Vec::with_capacity(route_count);
+        for normalized in normalized_rows {
+            for (route, weight) in normalized.routes.iter().zip(normalized.weights) {
+                route_slots.push(*slot_by_id.get(&route.expert).with_context(|| {
+                    format!(
+                        "FlashMoe layer-major unique expert union omitted layer {layer} expert {}",
+                        route.expert
+                    )
+                })?);
+                weights.push(weight);
+            }
+        }
+        Ok(ScheduledLayerMajorExperts {
+            layer,
+            rows: row_routes.len(),
+            active_experts,
+            route_slots,
+            weights,
+            experts: Arc::from(experts),
+        })
     }
 
     /// Read the unique expert working set for one layer-major prefill batch.
@@ -2524,6 +2653,13 @@ impl<'a> ScheduledExpertPhaseMlpPayload<'a> {
         }
     }
 
+    pub(crate) fn q4_checked(&self) -> Option<&ScheduledQ4ExpertPhaseMlpPayload<'a>> {
+        match self {
+            Self::Q4(payload) => Some(payload),
+            Self::Dense(_) | Self::DeepSeekGguf(_) => None,
+        }
+    }
+
     pub(crate) fn storage_layout(&self) -> ExpertStorageLayout {
         match self {
             Self::Q4(payload) => {
@@ -3931,6 +4067,27 @@ enum ScheduledExpertAccessCoordinator {
 }
 
 impl ScheduledExpertAccessCoordinator {
+    fn normalize_routes(&self, command: &ScheduledRoutingCommand) -> Result<ScheduledExpertRoutes> {
+        match self {
+            Self::Streamed(coordinator) => coordinator.core.scheduled_routes_from_command(command),
+            Self::Resident(table) => table.core.scheduled_routes_from_command(command),
+        }
+    }
+
+    fn acquire_unique(
+        &mut self,
+        layer: usize,
+        experts: &[usize],
+    ) -> Result<Vec<Arc<ScheduledExpertSlot>>> {
+        match self {
+            Self::Streamed(coordinator) => coordinator.acquire_unique(layer, experts),
+            Self::Resident(table) => experts
+                .iter()
+                .map(|expert| table.slot(layer, *expert))
+                .collect(),
+        }
+    }
+
     fn issue_routing_command(
         &mut self,
         command: &ScheduledRoutingCommand,
@@ -4057,7 +4214,6 @@ impl ScheduledExpertReadCoordinator {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn issue_experts(
         &mut self,
         layer: usize,
@@ -4084,6 +4240,15 @@ impl ScheduledExpertReadCoordinator {
             pending.push(PendingScheduledRead::new(issue.id, rx));
         }
         Ok(pending)
+    }
+
+    fn acquire_unique(
+        &mut self,
+        layer: usize,
+        experts: &[usize],
+    ) -> Result<Vec<Arc<ScheduledExpertSlot>>> {
+        let pending = self.issue_experts(layer, experts)?;
+        self.finish(pending)
     }
 
     pub(crate) fn issue_routing_command(
@@ -8703,6 +8868,54 @@ mod tests {
     }
 
     #[test]
+    fn layer_major_streaming_reads_each_unique_expert_once_per_layer_request() {
+        let temp = tempfile::tempdir().unwrap();
+        write_identity_fixed_q4_layer(temp.path(), 0, 512);
+        let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
+        let mut layout = qwen35_layout();
+        layout.layers = 1;
+        let mut capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+        capabilities.active_experts = 2;
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let mut scheduler = FlashMoeExecutionScheduler::new(graph, store).unwrap();
+        let routes = vec![vec![(3, 0.8), (1, 0.2)], vec![(1, 0.7), (2, 0.3)]];
+
+        let scheduled = scheduler.resolve_layer_major_experts(0, &routes).unwrap();
+
+        assert_eq!(scheduled.layer(), 0);
+        assert_eq!(scheduled.rows(), 2);
+        assert_eq!(scheduled.active_experts(), 2);
+        assert_eq!(scheduled.route_slots(), &[2, 0, 0, 1]);
+        assert_eq!(scheduled.weights(), &[0.8, 0.2, 0.7, 0.3]);
+        assert_eq!(
+            scheduled
+                .experts()
+                .iter()
+                .map(|slot| slot.expert())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let first = scheduler.snapshot();
+        assert_eq!(first.issued_reads, 3);
+        assert_eq!(first.positioned_reads, 3);
+        assert_eq!(
+            first.bytes_read,
+            (3 * tiny_fixed_q4_layout().expert_bytes) as u64
+        );
+
+        let repeated = scheduler.resolve_layer_major_experts(0, &routes).unwrap();
+        assert_eq!(repeated.route_slots(), scheduled.route_slots());
+        let second = scheduler.snapshot();
+        assert_eq!(second.issued_reads, 6);
+        assert_eq!(second.positioned_reads, 6);
+        assert_eq!(
+            second.bytes_read,
+            (6 * tiny_fixed_q4_layout().expert_bytes) as u64
+        );
+    }
+
+    #[test]
     fn execution_scheduler_resident_graph_maps_complete_table_without_positioned_reads() {
         let temp = tempfile::tempdir().unwrap();
         write_identity_fixed_dense_layer(temp.path(), 0, 1, DenseExpertDtype::Bf16);
@@ -8771,6 +8984,71 @@ mod tests {
         );
         assert_eq!(scheduler.snapshot().positioned_reads, 0);
         assert_eq!(scheduler.snapshot().bytes_read, 0);
+    }
+
+    #[test]
+    fn layer_major_resident_graph_reuses_mapped_union_without_scheduler_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        write_identity_fixed_dense_layer(temp.path(), 0, 4, DenseExpertDtype::Bf16);
+        let spec = FixedDenseExpertSlotSpec::new(DenseExpertDtype::Bf16, 2, 2).unwrap();
+        let store =
+            ExpertSlotStore::open_with_fixed_dense(temp.path().to_path_buf(), spec).unwrap();
+
+        let mut layout = qwen35_layout();
+        layout.layers = 1;
+        let mut capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+        capabilities.expert_storage = ExpertStoreExecutionDescriptor {
+            layout: ExpertStorageLayout::FixedBf16,
+            slot_spec: ExpertSlotSpec::FixedDense(spec),
+            layers: 1,
+            first_expert_layer: 0,
+            experts_per_layer: 4,
+        };
+        capabilities.experts_per_layer = 4;
+        capabilities.active_experts = 2;
+        let stage = capabilities
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == FlashMoeGraphStage::ActiveExpertReads)
+            .unwrap();
+        stage.placement = FlashMoeStagePlacement::SchedulerMemory;
+        stage.implementation = FlashMoeStageImplementation::ResidentMappedWholeExpertSlots;
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+
+        let mut bound = 0usize;
+        let mut scheduler =
+            FlashMoeExecutionScheduler::new_with_resident_binding(graph, store, |_| {
+                bound += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(bound, 4);
+        let routes = vec![vec![(3, 0.8), (1, 0.2)], vec![(1, 0.7), (2, 0.3)]];
+
+        let first = scheduler.resolve_layer_major_experts(0, &routes).unwrap();
+        let second = scheduler.resolve_layer_major_experts(0, &routes).unwrap();
+
+        assert_eq!(first.route_slots(), &[2, 0, 0, 1]);
+        assert_eq!(first.weights(), &[0.8, 0.2, 0.7, 0.3]);
+        assert_eq!(
+            first
+                .experts()
+                .iter()
+                .map(|slot| slot.expert())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            first
+                .experts()
+                .iter()
+                .zip(second.experts().iter())
+                .all(|(left, right)| Arc::ptr_eq(left, right))
+        );
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.issued_reads, 0);
+        assert_eq!(snapshot.positioned_reads, 0);
+        assert_eq!(snapshot.bytes_read, 0);
     }
 
     #[test]

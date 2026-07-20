@@ -1,6 +1,6 @@
 # Qwen3-Coder-Next prefill qualification
 
-Status: **Locked baseline; chunk-owner command measured and not promoted**
+Status: **Layer-major command promoted; integrated browser-agent rerun pending**
 
 This is the repeatable native-runner performance contract derived from the preserved Typing Defense
 evaluation. It does not duplicate private prompt bodies. A qualification run renders the current
@@ -38,14 +38,65 @@ target/aarch64-apple-darwin/release/pb harness infer \
 
 The result must identify `Qwen3NextMoe`, K=10, effective thinking off, fresh/cached token counts,
 prefill and decode separately, `resident_complete_corpus` or `streamed_parallel_pread`, and the
-prefill command kind. The current `qwen_chunked_token_batch` is an ownership/command-boundary
-migration step and is not the target layer-major command.
+prefill command kind. Promoted long prompts report `qwen_layer_major_matrix`; scalar controls
+report `scalar_token`.
 
-Promotion requires scalar/batch state and greedy-token parity for zero/restored prefixes and all
+Promotion required scalar/batch state and greedy-token parity for zero/restored prefixes and all
 chunk boundaries, resident zero-read behavior, streamed scheduler ownership, no more than 5%
 additional request/session reserve, at least 5x over the 4–5k scalar baseline, and no more than 120
-seconds at that frontier. Until all gates pass, record the measurement and leave the target
-layer-major command unpromoted.
+seconds at that frontier. The 2026-07-20 result below closes those deterministic and performance
+gates; artifact quality remains independently gated by the full agent/browser evaluation.
+
+## 2026-07-20 layer-major promotion
+
+The final release arm64 binary prepared a layer-major graph only for the exact
+`Qwen3NextMoe` resident-affine-Q4/fixed-affine-Q4 capability. `auto` keeps short suffixes and every
+incompatible supported layout on the scalar graph. Compatible suffixes of at least 32 tokens use a
+resource-resolved layer-major chunk of at most 8,192 rows; the calculation preserves a 512 MiB
+safety margin and caps graph scratch at 5% of the current resident/session basis. An explicit
+unsupported or unreservable layer-major qualification fails before execution rather than retrying
+the scalar graph.
+
+Exact parity was checked inside one loaded runtime. State fingerprints cover the final hidden row,
+aggregate and per-layer full-attention KV, aggregate and per-layer router/recurrent records, and
+aggregate and per-layer Metal linear-attention buffers.
+
+| Expert graph | Prefix | Forced chunk | Result |
+| --- | ---: | ---: | --- |
+| complete resident corpus | 0 | 17 | exact after 40 fresh tokens |
+| complete resident corpus | 10 cached + 30 fresh | 7 | warm-prefix and restored-prefix exact |
+| forced 32 GiB streamed scheduler | 0 | 17 | exact after 40 fresh tokens |
+| forced 32 GiB streamed scheduler | 10 cached + 30 fresh | 7 | warm-prefix and restored-prefix exact |
+
+The resident scheduler tests observe zero issued or positioned reads and reuse the same mapped
+expert slots. The streamed tests observe one positioned read for each member of the sorted unique
+layer union on every request; a repeated request reads the union again, proving that the graph did
+not add an application expert cache. Both live graphs finished with zero transient expert buffers
+and zero in-flight commands.
+
+The deterministic 4,354-token raw geometry is the ASCII sequence `a a ... a` with no trailing
+space (input SHA-256
+`a524b9f622ba729c0e9ecfea470bb4f002d57f37e3e97e8d4ade5827e40d9a26`). It isolates the same locked
+frontier size from changing agent prompt prose; the integrated stage prompt remains part of the
+subsequent browser-agent acceptance run. One resident graph boundary produced:
+
+| Metric | Result | Gate |
+| --- | ---: | ---: |
+| fresh tokens | 4,354 | 4–5k frontier |
+| prefill wall time | 59,685 ms | at most 120,000 ms |
+| prefill throughput | 72.949 token/s | report |
+| preserved scalar wall time | 689,600–690,200 ms | baseline |
+| speedup vs 689,600 ms | 11.554x | at least 5x |
+| resident baseline allocation | 44,981,485,568 bytes | baseline |
+| layer-major peak allocation | 46,330,593,280 bytes | report |
+| additional allocation | 1,349,107,712 bytes (2.9993%) | at most 5% |
+| resource boundaries | 1 | report |
+| live transient buffers / commands | 0 / 0 | required |
+
+The greedy continuation was `a`, and telemetry reported `Qwen3NextMoe`, K=10,
+`resident_complete_corpus`, `qwen_layer_major_matrix`, and thinking disabled. Relative to the
+preserved baseline, all three promotion thresholds pass without changing quantization, expert
+ownership, or sampling.
 
 ## 2026-07-20 chunk-owner measurement
 

@@ -4,7 +4,9 @@ use std::fmt;
 use super::deepseek_metal::DEEPSEEK_V4_REQUIRED_METAL_KERNELS;
 #[cfg(test)]
 use super::experts::{DeepSeekGgufExpertSlotSpec, FixedQ4ExpertSlotSpec};
-use super::experts::{ExpertSlotSpec, ExpertStorageLayout, ExpertStoreExecutionDescriptor};
+use super::experts::{
+    ExpertSlotSpec, ExpertStorageLayout, ExpertStoreExecutionDescriptor, FixedQ4ExpertEncoding,
+};
 #[cfg(test)]
 use super::metal::MetalPipelineNameSet;
 use super::metal::{MetalRuntimeCapabilities, kernels};
@@ -237,12 +239,53 @@ pub(crate) struct FlashMoeDeviceCapability {
     pub(crate) metal: MetalRuntimeCapabilities,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwenPrefillGraphCapability {
+    ScalarToken,
+    LayerMajorAffineQ4,
+}
+
+impl QwenPrefillGraphCapability {
+    fn resolve(
+        layout: &QwenMoeModelLayout,
+        dense_layout: ResidentDenseLayout,
+        expert_storage: ExpertStoreExecutionDescriptor,
+    ) -> Self {
+        let affine_q4_experts = matches!(
+            expert_storage.slot_spec,
+            ExpertSlotSpec::FixedQ4(spec)
+                if expert_storage.layout == ExpertStorageLayout::FixedQ4
+                    && spec.encoding == FixedQ4ExpertEncoding::AffineBf16
+        );
+        if layout.family == QwenMoeFamily::Qwen3NextMoe
+            && dense_layout == ResidentDenseLayout::Q4
+            && affine_q4_experts
+        {
+            Self::LayerMajorAffineQ4
+        } else {
+            Self::ScalarToken
+        }
+    }
+
+    pub(crate) const fn supports_layer_major(self) -> bool {
+        matches!(self, Self::LayerMajorAffineQ4)
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScalarToken => "scalar_token",
+            Self::LayerMajorAffineQ4 => "qwen3_next_layer_major_affine_q4",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlashMoeCapabilityPlan {
     pub family: QwenMoeFamily,
     pub(crate) input_adapter: FlashMoeInputAdapterCapability,
     pub(crate) dense_layout: ResidentDenseLayout,
     pub(crate) expert_storage: ExpertStoreExecutionDescriptor,
+    pub(crate) qwen_prefill_graph: QwenPrefillGraphCapability,
     pub(crate) device: FlashMoeDeviceCapability,
     pub routing: QwenMoeRoutingPlacement,
     pub experts_per_layer: usize,
@@ -462,6 +505,7 @@ impl FlashMoeCapabilityPlan {
             input_adapter,
             dense_layout,
             expert_storage,
+            qwen_prefill_graph: QwenPrefillGraphCapability::ScalarToken,
             device: FlashMoeDeviceCapability { metal },
             routing: layout.execution.routing,
             experts_per_layer: layout.experts_per_layer,
@@ -786,6 +830,11 @@ impl FlashMoeCapabilityPlan {
             input_adapter,
             dense_layout,
             expert_storage,
+            qwen_prefill_graph: QwenPrefillGraphCapability::resolve(
+                layout,
+                dense_layout,
+                expert_storage,
+            ),
             device: FlashMoeDeviceCapability { metal },
             routing: layout.execution.routing,
             experts_per_layer: layout.experts_per_layer,
@@ -1467,12 +1516,63 @@ mod tests {
         assert_eq!(plan.expert_storage.layout, ExpertStorageLayout::FixedQ4);
         assert_eq!(plan.experts_per_layer, 512);
         assert_eq!(plan.active_experts, 10);
+        assert_eq!(
+            plan.qwen_prefill_graph,
+            QwenPrefillGraphCapability::LayerMajorAffineQ4
+        );
         assert_eq!(plan.attention_layers.len(), 48);
         assert_eq!(plan.attention_layers[0], QwenMoeLayerKind::LinearAttention);
         assert_eq!(plan.attention_layers[3], QwenMoeLayerKind::FullAttention);
         assert_eq!(
             plan.routing_weight_normalization,
             QwenMoeRoutingWeightNormalization::RenormalizeSelected
+        );
+    }
+
+    #[test]
+    fn qwen_layer_major_prefill_is_prepared_only_for_the_exact_affine_q4_graph() {
+        let next = qwen3_coder_next_layout();
+        let non_q4_dense = FlashMoeCapabilityPlan::resolve(
+            &next,
+            text_adapter(),
+            ResidentDenseLayout::Bf16,
+            fixed_q4_experts(&next),
+            &attention_layers(&next),
+            Some(full_metal()),
+        )
+        .unwrap();
+        assert_eq!(
+            non_q4_dense.qwen_prefill_graph,
+            QwenPrefillGraphCapability::ScalarToken
+        );
+
+        let non_q4_experts = FlashMoeCapabilityPlan::resolve(
+            &next,
+            text_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_dense_experts(&next, DenseExpertDtype::Bf16),
+            &attention_layers(&next),
+            Some(full_metal()),
+        )
+        .unwrap();
+        assert_eq!(
+            non_q4_experts.qwen_prefill_graph,
+            QwenPrefillGraphCapability::ScalarToken
+        );
+
+        let qwen35 = qwen35_layout();
+        let other_family = FlashMoeCapabilityPlan::resolve(
+            &qwen35,
+            text_adapter(),
+            ResidentDenseLayout::Q4,
+            fixed_q4_experts(&qwen35),
+            &attention_layers(&qwen35),
+            Some(full_metal()),
+        )
+        .unwrap();
+        assert_eq!(
+            other_family.qwen_prefill_graph,
+            QwenPrefillGraphCapability::ScalarToken
         );
     }
 
@@ -2162,6 +2262,7 @@ mod tests {
             input_adapter: text_adapter(),
             dense_layout: ResidentDenseLayout::Q4,
             expert_storage: fixed_q4_experts(&layout),
+            qwen_prefill_graph: QwenPrefillGraphCapability::ScalarToken,
             device: FlashMoeDeviceCapability {
                 metal: full_metal(),
             },

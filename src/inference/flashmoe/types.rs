@@ -251,6 +251,17 @@ impl NativeToolConstraintMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePrefillMode {
+    #[default]
+    Auto,
+    Scalar,
+    /// Explicit qualification surface for exercising the layer-major graph
+    /// below its production prompt-geometry threshold.
+    LayerMajor,
+}
+
 #[derive(Debug, Clone)]
 pub struct StructuredGenerationRequest {
     pub messages: Vec<ChatMessage>,
@@ -263,6 +274,18 @@ pub struct StructuredGenerationRequest {
     pub raw_prompt: bool,
     pub trace_candidates: bool,
     pub tool_constraint_mode: NativeToolConstraintMode,
+    /// Explicit harness qualification control. Production requests use `Auto`;
+    /// `Scalar` preserves the exact token-major reference for A/B parity;
+    /// `LayerMajor` is an explicit harness qualification override.
+    pub prefill_mode: NativePrefillMode,
+    /// Emit exact prefill-state fingerprints in native harness summaries.
+    /// This is an opt-in qualification aid because capturing Metal recurrent
+    /// state requires a large device-to-host readback.
+    pub prefill_state_summary: bool,
+    /// Explicit harness qualification chunk boundary for layer-major Qwen
+    /// prefill. Production requests leave this unset and use the resource-
+    /// resolved graph geometry.
+    pub prefill_chunk_tokens: Option<usize>,
     /// Maximum combined prompt and generated-token capacity for this request.
     /// `None` retains the model/runtime default used by direct FlashMoe tools.
     pub context_size: Option<usize>,
@@ -282,6 +305,9 @@ impl StructuredGenerationRequest {
             raw_prompt: false,
             trace_candidates: false,
             tool_constraint_mode: NativeToolConstraintMode::Auto,
+            prefill_mode: NativePrefillMode::Auto,
+            prefill_state_summary: false,
+            prefill_chunk_tokens: None,
             context_size: None,
             max_tokens: request.max_tokens,
             temperature: request.temperature,
@@ -350,6 +376,19 @@ pub struct NativeGenerationStats {
     pub expert_strategy: String,
     pub prefill_command_kind: String,
     pub thinking_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_state: Option<NativePrefillStateStats>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePrefillStateStats {
+    pub final_hidden_sha256: String,
+    pub full_attention_kv_sha256: String,
+    pub router_recurrent_trace_sha256: String,
+    pub linear_attention_state_sha256: String,
+    pub full_attention_kv_layer_sha256: Vec<Option<String>>,
+    pub router_recurrent_layer_sha256: Vec<Option<String>>,
+    pub linear_attention_layer_sha256: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone)]

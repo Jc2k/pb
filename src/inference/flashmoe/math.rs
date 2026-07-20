@@ -561,6 +561,7 @@ pub(super) fn trace_layer_values(position: usize, layer: usize, stage: &str, val
     let _ = (position, layer, stage, values);
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn causal_attention(
     q: &[f32],
     keys_values: &[(&[f32], &[f32])],

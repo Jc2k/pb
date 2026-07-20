@@ -10982,6 +10982,9 @@ fn flashmoe_structured_request(
         } else {
             crate::inference::flashmoe::NativeToolConstraintMode::Auto
         },
+        prefill_mode: crate::inference::flashmoe::NativePrefillMode::Auto,
+        prefill_state_summary: false,
+        prefill_chunk_tokens: None,
         context_size: Some(args.ctx_size as usize),
         max_tokens: args.max_tokens,
         temperature: args.temperature,

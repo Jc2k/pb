@@ -1705,6 +1705,7 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
     let (actual, _timing, dispatches) = metal
         .resident_mmap_matvec_batch(&projections, &input)
         .unwrap();
+    let single_row_actual = actual.clone();
 
     assert_eq!(dispatches, 1);
     assert_eq!(actual.len(), tensors.len());
@@ -1723,6 +1724,139 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
             assert!(
                 (*actual - *expected).abs() < 1e-4,
                 "projection {projection_idx} row {row}: Metal q4 batch mmap {actual} diverged from CPU reference {expected}"
+            );
+        }
+    }
+
+    let second_input = input
+        .iter()
+        .enumerate()
+        .map(|(index, value)| value * -0.375 + index as f32 * 0.0125)
+        .collect::<Vec<_>>();
+    let matrix_input = [input.as_slice(), second_input.as_slice()].concat();
+    let (matrix_actual, _, matrix_dispatches) = metal
+        .resident_mmap_projection_matrix(&projections, 2, cols, &matrix_input)
+        .unwrap();
+    assert_eq!(matrix_dispatches, 1);
+    for (projection_idx, (actual, tensor)) in matrix_actual.iter().zip(tensors.iter()).enumerate() {
+        assert_eq!(actual.len(), 2 * tensor.shape[0]);
+        assert_eq!(
+            actual[..tensor.shape[0]]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            single_row_actual[projection_idx]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "projection {projection_idx} one-row matrix must exactly match scalar batch"
+        );
+        for (input_row, row_input) in [input.as_slice(), second_input.as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let expected = q4_fma_matvec_with_group_size(
+                &tensor.quantized.values,
+                row_input,
+                &tensor.quantized.scales,
+                &tensor.quantized.biases,
+                tensor.shape[0],
+                cols,
+                group_size,
+            )
+            .unwrap();
+            let row_start = input_row * tensor.shape[0];
+            for (row, (actual, expected)) in actual[row_start..row_start + tensor.shape[0]]
+                .iter()
+                .zip(expected.iter())
+                .enumerate()
+            {
+                assert!(
+                    (*actual - *expected).abs() < 1e-4,
+                    "projection {projection_idx} input {input_row} row {row}: Metal q4 matrix {actual} diverged from CPU reference {expected}"
+                );
+            }
+        }
+    }
+
+    let norm_weight = (0..cols)
+        .map(|index| 0.75 + index as f32 * 0.03125)
+        .collect::<Vec<_>>();
+    let matrix_norm = metal
+        .qwen_rms_norm_rows(&matrix_input, &norm_weight, 2, cols)
+        .unwrap();
+    for (row, row_input) in [input.as_slice(), second_input.as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let scalar_norm = metal
+            .qwen_rms_norm_rows(row_input, &norm_weight, 1, cols)
+            .unwrap();
+        assert_eq!(
+            matrix_norm[row * cols..(row + 1) * cols]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            scalar_norm
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "Qwen RMS-normalization matrix row {row} must exactly match the scalar command"
+        );
+    }
+
+    let query_rows = 2;
+    let prefix_rows = 1;
+    let query_heads = 2;
+    let kv_heads = 1;
+    let head_dim = 256;
+    let queries = (0..query_rows * query_heads * head_dim)
+        .map(|index| ((index as f32 + 0.5) * 0.013).sin() * 0.25)
+        .collect::<Vec<_>>();
+    let keys = (0..(prefix_rows + query_rows) * kv_heads * head_dim)
+        .map(|index| ((index as f32 + 1.5) * 0.017).cos() * 0.375)
+        .collect::<Vec<_>>();
+    let values = (0..(prefix_rows + query_rows) * kv_heads * head_dim)
+        .map(|index| ((index as f32 + 2.5) * 0.019).sin() * 0.5)
+        .collect::<Vec<_>>();
+    let attention = metal
+        .qwen_causal_attention_rows(
+            &queries,
+            &keys,
+            &values,
+            query_rows,
+            prefix_rows,
+            query_heads,
+            kv_heads,
+            head_dim,
+        )
+        .unwrap();
+    for query_row in 0..query_rows {
+        let q_start = query_row * query_heads * head_dim;
+        let records = (0..prefix_rows + query_row + 1)
+            .map(|key_row| {
+                let start = key_row * kv_heads * head_dim;
+                (
+                    &keys[start..start + kv_heads * head_dim],
+                    &values[start..start + kv_heads * head_dim],
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = causal_attention(
+            &queries[q_start..q_start + query_heads * head_dim],
+            &records,
+            query_heads,
+            kv_heads,
+            head_dim,
+        );
+        for (dimension, (actual, expected)) in attention[q_start..q_start + query_heads * head_dim]
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() < 2e-5,
+                "Qwen causal attention row {query_row} dimension {dimension}: Metal {actual} diverged from CPU {expected}"
             );
         }
     }

@@ -153,8 +153,9 @@ models and explicit GGUF paths that select it before loading.
 
 ### Qwen3-Coder-Next agent-performance follow-on
 
-Status: **Active migration.** Native constraints, telemetry, bounded chunk ownership, and workflow
-evidence/output shaping are shipped; layer-major Qwen prefill and qualification remain open.
+Status: **Layer-major prefill shipped and qualified; integrated agent rerun active.** Native
+constraints, telemetry, workflow evidence/output shaping, and the Qwen3-Coder-Next layer-major
+prefill graph are shipped. The preserved browser-agent contract remains the next integrated gate.
 
 The preserved native agent run identified scalar fresh-prompt prefill, repeated stage evidence,
 unconstrained native tool selection, and oversized edits as the remaining path to a successful
@@ -162,29 +163,36 @@ browser-task qualification. The detailed
 [agent performance follow-on](qwen3-coder-next-agent-follow-on.md) makes the built-in runner the
 primary target while retaining explicit llama.cpp GGUF support as a regression control.
 
-The target Qwen prefill command is layer-major and selected from prompt geometry inside the same
-load-resolved graph. Complete resident experts continue to issue no expert reads; the streamed
-graph continues to use scheduler-owned parallel positioned reads and the OS page cache. Batch
-buffers are request scratch, not an application cache. Full attention updates the existing typed KV
-state, linear attention preserves ordered recurrent updates, and each row retains exact K=10 route
-semantics. The command must pass zero-prefix, restored-prefix, chunk-boundary, resident, and streamed
-parity before promotion and may not fall back to scalar after an execution failure.
+Capability preparation now selects the layer-major command only for the exact
+`Qwen3NextMoe`/resident-affine-Q4/fixed-affine-Q4 graph. Other supported Qwen families and typed
+layouts keep the scalar token command; an explicit incompatible qualification request fails before
+execution instead of probing and falling back. For a compatible graph, `auto` selects layer-major
+prefill for fresh suffixes of at least 32 tokens. The live Metal snapshot bounds chunks to 8,192
+rows using a 384 KiB-per-row estimate, a 512 MiB safety margin, and at most 5% of the current
+resident/session basis. If even one 32-row tile cannot be reserved, `auto` stays scalar. The hidden
+harness can force the scalar reference, layer-major graph, and smaller chunk boundaries for exact
+qualification; these are explicit controls rather than environment toggles.
 
-The current migration step groups fresh Qwen prompts of at least 32 tokens into resource-resolved
-chunks of at most 64. It drains autoreleased Metal objects and checks the working-set ledger once at
-each chunk boundary while executing the existing exact token graph inside the chunk. This removes
-per-token ownership sampling without changing attention, recurrence, routing, expert access, KV
-records, or session capture. It is reported as `qwen_chunked_token_batch`, not as the target
-layer-major command, and does not close the 5x/120-second promotion gate. The resident graph still
-issues zero expert reads and the streamed graph still obtains every selected expert through the
-same scheduler-owned positioned-read path.
+Each chunk is genuinely layer-major. Resident Q4 projections consume every row, full attention
+executes causal Metal attention over restored KV plus preceding chunk rows, and hybrid linear
+attention batches projections while applying recurrent updates in token order. CPU softmax/top-10
+keeps every row's route order and exact weights. The scheduler reduces those rows to a sorted unique
+expert union: complete resident graphs clone mapped slots and issue zero reads, while streamed
+graphs issue one scheduler-owned parallel positioned read per unique expert into request scratch.
+Routed and shared affine-Q4 expert projections then execute as matrices and combine in the scalar
+accumulation order. Request buffers are never retained as an identity-based expert cache.
 
-The locked short-control qualification measured 512 fresh resident tokens at 16.64 token/s. Even a
-linear extrapolation exceeds 261 seconds at the 4,354-token frontier, so the full agent/browser run
-remains gated until the layer-major graph exists. Decode profiling measured 6.38 token/s and placed
-83% of the wall time in the fused attention/projection bucket; no sampling-only optimization was
-promoted. The preserved commands and measurements are recorded in
-[the prefill qualification](benchmarks/qwen3-coder-next-prefill-qualification.md).
+Promotion used exact bitwise fingerprints for the final hidden row, every full-attention KV layer,
+every router/recurrent layer record, and every Metal linear-attention state buffer. Resident and
+forced-32-GiB streamed runs passed zero-prefix, restored-prefix, and forced 17- and 7-row chunk
+boundaries with the same greedy token. The 4,354-token frontier completed in 59.685 seconds at
+72.95 token/s versus the preserved 689.6-second scalar baseline, an 11.55x speedup. Peak request
+allocation increased by 1,349,107,712 bytes, or 3.00%, and the graph completed in one boundary with
+no live transient buffers or commands. This closes the 5x, 120-second, and 5% promotion gates. The
+historical chunk-owner result and full evidence are retained in
+[the prefill qualification](benchmarks/qwen3-coder-next-prefill-qualification.md). Decode profiling
+still measures 6.38 token/s with 83% of wall time in fused attention/projection, so no
+sampling-only decode change was promoted.
 
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by
@@ -1576,7 +1584,7 @@ Current capability matrix:
 | Family | Dense/expert layout | Graph/load status | Correctness evidence |
 | --- | --- | --- | --- |
 | Qwen3.5 MoE | Resident Q4 / fixed-Q4 slots | Supported | Linked parity, all-target, release, real smoke |
-| Qwen3-Coder-Next | Resident affine Q4 / complete resident or fixed-Q4 streamed expert slots selected at graph preparation | Supported with `mlx-community/Qwen3-Coder-Next-4bit`; explicit GGUF remains llama.cpp | Nine-shard cache build, 48-layer/512-expert/K=10 real load, resident and forced-streamed graph decisions, deterministic native inference, and upstream MLX-LM raw-token parity |
+| Qwen3-Coder-Next | Resident affine Q4 / complete resident or fixed-Q4 streamed expert slots selected at graph preparation | Supported with `mlx-community/Qwen3-Coder-Next-4bit`; exact affine-Q4 graphs promote long suffixes to layer-major prefill; explicit GGUF remains llama.cpp | Nine-shard cache build, 48-layer/512-expert/K=10 real load, resident and forced-streamed graph decisions, exact zero/restored/chunk state parity, 59.685-second 4,354-token qualification, deterministic native inference, and upstream MLX-LM raw-token parity |
 | Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Supported through the unified graph with `mlx-community/Qwen3-30B-A3B-4bit` | Linked K=8 parity, 48-layer/128-expert cache build, real load/infer, and raw-output parity with upstream MLX-LM |
 | Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Supported through the unified graph and typed vision executor with `mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` | Adapter/capability parity, stale-index header import, 48-layer/128-expert cache build, real text inference, and real image request through the shared decoder |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |

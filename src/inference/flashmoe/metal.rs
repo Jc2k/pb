@@ -40,9 +40,10 @@ use super::math::{routing_sigmoid_noaux_top_k, routing_softmax_top_k};
 use super::scheduler::ScheduledQ4ExpertPhaseMlpPayload;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::{
-    ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState,
+    ScheduledCmd3ExpertPayload, ScheduledCmd3MetalPostAttentionInput, ScheduledCmd3OutputState,
     ScheduledDenseExpertPhaseMlpPayload, ScheduledExpertPhaseMlpPayload, ScheduledExpertSlot,
-    ScheduledRoutingCandidateSource, ScheduledRoutingCommand, ScheduledSharedExpertPhaseRef,
+    ScheduledLayerMajorExperts, ScheduledRoutingCandidateSource, ScheduledRoutingCommand,
+    ScheduledSharedExpertPhaseRef,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::state::{
@@ -52,9 +53,9 @@ use super::state::{
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::weights::{
-    Cmd2ResidentPostAttentionPrepProjections, DenseQ4MmapMatvecProjection,
-    LinearAttentionResidentBindings, ResidentMmapMatvecProjection, ResidentStaticDtype,
-    SharedExpertPhaseResidentProjections, SharedExpertPhaseWeights,
+    Cmd2ResidentPostAttentionPrepProjections, DenseMmapMatvecProjection,
+    DenseQ4MmapMatvecProjection, LinearAttentionResidentBindings, ResidentMmapMatvecProjection,
+    ResidentStaticDtype, SharedExpertPhaseResidentProjections, SharedExpertPhaseWeights,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use anyhow::{Context as _, Result, bail};
@@ -1162,6 +1163,27 @@ impl MetalDispatchPlan {
         }
     }
 
+    pub(crate) fn q4_mmap_matrix_threadgroups(rows: u64, input_rows: u64) -> Self {
+        const Q4_MMAP_ROWS_PER_THREADGROUP: u64 = 16;
+        Self {
+            mode: MetalDispatchMode::Threadgroups,
+            grid: MetalDispatchSize::new(
+                rows.div_ceil(Q4_MMAP_ROWS_PER_THREADGROUP).max(1),
+                input_rows.max(1),
+                1,
+            ),
+            threadgroup: MetalDispatchSize::new(256, 1, 1),
+        }
+    }
+
+    pub(crate) fn qwen_attention_threadgroups(query_rows: u64, query_heads: u64) -> Self {
+        Self {
+            mode: MetalDispatchMode::Threadgroups,
+            grid: MetalDispatchSize::new(query_rows.max(1), query_heads.max(1), 1),
+            threadgroup: MetalDispatchSize::new(256, 1, 1),
+        }
+    }
+
     pub(crate) fn single_threadgroup(threads: u64) -> Self {
         Self {
             mode: MetalDispatchMode::Threadgroups,
@@ -1198,13 +1220,18 @@ pub(crate) mod kernels {
     pub(crate) const DENSE_MMAP_FMA_MATVEC_BF16: &str = "dense_mmap_fma_matvec_bf16";
     pub(crate) const DENSE_MMAP_FMA_MATVEC_F16: &str = "dense_mmap_fma_matvec_f16";
     pub(crate) const DENSE_MMAP_FMA_MATVEC_F32: &str = "dense_mmap_fma_matvec_f32";
+    pub(crate) const DENSE_MMAP_FMA_MATRIX_BF16: &str = "dense_mmap_fma_matrix_bf16";
+    pub(crate) const DENSE_MMAP_FMA_MATRIX_F16: &str = "dense_mmap_fma_matrix_f16";
+    pub(crate) const DENSE_MMAP_FMA_MATRIX_F32: &str = "dense_mmap_fma_matrix_f32";
     pub(crate) const RMS_NORM_REDUCED: &str = "rms_norm_reduced";
     pub(crate) const RESIDUAL_ADD_RMS_NORM: &str = "residual_add_rms_norm";
     pub(crate) const ATTENTION_SCORES: &str = "attention_scores";
+    pub(crate) const QWEN_CAUSAL_ATTENTION_ROWS: &str = "qwen_causal_attention_rows";
     pub(crate) const EXPERT_MLP_FUSED: &str = "expert_mlp_fused";
     pub(crate) const SILU_PRODUCT: &str = "silu_product";
     pub(crate) const SHARED_EXPERT_ACTIVATION: &str = "shared_expert_activation";
     pub(crate) const COMBINE_EXPERT_PHASE: &str = "combine_expert_phase";
+    pub(crate) const QWEN_LAYER_MAJOR_COMBINE: &str = "qwen_layer_major_combine";
     pub(crate) const FILL_ZERO: &str = "fill_zero";
     pub(crate) const TOPK_VOCAB: &str = "topk_vocab";
     pub(crate) const LINEAR_CONV1D_STEP_BF16: &str = "linear_conv1d_step_bf16";
@@ -1280,13 +1307,18 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::DENSE_MMAP_FMA_MATVEC_BF16,
     kernels::DENSE_MMAP_FMA_MATVEC_F16,
     kernels::DENSE_MMAP_FMA_MATVEC_F32,
+    kernels::DENSE_MMAP_FMA_MATRIX_BF16,
+    kernels::DENSE_MMAP_FMA_MATRIX_F16,
+    kernels::DENSE_MMAP_FMA_MATRIX_F32,
     kernels::RMS_NORM_REDUCED,
     kernels::RESIDUAL_ADD_RMS_NORM,
     kernels::ATTENTION_SCORES,
+    kernels::QWEN_CAUSAL_ATTENTION_ROWS,
     kernels::EXPERT_MLP_FUSED,
     kernels::SILU_PRODUCT,
     kernels::SHARED_EXPERT_ACTIVATION,
     kernels::COMBINE_EXPERT_PHASE,
+    kernels::QWEN_LAYER_MAJOR_COMBINE,
     kernels::FILL_ZERO,
     kernels::TOPK_VOCAB,
     kernels::LINEAR_CONV1D_STEP_BF16,
@@ -1321,13 +1353,18 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) dense_mmap_bf16: &'static str,
     pub(crate) dense_mmap_f16: &'static str,
     pub(crate) dense_mmap_f32: &'static str,
+    pub(crate) dense_matrix_bf16: &'static str,
+    pub(crate) dense_matrix_f16: &'static str,
+    pub(crate) dense_matrix_f32: &'static str,
     pub(crate) rms_norm_reduced: &'static str,
     pub(crate) residual_rms_norm: &'static str,
     pub(crate) attention: &'static str,
+    pub(crate) qwen_causal_attention_rows: &'static str,
     pub(crate) expert_mlp: &'static str,
     pub(crate) silu_product: &'static str,
     pub(crate) shared_expert_activation: &'static str,
     pub(crate) combine_expert_phase: &'static str,
+    pub(crate) qwen_layer_major_combine: &'static str,
     pub(crate) fill_zero: &'static str,
     pub(crate) topk_vocab: &'static str,
     pub(crate) linear_conv1d_bf16: &'static str,
@@ -1363,13 +1400,18 @@ impl MetalPipelineNameSet {
             dense_mmap_bf16: kernels::DENSE_MMAP_FMA_MATVEC_BF16,
             dense_mmap_f16: kernels::DENSE_MMAP_FMA_MATVEC_F16,
             dense_mmap_f32: kernels::DENSE_MMAP_FMA_MATVEC_F32,
+            dense_matrix_bf16: kernels::DENSE_MMAP_FMA_MATRIX_BF16,
+            dense_matrix_f16: kernels::DENSE_MMAP_FMA_MATRIX_F16,
+            dense_matrix_f32: kernels::DENSE_MMAP_FMA_MATRIX_F32,
             rms_norm_reduced: kernels::RMS_NORM_REDUCED,
             residual_rms_norm: kernels::RESIDUAL_ADD_RMS_NORM,
             attention: kernels::ATTENTION_SCORES,
+            qwen_causal_attention_rows: kernels::QWEN_CAUSAL_ATTENTION_ROWS,
             expert_mlp: kernels::EXPERT_MLP_FUSED,
             silu_product: kernels::SILU_PRODUCT,
             shared_expert_activation: kernels::SHARED_EXPERT_ACTIVATION,
             combine_expert_phase: kernels::COMBINE_EXPERT_PHASE,
+            qwen_layer_major_combine: kernels::QWEN_LAYER_MAJOR_COMBINE,
             fill_zero: kernels::FILL_ZERO,
             topk_vocab: kernels::TOPK_VOCAB,
             linear_conv1d_bf16: kernels::LINEAR_CONV1D_STEP_BF16,
@@ -1405,13 +1447,18 @@ impl MetalPipelineNameSet {
             self.dense_mmap_bf16,
             self.dense_mmap_f16,
             self.dense_mmap_f32,
+            self.dense_matrix_bf16,
+            self.dense_matrix_f16,
+            self.dense_matrix_f32,
             self.rms_norm_reduced,
             self.residual_rms_norm,
             self.attention,
+            self.qwen_causal_attention_rows,
             self.expert_mlp,
             self.silu_product,
             self.shared_expert_activation,
             self.combine_expert_phase,
+            self.qwen_layer_major_combine,
             self.fill_zero,
             self.topk_vocab,
             self.linear_conv1d_bf16,
@@ -1448,13 +1495,18 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) dense_mmap_bf16_pipeline: T,
     pub(crate) dense_mmap_f16_pipeline: T,
     pub(crate) dense_mmap_f32_pipeline: T,
+    pub(crate) dense_matrix_bf16_pipeline: T,
+    pub(crate) dense_matrix_f16_pipeline: T,
+    pub(crate) dense_matrix_f32_pipeline: T,
     pub(crate) rms_norm_reduced_pipeline: T,
     pub(crate) residual_rms_norm_pipeline: T,
     pub(crate) attention_pipeline: T,
+    pub(crate) qwen_causal_attention_rows_pipeline: T,
     pub(crate) expert_mlp_pipeline: T,
     pub(crate) silu_product_pipeline: T,
     pub(crate) shared_expert_activation_pipeline: T,
     pub(crate) combine_expert_phase_pipeline: T,
+    pub(crate) qwen_layer_major_combine_pipeline: T,
     pub(crate) fill_zero_pipeline: T,
     pub(crate) topk_vocab_pipeline: T,
     pub(crate) linear_conv1d_bf16_pipeline: T,
@@ -1489,13 +1541,18 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.dense_mmap_bf16_pipeline);
         release(self.dense_mmap_f16_pipeline);
         release(self.dense_mmap_f32_pipeline);
+        release(self.dense_matrix_bf16_pipeline);
+        release(self.dense_matrix_f16_pipeline);
+        release(self.dense_matrix_f32_pipeline);
         release(self.rms_norm_reduced_pipeline);
         release(self.residual_rms_norm_pipeline);
         release(self.attention_pipeline);
+        release(self.qwen_causal_attention_rows_pipeline);
         release(self.expert_mlp_pipeline);
         release(self.silu_product_pipeline);
         release(self.shared_expert_activation_pipeline);
         release(self.combine_expert_phase_pipeline);
+        release(self.qwen_layer_major_combine_pipeline);
         release(self.fill_zero_pipeline);
         release(self.topk_vocab_pipeline);
         release(self.linear_conv1d_bf16_pipeline);
@@ -1728,13 +1785,20 @@ impl MetalRuntime {
                 dense_mmap_bf16_pipeline: take_pipeline(names.dense_mmap_bf16),
                 dense_mmap_f16_pipeline: take_pipeline(names.dense_mmap_f16),
                 dense_mmap_f32_pipeline: take_pipeline(names.dense_mmap_f32),
+                dense_matrix_bf16_pipeline: take_pipeline(names.dense_matrix_bf16),
+                dense_matrix_f16_pipeline: take_pipeline(names.dense_matrix_f16),
+                dense_matrix_f32_pipeline: take_pipeline(names.dense_matrix_f32),
                 rms_norm_reduced_pipeline: take_pipeline(names.rms_norm_reduced),
                 residual_rms_norm_pipeline: take_pipeline(names.residual_rms_norm),
                 attention_pipeline: take_pipeline(names.attention),
+                qwen_causal_attention_rows_pipeline: take_pipeline(
+                    names.qwen_causal_attention_rows,
+                ),
                 expert_mlp_pipeline: take_pipeline(names.expert_mlp),
                 silu_product_pipeline: take_pipeline(names.silu_product),
                 shared_expert_activation_pipeline: take_pipeline(names.shared_expert_activation),
                 combine_expert_phase_pipeline: take_pipeline(names.combine_expert_phase),
+                qwen_layer_major_combine_pipeline: take_pipeline(names.qwen_layer_major_combine),
                 fill_zero_pipeline: take_pipeline(names.fill_zero),
                 topk_vocab_pipeline: take_pipeline(names.topk_vocab),
                 linear_conv1d_bf16_pipeline: take_pipeline(names.linear_conv1d_bf16),
@@ -2205,6 +2269,91 @@ impl MetalExecutionContext {
         .execute(layout, bindings, input, residual, post_norm_weight, top_k)
     }
 
+    pub(crate) fn qwen_linear_attention_matrix(
+        &self,
+        layout: LinearAttentionLayout,
+        bindings: &LinearAttentionResidentBindings,
+        rows: usize,
+        qkv: &[f32],
+        z: &[f32],
+        beta: &[f32],
+        alpha: &[f32],
+    ) -> anyhow::Result<Vec<f32>> {
+        MetalFusedLinearAttentionBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.linear_attention_state,
+            &self.buffers,
+        )
+        .execute_recurrent_matrix(layout, bindings, rows, qkv, z, beta, alpha)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qwen_post_attention_matrix(
+        &self,
+        out_proj: &ResidentMmapMatvecProjection,
+        router: &ResidentMmapMatvecProjection,
+        rows: usize,
+        attention_width: usize,
+        width: usize,
+        attention: &[f32],
+        residual: &[f32],
+        post_norm_weight: &[f32],
+    ) -> anyhow::Result<MetalLayerMajorPostAttention> {
+        MetalResidentProjectionBatchBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.buffers,
+        )
+        .execute_post_attention_matrix(
+            out_proj,
+            router,
+            rows,
+            attention_width,
+            width,
+            attention,
+            residual,
+            post_norm_weight,
+            self.norm_epsilon,
+        )?
+        .context("Qwen layer-major post-attention matrix requires resident dense weights")
+    }
+
+    pub(crate) fn qwen_layer_major_experts(
+        &self,
+        scheduled: &ScheduledLayerMajorExperts,
+        normed: &[f32],
+        residual: &[f32],
+        shared: ScheduledSharedExpertPhaseRef<'_>,
+    ) -> anyhow::Result<Vec<f32>> {
+        let dense_weights = self
+            .dense_weights
+            .as_ref()
+            .context("Qwen layer-major expert graph requires resident dense Metal weights")?;
+        MetalScheduledCmd3Builder::new(
+            &self.runtime,
+            dense_weights,
+            Arc::clone(&self.buffers),
+            self.norm_epsilon,
+        )
+        .execute_layer_major(scheduled, normed, residual, shared)
+    }
+
+    pub(crate) fn qwen_rms_norm_rows(
+        &self,
+        input: &[f32],
+        weight: &[f32],
+        rows: usize,
+        width: usize,
+    ) -> anyhow::Result<Vec<f32>> {
+        MetalResidentProjectionBatchBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.buffers,
+        )
+        .execute_rms_norm_rows(input, weight, rows, width, self.norm_epsilon)
+    }
+
     pub(crate) fn resident_projection_batch(
         &self,
         projections: &[ResidentMmapMatvecProjection],
@@ -2216,6 +2365,180 @@ impl MetalExecutionContext {
             &self.buffers,
         )
         .execute(projections, input)
+    }
+
+    pub(crate) fn resident_projection_matrix_batch(
+        &self,
+        projections: &[ResidentMmapMatvecProjection],
+        input_rows: usize,
+        input_cols: usize,
+        input: &[f32],
+    ) -> anyhow::Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        MetalResidentProjectionBatchBuilder::new(
+            &self.runtime,
+            self.dense_weights.as_ref(),
+            &self.buffers,
+        )
+        .execute_matrix(projections, input_rows, input_cols, input)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qwen_causal_attention_rows(
+        &self,
+        queries: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        query_rows: usize,
+        prefix_rows: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> anyhow::Result<Vec<f32>> {
+        let query_width = query_heads
+            .checked_mul(head_dim)
+            .context("Qwen attention query width overflow")?;
+        let kv_width = kv_heads
+            .checked_mul(head_dim)
+            .context("Qwen attention KV width overflow")?;
+        let key_rows = prefix_rows
+            .checked_add(query_rows)
+            .context("Qwen attention key row count overflow")?;
+        if query_rows == 0
+            || query_heads == 0
+            || kv_heads == 0
+            || head_dim == 0
+            || head_dim > 256
+            || !query_heads.is_multiple_of(kv_heads)
+            || queries.len() != query_rows.saturating_mul(query_width)
+            || keys.len() != key_rows.saturating_mul(kv_width)
+            || values.len() != key_rows.saturating_mul(kv_width)
+        {
+            anyhow::bail!(
+                "Qwen causal attention matrix has incompatible geometry: queries={} keys={} values={} rows={} prefix={} q_heads={} kv_heads={} head_dim={}",
+                queries.len(),
+                keys.len(),
+                values.len(),
+                query_rows,
+                prefix_rows,
+                query_heads,
+                kv_heads,
+                head_dim
+            );
+        }
+        let query_rows_u32 = u32::try_from(query_rows)?;
+        let prefix_rows_u32 = u32::try_from(prefix_rows)?;
+        let query_heads_u32 = u32::try_from(query_heads)?;
+        let kv_heads_u32 = u32::try_from(kv_heads)?;
+        let head_dim_u32 = u32::try_from(head_dim)?;
+        unsafe {
+            let mut buffers = Vec::with_capacity(4);
+            let allocated = (|| -> anyhow::Result<_> {
+                let query_buffer = self.buffers.tracked_buffer_with_bytes(
+                    self.runtime.device,
+                    f32_as_bytes(queries),
+                    &mut buffers,
+                )?;
+                let key_buffer = self.buffers.tracked_buffer_with_bytes(
+                    self.runtime.device,
+                    f32_as_bytes(keys),
+                    &mut buffers,
+                )?;
+                let value_buffer = self.buffers.tracked_buffer_with_bytes(
+                    self.runtime.device,
+                    f32_as_bytes(values),
+                    &mut buffers,
+                )?;
+                let output_buffer = self.buffers.tracked_buffer_with_len(
+                    self.runtime.device,
+                    queries.len() * std::mem::size_of::<f32>(),
+                    &mut buffers,
+                )?;
+                Ok((query_buffer, key_buffer, value_buffer, output_buffer))
+            })();
+            let (query_buffer, key_buffer, value_buffer, output_buffer) = match allocated {
+                Ok(allocated) => allocated,
+                Err(error) => {
+                    self.buffers.recycle_or_release_phase(
+                        buffers
+                            .into_iter()
+                            .map(MetalPhaseBuffer::recyclable)
+                            .collect(),
+                        true,
+                    );
+                    return Err(error);
+                }
+            };
+            let mut encoding = match MetalCommandEncoding::new(
+                self.runtime.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Qwen causal-attention row command buffer",
+                "failed to create Qwen causal-attention row encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.buffers.recycle_or_release_phase(
+                        buffers
+                            .into_iter()
+                            .map(MetalPhaseBuffer::recyclable)
+                            .collect(),
+                        true,
+                    );
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.runtime.pipelines.qwen_causal_attention_rows_pipeline,
+            );
+            set_buffer(encoder, query_buffer, 0);
+            set_buffer(encoder, key_buffer, 1);
+            set_buffer(encoder, value_buffer, 2);
+            set_buffer(encoder, output_buffer, 3);
+            set_bytes(encoder, u32_as_bytes(&query_rows_u32), 4);
+            set_bytes(encoder, u32_as_bytes(&prefix_rows_u32), 5);
+            set_bytes(encoder, u32_as_bytes(&query_heads_u32), 6);
+            set_bytes(encoder, u32_as_bytes(&kv_heads_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&head_dim_u32), 8);
+            dispatch_metal_plan(
+                encoder,
+                MetalDispatchPlan::qwen_attention_threadgroups(
+                    query_rows as u64,
+                    query_heads as u64,
+                ),
+            );
+            encoding.end_encoding();
+            let context = MetalCommandContext::new("qwen_causal_attention_rows")
+                .with("query_rows", query_rows)
+                .with("prefix_rows", prefix_rows)
+                .with("query_heads", query_heads)
+                .with("kv_heads", kv_heads)
+                .with("head_dim", head_dim);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.buffers.recycle_or_release_phase(
+                    buffers
+                        .into_iter()
+                        .map(MetalPhaseBuffer::recyclable)
+                        .collect(),
+                    error.should_release_buffers(),
+                );
+                return Err(error.into());
+            }
+            let output = read_f32_buffer(output_buffer, queries.len());
+            drop(encoding);
+            self.buffers.recycle_or_release_phase(
+                buffers
+                    .into_iter()
+                    .map(MetalPhaseBuffer::recyclable)
+                    .collect(),
+                false,
+            );
+            Ok(output)
+        }
     }
 
     pub(crate) fn resident_projection_batch_with_input_buffer(
@@ -2952,6 +3275,15 @@ pub(crate) struct MetalScheduledCmd3Builder<'a> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+struct MetalLayerMajorOneRowReference {
+    expert_outputs: MetalObjcId,
+    shared_output: MetalObjcId,
+    shared_router: MetalObjcId,
+    shared_router_width: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl<'a> MetalScheduledCmd3Builder<'a> {
     pub(crate) fn new(
         runtime: &'a MetalRuntime,
@@ -3048,6 +3380,859 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 payloads,
             )
         })
+    }
+
+    pub(crate) fn execute_layer_major(
+        &self,
+        scheduled: &ScheduledLayerMajorExperts,
+        normed: &[f32],
+        residual: &[f32],
+        shared: ScheduledSharedExpertPhaseRef<'_>,
+    ) -> anyhow::Result<Vec<f32>> {
+        let rows = scheduled.rows();
+        let active_experts = scheduled.active_experts();
+        let width = residual
+            .len()
+            .checked_div(rows.max(1))
+            .context("Qwen layer-major residual width division failed")?;
+        let route_count = rows
+            .checked_mul(active_experts)
+            .context("Qwen layer-major route count overflow")?;
+        if rows == 0
+            || active_experts == 0
+            || width == 0
+            || residual.len() != rows * width
+            || normed.len() != residual.len()
+            || scheduled.route_slots().len() != route_count
+            || scheduled.weights().len() != route_count
+            || scheduled.experts().is_empty()
+        {
+            bail!(
+                "Qwen layer-major expert command has incompatible geometry layer={} rows={rows} width={width} active={active_experts} normed={} residual={} routes={} weights={} unique={}",
+                scheduled.layer(),
+                normed.len(),
+                residual.len(),
+                scheduled.route_slots().len(),
+                scheduled.weights().len(),
+                scheduled.experts().len()
+            );
+        }
+
+        let mut routes_by_slot = vec![Vec::new(); scheduled.experts().len()];
+        for (route, slot) in scheduled.route_slots().iter().copied().enumerate() {
+            routes_by_slot
+                .get_mut(slot)
+                .with_context(|| {
+                    format!("Qwen layer-major route {route} references missing expert slot {slot}")
+                })?
+                .push(route);
+        }
+        if routes_by_slot.iter().any(Vec::is_empty) {
+            bail!("Qwen layer-major unique expert union contains an unused slot");
+        }
+        let mut gathered = Vec::with_capacity(route_count * width);
+        let mut grouped_output_indices = vec![0u32; route_count];
+        let mut groups = Vec::with_capacity(routes_by_slot.len());
+        for routes in &routes_by_slot {
+            let start = gathered.len() / width;
+            for route in routes {
+                let row = route / active_experts;
+                gathered.extend_from_slice(&normed[row * width..(row + 1) * width]);
+                grouped_output_indices[*route] = u32::try_from(gathered.len() / width - 1)
+                    .context("Qwen layer-major grouped route index exceeds u32")?;
+            }
+            groups.push((start, routes.len()));
+        }
+        debug_assert_eq!(gathered.len(), route_count * width);
+
+        objc2::rc::autoreleasepool(|_| unsafe {
+            self.encode_and_execute_layer_major(
+                scheduled,
+                width,
+                &gathered,
+                normed,
+                residual,
+                &grouped_output_indices,
+                &groups,
+                shared,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_one_row_scalar_reference(
+        &self,
+        encoder: MetalObjcId,
+        scheduled: &ScheduledLayerMajorExperts,
+        width: usize,
+        intermediate: usize,
+        payloads: &[ScheduledExpertPhaseMlpPayload<'_>],
+        normed_buffer: MetalObjcId,
+        _residual_buffer: MetalObjcId,
+        shared: ScheduledSharedExpertPhaseRef<'_>,
+        phase_buffers: &mut Vec<MetalPhaseBuffer>,
+        source_buffers: &mut MetalExpertSourceBufferCache,
+    ) -> anyhow::Result<MetalLayerMajorOneRowReference> {
+        unsafe {
+            let active_experts = scheduled.active_experts();
+            let gate =
+                self.phase_buffer(intermediate * std::mem::size_of::<f32>(), phase_buffers)?;
+            let up = self.phase_buffer(intermediate * std::mem::size_of::<f32>(), phase_buffers)?;
+            let activated =
+                self.phase_buffer(intermediate * std::mem::size_of::<f32>(), phase_buffers)?;
+            let expert_outputs = self.phase_buffer(
+                active_experts * width * std::mem::size_of::<f32>(),
+                phase_buffers,
+            )?;
+            for route in 0..active_experts {
+                let slot = scheduled.route_slots()[route];
+                let payload = payloads
+                    .get(slot)
+                    .and_then(ScheduledExpertPhaseMlpPayload::q4_checked)
+                    .with_context(|| {
+                        format!("one-row Qwen parity route {route} has no affine-Q4 payload")
+                    })?;
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.gate,
+                    payload.gate_source(),
+                    normed_buffer,
+                    gate,
+                    0,
+                    phase_buffers,
+                    source_buffers,
+                )?;
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.up,
+                    payload.up_source(),
+                    normed_buffer,
+                    up,
+                    0,
+                    phase_buffers,
+                    source_buffers,
+                )?;
+                let intermediate_u32 = u32::try_from(intermediate)
+                    .context("one-row Qwen parity intermediate exceeds u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.runtime.pipelines.silu_product_pipeline,
+                );
+                set_buffer(encoder, gate, 0);
+                set_buffer(encoder, up, 1);
+                set_buffer(encoder, activated, 2);
+                set_bytes(encoder, u32_as_bytes(&intermediate_u32), 3);
+                dispatch_threads(encoder, intermediate as u64);
+                self.encode_q4_matvec(
+                    encoder,
+                    &payload.down,
+                    payload.down_source(),
+                    activated,
+                    expert_outputs,
+                    (route * width * std::mem::size_of::<f32>()) as u64,
+                    phase_buffers,
+                    source_buffers,
+                )?;
+            }
+
+            let (shared_output, shared_router, shared_router_width) = match shared {
+                ScheduledSharedExpertPhaseRef::Resident(shared) => {
+                    let shape = shared.validated_shape()?;
+                    let gate = self.phase_buffer(
+                        shape.total_intermediate * std::mem::size_of::<f32>(),
+                        phase_buffers,
+                    )?;
+                    let up = self.phase_buffer(
+                        shape.total_intermediate * std::mem::size_of::<f32>(),
+                        phase_buffers,
+                    )?;
+                    let activated = self.phase_buffer(
+                        shape.total_intermediate * std::mem::size_of::<f32>(),
+                        phase_buffers,
+                    )?;
+                    let output =
+                        self.phase_buffer(width * std::mem::size_of::<f32>(), phase_buffers)?;
+                    let router_width = shared.router.as_ref().map_or(0, |router| router.rows());
+                    let router = self.phase_buffer(
+                        router_width.max(1) * std::mem::size_of::<f32>(),
+                        phase_buffers,
+                    )?;
+                    encode_resident_projection(
+                        &self.runtime.pipelines,
+                        encoder,
+                        self.dense_weights,
+                        &shared.gate,
+                        normed_buffer,
+                        gate,
+                        0,
+                    )?;
+                    encode_resident_projection(
+                        &self.runtime.pipelines,
+                        encoder,
+                        self.dense_weights,
+                        &shared.up,
+                        normed_buffer,
+                        up,
+                        0,
+                    )?;
+                    if let Some(projection) = shared.router.as_ref() {
+                        encode_resident_projection(
+                            &self.runtime.pipelines,
+                            encoder,
+                            self.dense_weights,
+                            projection,
+                            normed_buffer,
+                            router,
+                            0,
+                        )?;
+                    }
+                    let total_u32 = u32::try_from(shape.total_intermediate)
+                        .context("one-row shared intermediate exceeds u32")?;
+                    let intermediate_u32 = u32::try_from(shape.intermediate)
+                        .context("one-row shared expert width exceeds u32")?;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.runtime.pipelines.shared_expert_activation_pipeline,
+                    );
+                    set_buffer(encoder, gate, 0);
+                    set_buffer(encoder, up, 1);
+                    set_buffer(encoder, router, 2);
+                    set_buffer(encoder, activated, 3);
+                    set_bytes(encoder, u32_as_bytes(&intermediate_u32), 4);
+                    set_bytes(encoder, u32_as_bytes(&total_u32), 5);
+                    dispatch_threads(encoder, shape.total_intermediate as u64);
+                    encode_resident_projection(
+                        &self.runtime.pipelines,
+                        encoder,
+                        self.dense_weights,
+                        &shared.down,
+                        activated,
+                        output,
+                        0,
+                    )?;
+                    (output, router, router_width)
+                }
+                ScheduledSharedExpertPhaseRef::None => {
+                    let output =
+                        self.phase_buffer(width * std::mem::size_of::<f32>(), phase_buffers)?;
+                    let width_u32 =
+                        u32::try_from(width).context("one-row shared fill width exceeds u32")?;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.runtime.pipelines.fill_zero_pipeline,
+                    );
+                    set_buffer(encoder, output, 0);
+                    set_bytes(encoder, u32_as_bytes(&width_u32), 1);
+                    dispatch_threads(encoder, width as u64);
+                    let router = self.phase_buffer_with_bytes(
+                        f32_as_bytes(std::slice::from_ref(&80.0f32)),
+                        phase_buffers,
+                    )?;
+                    (output, router, 0)
+                }
+                ScheduledSharedExpertPhaseRef::Dense(_) => {
+                    bail!("one-row Qwen parity requires resident shared projections")
+                }
+            };
+            Ok(MetalLayerMajorOneRowReference {
+                expert_outputs,
+                shared_output,
+                shared_router,
+                shared_router_width,
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_and_execute_layer_major(
+        &self,
+        scheduled: &ScheduledLayerMajorExperts,
+        width: usize,
+        gathered: &[f32],
+        normed: &[f32],
+        residual: &[f32],
+        grouped_output_indices: &[u32],
+        groups: &[(usize, usize)],
+        shared: ScheduledSharedExpertPhaseRef<'_>,
+    ) -> anyhow::Result<Vec<f32>> {
+        unsafe {
+            let rows = scheduled.rows();
+            let active_experts = scheduled.active_experts();
+            let route_count = rows * active_experts;
+            let payloads = scheduled
+                .experts()
+                .iter()
+                .map(|expert| expert.scheduled_cmd3_expert_phase_payload(width))
+                .collect::<Result<Vec<_>>>()?;
+            let intermediate = payloads
+                .first()
+                .and_then(ScheduledExpertPhaseMlpPayload::q4_checked)
+                .map(|payload| payload.gate.rows)
+                .context("Qwen layer-major expert graph requires fixed affine-Q4 payloads")?;
+            for payload in &payloads {
+                let q4 = payload
+                    .q4_checked()
+                    .context("Qwen layer-major expert graph requires fixed affine-Q4 payloads")?;
+                if q4.gate.rows != intermediate
+                    || !q4
+                        .gate
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(super::experts::EXPERT_SCALE_BIAS_DTYPE_BF16)
+                {
+                    bail!("Qwen layer-major expert graph requires uniform BF16 affine-Q4 experts");
+                }
+            }
+
+            let mut phase_buffers = Vec::new();
+            let setup = (|| -> anyhow::Result<_> {
+                let gathered_buffer =
+                    self.phase_buffer_with_bytes(f32_as_bytes(gathered), &mut phase_buffers)?;
+                let normed_buffer =
+                    self.phase_buffer_with_bytes(f32_as_bytes(normed), &mut phase_buffers)?;
+                let residual_buffer =
+                    self.phase_buffer_with_bytes(f32_as_bytes(residual), &mut phase_buffers)?;
+                let weights_buffer = self.phase_buffer_with_bytes(
+                    f32_as_bytes(scheduled.weights()),
+                    &mut phase_buffers,
+                )?;
+                let grouped_indices_buffer = self.phase_buffer_with_bytes(
+                    u32_as_bytes_slice(grouped_output_indices),
+                    &mut phase_buffers,
+                )?;
+                let route_intermediate_values = route_count
+                    .checked_mul(intermediate)
+                    .context("Qwen layer-major expert activation size overflow")?;
+                let grouped_output_values = route_count
+                    .checked_mul(width)
+                    .context("Qwen layer-major expert output size overflow")?;
+                let gate_buffer = self.phase_buffer(
+                    route_intermediate_values * std::mem::size_of::<f32>(),
+                    &mut phase_buffers,
+                )?;
+                let up_buffer = self.phase_buffer(
+                    route_intermediate_values * std::mem::size_of::<f32>(),
+                    &mut phase_buffers,
+                )?;
+                let activated_buffer = self.phase_buffer(
+                    route_intermediate_values * std::mem::size_of::<f32>(),
+                    &mut phase_buffers,
+                )?;
+                let grouped_output_buffer = self.phase_buffer(
+                    grouped_output_values * std::mem::size_of::<f32>(),
+                    &mut phase_buffers,
+                )?;
+                let shared_output_buffer = self.phase_buffer(
+                    rows * width * std::mem::size_of::<f32>(),
+                    &mut phase_buffers,
+                )?;
+                let hidden_buffer = self.phase_buffer(
+                    rows * width * std::mem::size_of::<f32>(),
+                    &mut phase_buffers,
+                )?;
+                Ok((
+                    gathered_buffer,
+                    normed_buffer,
+                    residual_buffer,
+                    weights_buffer,
+                    grouped_indices_buffer,
+                    gate_buffer,
+                    up_buffer,
+                    activated_buffer,
+                    grouped_output_buffer,
+                    shared_output_buffer,
+                    hidden_buffer,
+                ))
+            })();
+            let (
+                gathered_buffer,
+                normed_buffer,
+                residual_buffer,
+                weights_buffer,
+                grouped_indices_buffer,
+                gate_buffer,
+                up_buffer,
+                activated_buffer,
+                grouped_output_buffer,
+                shared_output_buffer,
+                hidden_buffer,
+            ) = match setup {
+                Ok(values) => values,
+                Err(error) => {
+                    self.buffers.recycle_or_release_phase(phase_buffers, true);
+                    return Err(error);
+                }
+            };
+
+            let mut encoding = match MetalCommandEncoding::new(
+                self.runtime.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Qwen layer-major expert command buffer",
+                "failed to create Qwen layer-major expert encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.buffers.recycle_or_release_phase(phase_buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            let encode_result = (||
+             -> anyhow::Result<(
+                MetalObjcId,
+                MetalObjcId,
+                MetalObjcId,
+                MetalObjcId,
+                usize,
+                Option<MetalLayerMajorOneRowReference>,
+            )> {
+                let mut source_buffers = MetalExpertSourceBufferCache::default();
+                for (((payload, group), expert), slot_index) in payloads
+                    .iter()
+                    .zip(groups)
+                    .zip(scheduled.experts().iter())
+                    .zip(0usize..)
+                {
+                    let q4 = payload
+                        .q4_checked()
+                        .context("Qwen layer-major expert payload changed after validation")?;
+                    let (start, count) = *group;
+                    self.encode_layer_major_q4_matrix(
+                        encoder,
+                        &q4.gate,
+                        q4.gate_source(),
+                        gathered_buffer,
+                        start * width,
+                        gate_buffer,
+                        start * intermediate,
+                        count,
+                        &mut phase_buffers,
+                        &mut source_buffers,
+                    )?;
+                    self.encode_layer_major_q4_matrix(
+                        encoder,
+                        &q4.up,
+                        q4.up_source(),
+                        gathered_buffer,
+                        start * width,
+                        up_buffer,
+                        start * intermediate,
+                        count,
+                        &mut phase_buffers,
+                        &mut source_buffers,
+                    )?;
+                    debug_assert_eq!(expert.expert(), scheduled.experts()[slot_index].expert());
+                }
+                let activated_values = route_count * intermediate;
+                let activated_u32 = u32::try_from(activated_values)
+                    .context("Qwen layer-major activation width exceeds u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.runtime.pipelines.silu_product_pipeline,
+                );
+                set_buffer(encoder, gate_buffer, 0);
+                set_buffer(encoder, up_buffer, 1);
+                set_buffer(encoder, activated_buffer, 2);
+                set_bytes(encoder, u32_as_bytes(&activated_u32), 3);
+                dispatch_threads(encoder, activated_values as u64);
+                for (payload, group) in payloads.iter().zip(groups) {
+                    let q4 = payload
+                        .q4_checked()
+                        .context("Qwen layer-major expert payload changed after validation")?;
+                    let (start, count) = *group;
+                    self.encode_layer_major_q4_matrix(
+                        encoder,
+                        &q4.down,
+                        q4.down_source(),
+                        activated_buffer,
+                        start * intermediate,
+                        grouped_output_buffer,
+                        start * width,
+                        count,
+                        &mut phase_buffers,
+                        &mut source_buffers,
+                    )?;
+                }
+
+                let (shared_router, shared_router_width) = match shared {
+                    ScheduledSharedExpertPhaseRef::Resident(shared) => {
+                        let shape = shared.validated_shape()?;
+                        let shared_gate = self.phase_buffer(
+                            rows * shape.total_intermediate * std::mem::size_of::<f32>(),
+                            &mut phase_buffers,
+                        )?;
+                        let shared_up = self.phase_buffer(
+                            rows * shape.total_intermediate * std::mem::size_of::<f32>(),
+                            &mut phase_buffers,
+                        )?;
+                        let shared_activated = self.phase_buffer(
+                            rows * shape.total_intermediate * std::mem::size_of::<f32>(),
+                            &mut phase_buffers,
+                        )?;
+                        let shared_router_width = shared.router.as_ref().map_or(0, |p| p.rows());
+                        let shared_router = self.phase_buffer(
+                            rows * shared_router_width.max(1) * std::mem::size_of::<f32>(),
+                            &mut phase_buffers,
+                        )?;
+                        self.encode_layer_major_resident_matrix(
+                            encoder,
+                            &shared.gate,
+                            normed_buffer,
+                            shared_gate,
+                            rows,
+                        )?;
+                        self.encode_layer_major_resident_matrix(
+                            encoder,
+                            &shared.up,
+                            normed_buffer,
+                            shared_up,
+                            rows,
+                        )?;
+                        if let Some(router) = shared.router.as_ref() {
+                            self.encode_layer_major_resident_matrix(
+                                encoder,
+                                router,
+                                normed_buffer,
+                                shared_router,
+                                rows,
+                            )?;
+                        }
+                        let shared_values = rows * shape.total_intermediate;
+                        let shared_values_u32 = u32::try_from(shared_values)
+                            .context("Qwen shared activation width exceeds u32")?;
+                        msg_send_void1_id(
+                            encoder,
+                            sel("setComputePipelineState:"),
+                            self.runtime.pipelines.silu_product_pipeline,
+                        );
+                        set_buffer(encoder, shared_gate, 0);
+                        set_buffer(encoder, shared_up, 1);
+                        set_buffer(encoder, shared_activated, 2);
+                        set_bytes(encoder, u32_as_bytes(&shared_values_u32), 3);
+                        dispatch_threads(encoder, shared_values as u64);
+                        self.encode_layer_major_resident_matrix(
+                            encoder,
+                            &shared.down,
+                            shared_activated,
+                            shared_output_buffer,
+                            rows,
+                        )?;
+                        (shared_router, shared_router_width)
+                    }
+                    ScheduledSharedExpertPhaseRef::None => {
+                        let zero_width = u32::try_from(rows * width)
+                            .context("Qwen shared zero-fill width exceeds u32")?;
+                        msg_send_void1_id(
+                            encoder,
+                            sel("setComputePipelineState:"),
+                            self.runtime.pipelines.fill_zero_pipeline,
+                        );
+                        set_buffer(encoder, shared_output_buffer, 0);
+                        set_bytes(encoder, u32_as_bytes(&zero_width), 1);
+                        dispatch_threads(encoder, (rows * width) as u64);
+                        (shared_output_buffer, 0)
+                    }
+                    ScheduledSharedExpertPhaseRef::Dense(_) => {
+                        bail!("Qwen layer-major shared expert requires resident projections")
+                    }
+                };
+
+                let one_row_reference = (rows == 1)
+                    .then(|| {
+                        self.encode_one_row_scalar_reference(
+                            encoder,
+                            scheduled,
+                            width,
+                            intermediate,
+                            &payloads,
+                            normed_buffer,
+                            residual_buffer,
+                            shared,
+                            &mut phase_buffers,
+                            &mut source_buffers,
+                        )
+                    })
+                    .transpose()?;
+
+                let rows_u32 = u32::try_from(rows).context("Qwen batch rows exceed u32")?;
+                let width_u32 = u32::try_from(width).context("Qwen batch width exceeds u32")?;
+                let active_u32 = u32::try_from(active_experts)
+                    .context("Qwen active expert count exceeds u32")?;
+                let shared_router_width_u32 = u32::try_from(shared_router_width)
+                    .context("Qwen shared router width exceeds u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.runtime.pipelines.qwen_layer_major_combine_pipeline,
+                );
+                set_buffer(encoder, residual_buffer, 0);
+                set_buffer(encoder, shared_output_buffer, 1);
+                set_buffer(encoder, grouped_output_buffer, 2);
+                set_buffer(encoder, weights_buffer, 3);
+                set_buffer(encoder, grouped_indices_buffer, 4);
+                set_buffer(encoder, shared_router, 5);
+                set_buffer(encoder, hidden_buffer, 6);
+                set_bytes(encoder, u32_as_bytes(&rows_u32), 7);
+                set_bytes(encoder, u32_as_bytes(&width_u32), 8);
+                set_bytes(encoder, u32_as_bytes(&active_u32), 9);
+                set_bytes(encoder, u32_as_bytes(&shared_router_width_u32), 10);
+                dispatch_threads(encoder, (rows * width) as u64);
+                Ok((
+                    hidden_buffer,
+                    grouped_output_buffer,
+                    shared_output_buffer,
+                    shared_router,
+                    shared_router_width,
+                    one_row_reference,
+                ))
+            })();
+            let (
+                hidden_buffer,
+                grouped_output_buffer,
+                shared_output_buffer,
+                shared_router,
+                shared_router_width,
+                one_row_reference,
+            ) = match encode_result {
+                Ok(result) => result,
+                Err(error) => {
+                    drop(encoding);
+                    self.buffers.recycle_or_release_phase(phase_buffers, true);
+                    return Err(error);
+                }
+            };
+            encoding.end_encoding();
+            let context = MetalCommandContext::new("qwen_layer_major_experts")
+                .with("layer", scheduled.layer())
+                .with("rows", rows)
+                .with("active_experts", active_experts)
+                .with("unique_experts", scheduled.experts().len());
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.buffers
+                    .recycle_or_release_phase(phase_buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            if let Some(reference) = one_row_reference {
+                let grouped = read_f32_buffer(grouped_output_buffer, route_count * width);
+                let scalar = read_f32_buffer(reference.expert_outputs, route_count * width);
+                for route in 0..route_count {
+                    let grouped_route = grouped_output_indices[route] as usize;
+                    for col in 0..width {
+                        let actual = grouped[grouped_route * width + col];
+                        let expected = scalar[route * width + col];
+                        if actual.to_bits() != expected.to_bits() {
+                            drop(encoding);
+                            self.buffers.recycle_or_release_phase(phase_buffers, false);
+                            bail!(
+                                "Qwen one-row layer-major expert parity failed layer={} route={route} col={col}: matrix={actual} scalar={expected} delta={}",
+                                scheduled.layer(),
+                                (actual - expected).abs()
+                            );
+                        }
+                    }
+                }
+                let shared_actual = read_f32_buffer(shared_output_buffer, width);
+                let shared_expected = read_f32_buffer(reference.shared_output, width);
+                for (col, (actual, expected)) in
+                    shared_actual.iter().zip(shared_expected.iter()).enumerate()
+                {
+                    if actual.to_bits() != expected.to_bits() {
+                        drop(encoding);
+                        self.buffers.recycle_or_release_phase(phase_buffers, false);
+                        bail!(
+                            "Qwen one-row layer-major shared-expert parity failed layer={} col={col}: matrix={actual} scalar={expected} delta={}",
+                            scheduled.layer(),
+                            (actual - expected).abs()
+                        );
+                    }
+                }
+                if shared_router_width != reference.shared_router_width {
+                    drop(encoding);
+                    self.buffers.recycle_or_release_phase(phase_buffers, false);
+                    bail!("Qwen one-row shared-router widths differ");
+                }
+                if shared_router_width > 0 {
+                    let router_actual = read_f32_buffer(shared_router, shared_router_width);
+                    let router_expected =
+                        read_f32_buffer(reference.shared_router, shared_router_width);
+                    for (index, (actual, expected)) in
+                        router_actual.iter().zip(router_expected.iter()).enumerate()
+                    {
+                        if actual.to_bits() != expected.to_bits() {
+                            drop(encoding);
+                            self.buffers.recycle_or_release_phase(phase_buffers, false);
+                            bail!(
+                                "Qwen one-row shared-router parity failed layer={} index={index}: matrix={actual} scalar={expected} delta={}",
+                                scheduled.layer(),
+                                (actual - expected).abs()
+                            );
+                        }
+                    }
+                }
+            }
+            let hidden = read_f32_buffer(hidden_buffer, rows * width);
+            drop(encoding);
+            self.buffers.recycle_or_release_phase(phase_buffers, false);
+            Ok(hidden)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_layer_major_q4_matrix(
+        &self,
+        encoder: MetalObjcId,
+        payload: &super::experts::Q4MatvecPayload<'_>,
+        source: super::experts::Q4MatvecSource<'_>,
+        input: MetalObjcId,
+        input_value_offset: usize,
+        output: MetalObjcId,
+        output_value_offset: usize,
+        input_rows: usize,
+        buffers: &mut Vec<MetalPhaseBuffer>,
+        source_buffers: &mut MetalExpertSourceBufferCache,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            if input_rows == 0
+                || !payload
+                    .scale_bias_dtype
+                    .eq_ignore_ascii_case(super::experts::EXPERT_SCALE_BIAS_DTYPE_BF16)
+            {
+                bail!("Qwen layer-major Q4 matrix requires non-empty BF16 affine rows");
+            }
+            let buffer = self.expert_source_buffer(
+                source.bytes,
+                source.reusable_bytes,
+                buffers,
+                source_buffers,
+            )?;
+            self.encode_layer_major_q4_matrix_from_buffer(
+                encoder,
+                buffer,
+                source.packed_offset as u64,
+                source.scale_offset as u64,
+                source.bias_offset as u64,
+                payload.rows,
+                payload.cols,
+                payload.group_size,
+                input,
+                input_value_offset,
+                output,
+                output_value_offset,
+                input_rows,
+            )
+        }
+    }
+
+    unsafe fn encode_layer_major_resident_matrix(
+        &self,
+        encoder: MetalObjcId,
+        projection: &ResidentMmapMatvecProjection,
+        input: MetalObjcId,
+        output: MetalObjcId,
+        input_rows: usize,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            match projection {
+                ResidentMmapMatvecProjection::Q4(projection) => {
+                    if !projection
+                        .scale_bias_dtype
+                        .eq_ignore_ascii_case(super::experts::EXPERT_SCALE_BIAS_DTYPE_BF16)
+                    {
+                        bail!("Qwen layer-major resident matrix requires BF16 scale/bias weights");
+                    }
+                    self.encode_layer_major_q4_matrix_from_buffer(
+                        encoder,
+                        self.dense_weights.buffer,
+                        projection.packed_byte_offset,
+                        projection.scales_byte_offset,
+                        projection.biases_byte_offset,
+                        projection.rows,
+                        projection.cols,
+                        projection.group_size,
+                        input,
+                        0,
+                        output,
+                        0,
+                        input_rows,
+                    )
+                }
+                ResidentMmapMatvecProjection::Dense(projection) => encode_dense_resident_matrix(
+                    &self.runtime.pipelines,
+                    encoder,
+                    self.dense_weights,
+                    projection,
+                    input,
+                    output,
+                    input_rows,
+                ),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_layer_major_q4_matrix_from_buffer(
+        &self,
+        encoder: MetalObjcId,
+        weights: MetalObjcId,
+        packed_offset: u64,
+        scale_offset: u64,
+        bias_offset: u64,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: MetalObjcId,
+        input_value_offset: usize,
+        output: MetalObjcId,
+        output_value_offset: usize,
+        input_rows: usize,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            let rows_u32 = u32::try_from(rows).context("Qwen matrix rows exceed u32")?;
+            let cols_u32 = u32::try_from(cols).context("Qwen matrix cols exceed u32")?;
+            let groups_u32 = u32::try_from(cols.div_ceil(group_size.max(1)))
+                .context("Qwen matrix groups exceed u32")?;
+            let group_size_u32 =
+                u32::try_from(group_size).context("Qwen matrix group size exceeds u32")?;
+            let projection_count = 1u32;
+            let row_offset = 0u32;
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.runtime
+                    .pipelines
+                    .q4_mmap_batch_bf16_scale_bias_pipeline,
+            );
+            set_buffer(encoder, weights, 0);
+            set_buffer_with_offset(
+                encoder,
+                input,
+                (input_value_offset * std::mem::size_of::<f32>()) as u64,
+                1,
+            );
+            set_buffer_with_offset(
+                encoder,
+                output,
+                (output_value_offset * std::mem::size_of::<f32>()) as u64,
+                2,
+            );
+            set_bytes(encoder, u64_as_bytes(&packed_offset), 3);
+            set_bytes(encoder, u64_as_bytes(&scale_offset), 4);
+            set_bytes(encoder, u64_as_bytes(&bias_offset), 5);
+            set_bytes(encoder, u32_as_bytes(&row_offset), 6);
+            set_bytes(encoder, u32_as_bytes(&rows_u32), 7);
+            set_bytes(encoder, u32_as_bytes(&groups_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&projection_count), 9);
+            set_bytes(encoder, u32_as_bytes(&cols_u32), 10);
+            set_bytes(encoder, u32_as_bytes(&group_size_u32), 11);
+            dispatch_q4_mmap_matrix_threadgroups(encoder, rows as u64, input_rows as u64);
+            Ok(())
+        }
     }
 
     fn recycle_input(&self, input: MetalPostAttentionPrep) {
@@ -3202,10 +4387,12 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 self.encode_combine(
                     encoder,
                     command_plan.combine,
+                    command_plan.shared,
                     input_buffers,
                     &output_buffers,
                     combine_buffers,
                     shared_router,
+                    &mut phase_buffers,
                 )?;
                 if let (Some(weight), Some(next_normed), Some(next_plan)) = (
                     next_norm_weight,
@@ -3496,26 +4683,46 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         &self,
         encoder: MetalObjcId,
         plan: MetalCmd3CombinePlan,
+        shared_plan: MetalCmd3SharedPhasePlan,
         inputs: MetalCmd3InputBuffers,
         outputs: &MetalCmd3OutputBuffers,
         combine: MetalCmd3CombineBuffers,
         shared_router: MetalObjcId,
+        buffers: &mut Vec<MetalPhaseBuffer>,
     ) -> anyhow::Result<()> {
         unsafe {
+            let layout = plan.buffer_layout()?;
             let stage = MetalCmd3CombineStageBuffers::new(plan, inputs, outputs, combine)?;
+            let grouped_indices = (0..plan.active_count)
+                .map(u32::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("Metal CMD3 active expert index exceeds u32")?;
+            let grouped_indices =
+                self.phase_buffer_with_bytes(u32_as_bytes_slice(&grouped_indices), buffers)?;
+            let rows = 1u32;
+            let shared_router_width = if shared_plan.source == MetalCmd3SharedPhaseSource::Resident
+            {
+                u32::try_from(shared_plan.shared_experts)
+                    .context("Metal CMD3 shared router width exceeds u32")?
+            } else {
+                0
+            };
             msg_send_void1_id(
                 encoder,
                 sel("setComputePipelineState:"),
-                self.runtime.pipelines.combine_expert_phase_pipeline,
+                self.runtime.pipelines.qwen_layer_major_combine_pipeline,
             );
             set_buffer(encoder, stage.residual, 0);
             set_buffer(encoder, stage.shared_output, 1);
             set_buffer(encoder, stage.expert_outputs, 2);
             set_buffer(encoder, stage.routing_weights, 3);
-            set_buffer(encoder, stage.hidden, 4);
-            set_buffer(encoder, stage.width, 5);
-            set_buffer(encoder, stage.active_count, 6);
-            set_buffer(encoder, shared_router, 7);
+            set_buffer(encoder, grouped_indices, 4);
+            set_buffer(encoder, shared_router, 5);
+            set_buffer(encoder, stage.hidden, 6);
+            set_bytes(encoder, u32_as_bytes(&rows), 7);
+            set_bytes(encoder, u32_as_bytes(&layout.width_u32), 8);
+            set_bytes(encoder, u32_as_bytes(&layout.active_count_u32), 9);
+            set_bytes(encoder, u32_as_bytes(&shared_router_width), 10);
             dispatch_threads(encoder, stage.plan.dispatch_threads);
             Ok(())
         }
@@ -3995,6 +5202,48 @@ unsafe fn encode_resident_projection_rows(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn encode_dense_resident_matrix(
+    pipelines: &MetalPipelineSet<MetalObjcId>,
+    encoder: MetalObjcId,
+    dense_weights: &MetalDenseWeights,
+    projection: &DenseMmapMatvecProjection,
+    input_buffer: MetalObjcId,
+    output_buffer: MetalObjcId,
+    input_rows: usize,
+) -> Result<()> {
+    unsafe {
+        let pipeline = match projection.dtype.to_ascii_uppercase().as_str() {
+            "BF16" | "BFLOAT16" => pipelines.dense_matrix_bf16_pipeline,
+            "F16" | "FLOAT16" | "FP16" => pipelines.dense_matrix_f16_pipeline,
+            "F32" | "FLOAT32" | "FP32" => pipelines.dense_matrix_f32_pipeline,
+            _ => bail!(
+                "resident dense matrix {} has unsupported dtype {}",
+                projection.tensor_name,
+                projection.dtype
+            ),
+        };
+        let rows =
+            u32::try_from(projection.rows).context("resident dense matrix rows do not fit u32")?;
+        let cols =
+            u32::try_from(projection.cols).context("resident dense matrix cols do not fit u32")?;
+        msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline);
+        set_buffer(encoder, dense_weights.buffer, 0);
+        set_buffer(encoder, input_buffer, 1);
+        set_buffer(encoder, output_buffer, 2);
+        set_bytes(encoder, u64_as_bytes(&projection.byte_offset), 3);
+        set_bytes(encoder, u32_as_bytes(&rows), 4);
+        set_bytes(encoder, u32_as_bytes(&cols), 5);
+        msg_send_void2_size(
+            encoder,
+            sel("dispatchThreads:threadsPerThreadgroup:"),
+            MetalDispatchSize::new(projection.rows as u64, input_rows as u64, 1),
+            MetalDispatchSize::new(projection.rows.min(256) as u64, 1, 1),
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl std::ops::Deref for MetalFusedLinearAttentionBuilder<'_> {
     type Target = MetalRuntime;
 
@@ -4019,6 +5268,292 @@ fn select_static_dtype_pipeline(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalFusedLinearAttentionBuilder<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_recurrent_matrix(
+        &self,
+        layout: LinearAttentionLayout,
+        bindings: &LinearAttentionResidentBindings,
+        rows: usize,
+        qkv: &[f32],
+        z: &[f32],
+        beta: &[f32],
+        alpha: &[f32],
+    ) -> Result<Vec<f32>> {
+        let layer = bindings.layer;
+        let static_tensors = &bindings.static_tensors;
+        let expected_qkv = rows
+            .checked_mul(layout.conv_dim)
+            .context("linear-attention QKV matrix size overflow")?;
+        let expected_values = rows
+            .checked_mul(layout.total_value_width)
+            .context("linear-attention value matrix size overflow")?;
+        let expected_heads = rows
+            .checked_mul(layout.num_value_heads)
+            .context("linear-attention gate matrix size overflow")?;
+        if rows == 0
+            || qkv.len() != expected_qkv
+            || z.len() != expected_values
+            || beta.len() != expected_heads
+            || alpha.len() != expected_heads
+            || static_tensors.conv_weight.values != layout.conv_dim * layout.conv_kernel_size
+            || static_tensors.a_log.values != layout.num_value_heads
+            || static_tensors.dt_bias.values != layout.num_value_heads
+            || static_tensors.norm_weight.values != layout.value_dim
+            || static_tensors.a_log.dtype != ResidentStaticDtype::F32
+            || layout.key_dim == 0
+            || layout.key_dim > 256
+            || layout.value_dim == 0
+            || layout.value_dim > 256
+            || layout.num_key_heads == 0
+            || layout.num_value_heads == 0
+        {
+            bail!(
+                "Qwen layer-major linear-attention matrix has incompatible geometry at layer {layer}: rows={rows} qkv={} expected={expected_qkv} z={} expected_values={expected_values} beta={} alpha={} expected_heads={expected_heads}",
+                qkv.len(),
+                z.len(),
+                beta.len(),
+                alpha.len()
+            );
+        }
+        let dense_weights = self
+            .dense_weights
+            .as_ref()
+            .context("Qwen layer-major linear attention requires resident dense Metal weights")?;
+        let mut state_guard = self
+            .linear_attention_state
+            .lock()
+            .expect("metal linear attention state poisoned");
+        let state = state_guard
+            .layers
+            .get_mut(layer)
+            .and_then(Option::as_mut)
+            .with_context(|| {
+                format!("Qwen layer-major linear-attention state has no resolved layer {layer}")
+            })?;
+        if state.conv_dim != layout.conv_dim
+            || state.total_value_width != layout.total_value_width
+            || state.num_value_heads != layout.num_value_heads
+            || state.conv_state_len != layout.conv_state_len()
+            || state.ssm_state_len != layout.ssm_state_len()
+        {
+            bail!("Qwen layer-major linear-attention recurrent state does not match layer {layer}");
+        }
+
+        unsafe {
+            let qkv_buffer = self.buffer_with_bytes(f32_as_bytes(qkv))?;
+            let z_buffer = self.buffer_with_bytes(f32_as_bytes(z))?;
+            let beta_buffer = self.buffer_with_bytes(f32_as_bytes(beta))?;
+            let alpha_buffer = self.buffer_with_bytes(f32_as_bytes(alpha))?;
+            let output_buffer =
+                self.buffer_with_len(expected_values * std::mem::size_of::<f32>())?;
+            let buffers = vec![
+                qkv_buffer,
+                z_buffer,
+                beta_buffer,
+                alpha_buffer,
+                output_buffer,
+            ];
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Qwen layer-major linear-attention command buffer",
+                "failed to create Qwen layer-major linear-attention encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    drop(state_guard);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            let encode_result = (|| -> Result<()> {
+                let conv_dim_u32 = u32::try_from(layout.conv_dim)
+                    .context("linear-attention conv width exceeds u32")?;
+                let kernel_size_u32 = u32::try_from(layout.conv_kernel_size)
+                    .context("linear-attention convolution width exceeds u32")?;
+                let key_dim_u32 = u32::try_from(layout.key_dim)
+                    .context("linear-attention key width exceeds u32")?;
+                let value_dim_u32 = u32::try_from(layout.value_dim)
+                    .context("linear-attention value width exceeds u32")?;
+                let heads_u32 = u32::try_from(layout.num_value_heads)
+                    .context("linear-attention head count exceeds u32")?;
+                let heads_per_key_u32 = u32::try_from(layout.value_heads_per_key_head())
+                    .context("linear-attention head ratio exceeds u32")?;
+                let inv_scale = 1.0f32 / (layout.key_dim as f32).sqrt();
+                let eps = 1e-6f32;
+                for row in 0..rows {
+                    let qkv_offset = (row * layout.conv_dim * std::mem::size_of::<f32>()) as u64;
+                    let z_offset =
+                        (row * layout.total_value_width * std::mem::size_of::<f32>()) as u64;
+                    let gate_offset =
+                        (row * layout.num_value_heads * std::mem::size_of::<f32>()) as u64;
+                    let output_offset = z_offset;
+
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        select_static_dtype_pipeline(
+                            &static_tensors.conv_weight.dtype,
+                            self.pipelines.linear_conv1d_bf16_pipeline,
+                            self.pipelines.linear_conv1d_f16_pipeline,
+                            self.pipelines.linear_conv1d_f32_pipeline,
+                        ),
+                    );
+                    set_buffer(encoder, state.conv_state, 0);
+                    set_buffer_with_offset(encoder, qkv_buffer, qkv_offset, 1);
+                    set_buffer_with_offset(
+                        encoder,
+                        dense_weights.buffer,
+                        static_tensors.conv_weight.byte_offset,
+                        2,
+                    );
+                    set_buffer(encoder, state.conv_output, 3);
+                    set_bytes(encoder, u32_as_bytes(&conv_dim_u32), 4);
+                    set_bytes(encoder, u32_as_bytes(&kernel_size_u32), 5);
+                    dispatch_threads(encoder, layout.conv_dim as u64);
+
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.pipelines.linear_rms_norm_qk_pipeline,
+                    );
+                    set_buffer(encoder, state.conv_output, 0);
+                    set_buffer_with_offset(
+                        encoder,
+                        state.conv_output,
+                        (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                        1,
+                    );
+                    set_bytes(encoder, u32_as_bytes(&key_dim_u32), 2);
+                    set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&inv_scale)), 3);
+                    msg_send_void2_size(
+                        encoder,
+                        sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                        MetalDispatchSize::new(layout.num_key_heads as u64, 1, 1),
+                        MetalDispatchSize::new(layout.key_dim as u64, 1, 1),
+                    );
+
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        select_static_dtype_pipeline(
+                            &static_tensors.dt_bias.dtype,
+                            self.pipelines.linear_decay_beta_bf16_pipeline,
+                            self.pipelines.linear_decay_beta_f16_pipeline,
+                            self.pipelines.linear_decay_beta_f32_pipeline,
+                        ),
+                    );
+                    set_buffer_with_offset(encoder, alpha_buffer, gate_offset, 0);
+                    set_buffer_with_offset(encoder, beta_buffer, gate_offset, 1);
+                    set_buffer_with_offset(
+                        encoder,
+                        dense_weights.buffer,
+                        static_tensors.a_log.byte_offset,
+                        2,
+                    );
+                    set_buffer_with_offset(
+                        encoder,
+                        dense_weights.buffer,
+                        static_tensors.dt_bias.byte_offset,
+                        3,
+                    );
+                    set_buffer(encoder, state.g_decay, 4);
+                    set_buffer(encoder, state.beta_gate, 5);
+                    set_bytes(encoder, u32_as_bytes(&heads_u32), 6);
+                    dispatch_threads(encoder, layout.num_value_heads as u64);
+
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.pipelines.linear_delta_step_pipeline,
+                    );
+                    set_buffer(encoder, state.ssm_state, 0);
+                    set_buffer(encoder, state.conv_output, 1);
+                    set_buffer_with_offset(
+                        encoder,
+                        state.conv_output,
+                        (layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                        2,
+                    );
+                    set_buffer_with_offset(
+                        encoder,
+                        state.conv_output,
+                        (2 * layout.total_key_width * std::mem::size_of::<f32>()) as u64,
+                        3,
+                    );
+                    set_buffer(encoder, state.g_decay, 4);
+                    set_buffer(encoder, state.beta_gate, 5);
+                    set_buffer(encoder, state.delta_output, 6);
+                    set_bytes(encoder, u32_as_bytes(&key_dim_u32), 7);
+                    set_bytes(encoder, u32_as_bytes(&value_dim_u32), 8);
+                    set_bytes(encoder, u32_as_bytes(&heads_per_key_u32), 9);
+                    msg_send_void2_size(
+                        encoder,
+                        sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                        MetalDispatchSize::new(layout.num_value_heads as u64, 1, 1),
+                        MetalDispatchSize::new(layout.value_dim as u64, 1, 1),
+                    );
+
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        select_static_dtype_pipeline(
+                            &static_tensors.norm_weight.dtype,
+                            self.pipelines.linear_gated_rms_norm_bf16_pipeline,
+                            self.pipelines.linear_gated_rms_norm_f16_pipeline,
+                            self.pipelines.linear_gated_rms_norm_f32_pipeline,
+                        ),
+                    );
+                    set_buffer(encoder, state.delta_output, 0);
+                    set_buffer_with_offset(encoder, z_buffer, z_offset, 1);
+                    set_buffer_with_offset(
+                        encoder,
+                        dense_weights.buffer,
+                        static_tensors.norm_weight.byte_offset,
+                        2,
+                    );
+                    set_buffer_with_offset(encoder, output_buffer, output_offset, 3);
+                    set_bytes(encoder, u32_as_bytes(&value_dim_u32), 4);
+                    set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&eps)), 5);
+                    msg_send_void2_size(
+                        encoder,
+                        sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                        MetalDispatchSize::new(layout.num_value_heads as u64, 1, 1),
+                        MetalDispatchSize::new(layout.value_dim as u64, 1, 1),
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = encode_result {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, true);
+                drop(state_guard);
+                return Err(error);
+            }
+            encoding.end_encoding();
+            let context = MetalCommandContext::new("qwen_layer_major_linear_attention")
+                .with("layer", layer)
+                .with("rows", rows)
+                .with("value_width", layout.total_value_width);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                drop(state_guard);
+                return Err(error.into());
+            }
+            let output = read_f32_buffer(output_buffer, expected_values);
+            drop(encoding);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            drop(state_guard);
+            Ok(output)
+        }
+    }
+
     pub(crate) fn execute(
         &self,
         layout: LinearAttentionLayout,
@@ -4486,6 +6021,14 @@ pub(crate) struct MetalResidentProjectionBatchBuilder<'a> {
     runtime: &'a MetalRuntime,
     dense_weights: Option<&'a MetalDenseWeights>,
     buffers: &'a MetalBufferPool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalLayerMajorPostAttention {
+    pub(crate) hidden: Vec<f32>,
+    pub(crate) normed: Vec<f32>,
+    pub(crate) router_scores: Vec<f32>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5709,13 +7252,17 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
         encoder: MetalObjcId,
         projections: &[&DenseQ4MmapMatvecProjection],
         input_buffer: MetalObjcId,
+        input_rows: usize,
         output_buffer: MetalObjcId,
         output_offsets: &[usize],
         total_rows: usize,
         buffers: &mut Vec<MetalObjcId>,
     ) -> Result<bool> {
         unsafe {
-            if projections.len() < 2 || output_offsets.len() != projections.len() {
+            if projections.is_empty()
+                || input_rows == 0
+                || output_offsets.len() != projections.len()
+            {
                 return Ok(false);
             }
             let Some(dense_weights) = &self.dense_weights else {
@@ -5812,7 +7359,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
             set_bytes(encoder, u32_as_bytes(&projection_count), 9);
             set_bytes(encoder, u32_as_bytes(&cols), 10);
             set_bytes(encoder, u32_as_bytes(&group_size), 11);
-            dispatch_q4_mmap_threadgroups(encoder, total_rows as u64);
+            dispatch_q4_mmap_matrix_threadgroups(encoder, total_rows as u64, input_rows as u64);
             Ok(true)
         }
     }
@@ -5872,6 +7419,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                         encoder,
                         &q4_projections,
                         input_buffer,
+                        1,
                         output_buffer,
                         &output_offsets,
                         total_rows,
@@ -5949,6 +7497,508 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
         }
     }
 
+    pub(crate) fn execute_matrix(
+        &self,
+        projections: &[ResidentMmapMatvecProjection],
+        input_rows: usize,
+        input_cols: usize,
+        input: &[f32],
+    ) -> Result<Option<(Vec<Vec<f32>>, MetalMatvecTiming, usize)>> {
+        if projections.is_empty() {
+            return Ok(Some((Vec::new(), MetalMatvecTiming::default(), 0)));
+        }
+        if input_rows == 0 || input_cols == 0 {
+            bail!(
+                "FlashMoe resident projection matrix requires non-zero geometry, got {input_rows}x{input_cols}"
+            );
+        }
+        let expected_input = input_rows
+            .checked_mul(input_cols)
+            .context("resident projection matrix input size overflow")?;
+        if input.len() != expected_input {
+            bail!(
+                "FlashMoe resident projection matrix has {} values, expected {input_rows}x{input_cols}={expected_input}",
+                input.len()
+            );
+        }
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+
+        let mut total_rows = 0usize;
+        let mut output_offsets = Vec::with_capacity(projections.len());
+        for projection in projections {
+            validate_resident_projection(projection, input_cols, dense_weights.len)?;
+            let output_offset = total_rows;
+            total_rows = total_rows
+                .checked_add(projection.rows())
+                .context("resident mmap matrix output row count overflow")?;
+            output_offsets.push(output_offset);
+        }
+        let total_output_values = input_rows
+            .checked_mul(total_rows)
+            .context("resident mmap matrix output size overflow")?;
+        let q4_projections = projections
+            .iter()
+            .map(ResidentMmapMatvecProjection::q4)
+            .collect::<Option<Vec<_>>>()
+            .context(
+                "FlashMoe layer-major resident projection matrix requires affine-Q4 projections",
+            )?;
+
+        unsafe {
+            let mut timing = MetalMatvecTiming::default();
+            let upload_started = Instant::now();
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let output_buffer =
+                self.buffer_with_len(total_output_values * std::mem::size_of::<f32>())?;
+            let mut buffers = vec![input_buffer, output_buffer];
+            timing.buffer_upload += upload_started.elapsed();
+
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Flash-MoE dense q4 mmap matrix Metal command buffer",
+                "failed to create Flash-MoE dense q4 mmap matrix Metal compute encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            let encoded = match self.try_encode_q4_mmap_projection_batch(
+                encoder,
+                &q4_projections,
+                input_buffer,
+                input_rows,
+                output_buffer,
+                &output_offsets,
+                total_rows,
+                &mut buffers,
+            ) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    drop(encoding);
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            if !encoded {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, true);
+                bail!(
+                    "FlashMoe layer-major resident projection matrix did not resolve a compatible affine-Q4 command"
+                );
+            }
+            encoding.end_encoding();
+
+            let dispatch_started = Instant::now();
+            let names = projections
+                .iter()
+                .map(ResidentMmapMatvecProjection::tensor_name)
+                .collect::<Vec<_>>()
+                .join(",");
+            let context = MetalCommandContext::new("dense_q4_mmap_projection_matrix")
+                .with("projections", projections.len())
+                .with("input_rows", input_rows)
+                .with("input_cols", input_cols)
+                .with("output_rows", total_rows)
+                .with("tensors", names);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            timing.dispatch += dispatch_started.elapsed();
+
+            let readback_started = Instant::now();
+            let packed_output = read_f32_buffer(output_buffer, total_output_values);
+            timing.readback += readback_started.elapsed();
+            let mut outputs = Vec::with_capacity(projections.len());
+            for (projection, output_offset) in projections.iter().zip(output_offsets.iter()) {
+                let output_width = projection.output_width();
+                let mut output = vec![0.0f32; input_rows * output_width];
+                for input_row in 0..input_rows {
+                    let source_start = input_row * total_rows + *output_offset;
+                    let source_end = source_start + projection.rows();
+                    let target_start = input_row * output_width;
+                    let target_end = target_start + projection.rows();
+                    output[target_start..target_end]
+                        .copy_from_slice(&packed_output[source_start..source_end]);
+                }
+                outputs.push(output);
+            }
+
+            drop(encoding);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some((outputs, timing, 1)))
+        }
+    }
+
+    pub(crate) fn execute_rms_norm_rows(
+        &self,
+        input: &[f32],
+        weight: &[f32],
+        rows: usize,
+        width: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>> {
+        let expected_values = rows
+            .checked_mul(width)
+            .context("Qwen RMS-normalization matrix size overflow")?;
+        if rows == 0
+            || width == 0
+            || width > u32::MAX as usize
+            || input.len() != expected_values
+            || weight.len() != width
+        {
+            bail!(
+                "Qwen RMS-normalization matrix has incompatible geometry: rows={rows} width={width} input={} weight={}",
+                input.len(),
+                weight.len()
+            );
+        }
+        unsafe {
+            let input_buffer = self.buffer_with_bytes(f32_as_bytes(input))?;
+            let weight_buffer = self.buffer_with_bytes(f32_as_bytes(weight))?;
+            let output_buffer =
+                self.buffer_with_len(expected_values * std::mem::size_of::<f32>())?;
+            let buffers = vec![input_buffer, weight_buffer, output_buffer];
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Qwen RMS-normalization matrix command buffer",
+                "failed to create Qwen RMS-normalization matrix encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            let width_u32 = width as u32;
+            msg_send_void1_id(
+                encoder,
+                sel("setComputePipelineState:"),
+                self.pipelines.rms_norm_reduced_pipeline,
+            );
+            set_buffer(encoder, input_buffer, 0);
+            set_buffer(encoder, weight_buffer, 1);
+            set_buffer(encoder, output_buffer, 2);
+            set_bytes(encoder, u32_as_bytes(&width_u32), 3);
+            set_bytes(encoder, f32_as_bytes(std::slice::from_ref(&epsilon)), 4);
+            msg_send_void2_size(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MetalDispatchSize::new(1, rows as u64, 1),
+                MetalDispatchSize::new(256, 1, 1),
+            );
+            encoding.end_encoding();
+            let context = MetalCommandContext::new("qwen_rms_norm_rows")
+                .with("rows", rows)
+                .with("width", width);
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            let output = read_f32_buffer(output_buffer, expected_values);
+            drop(encoding);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            Ok(output)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_post_attention_matrix(
+        &self,
+        out_proj: &ResidentMmapMatvecProjection,
+        router: &ResidentMmapMatvecProjection,
+        rows: usize,
+        attention_width: usize,
+        width: usize,
+        attention: &[f32],
+        residual: &[f32],
+        post_norm_weight: &[f32],
+        norm_epsilon: f32,
+    ) -> Result<Option<MetalLayerMajorPostAttention>> {
+        let Some(dense_weights) = &self.dense_weights else {
+            return Ok(None);
+        };
+        let attention_values = rows
+            .checked_mul(attention_width)
+            .context("layer-major attention matrix size overflow")?;
+        let hidden_values = rows
+            .checked_mul(width)
+            .context("layer-major hidden matrix size overflow")?;
+        if rows == 0
+            || attention_width == 0
+            || width == 0
+            || attention.len() != attention_values
+            || residual.len() != hidden_values
+            || post_norm_weight.len() != width
+            || !norm_epsilon.is_finite()
+            || norm_epsilon <= 0.0
+        {
+            bail!(
+                "Qwen layer-major post-attention matrix has incompatible geometry rows={rows} attention_width={attention_width} width={width} attention={} residual={} norm={} epsilon={norm_epsilon}",
+                attention.len(),
+                residual.len(),
+                post_norm_weight.len()
+            );
+        }
+        validate_resident_projection(out_proj, attention_width, dense_weights.len)?;
+        validate_resident_projection(router, width, dense_weights.len)?;
+        if out_proj.output_width() != width || router.output_width() != router.rows() {
+            bail!(
+                "Qwen layer-major post-attention projection shapes are incompatible: out={}x{} router={}x{} width={width}",
+                out_proj.rows(),
+                out_proj.cols(),
+                router.rows(),
+                router.cols()
+            );
+        }
+        unsafe {
+            let attention_buffer = self.buffer_with_bytes(f32_as_bytes(attention))?;
+            let residual_input_buffer = self.buffer_with_bytes(f32_as_bytes(residual))?;
+            let norm_weight_buffer = self.buffer_with_bytes(f32_as_bytes(post_norm_weight))?;
+            let projected_buffer =
+                self.buffer_with_len(hidden_values * std::mem::size_of::<f32>())?;
+            let hidden_buffer = self.buffer_with_len(hidden_values * std::mem::size_of::<f32>())?;
+            let normed_buffer = self.buffer_with_len(hidden_values * std::mem::size_of::<f32>())?;
+            let router_values = rows
+                .checked_mul(router.rows())
+                .context("layer-major router matrix size overflow")?;
+            let router_buffer = self.buffer_with_len(router_values * std::mem::size_of::<f32>())?;
+            let mut buffers = vec![
+                attention_buffer,
+                residual_input_buffer,
+                norm_weight_buffer,
+                projected_buffer,
+                hidden_buffer,
+                normed_buffer,
+                router_buffer,
+            ];
+            let scalar_reference = if rows == 1 {
+                let projected = self.buffer_with_len(hidden_values * std::mem::size_of::<f32>())?;
+                let hidden = self.buffer_with_len(hidden_values * std::mem::size_of::<f32>())?;
+                let normed = self.buffer_with_len(hidden_values * std::mem::size_of::<f32>())?;
+                let router = self.buffer_with_len(router_values * std::mem::size_of::<f32>())?;
+                buffers.extend_from_slice(&[projected, hidden, normed, router]);
+                Some((projected, hidden, normed, router))
+            } else {
+                None
+            };
+            let mut encoding = match MetalCommandEncoding::new(
+                self.command_queue,
+                Arc::clone(self.buffers.resources()),
+                "failed to create Qwen layer-major post-attention command buffer",
+                "failed to create Qwen layer-major post-attention encoder",
+            ) {
+                Ok(encoding) => encoding,
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, true);
+                    return Err(error);
+                }
+            };
+            let encoder = encoding.encoder();
+            let encode_result = (|| -> Result<()> {
+                match out_proj {
+                    ResidentMmapMatvecProjection::Q4(out_q4) => {
+                        if !self.try_encode_q4_mmap_projection_batch(
+                            encoder,
+                            &[out_q4],
+                            attention_buffer,
+                            rows,
+                            projected_buffer,
+                            &[0],
+                            width,
+                            &mut buffers,
+                        )? {
+                            bail!(
+                                "Qwen layer-major output projection did not resolve a matrix command"
+                            );
+                        }
+                    }
+                    ResidentMmapMatvecProjection::Dense(out_dense) => {
+                        encode_dense_resident_matrix(
+                            &self.pipelines,
+                            encoder,
+                            dense_weights,
+                            out_dense,
+                            attention_buffer,
+                            projected_buffer,
+                            rows,
+                        )?;
+                    }
+                }
+                let width_u32 =
+                    u32::try_from(width).context("Qwen layer-major hidden width exceeds u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.pipelines.residual_rms_norm_pipeline,
+                );
+                set_buffer(encoder, projected_buffer, 0);
+                set_buffer(encoder, residual_input_buffer, 1);
+                set_buffer(encoder, norm_weight_buffer, 2);
+                set_buffer(encoder, hidden_buffer, 3);
+                set_buffer(encoder, normed_buffer, 4);
+                set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                set_bytes(
+                    encoder,
+                    f32_as_bytes(std::slice::from_ref(&norm_epsilon)),
+                    6,
+                );
+                msg_send_void2_size(
+                    encoder,
+                    sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                    MetalDispatchSize::new(1, rows as u64, 1),
+                    MetalDispatchSize::new(256, 1, 1),
+                );
+                match router {
+                    ResidentMmapMatvecProjection::Q4(router_q4) => {
+                        if !self.try_encode_q4_mmap_projection_batch(
+                            encoder,
+                            &[router_q4],
+                            normed_buffer,
+                            rows,
+                            router_buffer,
+                            &[0],
+                            router.rows(),
+                            &mut buffers,
+                        )? {
+                            bail!(
+                                "Qwen layer-major router projection did not resolve a matrix command"
+                            );
+                        }
+                    }
+                    ResidentMmapMatvecProjection::Dense(router_dense) => {
+                        encode_dense_resident_matrix(
+                            &self.pipelines,
+                            encoder,
+                            dense_weights,
+                            router_dense,
+                            normed_buffer,
+                            router_buffer,
+                            rows,
+                        )?;
+                    }
+                }
+                if let Some((scalar_projected, scalar_hidden, scalar_normed, scalar_router)) =
+                    scalar_reference
+                {
+                    encode_resident_projection(
+                        &self.pipelines,
+                        encoder,
+                        dense_weights,
+                        out_proj,
+                        attention_buffer,
+                        scalar_projected,
+                        0,
+                    )?;
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.pipelines.residual_rms_norm_pipeline,
+                    );
+                    set_buffer(encoder, scalar_projected, 0);
+                    set_buffer(encoder, residual_input_buffer, 1);
+                    set_buffer(encoder, norm_weight_buffer, 2);
+                    set_buffer(encoder, scalar_hidden, 3);
+                    set_buffer(encoder, scalar_normed, 4);
+                    set_bytes(encoder, u32_as_bytes(&width_u32), 5);
+                    set_bytes(
+                        encoder,
+                        f32_as_bytes(std::slice::from_ref(&norm_epsilon)),
+                        6,
+                    );
+                    dispatch_single_threadgroup(encoder, 256);
+                    encode_resident_projection(
+                        &self.pipelines,
+                        encoder,
+                        dense_weights,
+                        router,
+                        scalar_normed,
+                        scalar_router,
+                        0,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = encode_result {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, true);
+                return Err(error);
+            }
+            encoding.end_encoding();
+            let context = MetalCommandContext::new("qwen_layer_major_post_attention")
+                .with("rows", rows)
+                .with("attention_width", attention_width)
+                .with("width", width)
+                .with("experts", router.rows());
+            if let Err(error) =
+                commit_and_wait_metal_command_buffer(encoding.command_buffer(), &context)
+            {
+                drop(encoding);
+                self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
+                return Err(error.into());
+            }
+            if let Some((scalar_projected, scalar_hidden, scalar_normed, scalar_router)) =
+                scalar_reference
+            {
+                for (phase, actual_buffer, expected_buffer, values) in [
+                    (
+                        "output_projection",
+                        projected_buffer,
+                        scalar_projected,
+                        hidden_values,
+                    ),
+                    ("residual", hidden_buffer, scalar_hidden, hidden_values),
+                    ("post_norm", normed_buffer, scalar_normed, hidden_values),
+                    ("router", router_buffer, scalar_router, router_values),
+                ] {
+                    let actual = read_f32_buffer(actual_buffer, values);
+                    let expected = read_f32_buffer(expected_buffer, values);
+                    if let Some((index, (actual, expected))) = actual
+                        .iter()
+                        .zip(expected.iter())
+                        .enumerate()
+                        .find(|(_, (actual, expected))| actual.to_bits() != expected.to_bits())
+                    {
+                        drop(encoding);
+                        self.recycle_or_release_buffers(&buffers, false);
+                        bail!(
+                            "Qwen one-row post-attention parity failed phase={phase} index={index}: matrix={actual} scalar={expected} delta={}",
+                            (actual - expected).abs()
+                        );
+                    }
+                }
+            }
+            let output = MetalLayerMajorPostAttention {
+                hidden: read_f32_buffer(hidden_buffer, hidden_values),
+                normed: read_f32_buffer(normed_buffer, hidden_values),
+                router_scores: read_f32_buffer(router_buffer, router_values),
+            };
+            drop(encoding);
+            for buffer in buffers {
+                self.recycle(buffer);
+            }
+            Ok(Some(output))
+        }
+    }
+
     pub(crate) fn execute_with_input_buffer(
         &self,
         projections: &[ResidentMmapMatvecProjection],
@@ -6004,6 +8054,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                         encoder,
                         &q4_projections,
                         input_buffer,
+                        1,
                         output_buffer,
                         &output_offsets,
                         total_rows,
@@ -7653,6 +9704,20 @@ pub(crate) unsafe fn dispatch_q4_mmap_threadgroups(encoder: MetalObjcId, rows: u
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn dispatch_q4_mmap_matrix_threadgroups(
+    encoder: MetalObjcId,
+    rows: u64,
+    input_rows: u64,
+) {
+    unsafe {
+        dispatch_metal_plan(
+            encoder,
+            MetalDispatchPlan::q4_mmap_matrix_threadgroups(rows, input_rows),
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) unsafe fn dispatch_single_threadgroup(encoder: MetalObjcId, threads: u64) {
     unsafe { dispatch_metal_plan(encoder, MetalDispatchPlan::single_threadgroup(threads)) }
 }
@@ -8143,40 +10208,24 @@ inline float bf16_to_float(ushort value) {
     return as_type<float>(uint(value) << 16u);
 }
 
-kernel void q4_fma_matvec_bf16_scale_bias(
-    device const uchar* packed [[buffer(0)]],
-    device const float* input [[buffer(1)]],
-    device const ushort* scales [[buffer(2)]],
-    device const ushort* biases [[buffer(3)]],
-    device float* output [[buffer(4)]],
-    constant uint& rows [[buffer(5)]],
-    constant uint& cols [[buffer(6)]],
-    constant uint& groups_per_row [[buffer(7)]],
-    constant uint& group_size [[buffer(8)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-    const uint rows_per_threadgroup = 8;
-    const uint input_cache_len = 8192;
-    uint row = tile * rows_per_threadgroup + simd_group;
+inline float q4_fma_row_bf16_ptrs(
+    device const uchar* packed,
+    device const ushort* scales,
+    device const ushort* biases,
+    device const float* input,
+    threadgroup float* input_cache,
+    uint row,
+    uint cols,
+    uint groups_per_row,
+    uint group_size,
+    bool word_aligned,
+    bool use_input_cache,
+    uint simd_lane) {
     uint packed_stride = (cols + 1) / 2;
-    bool use_input_cache = cols <= input_cache_len;
-    threadgroup float input_cache[8192];
-    if (use_input_cache) {
-        for (uint col = lid; col < cols; col += 256) {
-            input_cache[col] = input[col];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (row >= rows) {
-        return;
-    }
-
-    float acc = 0.0f;
     uint packed_row = row * packed_stride;
     uint scale_row = row * groups_per_row;
-    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0);
+    bool use_word_path = word_aligned && (cols % 8 == 0) && (group_size % 8 == 0);
+    float acc = 0.0f;
     if (use_word_path) {
         device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
         uint packed_words_per_row = cols / 8;
@@ -8187,7 +10236,6 @@ kernel void q4_fma_matvec_bf16_scale_bias(
             uint group = col0 / group_size;
             float scale = bf16_to_float(scales[scale_row + group]);
             float bias = bf16_to_float(biases[scale_row + group]);
-
             float x0 = use_input_cache ? input_cache[col0 + 0] : input[col0 + 0];
             float x1 = use_input_cache ? input_cache[col0 + 1] : input[col0 + 1];
             float x2 = use_input_cache ? input_cache[col0 + 2] : input[col0 + 2];
@@ -8196,7 +10244,6 @@ kernel void q4_fma_matvec_bf16_scale_bias(
             float x5 = use_input_cache ? input_cache[col0 + 5] : input[col0 + 5];
             float x6 = use_input_cache ? input_cache[col0 + 6] : input[col0 + 6];
             float x7 = use_input_cache ? input_cache[col0 + 7] : input[col0 + 7];
-
             acc += fma(float((word >>  0) & 0x0f), scale * x0, bias * x0);
             acc += fma(float((word >>  4) & 0x0f), scale * x1, bias * x1);
             acc += fma(float((word >>  8) & 0x0f), scale * x2, bias * x2);
@@ -8215,7 +10262,6 @@ kernel void q4_fma_matvec_bf16_scale_bias(
             float scale0 = bf16_to_float(scales[scale_row + group0]);
             float bias0 = bf16_to_float(biases[scale_row + group0]);
             acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
-
             uint col1 = col0 + 1;
             if (col1 < cols) {
                 float x1 = use_input_cache ? input_cache[col1] : input[col1];
@@ -8226,7 +10272,41 @@ kernel void q4_fma_matvec_bf16_scale_bias(
             }
         }
     }
-    float sum = simd_sum(acc);
+    return simd_sum(acc);
+}
+
+kernel void q4_fma_matvec_bf16_scale_bias(
+    device const uchar* packed [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& cols [[buffer(6)]],
+    constant uint& groups_per_row [[buffer(7)]],
+    constant uint& group_size [[buffer(8)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_threadgroup = 8;
+    const uint input_cache_len = 8192;
+    uint row = tile * rows_per_threadgroup + simd_group;
+    bool use_input_cache = cols <= input_cache_len;
+    threadgroup float input_cache[8192];
+    if (use_input_cache) {
+        for (uint col = lid; col < cols; col += 256) {
+            input_cache[col] = input[col];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) {
+        return;
+    }
+
+    float sum = q4_fma_row_bf16_ptrs(
+        packed, scales, biases, input, input_cache,
+        row, cols, groups_per_row, group_size, true, use_input_cache, simd_lane);
     if (simd_lane == 0) {
         output[row] = sum;
     }
@@ -8663,7 +10743,6 @@ kernel void q4_mmap_fma_matvec_bf16_scale_bias(
     const uint input_cache_len = 4096;
     uint row0 = tile * rows_per_threadgroup + simd_group;
     uint row1 = row0 + 8;
-    uint packed_stride = (cols + 1) / 2;
     bool use_input_cache = cols <= input_cache_len;
     threadgroup float input_cache[4096];
     if (use_input_cache) {
@@ -8677,84 +10756,15 @@ kernel void q4_mmap_fma_matvec_bf16_scale_bias(
     }
 
     bool row1_valid = row1 < rows;
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    uint packed_row0 = row0 * packed_stride;
-    uint packed_row1 = row1 * packed_stride;
-    uint scale_row0 = row0 * groups_per_row;
-    uint scale_row1 = row1 * groups_per_row;
-    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0) && ((packed_byte_offset & 3ul) == 0ul);
-    if (use_word_path) {
-        device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
-        uint packed_words_per_row = cols / 8;
-        uint word_row0 = row0 * packed_words_per_row;
-        uint word_row1 = row1 * packed_words_per_row;
-        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
-            uint word0 = packed_words[word_row0 + packed_word];
-            uint word1 = row1_valid ? packed_words[word_row1 + packed_word] : 0u;
-            uint col0 = packed_word * 8;
-            uint group = col0 / group_size;
-            float scale0 = bf16_to_float(scales[scale_row0 + group]);
-            float bias0 = bf16_to_float(biases[scale_row0 + group]);
-            float scale1 = row1_valid ? bf16_to_float(scales[scale_row1 + group]) : 0.0f;
-            float bias1 = row1_valid ? bf16_to_float(biases[scale_row1 + group]) : 0.0f;
-
-            float x0 = use_input_cache ? input_cache[col0 + 0] : input[col0 + 0];
-            float x1 = use_input_cache ? input_cache[col0 + 1] : input[col0 + 1];
-            float x2 = use_input_cache ? input_cache[col0 + 2] : input[col0 + 2];
-            float x3 = use_input_cache ? input_cache[col0 + 3] : input[col0 + 3];
-            float x4 = use_input_cache ? input_cache[col0 + 4] : input[col0 + 4];
-            float x5 = use_input_cache ? input_cache[col0 + 5] : input[col0 + 5];
-            float x6 = use_input_cache ? input_cache[col0 + 6] : input[col0 + 6];
-            float x7 = use_input_cache ? input_cache[col0 + 7] : input[col0 + 7];
-
-            acc0 += fma(float((word0 >>  0) & 0x0f), scale0 * x0, bias0 * x0);
-            acc0 += fma(float((word0 >>  4) & 0x0f), scale0 * x1, bias0 * x1);
-            acc0 += fma(float((word0 >>  8) & 0x0f), scale0 * x2, bias0 * x2);
-            acc0 += fma(float((word0 >> 12) & 0x0f), scale0 * x3, bias0 * x3);
-            acc0 += fma(float((word0 >> 16) & 0x0f), scale0 * x4, bias0 * x4);
-            acc0 += fma(float((word0 >> 20) & 0x0f), scale0 * x5, bias0 * x5);
-            acc0 += fma(float((word0 >> 24) & 0x0f), scale0 * x6, bias0 * x6);
-            acc0 += fma(float((word0 >> 28) & 0x0f), scale0 * x7, bias0 * x7);
-
-            acc1 += fma(float((word1 >>  0) & 0x0f), scale1 * x0, bias1 * x0);
-            acc1 += fma(float((word1 >>  4) & 0x0f), scale1 * x1, bias1 * x1);
-            acc1 += fma(float((word1 >>  8) & 0x0f), scale1 * x2, bias1 * x2);
-            acc1 += fma(float((word1 >> 12) & 0x0f), scale1 * x3, bias1 * x3);
-            acc1 += fma(float((word1 >> 16) & 0x0f), scale1 * x4, bias1 * x4);
-            acc1 += fma(float((word1 >> 20) & 0x0f), scale1 * x5, bias1 * x5);
-            acc1 += fma(float((word1 >> 24) & 0x0f), scale1 * x6, bias1 * x6);
-            acc1 += fma(float((word1 >> 28) & 0x0f), scale1 * x7, bias1 * x7);
-        }
-    } else {
-        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
-            uchar byte0 = packed[packed_row0 + packed_col];
-            uchar byte1 = row1_valid ? packed[packed_row1 + packed_col] : uchar(0);
-            uint col0 = packed_col * 2;
-            float x0 = use_input_cache ? input_cache[col0] : input[col0];
-            uint group0 = col0 / group_size;
-            float scale00 = bf16_to_float(scales[scale_row0 + group0]);
-            float bias00 = bf16_to_float(biases[scale_row0 + group0]);
-            float scale10 = row1_valid ? bf16_to_float(scales[scale_row1 + group0]) : 0.0f;
-            float bias10 = row1_valid ? bf16_to_float(biases[scale_row1 + group0]) : 0.0f;
-            acc0 += fma(float(byte0 & 0x0f), scale00 * x0, bias00 * x0);
-            acc1 += fma(float(byte1 & 0x0f), scale10 * x0, bias10 * x0);
-
-            uint col1 = col0 + 1;
-            if (col1 < cols) {
-                float x1 = use_input_cache ? input_cache[col1] : input[col1];
-                uint group1 = col1 / group_size;
-                float scale01 = bf16_to_float(scales[scale_row0 + group1]);
-                float bias01 = bf16_to_float(biases[scale_row0 + group1]);
-                float scale11 = row1_valid ? bf16_to_float(scales[scale_row1 + group1]) : 0.0f;
-                float bias11 = row1_valid ? bf16_to_float(biases[scale_row1 + group1]) : 0.0f;
-                acc0 += fma(float(byte0 >> 4), scale01 * x1, bias01 * x1);
-                acc1 += fma(float(byte1 >> 4), scale11 * x1, bias11 * x1);
-            }
-        }
-    }
-    float sum0 = simd_sum(acc0);
-    float sum1 = simd_sum(acc1);
+    bool word_aligned = (packed_byte_offset & 3ul) == 0ul;
+    float sum0 = q4_fma_row_bf16_ptrs(
+        packed, scales, biases, input, input_cache,
+        row0, cols, groups_per_row, group_size,
+        word_aligned, use_input_cache, simd_lane);
+    float sum1 = row1_valid ? q4_fma_row_bf16_ptrs(
+        packed, scales, biases, input, input_cache,
+        row1, cols, groups_per_row, group_size,
+        word_aligned, use_input_cache, simd_lane) : 0.0f;
     if (simd_lane == 0) {
         output[row0] = sum0;
         if (row1_valid) {
@@ -8862,58 +10872,11 @@ inline float q4_mmap_fma_row_bf16(
     device const uchar* packed = weight_bytes + packed_byte_offset;
     device const ushort* scales = reinterpret_cast<device const ushort*>(weight_bytes + scales_byte_offset);
     device const ushort* biases = reinterpret_cast<device const ushort*>(weight_bytes + biases_byte_offset);
-    uint packed_stride = (cols + 1) / 2;
-    uint packed_row = row * packed_stride;
-    uint scale_row = row * groups_per_row;
-    bool use_word_path = (cols % 8 == 0) && (group_size % 8 == 0) && ((packed_byte_offset & 3ul) == 0ul);
-    float acc = 0.0f;
-    if (use_word_path) {
-        device const uint* packed_words = reinterpret_cast<device const uint*>(packed);
-        uint packed_words_per_row = cols / 8;
-        uint word_row = row * packed_words_per_row;
-        for (uint packed_word = simd_lane; packed_word < packed_words_per_row; packed_word += 32) {
-            uint word = packed_words[word_row + packed_word];
-            uint col0 = packed_word * 8;
-            uint group = col0 / group_size;
-            float scale = bf16_to_float(scales[scale_row + group]);
-            float bias = bf16_to_float(biases[scale_row + group]);
-            float x0 = input_cache[col0 + 0];
-            float x1 = input_cache[col0 + 1];
-            float x2 = input_cache[col0 + 2];
-            float x3 = input_cache[col0 + 3];
-            float x4 = input_cache[col0 + 4];
-            float x5 = input_cache[col0 + 5];
-            float x6 = input_cache[col0 + 6];
-            float x7 = input_cache[col0 + 7];
-            acc += fma(float((word >>  0) & 0x0f), scale * x0, bias * x0);
-            acc += fma(float((word >>  4) & 0x0f), scale * x1, bias * x1);
-            acc += fma(float((word >>  8) & 0x0f), scale * x2, bias * x2);
-            acc += fma(float((word >> 12) & 0x0f), scale * x3, bias * x3);
-            acc += fma(float((word >> 16) & 0x0f), scale * x4, bias * x4);
-            acc += fma(float((word >> 20) & 0x0f), scale * x5, bias * x5);
-            acc += fma(float((word >> 24) & 0x0f), scale * x6, bias * x6);
-            acc += fma(float((word >> 28) & 0x0f), scale * x7, bias * x7);
-        }
-    } else {
-        for (uint packed_col = simd_lane; packed_col < packed_stride; packed_col += 32) {
-            uchar byte = packed[packed_row + packed_col];
-            uint col0 = packed_col * 2;
-            float x0 = input_cache[col0];
-            uint group0 = col0 / group_size;
-            float scale0 = bf16_to_float(scales[scale_row + group0]);
-            float bias0 = bf16_to_float(biases[scale_row + group0]);
-            acc += fma(float(byte & 0x0f), scale0 * x0, bias0 * x0);
-            uint col1 = col0 + 1;
-            if (col1 < cols) {
-                float x1 = input_cache[col1];
-                uint group1 = col1 / group_size;
-                float scale1 = bf16_to_float(scales[scale_row + group1]);
-                float bias1 = bf16_to_float(biases[scale_row + group1]);
-                acc += fma(float(byte >> 4), scale1 * x1, bias1 * x1);
-            }
-        }
-    }
-    return simd_sum(acc);
+    bool use_input_cache = cols <= 4096;
+    return q4_fma_row_bf16_ptrs(
+        packed, scales, biases, input, input_cache,
+        row, cols, groups_per_row, group_size,
+        (packed_byte_offset & 3ul) == 0ul, use_input_cache, simd_lane);
 }
 
 kernel void q4_mmap_fma_multilinear_bf16_scale_bias(
@@ -8976,16 +10939,20 @@ kernel void q4_mmap_fma_matvec_batch(
     constant uint& projection_count [[buffer(9)]],
     constant uint& cols [[buffer(10)]],
     constant uint& group_size [[buffer(11)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const uint rows_per_threadgroup = 16;
     const uint input_cache_len = 4096;
-    uint row0 = tile * rows_per_threadgroup + simd_group;
+    uint total_rows = row_offsets[projection_count - 1] + rows[projection_count - 1];
+    uint input_row = tile.y;
+    input += input_row * cols;
+    output += input_row * total_rows;
+    uint row0 = tile.x * rows_per_threadgroup + simd_group;
     uint row1 = row0 + 8;
     threadgroup float input_cache[4096];
-    for (uint col = lid; col < cols && col < input_cache_len; col += 256) {
+    for (uint col = lid.x; col < cols && col < input_cache_len; col += 256) {
         input_cache[col] = input[col];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9030,16 +10997,20 @@ kernel void q4_mmap_fma_matvec_batch_bf16_scale_bias(
     constant uint& projection_count [[buffer(9)]],
     constant uint& cols [[buffer(10)]],
     constant uint& group_size [[buffer(11)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const uint rows_per_threadgroup = 16;
     const uint input_cache_len = 4096;
-    uint row0 = tile * rows_per_threadgroup + simd_group;
+    uint total_rows = row_offsets[projection_count - 1] + rows[projection_count - 1];
+    uint input_row = tile.y;
+    input += input_row * cols;
+    output += input_row * total_rows;
+    uint row0 = tile.x * rows_per_threadgroup + simd_group;
     uint row1 = row0 + 8;
     threadgroup float input_cache[4096];
-    for (uint col = lid; col < cols && col < input_cache_len; col += 256) {
+    for (uint col = lid.x; col < cols && col < input_cache_len; col += 256) {
         input_cache[col] = input[col];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9125,16 +11096,83 @@ kernel void dense_mmap_fma_matvec_f32(
     output[row] = acc;
 }
 
+kernel void dense_mmap_fma_matrix_bf16(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& weight_byte_offset [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    uint2 position [[thread_position_in_grid]]) {
+    uint row = position.x;
+    uint input_row = position.y;
+    if (row >= rows) { return; }
+    device const ushort* weights = reinterpret_cast<device const ushort*>(weight_bytes + weight_byte_offset);
+    input += input_row * cols;
+    float acc = 0.0f;
+    uint start = row * cols;
+    for (uint col = 0; col < cols; ++col) {
+        acc = fma(bf16_to_float(weights[start + col]), input[col], acc);
+    }
+    output[input_row * rows + row] = acc;
+}
+
+kernel void dense_mmap_fma_matrix_f16(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& weight_byte_offset [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    uint2 position [[thread_position_in_grid]]) {
+    uint row = position.x;
+    uint input_row = position.y;
+    if (row >= rows) { return; }
+    device const half* weights = reinterpret_cast<device const half*>(weight_bytes + weight_byte_offset);
+    input += input_row * cols;
+    float acc = 0.0f;
+    uint start = row * cols;
+    for (uint col = 0; col < cols; ++col) {
+        acc = fma(float(weights[start + col]), input[col], acc);
+    }
+    output[input_row * rows + row] = acc;
+}
+
+kernel void dense_mmap_fma_matrix_f32(
+    device const uchar* weight_bytes [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& weight_byte_offset [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    uint2 position [[thread_position_in_grid]]) {
+    uint row = position.x;
+    uint input_row = position.y;
+    if (row >= rows) { return; }
+    device const float* weights = reinterpret_cast<device const float*>(weight_bytes + weight_byte_offset);
+    input += input_row * cols;
+    float acc = 0.0f;
+    uint start = row * cols;
+    for (uint col = 0; col < cols; ++col) {
+        acc = fma(weights[start + col], input[col], acc);
+    }
+    output[input_row * rows + row] = acc;
+}
+
 kernel void rms_norm_reduced(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
     device float* output [[buffer(2)]],
     constant uint& width [[buffer(3)]],
     constant float& epsilon [[buffer(4)]],
-    uint lid [[thread_position_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 thread_position [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const uint threads = 256;
+    uint lid = thread_position.x;
+    input += group.y * width;
+    output += group.y * width;
     threadgroup float partial[32];
     float sum = 0.0f;
     for (uint i = lid; i < width; i += threads) {
@@ -9168,10 +11206,16 @@ kernel void residual_add_rms_norm(
     device float* normed [[buffer(4)]],
     constant uint& width [[buffer(5)]],
     constant float& epsilon [[buffer(6)]],
-    uint lid [[thread_position_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 thread_position [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     const uint threads = 256;
+    uint lid = thread_position.x;
+    projected += group.y * width;
+    residual += group.y * width;
+    hidden += group.y * width;
+    normed += group.y * width;
     threadgroup float partial[32];
     float sum = 0.0f;
     for (uint i = lid; i < width; i += threads) {
@@ -9212,6 +11256,69 @@ kernel void attention_scores(
         acc = fma(query[i], keys[token * width + i], acc);
     }
     scores[token] = acc * rsqrt(float(max(head_dim, 1u)));
+}
+
+kernel void qwen_causal_attention_rows(
+    device const float* queries [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& query_rows [[buffer(4)]],
+    constant uint& prefix_rows [[buffer(5)]],
+    constant uint& query_heads [[buffer(6)]],
+    constant uint& kv_heads [[buffer(7)]],
+    constant uint& head_dim [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 thread_position [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint thread_count = 256;
+    threadgroup float partial_sums[8];
+    threadgroup float shared_score;
+    uint query_row = group.x;
+    uint query_head = group.y;
+    uint dimension = thread_position.x;
+    if (query_row >= query_rows || query_head >= query_heads) {
+        return;
+    }
+    uint groups_per_kv = max(query_heads / max(kv_heads, 1u), 1u);
+    uint kv_head = min(query_head / groups_per_kv, max(kv_heads, 1u) - 1u);
+    uint query_offset = (query_row * query_heads + query_head) * head_dim;
+    uint key_count = prefix_rows + query_row + 1;
+    float accumulator = 0.0f;
+    float denominator = 0.0f;
+    float maximum = -INFINITY;
+    float query_value = dimension < head_dim ? queries[query_offset + dimension] : 0.0f;
+    for (uint key_row = 0; key_row < key_count; ++key_row) {
+        uint kv_offset = (key_row * kv_heads + kv_head) * head_dim;
+        float product = dimension < head_dim ? query_value * keys[kv_offset + dimension] : 0.0f;
+        float subgroup_sum = simd_sum(product);
+        if (simd_lane == 0) {
+            partial_sums[simd_group] = subgroup_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_position.x == 0) {
+            float score = 0.0f;
+            for (uint subgroup = 0; subgroup < thread_count / 32; ++subgroup) {
+                score += partial_sums[subgroup];
+            }
+            shared_score = score * rsqrt(float(max(head_dim, 1u)));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float next_maximum = max(maximum, shared_score);
+        float previous_scale = isinf(maximum) ? 0.0f : exp(maximum - next_maximum);
+        float current_scale = exp(shared_score - next_maximum);
+        if (dimension < head_dim) {
+            accumulator = accumulator * previous_scale
+                + values[kv_offset + dimension] * current_scale;
+        }
+        denominator = denominator * previous_scale + current_scale;
+        maximum = next_maximum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (dimension < head_dim) {
+        output[query_offset + dimension] = accumulator / max(denominator, 1.0e-20f);
+    }
 }
 
 kernel void glm_mla_prepare_query_kv(
@@ -9403,6 +11510,38 @@ kernel void combine_expert_phase(
     float moe = 0.0f;
     for (uint expert = 0; expert < active_experts; ++expert) {
         moe += weights[expert] * expert_outputs[expert * width + idx];
+    }
+    hidden[idx] = residual[idx] + moe + shared_weight * shared[idx];
+}
+
+kernel void qwen_layer_major_combine(
+    device const float* residual [[buffer(0)]],
+    device const float* shared [[buffer(1)]],
+    device const float* grouped_expert_outputs [[buffer(2)]],
+    device const float* weights [[buffer(3)]],
+    device const uint* grouped_output_indices [[buffer(4)]],
+    device const float* shared_router [[buffer(5)]],
+    device float* hidden [[buffer(6)]],
+    constant uint& rows [[buffer(7)]],
+    constant uint& width [[buffer(8)]],
+    constant uint& active_experts [[buffer(9)]],
+    constant uint& shared_router_width [[buffer(10)]],
+    uint idx [[thread_position_in_grid]]) {
+    uint total = rows * width;
+    if (idx >= total) { return; }
+    uint row = idx / width;
+    uint col = idx - row * width;
+    uint route_base = row * active_experts;
+    float moe = 0.0f;
+    for (uint active = 0; active < active_experts; ++active) {
+        uint route = route_base + active;
+        uint grouped = grouped_output_indices[route];
+        moe += weights[route] * grouped_expert_outputs[grouped * width + col];
+    }
+    float shared_weight = 0.0f;
+    if (shared_router_width > 0) {
+        float route = shared_router[row * shared_router_width];
+        shared_weight = 1.0f / (1.0f + exp(-route));
     }
     hidden[idx] = residual[idx] + moe + shared_weight * shared[idx];
 }
@@ -10382,8 +12521,8 @@ mod tests {
             [
                 vec![1, 2, 38, 3, 4, 5, 6, 7, 8],
                 vec![33, 37, 34, 35, 36],
-                vec![24, 25, 26],
-                (9..=16).collect::<Vec<_>>(),
+                vec![24, 25, 26, 41, 42, 43],
+                vec![9, 10, 11, 39, 12, 13, 14, 15, 40, 16],
                 vec![18, 19, 27, 28, 20, 21, 29, 30, 22, 23, 31, 32],
             ]
             .concat()
@@ -10409,13 +12548,18 @@ mod tests {
             dense_mmap_bf16_pipeline: 24,
             dense_mmap_f16_pipeline: 25,
             dense_mmap_f32_pipeline: 26,
+            dense_matrix_bf16_pipeline: 41,
+            dense_matrix_f16_pipeline: 42,
+            dense_matrix_f32_pipeline: 43,
             rms_norm_reduced_pipeline: 9,
             residual_rms_norm_pipeline: 10,
             attention_pipeline: 11,
+            qwen_causal_attention_rows_pipeline: 39,
             expert_mlp_pipeline: 12,
             silu_product_pipeline: 13,
             shared_expert_activation_pipeline: 14,
             combine_expert_phase_pipeline: 15,
+            qwen_layer_major_combine_pipeline: 40,
             fill_zero_pipeline: 16,
             topk_vocab_pipeline: 18,
             linear_conv1d_bf16_pipeline: 19,
@@ -10452,13 +12596,18 @@ mod tests {
             dense_mmap_bf16_pipeline: id,
             dense_mmap_f16_pipeline: id,
             dense_mmap_f32_pipeline: id,
+            dense_matrix_bf16_pipeline: id,
+            dense_matrix_f16_pipeline: id,
+            dense_matrix_f32_pipeline: id,
             rms_norm_reduced_pipeline: id,
             residual_rms_norm_pipeline: id,
             attention_pipeline: id,
+            qwen_causal_attention_rows_pipeline: id,
             expert_mlp_pipeline: id,
             silu_product_pipeline: id,
             shared_expert_activation_pipeline: id,
             combine_expert_phase_pipeline: id,
+            qwen_layer_major_combine_pipeline: id,
             fill_zero_pipeline: id,
             topk_vocab_pipeline: id,
             linear_conv1d_bf16_pipeline: id,
@@ -12498,6 +14647,22 @@ mod tests {
             }
         );
         assert_eq!(
+            MetalDispatchPlan::q4_mmap_matrix_threadgroups(17, 64),
+            MetalDispatchPlan {
+                mode: MetalDispatchMode::Threadgroups,
+                grid: MetalDispatchSize::new(2, 64, 1),
+                threadgroup: MetalDispatchSize::new(256, 1, 1),
+            }
+        );
+        assert_eq!(
+            MetalDispatchPlan::qwen_attention_threadgroups(64, 16),
+            MetalDispatchPlan {
+                mode: MetalDispatchMode::Threadgroups,
+                grid: MetalDispatchSize::new(64, 16, 1),
+                threadgroup: MetalDispatchSize::new(256, 1, 1),
+            }
+        );
+        assert_eq!(
             MetalDispatchPlan::single_threadgroup(512),
             MetalDispatchPlan {
                 mode: MetalDispatchMode::Threadgroups,
@@ -12506,6 +14671,10 @@ mod tests {
             }
         );
         assert_eq!(MetalDispatchPlan::q4_threadgroups(0).grid.width, 1);
+        assert_eq!(
+            MetalDispatchPlan::q4_mmap_matrix_threadgroups(0, 0).grid,
+            MetalDispatchSize::new(1, 1, 1)
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
