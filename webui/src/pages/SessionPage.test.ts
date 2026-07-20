@@ -2,7 +2,9 @@
 import { ok } from "node:assert/strict";
 import { equal } from "node:assert/strict";
 import {
+  latestGoalChangeRequest,
   latestPendingDeliveryProposal,
+  latestPendingGoalProposal,
   readyEvidenceLabel,
   workflowOutcomeLabel,
   workflowProgressLabel,
@@ -54,6 +56,48 @@ Deno.test("delivery proposal remains conversational until an explicit Build turn
     },
   });
   equal(latestPendingDeliveryProposal(events), undefined);
+});
+
+Deno.test("goal proposal stays read-only until a durable goal starts", () => {
+  const events: EventEnvelope[] = [{
+    version: "v1",
+    event: {
+      type: "goal_proposed",
+      proposal_id: "goal-proposal-1",
+      source_turn_id: "turn-1",
+      objective: "Ship goal mode",
+      criteria: [{ text: "Persist checkpoints", verifier: "review_required" }],
+    },
+  }];
+  equal(latestPendingGoalProposal(events)?.objective, "Ship goal mode");
+  events.push({
+    version: "v1",
+    event: {
+      type: "goal_started",
+      goal_id: "goal-1",
+      objective: "Ship goal mode",
+      plan_sha256: "digest",
+    },
+  });
+  equal(latestPendingGoalProposal(events), undefined);
+});
+
+Deno.test("model goal change requests remain pending only until a user path resolves them", () => {
+  const events: EventEnvelope[] = [{
+    version: "v1",
+    event: {
+      type: "goal_change_requested",
+      goal_id: "goal-1",
+      kind: "budget",
+      summary: "Need one more checked pass",
+    },
+  }];
+  equal(latestGoalChangeRequest(events)?.kind, "budget");
+  events.push({
+    version: "v1",
+    event: { type: "goal_resumed", goal_id: "goal-1" },
+  });
+  equal(latestGoalChangeRequest(events), undefined);
 });
 
 Deno.test("strict workflow stages and outcomes use compact truthful labels", () => {
@@ -226,11 +270,10 @@ Deno.test("handoff feedback renders as a teammate with expandable evidence", asy
   const types = await Deno.readTextFile("webui/src/types/index.ts");
 
   ok(page.includes('session.status === "completed"'));
-  ok(
-    types.includes(
-      'SessionStatus = "queued" | "running" | "paused" | "completed" | "failed"',
-    ),
-  );
+  ok(types.includes("export type SessionStatus"));
+  for (const status of ["queued", "running", "paused", "completed", "failed"]) {
+    ok(types.includes(`"${status}"`));
+  }
   ok(types.includes('type: "team_message"'));
   ok(types.includes('type: "check_result"'));
   ok(types.includes('type: "handoff_summary"'));

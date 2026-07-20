@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import type {
+  ComposerMode,
   InstalledIntegration,
   IntegrationConfigSchemaResponse,
   IntegrationKind,
@@ -10,7 +11,6 @@ import type {
   ProjectUsageStats,
   SessionAttachment,
   SessionItem,
-  TurnIntent,
 } from "../types";
 import {
   IntegrationConfigForm,
@@ -27,6 +27,7 @@ import {
 } from "../components/SessionDashboard";
 import { PageShell } from "../components/PageShell";
 import { IntentControl } from "../components/IntentControl";
+import { GoalStartSheet } from "../components/GoalStartSheet";
 import {
   ensureNotificationPermission,
   projectName,
@@ -146,7 +147,8 @@ export function ProjectPage() {
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [task, setTask] = useState("");
-  const [intent, setIntent] = useState<Exclude<TurnIntent, "auto">>("discuss");
+  const [intent, setIntent] = useState<ComposerMode>("discuss");
+  const [goalOpen, setGoalOpen] = useState(false);
   const [branch, setBranch] = useState("main");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
@@ -218,6 +220,10 @@ export function ProjectPage() {
 
   const startProjectSession = async () => {
     if (!project || !task.trim()) return;
+    if (intent === "goal") {
+      setGoalOpen(true);
+      return;
+    }
     setIsSubmitting(true);
     try {
       const res = await fetch("/api/sessions", {
@@ -311,7 +317,11 @@ export function ProjectPage() {
                   <ImageAttachments images={images} setImages={setImages} />
                   <div className="composer-actions">
                     <div className="quick-actions">
-                      <IntentControl intent={intent} onChange={setIntent} disabled={isSubmitting} />
+                      <IntentControl
+                        intent={intent}
+                        onChange={setIntent}
+                        disabled={isSubmitting}
+                      />
                       <button
                         className="btn btn-light"
                         type="button"
@@ -471,6 +481,13 @@ export function ProjectPage() {
           </p>
         </aside>
       </div>
+      <GoalStartSheet
+        open={goalOpen}
+        initialObjective={task}
+        workdir={project?.path}
+        onClose={() => setGoalOpen(false)}
+        onStarted={(sessionId) => navigate(`/sessions/${sessionId}`)}
+      />
     </PageShell>
   );
 }

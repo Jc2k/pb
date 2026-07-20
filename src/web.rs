@@ -117,6 +117,56 @@ pub struct AnswerSessionQuestionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartGoalRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub objective: String,
+    #[serde(default)]
+    pub criteria: Vec<crate::goal::GoalCriterionInput>,
+    #[serde(default)]
+    pub continuation: crate::goal::GoalContinuationPolicy,
+    #[serde(default)]
+    pub budget: Option<crate::goal::GoalBudget>,
+    #[serde(default)]
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalDigestRequest {
+    pub goal_sha256: String,
+    #[serde(default)]
+    pub plan_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoalRpcMutationRequest {
+    pub goal_id: String,
+    pub goal_sha256: String,
+    #[serde(default)]
+    pub plan_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalAmendmentRequest {
+    pub goal_sha256: String,
+    pub objective: String,
+    #[serde(default)]
+    pub criteria: Vec<crate::goal::GoalCriterionInput>,
+    pub continuation: crate::goal::GoalContinuationPolicy,
+    #[serde(default)]
+    pub budget: Option<crate::goal::GoalBudget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalResponse {
+    pub session_id: String,
+    pub goal_id: String,
+    pub goal_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub session_id: String,
 }
@@ -146,6 +196,9 @@ pub struct SessionListItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_outcome: Option<crate::workflow::WorkflowOutcome>,
     pub strict_workflow: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::goal::GoalSummary>,
+    pub active_goal: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -246,6 +299,9 @@ pub struct SessionDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<crate::workflow::WorkflowSummary>,
     pub strict_workflow: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::goal::GoalCheckpoint>,
+    pub active_goal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +402,9 @@ struct SessionState {
     usage_records: Arc<StdMutex<Vec<SessionMetricsSnapshot>>>,
     workflow: Option<crate::workflow::WorkflowCheckpoint>,
     completed_workflows: Vec<crate::workflow::WorkflowSummary>,
+    goal: Option<crate::goal::GoalCheckpoint>,
+    completed_goals: Vec<crate::goal::GoalCheckpoint>,
+    pause_token: Arc<AtomicBool>,
     cancel_token: Arc<AtomicBool>,
     updated_at_ms: u64,
 }
@@ -463,6 +522,23 @@ pub async fn run_server_with_ready(
         .route("/api/sessions/{id}/cancel", post(cancel_session))
         .route("/api/sessions/{id}/answer", post(answer_question))
         .route("/api/sessions/{id}/events", get(session_events))
+        .route("/api/goals", post(start_goal))
+        .route("/api/goals/{id}", get(get_goal))
+        .route("/api/goals/{id}/draft", patch(revise_goal_draft))
+        .route("/api/goals/{id}/approve-plan", post(approve_goal_plan))
+        .route("/api/goals/{id}/pause", post(pause_goal))
+        .route("/api/goals/{id}/resume", post(resume_goal))
+        .route("/api/goals/{id}/cancel", post(cancel_goal))
+        .route("/api/goals/{id}/accept", post(accept_goal))
+        .route("/api/goals/{id}/amendments", post(amend_goal))
+        .route(
+            "/api/goals/{id}/amendments/{amendment_id}/approve",
+            post(approve_goal_amendment),
+        )
+        .route(
+            "/api/goals/{id}/amendments/{amendment_id}/discard",
+            post(discard_goal_amendment),
+        )
         .route("/api/projects", get(list_projects))
         .route("/api/projects/{name}/usage", get(get_project_usage))
         .route(
@@ -742,6 +818,9 @@ async fn start_session_inner(
         usage_records: Arc::clone(&usage_records),
         workflow: None,
         completed_workflows: Vec::new(),
+        goal: None,
+        completed_goals: Vec::new(),
+        pause_token: Arc::new(AtomicBool::new(false)),
         cancel_token: Arc::new(AtomicBool::new(false)),
         updated_at_ms: now,
     };
@@ -762,11 +841,681 @@ async fn start_session_inner(
         &usage_records,
         None,
         Vec::new(),
+        None,
+        Vec::new(),
     );
 
     dispatch_next_session(state.clone());
 
     Ok(SessionResponse { session_id })
+}
+
+async fn start_goal(
+    State((state, defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<StartGoalRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    start_goal_inner(state, defaults, req)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to start goal");
+            StatusCode::BAD_REQUEST
+        })
+}
+
+async fn start_goal_inner(
+    state: AppState,
+    defaults: AgentRequest,
+    req: StartGoalRequest,
+) -> Result<GoalResponse> {
+    let now = now_millis();
+    let goal_id = format!("goal-{now}");
+    let objective = req.objective.trim().to_string();
+    if objective.is_empty() {
+        bail!("goal objective must not be empty");
+    }
+
+    // Snapshot the registry before taking the session lock. Goal activation never waits for a
+    // second application lock while it is changing durable session state.
+    let registered_projects = state.projects.lock().await.clone();
+    let mut sessions = state.sessions.lock().await;
+    let session_id = req.session_id.clone().unwrap_or_else(new_session_id);
+    if let Some(session) = sessions.get_mut(&session_id) {
+        if session.goal.is_some() || session.running || session.pending_question.is_some() {
+            bail!("session already has active work");
+        }
+        if !matches!(
+            session.status,
+            SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Paused
+        ) {
+            bail!("session is not ready to start a goal");
+        }
+        let workdir = session
+            .workdir
+            .clone()
+            .context("goal mode requires a registered repository")?;
+        ensure_goal_workdir_registered(&registered_projects, &workdir)?;
+        let policy = goal_policy_for_request(Some(&workdir))?;
+        let run = crate::goal::GoalRun::start(
+            goal_id.clone(),
+            session_id.clone(),
+            objective.clone(),
+            req.criteria,
+            req.continuation,
+            req.budget,
+            policy,
+            workdir.to_string_lossy(),
+            now,
+        )?;
+        let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
+        session.task = objective.clone();
+        session.title = Some(objective.clone());
+        session.request_template.task = objective.clone();
+        session.request_template.intent = Some(crate::workflow::TurnIntent::Discuss);
+        session.request_template.goal_context = None;
+        session.request_template.workflow_checkpoint = None;
+        session.request_template.workflow_stage = None;
+        session.goal = Some(checkpoint.clone());
+        session.running = false;
+        session.paused = true;
+        session.status = SessionStatus::Paused;
+        session.updated_at_ms = now;
+        publish_goal_started(session, &checkpoint);
+        persist_live_session(&session_id, session);
+        return Ok(GoalResponse {
+            session_id,
+            goal_id,
+            goal_sha256: checkpoint.sha256,
+        });
+    }
+
+    let workdir = req
+        .workdir
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .context("goal mode requires a registered repository")?;
+    ensure_goal_workdir_registered(&registered_projects, &workdir)?;
+    let policy = goal_policy_for_request(Some(&workdir))?;
+    let run = crate::goal::GoalRun::start(
+        goal_id.clone(),
+        session_id.clone(),
+        objective.clone(),
+        req.criteria,
+        req.continuation,
+        req.budget,
+        policy,
+        workdir.to_string_lossy(),
+        now,
+    )?;
+    let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
+    let (sender, _) = broadcast::channel(256);
+    let history = Arc::new(StdMutex::new(Vec::new()));
+    let usage_records = Arc::new(StdMutex::new(Vec::new()));
+    let mut request = defaults;
+    request.session_id = session_id.clone();
+    request.task = objective.clone();
+    request.workdir = Some(workdir.clone());
+    request.repository_less = false;
+    request.intent = Some(crate::workflow::TurnIntent::Discuss);
+    request.goal_context = None;
+    request.workflow_policy = Some(workflow_policy_for_request(Some(&workdir))?);
+    request.workflow_stage = None;
+    request.workflow_checkpoint = None;
+    request.turn_id = new_turn_id(&session_id);
+    request.branch = None;
+    request.conversation_handoff = None;
+    if let Some(model) = req.model {
+        request.model = model;
+    }
+    let mut session = SessionState {
+        task: objective.clone(),
+        title: Some(objective),
+        branch: None,
+        workdir: Some(workdir),
+        request_template: request,
+        running: false,
+        paused: true,
+        status: SessionStatus::Paused,
+        pending_question: None,
+        sender,
+        history,
+        metrics: None,
+        usage_records,
+        workflow: None,
+        completed_workflows: Vec::new(),
+        goal: Some(checkpoint.clone()),
+        completed_goals: Vec::new(),
+        pause_token: Arc::new(AtomicBool::new(false)),
+        cancel_token: Arc::new(AtomicBool::new(false)),
+        updated_at_ms: now,
+    };
+    publish_goal_started(&mut session, &checkpoint);
+    persist_live_session(&session_id, &session);
+    sessions.insert(session_id.clone(), session);
+    Ok(GoalResponse {
+        session_id,
+        goal_id,
+        goal_sha256: checkpoint.sha256,
+    })
+}
+
+fn ensure_goal_workdir_registered(
+    projects: &[ProjectEntry],
+    workdir: &std::path::Path,
+) -> Result<()> {
+    let requested = crate::agent_core::find_git_root(workdir)
+        .unwrap_or_else(|| workdir.to_path_buf())
+        .canonicalize()
+        .with_context(|| format!("goal repository does not exist: {}", workdir.display()))?;
+    let registered = projects.iter().any(|project| {
+        let path = project
+            .repository_root
+            .as_deref()
+            .unwrap_or(project.path.as_str());
+        let path = PathBuf::from(path);
+        let root = crate::agent_core::find_git_root(&path).unwrap_or(path);
+        root.canonicalize().is_ok_and(|root| root == requested)
+    });
+    if !registered {
+        bail!(
+            "goal mode requires a registered repository; add {} to pb first",
+            requested.display()
+        );
+    }
+    Ok(())
+}
+
+fn publish_goal_started(session: &mut SessionState, checkpoint: &crate::goal::GoalCheckpoint) {
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::GoalStarted {
+            goal_id: checkpoint.run.id.clone(),
+            objective: checkpoint.run.objective.clone(),
+            plan_sha256: checkpoint.run.plan_sha256.clone(),
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::GoalPlanAwaitingApproval {
+            goal_id: checkpoint.run.id.clone(),
+            plan_sha256: checkpoint.run.plan_sha256.clone(),
+            milestones: checkpoint.run.milestones.len(),
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+}
+
+async fn get_goal(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<crate::goal::GoalCheckpoint>, StatusCode> {
+    let sessions = state.sessions.lock().await;
+    sessions
+        .values()
+        .find_map(|session| {
+            session
+                .goal
+                .as_ref()
+                .filter(|checkpoint| checkpoint.run.id == id)
+                .or_else(|| {
+                    session
+                        .completed_goals
+                        .iter()
+                        .find(|checkpoint| checkpoint.run.id == id)
+                })
+                .cloned()
+        })
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn approve_goal_plan(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<GoalDigestRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    let response = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+        let plan_sha256 = req
+            .plan_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("plan_sha256 is required"))?;
+        run.approve_plan(plan_sha256, now_millis())?;
+        configure_goal_milestone_request(session, run)?;
+        session.status = SessionStatus::Queued;
+        session.paused = false;
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalPlanApproved {
+                goal_id: run.id.clone(),
+                plan_sha256: run.plan_sha256.clone(),
+                timestamp_ms: Some(now_millis()),
+            },
+        );
+        publish_current_goal_milestone(session, run);
+        Ok(())
+    })
+    .await?;
+    dispatch_next_session(state);
+    Ok(Json(response))
+}
+
+async fn revise_goal_draft(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<GoalAmendmentRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+        run.revise_initial_plan(
+            req.objective.clone(),
+            req.criteria.clone(),
+            req.continuation,
+            req.budget,
+            now_millis(),
+        )?;
+        session.task = run.objective.clone();
+        session.title = Some(run.objective.clone());
+        session.request_template.task = run.objective.clone();
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalPlanAwaitingApproval {
+                goal_id: run.id.clone(),
+                plan_sha256: run.plan_sha256.clone(),
+                milestones: run.milestones.len(),
+                timestamp_ms: Some(now_millis()),
+            },
+        );
+        Ok(())
+    })
+    .await
+    .map(Json)
+}
+
+async fn pause_goal(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<GoalDigestRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    let response = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+        let paused = run.request_pause(now_millis())?;
+        session.pause_token.store(true, Ordering::SeqCst);
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalPauseRequested {
+                goal_id: run.id.clone(),
+                timestamp_ms: Some(now_millis()),
+            },
+        );
+        if paused {
+            session.status = SessionStatus::Paused;
+            session.paused = true;
+            publish_event(
+                &session.sender,
+                &session.history,
+                AgentEvent::GoalPaused {
+                    goal_id: run.id.clone(),
+                    timestamp_ms: Some(now_millis()),
+                },
+            );
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn resume_goal(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<GoalDigestRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    let response = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+        run.resume(now_millis())?;
+        session.pause_token.store(false, Ordering::SeqCst);
+        configure_goal_milestone_request(session, run)?;
+        session.status = SessionStatus::Queued;
+        session.paused = false;
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalResumed {
+                goal_id: run.id.clone(),
+                timestamp_ms: Some(now_millis()),
+            },
+        );
+        publish_current_goal_milestone(session, run);
+        Ok(())
+    })
+    .await?;
+    dispatch_next_session(state);
+    Ok(Json(response))
+}
+
+async fn cancel_goal(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<GoalDigestRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    let mut sessions = state.sessions.lock().await;
+    let (session_id, session) = find_active_goal_session_mut(&mut sessions, &id)?;
+    let checkpoint = session.goal.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    if checkpoint.sha256 != req.goal_sha256 {
+        return Err(StatusCode::CONFLICT);
+    }
+    if session.running {
+        session.pause_token.store(false, Ordering::SeqCst);
+        session.cancel_token.store(true, Ordering::SeqCst);
+        return Ok(Json(GoalResponse {
+            session_id,
+            goal_id: id,
+            goal_sha256: checkpoint.sha256.clone(),
+        }));
+    }
+    let mut run = session.goal.take().unwrap().run;
+    run.cancel(now_millis());
+    let checkpoint = crate::goal::GoalCheckpoint::new(run).map_err(internal_status)?;
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::GoalCancelled {
+            goal_id: checkpoint.run.id.clone(),
+            checkpoint_sha256: checkpoint.sha256.clone(),
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+    session.completed_goals.push(checkpoint.clone());
+    session.status = SessionStatus::Completed;
+    session.paused = false;
+    session.updated_at_ms = now_millis();
+    persist_live_session(&session_id, session);
+    Ok(Json(GoalResponse {
+        session_id,
+        goal_id: id,
+        goal_sha256: checkpoint.sha256,
+    }))
+}
+
+async fn accept_goal(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<GoalDigestRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    let mut sessions = state.sessions.lock().await;
+    let (session_id, session) = find_active_goal_session_mut(&mut sessions, &id)?;
+    let mut checkpoint = session.goal.take().ok_or(StatusCode::NOT_FOUND)?;
+    if checkpoint.sha256 != req.goal_sha256 {
+        session.goal = Some(checkpoint);
+        return Err(StatusCode::CONFLICT);
+    }
+    checkpoint
+        .run
+        .accept(&req.goal_sha256, &checkpoint.sha256, now_millis())
+        .map_err(conflict_status)?;
+    checkpoint = crate::goal::GoalCheckpoint::new(checkpoint.run).map_err(internal_status)?;
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::GoalCompleted {
+            goal_id: checkpoint.run.id.clone(),
+            outcome: crate::goal::GoalOutcome::Complete,
+            completion_basis: crate::goal::GoalCompletionBasis::UserAccepted,
+            checkpoint_sha256: checkpoint.sha256.clone(),
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+    session.completed_goals.push(checkpoint.clone());
+    session.status = SessionStatus::Completed;
+    session.paused = false;
+    persist_live_session(&session_id, session);
+    Ok(Json(GoalResponse {
+        session_id,
+        goal_id: id,
+        goal_sha256: checkpoint.sha256,
+    }))
+}
+
+async fn amend_goal(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<GoalAmendmentRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+        let amendment_id = format!("amendment-{}", now_millis());
+        run.propose_amendment(
+            amendment_id.clone(),
+            req.goal_sha256.clone(),
+            req.objective.clone(),
+            req.criteria.clone(),
+            req.continuation,
+            req.budget,
+            now_millis(),
+        )?;
+        let replacement_plan_sha256 = run
+            .pending_amendment
+            .as_ref()
+            .map(|amendment| amendment.replacement_plan_sha256.clone())
+            .unwrap_or_default();
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalAmendmentRequested {
+                goal_id: run.id.clone(),
+                amendment_id,
+                replacement_plan_sha256,
+                timestamp_ms: Some(now_millis()),
+            },
+        );
+        session.status = SessionStatus::Paused;
+        session.paused = true;
+        Ok(())
+    })
+    .await
+    .map(Json)
+}
+
+async fn approve_goal_amendment(
+    Path((id, amendment_id)): Path<(String, String)>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<GoalDigestRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    let response = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+        let pending = run
+            .pending_amendment
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("goal has no pending amendment"))?;
+        if pending.id != amendment_id {
+            bail!("amendment id is stale");
+        }
+        let plan_sha256 = req
+            .plan_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("plan_sha256 is required"))?;
+        run.approve_amendment(plan_sha256, now_millis())?;
+        configure_goal_milestone_request(session, run)?;
+        session.status = SessionStatus::Queued;
+        session.paused = false;
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalAmendmentResolved {
+                goal_id: run.id.clone(),
+                amendment_id: amendment_id.clone(),
+                accepted: true,
+                timestamp_ms: Some(now_millis()),
+            },
+        );
+        publish_current_goal_milestone(session, run);
+        Ok(())
+    })
+    .await?;
+    dispatch_next_session(state);
+    Ok(Json(response))
+}
+
+async fn discard_goal_amendment(
+    Path((id, amendment_id)): Path<(String, String)>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<GoalDigestRequest>,
+) -> Result<Json<GoalResponse>, StatusCode> {
+    mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+        if run
+            .pending_amendment
+            .as_ref()
+            .is_none_or(|pending| pending.id != amendment_id)
+        {
+            bail!("amendment id is stale");
+        }
+        run.discard_amendment(now_millis())?;
+        session.status = SessionStatus::Paused;
+        session.paused = true;
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalAmendmentResolved {
+                goal_id: run.id.clone(),
+                amendment_id: amendment_id.clone(),
+                accepted: false,
+                timestamp_ms: Some(now_millis()),
+            },
+        );
+        Ok(())
+    })
+    .await
+    .map(Json)
+}
+
+async fn mutate_active_goal(
+    state: &AppState,
+    goal_id: &str,
+    expected_sha256: &str,
+    mutate: impl FnOnce(&mut SessionState, &mut crate::goal::GoalRun) -> Result<()>,
+) -> Result<GoalResponse, StatusCode> {
+    let mut sessions = state.sessions.lock().await;
+    let (session_id, session) = find_active_goal_session_mut(&mut sessions, goal_id)?;
+    let mut checkpoint = session.goal.take().ok_or(StatusCode::NOT_FOUND)?;
+    if checkpoint.sha256 != expected_sha256 {
+        session.goal = Some(checkpoint);
+        return Err(StatusCode::CONFLICT);
+    }
+    if let Err(error) = mutate(session, &mut checkpoint.run) {
+        session.goal = Some(checkpoint);
+        tracing::warn!(%error, "goal mutation rejected");
+        return Err(StatusCode::CONFLICT);
+    }
+    checkpoint = crate::goal::GoalCheckpoint::new(checkpoint.run).map_err(internal_status)?;
+    session.updated_at_ms = now_millis();
+    session.goal = Some(checkpoint.clone());
+    persist_live_session(&session_id, session);
+    Ok(GoalResponse {
+        session_id,
+        goal_id: goal_id.to_string(),
+        goal_sha256: checkpoint.sha256,
+    })
+}
+
+fn find_active_goal_session_mut<'a>(
+    sessions: &'a mut HashMap<String, SessionState>,
+    goal_id: &str,
+) -> Result<(String, &'a mut SessionState), StatusCode> {
+    sessions
+        .iter_mut()
+        .find(|(_, session)| {
+            session
+                .goal
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.run.id == goal_id)
+        })
+        .map(|(session_id, session)| (session_id.clone(), session))
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+fn configure_goal_milestone_request(
+    session: &mut SessionState,
+    run: &crate::goal::GoalRun,
+) -> Result<()> {
+    let milestone = run
+        .current_milestone()
+        .context("goal has no milestone ready to run")?;
+    let mut request = session.request_template.clone();
+    request.task = format!(
+        "Goal: {}\n\nCurrent milestone: {}\n\n{}",
+        run.objective, milestone.title, milestone.description
+    );
+    request.intent = Some(crate::workflow::TurnIntent::Deliver);
+    request.workflow_policy = Some(if let Some(checkpoint) = milestone.workflow.as_ref() {
+        checkpoint.run.policy.clone()
+    } else {
+        let base = workflow_policy_for_request(session.workdir.as_deref())?;
+        let mut limits = base.limits;
+        limits.total_model_invocations = limits.total_model_invocations.min(
+            run.budget
+                .total_model_invocations
+                .saturating_sub(run.counters.model_invocations)
+                .max(1),
+        );
+        limits.total_generated_tokens = limits.total_generated_tokens.min(
+            run.budget
+                .total_generated_tokens
+                .saturating_sub(run.counters.generated_tokens)
+                .max(1),
+        );
+        crate::workflow::WorkflowConfigDocument {
+            version: base.version,
+            delivery: base.delivery,
+            default_intent: base.default_intent,
+            limits,
+        }
+        .compile()?
+    });
+    request.workflow_stage = None;
+    request.workflow_checkpoint = milestone.workflow.clone();
+    request.goal_context = Some(run.model_brief());
+    request.turn_id = milestone
+        .workflow
+        .as_ref()
+        .map(|checkpoint| checkpoint.run.source_turn_id.clone())
+        .unwrap_or_else(|| new_turn_id(&session_id_for_goal(run)));
+    request.conversation_handoff =
+        delivery_handoff_for_turn(request.intent, &request.turn_id, &request.task, None);
+    request.branch = session.branch.clone();
+    request.workdir = session.workdir.clone();
+    session.task = run.objective.clone();
+    session.request_template = request;
+    Ok(())
+}
+
+fn session_id_for_goal(run: &crate::goal::GoalRun) -> String {
+    run.session_id.clone()
+}
+
+fn publish_current_goal_milestone(session: &SessionState, run: &crate::goal::GoalRun) {
+    if let Some(milestone) = run.current_milestone() {
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalMilestoneStarted {
+                goal_id: run.id.clone(),
+                milestone_id: milestone.id.clone(),
+                title: milestone.title.clone(),
+                timestamp_ms: Some(now_millis()),
+            },
+        );
+    }
+}
+
+fn conflict_status(_error: anyhow::Error) -> StatusCode {
+    StatusCode::CONFLICT
+}
+
+fn internal_status(error: anyhow::Error) -> StatusCode {
+    tracing::error!(%error, "goal persistence invariant failed");
+    StatusCode::INTERNAL_SERVER_ERROR
 }
 
 fn materialize_attachments(
@@ -915,6 +1664,7 @@ async fn continue_session(
     request.workflow_policy = Some(workflow_policy);
     request.workflow_stage = None;
     request.workflow_checkpoint = None;
+    request.goal_context = None;
     request.turn_id = new_turn_id(&id);
     let cited_proposal = {
         let history = session
@@ -960,6 +1710,8 @@ async fn continue_session(
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
     let completed_workflows = session.completed_workflows.clone();
+    let goal = session.goal.clone();
+    let completed_goals = session.completed_goals.clone();
     drop(sessions);
     persist_session_snapshot(
         &id,
@@ -971,6 +1723,8 @@ async fn continue_session(
         &usage_records,
         None,
         completed_workflows,
+        goal,
+        completed_goals,
     );
     dispatch_next_session(state.clone());
 
@@ -1034,6 +1788,8 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
     let usage_records = Arc::clone(&session.usage_records);
     let workflow = session.workflow.clone();
     let completed_workflows = session.completed_workflows.clone();
+    let goal = session.goal.clone();
+    let completed_goals = session.completed_goals.clone();
     drop(sessions);
     persist_session_snapshot(
         &id,
@@ -1045,6 +1801,8 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
         &usage_records,
         workflow,
         completed_workflows,
+        goal,
+        completed_goals,
     );
     dispatch_next_session(state.clone());
     Ok(SessionResponse { session_id: id })
@@ -1134,6 +1892,8 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
     let usage_records = Arc::clone(&session.usage_records);
     let workflow = session.workflow.clone();
     let completed_workflows = session.completed_workflows.clone();
+    let goal = session.goal.clone();
+    let completed_goals = session.completed_goals.clone();
     let status = session.status;
     drop(sessions);
     persist_session_snapshot(
@@ -1146,6 +1906,8 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         &usage_records,
         workflow,
         completed_workflows,
+        goal,
+        completed_goals,
     );
     if terminate_environment {
         crate::session_environment::terminate_global_session(&id)?;
@@ -1220,6 +1982,8 @@ async fn answer_question_inner(
         let workdir = session.workdir.clone();
         let workflow = session.workflow.clone();
         let completed_workflows = session.completed_workflows.clone();
+        let goal = session.goal.clone();
+        let completed_goals = session.completed_goals.clone();
         let question_id = req.question_id.clone();
         pending
             .responder
@@ -1248,6 +2012,8 @@ async fn answer_question_inner(
             &usage_records,
             workflow,
             completed_workflows,
+            goal,
+            completed_goals,
         );
     }
     state.update_sleep_prevention_working(true);
@@ -1284,6 +2050,15 @@ fn latest_handoff_outcome(session: &SessionState) -> Option<HandoffOutcome> {
 }
 
 fn latest_workflow_summary(session: &SessionState) -> Option<crate::workflow::WorkflowSummary> {
+    if let Some(goal) = session.goal.as_ref() {
+        return goal.run.current_milestone().and_then(|milestone| {
+            milestone
+                .workflow
+                .as_ref()
+                .map(|checkpoint| crate::workflow::WorkflowSummary::from(&checkpoint.run))
+                .or_else(|| milestone.workflow_summary.clone())
+        });
+    }
     session
         .workflow
         .as_ref()
@@ -1292,9 +2067,17 @@ fn latest_workflow_summary(session: &SessionState) -> Option<crate::workflow::Wo
 }
 
 fn strict_workflow_enabled(session: &SessionState) -> bool {
-    session.request_template.intent == Some(crate::workflow::TurnIntent::Deliver)
+    (session.request_template.intent == Some(crate::workflow::TurnIntent::Deliver)
         && session.request_template.workflow_policy.is_some()
-        && !session.request_template.turn_id.trim().is_empty()
+        && !session.request_template.turn_id.trim().is_empty())
+        || session.goal.is_some()
+}
+
+fn latest_goal_checkpoint(session: &SessionState) -> Option<&crate::goal::GoalCheckpoint> {
+    session
+        .goal
+        .as_ref()
+        .or_else(|| session.completed_goals.last())
 }
 
 async fn list_sessions(
@@ -1305,6 +2088,7 @@ async fn list_sessions(
         .iter()
         .map(|(session_id, session)| {
             let workflow = latest_workflow_summary(session);
+            let goal = latest_goal_checkpoint(session);
             SessionListItem {
                 session_id: session_id.clone(),
                 task: session.task.clone(),
@@ -1326,6 +2110,8 @@ async fn list_sessions(
                 workflow_stage: workflow.as_ref().map(|workflow| workflow.stage),
                 workflow_outcome: workflow.as_ref().and_then(|workflow| workflow.outcome),
                 strict_workflow: strict_workflow_enabled(session),
+                goal: goal.map(|checkpoint| crate::goal::GoalSummary::from(&checkpoint.run)),
+                active_goal: session.goal.is_some(),
             }
         })
         .collect::<Vec<_>>();
@@ -1348,6 +2134,7 @@ async fn get_session(
         })
         .unwrap_or_default();
     let workflow = latest_workflow_summary(session);
+    let goal = latest_goal_checkpoint(session).cloned();
     Ok(Json(SessionDetails {
         session_id: id,
         task: session.task.clone(),
@@ -1369,6 +2156,8 @@ async fn get_session(
         usage_records: session_usage_records(session),
         workflow,
         strict_workflow: strict_workflow_enabled(session),
+        goal,
+        active_goal: session.goal.is_some(),
     }))
 }
 
@@ -1544,6 +2333,10 @@ struct WebEventSink {
     persisted_workdir: Option<PathBuf>,
     workflow: Option<crate::workflow::WorkflowCheckpoint>,
     completed_workflows: Vec<crate::workflow::WorkflowSummary>,
+    goal_deadline_ms: Option<u64>,
+    goal: Option<crate::goal::GoalCheckpoint>,
+    completed_goals: Vec<crate::goal::GoalCheckpoint>,
+    pause_token: Arc<AtomicBool>,
     cancel_token: Arc<AtomicBool>,
 }
 
@@ -1607,6 +2400,14 @@ impl EventSink for WebEventSink {
             }
         }
         publish_event(&self.sender, &self.history, event);
+        if self.goal.is_some() {
+            self.goal = tokio::runtime::Handle::current().block_on(async {
+                let sessions = self.state.sessions.lock().await;
+                sessions
+                    .get(&self.session_id)
+                    .and_then(|session| session.goal.clone())
+            });
+        }
         persist_session_snapshot(
             &self.session_id,
             &self.request_template,
@@ -1617,6 +2418,8 @@ impl EventSink for WebEventSink {
             &self.usage_records,
             self.workflow.clone(),
             self.completed_workflows.clone(),
+            self.goal.clone(),
+            self.completed_goals.clone(),
         );
     }
 
@@ -1625,20 +2428,33 @@ impl EventSink for WebEventSink {
         checkpoint: &crate::workflow::WorkflowCheckpoint,
     ) -> Result<()> {
         checkpoint.validate()?;
-        let summary = crate::workflow::WorkflowSummary::from(&checkpoint.run);
-        if checkpoint.run.stage.is_terminal()
-            && checkpoint.run.stage != crate::workflow::WorkflowStage::Blocked
-        {
-            if self
-                .completed_workflows
-                .last()
-                .is_none_or(|existing| existing.id != summary.id)
-            {
-                self.completed_workflows.push(summary);
-            }
+        if let Some(goal) = self.goal.take() {
+            let latest = tokio::runtime::Handle::current().block_on(async {
+                let sessions = self.state.sessions.lock().await;
+                sessions
+                    .get(&self.session_id)
+                    .and_then(|session| session.goal.clone())
+            });
+            let mut run = latest.unwrap_or(goal).run;
+            run.checkpoint_active_workflow(checkpoint.clone(), now_millis())?;
+            self.goal = Some(crate::goal::GoalCheckpoint::new(run)?);
             self.workflow = None;
         } else {
-            self.workflow = Some(checkpoint.clone());
+            let summary = crate::workflow::WorkflowSummary::from(&checkpoint.run);
+            if checkpoint.run.stage.is_terminal()
+                && checkpoint.run.stage != crate::workflow::WorkflowStage::Blocked
+            {
+                if self
+                    .completed_workflows
+                    .last()
+                    .is_none_or(|existing| existing.id != summary.id)
+                {
+                    self.completed_workflows.push(summary);
+                }
+                self.workflow = None;
+            } else {
+                self.workflow = Some(checkpoint.clone());
+            }
         }
         tokio::runtime::Handle::current().block_on(async {
             let mut sessions = self.state.sessions.lock().await;
@@ -1647,7 +2463,13 @@ impl EventSink for WebEventSink {
                 .with_context(|| format!("session not found: {}", self.session_id))?;
             session.workflow = self.workflow.clone();
             session.completed_workflows = self.completed_workflows.clone();
-            session.request_template.workflow_checkpoint = session.workflow.clone();
+            session.goal = self.goal.clone();
+            session.completed_goals = self.completed_goals.clone();
+            session.request_template.workflow_checkpoint = if session.goal.is_some() {
+                None
+            } else {
+                session.workflow.clone()
+            };
             session.updated_at_ms = now_millis();
             Ok::<(), anyhow::Error>(())
         })?;
@@ -1661,12 +2483,99 @@ impl EventSink for WebEventSink {
             &self.usage_records,
             self.workflow.clone(),
             self.completed_workflows.clone(),
+            self.goal.clone(),
+            self.completed_goals.clone(),
         );
         Ok(())
     }
 
     fn should_cancel(&self) -> bool {
         self.cancel_token.load(Ordering::SeqCst)
+    }
+
+    fn should_pause(&self) -> bool {
+        self.pause_token.load(Ordering::SeqCst)
+            || self
+                .goal_deadline_ms
+                .is_some_and(|deadline| now_millis() >= deadline)
+    }
+
+    fn request_goal_pause(&mut self, reason: &str) -> Result<String> {
+        let reason = reason.to_string();
+        let goal_id = tokio::runtime::Handle::current().block_on(async {
+            let mut sessions = self.state.sessions.lock().await;
+            let session = sessions
+                .get_mut(&self.session_id)
+                .with_context(|| format!("session not found: {}", self.session_id))?;
+            let mut run = session
+                .goal
+                .as_ref()
+                .context("goal pause request lost its durable goal")?
+                .run
+                .clone();
+            let goal_id = run.id.clone();
+            let paused = run.request_pause(now_millis())?;
+            session.goal = Some(crate::goal::GoalCheckpoint::new(run)?);
+            session.pause_token.store(true, Ordering::SeqCst);
+            publish_event(
+                &session.sender,
+                &session.history,
+                AgentEvent::GoalPauseRequested {
+                    goal_id: goal_id.clone(),
+                    timestamp_ms: Some(now_millis()),
+                },
+            );
+            if paused {
+                session.status = SessionStatus::Paused;
+                session.paused = true;
+                publish_event(
+                    &session.sender,
+                    &session.history,
+                    AgentEvent::GoalPaused {
+                        goal_id: goal_id.clone(),
+                        timestamp_ms: Some(now_millis()),
+                    },
+                );
+            }
+            persist_live_session(&self.session_id, session);
+            Ok::<String, anyhow::Error>(goal_id)
+        })?;
+        Ok(format!(
+            "safe-boundary pause requested for {goal_id}; reason recorded: {reason}"
+        ))
+    }
+
+    fn request_goal_change(&mut self, kind: &str, summary: &str) -> Result<String> {
+        let kind = kind.to_string();
+        let summary = summary.to_string();
+        tokio::runtime::Handle::current().block_on(async {
+            let sessions = self.state.sessions.lock().await;
+            let session = sessions
+                .get(&self.session_id)
+                .with_context(|| format!("session not found: {}", self.session_id))?;
+            let goal_id = session
+                .goal
+                .as_ref()
+                .context("goal change request lost its durable goal")?
+                .run
+                .id
+                .clone();
+            publish_event(
+                &session.sender,
+                &session.history,
+                AgentEvent::GoalChangeRequested {
+                    goal_id,
+                    kind: kind.clone(),
+                    summary: summary.clone(),
+                    timestamp_ms: Some(now_millis()),
+                },
+            );
+            Ok::<(), anyhow::Error>(())
+        })?;
+        self.request_goal_pause(&format!("{kind} review requested: {summary}"))?;
+        Ok(format!(
+            "{kind} request recorded and the goal will pause for human review"
+        ))
     }
 
     fn ask_user(&mut self, question: &str) -> Result<String> {
@@ -1714,6 +2623,8 @@ impl EventSink for WebEventSink {
                     &session.usage_records,
                     session.workflow.clone(),
                     session.completed_workflows.clone(),
+                    session.goal.clone(),
+                    session.completed_goals.clone(),
                 );
             }
             self.state.update_sleep_prevention_working(false);
@@ -1766,6 +2677,8 @@ fn dispatch_next_session(state: AppState) {
                         Arc::clone(&session.usage_records),
                         session.workflow.clone(),
                         session.completed_workflows.clone(),
+                        session.goal.clone(),
+                        session.completed_goals.clone(),
                     )),
                     true,
                 )
@@ -1788,6 +2701,8 @@ fn dispatch_next_session(state: AppState) {
             usage_records,
             workflow,
             completed_workflows,
+            goal,
+            completed_goals,
         ) = next;
         persist_session_snapshot(
             &session_id,
@@ -1799,6 +2714,8 @@ fn dispatch_next_session(state: AppState) {
             &usage_records,
             workflow,
             completed_workflows,
+            goal,
+            completed_goals,
         );
         spawn_agent_run(state, session_id, request);
     });
@@ -1813,6 +2730,9 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             usage_records,
             workflow,
             completed_workflows,
+            goal,
+            completed_goals,
+            pause_token,
             cancel_token,
         ) = {
             let sessions = state.sessions.lock().await;
@@ -1829,6 +2749,9 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 Arc::clone(&session.usage_records),
                 session.workflow.clone(),
                 session.completed_workflows.clone(),
+                session.goal.clone(),
+                session.completed_goals.clone(),
+                Arc::clone(&session.pause_token),
                 Arc::clone(&session.cancel_token),
             )
         };
@@ -1848,12 +2771,32 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 persisted_workdir: request_for_run.workdir.clone(),
                 workflow,
                 completed_workflows,
+                goal_deadline_ms: goal.as_ref().map(|checkpoint| {
+                    checkpoint.run.created_at_ms.saturating_add(
+                        checkpoint
+                            .run
+                            .budget
+                            .wall_time_minutes
+                            .saturating_mul(60_000),
+                    )
+                }),
+                goal,
+                completed_goals,
+                pause_token,
                 cancel_token,
             };
             run_agent_managed(request_for_run.clone(), &models_root, sink)
         })
         .await;
 
+        let goal_projects = if matches!(
+            &result,
+            Ok(Ok(run_result)) if run_result.requested_goal.is_some()
+        ) {
+            Some(state.projects.lock().await.clone())
+        } else {
+            None
+        };
         let mut terminate_environment = false;
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&session_id) {
@@ -1867,12 +2810,37 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                     session.request_template.repository_context =
                         run_result.repository_context.clone();
                     session.request_template.workspace_graph = run_result.workspace_graph.clone();
-                    session.branch = Some(run_result.branch);
-                    session.workdir = Some(run_result.focus_root);
-                    if let Some(checkpoint) = run_result.workflow.clone() {
+                    session.branch = Some(run_result.branch.clone());
+                    session.workdir = Some(run_result.focus_root.clone());
+                    if session.goal.is_some() {
+                        match apply_goal_run_result(session, &run_result) {
+                            Ok((status, terminate)) => {
+                                final_status = status;
+                                terminate_environment = terminate;
+                            }
+                            Err(error) => {
+                                final_status = SessionStatus::Failed;
+                                fail_active_goal_engine(
+                                    session,
+                                    format!("goal controller failed: {error:#}"),
+                                );
+                                publish_event(
+                                    &session.sender,
+                                    &session.history,
+                                    AgentEvent::Error {
+                                        summary: "Goal controller failed".to_string(),
+                                        message: format!("{error:#}"),
+                                        nesting_depth: None,
+                                        timestamp_ms: Some(now_millis()),
+                                    },
+                                );
+                            }
+                        }
+                    } else if let Some(checkpoint) = run_result.workflow.clone() {
                         if checkpoint.run.stage == crate::workflow::WorkflowStage::Blocked {
                             session.workflow = Some(checkpoint.clone());
                             session.request_template.workflow_checkpoint = Some(checkpoint);
+                            final_status = SessionStatus::Failed;
                         } else {
                             let summary = crate::workflow::WorkflowSummary::from(&checkpoint.run);
                             if session
@@ -1885,8 +2853,32 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                             session.workflow = None;
                             session.request_template.workflow_checkpoint = None;
                         }
-                    }
-                    if let Some(handoff) = run_result.requested_delivery {
+                    } else if let Some(proposal) = run_result.requested_goal {
+                        match activate_requested_goal(
+                            session,
+                            &session_id,
+                            proposal,
+                            goal_projects.as_deref().unwrap_or(&[]),
+                        ) {
+                            Ok(()) => {
+                                final_status = SessionStatus::Paused;
+                                session.paused = true;
+                            }
+                            Err(error) => {
+                                final_status = SessionStatus::Failed;
+                                publish_event(
+                                    &session.sender,
+                                    &session.history,
+                                    AgentEvent::Error {
+                                        summary: "Goal activation failed".to_string(),
+                                        message: format!("{error:#}"),
+                                        nesting_depth: None,
+                                        timestamp_ms: Some(now_millis()),
+                                    },
+                                );
+                            }
+                        }
+                    } else if let Some(handoff) = run_result.requested_delivery {
                         session.request_template.intent =
                             Some(crate::workflow::TurnIntent::Deliver);
                         session.request_template.task = handoff.task_summary.clone();
@@ -1894,19 +2886,24 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         session.request_template.workflow_stage = None;
                         session.task = session.request_template.task.clone();
                         final_status = SessionStatus::Queued;
-                    } else if run_result.termination_reason
-                        == crate::events::TerminationReason::Cancelled
+                    }
+                    if session.goal.is_none()
+                        && run_result.termination_reason
+                            == crate::events::TerminationReason::Cancelled
                     {
                         final_status = SessionStatus::Completed;
                         terminate_environment = true;
-                    } else if !run_result.reached_final
-                        || run_result.termination_reason != crate::events::TerminationReason::Final
+                    } else if session.goal.is_none()
+                        && (!run_result.reached_final
+                            || run_result.termination_reason
+                                != crate::events::TerminationReason::Final)
                     {
                         final_status = SessionStatus::Failed;
                     }
                 }
                 Ok(Err(err)) => {
                     final_status = SessionStatus::Failed;
+                    fail_active_goal_engine(session, format!("milestone runner failed: {err:#}"));
                     publish_event(
                         &session.sender,
                         &session.history,
@@ -1920,6 +2917,10 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 }
                 Err(err) => {
                     final_status = SessionStatus::Failed;
+                    fail_active_goal_engine(
+                        session,
+                        format!("milestone runner task failed: {err:#}"),
+                    );
                     publish_event(
                         &session.sender,
                         &session.history,
@@ -1933,6 +2934,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 }
             }
             session.cancel_token.store(false, Ordering::SeqCst);
+            session.pause_token.store(false, Ordering::SeqCst);
             session.status = final_status;
             persist_session_snapshot(
                 &session_id,
@@ -1944,6 +2946,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 &session.usage_records,
                 session.workflow.clone(),
                 session.completed_workflows.clone(),
+                session.goal.clone(),
+                session.completed_goals.clone(),
             );
         }
         drop(sessions);
@@ -1954,6 +2958,263 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
         }
         dispatch_next_session(state.clone());
     });
+}
+
+fn activate_requested_goal(
+    session: &mut SessionState,
+    session_id: &str,
+    proposal: crate::goal::GoalProposal,
+    registered_projects: &[ProjectEntry],
+) -> Result<()> {
+    let workdir = session
+        .workdir
+        .clone()
+        .context("goal activation requires a repository-backed session")?;
+    ensure_goal_workdir_registered(registered_projects, &workdir)?;
+    let now = now_millis();
+    let run = crate::goal::GoalRun::start(
+        format!("goal-{now}"),
+        session_id.to_string(),
+        proposal.objective.clone(),
+        proposal.criteria,
+        crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
+        None,
+        goal_policy_for_request(Some(&workdir))?,
+        workdir.to_string_lossy(),
+        now,
+    )?;
+    let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
+    session.task = proposal.objective.clone();
+    session.title = Some(proposal.objective.clone());
+    session.request_template.task = proposal.objective;
+    session.request_template.intent = Some(crate::workflow::TurnIntent::Discuss);
+    session.request_template.workflow_stage = None;
+    session.request_template.workflow_checkpoint = None;
+    session.goal = Some(checkpoint.clone());
+    session.pause_token.store(false, Ordering::SeqCst);
+    publish_goal_started(session, &checkpoint);
+    Ok(())
+}
+
+fn apply_goal_run_result(
+    session: &mut SessionState,
+    run_result: &crate::agent_core::AgentRunResult,
+) -> Result<(SessionStatus, bool)> {
+    let now = now_millis();
+    let mut run = session
+        .goal
+        .as_ref()
+        .context("goal session lost its active checkpoint")?
+        .run
+        .clone();
+    let cancel_requested = session.cancel_token.load(Ordering::SeqCst)
+        || run_result.termination_reason == crate::events::TerminationReason::Cancelled;
+    if cancel_requested {
+        run.cancel(now);
+        let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalCancelled {
+                goal_id: checkpoint.run.id.clone(),
+                checkpoint_sha256: checkpoint.sha256.clone(),
+                timestamp_ms: Some(now),
+            },
+        );
+        session.completed_goals.push(checkpoint);
+        session.goal = None;
+        session.request_template.workflow_checkpoint = None;
+        return Ok((SessionStatus::Completed, true));
+    }
+
+    let Some(workflow) = run_result.workflow.clone() else {
+        run.fail_external(
+            crate::goal::GoalOutcome::EngineError,
+            format!(
+                "milestone runner ended without a workflow checkpoint: {}",
+                run_result.termination_reason
+            ),
+            now,
+        );
+        let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
+        publish_goal_failed(session, &checkpoint);
+        session.completed_goals.push(checkpoint);
+        session.goal = None;
+        return Ok((SessionStatus::Failed, false));
+    };
+
+    if run.wall_time_exhausted(now) && !workflow.run.stage.is_terminal() {
+        run.checkpoint_active_workflow(workflow, now)?;
+        run.fail_external(
+            crate::goal::GoalOutcome::BudgetExhausted,
+            "goal wall-time budget was reached at a safe workflow boundary",
+            now,
+        );
+        let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
+        publish_goal_failed(session, &checkpoint);
+        session.completed_goals.push(checkpoint);
+        session.goal = None;
+        session.request_template.workflow_checkpoint = None;
+        return Ok((SessionStatus::Failed, false));
+    }
+
+    if run.pause_requested && !workflow.run.stage.is_terminal() {
+        run.checkpoint_active_workflow(workflow, now)?;
+        run.pause_at_boundary(now)?;
+        let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
+        publish_event(
+            &session.sender,
+            &session.history,
+            AgentEvent::GoalPaused {
+                goal_id: checkpoint.run.id.clone(),
+                timestamp_ms: Some(now),
+            },
+        );
+        session.goal = Some(checkpoint);
+        session.request_template.workflow_checkpoint = None;
+        session.paused = true;
+        return Ok((SessionStatus::Paused, false));
+    }
+
+    if workflow.run.stage == crate::workflow::WorkflowStage::Blocked {
+        let reason = workflow
+            .run
+            .blocked_reason
+            .clone()
+            .unwrap_or_else(|| "strict milestone workflow is blocked".to_string());
+        run.block_active_workflow(workflow, reason, now)?;
+        session.goal = Some(crate::goal::GoalCheckpoint::new(run)?);
+        session.request_template.workflow_checkpoint = None;
+        session.paused = true;
+        return Ok((SessionStatus::Paused, false));
+    }
+
+    let milestone_id = run
+        .active_milestone_id
+        .clone()
+        .context("goal workflow completed without an active milestone")?;
+    let workflow_id = workflow.run.id.clone();
+    run.finish_active_workflow(workflow, now)?;
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::GoalMilestoneCompleted {
+            goal_id: run.id.clone(),
+            milestone_id,
+            workflow_id,
+            timestamp_ms: Some(now),
+        },
+    );
+    let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
+    match checkpoint.run.stage {
+        crate::goal::GoalStage::RunningMilestone => {
+            configure_goal_milestone_request(session, &checkpoint.run)?;
+            publish_current_goal_milestone(session, &checkpoint.run);
+            session.goal = Some(checkpoint);
+            session.paused = false;
+            Ok((SessionStatus::Queued, false))
+        }
+        crate::goal::GoalStage::Paused => {
+            publish_event(
+                &session.sender,
+                &session.history,
+                AgentEvent::GoalPaused {
+                    goal_id: checkpoint.run.id.clone(),
+                    timestamp_ms: Some(now),
+                },
+            );
+            session.goal = Some(checkpoint);
+            session.paused = true;
+            session.request_template.workflow_checkpoint = None;
+            Ok((SessionStatus::Paused, false))
+        }
+        crate::goal::GoalStage::AwaitingUserReview => {
+            publish_event(
+                &session.sender,
+                &session.history,
+                AgentEvent::GoalReadyForReview {
+                    goal_id: checkpoint.run.id.clone(),
+                    checkpoint_sha256: checkpoint.sha256.clone(),
+                    timestamp_ms: Some(now),
+                },
+            );
+            session.goal = Some(checkpoint);
+            session.paused = true;
+            session.request_template.workflow_checkpoint = None;
+            Ok((SessionStatus::Paused, false))
+        }
+        crate::goal::GoalStage::Completed => {
+            let basis = checkpoint
+                .run
+                .completion_basis
+                .unwrap_or(crate::goal::GoalCompletionBasis::MachineVerified);
+            publish_event(
+                &session.sender,
+                &session.history,
+                AgentEvent::GoalCompleted {
+                    goal_id: checkpoint.run.id.clone(),
+                    outcome: crate::goal::GoalOutcome::Complete,
+                    completion_basis: basis,
+                    checkpoint_sha256: checkpoint.sha256.clone(),
+                    timestamp_ms: Some(now),
+                },
+            );
+            session.completed_goals.push(checkpoint);
+            session.goal = None;
+            session.request_template.workflow_checkpoint = None;
+            Ok((SessionStatus::Completed, false))
+        }
+        crate::goal::GoalStage::Failed => {
+            publish_goal_failed(session, &checkpoint);
+            session.completed_goals.push(checkpoint);
+            session.goal = None;
+            session.request_template.workflow_checkpoint = None;
+            Ok((SessionStatus::Failed, false))
+        }
+        stage => {
+            session.goal = Some(checkpoint);
+            bail!("goal controller produced unsupported post-workflow stage {stage:?}")
+        }
+    }
+}
+
+fn fail_active_goal_engine(session: &mut SessionState, reason: String) {
+    let Some(checkpoint) = session.goal.take() else {
+        return;
+    };
+    let mut run = checkpoint.run;
+    run.fail_external(crate::goal::GoalOutcome::EngineError, reason, now_millis());
+    match crate::goal::GoalCheckpoint::new(run) {
+        Ok(checkpoint) => {
+            publish_goal_failed(session, &checkpoint);
+            session.completed_goals.push(checkpoint);
+            session.request_template.workflow_checkpoint = None;
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to terminalize goal after controller error");
+        }
+    }
+}
+
+fn publish_goal_failed(session: &SessionState, checkpoint: &crate::goal::GoalCheckpoint) {
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::GoalFailed {
+            goal_id: checkpoint.run.id.clone(),
+            outcome: checkpoint
+                .run
+                .outcome
+                .unwrap_or(crate::goal::GoalOutcome::EngineError),
+            reason: checkpoint
+                .run
+                .blocked_reason
+                .clone()
+                .unwrap_or_else(|| "goal failed".to_string()),
+            checkpoint_sha256: checkpoint.sha256.clone(),
+            timestamp_ms: Some(now_millis()),
+        },
+    );
 }
 
 async fn session_events(
@@ -2032,6 +3293,70 @@ async fn handle_rpc_connection(
             let params: StartSessionRequest = serde_json::from_value(request.params)?;
             let result = start_session_inner(state, defaults, params).await?;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
+        }
+        "pb.goal.start" => {
+            let params: StartGoalRequest = serde_json::from_value(request.params)?;
+            match start_goal_inner(state, defaults, params).await {
+                Ok(result) => write_rpc_response(reader.get_mut(), request.id, result).await?,
+                Err(err) => write_rpc_error(reader.get_mut(), request.id, err.to_string()).await?,
+            }
+        }
+        "pb.goal.get" => {
+            let params: serde_json::Value = request.params;
+            let goal_id = params
+                .get("goal_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing goal_id"))?
+                .to_string();
+            match get_goal(Path(goal_id), State((state, defaults))).await {
+                Ok(Json(result)) => {
+                    write_rpc_response(reader.get_mut(), request.id, result).await?
+                }
+                Err(status) => {
+                    write_rpc_error(
+                        reader.get_mut(),
+                        request.id,
+                        format!("goal request failed with HTTP status {}", status.as_u16()),
+                    )
+                    .await?
+                }
+            }
+        }
+        "pb.goal.pause" | "pb.goal.resume" | "pb.goal.cancel" | "pb.goal.accept" => {
+            let params: GoalRpcMutationRequest = serde_json::from_value(request.params)?;
+            let goal_id = params.goal_id;
+            let digest = GoalDigestRequest {
+                goal_sha256: params.goal_sha256,
+                plan_sha256: params.plan_sha256,
+            };
+            let result = match request.method.as_str() {
+                "pb.goal.pause" => {
+                    pause_goal(Path(goal_id), State((state, defaults)), Json(digest)).await
+                }
+                "pb.goal.resume" => {
+                    resume_goal(Path(goal_id), State((state, defaults)), Json(digest)).await
+                }
+                "pb.goal.cancel" => {
+                    cancel_goal(Path(goal_id), State((state, defaults)), Json(digest)).await
+                }
+                "pb.goal.accept" => {
+                    accept_goal(Path(goal_id), State((state, defaults)), Json(digest)).await
+                }
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(Json(result)) => {
+                    write_rpc_response(reader.get_mut(), request.id, result).await?
+                }
+                Err(status) => {
+                    write_rpc_error(
+                        reader.get_mut(),
+                        request.id,
+                        format!("goal request failed with HTTP status {}", status.as_u16()),
+                    )
+                    .await?
+                }
+            }
         }
         "pb.session.list" => {
             let result = session_list_snapshot(&state).await;
@@ -2325,6 +3650,9 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
             usage_records: Arc::new(StdMutex::new(usage_records)),
             workflow: persisted.workflow,
             completed_workflows: persisted.completed_workflows,
+            goal: persisted.goal,
+            completed_goals: persisted.completed_goals,
+            pause_token: Arc::new(AtomicBool::new(false)),
             cancel_token: Arc::new(AtomicBool::new(false)),
             updated_at_ms: persisted.updated_at_ms,
         },
@@ -2349,6 +3677,8 @@ fn persist_session_snapshot(
     usage_records: &StdMutex<Vec<SessionMetricsSnapshot>>,
     workflow: Option<crate::workflow::WorkflowCheckpoint>,
     completed_workflows: Vec<crate::workflow::WorkflowSummary>,
+    goal: Option<crate::goal::GoalCheckpoint>,
+    completed_goals: Vec<crate::goal::GoalCheckpoint>,
 ) {
     let events = history
         .lock()
@@ -2373,9 +3703,27 @@ fn persist_session_snapshot(
     }
     persisted.workflow = workflow;
     persisted.completed_workflows = completed_workflows;
+    persisted.goal = goal;
+    persisted.completed_goals = completed_goals;
     if let Err(err) = session_store::save_session(&persisted) {
         eprintln!("failed to persist pb session {session_id}: {err:#}");
     }
+}
+
+fn persist_live_session(session_id: &str, session: &SessionState) {
+    persist_session_snapshot(
+        session_id,
+        &session.request_template,
+        session.branch.clone(),
+        session.workdir.clone(),
+        session.status,
+        &session.history,
+        &session.usage_records,
+        session.workflow.clone(),
+        session.completed_workflows.clone(),
+        session.goal.clone(),
+        session.completed_goals.clone(),
+    );
 }
 
 fn combined_metrics(records: &[SessionMetricsSnapshot]) -> Option<SessionMetricsSnapshot> {
@@ -2396,6 +3744,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
         .iter()
         .map(|(session_id, session)| {
             let workflow = latest_workflow_summary(session);
+            let goal = latest_goal_checkpoint(session);
             SessionListItem {
                 session_id: session_id.clone(),
                 task: session.task.clone(),
@@ -2417,6 +3766,8 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
                 workflow_stage: workflow.as_ref().map(|workflow| workflow.stage),
                 workflow_outcome: workflow.as_ref().and_then(|workflow| workflow.outcome),
                 strict_workflow: strict_workflow_enabled(session),
+                goal: goal.map(|checkpoint| crate::goal::GoalSummary::from(&checkpoint.run)),
+                active_goal: session.goal.is_some(),
             }
         })
         .collect::<Vec<_>>();
@@ -2447,6 +3798,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         })
         .unwrap_or_default();
     let workflow = latest_workflow_summary(session);
+    let goal = latest_goal_checkpoint(session).cloned();
     Some(SessionDetails {
         session_id: id.to_string(),
         task: session.task.clone(),
@@ -2468,6 +3820,8 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         usage_records: session_usage_records(session),
         workflow,
         strict_workflow: strict_workflow_enabled(session),
+        goal,
+        active_goal: session.goal.is_some(),
     })
 }
 
@@ -2532,6 +3886,14 @@ fn workflow_policy_for_request(
     } else {
         crate::workflow::WorkflowConfigDocument::default().compile()
     }
+}
+
+fn goal_policy_for_request(
+    workdir: Option<&std::path::Path>,
+) -> Result<crate::goal::CompiledGoalPolicy> {
+    let workdir = workdir.context("goal mode requires a repository")?;
+    let root = crate::agent_core::find_git_root(workdir).unwrap_or_else(|| workdir.to_path_buf());
+    crate::goal::GoalConfigDocument::load_or_default(&root)
 }
 
 fn delivery_handoff_for_turn(
@@ -2669,6 +4031,7 @@ mod workflow_tests {
             prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
             session_id: "session-web-workflow".to_string(),
             attachments: Vec::new(),
+            goal_context: None,
             contract: None,
         }
     }
@@ -2840,5 +4203,148 @@ mod workflow_tests {
                     }
                 ))
         );
+    }
+
+    #[tokio::test]
+    async fn goal_start_projects_approval_state_and_rejects_stale_mutations() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            projects: Arc::new(Mutex::new(vec![ProjectEntry {
+                name: "test".to_string(),
+                path: repo.path().to_string_lossy().into_owned(),
+                repository_root: None,
+                notify_on_finish: false,
+            }])),
+            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+        };
+        let response = start_goal_inner(
+            state.clone(),
+            request(repo.path()),
+            StartGoalRequest {
+                session_id: None,
+                objective: "Ship durable goals".to_string(),
+                criteria: vec![crate::goal::GoalCriterionInput {
+                    text: "Persist checkpoints".to_string(),
+                    verifier: crate::goal::GoalVerifier::ReviewRequired,
+                }],
+                continuation: crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                budget: None,
+                workdir: Some(repo.path().to_string_lossy().into_owned()),
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let details = session_details_snapshot(&state, &response.session_id)
+            .await
+            .unwrap();
+        assert!(details.active_goal);
+        assert_eq!(details.status, SessionStatus::Paused);
+        let goal = details.goal.unwrap();
+        assert_eq!(goal.run.stage, crate::goal::GoalStage::AwaitingPlanApproval);
+        assert_eq!(goal.run.budget, crate::goal::GoalBudget::standard());
+        assert_eq!(goal.sha256, response.goal_sha256);
+
+        let stale = mutate_active_goal(&state, &response.goal_id, "stale", |_, _| Ok(())).await;
+        assert_eq!(stale.unwrap_err(), StatusCode::CONFLICT);
+        let unchanged = get_goal(Path(response.goal_id), State((state, request(repo.path()))))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(unchanged.sha256, response.goal_sha256);
+    }
+
+    #[tokio::test]
+    async fn initial_goal_draft_can_change_before_approval_and_cancel_archives_it() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            projects: Arc::new(Mutex::new(vec![ProjectEntry {
+                name: "test".to_string(),
+                path: repo.path().to_string_lossy().into_owned(),
+                repository_root: None,
+                notify_on_finish: false,
+            }])),
+            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+        };
+        let defaults = request(repo.path());
+        let started = start_goal_inner(
+            state.clone(),
+            defaults.clone(),
+            StartGoalRequest {
+                session_id: None,
+                objective: "Original goal".to_string(),
+                criteria: Vec::new(),
+                continuation: crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                budget: None,
+                workdir: Some(repo.path().to_string_lossy().into_owned()),
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+        let revised = revise_goal_draft(
+            Path(started.goal_id.clone()),
+            State((state.clone(), defaults.clone())),
+            Json(GoalAmendmentRequest {
+                goal_sha256: started.goal_sha256.clone(),
+                objective: "Revised goal".to_string(),
+                criteria: vec![crate::goal::GoalCriterionInput {
+                    text: "Revised evidence".to_string(),
+                    verifier: crate::goal::GoalVerifier::ReviewRequired,
+                }],
+                continuation: crate::goal::GoalContinuationPolicy::ManualMilestones,
+                budget: Some(crate::goal::GoalBudget::standard()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_ne!(revised.goal_sha256, started.goal_sha256);
+
+        let cancelled = cancel_goal(
+            Path(started.goal_id.clone()),
+            State((state.clone(), defaults.clone())),
+            Json(GoalDigestRequest {
+                goal_sha256: revised.goal_sha256,
+                plan_sha256: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let details = session_details_snapshot(&state, &cancelled.session_id)
+            .await
+            .unwrap();
+        assert!(!details.active_goal);
+        assert_eq!(details.status, SessionStatus::Completed);
+        let archived = get_goal(Path(started.goal_id), State((state, defaults)))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(archived.run.stage, crate::goal::GoalStage::Cancelled);
+        assert_eq!(archived.run.objective, "Revised goal");
     }
 }

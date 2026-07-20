@@ -26,6 +26,11 @@ Discussion is read-only. Delivery starts only from explicit Build intent in the 
 delivery-oriented CLI entry point such as `pb queue`. A discussion can propose work but cannot
 silently promote itself.
 
+Goal creation is a separate explicit lifecycle action, not a third serialized `TurnIntent`. A
+discussion model may propose a Goal. Only the user's Goal action, the Goal API/CLI, or an explicit
+Auto turn citing its exact current turn can create one, and creation still stops for exact plan
+approval. Project configuration cannot activate a Goal or choose automatic continuation.
+
 When planning discovers a materially missing choice, it may ask the user. The answer becomes part of
 the task contract. Guessing would make progress faster at the cost of changing ownership of the
 decision, so the workflow pauses instead.
@@ -58,6 +63,17 @@ There are three distinct claims:
 | Model final | The model reached a response it considers final. Useful, but not external verification. |
 | Workflow Ready | pb accepted the required plan, current checks and current review, then completed the local workflow. |
 | Acceptance satisfied | An explicitly supplied harness contract passed its allowed-path, mutation, check, commit, and completion gates. |
+
+Goal mode adds two higher-level claims without weakening those three:
+
+| Claim | Meaning |
+| --- | --- |
+| Goal ready for review | Every current criterion has strict-workflow evidence, but at least one criterion is prose or explicitly user-owned. |
+| Goal complete | Every current criterion is machine-verified, or the user accepted the exact current Goal checkpoint. |
+
+A workflow Ready result is evidence for a criterion; it is not by itself permission to call a
+multi-milestone Goal complete. A reviewer model's prose never converts a subjective criterion into
+machine verification.
 
 The hidden harness surface can receive a trusted JSON contract from outside its scratch workspace.
 It is parsed before model loading and remains the source of task-specific acceptance facts. Without
@@ -92,11 +108,26 @@ fingerprints are unchanged, even if an intervening action parses but then fails.
 transition or executed tool result resets that sequence; a truncated file-write payload is never
 treated as a partial file.
 
+Goal budgets apply across all child workflows and do not reset between milestones, pause/resume, or
+amendments. A project ceiling may narrow a user's request. A model can request budget review but
+cannot apply an increase. Budget exhaustion is reported as a typed stopped outcome, never as
+completion.
+
 ## Persistence contract
 
 Workflow checkpoints preserve structured artifacts, counters, fingerprints, and terminal state.
 After a service restart, unfinished daemon sessions restore as paused. The user chooses whether to
 resume them; pb does not continue mutation merely because a process came back.
+
+Goal checkpoints add the accepted objective, criteria, plan versions, retired criteria, milestone
+and child-workflow evidence, total counters, authority and policy hashes, decisions, and terminal
+basis. Mutating HTTP/RPC calls carry the current Goal digest; stale approval, pause, edit, cancel, or
+accept requests conflict without altering state. A running Goal restores paused. A Goal already
+waiting for initial plan approval or final user acceptance remains in that exact review state.
+
+Stopping a Goal is preservation, not rollback: managed commits, current workspace changes, events,
+and evidence remain. Editing after work begins similarly cannot rewrite completed history; it
+supersedes only unfinished plan material after the replacement digest is approved.
 
 ## Publication contract
 

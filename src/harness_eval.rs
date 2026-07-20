@@ -32,6 +32,28 @@ pub struct ControlFixtureCorpus {
     #[serde(default)]
     pub small_model_fixtures: Vec<String>,
     pub workflow_fixtures: Vec<WorkflowControlFixture>,
+    #[serde(default)]
+    pub goal_fixtures: Vec<GoalControlFixture>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalControlFixture {
+    pub id: String,
+    pub hypothesis: String,
+    pub assertion: GoalControlAssertion,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalControlAssertion {
+    ExactPlanApproval,
+    ModelToolAuthorityBound,
+    SequentialMilestones,
+    PauseCheckpointResume,
+    AmendmentPreservesEvidence,
+    CompletionBasisBound,
+    BudgetAndCancellationAccounting,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +249,30 @@ pub struct HarnessEvalToolCall {
 pub struct ControlFixtureResult {
     pub id: String,
     #[serde(default)]
+    pub strict_goal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_assertion_passed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_stage: Option<crate::goal::GoalStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_outcome: Option<crate::goal::GoalOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_completion_basis: Option<crate::goal::GoalCompletionBasis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_checkpoint_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_plan_sha256: Option<String>,
+    #[serde(default)]
+    pub goal_completed_milestones: usize,
+    #[serde(default)]
+    pub goal_total_milestones: usize,
+    #[serde(default)]
+    pub goal_workflows: usize,
+    #[serde(default)]
+    pub goal_model_invocations: usize,
+    #[serde(default)]
+    pub goal_generated_tokens: usize,
+    #[serde(default)]
     pub strict_workflow: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_assertion_passed: Option<bool>,
@@ -368,6 +414,20 @@ fn parse_control_fixture_corpus(contents: &str) -> Result<ControlFixtureCorpus> 
             bail!("duplicate harness control fixture id '{}'", fixture.id);
         }
     }
+    if corpus.goal_fixtures.len() != 7 {
+        bail!(
+            "harness Goal fixture corpus must contain the 7 required assertions; found {}",
+            corpus.goal_fixtures.len()
+        );
+    }
+    for fixture in &corpus.goal_fixtures {
+        if fixture.id.trim().is_empty() || fixture.hypothesis.trim().is_empty() {
+            bail!("harness Goal fixture id and hypothesis must not be empty");
+        }
+        if !ids.insert(fixture.id.as_str()) {
+            bail!("duplicate harness control fixture id '{}'", fixture.id);
+        }
+    }
     if corpus.small_model_fixtures.is_empty() {
         bail!("harness small-model fixture group must not be empty");
     }
@@ -429,6 +489,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
         session_id: format!("control-fixture-{}", fixture.id),
         attachments: Vec::new(),
+        goal_context: None,
         contract,
     };
     let completions = fixture
@@ -499,6 +560,7 @@ fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
         prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
         session_id: "workflow-fixture".to_string(),
         attachments: Vec::new(),
+        goal_context: None,
         contract: None,
     })
 }
@@ -1624,6 +1686,468 @@ fn fixture_workspace_graph(
     Ok((contract, workspace_graph))
 }
 
+#[derive(Default)]
+struct GoalAssertionObservation {
+    run: Option<crate::goal::GoalRun>,
+    checkpoint_sha256: Option<String>,
+    llm_invocations: usize,
+    tool_calls: usize,
+}
+
+fn goal_fixture_run(
+    criteria: Vec<crate::goal::GoalCriterionInput>,
+    continuation: crate::goal::GoalContinuationPolicy,
+    budget: Option<crate::goal::GoalBudget>,
+) -> Result<crate::goal::GoalRun> {
+    crate::goal::GoalRun::start(
+        "goal-control-fixture",
+        "goal-control-session",
+        "Qualify durable Goal control",
+        criteria,
+        continuation,
+        budget,
+        crate::goal::GoalConfigDocument::default().compile()?,
+        "/tmp/pb-goal-control-fixture",
+        1,
+    )
+}
+
+fn goal_criteria(
+    verifier: crate::goal::GoalVerifier,
+    count: usize,
+) -> Vec<crate::goal::GoalCriterionInput> {
+    (1..=count)
+        .map(|index| crate::goal::GoalCriterionInput {
+            text: format!("Satisfy bounded criterion {index}"),
+            verifier,
+        })
+        .collect()
+}
+
+fn goal_no_change_checkpoint(
+    id: &str,
+    usage: crate::workflow::WorkflowUsage,
+) -> Result<crate::workflow::WorkflowCheckpoint> {
+    let mut state = workflow_fixture_state()?;
+    state.run.id = id.to_string();
+    state
+        .run
+        .apply(crate::workflow::WorkflowEvent::UsageRecorded { usage })?;
+    let fingerprint = state
+        .run
+        .repository
+        .task_baseline
+        .content
+        .fingerprint
+        .clone();
+    state
+        .run
+        .apply(crate::workflow::WorkflowEvent::ImplementationSubmitted {
+            implementation: workflow_fixture_implementation(
+                &state.plan,
+                fingerprint.clone(),
+                true,
+            )?,
+        })?;
+    state
+        .run
+        .apply(crate::workflow::WorkflowEvent::ChecksPassed {
+            content_fingerprint: fingerprint,
+            selected_checks: Vec::new(),
+            evidence: crate::checks::CheckEvidenceLedger::default(),
+        })?;
+    crate::workflow::WorkflowCheckpoint::new(state.run)
+}
+
+fn execute_goal_assertion(assertion: GoalControlAssertion) -> Result<GoalAssertionObservation> {
+    use crate::goal::{
+        GoalCheckpoint, GoalCompletionBasis, GoalContinuationPolicy, GoalCriterionStatus,
+        GoalMilestoneStatus, GoalOutcome, GoalStage, GoalVerifier,
+    };
+
+    match assertion {
+        GoalControlAssertion::ExactPlanApproval => {
+            let mut run = goal_fixture_run(
+                goal_criteria(GoalVerifier::ReviewRequired, 2),
+                GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                None,
+            )?;
+            require_workflow_fixture(
+                run.approve_plan("stale-plan", 2).is_err()
+                    && run.stage == GoalStage::AwaitingPlanApproval,
+                "stale Goal plan approval changed controller state",
+            )?;
+            let plan = run.plan_sha256.clone();
+            run.approve_plan(&plan, 3)?;
+            require_workflow_fixture(
+                run.stage == GoalStage::RunningMilestone
+                    && run.active_milestone_id.is_some()
+                    && run
+                        .milestones
+                        .iter()
+                        .filter(|milestone| milestone.status == GoalMilestoneStatus::Running)
+                        .count()
+                        == 1,
+                "exact Goal approval did not start exactly one milestone",
+            )?;
+            let checkpoint = GoalCheckpoint::new(run.clone())?;
+            Ok(GoalAssertionObservation {
+                run: Some(run),
+                checkpoint_sha256: Some(checkpoint.sha256),
+                ..GoalAssertionObservation::default()
+            })
+        }
+        GoalControlAssertion::ModelToolAuthorityBound => {
+            let state = workflow_fixture_state()?;
+            let mut discuss = workflow_fixture_request(state.scratch.path())?;
+            discuss.intent = Some(crate::workflow::TurnIntent::Discuss);
+            discuss.max_steps = 2;
+            discuss.tool_allowlist =
+                Some(vec!["propose_goal".to_string(), "start_goal".to_string()]);
+            let proposed = run_scripted_agent_steps(
+                &discuss,
+                vec![
+                    workflow_tool_completion(
+                        "propose_goal",
+                        serde_json::json!({
+                            "objective": "Qualify Goal mode",
+                            "criteria": ["Keep activation explicit"]
+                        }),
+                    ),
+                    ScriptedCompletion {
+                        content:
+                            r#"{"type":"final","content":"The Goal still requires user review."}"#
+                                .to_string(),
+                        truncated: false,
+                    },
+                ],
+                state.scratch.path(),
+                &mut |_| {},
+            )?;
+            let mut auto = discuss.clone();
+            auto.intent = Some(crate::workflow::TurnIntent::Auto);
+            auto.turn_id = "goal-auto-current-turn".to_string();
+            auto.max_steps = 1;
+            let started = run_scripted_agent_steps(
+                &auto,
+                vec![workflow_tool_completion(
+                    "start_goal",
+                    serde_json::json!({
+                        "source_turn_id": "goal-auto-current-turn",
+                        "objective": "Qualify Goal mode",
+                        "criteria": ["Keep activation explicit"]
+                    }),
+                )],
+                state.scratch.path(),
+                &mut |_| {},
+            )?;
+            require_workflow_fixture(
+                proposed.goal_proposal.is_some()
+                    && proposed.requested_goal.is_none()
+                    && started.requested_goal.as_ref().is_some_and(|proposal| {
+                        proposal.source_turn_id == "goal-auto-current-turn"
+                    }),
+                "model Goal tools granted authority or lost exact-turn binding",
+            )?;
+            Ok(GoalAssertionObservation {
+                run: Some(goal_fixture_run(
+                    goal_criteria(GoalVerifier::ReviewRequired, 1),
+                    GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                    None,
+                )?),
+                llm_invocations: proposed.llm_invocations + started.llm_invocations,
+                tool_calls: proposed.tool_calls + started.tool_calls,
+                ..GoalAssertionObservation::default()
+            })
+        }
+        GoalControlAssertion::SequentialMilestones => {
+            let mut run = goal_fixture_run(
+                goal_criteria(GoalVerifier::WorkflowReady, 2),
+                GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                None,
+            )?;
+            let plan = run.plan_sha256.clone();
+            run.approve_plan(&plan, 2)?;
+            run.finish_active_workflow(
+                goal_no_change_checkpoint(
+                    "goal-sequential-1",
+                    crate::workflow::WorkflowUsage::default(),
+                )?,
+                3,
+            )?;
+            require_workflow_fixture(
+                run.stage == GoalStage::RunningMilestone
+                    && run.counters.workflows == 1
+                    && run
+                        .milestones
+                        .iter()
+                        .filter(|milestone| milestone.status == GoalMilestoneStatus::Running)
+                        .count()
+                        == 1,
+                "Goal did not advance sequentially after a Ready workflow",
+            )?;
+            run.finish_active_workflow(
+                goal_no_change_checkpoint(
+                    "goal-sequential-2",
+                    crate::workflow::WorkflowUsage::default(),
+                )?,
+                4,
+            )?;
+            require_workflow_fixture(
+                run.stage == GoalStage::Completed
+                    && run.completion_basis == Some(GoalCompletionBasis::MachineVerified)
+                    && run.counters.workflows == 2,
+                "machine-verifiable Goal did not close after all sequential milestones",
+            )?;
+            Ok(GoalAssertionObservation {
+                run: Some(run),
+                ..GoalAssertionObservation::default()
+            })
+        }
+        GoalControlAssertion::PauseCheckpointResume => {
+            let mut run = goal_fixture_run(
+                goal_criteria(GoalVerifier::ReviewRequired, 1),
+                GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                None,
+            )?;
+            let plan = run.plan_sha256.clone();
+            run.approve_plan(&plan, 2)?;
+            let state = workflow_fixture_state()?;
+            let mut workflow = state.run;
+            workflow.apply(crate::workflow::WorkflowEvent::UsageRecorded {
+                usage: crate::workflow::WorkflowUsage {
+                    model_invocations: 2,
+                    generated_tokens: 37,
+                    ..crate::workflow::WorkflowUsage::default()
+                },
+            })?;
+            run.checkpoint_active_workflow(crate::workflow::WorkflowCheckpoint::new(workflow)?, 3)?;
+            require_workflow_fixture(!run.request_pause(4)?, "active Goal paused mid-stage")?;
+            run.pause_at_boundary(5)?;
+            let checkpoint = GoalCheckpoint::new(run)?;
+            let before = checkpoint.run.effective_counters();
+            let encoded = serde_json::to_vec(&checkpoint)?;
+            let restored: GoalCheckpoint = serde_json::from_slice(&encoded)?;
+            restored.validate()?;
+            let mut run = restored.run;
+            run.resume(6)?;
+            require_workflow_fixture(
+                run.stage == GoalStage::RunningMilestone
+                    && run.effective_counters() == before
+                    && run
+                        .current_milestone()
+                        .and_then(|item| item.workflow.as_ref())
+                        .is_some(),
+                "Goal resume lost its workflow checkpoint or effective counters",
+            )?;
+            Ok(GoalAssertionObservation {
+                run: Some(run),
+                ..GoalAssertionObservation::default()
+            })
+        }
+        GoalControlAssertion::AmendmentPreservesEvidence => {
+            let mut run = goal_fixture_run(
+                goal_criteria(GoalVerifier::ReviewRequired, 1),
+                GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                None,
+            )?;
+            let plan = run.plan_sha256.clone();
+            run.approve_plan(&plan, 2)?;
+            run.finish_active_workflow(
+                goal_no_change_checkpoint(
+                    "goal-amendment-evidence",
+                    crate::workflow::WorkflowUsage::default(),
+                )?,
+                3,
+            )?;
+            let before = GoalCheckpoint::new(run.clone())?;
+            run.propose_amendment(
+                "goal-amendment-1",
+                before.sha256,
+                "Qualify durable Goal control with clearer wording",
+                goal_criteria(GoalVerifier::ReviewRequired, 1),
+                GoalContinuationPolicy::ManualMilestones,
+                None,
+                4,
+            )?;
+            let replacement = run
+                .pending_amendment
+                .as_ref()
+                .context("Goal amendment draft missing")?
+                .replacement_plan_sha256
+                .clone();
+            run.approve_amendment(&replacement, 5)?;
+            require_workflow_fixture(
+                run.stage == GoalStage::AwaitingUserReview
+                    && run.plan_version == 2
+                    && run.retired_criteria.len() == 1
+                    && run.criteria[0].status == GoalCriterionStatus::EvidenceReady
+                    && run.criteria[0]
+                        .evidence_ids
+                        .iter()
+                        .any(|evidence| evidence.starts_with("carry-forward:")),
+                "approved Goal amendment discarded compatible evidence or history",
+            )?;
+            Ok(GoalAssertionObservation {
+                run: Some(run),
+                ..GoalAssertionObservation::default()
+            })
+        }
+        GoalControlAssertion::CompletionBasisBound => {
+            let mut machine = goal_fixture_run(
+                goal_criteria(GoalVerifier::WorkflowReady, 1),
+                GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                None,
+            )?;
+            let plan = machine.plan_sha256.clone();
+            machine.approve_plan(&plan, 2)?;
+            machine.finish_active_workflow(
+                goal_no_change_checkpoint(
+                    "goal-machine-complete",
+                    crate::workflow::WorkflowUsage::default(),
+                )?,
+                3,
+            )?;
+            let mut reviewed = goal_fixture_run(
+                goal_criteria(GoalVerifier::ReviewRequired, 1),
+                GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                None,
+            )?;
+            let plan = reviewed.plan_sha256.clone();
+            reviewed.approve_plan(&plan, 2)?;
+            reviewed.finish_active_workflow(
+                goal_no_change_checkpoint(
+                    "goal-user-complete",
+                    crate::workflow::WorkflowUsage::default(),
+                )?,
+                3,
+            )?;
+            let checkpoint = GoalCheckpoint::new(reviewed.clone())?;
+            reviewed.accept(&checkpoint.sha256, &checkpoint.sha256, 4)?;
+            require_workflow_fixture(
+                machine.completion_basis == Some(GoalCompletionBasis::MachineVerified)
+                    && reviewed.completion_basis == Some(GoalCompletionBasis::UserAccepted)
+                    && reviewed.stage == GoalStage::Completed,
+                "Goal completion conflated machine evidence with explicit user acceptance",
+            )?;
+            Ok(GoalAssertionObservation {
+                run: Some(reviewed),
+                ..GoalAssertionObservation::default()
+            })
+        }
+        GoalControlAssertion::BudgetAndCancellationAccounting => {
+            let mut budget = crate::goal::GoalBudget::standard();
+            budget.total_model_invocations = 1;
+            let mut exhausted = goal_fixture_run(
+                goal_criteria(GoalVerifier::WorkflowReady, 2),
+                GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                Some(budget),
+            )?;
+            let plan = exhausted.plan_sha256.clone();
+            exhausted.approve_plan(&plan, 2)?;
+            exhausted.finish_active_workflow(
+                goal_no_change_checkpoint(
+                    "goal-budget-first",
+                    crate::workflow::WorkflowUsage {
+                        model_invocations: 1,
+                        generated_tokens: 10,
+                        ..crate::workflow::WorkflowUsage::default()
+                    },
+                )?,
+                3,
+            )?;
+            let mut cancelled = goal_fixture_run(
+                goal_criteria(GoalVerifier::ReviewRequired, 1),
+                GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                None,
+            )?;
+            let plan = cancelled.plan_sha256.clone();
+            cancelled.approve_plan(&plan, 2)?;
+            let state = workflow_fixture_state()?;
+            let mut workflow = state.run;
+            workflow.apply(crate::workflow::WorkflowEvent::UsageRecorded {
+                usage: crate::workflow::WorkflowUsage {
+                    model_invocations: 2,
+                    generated_tokens: 29,
+                    ..crate::workflow::WorkflowUsage::default()
+                },
+            })?;
+            cancelled.checkpoint_active_workflow(
+                crate::workflow::WorkflowCheckpoint::new(workflow)?,
+                3,
+            )?;
+            cancelled.cancel(4);
+            require_workflow_fixture(
+                exhausted.stage == GoalStage::Failed
+                    && exhausted.outcome == Some(GoalOutcome::BudgetExhausted)
+                    && exhausted.counters.model_invocations == 1
+                    && cancelled.stage == GoalStage::Cancelled
+                    && cancelled.counters.workflows == 1
+                    && cancelled.counters.model_invocations == 2
+                    && cancelled.effective_counters() == cancelled.counters,
+                "Goal budgets reset between milestones or cancellation double-counted usage",
+            )?;
+            Ok(GoalAssertionObservation {
+                run: Some(exhausted),
+                ..GoalAssertionObservation::default()
+            })
+        }
+    }
+}
+
+fn run_goal_control_fixture(fixture: &GoalControlFixture) -> Result<ControlFixtureResult> {
+    let execution = execute_goal_assertion(fixture.assertion);
+    let (passed, observation, diagnostic) = match execution {
+        Ok(observation) => (true, observation, None),
+        Err(error) => (
+            false,
+            GoalAssertionObservation::default(),
+            Some(format!("{error:#}")),
+        ),
+    };
+    let run = observation.run.as_ref();
+    let counters = run.map(crate::goal::GoalRun::effective_counters);
+    Ok(ControlFixtureResult {
+        id: fixture.id.clone(),
+        strict_goal: true,
+        goal_assertion_passed: Some(passed),
+        goal_stage: run.map(|run| run.stage),
+        goal_outcome: run.and_then(|run| run.outcome),
+        goal_completion_basis: run.and_then(|run| run.completion_basis),
+        goal_checkpoint_sha256: observation.checkpoint_sha256,
+        goal_plan_sha256: run.map(|run| run.plan_sha256.clone()),
+        goal_completed_milestones: run.map_or(0, |run| {
+            run.milestones
+                .iter()
+                .filter(|milestone| milestone.status.is_completed())
+                .count()
+        }),
+        goal_total_milestones: run.map_or(0, |run| {
+            run.milestones
+                .iter()
+                .filter(|milestone| !milestone.status.is_superseded())
+                .count()
+        }),
+        goal_workflows: counters.as_ref().map_or(0, |counters| counters.workflows),
+        goal_model_invocations: counters
+            .as_ref()
+            .map_or(0, |counters| counters.model_invocations),
+        goal_generated_tokens: counters
+            .as_ref()
+            .map_or(0, |counters| counters.generated_tokens),
+        reached_final: passed,
+        termination_reason: if passed {
+            "fixture_pass".to_string()
+        } else {
+            "fixture_failed".to_string()
+        },
+        llm_invocations: observation.llm_invocations,
+        tool_calls: observation.tool_calls,
+        artifact_quality: diagnostic,
+        ..ControlFixtureResult::default()
+    })
+}
+
 pub fn run_control_fixture_corpus() -> Result<Vec<ControlFixtureResult>> {
     let corpus = control_fixture_corpus()?;
     let mut results = corpus
@@ -1638,6 +2162,13 @@ pub fn run_control_fixture_corpus() -> Result<Vec<ControlFixtureResult>> {
             .map(run_workflow_control_fixture)
             .collect::<Result<Vec<_>>>()?,
     );
+    results.extend(
+        corpus
+            .goal_fixtures
+            .iter()
+            .map(run_goal_control_fixture)
+            .collect::<Result<Vec<_>>>()?,
+    );
     Ok(results)
 }
 
@@ -1645,8 +2176,11 @@ pub fn run_eval_command(args: HarnessEvalArgs) -> Result<()> {
     let corpus = control_fixture_corpus()?;
     let fixtures = selected_control_fixtures(&corpus, args.suite);
     let workflow_fixtures = selected_workflow_fixtures(&corpus, args.suite);
+    let goal_fixtures = selected_goal_fixtures(&corpus, args.suite);
     let (configuration, results) = match args.model.as_deref() {
-        Some(model) => run_real_model_corpus(&args, model, &fixtures, &workflow_fixtures)?,
+        Some(model) => {
+            run_real_model_corpus(&args, model, &fixtures, &workflow_fixtures, &goal_fixtures)?
+        }
         None => (
             scripted_configuration(args.suite),
             fixtures
@@ -1657,6 +2191,11 @@ pub fn run_eval_command(args: HarnessEvalArgs) -> Result<()> {
                         .iter()
                         .map(|fixture| run_workflow_control_fixture(fixture)),
                 )
+                .chain(
+                    goal_fixtures
+                        .iter()
+                        .map(|fixture| run_goal_control_fixture(fixture)),
+                )
                 .collect::<Result<Vec<_>>>()?,
         ),
     };
@@ -1664,6 +2203,7 @@ pub fn run_eval_command(args: HarnessEvalArgs) -> Result<()> {
         corpus.version,
         &fixtures,
         &workflow_fixtures,
+        &goal_fixtures,
         configuration,
         results,
     )?;
@@ -1715,6 +2255,16 @@ fn selected_workflow_fixtures(
     }
 }
 
+fn selected_goal_fixtures(
+    corpus: &ControlFixtureCorpus,
+    suite: HarnessEvalSuite,
+) -> Vec<&GoalControlFixture> {
+    match suite {
+        HarnessEvalSuite::Control => corpus.goal_fixtures.iter().collect(),
+        HarnessEvalSuite::SmallModel => Vec::new(),
+    }
+}
+
 fn scripted_configuration(suite: HarnessEvalSuite) -> HarnessEvalConfiguration {
     HarnessEvalConfiguration {
         mode: "scripted".to_string(),
@@ -1742,6 +2292,7 @@ fn run_real_model_corpus(
     model: &str,
     fixtures: &[&ControlFixture],
     workflow_fixtures: &[&WorkflowControlFixture],
+    goal_fixtures: &[&GoalControlFixture],
 ) -> Result<(HarnessEvalConfiguration, Vec<ControlFixtureResult>)> {
     let user_config = UserConfig::load()?;
     let models_root = args
@@ -1779,7 +2330,8 @@ fn run_real_model_corpus(
         workspace_config_sha256: None,
         executor_policy: Vec::new(),
     };
-    let mut results = Vec::with_capacity(fixtures.len() + workflow_fixtures.len());
+    let mut results =
+        Vec::with_capacity(fixtures.len() + workflow_fixtures.len() + goal_fixtures.len());
     for fixture in fixtures {
         results.push(run_real_model_fixture(
             fixture,
@@ -1789,6 +2341,9 @@ fn run_real_model_corpus(
     }
     for fixture in workflow_fixtures {
         results.push(run_workflow_control_fixture(fixture)?);
+    }
+    for fixture in goal_fixtures {
+        results.push(run_goal_control_fixture(fixture)?);
     }
     Ok((configuration, results))
 }
@@ -1859,6 +2414,7 @@ fn run_real_model_fixture(
         prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
         session_id: format!("harness-eval-{}", fixture.id),
         attachments: Vec::new(),
+        goal_context: None,
         contract,
     };
     let mut events = Vec::new();
@@ -1876,10 +2432,12 @@ fn build_eval_records(
 ) -> Result<Vec<HarnessEvalRecord>> {
     let fixtures = corpus.fixtures.iter().collect::<Vec<_>>();
     let workflow_fixtures = corpus.workflow_fixtures.iter().collect::<Vec<_>>();
+    let goal_fixtures = corpus.goal_fixtures.iter().collect::<Vec<_>>();
     build_selected_eval_records(
         corpus.version,
         &fixtures,
         &workflow_fixtures,
+        &goal_fixtures,
         configuration,
         results,
     )
@@ -1889,10 +2447,11 @@ fn build_selected_eval_records(
     fixture_version: u32,
     fixtures: &[&ControlFixture],
     workflow_fixtures: &[&WorkflowControlFixture],
+    goal_fixtures: &[&GoalControlFixture],
     configuration: HarnessEvalConfiguration,
     results: Vec<ControlFixtureResult>,
 ) -> Result<Vec<HarnessEvalRecord>> {
-    let expected_count = fixtures.len() + workflow_fixtures.len();
+    let expected_count = fixtures.len() + workflow_fixtures.len() + goal_fixtures.len();
     if results.len() != expected_count {
         bail!(
             "harness evaluation produced {} results for {} fixtures",
@@ -1940,6 +2499,35 @@ fn build_selected_eval_records(
         } else {
             vec![format!(
                 "workflow assertion failed: {}",
+                result
+                    .artifact_quality
+                    .as_deref()
+                    .unwrap_or("no diagnostic was recorded")
+            )]
+        };
+        records.push(HarnessEvalRecord {
+            schema_version: HARNESS_EVAL_SCHEMA_VERSION,
+            fixture_version,
+            configuration: configuration.clone(),
+            protocol_pass: protocol_failures.is_empty(),
+            protocol_failures,
+            result,
+        });
+    }
+    for fixture in goal_fixtures {
+        let result = results.next().context("missing Goal fixture result")?;
+        if fixture.id != result.id {
+            bail!(
+                "harness evaluation result order mismatch: expected {}, got {}",
+                fixture.id,
+                result.id
+            );
+        }
+        let protocol_failures = if result.goal_assertion_passed == Some(true) {
+            Vec::new()
+        } else {
+            vec![format!(
+                "Goal assertion failed: {}",
                 result
                     .artifact_quality
                     .as_deref()
@@ -2427,6 +3015,18 @@ fn summarize_fixture(
 
     Ok(ControlFixtureResult {
         id: fixture.id.clone(),
+        strict_goal: false,
+        goal_assertion_passed: None,
+        goal_stage: None,
+        goal_outcome: None,
+        goal_completion_basis: None,
+        goal_checkpoint_sha256: None,
+        goal_plan_sha256: None,
+        goal_completed_milestones: 0,
+        goal_total_milestones: 0,
+        goal_workflows: 0,
+        goal_model_invocations: 0,
+        goal_generated_tokens: 0,
         strict_workflow: false,
         workflow_assertion_passed: None,
         workflow_outcome: None,
@@ -2737,9 +3337,9 @@ mod tests {
             assert!(!observation.priority.trim().is_empty());
             assert!(!observation.evidence.trim().is_empty());
         }
-        assert_eq!(baseline.results.len(), actual.len());
         let protocol_actual = actual
             .iter()
+            .filter(|result| !result.strict_goal)
             .cloned()
             .map(|mut result| {
                 // The v3 control baseline predates additive S0 context observations. Keep its
@@ -2754,6 +3354,7 @@ mod tests {
                 result
             })
             .collect::<Vec<_>>();
+        assert_eq!(baseline.results.len(), protocol_actual.len());
         for (expected, observed) in baseline.results.iter().zip(&protocol_actual) {
             assert_eq!(
                 expected, observed,
@@ -2761,6 +3362,16 @@ mod tests {
                 expected.id
             );
         }
+        let goal_results = actual
+            .iter()
+            .filter(|result| result.strict_goal)
+            .collect::<Vec<_>>();
+        assert_eq!(goal_results.len(), 7);
+        assert!(
+            goal_results
+                .iter()
+                .all(|result| result.goal_assertion_passed == Some(true))
+        );
         for id in ["irrelevant_review_evidence", "check_then_mutation"] {
             let result = actual.iter().find(|result| result.id == id).unwrap();
             assert!(result.reached_final, "{id} emitted a final action");
@@ -2950,7 +3561,9 @@ mod tests {
         );
         let fixtures = selected_control_fixtures(&corpus, HarnessEvalSuite::SmallModel);
         let workflows = selected_workflow_fixtures(&corpus, HarnessEvalSuite::SmallModel);
+        let goals = selected_goal_fixtures(&corpus, HarnessEvalSuite::SmallModel);
         assert!(workflows.is_empty());
+        assert!(goals.is_empty());
         let results = fixtures
             .iter()
             .map(|fixture| run_control_fixture(fixture))
@@ -2960,6 +3573,7 @@ mod tests {
             corpus.version,
             &fixtures,
             &workflows,
+            &goals,
             scripted_configuration(HarnessEvalSuite::SmallModel),
             results,
         )

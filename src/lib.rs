@@ -35,6 +35,7 @@ pub mod environment;
 pub mod environment_lock;
 pub mod events;
 mod github_oauth;
+pub mod goal;
 pub mod handoff;
 pub mod harness;
 pub mod harness_contract;
@@ -92,6 +93,11 @@ pub enum Commands {
     Pull(PullArgs),
     /// Submit or attach to a daemon-backed session over the pb unix socket
     Queue(QueueArgs),
+    /// Start and control durable multi-milestone goals
+    Goal {
+        #[command(subcommand)]
+        command: GoalCommand,
+    },
     /// Start the web UI server
     Serve,
     /// Manage user-level configuration
@@ -151,6 +157,40 @@ pub enum SelfCommand {
     /// Refresh launchd service configuration after a self-update
     #[command(name = "refresh-service", hide = true)]
     RefreshService,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GoalCommand {
+    /// Create a goal and wait for plan approval
+    Start(GoalStartArgs),
+    /// Show durable goal state, milestone progress, and budgets
+    Status { goal_id: String },
+    /// Request a safe-boundary pause
+    Pause { goal_id: String },
+    /// Resume a paused or blocked goal
+    Resume { goal_id: String },
+    /// Stop a goal while preserving commits, workspace content, and evidence
+    Cancel { goal_id: String },
+    /// Accept the current Ready-for-review evidence
+    Accept { goal_id: String },
+}
+
+#[derive(Args, Debug)]
+pub struct GoalStartArgs {
+    /// Durable objective to pursue
+    pub objective: String,
+    /// Registered repository root; defaults to the nearest git repository
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+    /// Completion criterion; may be repeated
+    #[arg(long = "criterion")]
+    pub criteria: Vec<String>,
+    /// Ask before every milestone
+    #[arg(long, conflicts_with = "automatic")]
+    pub manual: bool,
+    /// Continue approved milestones automatically within limits
+    #[arg(long)]
+    pub automatic: bool,
 }
 
 #[derive(Args, Debug)]
@@ -475,6 +515,10 @@ pub struct HarnessAgentArgs {
     /// Trusted workflow policy TOML to validate before model loading
     #[arg(long, value_name = "PATH")]
     pub workflow_config: Option<PathBuf>,
+
+    /// Trusted read-only Goal model brief JSON used for bounded Goal-control experiments
+    #[arg(long, value_name = "PATH")]
+    pub goal_context: Option<PathBuf>,
 
     /// Model identifier; defaults to the configured model
     #[arg(long)]
@@ -973,6 +1017,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
         Commands::Pull(args) => pull_model(&args).await,
         Commands::Queue(args) => run_queue(args).await,
+        Commands::Goal { command } => run_goal_command(command).await,
         Commands::Serve => run_serve().await,
         Commands::Config { command } => run_config_command(command),
         Commands::Projects { command } => run_projects_command(command).await,
@@ -1027,6 +1072,7 @@ async fn run_serve() -> Result<()> {
         prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
         session_id: String::new(),
         attachments: Vec::new(),
+        goal_context: None,
         contract: None,
     };
     let server_args = web::ServeArgs {
@@ -1598,6 +1644,105 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_goal_command(command: GoalCommand) -> Result<()> {
+    let socket_path = daemon_client::default_socket_path();
+    match command {
+        GoalCommand::Start(args) => {
+            let workdir = args
+                .workdir
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|path| agent_core::find_git_root(&path))
+                })
+                .context(
+                    "goal start requires --workdir or a current directory inside a git repository",
+                )?;
+            let continuation = if args.manual {
+                goal::GoalContinuationPolicy::ManualMilestones
+            } else if args.automatic {
+                goal::GoalContinuationPolicy::AutomaticWithinLimits
+            } else {
+                goal::GoalContinuationPolicy::ReviewPlanThenAutomatic
+            };
+            let response = daemon_client::start_goal(
+                &socket_path,
+                web::StartGoalRequest {
+                    session_id: None,
+                    objective: args.objective,
+                    criteria: args
+                        .criteria
+                        .into_iter()
+                        .map(|text| goal::GoalCriterionInput {
+                            text,
+                            verifier: goal::GoalVerifier::ReviewRequired,
+                        })
+                        .collect(),
+                    continuation,
+                    budget: None,
+                    workdir: Some(workdir.to_string_lossy().into_owned()),
+                    model: None,
+                },
+            )
+            .await?;
+            println!(
+                "goal {} created in session {}; review and approve plan {}",
+                response.goal_id, response.session_id, response.goal_sha256
+            );
+        }
+        GoalCommand::Status { goal_id } => {
+            print_goal_status(&daemon_client::get_goal(&socket_path, goal_id).await?);
+        }
+        GoalCommand::Pause { goal_id } => {
+            let checkpoint = daemon_client::get_goal(&socket_path, goal_id.clone()).await?;
+            daemon_client::pause_goal(&socket_path, goal_id.clone(), checkpoint.sha256).await?;
+            println!("pause requested for goal {goal_id}");
+        }
+        GoalCommand::Resume { goal_id } => {
+            let checkpoint = daemon_client::get_goal(&socket_path, goal_id.clone()).await?;
+            daemon_client::resume_goal(&socket_path, goal_id.clone(), checkpoint.sha256).await?;
+            println!("resumed goal {goal_id}");
+        }
+        GoalCommand::Cancel { goal_id } => {
+            let checkpoint = daemon_client::get_goal(&socket_path, goal_id.clone()).await?;
+            daemon_client::cancel_goal(&socket_path, goal_id.clone(), checkpoint.sha256).await?;
+            println!("stopped goal {goal_id}; repository work was preserved");
+        }
+        GoalCommand::Accept { goal_id } => {
+            let checkpoint = daemon_client::get_goal(&socket_path, goal_id.clone()).await?;
+            daemon_client::accept_goal(&socket_path, goal_id.clone(), checkpoint.sha256).await?;
+            println!("accepted goal {goal_id}");
+        }
+    }
+    Ok(())
+}
+
+fn print_goal_status(checkpoint: &goal::GoalCheckpoint) {
+    let summary = goal::GoalSummary::from(&checkpoint.run);
+    println!(
+        "goal {}\t{:?}\t{}",
+        summary.id, summary.stage, summary.objective
+    );
+    println!(
+        "milestones\t{}/{}\nworkflows\t{}/{}\ntokens\t{}/{}",
+        summary.completed_milestones,
+        summary.total_milestones,
+        summary.workflows,
+        summary.workflow_limit,
+        summary.generated_tokens,
+        summary.generated_token_limit
+    );
+    if let Some(current) = summary.current_milestone_title {
+        println!("current\t{current}");
+    }
+    if checkpoint.run.stage == goal::GoalStage::AwaitingPlanApproval {
+        println!(
+            "plan\t{} (approval required in the Web UI/API)",
+            checkpoint.run.plan_sha256
+        );
+    }
 }
 
 fn run_self_install() -> Result<()> {

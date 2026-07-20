@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { PageShell } from "../components/PageShell";
 import { IntentControl } from "../components/IntentControl";
+import { GoalStartSheet } from "../components/GoalStartSheet";
 import {
   AttachmentButton,
   ImageAttachments,
@@ -11,18 +12,23 @@ import {
   SessionRows,
   UsageMetrics,
 } from "../components/SessionDashboard";
-import type { ProjectUsageStats, SessionAttachment, TurnIntent } from "../types";
+import type {
+  ComposerMode,
+  ProjectUsageStats,
+  SessionAttachment,
+} from "../types";
 import { relativeTime, usageStatsForToday } from "../lib/helpers";
 import { useProjectSessionData } from "../lib/hooks";
 import { metricEnergyJoules, metricRuntimeMs } from "../lib/energy";
 
 export function HomePage() {
   const [task, setTask] = useState("");
-  const [intent, setIntent] = useState<Exclude<TurnIntent, "auto">>("discuss");
+  const [intent, setIntent] = useState<ComposerMode>("discuss");
+  const [goalOpen, setGoalOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
   const [filter, setFilter] = useState<SessionFilter>("all");
-  const { sessions } = useProjectSessionData();
+  const { sessions, projects } = useProjectSessionData();
   const navigate = useNavigate();
 
   const counts = useMemo(() => sessionCounts(sessions), [sessions]);
@@ -56,12 +62,20 @@ export function HomePage() {
 
   const startSession = async () => {
     if (!task.trim()) return;
+    if (intent === "goal") {
+      setGoalOpen(true);
+      return;
+    }
     setIsSubmitting(true);
     try {
       const res = await fetch("/api/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task: task.trim(), intent, attachments: images }),
+        body: JSON.stringify({
+          task: task.trim(),
+          intent,
+          attachments: images,
+        }),
       });
       if (!res.ok) return;
       const data = (await res.json()) as { session_id: string };
@@ -106,7 +120,11 @@ export function HomePage() {
               <div className="composer-actions">
                 <div className="quick-actions">
                   <div className="quick-action-row">
-                    <IntentControl intent={intent} onChange={setIntent} disabled={isSubmitting} />
+                    <IntentControl
+                      intent={intent}
+                      onChange={setIntent}
+                      disabled={isSubmitting}
+                    />
                     <button
                       className="btn btn-light"
                       type="button"
@@ -139,7 +157,10 @@ export function HomePage() {
                     >
                       <i className="bi bi-tools"></i> Fix error
                     </button>
-                    <button className="btn btn-light optional-action" type="button">
+                    <button
+                      className="btn btn-light optional-action"
+                      type="button"
+                    >
                       <span>More</span>
                       <i className="bi bi-chevron-down"></i>
                     </button>
@@ -165,13 +186,15 @@ export function HomePage() {
               <h2>Recent sessions</h2>
               <span>{counts.all} total</span>
             </div>
-            {counts.all > 0 ? (
-              <SessionFilters
-                filter={filter}
-                counts={counts}
-                onFilterChange={setFilter}
-              />
-            ) : null}
+            {counts.all > 0
+              ? (
+                <SessionFilters
+                  filter={filter}
+                  counts={counts}
+                  onFilterChange={setFilter}
+                />
+              )
+              : null}
             <SessionRows
               sessions={visibleSessions}
               emptyText="No sessions match this filter."
@@ -218,6 +241,13 @@ export function HomePage() {
           </section>
         </aside>
       </div>
+      <GoalStartSheet
+        open={goalOpen}
+        initialObjective={task}
+        projects={projects}
+        onClose={() => setGoalOpen(false)}
+        onStarted={(sessionId) => navigate(`/sessions/${sessionId}`)}
+      />
     </PageShell>
   );
 }

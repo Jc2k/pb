@@ -213,8 +213,11 @@ impl StageCapabilities {
                 self.terminal_action == TerminalActionKind::SubmitImplementation
             }
             "submit_code_review" => self.terminal_action == TerminalActionKind::SubmitCodeReview,
-            "propose_delivery" | "start_delivery" => {
+            "propose_delivery" | "start_delivery" | "propose_goal" | "start_goal" => {
                 self.terminal_action == TerminalActionKind::DiscussFinal
+            }
+            "goal_status" | "goal_pause" | "goal_request_amendment" | "goal_request_budget" => {
+                self.terminal_action != TerminalActionKind::None
             }
             "git_commit" | "git_revert" => false,
             _ => false,

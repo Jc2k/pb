@@ -63,6 +63,24 @@ Step, invocation, token, advisory, plan, and repair budgets cap model-driven wor
 guard fingerprints repeated failed operations against unchanged workspace/evidence state and can
 block a call or terminate the run without spending another model turn.
 
+### Goal control cannot self-amplify
+
+Durable Goal mode adds a Rust-owned controller above strict workflows, not a broader model stage.
+`.pb/goal.toml` supplies only validated ceilings and cannot enable Auto, automatic continuation,
+network/path/tool expansion, secrets, or publication. The controller snapshots its policy and a
+local-repository/no-publication authority envelope into every hashed Goal checkpoint.
+
+Discussion `propose_goal` is read-only. `start_goal` is exposed only to the internal Auto intent,
+must cite the current harness turn, and can create only an awaiting-approval Goal. During a Goal,
+the model can read bounded status or request pause, amendment, or budget review. Those calls pause
+for controller/user handling; they cannot resume, cancel, accept, rewrite the Goal, apply a budget
+increase, or grant publishing authority.
+
+All mutating user/API operations use optimistic Goal-checkpoint digests. Initial and replacement
+plan approval also names the exact plan digest. Child workflows retain the ordinary stage
+capability matrix, managed commit boundary, fingerprints, and policy checks. Total invocation,
+token, workflow, milestone, and wall-time limits bind continuation across child workflows.
+
 ### Bounded model-source resolution
 
 FlashMoe does not let a model filename select arbitrary tensor behavior during inference. The
@@ -97,6 +115,7 @@ ephemeral workspaces are session-owned.
 | Web listener | Loopback by default. A non-loopback listener is not automatically protected by authentication or TLS and is advertised through Bonjour for wake-on-HTTP. |
 | Container runtime | Isolation depends on the selected runtime and host configuration. Persistent images/caches remain outside the ephemeral resource lifecycle. |
 | Publication | Local Ready evidence does not authorize a push, pull request, merge, or provider-side mutation. |
+| Goal automatic continuation | Explicit per-Goal user authority inside snapshotted totals. It does not approve new paths, integrations, network access, policy prompts, or publication. |
 
 ## Credentials
 

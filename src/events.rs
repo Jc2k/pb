@@ -406,6 +406,112 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    GoalProposed {
+        proposal_id: String,
+        source_turn_id: String,
+        objective: String,
+        criteria: Vec<crate::goal::GoalCriterionInput>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalStarted {
+        goal_id: String,
+        objective: String,
+        plan_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalPlanAwaitingApproval {
+        goal_id: String,
+        plan_sha256: String,
+        milestones: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalPlanApproved {
+        goal_id: String,
+        plan_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalMilestoneStarted {
+        goal_id: String,
+        milestone_id: String,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalMilestoneCompleted {
+        goal_id: String,
+        milestone_id: String,
+        workflow_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalPauseRequested {
+        goal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalPaused {
+        goal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalResumed {
+        goal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalAmendmentRequested {
+        goal_id: String,
+        amendment_id: String,
+        replacement_plan_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalChangeRequested {
+        goal_id: String,
+        kind: String,
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalAmendmentResolved {
+        goal_id: String,
+        amendment_id: String,
+        accepted: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalReadyForReview {
+        goal_id: String,
+        checkpoint_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalCompleted {
+        goal_id: String,
+        outcome: crate::goal::GoalOutcome,
+        completion_basis: crate::goal::GoalCompletionBasis,
+        checkpoint_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalFailed {
+        goal_id: String,
+        outcome: crate::goal::GoalOutcome,
+        reason: String,
+        checkpoint_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    GoalCancelled {
+        goal_id: String,
+        checkpoint_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     WorkflowStarted {
         workflow_id: String,
         source_turn_id: String,
@@ -855,6 +961,163 @@ impl EventEnvelope {
                     timestamp_ms: Some(now),
                 },
             },
+            AgentEvent::GoalProposed {
+                proposal_id,
+                source_turn_id,
+                objective,
+                criteria,
+                ..
+            } => Self::new(AgentEvent::GoalProposed {
+                proposal_id,
+                source_turn_id,
+                objective,
+                criteria,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalStarted {
+                goal_id,
+                objective,
+                plan_sha256,
+                ..
+            } => Self::new(AgentEvent::GoalStarted {
+                goal_id,
+                objective,
+                plan_sha256,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalPlanAwaitingApproval {
+                goal_id,
+                plan_sha256,
+                milestones,
+                ..
+            } => Self::new(AgentEvent::GoalPlanAwaitingApproval {
+                goal_id,
+                plan_sha256,
+                milestones,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalPlanApproved {
+                goal_id,
+                plan_sha256,
+                ..
+            } => Self::new(AgentEvent::GoalPlanApproved {
+                goal_id,
+                plan_sha256,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalMilestoneStarted {
+                goal_id,
+                milestone_id,
+                title,
+                ..
+            } => Self::new(AgentEvent::GoalMilestoneStarted {
+                goal_id,
+                milestone_id,
+                title,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalMilestoneCompleted {
+                goal_id,
+                milestone_id,
+                workflow_id,
+                ..
+            } => Self::new(AgentEvent::GoalMilestoneCompleted {
+                goal_id,
+                milestone_id,
+                workflow_id,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalPauseRequested { goal_id, .. } => {
+                Self::new(AgentEvent::GoalPauseRequested {
+                    goal_id,
+                    timestamp_ms: Some(now),
+                })
+            }
+            AgentEvent::GoalPaused { goal_id, .. } => Self::new(AgentEvent::GoalPaused {
+                goal_id,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalResumed { goal_id, .. } => Self::new(AgentEvent::GoalResumed {
+                goal_id,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalAmendmentRequested {
+                goal_id,
+                amendment_id,
+                replacement_plan_sha256,
+                ..
+            } => Self::new(AgentEvent::GoalAmendmentRequested {
+                goal_id,
+                amendment_id,
+                replacement_plan_sha256,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalChangeRequested {
+                goal_id,
+                kind,
+                summary,
+                ..
+            } => Self::new(AgentEvent::GoalChangeRequested {
+                goal_id,
+                kind,
+                summary,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalAmendmentResolved {
+                goal_id,
+                amendment_id,
+                accepted,
+                ..
+            } => Self::new(AgentEvent::GoalAmendmentResolved {
+                goal_id,
+                amendment_id,
+                accepted,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalReadyForReview {
+                goal_id,
+                checkpoint_sha256,
+                ..
+            } => Self::new(AgentEvent::GoalReadyForReview {
+                goal_id,
+                checkpoint_sha256,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalCompleted {
+                goal_id,
+                outcome,
+                completion_basis,
+                checkpoint_sha256,
+                ..
+            } => Self::new(AgentEvent::GoalCompleted {
+                goal_id,
+                outcome,
+                completion_basis,
+                checkpoint_sha256,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalFailed {
+                goal_id,
+                outcome,
+                reason,
+                checkpoint_sha256,
+                ..
+            } => Self::new(AgentEvent::GoalFailed {
+                goal_id,
+                outcome,
+                reason,
+                checkpoint_sha256,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::GoalCancelled {
+                goal_id,
+                checkpoint_sha256,
+                ..
+            } => Self::new(AgentEvent::GoalCancelled {
+                goal_id,
+                checkpoint_sha256,
+                timestamp_ms: Some(now),
+            }),
             AgentEvent::WorkflowStarted {
                 workflow_id,
                 source_turn_id,

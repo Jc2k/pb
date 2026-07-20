@@ -26,6 +26,56 @@ pub fn render_event(event: &AgentEvent) {
         AgentEvent::DeliveryProposed { task_summary, .. } => {
             print_header("delivery proposed", task_summary);
         }
+        AgentEvent::GoalProposed {
+            objective,
+            criteria,
+            ..
+        } => print_header(
+            "goal proposed",
+            &format!("{objective} ({} criteria)", criteria.len()),
+        ),
+        AgentEvent::GoalStarted { objective, .. } => print_header("goal", objective),
+        AgentEvent::GoalPlanAwaitingApproval { milestones, .. } => {
+            print_header(
+                "goal plan",
+                &format!("{milestones} milestones awaiting approval"),
+            );
+        }
+        AgentEvent::GoalPlanApproved { .. } => print_header("goal plan", "approved"),
+        AgentEvent::GoalMilestoneStarted { title, .. } => {
+            print_header("goal milestone", &format!("started: {title}"));
+        }
+        AgentEvent::GoalMilestoneCompleted { milestone_id, .. } => {
+            print_header("goal milestone", &format!("completed: {milestone_id}"));
+        }
+        AgentEvent::GoalPauseRequested { .. } => print_header("goal", "pause requested"),
+        AgentEvent::GoalPaused { .. } => print_header("goal", "paused"),
+        AgentEvent::GoalResumed { .. } => print_header("goal", "resumed"),
+        AgentEvent::GoalAmendmentRequested { amendment_id, .. } => {
+            print_header("goal amendment", &format!("review {amendment_id}"));
+        }
+        AgentEvent::GoalChangeRequested { kind, summary, .. } => {
+            print_header(&format!("goal {kind} request"), summary);
+        }
+        AgentEvent::GoalAmendmentResolved {
+            amendment_id,
+            accepted,
+            ..
+        } => print_header(
+            "goal amendment",
+            &format!(
+                "{amendment_id}: {}",
+                if *accepted { "accepted" } else { "discarded" }
+            ),
+        ),
+        AgentEvent::GoalReadyForReview { .. } => print_header("goal", "ready for review"),
+        AgentEvent::GoalCompleted {
+            completion_basis, ..
+        } => print_header("goal", &format!("completed: {completion_basis:?}")),
+        AgentEvent::GoalFailed {
+            outcome, reason, ..
+        } => print_header("goal", &format!("failed: {outcome:?}: {reason}")),
+        AgentEvent::GoalCancelled { .. } => print_header("goal", "cancelled"),
         AgentEvent::WorkflowStarted { workflow_id, .. } => {
             print_header("workflow", &format!("{workflow_id} started"));
         }

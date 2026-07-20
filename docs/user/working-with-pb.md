@@ -18,6 +18,10 @@ Discussion is useful when the important output is understanding:
 
 Only your explicit **Build** choice promotes a web conversation into the delivery workflow.
 
+A discussion may also offer a read-only Goal proposal. The proposal does not start repository work.
+You can review and edit it in the Goal setup sheet. The internal Auto intent may ask pb to create a
+Goal for the exact current turn, but the resulting milestone plan still waits for your approval.
+
 ## Build
 
 Use **Build** when the desired outcome is a repository change. A queue task is already explicit:
@@ -34,6 +38,69 @@ workflow.
 You may see pb pause for a planning question when a missing choice would materially change the
 work. Answering that question updates the user-owned contract; it does not hand the model a general
 permission to improvise.
+
+## Goal
+
+**Shipped.** Use **Goal** when one durable objective needs several sequential, bounded Build
+workflows. Goal is a controller above Build, not another model profile. It is available beside
+Discuss and Build on Home, Projects, and a finished session. The setup sheet asks for:
+
+- the objective and completion criteria;
+- whether pb asks before each milestone or continues an approved plan within limits;
+- a Compact, Standard, Extended, or custom total budget; and
+- the registered local repository. Goal mode never adds publishing authority.
+
+Creating a Goal produces a linear milestone plan and stops at **Review goal plan**. You may edit the
+draft, approve the exact displayed plan digest, or stop it. Every approved milestone runs the normal
+strict Build workflow, including planning, plan critique, implementation, affected checks, code
+review, and a managed local commit. Only one milestone and one child workflow run at a time.
+
+The web session keeps a textual Goal banner visible while the Goal is active. On a phone the banner
+becomes a compact sticky `Goal · state · progress` row; **Details** opens the same milestone,
+criterion, evidence, budget, Pause/Resume, edit, accept, and stop controls. Session lists also carry
+a Goal badge, so colour or activity animation is never the only mode indicator.
+
+You can use the CLI against the running service:
+
+```bash
+pb goal start "Ship the durable migration" --workdir /path/to/project \
+  --criterion "Old sessions restore" --criterion "Mobile controls remain usable"
+pb goal status GOAL_ID
+pb goal pause GOAL_ID
+pb goal resume GOAL_ID
+pb goal cancel GOAL_ID
+pb goal accept GOAL_ID
+```
+
+`start` defaults to reviewing the plan and then continuing within the selected limits. Pass
+`--manual` to stop between milestones or `--automatic` for explicit bounded automatic
+continuation. Plan approval and goal editing are available in the web UI and HTTP API.
+
+### Changing or stopping a Goal
+
+Before initial approval, **Edit goal** replaces the draft and creates a new plan digest. After work
+starts, **Pause and edit** records a pause request; pb finishes the current non-interruptible model
+or tool operation, persists the child workflow at the next safe boundary, and only then opens the
+editor. An accepted amendment creates a new plan version. Completed milestones, workflows, and
+criterion evidence remain in history, while unfinished milestones are marked superseded. Budget
+changes remain subject to `.pb/goal.toml` ceilings.
+
+**Stop goal** preserves commits, uncommitted workspace content, events, and evidence. It does not
+roll back repository work. A daemon restart likewise never silently resumes Goal mutation: active
+work restores paused and requires an explicit Resume.
+
+### How Goal mode ends
+
+- Criteria marked `workflow_ready` by an API client may reach **Complete** automatically when all
+  current strict-workflow evidence is Ready.
+- Ordinary prose criteria stop at **Goal ready for review**. **Accept goal** records explicit user
+  acceptance and ends the Goal.
+- A failed milestone, exhausted total budget, context/engine failure, or cancellation records a
+  distinct terminal outcome instead of claiming completion.
+
+After a durable terminal checkpoint, the normal Discuss/Build/Goal composer returns. The completed,
+stopped, or failed Goal remains visible in session history and details. Local completion still does
+not push, open a pull request, merge, or publish.
 
 ## Profiles
 

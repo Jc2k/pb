@@ -55,6 +55,74 @@ pub async fn start_session(
     request(socket_path, "pb.session.start", params).await
 }
 
+pub async fn start_goal(
+    socket_path: &PathBuf,
+    params: crate::web::StartGoalRequest,
+) -> Result<crate::web::GoalResponse> {
+    request(socket_path, "pb.goal.start", params).await
+}
+
+pub async fn get_goal(
+    socket_path: &PathBuf,
+    goal_id: String,
+) -> Result<crate::goal::GoalCheckpoint> {
+    request(
+        socket_path,
+        "pb.goal.get",
+        serde_json::json!({ "goal_id": goal_id }),
+    )
+    .await
+}
+
+async fn mutate_goal(
+    socket_path: &PathBuf,
+    method: &'static str,
+    goal_id: String,
+    goal_sha256: String,
+) -> Result<crate::web::GoalResponse> {
+    request(
+        socket_path,
+        method,
+        serde_json::json!({
+            "goal_id": goal_id,
+            "goal_sha256": goal_sha256,
+        }),
+    )
+    .await
+}
+
+pub async fn pause_goal(
+    socket_path: &PathBuf,
+    goal_id: String,
+    goal_sha256: String,
+) -> Result<crate::web::GoalResponse> {
+    mutate_goal(socket_path, "pb.goal.pause", goal_id, goal_sha256).await
+}
+
+pub async fn resume_goal(
+    socket_path: &PathBuf,
+    goal_id: String,
+    goal_sha256: String,
+) -> Result<crate::web::GoalResponse> {
+    mutate_goal(socket_path, "pb.goal.resume", goal_id, goal_sha256).await
+}
+
+pub async fn cancel_goal(
+    socket_path: &PathBuf,
+    goal_id: String,
+    goal_sha256: String,
+) -> Result<crate::web::GoalResponse> {
+    mutate_goal(socket_path, "pb.goal.cancel", goal_id, goal_sha256).await
+}
+
+pub async fn accept_goal(
+    socket_path: &PathBuf,
+    goal_id: String,
+    goal_sha256: String,
+) -> Result<crate::web::GoalResponse> {
+    mutate_goal(socket_path, "pb.goal.accept", goal_id, goal_sha256).await
+}
+
 pub async fn list_sessions(socket_path: &PathBuf) -> Result<Vec<SessionListItem>> {
     request(socket_path, "pb.session.list", serde_json::json!({})).await
 }

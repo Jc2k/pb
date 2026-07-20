@@ -45,6 +45,10 @@ pub struct PersistedSession {
     pub workflow: Option<crate::workflow::WorkflowCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_workflows: Vec<crate::workflow::WorkflowSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::goal::GoalCheckpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_goals: Vec<crate::goal::GoalCheckpoint>,
     pub events: Vec<EventEnvelope>,
 }
 
@@ -76,6 +80,8 @@ impl PersistedSession {
             usage_records,
             workflow: None,
             completed_workflows: Vec::new(),
+            goal: None,
+            completed_goals: Vec::new(),
             events: trim_events(events),
         }
     }
@@ -147,6 +153,25 @@ pub fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSe
     for note_ref in refs.lines().map(str::trim).filter(|line| !line.is_empty()) {
         match read_note(workspace_root, note_ref).and_then(|payload| parse_session(&payload)) {
             Ok(mut session) => {
+                if let Some(checkpoint) = session.goal.take() {
+                    let mut run = checkpoint.run;
+                    if matches!(
+                        run.stage,
+                        crate::goal::GoalStage::Planning
+                            | crate::goal::GoalStage::PlanReview
+                            | crate::goal::GoalStage::PlanRevision
+                            | crate::goal::GoalStage::RunningMilestone
+                            | crate::goal::GoalStage::Evaluating
+                    ) {
+                        if let Err(error) = run.pause_at_boundary(now_millis()) {
+                            eprintln!(
+                                "failed to pause restored goal '{}' from {note_ref}: {error:#}",
+                                run.id
+                            );
+                        }
+                    }
+                    session.goal = crate::goal::GoalCheckpoint::new(run).ok();
+                }
                 session.status = Some(
                     match session.status.unwrap_or({
                         if session.running {
@@ -200,6 +225,14 @@ fn parse_session(payload: &str) -> Result<PersistedSession> {
         });
     let mut session: PersistedSession =
         serde_json::from_value(value).context("failed to parse session note")?;
+    if let Some(goal) = session.goal.as_ref() {
+        goal.validate()
+            .context("active goal checkpoint is invalid")?;
+    }
+    for goal in &session.completed_goals {
+        goal.validate()
+            .context("completed goal checkpoint is invalid")?;
+    }
     session.request_template.legacy_prompt_owned_delivery = legacy_prompt_owned_delivery;
     Ok(session)
 }
@@ -388,6 +421,7 @@ mod tests {
             prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
             session_id: String::new(),
             attachments: Vec::new(),
+            goal_context: None,
             contract: None,
         }
     }
@@ -434,6 +468,84 @@ mod tests {
     fn session_note_ref_rejects_path_separators() {
         assert!(session_note_ref("session-123").is_ok());
         assert!(session_note_ref("../bad").is_err());
+    }
+
+    #[test]
+    fn restore_preserves_plan_approval_and_pauses_only_active_goal_work() {
+        let repo = init_repo();
+        let request = request(repo.path());
+        let make_run = |id: &str, session_id: &str| {
+            crate::goal::GoalRun::start(
+                id,
+                session_id,
+                "Ship durable goals",
+                Vec::new(),
+                crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                None,
+                crate::goal::GoalConfigDocument::default()
+                    .compile()
+                    .unwrap(),
+                repo.path().to_string_lossy(),
+                1,
+            )
+            .unwrap()
+        };
+
+        let mut awaiting = PersistedSession::from_parts(
+            "session-awaiting-plan".to_string(),
+            request.clone(),
+            None,
+            Some(repo.path().to_path_buf()),
+            false,
+            SessionStatus::Paused,
+            Vec::new(),
+        );
+        awaiting.goal = Some(
+            crate::goal::GoalCheckpoint::new(make_run(
+                "goal-awaiting-plan",
+                "session-awaiting-plan",
+            ))
+            .unwrap(),
+        );
+        save_session(&awaiting).unwrap();
+
+        let mut active_run = make_run("goal-active", "session-active");
+        let plan = active_run.plan_sha256.clone();
+        active_run.approve_plan(&plan, 2).unwrap();
+        let mut active = PersistedSession::from_parts(
+            "session-active".to_string(),
+            request,
+            None,
+            Some(repo.path().to_path_buf()),
+            true,
+            SessionStatus::Running,
+            Vec::new(),
+        );
+        active.goal = Some(crate::goal::GoalCheckpoint::new(active_run).unwrap());
+        save_session(&active).unwrap();
+
+        let restored = restore_project_sessions(repo.path()).unwrap();
+        let awaiting = restored
+            .iter()
+            .find(|session| session.session_id == "session-awaiting-plan")
+            .unwrap();
+        assert_eq!(
+            awaiting.goal.as_ref().unwrap().run.stage,
+            crate::goal::GoalStage::AwaitingPlanApproval
+        );
+        let active = restored
+            .iter()
+            .find(|session| session.session_id == "session-active")
+            .unwrap();
+        assert_eq!(
+            active.goal.as_ref().unwrap().run.stage,
+            crate::goal::GoalStage::Paused
+        );
+        assert_eq!(
+            active.goal.as_ref().unwrap().run.paused_stage,
+            Some(crate::goal::GoalStage::RunningMilestone)
+        );
+        assert_eq!(active.status, Some(SessionStatus::Paused));
     }
 
     #[test]

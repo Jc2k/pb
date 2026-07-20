@@ -16,7 +16,8 @@ local config + Git notes ───┘
 ```
 
 Normal prompts are generated inside the pb process and sent to the selected local inference
-backend. Session events and workflow checkpoints are persisted into repository-local Git notes.
+backend. Session events, workflow checkpoints, and durable Goal checkpoints are persisted into
+repository-local Git notes.
 The web UI is embedded in the binary and served by the local Rust process. The listener stays on
 loopback by default. When the user selects a non-loopback address, an installed service advertises
 the HTTP socket through launchd and Bonjour; a direct development server creates an equivalent
@@ -42,6 +43,12 @@ Pulling the checkpoint is still an explicit external download,
 after which inference and SSD expert reads require no hosted model service.
 
 No hosted model API is required by the core workflow.
+
+Durable Goal orchestration remains in this local core. Objectives, criteria, accepted and retired
+plan versions, milestone evidence, budgets, model-requested changes, and user acceptance are stored
+with the local session. The responsive Goal UI calls the same loopback daemon API as other session
+controls. Goal mode adds no cloud scheduler, hosted inference fallback, analytics edge, or automatic
+publication path.
 
 ## Explicit external edges
 
@@ -91,7 +98,7 @@ explicit local backend inherits host connectivity.
 | --- | --- | --- |
 | User-global | Model preferences, project registry, OAuth token | Stored below the user's config/data roots; not checked into a project. |
 | Repository-owned | `.pb/` configuration, source, acceptance facts | Visible to project collaborators if committed; secret values should not appear here. |
-| Session-owned | Task workspace, container, services, network, event stream | Reconciled or removed when terminal/expired, except persisted history. |
+| Session-owned | Task workspace, container, services, network, event stream, active/completed Goal checkpoints | Reconciled or removed when terminal/expired, except persisted history. |
 | Reusable local artifact | Model weights, images, declared caches, llama.cpp and FlashMoe session state | May survive sessions; managed separately from task cleanup. |
 | External disclosure | Search query, remote tool arguments, provider mutation | Occurs only through an enabled edge; governed by its provider and local policy. |
 
@@ -100,6 +107,11 @@ explicit local backend inherits host connectivity.
 Git notes keep enough session history to reconnect and recover workflow state, but the pb notes
 namespace is not included in an ordinary branch push. It remains repository-local unless someone
 explicitly transfers that ref or copies the repository metadata.
+
+Goal restart safety is local persistence behavior: interrupted active work restores paused and
+requires an explicit Resume. Stopping a Goal preserves local commits, workspace content, and
+evidence; deleting the containing finished session through the existing session-delete operation
+removes its pb session note and Goal state under the same cleanup contract.
 
 Likewise, a managed commit is local evidence. pb intentionally stops before remote publication. A
 future publication flow must have its own approval, idempotency, provider, and audit contracts.

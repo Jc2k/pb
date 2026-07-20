@@ -33,6 +33,14 @@ const HARNESS_AGENT_TOOLS: &[&str] = &[
     "rm",
     "git_commit",
     "sub_agent",
+    "propose_delivery",
+    "start_delivery",
+    "propose_goal",
+    "start_goal",
+    "goal_status",
+    "goal_pause",
+    "goal_request_amendment",
+    "goal_request_budget",
 ];
 
 #[derive(Debug)]
@@ -112,6 +120,20 @@ struct WorkflowConfigMetadata {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct HarnessRunAudit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal_stage: Option<crate::goal::GoalStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal_plan_sha256: Option<String>,
+    goal_completed_milestones: usize,
+    goal_total_milestones: usize,
+    goal_workflows: usize,
+    goal_model_invocations: usize,
+    goal_generated_tokens: usize,
+    goal_pause_requests: usize,
+    goal_amendment_requests: usize,
+    goal_budget_requests: usize,
     strict_workflow: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_id: Option<String>,
@@ -265,6 +287,23 @@ impl HarnessEventSink {
             state.audit.clone(),
         ))
     }
+
+    fn configure_goal_context(&self, goal: &crate::goal::GoalModelBrief) -> Result<()> {
+        goal.validate()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("harness event journal lock was poisoned"))?;
+        state.audit.goal_id = Some(goal.id.clone());
+        state.audit.goal_stage = Some(goal.stage);
+        state.audit.goal_plan_sha256 = Some(goal.plan_sha256.clone());
+        state.audit.goal_completed_milestones = goal.completed_milestones;
+        state.audit.goal_total_milestones = goal.total_milestones;
+        state.audit.goal_workflows = goal.counters.workflows;
+        state.audit.goal_model_invocations = goal.counters.model_invocations;
+        state.audit.goal_generated_tokens = goal.counters.generated_tokens;
+        Ok(())
+    }
 }
 
 impl EventSink for HarnessEventSink {
@@ -288,7 +327,9 @@ impl EventSink for HarnessEventSink {
                         | "No-progress tool loop"
                         | "Repeated tool call loop"
                         | "Contract unsatisfied"
-                );
+                        | "Parse retry limit reached"
+                ) || summary.starts_with("Invalid pb JSON action")
+                    || summary.starts_with("Invalid structured workflow action");
                 state.observations.push(Observation {
                     rank: 2,
                     classification: if bounded_stop {
@@ -325,6 +366,14 @@ impl EventSink for HarnessEventSink {
                 state.audit.strict_workflow = true;
                 state.audit.workflow_id = Some(workflow_id.clone());
             }
+            AgentEvent::GoalPauseRequested { .. } => {
+                state.audit.goal_pause_requests += 1;
+            }
+            AgentEvent::GoalChangeRequested { kind, .. } => match kind.as_str() {
+                "amendment" => state.audit.goal_amendment_requests += 1,
+                "budget" => state.audit.goal_budget_requests += 1,
+                _ => {}
+            },
             AgentEvent::WorkflowStageStarted { stage, .. } => {
                 state.audit.workflow_stage_sequence.push(*stage);
             }
@@ -531,6 +580,46 @@ impl EventSink for HarnessEventSink {
             .context("failed to serialize harness workflow checkpoint")?;
         atomic_write(&path, &bytes)
     }
+
+    fn request_goal_pause(&mut self, reason: &str) -> Result<String> {
+        let goal_id = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("harness event journal lock was poisoned"))?
+            .audit
+            .goal_id
+            .clone()
+            .context("goal pause requires a configured harness Goal context")?;
+        self.emit(AgentEvent::GoalPauseRequested {
+            goal_id: goal_id.clone(),
+            timestamp_ms: Some(now_millis()),
+        });
+        Ok(format!(
+            "goal pause request recorded for {goal_id}: {}",
+            compact_detail(reason)
+        ))
+    }
+
+    fn request_goal_change(&mut self, kind: &str, summary: &str) -> Result<String> {
+        if !matches!(kind, "amendment" | "budget") {
+            bail!("unsupported harness Goal change request kind '{kind}'");
+        }
+        let goal_id = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("harness event journal lock was poisoned"))?
+            .audit
+            .goal_id
+            .clone()
+            .context("goal change requires a configured harness Goal context")?;
+        self.emit(AgentEvent::GoalChangeRequested {
+            goal_id: goal_id.clone(),
+            kind: kind.to_string(),
+            summary: compact_detail(summary),
+            timestamp_ms: Some(now_millis()),
+        });
+        Ok(format!("goal {kind} request recorded for {goal_id}"))
+    }
 }
 
 fn write_event_line(writer: &mut BufWriter<File>, encoded: &[u8]) -> std::io::Result<()> {
@@ -539,10 +628,26 @@ fn write_event_line(writer: &mut BufWriter<File>, encoded: &[u8]) -> std::io::Re
     writer.flush()
 }
 
+fn load_goal_context(path: &Path) -> Result<crate::goal::GoalModelBrief> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read harness Goal context {}", path.display()))?;
+    let goal: crate::goal::GoalModelBrief = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse harness Goal context {}", path.display()))?;
+    goal.validate()
+        .with_context(|| format!("invalid harness Goal context {}", path.display()))?;
+    Ok(goal)
+}
+
 pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     if args.task.trim().is_empty() {
         bail!("harness agent task must not be empty");
     }
+
+    let goal_context = args
+        .goal_context
+        .as_deref()
+        .map(load_goal_context)
+        .transpose()?;
 
     let contract = args
         .contract
@@ -674,6 +779,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         prior_check_evidence,
         session_id: format!("harness-{}", layout.run_id),
         attachments: harness_attachments(&args.images)?,
+        goal_context: goal_context.clone(),
         contract,
     };
 
@@ -694,6 +800,9 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         &layout.run_events,
         &layout.workflow_checkpoint,
     )?;
+    if let Some(goal) = goal_context.as_ref() {
+        sink.configure_goal_context(goal)?;
+    }
     let run_result = run_agent(request, &models_root, sink.clone());
     let (mut observations, summary, audit) = sink.snapshot()?;
     add_run_observations(&mut observations, &run_result, &layout.workspace, &summary);
@@ -1372,7 +1481,14 @@ fn add_run_observations(
             detail: compact_detail(&status),
         });
     }
-    if summary.summary.trim().is_empty() {
+    let normal_final_requires_summary = matches!(
+        result,
+        Ok(result)
+            if result.reached_final
+                && result.requested_delivery.is_none()
+                && result.requested_goal.is_none()
+    );
+    if summary.summary.trim().is_empty() && normal_final_requires_summary {
         observations.push(Observation {
             rank: 3,
             classification: "experiment_error",
@@ -1492,6 +1608,24 @@ fn write_journal(
     journal.push_str(&format!(
         "- Cumulative events: `{}`\n",
         layout.events.display()
+    ));
+    journal.push_str("\n## Goal audit\n\n");
+    journal.push_str(&format!(
+        "- Goal ID: `{}`\n- Stage: `{}`\n- Plan SHA-256: `{}`\n- Milestones completed/total: `{}/{}`\n- Workflows / model invocations / generated tokens: `{}` / `{}` / `{}`\n- Pause / amendment / budget requests: `{}` / `{}` / `{}`\n",
+        audit.goal_id.as_deref().unwrap_or("none"),
+        audit
+            .goal_stage
+            .map(|stage| format!("{stage:?}").to_ascii_lowercase())
+            .unwrap_or_else(|| "none".to_string()),
+        audit.goal_plan_sha256.as_deref().unwrap_or("none"),
+        audit.goal_completed_milestones,
+        audit.goal_total_milestones,
+        audit.goal_workflows,
+        audit.goal_model_invocations,
+        audit.goal_generated_tokens,
+        audit.goal_pause_requests,
+        audit.goal_amendment_requests,
+        audit.goal_budget_requests,
     ));
     journal.push_str("\n## Workflow audit\n\n");
     journal.push_str(&format!(
@@ -1716,7 +1850,15 @@ mod tests {
                 "apply_patch",
                 "rm",
                 "git_commit",
-                "sub_agent"
+                "sub_agent",
+                "propose_delivery",
+                "start_delivery",
+                "propose_goal",
+                "start_goal",
+                "goal_status",
+                "goal_pause",
+                "goal_request_amendment",
+                "goal_request_budget"
             ]
         );
     }
@@ -1738,6 +1880,8 @@ mod tests {
                 workflow: None,
                 delivery_proposal: None,
                 requested_delivery: None,
+                goal_proposal: None,
+                requested_goal: None,
             }
         };
 
@@ -2255,6 +2399,8 @@ mod tests {
             workflow: Some(checkpoint.clone()),
             delivery_proposal: None,
             requested_delivery: None,
+            goal_proposal: None,
+            requested_goal: None,
         });
         append_run_index_started(&layout, &run.task, None, &metadata).unwrap();
         append_run_index_finished(&layout, &result, &audit, None, &metadata).unwrap();
@@ -2318,6 +2464,8 @@ mod tests {
             workflow: None,
             delivery_proposal: None,
             requested_delivery: None,
+            goal_proposal: None,
+            requested_goal: None,
         });
         let summary = CapturedSummary {
             summary: "No changes were needed.".to_string(),
@@ -2353,6 +2501,8 @@ mod tests {
             workflow: None,
             delivery_proposal: None,
             requested_delivery: None,
+            goal_proposal: None,
+            requested_goal: None,
         });
         let summary = CapturedSummary {
             summary: "Discussion answer.".to_string(),
@@ -2388,6 +2538,8 @@ mod tests {
             workflow: None,
             delivery_proposal: None,
             requested_delivery: None,
+            goal_proposal: None,
+            requested_goal: None,
         });
         let summary = CapturedSummary {
             summary: "Model setup failed before delivery began.".to_string(),
@@ -2441,6 +2593,119 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(run_events).unwrap().lines().count(),
             1
+        );
+    }
+
+    #[test]
+    fn trusted_goal_context_is_validated_and_requests_are_audited() {
+        let context_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/harness-goal-context.json");
+        let goal = load_goal_context(&context_path).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let events = parent.path().join("events.jsonl");
+        let run_events = parent.path().join("run-events.jsonl");
+        let mut sink = HarnessEventSink::new(
+            &events,
+            &run_events,
+            &events.with_extension("checkpoint.json"),
+        )
+        .unwrap();
+        sink.configure_goal_context(&goal).unwrap();
+        sink.request_goal_pause("goal-harness-g8: inspect evidence")
+            .unwrap();
+        sink.request_goal_change("amendment", "goal-harness-g8: narrow the remaining scope")
+            .unwrap();
+        sink.request_goal_change("budget", "goal-harness-g8: request ten more turns")
+            .unwrap();
+
+        let (_, _, audit) = sink.snapshot().unwrap();
+        assert_eq!(audit.goal_id.as_deref(), Some("goal-harness-g8"));
+        assert_eq!(
+            audit.goal_stage,
+            Some(crate::goal::GoalStage::RunningMilestone)
+        );
+        assert_eq!(audit.goal_completed_milestones, 2);
+        assert_eq!(audit.goal_pause_requests, 1);
+        assert_eq!(audit.goal_amendment_requests, 1);
+        assert_eq!(audit.goal_budget_requests, 1);
+        let journal = std::fs::read_to_string(run_events).unwrap();
+        assert!(journal.contains("goal_pause_requested"));
+        assert!(journal.contains("goal_change_requested"));
+    }
+
+    #[test]
+    fn structured_parse_failures_are_classified_as_model_limitations() {
+        let parent = tempfile::tempdir().unwrap();
+        let events = parent.path().join("events.jsonl");
+        let run_events = parent.path().join("run-events.jsonl");
+        let mut sink = HarnessEventSink::new(
+            &events,
+            &run_events,
+            &events.with_extension("checkpoint.json"),
+        )
+        .unwrap();
+        sink.emit(AgentEvent::Error {
+            message: "model returned prose instead of a bounded action".to_string(),
+            summary: "Invalid pb JSON action on step 1/3".to_string(),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        sink.emit(AgentEvent::Error {
+            message: "three equivalent parse failures".to_string(),
+            summary: "Parse retry limit reached".to_string(),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+
+        let (observations, _, _) = sink.snapshot().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations
+                .iter()
+                .all(|item| item.classification == "model_limitation")
+        );
+    }
+
+    #[test]
+    fn intentional_goal_handoff_does_not_require_a_session_summary() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        let layout = prepare_scratch(Some(&root)).unwrap();
+        let result = Ok(AgentRunResult {
+            branch: "main".to_string(),
+            workspace_root: layout.workspace.clone(),
+            focus_root: layout.workspace.clone(),
+            repository_context: None,
+            workspace_graph: None,
+            reached_final: true,
+            contract_status: crate::events::ContractStatus::Unspecified,
+            verified_completed: false,
+            termination_reason: crate::events::TerminationReason::Final,
+            handoff_outcome: None,
+            workflow: None,
+            delivery_proposal: None,
+            requested_delivery: None,
+            goal_proposal: None,
+            requested_goal: Some(crate::goal::GoalProposal {
+                id: "proposal".to_string(),
+                source_turn_id: "turn".to_string(),
+                objective: "Qualify Goal mode".to_string(),
+                criteria: Vec::new(),
+            }),
+        });
+        let mut observations = Vec::new();
+
+        add_run_observations(
+            &mut observations,
+            &result,
+            &layout.workspace,
+            &CapturedSummary::default(),
+        );
+
+        assert!(
+            observations
+                .iter()
+                .all(|item| item.title != "agent emitted no session summary")
         );
     }
 
@@ -2579,6 +2844,8 @@ mod tests {
             workflow: None,
             delivery_proposal: None,
             requested_delivery: None,
+            goal_proposal: None,
+            requested_goal: None,
         });
         write_journal(
             layout,

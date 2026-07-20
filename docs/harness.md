@@ -20,6 +20,22 @@ The command blocks until `agent_core::run_agent` completes or fails. Existing we
 session paths continue to use their normal daemon lifecycle. `journal.md` is initialized before model
 loading, so an interrupted run still leaves the scratch location and raw-event recovery guidance.
 
+For a bounded active-Goal control experiment, a trusted caller may inject the same read-only model
+projection used by the daemon:
+
+```bash
+pb harness agent --intent discuss \
+  --goal-context fixtures/harness-goal-context.json \
+  "Call goal_status, then request a safe-boundary pause"
+```
+
+The JSON is parsed and validated before model loading. Impossible stages, counters above their
+budget, malformed plan digests, and inconsistent milestone totals are rejected. The projection
+contains no authority. It exposes only `goal_status`, `goal_pause`, `goal_request_amendment`, and
+`goal_request_budget`; the last three record controller requests in JSONL and the Goal audit section
+of the journal. They cannot apply an amendment, increase a budget, resume, cancel, accept, publish,
+or rewrite a Goal. Without `--goal-context`, those active-Goal tools remain hidden.
+
 ### Acceptance contracts
 
 An optional trusted JSON contract makes completion externally verifiable:
@@ -291,7 +307,12 @@ actions, named-check compliance, false completion, recovery loops, turns, latenc
 and termination. JSONL additionally records selected components/checks, runtime executions versus
 model `run_check` calls, reuse and dependency skips, started/avoided executors, team messages,
 repair turns, no-change, commit disposition, output fingerprints, workflow stages, and artifact
-hashes. The bounded open-weight protocol matrix and its known limitations are recorded in
+hashes. The complete control suite also contains seven deterministic Goal assertions for exact plan
+approval, model-tool authority, sequential milestones, pause/checkpoint/resume, amendment evidence,
+completion basis, and budget/cancellation accounting. Goal records carry the stage, outcome,
+completion basis, plan/checkpoint hashes, progress, and cumulative usage without labeling
+subjective artifact quality verified. The bounded open-weight protocol matrix and its known
+limitations are recorded in
 [Enforced workflow open-weight model evaluation](harness-workflow-model-evaluation.md). Without `--jsonl`, JSONL
 goes to stdout and the table goes to stderr so the machine stream stays parseable. The scripted
 report contains no timestamps, scratch paths, or nondeterministic commit IDs and is stable enough
@@ -323,6 +344,8 @@ S5's deterministic closure checkpoint and conservative schema pruning are record
 [workflow-closure checkpoint](benchmarks/small-model-agent-s5.md). The repeated 8K/16K rollout
 decision and final local-model comparison are recorded in the
 [S6 report](benchmarks/small-model-agent-s6.md).
+Goal-control qualification, the 4B/7B/14B matrix, and its rollout decision are recorded in the
+[Goal G8 report](benchmarks/goal-mode-g8.md).
 Each model-invocation record
 includes an optional backward-compatible context snapshot covering capacity, generation reserve,
 prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,

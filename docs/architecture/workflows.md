@@ -67,6 +67,65 @@ When the accepted plan, checks, and code review all describe the current content
 the commit operation. It verifies the repository boundary and builds a durable evidence bundle that
 binds the commit OID to the workflow artifacts and check receipts.
 
+## Durable Goal controller
+
+**Shipped.** Goal mode composes several strict delivery workflows without moving orchestration into
+model prose:
+
+```text
+Goal draft → exact plan approval → milestone 1 strict workflow
+                                      ↓ Ready
+                              criterion evidence
+                                      ↓
+                              milestone 2 … → evaluate
+                                                  ├─ machine criteria → Complete
+                                                  └─ prose criteria → Ready for review → Accept
+```
+
+The version-one initial plan is deterministically derived from the user's ordered completion
+criteria: one bounded sequential milestone per criterion. The user can edit that draft and approves
+its exact content digest before mutation. Each milestone then receives the full planning and plan-
+review stages of the existing strict workflow, so the simple Goal decomposition does not bypass
+repository-aware implementation planning or critique.
+
+`GoalRun` is the canonical controller state. It owns the objective, versioned plan, criteria,
+milestones, continuation choice, project policy hash, authority envelope, total budget and counters,
+pause/amendment state, child workflow checkpoint, outcome, and completion basis. A session has at
+most one active Goal and retains completed Goal checkpoints. Exactly one milestone can be active;
+parallel workflows are not a version-one capability.
+
+The controller clamps each new child workflow's invocation and generated-token policy to the Goal's
+remaining totals. Workflow completion rolls durable usage and evidence into the Goal before the
+next milestone can be selected. Workflow, token, invocation, and wall-time exhaustion stop at a
+typed budget outcome. Automatic continuation is a user-selected per-Goal choice and never comes
+from `.pb/goal.toml`.
+
+Pause is cooperative. The web/API mutation records a pause request immediately, but the agent loop
+checks it before another model or tool action and the delivery loop returns its unchanged,
+non-terminal workflow checkpoint. Only that durable safe-boundary transition becomes `GoalPaused`.
+Restart recovery applies the same rule: active work restores paused, while an initial plan awaiting
+approval or final evidence awaiting acceptance remains in that truthful review state.
+
+Before initial approval, editing replaces the draft and plan digest. After work starts, editing is a
+checkpointed amendment: current work pauses, a replacement plan receives a new version and digest,
+unfinished milestones become superseded only after approval, and completed milestone/workflow and
+criterion evidence moves to immutable history. Discarding records the prior stage so an explicit
+resume can return there.
+
+The model-facing Goal tools are deliberately asymmetric:
+
+- `propose_goal` records a read-only discussion artifact;
+- `start_goal` exists only in an explicit Auto turn, must cite that exact turn, and creates an
+  approval-gated Goal rather than mutation authority;
+- `goal_status` returns a bounded controller-owned brief;
+- `goal_pause`, `goal_request_amendment`, and `goal_request_budget` can only stop and request human
+  review; and
+- there is no model `goal_resume`, `goal_cancel`, `goal_accept`, or direct Goal rewrite tool.
+
+The daemon exposes digest-checked HTTP and Unix-RPC operations; `pb goal` uses the same controller.
+Session list/detail projections embed Goal summaries while retaining the child workflow only inside
+its milestone, avoiding two canonical copies of workflow state.
+
 ## Stage capability matrix
 
 | Capability | Discuss | Plan/review | Implement/repair | Check/commit |
@@ -221,6 +280,11 @@ cache miss or invalidation visible in the web transcript.
 Ready means local delivery is complete under the configured contract. Publication is a separate
 workflow because pushing, opening a pull request, and responding to provider state are external
 mutations with different approvals and idempotency needs.
+
+Goal completion is one level higher. `WorkflowReady` criteria may be machine-verified from strict
+workflow evidence. Review-required or user-confirmation criteria stop at Goal **Ready for review**
+until the user accepts the exact current Goal checkpoint. Complete, user-accepted, budget-reached,
+failed, and cancelled are durable distinct outcomes. None adds publication authority.
 
 For the detailed implementation record and transition invariants, see the
 [conversational delivery workflow plan](../conversational-delivery-workflow-plan.md).

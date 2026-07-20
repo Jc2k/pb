@@ -1,0 +1,22 @@
+{
+  "id": "goal-harness-g8",
+  "objective": "Qualify durable Goal controls without granting model-owned lifecycle authority",
+  "stage": "running_milestone",
+  "plan_sha256": "6f80a5d8d8578733ff86c10027ba2da2bd8d6c85315e889e21eb4f5c5f4dfb8c",
+  "budget": {
+    "max_milestones": 5,
+    "max_workflows": 8,
+    "total_model_invocations": 80,
+    "total_generated_tokens": 60000,
+    "wall_time_minutes": 90
+  },
+  "counters": {
+    "workflows": 2,
+    "model_invocations": 18,
+    "generated_tokens": 9240,
+    "advisory_calls": 1
+  },
+  "current_milestone": "Verify model-visible Goal status and typed change requests",
+  "completed_milestones": 2,
+  "total_milestones": 4
+}

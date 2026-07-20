@@ -400,5 +400,14 @@
     {"id":"workflow_resume_exact","hypothesis":"Resume reconstructs the exact stage, artifacts, and remaining budget.","assertion":"resume_preserves_stage_and_budget"},
     {"id":"workflow_web_harness_parity","hypothesis":"Web and harness projections agree for the same workflow state.","assertion":"web_harness_projection_parity"},
     {"id":"workflow_legacy_compatibility","hypothesis":"Legacy stored requests deserialize without strict completion claims.","assertion":"legacy_state_has_no_strict_claim"}
+  ],
+  "goal_fixtures": [
+    {"id":"goal_exact_plan_approval","hypothesis":"Only the exact current Goal plan digest can start exactly one milestone.","assertion":"exact_plan_approval"},
+    {"id":"goal_model_tool_authority","hypothesis":"Proposal and Auto tools remain read-only requests bound to the exact current turn.","assertion":"model_tool_authority_bound"},
+    {"id":"goal_sequential_milestones","hypothesis":"A Goal runs one strict milestone workflow at a time and closes only after all criteria pass.","assertion":"sequential_milestones"},
+    {"id":"goal_pause_checkpoint_resume","hypothesis":"Safe-boundary pause and resume preserve the exact child workflow and effective budget counters.","assertion":"pause_checkpoint_resume"},
+    {"id":"goal_amendment_evidence","hypothesis":"An approved amendment retains history and carries forward only compatible current evidence.","assertion":"amendment_preserves_evidence"},
+    {"id":"goal_completion_basis","hypothesis":"Machine verification and explicit user acceptance remain distinct completion bases.","assertion":"completion_basis_bound"},
+    {"id":"goal_budget_cancellation","hypothesis":"Goal budgets cannot reset between milestones and cancellation accounts for active usage exactly once.","assertion":"budget_and_cancellation_accounting"}
   ]
 }

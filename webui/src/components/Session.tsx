@@ -2,11 +2,29 @@ import type React from "react";
 import { Fragment, useState } from "react";
 import type { AgentEvent, EventEnvelope, SessionItem } from "../types";
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "../lib/constants";
-import { formatEventTime, getAvatarForProfile, projectName, relativeTime, sessionTitle } from "../lib/helpers";
-import { TODO_STATUS_LABELS, errorSummary, getToolDetail, profileJobTitle, profileName } from "../lib/sessionUtils";
+import {
+  formatEventTime,
+  getAvatarForProfile,
+  projectName,
+  relativeTime,
+  sessionTitle,
+} from "../lib/helpers";
+import {
+  errorSummary,
+  getToolDetail,
+  profileJobTitle,
+  profileName,
+  TODO_STATUS_LABELS,
+} from "../lib/sessionUtils";
 import type { TodoTask, ToolSummary } from "../lib/sessionUtils";
 import { parseRichText } from "../lib/richText";
-import { formatEnergy, formatPower, ledEquivalent, metricEnergyJoules, metricRuntimeMs } from "../lib/energy";
+import {
+  formatEnergy,
+  formatPower,
+  ledEquivalent,
+  metricEnergyJoules,
+  metricRuntimeMs,
+} from "../lib/energy";
 
 function formatHumanDurationMs(ms?: number): string {
   if (ms === undefined) return "an unknown amount of time";
@@ -34,8 +52,13 @@ function funEnergySummary(
   tokens: number,
   energyJoules?: number,
 ): string {
-  const prefix = `This session ran for ${formatHumanDurationMs(runtimeMs)}, used ${formatNumber(tokens)} tokens`;
-  if (energyJoules === undefined || energyJoules < 0 || !Number.isFinite(energyJoules)) {
+  const prefix = `This session ran for ${
+    formatHumanDurationMs(runtimeMs)
+  }, used ${formatNumber(tokens)} tokens`;
+  if (
+    energyJoules === undefined || energyJoules < 0 ||
+    !Number.isFinite(energyJoules)
+  ) {
     return `${prefix}.`;
   }
   const equivalent = ledEquivalent(energyJoules);
@@ -52,24 +75,33 @@ function RichText({ content }: { content: string }) {
       {blocks.map((block, index) => {
         switch (block.type) {
           case "heading": {
-            const Heading = `h${block.level + 2}` as keyof React.JSX.IntrinsicElements;
+            const Heading = `h${
+              block.level + 2
+            }` as keyof React.JSX.IntrinsicElements;
             return <Heading key={index}>{block.text}</Heading>;
           }
           case "unordered_list":
             return (
               <ul key={index}>
-                {block.items.map((item, itemIndex) => <li key={itemIndex}>{item}</li>)}
+                {block.items.map((item, itemIndex) => (
+                  <li key={itemIndex}>{item}</li>
+                ))}
               </ul>
             );
           case "ordered_list":
             return (
               <ol key={index}>
-                {block.items.map((item, itemIndex) => <li key={itemIndex}>{item}</li>)}
+                {block.items.map((item, itemIndex) => (
+                  <li key={itemIndex}>{item}</li>
+                ))}
               </ol>
             );
           case "code":
             return (
-              <pre key={index} className="rich-text-code"><code>{block.code}</code></pre>
+              <pre
+                key={index}
+                className="rich-text-code"
+              ><code>{block.code}</code></pre>
             );
           case "paragraph":
             return (
@@ -148,8 +180,9 @@ export function ToolGroupBubble({
 
   const toolNames = toolCalls
     .map((e, i) => {
-      if (e.event.type === "tool_call")
+      if (e.event.type === "tool_call") {
         return TOOL_FRIENDLY_NAMES[e.event.tool] || e.event.tool;
+      }
       return "";
     })
     .filter(Boolean)
@@ -170,7 +203,8 @@ export function ToolGroupBubble({
           <span className="tool-names">{toolNames}</span>
           <i
             className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
-          ></i>
+          >
+          </i>
         </button>
         <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
           <div className="tool-list">{toolItems}</div>
@@ -223,7 +257,10 @@ export function TodoDrawer({ tasks }: { tasks: TodoTask[] }) {
       <div className="empty-detail compact">
         <i className="bi bi-check2-square"></i>
         <h3>No managed tasks</h3>
-        <p>Todo tool activity will appear here as the agent plans and updates work.</p>
+        <p>
+          Todo tool activity will appear here as the agent plans and updates
+          work.
+        </p>
       </div>
     );
   }
@@ -234,18 +271,20 @@ export function TodoDrawer({ tasks }: { tasks: TodoTask[] }) {
         <li key={task.id} className={`todo-item ${task.status}`}>
           <div className="todo-title-row">
             <span className="todo-id">#{task.id}</span>
-            <span className="todo-status">{TODO_STATUS_LABELS[task.status] || task.status}</span>
+            <span className="todo-status">
+              {TODO_STATUS_LABELS[task.status] || task.status}
+            </span>
           </div>
           <strong>{task.title}</strong>
           {task.description && <p>{task.description}</p>}
           {task.parent_id ? <small>Parent #{task.parent_id}</small> : null}
-          {task.notes?.length ? (
-            <ul className="todo-notes">
-              {task.notes.map((note, index) => (
-                <li key={index}>{note}</li>
-              ))}
-            </ul>
-          ) : null}
+          {task.notes?.length
+            ? (
+              <ul className="todo-notes">
+                {task.notes.map((note, index) => <li key={index}>{note}</li>)}
+              </ul>
+            )
+            : null}
           {task.timestampMs && <time>{formatEventTime(task.timestampMs)}</time>}
         </li>
       ))}
@@ -272,7 +311,8 @@ export function ToolDrawerSummary({ summary }: { summary: ToolSummary }) {
           <strong>{summary.count}</strong>
           <i
             className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
-          ></i>
+          >
+          </i>
         </span>
       </button>
       {isOpen && (
@@ -302,8 +342,8 @@ function ErrorEventBubble({
   const detail = rawDetail.startsWith(`${summary}:`)
     ? rawDetail.slice(summary.length + 1).trim()
     : rawDetail === summary
-      ? ""
-      : rawDetail;
+    ? ""
+    : rawDetail;
   const hasDetail = detail.length > 0;
 
   return (
@@ -322,14 +362,21 @@ function ErrorEventBubble({
           <i
             className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
             aria-hidden="true"
-          ></i>
+          >
+          </i>
         </button>
         <div className={`collapse${isOpen ? " show" : ""}`}>
           <div className="error-detail">
-            {hasDetail ? <pre className="mb-0 small result-pre">{detail}</pre> : null}
-            {!hasDetail ? (
-              <p className="mb-0">{summary || "No error details provided."}</p>
-            ) : null}
+            {hasDetail
+              ? <pre className="mb-0 small result-pre">{detail}</pre>
+              : null}
+            {!hasDetail
+              ? (
+                <p className="mb-0">
+                  {summary || "No error details provided."}
+                </p>
+              )
+              : null}
           </div>
         </div>
       </div>
@@ -342,17 +389,25 @@ function CorrectionNotice({
 }: {
   event: Extract<AgentEvent, { type: "correction" }>;
 }) {
-  const text = (event.summary || event.message || "Agent framework correction").trim();
+  const text = (event.summary || event.message || "Agent framework correction")
+    .trim();
 
   return (
-    <article className="session-correction" aria-label="Agent framework correction">
+    <article
+      className="session-correction"
+      aria-label="Agent framework correction"
+    >
       <span>{text}</span>
-      {event.timestamp_ms ? <time>{formatEventTime(event.timestamp_ms)}</time> : null}
+      {event.timestamp_ms
+        ? <time>{formatEventTime(event.timestamp_ms)}</time>
+        : null}
     </article>
   );
 }
 
-export function InitialUserMessage({ task, timestampMs }: { task: string; timestampMs?: number }) {
+export function InitialUserMessage(
+  { task, timestampMs }: { task: string; timestampMs?: number },
+) {
   return (
     <article className="user message-row user-message">
       <div className="message-container">
@@ -413,13 +468,18 @@ function AssistantMessageRow({
 
 function handoffOutcomeLabel(outcome?: string): string {
   switch (outcome) {
-    case "ready": return "Ready to hand back";
-    case "no_change": return "No code changes";
+    case "ready":
+      return "Ready to hand back";
+    case "no_change":
+      return "No code changes";
     case "checks_failed":
-    case "repair_exhausted": return "Needs another pass";
+    case "repair_exhausted":
+      return "Needs another pass";
     case "executor_unavailable":
-    case "commit_blocked": return "Needs help";
-    default: return "Checking the handoff";
+    case "commit_blocked":
+      return "Needs help";
+    default:
+      return "Checking the handoff";
   }
 }
 
@@ -441,27 +501,39 @@ function TeamMessageBubble({
   const checkEvidence = Array.from(evidenceIds)
     .filter((id) => id.startsWith("check:"))
     .map((id) => id.slice("check:".length))
-    .map((checkId) => recentPriorEvents.find((candidate) =>
-      candidate.event.type === "check_result" && candidate.event.check_id === checkId
-    ))
+    .map((checkId) =>
+      recentPriorEvents.find((candidate) =>
+        candidate.event.type === "check_result" &&
+        candidate.event.check_id === checkId
+      )
+    )
     .filter((candidate): candidate is EventEnvelope => Boolean(candidate));
   const commitEvidence = Array.from(evidenceIds)
     .filter((id) => id.startsWith("commit:"))
     .map((id) => id.slice("commit:".length))
-    .map((oid) => recentPriorEvents.find((candidate) =>
-      candidate.event.type === "commit_result" && candidate.event.oid === oid
-    ))
+    .map((oid) =>
+      recentPriorEvents.find((candidate) =>
+        candidate.event.type === "commit_result" && candidate.event.oid === oid
+      )
+    )
     .filter((candidate): candidate is EventEnvelope => Boolean(candidate));
   const handoff = followingEvents.find((candidate) =>
     candidate.event.type === "handoff_summary"
   );
-  const summary = handoff?.event.type === "handoff_summary" ? handoff.event.summary : undefined;
+  const summary = handoff?.event.type === "handoff_summary"
+    ? handoff.event.summary
+    : undefined;
   const start = events.find((candidate) => candidate.event.type === "started");
-  const focusRoot = start?.event.type === "started" ? start.event.focus_root : undefined;
-  const hasEvidence = checkEvidence.length > 0 || commitEvidence.length > 0 || Boolean(summary) || Boolean(event.detail);
+  const focusRoot = start?.event.type === "started"
+    ? start.event.focus_root
+    : undefined;
+  const hasEvidence = checkEvidence.length > 0 || commitEvidence.length > 0 ||
+    Boolean(summary) || Boolean(event.detail);
 
   return (
-    <article className={`bot message-row assistant-message team-message tone-${event.tone}`}>
+    <article
+      className={`bot message-row assistant-message team-message tone-${event.tone}`}
+    >
       <div className="bot-avatar team-avatar">
         <img src={getAvatarForProfile("monitor")} alt="Trinity Walker" />
       </div>
@@ -469,62 +541,85 @@ function TeamMessageBubble({
         <div className="author-line">
           <strong>Trinity Walker</strong>
           <span>Team handoff</span>
-          {event.timestamp_ms ? <time>{formatEventTime(event.timestamp_ms)}</time> : null}
+          {event.timestamp_ms
+            ? <time>{formatEventTime(event.timestamp_ms)}</time>
+            : null}
         </div>
         <div className="bubble thought-bubble team-bubble">
-          <span className="handoff-state">{handoffOutcomeLabel(summary?.outcome)}</span>
+          <span className="handoff-state">
+            {handoffOutcomeLabel(summary?.outcome)}
+          </span>
           <p>{event.message}</p>
-          {hasEvidence ? (
-            <details className="handoff-evidence">
-              <summary>What I ran</summary>
-              {summary?.affected_components.length ? (
-                <p className="handoff-scope">
-                  <strong>Affected:</strong> {summary.affected_components.join(", ")}
-                </p>
-              ) : null}
-              {focusRoot ? (
-                <p className="handoff-scope"><strong>Focus:</strong> <code>{focusRoot}</code></p>
-              ) : null}
-              {event.detail ? <pre className="handoff-detail">{event.detail}</pre> : null}
-              {checkEvidence.map((candidate) => {
-                if (candidate.event.type !== "check_result") return null;
-                const check = candidate.event;
-                const status = check.skip_reason
-                  ? "skipped"
-                  : check.reused
+          {hasEvidence
+            ? (
+              <details className="handoff-evidence">
+                <summary>What I ran</summary>
+                {summary?.affected_components.length
+                  ? (
+                    <p className="handoff-scope">
+                      <strong>Affected:</strong>{" "}
+                      {summary.affected_components.join(", ")}
+                    </p>
+                  )
+                  : null}
+                {focusRoot
+                  ? (
+                    <p className="handoff-scope">
+                      <strong>Focus:</strong> <code>{focusRoot}</code>
+                    </p>
+                  )
+                  : null}
+                {event.detail
+                  ? <pre className="handoff-detail">{event.detail}</pre>
+                  : null}
+                {checkEvidence.map((candidate) => {
+                  if (candidate.event.type !== "check_result") return null;
+                  const check = candidate.event;
+                  const status = check.skip_reason
+                    ? "skipped"
+                    : check.reused
                     ? "reused"
                     : check.success
-                      ? "passed"
-                      : "failed";
-                return (
-                  <section className={`handoff-check ${status}`} key={`check-${check.check_id}`}>
-                    <div>
-                      <strong>{check.check_id}</strong>
-                      <span>{status}</span>
-                    </div>
-                    {check.command ? <code>{check.command}</code> : null}
-                    <small>
-                      {check.executor ? `Executor: ${check.executor}` : ""}
-                      {check.cwd ? ` · From: ${check.cwd}` : ""}
-                      {` · Exit: ${check.exit_status}`}
-                    </small>
-                    {check.skip_reason ? <p>{check.skip_reason}</p> : null}
-                    {check.output?.trim() ? <pre>{check.output}</pre> : null}
-                  </section>
-                );
-              })}
-              {commitEvidence.map((candidate) => {
-                if (candidate.event.type !== "commit_result") return null;
-                const commit = candidate.event;
-                return (
-                  <section className="handoff-commit" key={`commit-${commit.oid}`}>
-                    <strong>{commit.reused ? "Existing commit" : "Commit"}</strong>
-                    <code>{commit.oid?.slice(0, 12)} {commit.subject}</code>
-                  </section>
-                );
-              })}
-            </details>
-          ) : null}
+                    ? "passed"
+                    : "failed";
+                  return (
+                    <section
+                      className={`handoff-check ${status}`}
+                      key={`check-${check.check_id}`}
+                    >
+                      <div>
+                        <strong>{check.check_id}</strong>
+                        <span>{status}</span>
+                      </div>
+                      {check.command ? <code>{check.command}</code> : null}
+                      <small>
+                        {check.executor ? `Executor: ${check.executor}` : ""}
+                        {check.cwd ? ` · From: ${check.cwd}` : ""}
+                        {` · Exit: ${check.exit_status}`}
+                      </small>
+                      {check.skip_reason ? <p>{check.skip_reason}</p> : null}
+                      {check.output?.trim() ? <pre>{check.output}</pre> : null}
+                    </section>
+                  );
+                })}
+                {commitEvidence.map((candidate) => {
+                  if (candidate.event.type !== "commit_result") return null;
+                  const commit = candidate.event;
+                  return (
+                    <section
+                      className="handoff-commit"
+                      key={`commit-${commit.oid}`}
+                    >
+                      <strong>
+                        {commit.reused ? "Existing commit" : "Commit"}
+                      </strong>
+                      <code>{commit.oid?.slice(0, 12)} {commit.subject}</code>
+                    </section>
+                  );
+                })}
+              </details>
+            )
+            : null}
         </div>
       </div>
     </article>
@@ -603,11 +698,14 @@ export function MessageBubble({
         <AssistantMessageRow profile={e.profile} timestampMs={e.timestamp_ms}>
           <div className="assistant-question">
             <p>{e.question}</p>
-            {e.choices?.length ? (
-              <div className="question-choices">
-                {e.choices.map((choice) => <span key={choice}>{choice}</span>)}
-              </div>
-            ) : null}
+            {e.choices?.length
+              ? (
+                <div className="question-choices">
+                  {e.choices.map((choice) => <span key={choice}>{choice}
+                  </span>)}
+                </div>
+              )
+              : null}
           </div>
         </AssistantMessageRow>
       );
@@ -617,7 +715,9 @@ export function MessageBubble({
         <article className="session-correction" aria-label="Workflow challenge">
           <strong>{e.severity.toUpperCase()} challenge</strong>
           <span>{e.summary}</span>
-          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
+          {e.timestamp_ms
+            ? <time>{formatEventTime(e.timestamp_ms)}</time>
+            : null}
         </article>
       );
 
@@ -626,15 +726,22 @@ export function MessageBubble({
         <article className="session-error" aria-label="Workflow blocked">
           <strong>Delivery needs help</strong>
           <span>{e.reason}</span>
-          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
+          {e.timestamp_ms
+            ? <time>{formatEventTime(e.timestamp_ms)}</time>
+            : null}
         </article>
       );
 
     case "workflow_evidence_invalidated":
       return (
-        <article className="session-correction" aria-label="Workflow evidence invalidated">
+        <article
+          className="session-correction"
+          aria-label="Workflow evidence invalidated"
+        >
           <span>{e.reason}</span>
-          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
+          {e.timestamp_ms
+            ? <time>{formatEventTime(e.timestamp_ms)}</time>
+            : null}
         </article>
       );
 
@@ -737,16 +844,29 @@ export function MessageBubble({
 
     case "llm_invocation":
       return (
-        <article className="session-correction" aria-label={`Model inference step ${e.step}`}>
+        <article
+          className="session-correction"
+          aria-label={`Model inference step ${e.step}`}
+        >
           <span>
-            Model inference {e.step} · {formatHumanDurationMs(e.duration_ms)} · {formatNumber(e.prompt_tokens + e.generated_tokens)} tokens
+            Model inference {e.step} · {formatHumanDurationMs(e.duration_ms)} ·
+            {" "}
+            {formatNumber(e.prompt_tokens + e.generated_tokens)} tokens
             {e.prompt_cache
-              ? ` · ${formatNumber(e.prompt_cache.cached_tokens)} cached, ${formatNumber(e.prompt_cache.prefilled_tokens)} prefilled (${e.prompt_cache.source.replaceAll("_", " ")})`
+              ? ` · ${formatNumber(e.prompt_cache.cached_tokens)} cached, ${
+                formatNumber(e.prompt_cache.prefilled_tokens)
+              } prefilled (${e.prompt_cache.source.replaceAll("_", " ")})`
               : ""}
-            {e.energy_joules !== undefined ? ` · ${formatEnergy(e.energy_joules)}` : ""}
-            {e.average_power_watts !== undefined ? ` at ${formatPower(e.average_power_watts)}` : ""}
+            {e.energy_joules !== undefined
+              ? ` · ${formatEnergy(e.energy_joules)}`
+              : ""}
+            {e.average_power_watts !== undefined
+              ? ` at ${formatPower(e.average_power_watts)}`
+              : ""}
           </span>
-          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
+          {e.timestamp_ms
+            ? <time>{formatEventTime(e.timestamp_ms)}</time>
+            : null}
         </article>
       );
 
@@ -776,35 +896,72 @@ export function MessageBubble({
         <article className="session-correction" aria-label="Session metrics">
           <span>
             {funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)}
-            {totalEnergyJoules !== undefined ? (
-              <details>
-                <summary>Power-estimate details</summary>
-                <div>Average incremental power: {formatPower(e.average_power_watts)}</div>
-                {hasMeasurementMetadata ? (
-                  <>
-                    <div>Gross device energy: {formatEnergy(e.gross_energy_joules)}</div>
-                    <div>After display adjustment: {formatEnergy(e.adjusted_energy_joules)}</div>
-                    <div>Measurement coverage: {coverage ?? "Unknown"}</div>
-                    <div>Source: {e.energy_source?.replaceAll("_", " ") ?? "Unknown"}</div>
-                    <div>
-                      Exclusions: {[
-                        e.display_energy_excluded ? "measured display" : null,
-                        e.idle_baseline_applied ? "idle device baseline" : null,
-                      ].filter(Boolean).join(", ") || "none available"}
-                    </div>
-                  </>
-                ) : null}
-                <div>Model inference: {formatEnergy(e.llm_energy_joules)}</div>
-                <div>Tools: {formatEnergy(e.tool_energy_joules)}</div>
-                {hasMeasurementMetadata && e.energy_complete === false ? <div>Estimate is partial or changed source during the task.</div> : null}
-                {hasMeasurementMetadata && e.energy_exclusive === false ? <div>Another pb process held the system meter; task attribution is unavailable.</div> : null}
-              </details>
-            ) : null}
+            {totalEnergyJoules !== undefined
+              ? (
+                <details>
+                  <summary>Power-estimate details</summary>
+                  <div>
+                    Average incremental power:{" "}
+                    {formatPower(e.average_power_watts)}
+                  </div>
+                  {hasMeasurementMetadata
+                    ? (
+                      <>
+                        <div>
+                          Gross device energy:{" "}
+                          {formatEnergy(e.gross_energy_joules)}
+                        </div>
+                        <div>
+                          After display adjustment:{" "}
+                          {formatEnergy(e.adjusted_energy_joules)}
+                        </div>
+                        <div>Measurement coverage: {coverage ?? "Unknown"}</div>
+                        <div>
+                          Source:{" "}
+                          {e.energy_source?.replaceAll("_", " ") ?? "Unknown"}
+                        </div>
+                        <div>
+                          Exclusions: {[
+                            e.display_energy_excluded
+                              ? "measured display"
+                              : null,
+                            e.idle_baseline_applied
+                              ? "idle device baseline"
+                              : null,
+                          ].filter(Boolean).join(", ") || "none available"}
+                        </div>
+                      </>
+                    )
+                    : null}
+                  <div>
+                    Model inference: {formatEnergy(e.llm_energy_joules)}
+                  </div>
+                  <div>Tools: {formatEnergy(e.tool_energy_joules)}</div>
+                  {hasMeasurementMetadata && e.energy_complete === false
+                    ? (
+                      <div>
+                        Estimate is partial or changed source during the task.
+                      </div>
+                    )
+                    : null}
+                  {hasMeasurementMetadata && e.energy_exclusive === false
+                    ? (
+                      <div>
+                        Another pb process held the system meter; task
+                        attribution is unavailable.
+                      </div>
+                    )
+                    : null}
+                </details>
+              )
+              : null}
             {totalEnergyJoules === undefined && e.energy_exclusive === false
               ? " Power estimate unavailable: the system meter is unsupported or already in use."
               : null}
           </span>
-          {e.timestamp_ms ? <time>{formatEventTime(e.timestamp_ms)}</time> : null}
+          {e.timestamp_ms
+            ? <time>{formatEventTime(e.timestamp_ms)}</time>
+            : null}
         </article>
       );
     }
@@ -823,34 +980,42 @@ export function MessageBubble({
             <p>
               Session complete <code>{e.branch}</code>
             </p>
-            {e.summary?.trim() ? (
-              <>
-                <strong>Summary</strong>
-                <pre className="small result-pre">{e.summary}</pre>
-              </>
-            ) : null}
-            {e.commits?.trim() ? (
-              <>
-                <strong>Commits</strong>
-                <pre className="small result-pre">{e.commits}</pre>
-              </>
-            ) : null}
-            {e.diff_stat?.trim() ? (
-              <>
-                <strong>Diff stat from main</strong>
-                <pre className="small result-pre">{e.diff_stat}</pre>
-              </>
-            ) : null}
-            {e.diff?.trim() ? (
-              <details className="transcript-diff">
-                <summary className="transcript-diff-header">
-                  <span>Diff from main</span>
-                </summary>
-                <div className="transcript-diff-body">
-                  <DiffView diff={e.diff} />
-                </div>
-              </details>
-            ) : null}
+            {e.summary?.trim()
+              ? (
+                <>
+                  <strong>Summary</strong>
+                  <pre className="small result-pre">{e.summary}</pre>
+                </>
+              )
+              : null}
+            {e.commits?.trim()
+              ? (
+                <>
+                  <strong>Commits</strong>
+                  <pre className="small result-pre">{e.commits}</pre>
+                </>
+              )
+              : null}
+            {e.diff_stat?.trim()
+              ? (
+                <>
+                  <strong>Diff stat from main</strong>
+                  <pre className="small result-pre">{e.diff_stat}</pre>
+                </>
+              )
+              : null}
+            {e.diff?.trim()
+              ? (
+                <details className="transcript-diff">
+                  <summary className="transcript-diff-header">
+                    <span>Diff from main</span>
+                  </summary>
+                  <div className="transcript-diff-body">
+                    <DiffView diff={e.diff} />
+                  </div>
+                </details>
+              )
+              : null}
           </div>
         </article>
       );
@@ -863,20 +1028,27 @@ export function MessageBubble({
   }
 }
 
-
 function activityLabel(envelope: EventEnvelope): string | undefined {
   const event = envelope.event;
   switch (event.type) {
-    case "started": return "Session started";
+    case "started":
+      return "Session started";
     case "tool_call":
       return `${TOOL_FRIENDLY_NAMES[event.tool] || event.tool} started`;
-    case "tool_result": return "Tool result received";
-    case "user_question": return "Waiting for an answer";
-    case "user_answer": return "Answer received";
-    case "final": return "Response completed";
-    case "session_summary": return "Session completed";
-    case "error": return "Error reported";
-    default: return undefined;
+    case "tool_result":
+      return "Tool result received";
+    case "user_question":
+      return "Waiting for an answer";
+    case "user_answer":
+      return "Answer received";
+    case "final":
+      return "Response completed";
+    case "session_summary":
+      return "Session completed";
+    case "error":
+      return "Error reported";
+    default:
+      return undefined;
   }
 }
 
@@ -907,7 +1079,9 @@ export function SessionActivity({ events }: { events: EventEnvelope[] }) {
       {items.map((item, index) => (
         <li key={`${item.label}-${index}`}>
           <span>{item.label}</span>
-          {item.timestampMs ? <time>{formatEventTime(item.timestampMs)}</time> : null}
+          {item.timestampMs
+            ? <time>{formatEventTime(item.timestampMs)}</time>
+            : null}
         </li>
       ))}
     </ol>
@@ -922,7 +1096,33 @@ export function SessionCard({
   onClick: () => void;
 }) {
   let badge: React.ReactNode;
-  if (session.status === "running") {
+  if (session.goal) {
+    const goal = session.goal;
+    const text = goal.active
+      ? goal.stage === "awaiting_user_review"
+        ? "Goal ready for review"
+        : goal.stage === "blocked"
+        ? "Goal needs help"
+        : goal.stage === "paused"
+        ? "Goal paused"
+        : `Goal · ${goal.completed_milestones}/${goal.total_milestones}`
+      : goal.stage === "completed"
+      ? "Goal complete"
+      : goal.stage === "cancelled"
+      ? "Goal cancelled"
+      : goal.outcome === "budget_exhausted"
+      ? "Goal budget reached"
+      : "Goal stopped";
+    const style = goal.active
+      ? goal.stage === "blocked" || goal.stage === "awaiting_user_review" ||
+          goal.stage === "paused"
+        ? "bg-warning text-dark"
+        : "bg-primary"
+      : goal.stage === "completed"
+      ? "bg-success"
+      : "bg-secondary";
+    badge = <span className={`badge ${style}`}>{text}</span>;
+  } else if (session.status === "running") {
     badge = (
       <span className="badge bg-primary d-flex align-items-center gap-1">
         <span
@@ -935,14 +1135,19 @@ export function SessionCard({
   } else if (session.status === "queued") {
     badge = <span className="badge bg-info text-dark">Queued</span>;
   } else if (session.status === "paused") {
-    badge = session.pending_question ? (
-      <span className="badge bg-warning text-dark">Needs answer</span>
-    ) : (
-      <span className="badge bg-warning text-dark">Paused after restart</span>
-    );
-  } else if (session.workflow_outcome === "no_change" || session.handoff_outcome === "no_change") {
+    badge = session.pending_question
+      ? <span className="badge bg-warning text-dark">Needs answer</span>
+      : (
+        <span className="badge bg-warning text-dark">Paused after restart</span>
+      );
+  } else if (
+    session.workflow_outcome === "no_change" ||
+    session.handoff_outcome === "no_change"
+  ) {
     badge = <span className="badge bg-secondary">No code changes</span>;
-  } else if (session.workflow_outcome === "ready" || session.handoff_outcome === "ready") {
+  } else if (
+    session.workflow_outcome === "ready" || session.handoff_outcome === "ready"
+  ) {
     badge = <span className="badge bg-success">Ready</span>;
   } else if (
     session.workflow_outcome === "checks_failed" ||
@@ -951,7 +1156,9 @@ export function SessionCard({
     session.handoff_outcome === "checks_failed" ||
     session.handoff_outcome === "repair_exhausted"
   ) {
-    badge = <span className="badge bg-warning text-dark">Needs another pass</span>;
+    badge = (
+      <span className="badge bg-warning text-dark">Needs another pass</span>
+    );
   } else if (
     session.workflow_outcome === "executor_unavailable" ||
     session.workflow_outcome === "commit_blocked" ||

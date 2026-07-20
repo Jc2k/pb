@@ -5,7 +5,8 @@
 //! - Language ecosystems (Rust, Python, Node/Deno, Go)
 //! - Existing agent / coding-assistant documentation
 //!
-//! Based on the detections it writes (or confirms) a `.pb/environment.toml` and
+//! Based on the detections it writes (or confirms) the project environment,
+//! workspace, strict workflow, and durable goal policy under `.pb/`, then
 //! prints a summary of what it found and what it configured.
 
 use anyhow::Result;
@@ -50,6 +51,7 @@ pub struct ProjectInspection {
     pub has_pb_environment: bool,
     pub has_pb_workspace: bool,
     pub has_pb_workflow: bool,
+    pub has_pb_goal: bool,
 
     // Vision / image assets
     /// Project contains image files (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`).
@@ -176,6 +178,7 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     info.has_pb_environment = root.join(".pb").join("environment.toml").exists();
     info.has_pb_workspace = root.join(".pb").join("workspace.toml").exists();
     info.has_pb_workflow = root.join(".pb").join("workflow.toml").exists();
+    info.has_pb_goal = root.join(".pb").join("goal.toml").exists();
 
     info.environment_evidence.sort_by(|left, right| {
         left.component
@@ -1097,6 +1100,24 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
         );
     }
 
+    println!();
+    if info.has_pb_goal {
+        let policy = crate::goal::GoalConfigDocument::load(&root)?
+            .expect("goal config exists after inspection")
+            .compile()?;
+        println!(
+            "Existing durable goal policy found at {} (policy {}).",
+            root.join(".pb").join("goal.toml").display(),
+            &policy.sha256[..12]
+        );
+    } else {
+        crate::goal::GoalConfigDocument::default().save(&root)?;
+        println!(
+            "Durable goal policy written to {}.",
+            root.join(".pb").join("goal.toml").display()
+        );
+    }
+
     Ok(())
 }
 
@@ -1794,6 +1815,7 @@ mod tests {
         assert!(!info.has_pb_environment);
         assert!(!info.has_pb_workspace);
         assert!(!info.has_pb_workflow);
+        assert!(!info.has_pb_goal);
     }
 
     #[test]
@@ -1946,6 +1968,14 @@ mod tests {
     }
 
     #[test]
+    fn inspect_existing_pb_goal() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".pb/goal.toml", "version = 1\n");
+        let info = inspect(dir.path()).unwrap();
+        assert!(info.has_pb_goal);
+    }
+
+    #[test]
     fn init_writes_normalized_workspace_graph_without_overwriting_environment_schema() {
         let dir = TempDir::new().unwrap();
         run_init(
@@ -1957,6 +1987,7 @@ mod tests {
         assert!(dir.path().join(".pb/environment.toml").is_file());
         assert!(dir.path().join(".pb/workspace.toml").is_file());
         assert!(dir.path().join(".pb/workflow.toml").is_file());
+        assert!(dir.path().join(".pb/goal.toml").is_file());
         let graph = crate::workspace::WorkspaceConfigDocument::load(dir.path())
             .unwrap()
             .unwrap()

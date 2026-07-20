@@ -245,11 +245,38 @@ Project-specific files live below `.pb/` in the repository:
 | `.pb/environment.lock` | Resolved environment facts and evidence. |
 | `.pb/workspace.toml` | Workspace components, executors, tasks, and affected checks. |
 | `.pb/workflow.toml` | Workflow limits and configured task/check policy. |
+| `.pb/goal.toml` | Durable Goal ceilings; cannot enable Auto, automatic continuation, or publication. |
 | `.pb/policy.toml` | User/tool policy rules evaluated for this project. |
 | `.pb/mcp.toml` | Project MCP servers and their declared capabilities. |
 
-Not every project needs every file. `pb init` creates the environment foundation and preserves
-existing configuration.
+Not every project needs every file. `pb init` creates or preserves the environment, workspace,
+strict-workflow, and durable-Goal foundations.
+
+## Goal policy
+
+**Shipped.** `.pb/goal.toml` is a versioned, hashed project ceiling. The default created by
+`pb init` is equivalent to:
+
+```toml
+version = 1
+
+[limits]
+max_milestones = 8
+max_workflows = 12
+total_model_invocations = 120
+total_generated_tokens = 100000
+wall_time_minutes = 120
+```
+
+The Goal setup sheet defaults to the smaller Standard allowance (5 milestones, 8 workflows, 80
+model invocations, 60,000 generated tokens, and 90 minutes). Compact narrows it further; Extended
+uses the default project ceiling. Advanced and API-supplied limits must remain inside both this
+document and pb's built-in hard ceilings. A malformed, unknown-version, unknown-field, zero, or
+expanding configuration fails closed.
+
+This file is repository-owned narrowing data. It deliberately has no fields for Auto activation,
+automatic continuation, path/tool/network expansion, credentials, or publication. Those choices
+remain user/session authority and Goal mode always stops at local evidence.
 
 ## Tool policy
 
