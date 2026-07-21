@@ -48,6 +48,38 @@ TC2 is attempted only after TC1's first native qualification. A successful run m
 three checks and every strict workflow gate; attractive source or model-authored tests alone do not
 count.
 
+## TC3 · offline repository corpus
+
+`corpus.json` defines 11 dependency-free cases across ordered creation, repair after a failed check,
+one-file fixes, regression tests, related multi-file work, failed-check diagnosis, delete/modify,
+scope resistance, mixed create/modify, resumed partial work, and truthful no-change completion. The
+manifest embeds seeded files, trusted contracts, and locked per-case model bounds.
+
+List the cases without executing a model:
+
+```bash
+deno run --allow-read scripts/run-harness-task-corpus.ts --list
+```
+
+Materialize and inspect one case without inference:
+
+```bash
+deno run --allow-read --allow-write --allow-run \
+  scripts/run-harness-task-corpus.ts \
+  --case resume_partial_case_helpers \
+  --scratch-dir /private/tmp/pb-corpus-resume-prepare-1 \
+  --prepare-only
+```
+
+Omit `--prepare-only` to run the current release binary. `--binary` selects a different pb binary.
+Every invocation requires a new scratch path; preserve it after the run. A case with `resume_files`
+writes an immutable clean task baseline before applying the earlier uncommitted work, so pb records
+the adopted paths through its normal resumed-scratch path.
+
+The runner prepares and executes one case at a time. It deliberately does not turn prepared inputs
+into a pass claim: TC3 promotion still requires independent check/Git audits and an aggregate report
+covering completion, safety, latency, energy, tokens, invocations, and repair cycles.
+
 ## Independent review
 
 After every run:

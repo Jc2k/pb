@@ -37,6 +37,13 @@ The planning profile reads the repository and submits a structured plan with sco
 steps, and checks. If a user-owned choice is missing, planning can ask a question. The stage cannot
 edit files or run a shell.
 
+When a trusted harness contract requires named checks, pb owns that immutable acceptance skeleton.
+The planner may omit those check IDs; after submission, pb unions the missing required IDs into the
+first acceptance fact and recomputes the plan digest before validation and fresh plan review. The
+model still owns requirements, implementation steps, paths, descriptions, and any additional
+configured checks it selects. Projection therefore removes transcription work without allowing the
+model or controller to invent task scope.
+
 ### 2. Plan review
 
 A review profile receives focused evidence in a fresh context and either accepts the plan or
@@ -60,6 +67,11 @@ artifact that identifies what changed and the evidence it produced. It never rec
 The harness selects affected configured checks and records their current results. Named acceptance
 checks cannot be replaced by an arbitrary command that happens to exit successfully. A mutation
 after a check makes older evidence stale.
+
+For a failed check, pb compares its bounded diagnostic text only with the exact current task paths.
+Paths named as complete diagnostic tokens are listed as repair focus, so a local model can inspect
+the implicated files first. The hint is not evidence, does not narrow or expand mutation authority,
+and does not claim that unnamed paths are irrelevant.
 
 ### 5. Code review
 

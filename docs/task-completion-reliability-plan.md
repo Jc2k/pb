@@ -1,6 +1,6 @@
 # Verified task-completion reliability
 
-Status: **Active; TC1 qualified 3/3 and TC2 useful-coding completion qualified**
+Status: **Active; TC1 qualified 3/3, TC2 qualified, and the TC3 candidate corpus is checked in**
 
 This record tracks pb's move from protocol-safe local agent runs to repeatable, externally verified
 coding-task completion. It complements the [small-model reliability plan](small-model-agent-reliability-plan.md),
@@ -81,8 +81,11 @@ does not erase a functional success, but it blocks an efficiency promotion.
 
 ### TC3 — repository task corpus
 
-Build a 10–20 fixture offline corpus covering one-file fixes, regression tests, related multi-file
-changes, failed-check diagnosis, review repair, resume, and out-of-scope mutation resistance.
+The checked-in 11-case offline corpus covers ordered creation, repair after a failed check, one-file
+fixes, regression tests, related multi-file changes, failed-check diagnosis, delete/modify work,
+resume adoption, mixed create/modify work, truthful no-change completion, and out-of-scope mutation
+resistance. Its manifest, safe scratch preparation, trusted contracts, and locked per-case bounds are
+deterministically validated. Aggregate native model execution remains pending.
 
 Initial promotion target:
 
@@ -102,8 +105,9 @@ contract, not the presence of a plausible patch.
 Work is evidence-gated in this order:
 
 1. qualify the shipped next-missing-path controller with TC1;
-2. derive immutable acceptance skeleton facts from the trusted contract instead of asking the model
-   to reproduce them;
+2. **Implemented:** derive immutable required-check skeleton facts from the trusted contract,
+   project them into the submitted plan, and recompute its digest instead of asking the model to
+   reproduce them;
 3. generalize deterministic work units to mixed create/modify/delete plans;
 4. grant bounded additional work only after a content or evidence transition;
 5. run declared cheap diagnostics after completed work units without granting final check credit;
@@ -127,6 +131,8 @@ specific runtime shortcuts, and silent hosted-model fallback are not promotion s
 | 2026-07-21 | TC1 locked post-fix series | runs `1784668516949-33851-0`, `1784668983662-35797-0`, and `1784669344810-37478-0`; [TC1 report](benchmarks/task-completion-tc1.md) | 3/3 verified; zero rejected or forbidden actions; median 317,781 ms and 3.97 Wh; reporting fix qualified | Retain TC1 as a regression gate and run TC2 |
 | 2026-07-21 | TC2 initial run | scratch `/private/tmp/pb-tc2-slugify-1-20260721`, run `1784669878454-39823-0` | Both declared checks passed, but implementation exhausted six steps without typed submission; unsatisfied and unverified; fixture also failed to enforce dependency freedom | Reserve the last ready implementation turn for closure and add a trusted dependency gate |
 | 2026-07-21 | TC2 useful-coding qualification | scratch `/private/tmp/pb-tc2-slugify-3-20260721`, run `1784671564495-58382-0`, commit `7fd899ce771857bd39a3c6d0ec77e85e6b230607`; [TC2 report](benchmarks/task-completion-tc2.md) | Verified completion after one real repair; all three checks independently passed; clean three-path semantic commit; 16 calls, 1,167,352 ms, 12.90 Wh | Retain as a repair regression; expand TC3 and reduce model calls without weakening gates |
+| 2026-07-21 | Trusted acceptance projection | unit projection/digest test, scripted planning-stage test, exact-path repair-focus test, and complete Rust quality suite | Required contract check IDs are projected and rehashed before fresh review; bounded failed-check diagnostics focus repair without granting evidence or scope | Measure the native invocation and token effect in TC3 rather than claiming an efficiency win from deterministic tests |
+| 2026-07-21 | TC3 candidate corpus | `fixtures/harness-task-completion/corpus.json`, `scripts/run-harness-task-corpus.ts`, Deno preparation tests, Rust contract normalization test | 11 safe offline cases across 11 categories; reproducible seeded and resumed scratch preparation; aggregate native results not yet claimed | Execute preserved cases, audit every claimed success, and publish aggregate functional and efficiency results |
 
 ## Completion audit
 
@@ -138,6 +144,7 @@ specific runtime shortcuts, and silent hosted-model fallback are not promotion s
 - [x] TC1 native qualification passes and its journal, events, Git state, and check are reviewed.
 - [x] TC1 repeats successfully 3/3 with locked settings.
 - [x] TC2 reaches one independently verified completion.
-- [ ] TC3 corpus and aggregate report exist.
-- [ ] Highest-value evidenced controller and efficiency gaps are fixed and regression-tested.
+- [x] TC3 candidate corpus and single-case runner exist.
+- [ ] TC3 aggregate native-model report exists.
+- [x] Highest-value evidenced acceptance-projection gap is fixed and regression-tested.
 - [ ] External same-model comparison is recorded.

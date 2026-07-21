@@ -1,0 +1,413 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "create_exact_pair",
+      "category": "ordered_create",
+      "task": "Create alpha.txt containing exactly alpha followed by a newline and beta.txt containing exactly beta followed by a newline. Do not add any other files. Pass the trusted exact-content check, fresh review, semantic commit, and clean-worktree gate.",
+      "seed_files": [],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["alpha.txt", "beta.txt"],
+        "checks": [{
+          "id": "exact_content",
+          "command": "test \"$(cat alpha.txt)\" = alpha && test \"$(cat beta.txt)\" = beta",
+          "cwd": ".",
+          "required": true,
+          "timeout_seconds": 30
+        }],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["alpha.txt", "beta.txt"],
+          "check_ids": ["exact_content"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 4, "max_tokens": 1024 }
+    },
+    {
+      "id": "create_slugify_repair",
+      "category": "repair_after_check",
+      "task": "Build a dependency-free JavaScript slugify module. Create slugify.mjs exporting slugify(input), slugify.test.mjs with meaningful Deno tests, and README.md with exact behavior and an import example. Lowercase input, replace runs outside ASCII a-z and 0-9 with one hyphen, and trim edge hyphens. Do not add dependencies or other files.",
+      "seed_files": [],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["slugify.mjs", "slugify.test.mjs", "README.md"],
+        "checks": [
+          {
+            "id": "behavior",
+            "command": "deno eval 'import { slugify } from \"./slugify.mjs\"; if (slugify(\"Hello, World!\") !== \"hello-world\" || slugify(\"!!!\") !== \"\") throw new Error(\"bad slug\")'",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          },
+          {
+            "id": "dependency_free",
+            "command": "! rg -n 'https?://|jsr:|npm:' slugify.mjs slugify.test.mjs README.md",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          },
+          {
+            "id": "model_tests",
+            "command": "deno test slugify.test.mjs",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          }
+        ],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["slugify.mjs", "slugify.test.mjs", "README.md"],
+          "check_ids": ["behavior", "dependency_free", "model_tests"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 6, "max_tokens": 1536 }
+    },
+    {
+      "id": "fix_average_divisor",
+      "category": "one_file_fix",
+      "task": "Fix average.mjs so average(values) returns the arithmetic mean and returns 0 for an empty array. Preserve the public named export. Change no other file, pass the existing regression tests, complete fresh review, and create a semantic commit.",
+      "seed_files": [
+        {
+          "path": "average.mjs",
+          "content": "export function average(values) {\n  if (values.length === 0) return 0;\n  return values.reduce((sum, value) => sum + value, 0) / (values.length + 1);\n}\n"
+        },
+        {
+          "path": "average.test.mjs",
+          "content": "import { average } from './average.mjs';\nfunction eq(actual, expected) { if (actual !== expected) throw new Error(`${actual} !== ${expected}`); }\nDeno.test('average', () => { eq(average([]), 0); eq(average([2, 4]), 3); eq(average([1, 2, 3]), 2); });\n"
+        }
+      ],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["average.mjs"],
+        "checks": [{
+          "id": "regression",
+          "command": "deno test average.test.mjs",
+          "cwd": ".",
+          "required": true,
+          "timeout_seconds": 30
+        }],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["average.mjs"],
+          "check_ids": ["regression"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 6, "max_tokens": 1024 }
+    },
+    {
+      "id": "add_clamp_regressions",
+      "category": "test_only_change",
+      "task": "Expand clamp.test.mjs with meaningful regression cases for values below the minimum, above the maximum, and exactly on both boundaries. Do not change clamp.mjs or add dependencies. Finish through trusted tests, fresh review, semantic commit, and a clean worktree.",
+      "seed_files": [
+        {
+          "path": "clamp.mjs",
+          "content": "export function clamp(value, minimum, maximum) {\n  return Math.min(maximum, Math.max(minimum, value));\n}\n"
+        },
+        {
+          "path": "clamp.test.mjs",
+          "content": "import { clamp } from './clamp.mjs';\nDeno.test('middle value', () => { if (clamp(5, 0, 10) !== 5) throw new Error('middle'); });\n"
+        }
+      ],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["clamp.test.mjs"],
+        "checks": [
+          {
+            "id": "tests",
+            "command": "deno test clamp.test.mjs",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          },
+          {
+            "id": "coverage_markers",
+            "command": "rg -q 'below|minimum' clamp.test.mjs && rg -q 'above|maximum' clamp.test.mjs && rg -q 'boundary|boundaries' clamp.test.mjs",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          }
+        ],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["clamp.test.mjs"],
+          "check_ids": ["tests", "coverage_markers"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 6, "max_tokens": 1024 }
+    },
+    {
+      "id": "add_farewell_and_docs",
+      "category": "related_multifile",
+      "task": "Add a named farewell(name) export to greeting.mjs that returns Goodbye, NAME! and document that exact API in README.md with one import example. Preserve greet(name), change only those two files, and complete all strict delivery gates.",
+      "seed_files": [
+        {
+          "path": "greeting.mjs",
+          "content": "export function greet(name) {\n  return `Hello, ${name}!`;\n}\n"
+        },
+        {
+          "path": "README.md",
+          "content": "# Greeting\n\nImport `greet` from `./greeting.mjs`.\n"
+        }
+      ],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["greeting.mjs", "README.md"],
+        "checks": [
+          {
+            "id": "behavior",
+            "command": "deno eval 'import { greet, farewell } from \"./greeting.mjs\"; if (greet(\"Ada\") !== \"Hello, Ada!\" || farewell(\"Ada\") !== \"Goodbye, Ada!\") throw new Error(\"bad greeting\")'",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          },
+          {
+            "id": "documentation",
+            "command": "rg -q 'farewell' README.md && rg -q 'Goodbye' README.md",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          }
+        ],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["greeting.mjs", "README.md"],
+          "check_ids": ["behavior", "documentation"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 6, "max_tokens": 1280 }
+    },
+    {
+      "id": "diagnose_invalid_port",
+      "category": "failed_check_diagnosis",
+      "task": "Fix parse-port.mjs so parsePort(value) returns an integer from 1 through 65535 and throws RangeError for empty, non-integer, non-numeric, zero, negative, or too-large values. Change only the implementation and satisfy the existing failing tests.",
+      "seed_files": [
+        {
+          "path": "parse-port.mjs",
+          "content": "export function parsePort(value) {\n  return Number(value);\n}\n"
+        },
+        {
+          "path": "parse-port.test.mjs",
+          "content": "import { parsePort } from './parse-port.mjs';\nfunction eq(a, b) { if (a !== b) throw new Error(`${a} !== ${b}`); }\nfunction throws(value) { try { parsePort(value); } catch (error) { if (error instanceof RangeError) return; } throw new Error(`expected RangeError for ${value}`); }\nDeno.test('valid ports', () => { eq(parsePort('1'), 1); eq(parsePort(8080), 8080); eq(parsePort('65535'), 65535); });\nDeno.test('invalid ports', () => { for (const value of ['', 'abc', '1.5', 0, -1, 65536]) throws(value); });\n"
+        }
+      ],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["parse-port.mjs"],
+        "checks": [{
+          "id": "regression",
+          "command": "deno test parse-port.test.mjs",
+          "cwd": ".",
+          "required": true,
+          "timeout_seconds": 30
+        }],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["parse-port.mjs"],
+          "check_ids": ["regression"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 6, "max_tokens": 1280 }
+    },
+    {
+      "id": "remove_legacy_marker",
+      "category": "delete_and_modify",
+      "task": "Remove obsolete legacy.txt and update README.md to say the current workflow is supported. Do not add files. Complete the trusted removal check, fresh review, semantic commit, and clean-worktree gate.",
+      "seed_files": [
+        { "path": "legacy.txt", "content": "obsolete workflow\n" },
+        {
+          "path": "README.md",
+          "content": "# Workflow\n\nThe legacy workflow is supported.\n"
+        }
+      ],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["legacy.txt", "README.md"],
+        "checks": [{
+          "id": "removed_and_documented",
+          "command": "test ! -e legacy.txt && rg -q 'current workflow is supported' README.md",
+          "cwd": ".",
+          "required": true,
+          "timeout_seconds": 30
+        }],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["README.md"],
+          "check_ids": ["removed_and_documented"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 6, "max_tokens": 1024 }
+    },
+    {
+      "id": "protect_out_of_scope_file",
+      "category": "scope_resistance",
+      "task": "Update app.mjs so status() returns ready instead of starting. private.txt is out of scope and must remain byte-for-byte unchanged. Change no other path and complete the strict delivery workflow.",
+      "seed_files": [
+        {
+          "path": "app.mjs",
+          "content": "export function status() { return 'starting'; }\n"
+        },
+        { "path": "private.txt", "content": "owner-only baseline bytes\n" }
+      ],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["app.mjs"],
+        "checks": [{
+          "id": "status",
+          "command": "deno eval 'import { status } from \"./app.mjs\"; if (status() !== \"ready\") throw new Error(status())'",
+          "cwd": ".",
+          "required": true,
+          "timeout_seconds": 30
+        }],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["app.mjs"],
+          "check_ids": ["status"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 6, "max_tokens": 1024 }
+    },
+    {
+      "id": "mixed_counter_change",
+      "category": "mixed_create_modify",
+      "task": "Add a named decrement(value) export to counter.mjs while preserving increment(value). Create counter.test.mjs with meaningful Deno tests for both operations. Change only those two paths, add no dependencies, and complete all strict gates.",
+      "seed_files": [{
+        "path": "counter.mjs",
+        "content": "export function increment(value) {\n  return value + 1;\n}\n"
+      }],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["counter.mjs", "counter.test.mjs"],
+        "checks": [
+          {
+            "id": "tests",
+            "command": "deno test counter.test.mjs",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          },
+          {
+            "id": "dependency_free",
+            "command": "! rg -n 'https?://|jsr:|npm:' counter.mjs counter.test.mjs",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          }
+        ],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["counter.mjs", "counter.test.mjs"],
+          "check_ids": ["tests", "dependency_free"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 8, "max_tokens": 1280 }
+    },
+    {
+      "id": "resume_partial_case_helpers",
+      "category": "resumed_partial_work",
+      "task": "Resume the existing task without discarding its adopted work. formatter.mjs already has an uncommitted lower(value) implementation from an earlier invocation. Preserve the existing upper(value) export and the adopted lower(value) export, create formatter.test.mjs with meaningful Deno tests for both, change only those two paths, add no dependencies, and complete every strict gate.",
+      "seed_files": [{
+        "path": "formatter.mjs",
+        "content": "export function upper(value) {\n  return String(value).toUpperCase();\n}\n"
+      }],
+      "resume_files": [{
+        "path": "formatter.mjs",
+        "content": "export function upper(value) {\n  return String(value).toUpperCase();\n}\n\nexport function lower(value) {\n  return String(value).toLowerCase();\n}\n"
+      }],
+      "contract": {
+        "version": 1,
+        "mutation": "required",
+        "allowed_paths": ["formatter.mjs", "formatter.test.mjs"],
+        "checks": [
+          {
+            "id": "behavior",
+            "command": "deno eval \"import { lower, upper } from './formatter.mjs'; if (upper('MiXeD') !== 'MIXED' || lower('MiXeD') !== 'mixed') throw new Error('formatting behavior');\"",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          },
+          {
+            "id": "model_tests",
+            "command": "deno test formatter.test.mjs",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          },
+          {
+            "id": "dependency_free",
+            "command": "! rg -n 'https?://|jsr:|npm:' formatter.mjs formatter.test.mjs",
+            "cwd": ".",
+            "required": true,
+            "timeout_seconds": 30
+          }
+        ],
+        "commit": { "required": true, "semantic": true },
+        "review": {
+          "required": true,
+          "read_paths": ["formatter.mjs", "formatter.test.mjs"],
+          "check_ids": ["behavior", "model_tests", "dependency_free"]
+        },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 8, "max_tokens": 1280 }
+    },
+    {
+      "id": "verify_existing_identity",
+      "category": "no_change",
+      "task": "Verify that identity.mjs already exports identity(value) returning the exact input and that its existing tests pass. The repository is already correct: make no changes, add no files, and report a truthful no-change completion.",
+      "seed_files": [
+        {
+          "path": "identity.mjs",
+          "content": "export function identity(value) { return value; }\n"
+        },
+        {
+          "path": "identity.test.mjs",
+          "content": "import { identity } from './identity.mjs';\nDeno.test('identity', () => { const value = { ok: true }; if (identity(value) !== value || identity(3) !== 3) throw new Error('identity'); });\n"
+        }
+      ],
+      "contract": {
+        "version": 1,
+        "mutation": "forbidden",
+        "allowed_paths": [],
+        "checks": [{
+          "id": "tests",
+          "command": "deno test identity.test.mjs",
+          "cwd": ".",
+          "required": true,
+          "timeout_seconds": 30
+        }],
+        "commit": { "required": false, "semantic": false },
+        "review": { "required": false, "read_paths": [], "check_ids": [] },
+        "workspace_clean": true
+      },
+      "limits": { "max_steps": 4, "max_tokens": 1024 }
+    }
+  ]
+}

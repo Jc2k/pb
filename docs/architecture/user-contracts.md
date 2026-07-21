@@ -97,6 +97,12 @@ check evidence, verifies commit requirements, and evaluates final workspace clea
 `contract_status=satisfied` and `verified_completed=true`; a contract-free workflow remains
 unverified, and an unmet explicit contract terminates as `contract_unsatisfied`.
 
+Contract-required check IDs are controller-owned facts. A planner does not need to copy them into
+its submission: pb projects any missing IDs into the accepted plan, recomputes its digest, and sends
+that exact artifact to fresh plan review. Additional checks remain model-selected, while paths and
+implementation scope remain model-proposed and contract-validated; projection cannot turn an
+allowed path into a required mutation or add user intent.
+
 ## Evidence contract
 
 A change-bearing Ready build carries evidence that is current for the managed commit:

@@ -9079,6 +9079,7 @@ fn run_delivery_workflow(
         let context = delivery_stage_context(
             &run,
             graph,
+            args.contract.as_ref(),
             workspace_root,
             validation_feedback.as_deref(),
             repair_context.as_deref(),
@@ -9525,6 +9526,42 @@ fn accepted_plan_check_ids(run: &crate::workflow::WorkflowRun) -> Vec<String> {
     checks
 }
 
+fn diagnostic_output_mentions_path(output: &str, path: &str) -> bool {
+    output
+        .replace('\\', "/")
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    ':' | '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                )
+        })
+        .map(|token| token.strip_prefix("./").unwrap_or(token))
+        .any(|token| token == path)
+}
+
+fn failed_check_diagnostic_paths(
+    changed_paths: &[String],
+    failures: &[crate::checks::CheckFailureSummary],
+) -> Vec<String> {
+    let mut focused = changed_paths
+        .iter()
+        .filter(|path| {
+            failures.iter().any(|failure| {
+                diagnostic_output_mentions_path(&failure.output, path)
+                    || failure
+                        .skip_reason
+                        .as_deref()
+                        .is_some_and(|reason| diagnostic_output_mentions_path(reason, path))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    focused.sort();
+    focused.dedup();
+    focused
+}
+
 fn run_delivery_checks(
     run: &mut crate::workflow::WorkflowRun,
     graph: &crate::workspace::WorkspaceGraph,
@@ -9634,7 +9671,7 @@ fn run_delivery_checks(
         .chain(summary.skipped.iter())
         .cloned()
         .collect::<Vec<_>>();
-    let feedback = summary
+    let failure_details = summary
         .failures
         .iter()
         .map(|failure| {
@@ -9651,6 +9688,21 @@ fn run_delivery_checks(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let changed_paths = run
+        .repository
+        .task_baseline
+        .content
+        .changed_paths(&content_after);
+    let diagnostic_paths = failed_check_diagnostic_paths(&changed_paths, &summary.failures);
+    let diagnostic_focus = if diagnostic_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nHarness diagnostic focus: the failed check output explicitly names task path(s) [{}]. Inspect those paths first. Other plan paths remain in scope only when the diagnostic or fix requires them.",
+            diagnostic_paths.join(", ")
+        )
+    };
+    let feedback = format!("{failure_details}{diagnostic_focus}");
     run.apply(crate::workflow::WorkflowEvent::ChecksFailed {
         content_fingerprint: content_after.fingerprint,
         selected_checks: plan.checks,
@@ -9977,7 +10029,7 @@ fn run_delivery_commit(
 const PLAN_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan function exactly once with arguments shaped as:
 {"id":"plan-1","summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":[{"path":"path/to/file.ext","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["required-check-id"],"description":"..."}]}
-Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Paths are evaluated in step order: use create before a later modify when the path is currently missing, never modify or delete it before that create, and never create it again while it exists. Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. Use [] for component_ids or check_ids only when the normalized graph genuinely has none. Do not return the arguments as prose or a final action."#;
+Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Paths are evaluated in step order: use create before a later modify when the path is currently missing, never modify or delete it before that create, and never create it again while it exists. Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. When the harness names projected contract check ids, leave those ids out of check_ids; pb will add them deterministically after submission. Include only additional configured check ids selected by the plan. Use [] for component_ids or check_ids when there are no additional ids. Do not return the arguments as prose or a final action."#;
 
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan_review function exactly once with arguments shaped as:
@@ -10150,6 +10202,7 @@ fn workflow_terminal_precondition_feedback(
 fn delivery_stage_context(
     run: &crate::workflow::WorkflowRun,
     graph: &crate::workspace::WorkspaceGraph,
+    contract: Option<&crate::harness_contract::AgentContract>,
     workspace_root: &Path,
     validation_feedback: Option<&str>,
     repair_context: Option<&str>,
@@ -10177,6 +10230,7 @@ fn delivery_stage_context(
         crate::workflow::WorkflowStage::Planning | crate::workflow::WorkflowStage::PlanRevision => {
             let (graph_sha256, repository_brief_json) = delivery_repository_brief(run, graph)?;
             let handoff = serde_json::to_string_pretty(&run.task)?;
+            let acceptance_projection_note = contract_plan_projection_note(contract);
             let prior_challenges = run
                 .plan_review
                 .as_ref()
@@ -10186,7 +10240,7 @@ fn delivery_stage_context(
             Ok(StageContext {
                 system_prompt: "You are the planning stage of a harness-controlled delivery workflow. You have read-only repository tools. Produce a concrete, structurally complete plan tied to real workspace component/check ids and repository-relative paths. Resolve genuinely blocking human ambiguity with ask_user when that tool is exposed; otherwise record a truthful open question instead of inventing an answer. End only by calling submit_plan; prose final responses cannot advance the workflow.".to_string(),
                 user_prompt: format!(
-                    "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}\n\nBounded repository brief (full normalized graph SHA-256 {graph_sha256} remains the validation authority):\n{repository_brief_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{evidence_note}\n\n{handoff_note}\n\n{PLAN_SUBMISSION_GUIDANCE}{correction}",
+                    "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}\n\nBounded repository brief (full normalized graph SHA-256 {graph_sha256} remains the validation authority):\n{repository_brief_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{acceptance_projection_note}\n\n{evidence_note}\n\n{handoff_note}\n\n{PLAN_SUBMISSION_GUIDANCE}{correction}",
                     run.task,
                     run.planning_content().fingerprint,
                 ),
@@ -13534,12 +13588,21 @@ fn run_tool(
         }
         "submit_plan" => {
             let (plan, normalized_json_string) = parse_submission_artifact(arguments, "plan")?;
-            accept_stage_artifact_submission(
+            let (plan, projected_check_ids) =
+                project_contract_plan_checks(plan, context.request.contract.as_ref())?;
+            let mut result = accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::Plan { plan },
                 "plan",
                 normalized_json_string,
-            )
+            )?;
+            if !projected_check_ids.is_empty() {
+                result.push_str(&format!(
+                    "; harness projected trusted contract check ids into the accepted plan: {}",
+                    projected_check_ids.join(", ")
+                ));
+            }
+            Ok(result)
         }
         "submit_plan_review" => {
             let (review, normalized_json_string) = parse_submission_artifact(arguments, "review")?;
@@ -14540,6 +14603,67 @@ fn ensure_contract_paths_allowed<'a>(
     }
 }
 
+fn contract_plan_check_ids(
+    contract: Option<&crate::harness_contract::AgentContract>,
+) -> Vec<String> {
+    let Some(contract) = contract else {
+        return Vec::new();
+    };
+    let mut check_ids = contract
+        .checks
+        .iter()
+        .filter(|check| check.required)
+        .map(|check| check.id.clone())
+        .chain(contract.review.check_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    check_ids.sort();
+    check_ids.dedup();
+    check_ids
+}
+
+fn contract_plan_projection_note(
+    contract: Option<&crate::harness_contract::AgentContract>,
+) -> String {
+    let check_ids = contract_plan_check_ids(contract);
+    if check_ids.is_empty() {
+        return "Trusted acceptance projection: no contract-required check ids.".to_string();
+    }
+    format!(
+        "Trusted acceptance projection: pb will add these immutable contract-required check ids to the first submitted acceptance fact: [{}]. Do not spend output copying them into check_ids; include only additional configured checks selected by the plan. The projected plan and its recomputed digest are the exact artifact sent to plan review.",
+        check_ids.join(", ")
+    )
+}
+
+fn project_contract_plan_checks(
+    mut plan: crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>,
+    contract: Option<&crate::harness_contract::AgentContract>,
+) -> Result<(
+    crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>,
+    Vec<String>,
+)> {
+    let existing = plan
+        .artifact
+        .acceptance
+        .iter()
+        .flat_map(|acceptance| acceptance.check_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    let projected = contract_plan_check_ids(contract)
+        .into_iter()
+        .filter(|check_id| !existing.contains(check_id))
+        .collect::<Vec<_>>();
+    if projected.is_empty() {
+        return Ok((plan, projected));
+    }
+    let acceptance = plan
+        .artifact
+        .acceptance
+        .first_mut()
+        .context("plan requires an acceptance fact before contract checks can be projected")?;
+    acceptance.check_ids.extend(projected.iter().cloned());
+    let plan = crate::workflow::ArtifactEnvelope::new(plan.id, plan.artifact)?;
+    Ok((plan, projected))
+}
+
 fn validate_plan_contract_paths(
     request: &AgentRequest,
     plan: &crate::workflow::PlanArtifact,
@@ -14566,13 +14690,9 @@ fn validate_plan_contract_paths(
             .iter()
             .flat_map(|acceptance| acceptance.check_ids.iter().map(String::as_str))
             .collect::<HashSet<_>>();
-        let mut required_checks = contract
-            .checks
-            .iter()
-            .filter(|check| check.required)
-            .map(|check| check.id.as_str())
-            .chain(contract.review.check_ids.iter().map(String::as_str))
-            .filter(|check_id| !planned_checks.contains(check_id))
+        let mut required_checks = contract_plan_check_ids(Some(contract))
+            .into_iter()
+            .filter(|check_id| !planned_checks.contains(check_id.as_str()))
             .collect::<Vec<_>>();
         required_checks.sort_unstable();
         required_checks.dedup();
@@ -17967,6 +18087,126 @@ the next imagined action"#;
                 .to_string()
                 .contains("acceptance[].check_ids to select check(s): logic")
         );
+    }
+
+    #[test]
+    fn trusted_contract_check_ids_are_projected_into_the_plan_and_rehashed() {
+        let repo = init_contract_test_repo();
+        let plan = delivery_plan(
+            Some(("game.js", crate::workflow::PlannedChange::Create)),
+            Vec::new(),
+        );
+        let original_sha256 = plan.sha256.clone();
+        let contract = crate::harness_contract::AgentContract {
+            version: 1,
+            mutation: crate::harness_contract::MutationRequirement::Required,
+            allowed_paths: vec!["game.js".to_string()],
+            checks: vec![
+                crate::harness_contract::AgentCheckContract {
+                    id: "logic".to_string(),
+                    command: "true".to_string(),
+                    cwd: ".".to_string(),
+                    required: true,
+                    timeout_seconds: 2,
+                },
+                crate::harness_contract::AgentCheckContract {
+                    id: "review_gate".to_string(),
+                    command: "true".to_string(),
+                    cwd: ".".to_string(),
+                    required: false,
+                    timeout_seconds: 2,
+                },
+            ],
+            commit: crate::harness_contract::HarnessCommitContract::default(),
+            review: crate::harness_contract::HarnessReviewContract {
+                required: true,
+                read_paths: vec!["game.js".to_string()],
+                check_ids: vec!["review_gate".to_string()],
+            },
+            workspace_clean: false,
+        };
+
+        let (projected_plan, projected) =
+            project_contract_plan_checks(plan, Some(&contract)).unwrap();
+
+        assert_eq!(projected, vec!["logic", "review_gate"]);
+        let projection_note = contract_plan_projection_note(Some(&contract));
+        assert!(projection_note.contains("[logic, review_gate]"));
+        assert!(projection_note.contains("Do not spend output copying"));
+        assert_eq!(
+            projected_plan.artifact.acceptance[0].check_ids,
+            vec!["logic", "review_gate"]
+        );
+        assert_ne!(projected_plan.sha256, original_sha256);
+        projected_plan.validate_digest().unwrap();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.contract = Some(contract);
+        validate_plan_contract_paths(&request, &projected_plan.artifact).unwrap();
+    }
+
+    #[test]
+    fn planning_stage_projects_contract_checks_before_returning_the_artifact() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.contract = Some(normalized_test_contract("true"));
+        let contract = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::Planning,
+            request.workflow_policy.as_ref().unwrap().limits,
+            512,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_stage(
+            &request,
+            &contract,
+            stage_context(),
+            vec![ScriptedCompletion {
+                content: plan_submission(),
+                truncated: false,
+            }],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        let crate::workflow::StageSubmission::Plan { plan } =
+            outcome.stage.submission.expect("projected plan submission")
+        else {
+            panic!("planning stage returned a non-plan submission");
+        };
+        assert_eq!(plan.artifact.acceptance[0].check_ids, vec!["logic"]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, result, .. }
+                if tool == "submit_plan" && result.contains("harness projected trusted contract check ids")
+        )));
+    }
+
+    #[test]
+    fn repair_focus_uses_exact_task_paths_named_by_failed_check_output() {
+        let changed_paths = vec![
+            "README.md".to_string(),
+            "slugify.mjs".to_string(),
+            "slugify.test.mjs".to_string(),
+        ];
+        let failures = vec![crate::checks::CheckFailureSummary {
+            check_id: "dependency_free".to_string(),
+            exit_status: 1,
+            timed_out: false,
+            output: "slugify.test.mjs:2: remote import\nslugify.test.mjs.backup:1: ignored"
+                .to_string(),
+            skip_reason: None,
+        }];
+
+        assert_eq!(
+            failed_check_diagnostic_paths(&changed_paths, &failures),
+            vec!["slugify.test.mjs"]
+        );
+        assert!(!diagnostic_output_mentions_path(
+            "slugify.test.mjs.backup:1",
+            "slugify.test.mjs"
+        ));
     }
 
     #[test]
@@ -22747,7 +22987,7 @@ the next imagined action"#;
         .unwrap();
         assert_eq!(run.stage, crate::workflow::WorkflowStage::CodeReview);
 
-        let context = delivery_stage_context(&run, &graph, repo.path(), None, None).unwrap();
+        let context = delivery_stage_context(&run, &graph, None, repo.path(), None, None).unwrap();
         let legacy = legacy_workflow_review_material(&run, repo.path()).unwrap();
         let manifest = ChangeManifest::build(&run.repository, repo.path(), &checked.fingerprint)
             .unwrap()
@@ -22814,7 +23054,7 @@ the next imagined action"#;
         )
         .unwrap();
 
-        let context = delivery_stage_context(&run, &graph, repo.path(), None, None).unwrap();
+        let context = delivery_stage_context(&run, &graph, None, repo.path(), None, None).unwrap();
         assert!(context.user_prompt.contains("Bounded repository brief"));
         assert!(context.user_prompt.contains(&graph_sha256));
         assert!(context.user_prompt.contains("Cargo.toml"));

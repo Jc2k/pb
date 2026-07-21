@@ -458,4 +458,38 @@ mod tests {
             assert!(contract.workspace_clean);
         }
     }
+
+    #[test]
+    fn checked_in_task_corpus_contracts_normalize() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/harness-task-completion/corpus.json"
+        ))
+        .unwrap();
+        assert_eq!(corpus["version"], 1);
+        let cases = corpus["cases"].as_array().expect("corpus cases");
+        assert!((10..=20).contains(&cases.len()));
+        let mut case_ids = HashSet::new();
+
+        for fixture in cases {
+            let case_id = fixture["id"].as_str().expect("case id");
+            assert!(case_ids.insert(case_id), "duplicate case id {case_id}");
+            let document: HarnessContractDocument =
+                serde_json::from_value(fixture["contract"].clone())
+                    .unwrap_or_else(|error| panic!("{case_id} contract must parse: {error}"));
+            let contract = document
+                .normalize()
+                .unwrap_or_else(|error| panic!("{case_id} contract must normalize: {error}"));
+            assert!(!contract.checks.is_empty(), "{case_id} checks");
+            assert!(contract.workspace_clean, "{case_id} clean worktree");
+            if contract.mutation == MutationRequirement::Required {
+                assert!(
+                    !contract.allowed_paths.is_empty(),
+                    "{case_id} allowed paths"
+                );
+                assert!(contract.commit.required, "{case_id} required commit");
+                assert!(contract.commit.semantic, "{case_id} semantic commit");
+                assert!(contract.review.required, "{case_id} required review");
+            }
+        }
+    }
 }

@@ -94,9 +94,10 @@ A contract-free `ready` or `no_change` workflow exits zero while retaining
 zero with `contract_status=satisfied` and `verified_completed=true`. Strict delivery applies the
 contract to planned and final mutation, allowed paths, required checks, named fresh-review reads and
 check evidence, semantic commit requirements, and final workspace cleanliness; attaching a contract
-does not make `Ready` verified by itself. A strict plan selects every contract-required check in an
-acceptance fact's `check_ids`; pb rejects an omitted check before implementation and names that
-field in its correction. Required mutation with no delta becomes
+does not make `Ready` verified by itself. During planning, pb projects immutable required contract
+check IDs into the first submitted acceptance fact and recomputes the plan digest before validation
+and fresh review. The model selects only additional configured checks; direct or restored plans that
+still omit a required check are rejected before implementation. Required mutation with no delta becomes
 `contract_unsatisfied`; persistent check failure, missing executor, repeated repair failure, and an
 unsafe required commit remain distinct nonzero `checks_failed`, `executor_unavailable`,
 `repair_exhausted`, and `commit_blocked` outcomes. Step, parse, runtime-engine, and resource-limit
@@ -107,7 +108,7 @@ stored summaries without these additive fields remain readable with conservative
 ### Task-completion qualification
 
 The deterministic control corpus proves harness behavior, not generated artifact quality. The
-checked-in `fixtures/harness-task-completion` corpus adds two explicit offline artifact
+checked-in `fixtures/harness-task-completion` directory adds two explicit offline artifact
 qualifications:
 
 - TC1 requires two exact small files and qualifies native next-missing-path execution through checks,
@@ -120,6 +121,29 @@ independently reproduced check, the recorded commit at `HEAD`, and a clean workt
 containment, task completion, artifact quality, wall time, and energy are reported separately. The
 [reliability plan](task-completion-reliability-plan.md) defines the locked repeatability and corpus
 promotion gates.
+
+The same directory contains a schema-validated 11-case TC3 candidate corpus spanning ordered
+creation, repair after a failed check, a one-file fix, regression tests, related multi-file work,
+failed-check diagnosis, delete-and-modify work, out-of-scope resistance, mixed create/modify work,
+adopted work from a resumed scratch baseline, and truthful no-change completion. List it with:
+
+```bash
+deno run --allow-read scripts/run-harness-task-corpus.ts --list
+```
+
+Run one case at a time with a new scratch root and the current release binary:
+
+```bash
+deno run --allow-read --allow-write --allow-run \
+  scripts/run-harness-task-corpus.ts \
+  --case fix_average_divisor \
+  --scratch-dir /private/tmp/pb-corpus-fix-average-1
+```
+
+`--prepare-only` materializes the exact seeded repository, trusted contract, task, and optional
+resumed-task baseline without loading a model. Every scratch root is retained and audited with the
+same independent procedure as TC1/TC2. The manifest and runner establish reproducible inputs; they
+do not constitute the pending aggregate TC3 model result.
 
 The run audit records every observed strict named check in its planned and executed check evidence,
 even though strict delivery does not emit the legacy handoff summary. Harness-owned next-path work
