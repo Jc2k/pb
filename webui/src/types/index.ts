@@ -398,6 +398,9 @@ export type AgentEvent =
       cached_tokens: number;
       prefill_wall_ms: number;
       prefill_tokens_per_second: number;
+      prefill_metal_commands: number;
+      prefill_host_upload_bytes: number;
+      prefill_host_readback_bytes: number;
       decode_tokens: number;
       decode_wall_ms: number;
       decode_tokens_per_second: number;

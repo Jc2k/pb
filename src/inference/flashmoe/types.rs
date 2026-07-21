@@ -372,6 +372,12 @@ pub struct NativeGenerationStats {
     pub cached_tokens: usize,
     pub prefill_wall_ms: u64,
     pub prefill_tokens_per_second: f64,
+    #[serde(default)]
+    pub prefill_metal_commands: usize,
+    #[serde(default)]
+    pub prefill_host_upload_bytes: usize,
+    #[serde(default)]
+    pub prefill_host_readback_bytes: usize,
     pub decode_tokens: usize,
     pub decode_wall_ms: u64,
     pub decode_tokens_per_second: f64,
@@ -421,6 +427,12 @@ pub struct FlashMoeMetalResourceSnapshot {
     pub transient_expert_bytes: usize,
     pub in_flight_commands: usize,
     pub command_high_water: usize,
+    #[serde(default)]
+    pub command_submissions: usize,
+    #[serde(default)]
+    pub host_upload_bytes: usize,
+    #[serde(default)]
+    pub host_readback_bytes: usize,
     pub token_boundaries: usize,
     pub pressure_recoveries: usize,
     pub resource_limit_aborts: usize,

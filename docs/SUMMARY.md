@@ -44,6 +44,7 @@
   - [Native agent evaluation](benchmarks/qwen3-coder-next-agent.md)
   - [Agent performance follow-on](qwen3-coder-next-agent-follow-on.md)
   - [Prefill qualification](benchmarks/qwen3-coder-next-prefill-qualification.md)
+  - [Device-resident prefill graph](qwen3-coder-next-device-resident-prefill-plan.md)
 - [Harness reliability](harness-improvement-plan.md)
   - [Open-weight workflow evaluation](harness-workflow-model-evaluation.md)
 - [External publication follow-on](external-publication-workflow-follow-on.md)

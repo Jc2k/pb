@@ -388,6 +388,9 @@ struct MetalResourceLedgerState {
     driver_high_water_bytes: usize,
     in_flight_commands: usize,
     command_high_water: usize,
+    command_submissions: usize,
+    host_upload_bytes: usize,
+    host_readback_bytes: usize,
     token_boundaries: usize,
     pressure_recoveries: usize,
     resource_limit_aborts: usize,
@@ -418,6 +421,9 @@ impl MetalResourceLedgerState {
             driver_high_water_bytes: current_allocated_bytes,
             in_flight_commands: 0,
             command_high_water: 0,
+            command_submissions: 0,
+            host_upload_bytes: 0,
+            host_readback_bytes: 0,
             token_boundaries: 0,
             pressure_recoveries: 0,
             resource_limit_aborts: 0,
@@ -513,6 +519,9 @@ impl MetalResourceLedgerState {
             transient_expert_bytes: self.transient_expert.bytes,
             in_flight_commands: self.in_flight_commands,
             command_high_water: self.command_high_water,
+            command_submissions: self.command_submissions,
+            host_upload_bytes: self.host_upload_bytes,
+            host_readback_bytes: self.host_readback_bytes,
             token_boundaries: self.token_boundaries,
             pressure_recoveries: self.pressure_recoveries,
             resource_limit_aborts: self.resource_limit_aborts,
@@ -662,8 +671,19 @@ impl MetalResourceLedger {
 
     fn command_started(&self) {
         let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.command_submissions = state.command_submissions.saturating_add(1);
         state.in_flight_commands = state.in_flight_commands.saturating_add(1);
         state.command_high_water = state.command_high_water.max(state.in_flight_commands);
+    }
+
+    fn record_host_upload(&self, bytes: usize) {
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.host_upload_bytes = state.host_upload_bytes.saturating_add(bytes);
+    }
+
+    fn record_host_readback(&self, bytes: usize) {
+        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+        state.host_readback_bytes = state.host_readback_bytes.saturating_add(bytes);
     }
 
     fn command_finished(&self) {
@@ -883,6 +903,7 @@ impl MetalBufferPool {
             let buffer = self.buffer_with_len(device, bytes.len())?;
             let contents = msg_send_ptr0(buffer, sel("contents"));
             ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            self.resources.record_host_upload(bytes.len());
             Ok(buffer)
         }
     }
@@ -915,6 +936,7 @@ impl MetalBufferPool {
             };
             let contents = msg_send_ptr0(buffer, sel("contents"));
             ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            self.resources.record_host_upload(bytes.len());
             Ok(buffer)
         }
     }
@@ -950,8 +972,26 @@ impl MetalBufferPool {
             let buffer = self.tracked_buffer_with_len(device, bytes.len(), owned)?;
             let contents = msg_send_ptr0(buffer, sel("contents"));
             ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+            self.resources.record_host_upload(bytes.len());
             Ok(buffer)
         }
+    }
+
+    unsafe fn read_f32_buffer(&self, buffer: MetalObjcId, len: usize) -> Vec<f32> {
+        let bytes = len.saturating_mul(std::mem::size_of::<f32>());
+        self.resources.record_host_readback(bytes);
+        unsafe { read_f32_buffer(buffer, len) }
+    }
+
+    unsafe fn read_f32_buffer_offset(
+        &self,
+        buffer: MetalObjcId,
+        offset: usize,
+        len: usize,
+    ) -> Vec<f32> {
+        let bytes = len.saturating_mul(std::mem::size_of::<f32>());
+        self.resources.record_host_readback(bytes);
+        unsafe { read_f32_buffer_offset(buffer, offset, len) }
     }
 
     pub(crate) unsafe fn recycle(&self, buffer: MetalObjcId) {
@@ -2187,7 +2227,17 @@ impl MetalExecutionContext {
                 "FlashMoe Metal linear-attention state lock is poisoned during session capture"
             )
         })?;
-        capture_linear_attention_session_snapshot(&state)
+        let readback_values = state
+            .layers
+            .iter()
+            .flatten()
+            .map(|layer| layer.conv_state_len.saturating_add(layer.ssm_state_len))
+            .fold(0usize, usize::saturating_add);
+        let snapshot = capture_linear_attention_session_snapshot(&state)?;
+        self.buffers
+            .resources
+            .record_host_readback(readback_values.saturating_mul(std::mem::size_of::<f32>()));
+        Ok(snapshot)
     }
 
     pub(crate) fn restore_linear_attention_session_state(
@@ -2528,7 +2578,7 @@ impl MetalExecutionContext {
                 );
                 return Err(error.into());
             }
-            let output = read_f32_buffer(output_buffer, queries.len());
+            let output = self.buffers.read_f32_buffer(output_buffer, queries.len());
             drop(encoding);
             self.buffers.recycle_or_release_phase(
                 buffers
@@ -2648,7 +2698,7 @@ impl MetalExecutionContext {
     #[cfg(test)]
     pub(crate) fn read_and_recycle_f32(&self, buffer: MetalObjcId, len: usize) -> Vec<f32> {
         unsafe {
-            let values = read_f32_buffer(buffer, len);
+            let values = self.buffers.read_f32_buffer(buffer, len);
             self.buffers.recycle(buffer);
             values
         }
@@ -3200,7 +3250,7 @@ impl MetalScheduledCmd3Submission {
                     .recycle_or_release_phase(self.phase_buffers.take().unwrap_or_default(), true);
                 return Err(error.into());
             }
-            let hidden = read_f32_buffer(
+            let hidden = self.buffers.read_f32_buffer(
                 self.output.hidden_buffer,
                 self.output.output_state.hidden().len(),
             );
@@ -3208,7 +3258,7 @@ impl MetalScheduledCmd3Submission {
                 .output
                 .next_normed_buffer
                 .zip(self.output.output_state.next_normed())
-                .map(|(buffer, state)| read_f32_buffer(buffer, state.len()));
+                .map(|(buffer, state)| self.buffers.read_f32_buffer(buffer, state.len()));
             release(command_buffer);
             self.buffers
                 .recycle_or_release_phase(self.phase_buffers.take().unwrap_or_default(), false);
@@ -4019,8 +4069,12 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 return Err(error.into());
             }
             if let Some(reference) = one_row_reference {
-                let grouped = read_f32_buffer(grouped_output_buffer, route_count * width);
-                let scalar = read_f32_buffer(reference.expert_outputs, route_count * width);
+                let grouped = self
+                    .buffers
+                    .read_f32_buffer(grouped_output_buffer, route_count * width);
+                let scalar = self
+                    .buffers
+                    .read_f32_buffer(reference.expert_outputs, route_count * width);
                 for route in 0..route_count {
                     let grouped_route = grouped_output_indices[route] as usize;
                     for col in 0..width {
@@ -4037,8 +4091,8 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                         }
                     }
                 }
-                let shared_actual = read_f32_buffer(shared_output_buffer, width);
-                let shared_expected = read_f32_buffer(reference.shared_output, width);
+                let shared_actual = self.buffers.read_f32_buffer(shared_output_buffer, width);
+                let shared_expected = self.buffers.read_f32_buffer(reference.shared_output, width);
                 for (col, (actual, expected)) in
                     shared_actual.iter().zip(shared_expected.iter()).enumerate()
                 {
@@ -4058,9 +4112,12 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     bail!("Qwen one-row shared-router widths differ");
                 }
                 if shared_router_width > 0 {
-                    let router_actual = read_f32_buffer(shared_router, shared_router_width);
-                    let router_expected =
-                        read_f32_buffer(reference.shared_router, shared_router_width);
+                    let router_actual = self
+                        .buffers
+                        .read_f32_buffer(shared_router, shared_router_width);
+                    let router_expected = self
+                        .buffers
+                        .read_f32_buffer(reference.shared_router, shared_router_width);
                     for (index, (actual, expected)) in
                         router_actual.iter().zip(router_expected.iter()).enumerate()
                     {
@@ -4076,7 +4133,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     }
                 }
             }
-            let hidden = read_f32_buffer(hidden_buffer, rows * width);
+            let hidden = self.buffers.read_f32_buffer(hidden_buffer, rows * width);
             drop(encoding);
             self.buffers.recycle_or_release_phase(phase_buffers, false);
             Ok(hidden)
@@ -5544,7 +5601,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                 drop(state_guard);
                 return Err(error.into());
             }
-            let output = read_f32_buffer(output_buffer, expected_values);
+            let output = self.buffers.read_f32_buffer(output_buffer, expected_values);
             drop(encoding);
             for buffer in buffers {
                 self.recycle(buffer);
@@ -6285,8 +6342,12 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
                 return Err(error.into());
             }
-            let query = read_f32_buffer(query_buffer, q_b.output_width());
-            let compressed = read_f32_buffer(kv_a_buffer, kv_a.output_width());
+            let query = self
+                .buffers
+                .read_f32_buffer(query_buffer, q_b.output_width());
+            let compressed = self
+                .buffers
+                .read_f32_buffer(kv_a_buffer, kv_a.output_width());
             drop(encoding);
             for buffer in buffers {
                 self.recycle(buffer);
@@ -6845,8 +6906,8 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
                 return Err(error.into());
             }
-            let latent = read_f32_buffer(kv_a_buffer, input.latent_rank);
-            let rotary = read_f32_buffer_offset(
+            let latent = self.buffers.read_f32_buffer(kv_a_buffer, input.latent_rank);
+            let rotary = self.buffers.read_f32_buffer_offset(
                 record_rotary_buffer,
                 previous_records * input.rope_dim,
                 input.rope_dim,
@@ -6857,7 +6918,9 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 {
                     let (_, _, _, residual_buffer, normed_buffer, router_logits_buffer) =
                         post_buffers;
-                    let router_scores = read_f32_buffer(router_logits_buffer, plan.experts);
+                    let router_scores = self
+                        .buffers
+                        .read_f32_buffer(router_logits_buffer, plan.experts);
                     let active = if let Some(correction_bias) = post.router_correction_bias {
                         routing_sigmoid_noaux_top_k(
                             &router_scores,
@@ -6879,7 +6942,8 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                     ))
                 } else {
                     Ok(MetalGlmMlaFusedAttentionTerminal::Attention(
-                        read_f32_buffer(output_buffer, unembed_out.rows),
+                        self.buffers
+                            .read_f32_buffer(output_buffer, unembed_out.rows),
                     ))
                 }
             })();
@@ -6993,7 +7057,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
                 return Err(error.into());
             }
-            let output = read_f32_buffer(output_buffer, rows);
+            let output = self.buffers.read_f32_buffer(output_buffer, rows);
             drop(encoding);
             self.recycle(input_buffer);
             self.recycle(output_buffer);
@@ -7238,7 +7302,9 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
                 return Err(error.into());
             }
-            let output = read_f32_buffer(output_buffer, unembed_out.rows);
+            let output = self
+                .buffers
+                .read_f32_buffer(output_buffer, unembed_out.rows);
             drop(encoding);
             for buffer in buffers {
                 self.recycle(buffer);
@@ -7477,7 +7543,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
             timing.dispatch += dispatch_started.elapsed();
 
             let readback_started = Instant::now();
-            let packed_output = read_f32_buffer(output_buffer, total_rows);
+            let packed_output = self.buffers.read_f32_buffer(output_buffer, total_rows);
             timing.readback += readback_started.elapsed();
 
             let mut outputs = Vec::with_capacity(projections.len());
@@ -7616,7 +7682,9 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
             timing.dispatch += dispatch_started.elapsed();
 
             let readback_started = Instant::now();
-            let packed_output = read_f32_buffer(output_buffer, total_output_values);
+            let packed_output = self
+                .buffers
+                .read_f32_buffer(output_buffer, total_output_values);
             timing.readback += readback_started.elapsed();
             let mut outputs = Vec::with_capacity(projections.len());
             for (projection, output_offset) in projections.iter().zip(output_offsets.iter()) {
@@ -7711,7 +7779,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 self.recycle_or_release_buffers(&buffers, error.should_release_buffers());
                 return Err(error.into());
             }
-            let output = read_f32_buffer(output_buffer, expected_values);
+            let output = self.buffers.read_f32_buffer(output_buffer, expected_values);
             drop(encoding);
             for buffer in buffers {
                 self.recycle(buffer);
@@ -7969,8 +8037,8 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                     ("post_norm", normed_buffer, scalar_normed, hidden_values),
                     ("router", router_buffer, scalar_router, router_values),
                 ] {
-                    let actual = read_f32_buffer(actual_buffer, values);
-                    let expected = read_f32_buffer(expected_buffer, values);
+                    let actual = self.buffers.read_f32_buffer(actual_buffer, values);
+                    let expected = self.buffers.read_f32_buffer(expected_buffer, values);
                     if let Some((index, (actual, expected))) = actual
                         .iter()
                         .zip(expected.iter())
@@ -7987,9 +8055,9 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 }
             }
             let output = MetalLayerMajorPostAttention {
-                hidden: read_f32_buffer(hidden_buffer, hidden_values),
-                normed: read_f32_buffer(normed_buffer, hidden_values),
-                router_scores: read_f32_buffer(router_buffer, router_values),
+                hidden: self.buffers.read_f32_buffer(hidden_buffer, hidden_values),
+                normed: self.buffers.read_f32_buffer(normed_buffer, hidden_values),
+                router_scores: self.buffers.read_f32_buffer(router_buffer, router_values),
             };
             drop(encoding);
             for buffer in buffers {
@@ -8112,7 +8180,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
             timing.dispatch += dispatch_started.elapsed();
 
             let readback_started = Instant::now();
-            let packed_output = read_f32_buffer(output_buffer, total_rows);
+            let packed_output = self.buffers.read_f32_buffer(output_buffer, total_rows);
             timing.readback += readback_started.elapsed();
 
             let mut outputs = Vec::with_capacity(projections.len());
@@ -12210,6 +12278,9 @@ mod tests {
         let second = MetalCommandLease::new(Arc::clone(&resources));
         assert_eq!(resources.snapshot().in_flight_commands, 2);
         assert_eq!(resources.snapshot().command_high_water, 2);
+        assert_eq!(resources.snapshot().command_submissions, 2);
+        resources.record_host_upload(4_096);
+        resources.record_host_readback(2_048);
 
         resources.release_buffer(0x1000usize as MetalObjcId);
         resources.release_buffer(0x2000usize as MetalObjcId);
@@ -12218,6 +12289,9 @@ mod tests {
         let cleaned = resources.snapshot();
         assert_eq!(cleaned.active_general_buffers, 0);
         assert_eq!(cleaned.in_flight_commands, 0);
+        assert_eq!(cleaned.command_submissions, 2);
+        assert_eq!(cleaned.host_upload_bytes, 4_096);
+        assert_eq!(cleaned.host_readback_bytes, 2_048);
         assert_eq!(cleaned.ledger_live_bytes, 0);
     }
 

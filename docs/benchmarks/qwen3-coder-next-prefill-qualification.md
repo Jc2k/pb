@@ -124,3 +124,29 @@ decode tokens took 470.0 ms (6.38 token/s). The fused attention/projection bucke
 Accordingly, no decode change was promoted: a sampling-only tweak cannot meet the 1.5x gate. The
 next decode experiment must reduce the common Qwen attention/projection command and synchronization
 cost while preserving both resident and streamed graph ownership.
+
+## 2026-07-21 host-boundary baseline
+
+Phase-zero instrumentation for the device-resident continuation counts actual buffer copies,
+tracked readbacks, and Metal command leases in the shared resource owner. Native generation
+telemetry takes monotonic snapshots around prefill, so model load and sampling are excluded.
+
+The resident control forced the shipped layer-major matrix command over the raw 40-token ASCII
+prompt `a a ... a` (no trailing newline, SHA-256
+`10bee2ef5c59d7909d35adf25157506b0be2ce8aec863a876a43f95e3a2057d5`). It used one 40-row
+chunk and returned the greedy continuation `a`.
+
+| Metric | Result |
+| --- | ---: |
+| prefill wall time | 793 ms |
+| prefill throughput | 50.4075 token/s |
+| Metal command buffers | 239 |
+| host upload | 348,977,168 bytes |
+| host readback | 186,818,560 bytes |
+| expert strategy | `resident_complete_corpus` |
+| request-end active/transient/in-flight | 0 / 0 / 0 |
+
+The approximate five command buffers per transformer layer and more than 535 MB of host traffic on
+only 40 rows confirm that the promoted command is still host-synchronized between matrix phases.
+The existing traversal, parity, and scheduler evidence remains valid; promotion of a
+device-resident successor now additionally requires zero hidden/normed transfers between layers.

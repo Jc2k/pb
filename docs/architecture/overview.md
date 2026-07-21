@@ -129,8 +129,8 @@ conversion and are consumed directly instead of receiving a second `1 + weight` 
 same load-time memory calculation chooses complete resident expert slots when the whole corpus
 fits, or scheduler-owned positioned reads when it does not. Its chat contract is
 non-thinking-only, so prompt measurement and generation both disable thinking for this family.
-For the exact affine-Q4 capability, fresh suffixes of at least 32 tokens use a true layer-major
-prefill graph selected from the live Metal working-set budget. Resident dense projections and
+For the exact affine-Q4 capability, fresh suffixes of at least 32 tokens use the shipped
+layer-major matrix command selected from the live Metal working-set budget. Resident dense projections and
 causal attention run across all rows; hybrid recurrence advances in token order; CPU top-10
 routing forms one sorted unique expert union per layer; and routed/shared expert matrices preserve
 the scalar combine order. The prepared resident graph clones mapped slots with zero expert reads,
@@ -138,6 +138,10 @@ while the prepared streamed graph acquires the union through the same scheduler-
 positioned-read path. Exact hidden, KV, routing/recurrent, and linear-state fingerprints gate the
 command. Other family/layout combinations remain on their prepared scalar graph, and a graph
 execution failure never changes the model, precision, scheduler, or backend.
+The matrix command still synchronizes complete hidden/normed matrices through host-visible buffers
+between several phases. Replacing those transfers with a typed device-resident chunk owner is an
+active [design record](../qwen3-coder-next-device-resident-prefill-plan.md), not yet a shipped
+production guarantee.
 An explicit GGUF URI still selects llama.cpp; failure to load an already-selected native FlashMoe
 graph is terminal and never changes the backend behind the user's request.
 

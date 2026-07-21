@@ -195,6 +195,26 @@ historical chunk-owner result and full evidence are retained in
 still measures 6.38 token/s with 83% of wall time in fused attention/projection, so no
 sampling-only decode change was promoted.
 
+### Device-resident Qwen layer-major continuation
+
+Status: **Design record; implementation active.** The promoted command is layer-major in traversal
+and scheduler ownership, but its matrix phases remain host-synchronized: hidden/normed matrices
+are read back between dense, attention, post-attention, expert, and next-norm builders and uploaded
+again by the following phase. CPU top-10 routing is an intentional host boundary; complete hidden
+and normalized matrices are not.
+
+The next graph keeps chunk hidden/normed state in a typed Metal owner across layer boundaries,
+reads back only authoritative routing/KV/session facts and the final row, and feeds the same
+resident or scheduler-acquired expert union into one shared affine-Q4 matrix command. The shipped
+matrix command remains the production reference until exact state, transfer/synchronization,
+resource, resident/streamed, and performance gates pass. The implementation sequence and promotion
+contract are defined in the
+[device-resident prefill graph plan](qwen3-coder-next-device-resident-prefill-plan.md).
+The first instrumented resident control processed 40 raw tokens in 793 ms while creating 239 Metal
+command buffers, uploading 348,977,168 bytes, and reading back 186,818,560 bytes. Those measured
+host boundaries are now the baseline that the device-resident graph must remove; the request still
+ended with balanced buffers and commands.
+
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by
 the deterministic agent controller; executor capability and schema validation remain authoritative.

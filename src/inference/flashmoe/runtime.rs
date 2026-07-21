@@ -90,6 +90,33 @@ fn qwen_prefill_chunk_tokens(
     )
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NativePrefillResourceDelta {
+    metal_commands: usize,
+    host_upload_bytes: usize,
+    host_readback_bytes: usize,
+}
+
+fn native_prefill_resource_delta(
+    before: Option<&FlashMoeMetalResourceSnapshot>,
+    after: Option<&FlashMoeMetalResourceSnapshot>,
+) -> NativePrefillResourceDelta {
+    let (Some(before), Some(after)) = (before, after) else {
+        return NativePrefillResourceDelta::default();
+    };
+    NativePrefillResourceDelta {
+        metal_commands: after
+            .command_submissions
+            .saturating_sub(before.command_submissions),
+        host_upload_bytes: after
+            .host_upload_bytes
+            .saturating_sub(before.host_upload_bytes),
+        host_readback_bytes: after
+            .host_readback_bytes
+            .saturating_sub(before.host_readback_bytes),
+    }
+}
+
 fn resolve_expert_access(
     family: QwenMoeFamily,
     expert_storage: super::experts::ExpertStoreExecutionDescriptor,
@@ -174,6 +201,34 @@ mod deepseek_prefill_tests {
                 Some(&exhausted),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn prefill_resource_delta_uses_monotonic_metal_counters() {
+        let before = FlashMoeMetalResourceSnapshot {
+            command_submissions: 11,
+            host_upload_bytes: 1_000,
+            host_readback_bytes: 700,
+            ..FlashMoeMetalResourceSnapshot::default()
+        };
+        let after = FlashMoeMetalResourceSnapshot {
+            command_submissions: 59,
+            host_upload_bytes: 5_096,
+            host_readback_bytes: 2_748,
+            ..FlashMoeMetalResourceSnapshot::default()
+        };
+        assert_eq!(
+            native_prefill_resource_delta(Some(&before), Some(&after)),
+            NativePrefillResourceDelta {
+                metal_commands: 48,
+                host_upload_bytes: 4_096,
+                host_readback_bytes: 2_048,
+            }
+        );
+        assert_eq!(
+            native_prefill_resource_delta(None, Some(&after)),
+            NativePrefillResourceDelta::default()
         );
     }
 }
@@ -3782,6 +3837,7 @@ impl FlashMoeEngine {
                     .restore_linear_attention_session_state(&recurrent)?;
             }
         }
+        let prefill_resources_before = self.metal_resource_snapshot();
         let prefill_or_ttft_started = Instant::now();
         let mut deepseek_stable_checkpoint = None;
         let prefill_hidden = if prefill_start == prompt_len {
@@ -3968,6 +4024,11 @@ impl FlashMoeEngine {
             None
         };
 
+        let prefill_resources_after = self.metal_resource_snapshot();
+        let prefill_resources = native_prefill_resource_delta(
+            prefill_resources_before.as_ref(),
+            prefill_resources_after.as_ref(),
+        );
         let prefill_wall = prefill_or_ttft_started.elapsed();
         let mut sampler = TokenSampler::new(request.temperature, request.top_k, request.seed);
         if tool_constraint.is_some() {
@@ -4178,6 +4239,9 @@ impl FlashMoeEngine {
                 prompt_len.saturating_sub(prefill_start),
                 prefill_wall,
             ),
+            prefill_metal_commands: prefill_resources.metal_commands,
+            prefill_host_upload_bytes: prefill_resources.host_upload_bytes,
+            prefill_host_readback_bytes: prefill_resources.host_readback_bytes,
             decode_tokens,
             decode_wall_ms: duration_millis(decode_wall),
             decode_tokens_per_second: tokens_per_second(decode_tokens, decode_wall),

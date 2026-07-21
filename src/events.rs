@@ -380,6 +380,12 @@ pub struct NativeGenerationUsage {
     pub cached_tokens: usize,
     pub prefill_wall_ms: u64,
     pub prefill_tokens_per_second: f64,
+    #[serde(default)]
+    pub prefill_metal_commands: usize,
+    #[serde(default)]
+    pub prefill_host_upload_bytes: usize,
+    #[serde(default)]
+    pub prefill_host_readback_bytes: usize,
     pub decode_tokens: usize,
     pub decode_wall_ms: u64,
     pub decode_tokens_per_second: f64,
@@ -2000,6 +2006,9 @@ mod tests {
                 cached_tokens: 4096,
                 prefill_wall_ms: 120,
                 prefill_tokens_per_second: 7200.0,
+                prefill_metal_commands: 48,
+                prefill_host_upload_bytes: 1_024,
+                prefill_host_readback_bytes: 512,
                 decode_tokens: 3,
                 decode_wall_ms: 30,
                 decode_tokens_per_second: 100.0,
@@ -2026,9 +2035,37 @@ mod tests {
             AgentEvent::LlmInvocation {
                 context: Some(restored),
                 prompt_cache: Some(PromptCacheUsage { cached_tokens: 4096, .. }),
-                native: Some(NativeGenerationUsage { active_experts_per_token: Some(10), .. }),
+                native: Some(NativeGenerationUsage {
+                    active_experts_per_token: Some(10),
+                    prefill_metal_commands: 48,
+                    prefill_host_upload_bytes: 1_024,
+                    prefill_host_readback_bytes: 512,
+                    ..
+                }),
                 ..
             } if restored == context
+        ));
+
+        let mut legacy: Value = serde_json::from_str(&json).unwrap();
+        let native = legacy
+            .pointer_mut("/event/native")
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        native.remove("prefill_metal_commands");
+        native.remove("prefill_host_upload_bytes");
+        native.remove("prefill_host_readback_bytes");
+        let legacy: EventEnvelope = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            legacy.event,
+            AgentEvent::LlmInvocation {
+                native: Some(NativeGenerationUsage {
+                    prefill_metal_commands: 0,
+                    prefill_host_upload_bytes: 0,
+                    prefill_host_readback_bytes: 0,
+                    ..
+                }),
+                ..
+            }
         ));
     }
 

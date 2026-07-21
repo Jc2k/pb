@@ -292,10 +292,14 @@ example `pb harness infer ...`. `infer` and `bench` accept
 `--metal-working-set-limit-mib <MiB>` to lower the device-derived safety limit. The override can
 only make the default policy stricter and is applied before expert-access graph resolution, so a
 lower limit can select the existing positioned-read implementation instead of resident expert
-mapping. `--resource-summary` prints the opt-in JSON resource ledger;
-normal runs keep it disabled and emit tracing only for high-water changes, pressure recovery, or a
-resource-limit abort. `infer --no-thinking` asks a checkpoint's chat template to suppress emitted
-reasoning; it cannot be combined with `--raw`, which bypasses the chat template entirely.
+mapping. `--resource-summary` prints the opt-in JSON resource ledger; normal runs keep it disabled
+and emit tracing only for high-water changes, pressure recovery, or a resource-limit abort. The
+ledger includes cumulative Metal command submissions and actual bytes copied from host to Metal or
+read back through tracked runtime buffers. Native generation telemetry records the corresponding
+per-prefill deltas, allowing scalar, shipped layer-major matrix, and device-resident graph
+candidates to be compared without inferring traffic from model geometry. `infer --no-thinking`
+asks a checkpoint's chat template to suppress emitted reasoning; it cannot be combined with
+`--raw`, which bypasses the chat template entirely.
 For Qwen prefill qualification, `infer --prefill-mode auto|scalar|layer-major` selects the promoted
 policy, exact scalar reference, or an explicit layer-major request. `auto` promotes only a prepared
 Qwen3-Coder-Next affine-Q4 graph with at least 32 fresh tokens and sufficient live Metal reserve.
