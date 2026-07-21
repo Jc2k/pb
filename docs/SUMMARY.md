@@ -42,6 +42,7 @@
   - [DeepSeek V4 Flash field run](benchmarks/deepseek-v4-flash-agent.md)
 - [Verified task-completion reliability](task-completion-reliability-plan.md)
   - [TC1 · Verified completion](benchmarks/task-completion-tc1.md)
+  - [TC2 · Useful coding](benchmarks/task-completion-tc2.md)
 - [Qwen3-Coder-Next native agent](qwen3-coder-next-agent-plan.md)
   - [Native agent evaluation](benchmarks/qwen3-coder-next-agent.md)
   - [Agent performance follow-on](qwen3-coder-next-agent-follow-on.md)

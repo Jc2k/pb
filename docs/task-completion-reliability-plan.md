@@ -1,6 +1,6 @@
 # Verified task-completion reliability
 
-Status: **Active; TC1 qualified 3/3, TC2 native qualification pending**
+Status: **Active; TC1 qualified 3/3 and TC2 useful-coding completion qualified**
 
 This record tracks pb's move from protocol-safe local agent runs to repeatable, externally verified
 coding-task completion. It complements the [small-model reliability plan](small-model-agent-reliability-plan.md),
@@ -125,6 +125,8 @@ specific runtime shortcuts, and silent hosted-model fallback are not promotion s
 | 2026-07-21 | Reporting | `scripts/summarize-harness-completion.ts` and synthetic tests | Machine-readable harness claims and efficiency metrics remain distinct from independent verification | Validate against preserved field runs and use for TC1 |
 | 2026-07-21 | TC1 native qualification 1 | scratch `/private/tmp/pb-tc1-ordered-create-1-20260721`, run `1784667572614-75379-0`, commit `f4da7a5a925f82a6c129850f284ff2731d8568d9` | Verified completion; exact check independently passed; clean worktree; 7 calls, 561,696 ms, 7.24 Wh; exposed two journal diagnostic defects | Fix strict planned-check audit and work-unit classification, then repeat TC1 with the locked settings |
 | 2026-07-21 | TC1 locked post-fix series | runs `1784668516949-33851-0`, `1784668983662-35797-0`, and `1784669344810-37478-0`; [TC1 report](benchmarks/task-completion-tc1.md) | 3/3 verified; zero rejected or forbidden actions; median 317,781 ms and 3.97 Wh; reporting fix qualified | Retain TC1 as a regression gate and run TC2 |
+| 2026-07-21 | TC2 initial run | scratch `/private/tmp/pb-tc2-slugify-1-20260721`, run `1784669878454-39823-0` | Both declared checks passed, but implementation exhausted six steps without typed submission; unsatisfied and unverified; fixture also failed to enforce dependency freedom | Reserve the last ready implementation turn for closure and add a trusted dependency gate |
+| 2026-07-21 | TC2 useful-coding qualification | scratch `/private/tmp/pb-tc2-slugify-3-20260721`, run `1784671564495-58382-0`, commit `7fd899ce771857bd39a3c6d0ec77e85e6b230607`; [TC2 report](benchmarks/task-completion-tc2.md) | Verified completion after one real repair; all three checks independently passed; clean three-path semantic commit; 16 calls, 1,167,352 ms, 12.90 Wh | Retain as a repair regression; expand TC3 and reduce model calls without weakening gates |
 
 ## Completion audit
 
@@ -135,7 +137,7 @@ specific runtime shortcuts, and silent hosted-model fallback are not promotion s
 - [x] Current release is rebuilt from the source under evaluation.
 - [x] TC1 native qualification passes and its journal, events, Git state, and check are reviewed.
 - [x] TC1 repeats successfully 3/3 with locked settings.
-- [ ] TC2 reaches one independently verified completion.
+- [x] TC2 reaches one independently verified completion.
 - [ ] TC3 corpus and aggregate report exist.
 - [ ] Highest-value evidenced controller and efficiency gaps are fixed and regression-tested.
 - [ ] External same-model comparison is recorded.

@@ -1,6 +1,6 @@
 # Qwen3-Coder-Next Agent Performance Follow-on
 
-Status: **Integrated qualification incomplete; next-path deterministic gate implemented.** Durable stage evidence, compact terminal schemas, Qwen
+Status: **Useful-coding qualification complete; larger integrated qualification remains open.** Durable stage evidence, compact terminal schemas, Qwen
 native tool constraints, output-aware mutation bounds, strict-stage TODO removal,
 dependency-aware batch rejection, native telemetry, and true layer-major Qwen3-Coder-Next prefill
 are implemented. The prefill graph passed exact state and resource/performance promotion gates; the
@@ -17,8 +17,10 @@ The harness now steers all-create implementations toward one exact next missing 
 at a time. Its deterministic fixture rejects an out-of-order write, advances after the exact target
 exists, and keeps the implementation terminal hidden while another creation is missing. The focused
 native TC1 qualification and three unchanged post-fix trials passed through trusted check, fresh
-review, semantic commit, clean worktree, and verified completion. The smaller useful-coding TC2 gate
-now precedes another full browser run.
+review, semantic commit, clean worktree, and verified completion. TC2 then qualified a useful
+three-file module through an enforced dependency failure, bounded repair, all trusted checks, fresh
+review, semantic commit, and independent verification. The broader offline corpus now precedes
+another full browser run.
 Decode has been profiled; no change was promoted because the measured sampling path cannot meet the
 1.5x gate.
 
@@ -102,8 +104,9 @@ The preserved evidence that drives implementation is deliberately small:
 The focused contract-backed acceptance and compact-recovery gates passed, while the integrated run
 completed truthfully without producing a runnable game. Deterministic next-missing-plan-path and
 small-work-unit steering now pass a scripted two-file fixture, one initial native qualification, and
-3/3 locked post-fix TC1 trials. TC2 useful-coding qualification is the remaining small-task gate
-before another Phase 5 run.
+3/3 locked post-fix TC1 trials. TC2 useful-coding qualification also passed after the controller
+reserved its last ready implementation and repair turns for typed closure. The broader offline
+task-completion corpus is now the remaining gate before another Phase 5 run.
 
 ## Architectural invariants
 

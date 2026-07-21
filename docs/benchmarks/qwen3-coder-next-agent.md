@@ -273,9 +273,11 @@ energy was 3.97 Wh. Full evidence is in the
 
 ## Ranked follow-up
 
-1. Retain the qualified next-path work-unit control as a regression gate. TC1 passed the initial
-   native qualification and 3/3 locked post-fix trials through check, fresh review, managed commit,
-   clean worktree, and verified completion.
+1. Retain the qualified next-path and final-ready-closure controls as regression gates. TC1 passed
+   the initial native qualification and 3/3 locked post-fix trials; TC2 then passed a three-file
+   implementation through an enforced dependency failure, bounded repair, fresh review, managed
+   commit, clean worktree, and independent verification. See the
+   [TC2 report](task-completion-tc2.md).
 2. Retain exact-target, right-sized compact recovery as a regression gate. Native run
    `1784598393414-28929-0` qualified the 320-character/352-token retry without path drift, cap
    regrowth, or partial mutation.
