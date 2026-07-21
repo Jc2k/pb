@@ -40,6 +40,7 @@
   - [S5 · Workflow closure](benchmarks/small-model-agent-s5.md)
   - [S6 · Model evaluation](benchmarks/small-model-agent-s6.md)
   - [DeepSeek V4 Flash field run](benchmarks/deepseek-v4-flash-agent.md)
+- [Verified task-completion reliability](task-completion-reliability-plan.md)
 - [Qwen3-Coder-Next native agent](qwen3-coder-next-agent-plan.md)
   - [Native agent evaluation](benchmarks/qwen3-coder-next-agent.md)
   - [Agent performance follow-on](qwen3-coder-next-agent-follow-on.md)

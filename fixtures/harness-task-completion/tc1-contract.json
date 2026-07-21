@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "mutation": "required",
+  "allowed_paths": ["alpha.txt", "beta.txt"],
+  "checks": [
+    {
+      "id": "exact_content",
+      "command": "test \"$(cat alpha.txt)\" = \"alpha completion fixture\" && test \"$(cat beta.txt)\" = \"beta completion fixture\"",
+      "cwd": ".",
+      "required": true,
+      "timeout_seconds": 30
+    }
+  ],
+  "commit": { "required": true, "semantic": true },
+  "review": {
+    "required": true,
+    "read_paths": ["alpha.txt", "beta.txt"],
+    "check_ids": ["exact_content"]
+  },
+  "workspace_clean": true
+}

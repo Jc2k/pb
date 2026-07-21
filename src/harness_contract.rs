@@ -425,4 +425,37 @@ mod tests {
         let error = contract.compile_workspace_graph(graph).unwrap_err();
         assert!(error.to_string().contains("conflicts"));
     }
+
+    #[test]
+    fn checked_in_task_completion_contracts_normalize() {
+        let fixtures = [
+            (
+                "tc1",
+                include_str!("../fixtures/harness-task-completion/tc1-contract.json"),
+                2,
+                1,
+            ),
+            (
+                "tc2",
+                include_str!("../fixtures/harness-task-completion/tc2-contract.json"),
+                3,
+                2,
+            ),
+        ];
+
+        for (name, fixture, expected_paths, expected_checks) in fixtures {
+            let document: HarnessContractDocument = serde_json::from_str(fixture)
+                .unwrap_or_else(|error| panic!("{name} contract must parse: {error}"));
+            let contract = document
+                .normalize()
+                .unwrap_or_else(|error| panic!("{name} contract must normalize: {error}"));
+            assert_eq!(contract.mutation, MutationRequirement::Required);
+            assert_eq!(contract.allowed_paths.len(), expected_paths);
+            assert_eq!(contract.checks.len(), expected_checks);
+            assert!(contract.commit.required);
+            assert!(contract.commit.semantic);
+            assert!(contract.review.required);
+            assert!(contract.workspace_clean);
+        }
+    }
 }

@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "mutation": "required",
+  "allowed_paths": ["slugify.mjs", "slugify.test.mjs", "README.md"],
+  "checks": [
+    {
+      "id": "behavior",
+      "command": "deno eval 'import { slugify } from \"./slugify.mjs\"; const cases = [[\"Hello, World!\",\"hello-world\"],[\"  many   spaces  \",\"many-spaces\"],[\"a___b---c\",\"a-b-c\"],[\"Version 2.0\",\"version-2-0\"],[\"---Already-Slugged---\",\"already-slugged\"],[\"\",\"\"],[\"!!!\",\"\"]]; for (const [input, expected] of cases) { const actual = slugify(input); if (actual !== expected) throw new Error(`${input}: ${actual} !== ${expected}`); }'",
+      "cwd": ".",
+      "required": true,
+      "timeout_seconds": 30
+    },
+    {
+      "id": "model_tests",
+      "command": "deno test slugify.test.mjs",
+      "cwd": ".",
+      "required": true,
+      "timeout_seconds": 30
+    }
+  ],
+  "commit": { "required": true, "semantic": true },
+  "review": {
+    "required": true,
+    "read_paths": ["slugify.mjs", "slugify.test.mjs", "README.md"],
+    "check_ids": ["behavior", "model_tests"]
+  },
+  "workspace_clean": true
+}

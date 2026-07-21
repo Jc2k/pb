@@ -104,6 +104,23 @@ exits keep their existing structured reasons. A prompt whose authoritative ancho
 schemas cannot fit is rejected before inference with the distinct `context_limit` reason. Older
 stored summaries without these additive fields remain readable with conservative defaults.
 
+### Task-completion qualification
+
+The deterministic control corpus proves harness behavior, not generated artifact quality. The
+checked-in `fixtures/harness-task-completion` corpus adds two explicit offline artifact
+qualifications:
+
+- TC1 requires two exact small files and qualifies native next-missing-path execution through checks,
+  fresh review, managed commit, and a clean worktree; and
+- TC2 requires a small dependency-free module, model-authored tests, documentation, an independent
+  behavior check, and the same complete strict workflow.
+
+A task-completion fixture passes only with a satisfied explicit contract, verified completion, an
+independently reproduced check, the recorded commit at `HEAD`, and a clean worktree. Protocol
+containment, task completion, artifact quality, wall time, and energy are reported separately. The
+[reliability plan](task-completion-reliability-plan.md) defines the locked repeatability and corpus
+promotion gates.
+
 ### Prompt budget and bounded results
 
 Every model call is rendered and tokenized before it is charged to the invocation budget. The
