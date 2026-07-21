@@ -356,9 +356,25 @@ pub struct FlashMoeEngine {
     pub(super) deepseek_sessions: DeepSeekV4SessionStore<DeepSeekV4SessionSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashMoeLoadOptions {
     pub metal_working_set_limit_bytes: Option<usize>,
+    pub session_cache: crate::config::ResolvedSessionCacheConfig,
+    pub memory_sessions: usize,
+}
+
+impl Default for FlashMoeLoadOptions {
+    fn default() -> Self {
+        Self {
+            metal_working_set_limit_bytes: None,
+            session_cache: crate::config::ResolvedSessionCacheConfig {
+                enabled: true,
+                root: dirs::cache_dir().map(|root| root.join("pb")),
+                max_bytes: crate::config::DEFAULT_SESSION_CACHE_MAX_BYTES,
+            },
+            memory_sessions: crate::config::DEFAULT_FLASHMOE_MEMORY_SESSIONS,
+        }
+    }
 }
 
 pub fn load(plan: &FlashMoePlan) -> Result<FlashMoeEngine> {
@@ -592,8 +608,10 @@ where
         Some(&plan.chat_template),
     )?;
     progress("tokenizer", phase_started.elapsed());
-    let session_cache =
-        FlashMoeSessionCache::new(FlashMoeDiskCache::from_plan(plan, config.num_hidden_layers));
+    let session_cache = FlashMoeSessionCache::new(
+        FlashMoeDiskCache::from_plan(plan, config.num_hidden_layers, &options.session_cache),
+        options.memory_sessions,
+    );
     Ok(FlashMoeEngine {
         plan: plan.clone(),
         scheduler,

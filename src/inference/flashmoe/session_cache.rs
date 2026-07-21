@@ -16,7 +16,6 @@ use super::state::{
 
 const CACHE_VERSION: &str = "flashmoe-session-v1";
 const MAGIC: &[u8; 8] = b"PBFMKV01";
-const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_TOKENS: usize = 1_000_000;
 const MAX_VECTOR_FLOATS: usize = 32 * 1024 * 1024;
 
@@ -35,16 +34,24 @@ struct SessionManifest {
 }
 
 impl FlashMoeDiskCache {
-    pub(super) fn from_plan(plan: &FlashMoePlan, layers: usize) -> Option<Self> {
-        if cache_disabled() {
+    pub(super) fn from_plan(
+        plan: &FlashMoePlan,
+        layers: usize,
+        settings: &crate::config::ResolvedSessionCacheConfig,
+    ) -> Option<Self> {
+        if !settings.enabled {
             return None;
         }
-        let root = cache_root()?.join(model_fingerprint_hex(plan));
+        let root = settings
+            .root
+            .as_ref()?
+            .join(CACHE_VERSION)
+            .join(model_fingerprint_hex(plan));
         Some(Self {
             root,
             fingerprint: model_fingerprint(plan),
             layers,
-            max_bytes: cache_max_bytes(),
+            max_bytes: settings.max_bytes,
         })
     }
 
@@ -470,32 +477,6 @@ fn model_fingerprint_hex(plan: &FlashMoePlan) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-fn cache_disabled() -> bool {
-    std::env::var("PB_FLASHMOE_SESSION_CACHE")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "off" | "false"
-            )
-        })
-}
-
-fn cache_max_bytes() -> u64 {
-    std::env::var("PB_FLASHMOE_SESSION_CACHE_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MAX_BYTES)
-}
-
-fn cache_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("PB_CACHE_DIR").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(root).join(CACHE_VERSION));
-    }
-    dirs::cache_dir().map(|root| root.join("pb").join(CACHE_VERSION))
 }
 
 fn secure_directory(path: &Path) -> Result<()> {

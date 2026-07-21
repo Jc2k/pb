@@ -36,8 +36,10 @@ byte-budgeted cache. State files contain token ids and derived attention or recu
 they can reflect repository content that appeared in the prompt. Model, tokenizer, template,
 runtime-layout, and token hashes prevent incompatible restoration; session filenames are hashed;
 directories and files are owner-only on Unix; writes use temporary files and atomic replacement.
-`PB_LLAMA_SESSION_CACHE=off` and `PB_FLASHMOE_SESSION_CACHE=off` independently disable disk
-persistence without disabling in-process reuse.
+`inference.llamacpp_session_cache_enabled=false` and
+`inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
+disabling in-process reuse. These controls, their byte budgets, and the optional cache root are
+typed user configuration rather than process environment variables.
 
 The DeepSeek V4 Flash extension keeps its model, resident tensors, streamed expert packs, tokenizer,
 Metal state, and prompts on the same local path. Its typed hyperconnection/compressed-attention state

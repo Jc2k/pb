@@ -507,11 +507,13 @@ impl StdioMcpClient {
             {
                 let mut service_env = config.env.clone();
                 for (container_key, host_key) in &config.capabilities.secret_env {
-                    let value = std::env::var(host_key).with_context(|| {
-                        format!(
-                            "MCP server {server_name} requires host secret environment variable {host_key}"
-                        )
-                    })?;
+                    let value = crate::host_environment::configured_secret(host_key).with_context(
+                        || {
+                            format!(
+                                "MCP server {server_name} requires host secret environment variable {host_key}"
+                            )
+                        },
+                    )?;
                     service_env.insert(container_key.clone(), value);
                 }
                 let mut service =

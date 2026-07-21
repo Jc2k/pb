@@ -38,14 +38,36 @@ struct RpcNotification {
 }
 
 pub fn default_socket_path() -> PathBuf {
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("pb.sock");
+    #[cfg(unix)]
+    let user_id = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let user_id = 0_u32;
+    socket_path_for(crate::host_environment::runtime_dir(), user_id)
+}
+
+fn socket_path_for(runtime_dir: Option<PathBuf>, user_id: u32) -> PathBuf {
+    if let Some(runtime_dir) = runtime_dir {
+        return runtime_dir.join("pb.sock");
     }
-    let user = std::env::var("USER")
-        .ok()
-        .filter(|user| !user.is_empty())
-        .unwrap_or_else(|| "user".to_string());
-    PathBuf::from(format!("/tmp/pb-{user}.sock"))
+    PathBuf::from(format!("/tmp/pb-{user_id}.sock"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_path_prefers_the_runtime_directory() {
+        assert_eq!(
+            socket_path_for(Some(PathBuf::from("/run/user/42")), 42),
+            PathBuf::from("/run/user/42/pb.sock")
+        );
+    }
+
+    #[test]
+    fn socket_path_fallback_uses_the_numeric_user_id() {
+        assert_eq!(socket_path_for(None, 42), PathBuf::from("/tmp/pb-42.sock"));
+    }
 }
 
 pub async fn start_session(

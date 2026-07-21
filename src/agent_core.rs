@@ -10830,15 +10830,23 @@ impl LocalModelEvalEngine {
                     "FlashMoe harness evaluation is disabled until a bounded resource policy is active"
                 );
             }
-            return crate::inference::flashmoe::load(&plan)
-                .map(Self::FlashMoe)
-                .with_context(|| {
-                    format!(
-                        "failed to load FlashMoe harness evaluation model {} from {}",
-                        plan.model,
-                        plan.runtime_dir.display()
-                    )
-                });
+            let settings = crate::config::UserConfig::load()?.effective_flashmoe();
+            return crate::inference::flashmoe::load_with_options(
+                &plan,
+                crate::inference::flashmoe::FlashMoeLoadOptions {
+                    metal_working_set_limit_bytes: None,
+                    session_cache: settings.session_cache,
+                    memory_sessions: settings.memory_sessions,
+                },
+            )
+            .map(Self::FlashMoe)
+            .with_context(|| {
+                format!(
+                    "failed to load FlashMoe harness evaluation model {} from {}",
+                    plan.model,
+                    plan.runtime_dir.display()
+                )
+            });
         }
         let path = find_model_in_cache_in(models_root, model)?;
         llamacpp::load_from_file(&path, gpu_layers)

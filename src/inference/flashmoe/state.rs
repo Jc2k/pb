@@ -2014,7 +2014,7 @@ impl KvCache {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct FlashMoeSessionCache {
     entries: BTreeMap<String, Vec<FlashMoeCachedSessionState>>,
     session_order: VecDeque<String>,
@@ -2023,6 +2023,22 @@ pub(super) struct FlashMoeSessionCache {
     dirty_sessions: BTreeSet<String>,
     dirty_prefixes: BTreeSet<String>,
     disk: Option<FlashMoeDiskCache>,
+    memory_session_limit: usize,
+}
+
+impl Default for FlashMoeSessionCache {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            session_order: VecDeque::new(),
+            prefixes: BTreeMap::new(),
+            prefix_order: VecDeque::new(),
+            dirty_sessions: BTreeSet::new(),
+            dirty_prefixes: BTreeSet::new(),
+            disk: None,
+            memory_session_limit: crate::config::DEFAULT_FLASHMOE_MEMORY_SESSIONS,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2032,9 +2048,10 @@ pub(super) struct FlashMoeCachedSessionState {
 }
 
 impl FlashMoeSessionCache {
-    pub(crate) fn new(disk: Option<FlashMoeDiskCache>) -> Self {
+    pub(crate) fn new(disk: Option<FlashMoeDiskCache>, memory_session_limit: usize) -> Self {
         Self {
             disk,
+            memory_session_limit,
             ..Self::default()
         }
     }
@@ -2264,7 +2281,7 @@ impl FlashMoeSessionCache {
         self.entries.insert(session_id.clone(), checkpoints);
         self.touch_session(session_id);
         self.dirty_sessions.insert(session_id.clone());
-        self.evict_excess_sessions(memory_session_limit());
+        self.evict_excess_sessions(self.memory_session_limit);
         if let (Some(cpu), Some(recurrent)) = (
             generation.base_cache.take(),
             generation.base_recurrent.take(),
@@ -2343,15 +2360,6 @@ impl FlashMoeSessionCache {
         self.dirty_sessions.remove(session_id);
         Ok(())
     }
-}
-
-fn memory_session_limit() -> usize {
-    const DEFAULT_MEMORY_SESSIONS: usize = 2;
-    std::env::var("PB_FLASHMOE_MEMORY_SESSIONS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MEMORY_SESSIONS)
 }
 
 #[derive(Debug)]
@@ -2814,6 +2822,20 @@ mod tests {
             sessions.session_order,
             VecDeque::from(["second".into(), "third".into()])
         );
+    }
+
+    #[test]
+    fn configured_memory_session_limit_is_enforced_on_commit() {
+        let mut sessions = FlashMoeSessionCache::new(None, 1);
+        for (session_id, token) in [("first", 10), ("second", 20)] {
+            let mut generation = sessions.begin_generation(Some(session_id), vec![token], 1, 1);
+            generation.capture_prompt_cache(vec![token as f32], recurrent_session_snapshot());
+            sessions.commit_generation(&mut generation).unwrap();
+        }
+
+        assert!(!sessions.entries.contains_key("first"));
+        assert!(sessions.entries.contains_key("second"));
+        assert_eq!(sessions.session_order, VecDeque::from(["second".into()]));
     }
 
     #[test]

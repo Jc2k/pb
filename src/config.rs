@@ -20,6 +20,55 @@ pub struct UserConfig {
     pub mcp: McpConfig,
     pub lsp: LspConfig,
     pub memory: MemoryConfig,
+    pub storage: StorageConfig,
+    pub inference: InferenceConfig,
+    pub flashmoe: FlashMoeConfig,
+}
+
+pub const DEFAULT_SESSION_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const DEFAULT_FLASHMOE_MEMORY_SESSIONS: usize = 2;
+pub const DEFAULT_FLASHMOE_RESIDENT_MODELS: usize = 2;
+pub const DEFAULT_FLASHMOE_IDLE_SECONDS: u64 = 15 * 60;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Root for pb-owned workspaces, leases, and managed cache records.
+    pub state_dir: Option<PathBuf>,
+    /// Root for prompt-derived inference caches.
+    pub cache_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct InferenceConfig {
+    pub llamacpp_session_cache_enabled: Option<bool>,
+    pub llamacpp_session_cache_max_bytes: Option<u64>,
+    pub flashmoe_session_cache_enabled: Option<bool>,
+    pub flashmoe_session_cache_max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlashMoeConfig {
+    pub memory_sessions: Option<usize>,
+    pub resident_models: Option<usize>,
+    pub idle_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSessionCacheConfig {
+    pub enabled: bool,
+    pub root: Option<PathBuf>,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFlashMoeConfig {
+    pub session_cache: ResolvedSessionCacheConfig,
+    pub memory_sessions: usize,
+    pub resident_models: usize,
+    pub idle_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -72,7 +121,10 @@ impl UserConfig {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+        let config: Self =
+            toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -81,6 +133,7 @@ impl UserConfig {
     }
 
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
+        self.validate()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -116,6 +169,39 @@ impl UserConfig {
                 .personal_repo
                 .as_ref()
                 .map(|path| display_path(path)),
+            "storage.state_dir" => self
+                .storage
+                .state_dir
+                .as_ref()
+                .map(|path| display_path(path)),
+            "storage.cache_dir" => self
+                .storage
+                .cache_dir
+                .as_ref()
+                .map(|path| display_path(path)),
+            "inference.llamacpp_session_cache_enabled" => self
+                .inference
+                .llamacpp_session_cache_enabled
+                .map(|value| value.to_string()),
+            "inference.llamacpp_session_cache_max_bytes" => self
+                .inference
+                .llamacpp_session_cache_max_bytes
+                .map(|value| value.to_string()),
+            "inference.flashmoe_session_cache_enabled" => self
+                .inference
+                .flashmoe_session_cache_enabled
+                .map(|value| value.to_string()),
+            "inference.flashmoe_session_cache_max_bytes" => self
+                .inference
+                .flashmoe_session_cache_max_bytes
+                .map(|value| value.to_string()),
+            "flashmoe.memory_sessions" => {
+                self.flashmoe.memory_sessions.map(|value| value.to_string())
+            }
+            "flashmoe.resident_models" => {
+                self.flashmoe.resident_models.map(|value| value.to_string())
+            }
+            "flashmoe.idle_seconds" => self.flashmoe.idle_seconds.map(|value| value.to_string()),
             _ => bail_unknown_key(key)?,
         })
     }
@@ -148,8 +234,32 @@ impl UserConfig {
             "model.top_k" => self.model.top_k = Some(parse_value(key, value)?),
             "model.seed" => self.model.seed = Some(parse_value(key, value)?),
             "memory.personal_repo" => self.memory.personal_repo = Some(PathBuf::from(value)),
+            "storage.state_dir" => self.storage.state_dir = Some(parse_absolute_path(key, value)?),
+            "storage.cache_dir" => self.storage.cache_dir = Some(parse_absolute_path(key, value)?),
+            "inference.llamacpp_session_cache_enabled" => {
+                self.inference.llamacpp_session_cache_enabled = Some(parse_value(key, value)?)
+            }
+            "inference.llamacpp_session_cache_max_bytes" => {
+                self.inference.llamacpp_session_cache_max_bytes = Some(parse_positive(key, value)?)
+            }
+            "inference.flashmoe_session_cache_enabled" => {
+                self.inference.flashmoe_session_cache_enabled = Some(parse_value(key, value)?)
+            }
+            "inference.flashmoe_session_cache_max_bytes" => {
+                self.inference.flashmoe_session_cache_max_bytes = Some(parse_positive(key, value)?)
+            }
+            "flashmoe.memory_sessions" => {
+                self.flashmoe.memory_sessions = Some(parse_positive(key, value)?)
+            }
+            "flashmoe.resident_models" => {
+                self.flashmoe.resident_models = Some(parse_positive(key, value)?)
+            }
+            "flashmoe.idle_seconds" => {
+                self.flashmoe.idle_seconds = Some(parse_positive(key, value)?)
+            }
             _ => return bail_unknown_key(key),
         }
+        self.validate()?;
         Ok(())
     }
 
@@ -239,6 +349,80 @@ impl UserConfig {
     pub fn effective_personal_memory_repo(&self) -> Option<PathBuf> {
         self.memory.personal_repo.clone()
     }
+
+    pub fn effective_state_dir(&self) -> Result<PathBuf> {
+        if let Some(path) = &self.storage.state_dir {
+            return Ok(path.clone());
+        }
+        let base = dirs::data_local_dir().context("cannot determine local pb data directory")?;
+        Ok(base.join("pb").join("state"))
+    }
+
+    pub fn effective_cache_dir(&self) -> Option<PathBuf> {
+        self.storage
+            .cache_dir
+            .clone()
+            .or_else(|| dirs::cache_dir().map(|root| root.join("pb")))
+    }
+
+    pub fn effective_llamacpp_session_cache(&self) -> ResolvedSessionCacheConfig {
+        ResolvedSessionCacheConfig {
+            enabled: self
+                .inference
+                .llamacpp_session_cache_enabled
+                .unwrap_or(true),
+            root: self.effective_cache_dir(),
+            max_bytes: self
+                .inference
+                .llamacpp_session_cache_max_bytes
+                .unwrap_or(DEFAULT_SESSION_CACHE_MAX_BYTES),
+        }
+    }
+
+    pub fn effective_flashmoe(&self) -> ResolvedFlashMoeConfig {
+        ResolvedFlashMoeConfig {
+            session_cache: ResolvedSessionCacheConfig {
+                enabled: self
+                    .inference
+                    .flashmoe_session_cache_enabled
+                    .unwrap_or(true),
+                root: self.effective_cache_dir(),
+                max_bytes: self
+                    .inference
+                    .flashmoe_session_cache_max_bytes
+                    .unwrap_or(DEFAULT_SESSION_CACHE_MAX_BYTES),
+            },
+            memory_sessions: self
+                .flashmoe
+                .memory_sessions
+                .unwrap_or(DEFAULT_FLASHMOE_MEMORY_SESSIONS),
+            resident_models: self
+                .flashmoe
+                .resident_models
+                .unwrap_or(DEFAULT_FLASHMOE_RESIDENT_MODELS),
+            idle_seconds: self
+                .flashmoe
+                .idle_seconds
+                .unwrap_or(DEFAULT_FLASHMOE_IDLE_SECONDS),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_optional_absolute_path("storage.state_dir", self.storage.state_dir.as_deref())?;
+        validate_optional_absolute_path("storage.cache_dir", self.storage.cache_dir.as_deref())?;
+        validate_optional_positive(
+            "inference.llamacpp_session_cache_max_bytes",
+            self.inference.llamacpp_session_cache_max_bytes,
+        )?;
+        validate_optional_positive(
+            "inference.flashmoe_session_cache_max_bytes",
+            self.inference.flashmoe_session_cache_max_bytes,
+        )?;
+        validate_optional_positive("flashmoe.memory_sessions", self.flashmoe.memory_sessions)?;
+        validate_optional_positive("flashmoe.resident_models", self.flashmoe.resident_models)?;
+        validate_optional_positive("flashmoe.idle_seconds", self.flashmoe.idle_seconds)?;
+        Ok(())
+    }
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -260,9 +444,46 @@ where
         .map_err(|err| anyhow::anyhow!("invalid value for {key}: {value} ({err})"))
 }
 
+fn parse_positive<T>(key: &str, value: &str) -> Result<T>
+where
+    T: std::str::FromStr + PartialOrd + From<u8> + Copy,
+    T::Err: std::fmt::Display,
+{
+    let parsed = parse_value::<T>(key, value)?;
+    if parsed <= T::from(0) {
+        bail!("invalid value for {key}: expected a positive value");
+    }
+    Ok(parsed)
+}
+
+fn parse_absolute_path(key: &str, value: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(value);
+    validate_optional_absolute_path(key, Some(&path))?;
+    Ok(path)
+}
+
+fn validate_optional_absolute_path(key: &str, path: Option<&Path>) -> Result<()> {
+    if let Some(path) = path
+        && (path.as_os_str().is_empty() || !path.is_absolute())
+    {
+        bail!("invalid value for {key}: expected a non-empty absolute path");
+    }
+    Ok(())
+}
+
+fn validate_optional_positive<T>(key: &str, value: Option<T>) -> Result<()>
+where
+    T: PartialOrd + From<u8> + Copy,
+{
+    if value.is_some_and(|value| value <= T::from(0)) {
+        bail!("invalid value for {key}: expected a positive value");
+    }
+    Ok(())
+}
+
 fn bail_unknown_key<T>(key: &str) -> Result<T> {
     bail!(
-        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, capabilities, and disabled fields. Container MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, and secret_env. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
+        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, memory.personal_repo, storage.state_dir, storage.cache_dir, inference.llamacpp_session_cache_enabled, inference.llamacpp_session_cache_max_bytes, inference.flashmoe_session_cache_enabled, inference.flashmoe_session_cache_max_bytes, flashmoe.memory_sessions, flashmoe.resident_models, flashmoe.idle_seconds. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, capabilities, and disabled fields. Container MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, and secret_env. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
     )
 }
 
@@ -322,6 +543,64 @@ mod tests {
             UserConfig::default().effective_max_steps(),
             DEFAULT_AGENT_MAX_STEPS
         );
+    }
+
+    #[test]
+    fn runtime_storage_and_inference_settings_round_trip() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let cache_dir = dir.path().join("cache");
+        let path = dir.path().join("config.toml");
+        let mut config = UserConfig::default();
+        config
+            .set("storage.state_dir", &state_dir.to_string_lossy())
+            .unwrap();
+        config
+            .set("storage.cache_dir", &cache_dir.to_string_lossy())
+            .unwrap();
+        config
+            .set("inference.llamacpp_session_cache_enabled", "false")
+            .unwrap();
+        config
+            .set("inference.llamacpp_session_cache_max_bytes", "1024")
+            .unwrap();
+        config
+            .set("inference.flashmoe_session_cache_enabled", "false")
+            .unwrap();
+        config
+            .set("inference.flashmoe_session_cache_max_bytes", "2048")
+            .unwrap();
+        config.set("flashmoe.memory_sessions", "3").unwrap();
+        config.set("flashmoe.resident_models", "4").unwrap();
+        config.set("flashmoe.idle_seconds", "60").unwrap();
+        config.save_to_path(&path).unwrap();
+
+        let loaded = UserConfig::load_from_path(&path).unwrap();
+        assert_eq!(loaded.effective_state_dir().unwrap(), state_dir);
+        let llama = loaded.effective_llamacpp_session_cache();
+        assert!(!llama.enabled);
+        assert_eq!(llama.root, Some(cache_dir.clone()));
+        assert_eq!(llama.max_bytes, 1024);
+        let flashmoe = loaded.effective_flashmoe();
+        assert!(!flashmoe.session_cache.enabled);
+        assert_eq!(flashmoe.session_cache.root, Some(cache_dir));
+        assert_eq!(flashmoe.session_cache.max_bytes, 2048);
+        assert_eq!(flashmoe.memory_sessions, 3);
+        assert_eq!(flashmoe.resident_models, 4);
+        assert_eq!(flashmoe.idle_seconds, 60);
+    }
+
+    #[test]
+    fn runtime_settings_reject_relative_paths_and_zero_limits() {
+        let mut config = UserConfig::default();
+        assert!(config.set("storage.state_dir", "relative/state").is_err());
+        assert!(
+            config
+                .set("inference.llamacpp_session_cache_max_bytes", "0")
+                .is_err()
+        );
+        assert!(config.set("flashmoe.memory_sessions", "0").is_err());
+        assert!(config.set("flashmoe.idle_seconds", "0").is_err());
     }
 
     #[test]

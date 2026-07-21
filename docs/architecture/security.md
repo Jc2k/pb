@@ -122,6 +122,9 @@ ephemeral workspaces are session-owned.
 The GitHub OAuth flow uses PKCE and a loopback callback. Its token is stored below the user
 configuration directory and created with mode `0600` on Unix. Project files can name host
 environment variables for service secret injection; they should not contain the secret values.
+Parent-process environment access is confined to an audited boundary: operating-system directory
+conventions and secret names explicitly declared by configuration. User-visible pb behavior does
+not use standalone environment flags.
 
 pb does not turn a secret-bearing host command into a contained operation. Prefer capability-scoped
 container integrations when repository, egress, and secret boundaries matter.

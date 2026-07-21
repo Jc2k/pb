@@ -40,6 +40,7 @@ pub mod handoff;
 pub mod harness;
 pub mod harness_contract;
 pub mod harness_eval;
+mod host_environment;
 mod http_listener;
 pub mod inference;
 pub mod init;
@@ -1517,12 +1518,10 @@ fn parse_github_repo_url(url: &str) -> Option<String> {
 }
 
 async fn run_projects_command(command: ProjectsCommand) -> Result<()> {
+    let user_config = UserConfig::load()?;
     match command {
         ProjectsCommand::Add(args) => {
-            let socket_path = args
-                .socket_path
-                .clone()
-                .unwrap_or_else(daemon_client::default_socket_path);
+            let socket_path = resolve_socket_path(args.socket_path.clone(), &user_config);
             let entry = daemon_client::add_project(
                 &socket_path,
                 projects::AddProjectRequest {
@@ -1534,10 +1533,7 @@ async fn run_projects_command(command: ProjectsCommand) -> Result<()> {
             println!("added project {}\t{}", entry.name, entry.path);
         }
         ProjectsCommand::List(args) => {
-            let socket_path = args
-                .socket_path
-                .clone()
-                .unwrap_or_else(daemon_client::default_socket_path);
+            let socket_path = resolve_socket_path(args.socket_path.clone(), &user_config);
             let projects = daemon_client::list_projects(&socket_path).await?;
             if projects.is_empty() {
                 println!("no projects registered");
@@ -1548,10 +1544,7 @@ async fn run_projects_command(command: ProjectsCommand) -> Result<()> {
             }
         }
         ProjectsCommand::Rm(args) => {
-            let socket_path = args
-                .socket_path
-                .clone()
-                .unwrap_or_else(daemon_client::default_socket_path);
+            let socket_path = resolve_socket_path(args.socket_path.clone(), &user_config);
             let entry = daemon_client::remove_project(
                 &socket_path,
                 projects::RemoveProjectRequest { name: args.name },
@@ -1564,10 +1557,8 @@ async fn run_projects_command(command: ProjectsCommand) -> Result<()> {
 }
 
 async fn run_queue(args: QueueArgs) -> Result<()> {
-    let socket_path = args
-        .socket_path
-        .clone()
-        .unwrap_or_else(daemon_client::default_socket_path);
+    let user_config = UserConfig::load()?;
+    let socket_path = resolve_socket_path(args.socket_path.clone(), &user_config);
 
     if let Some(session_id) = args.delete_session.clone() {
         let deleted = daemon_client::delete_session(&socket_path, session_id).await?;
@@ -1687,7 +1678,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
 }
 
 async fn run_goal_command(command: GoalCommand) -> Result<()> {
-    let socket_path = daemon_client::default_socket_path();
+    let socket_path = UserConfig::load()?.effective_socket_path();
     match command {
         GoalCommand::Start(args) => {
             let workdir = args
@@ -1757,6 +1748,10 @@ async fn run_goal_command(command: GoalCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_socket_path(cli_path: Option<PathBuf>, user_config: &UserConfig) -> PathBuf {
+    cli_path.unwrap_or_else(|| user_config.effective_socket_path())
 }
 
 fn print_goal_status(checkpoint: &goal::GoalCheckpoint) {
@@ -1936,19 +1931,17 @@ fn remove_self_data() -> Result<()> {
 
 fn self_data_paths() -> Result<Vec<PathBuf>> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
+    let user_config = UserConfig::load()?;
+    let cache = crate::host_environment::cache_home()
         .unwrap_or_else(|| home.join(".cache"))
         .join("pb");
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
+    let config = crate::host_environment::config_home()
         .unwrap_or_else(|| home.join(".config"))
         .join("pb");
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
+    let state = crate::host_environment::state_home()
         .unwrap_or_else(|| home.join(".local").join("state"))
         .join("pb");
-    Ok(vec![
+    let mut paths = vec![
         default_data_dir(),
         cache,
         config,
@@ -1957,7 +1950,14 @@ fn self_data_paths() -> Result<Vec<PathBuf>> {
         home.join("Library").join("Logs").join("pb.stderr.log"),
         home.join("Library").join("Logs").join("pb.tray.stdout.log"),
         home.join("Library").join("Logs").join("pb.tray.stderr.log"),
-    ])
+    ];
+    paths.push(user_config.effective_state_dir()?);
+    if let Some(cache_dir) = user_config.effective_cache_dir() {
+        paths.push(cache_dir);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
@@ -2162,7 +2162,7 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
             routing_policy,
         ),
     };
-    let load_options = flashmoe_load_options(args.metal_working_set_limit_mib)?;
+    let load_options = flashmoe_load_options(args.metal_working_set_limit_mib, &user_config)?;
     let load_started = Instant::now();
     eprintln!("flashmoe infer: loading backend");
     let mut engine = if args.verbose {
@@ -2476,7 +2476,7 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
             inference::flashmoe::plan_unchecked_with_routing(&model, &models_root, routing_policy)
         }
     };
-    let load_options = flashmoe_load_options(args.metal_working_set_limit_mib)?;
+    let load_options = flashmoe_load_options(args.metal_working_set_limit_mib, &user_config)?;
     let load_started = Instant::now();
     eprintln!("flashmoe bench: loading backend");
     let mut engine = if args.verbose {
@@ -2656,15 +2656,20 @@ fn run_flashmoe_bench(args: FlashMoeBenchArgs) -> Result<()> {
 
 fn flashmoe_load_options(
     limit_mib: Option<usize>,
+    user_config: &UserConfig,
 ) -> Result<inference::flashmoe::FlashMoeLoadOptions> {
-    let Some(limit_mib) = limit_mib else {
-        return Ok(inference::flashmoe::FlashMoeLoadOptions::default());
-    };
+    let flashmoe = user_config.effective_flashmoe();
     let limit_bytes = limit_mib
-        .checked_mul(1024 * 1024)
-        .context("--metal-working-set-limit-mib is too large")?;
+        .map(|limit_mib| {
+            limit_mib
+                .checked_mul(1024 * 1024)
+                .context("--metal-working-set-limit-mib is too large")
+        })
+        .transpose()?;
     Ok(inference::flashmoe::FlashMoeLoadOptions {
-        metal_working_set_limit_bytes: Some(limit_bytes),
+        metal_working_set_limit_bytes: limit_bytes,
+        session_cache: flashmoe.session_cache,
+        memory_sessions: flashmoe.memory_sessions,
     })
 }
 
@@ -4156,10 +4161,8 @@ fn default_gpu_layers() -> u32 {
 }
 
 fn default_data_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.is_empty()
-    {
-        return PathBuf::from(xdg).join("pb");
+    if let Some(xdg) = crate::host_environment::data_home() {
+        return xdg.join("pb");
     }
     if let Some(home) = dirs::home_dir() {
         return home.join(".local").join("share").join("pb");
@@ -4466,16 +4469,16 @@ mod tests {
         assert!(infer.resource_summary);
 
         assert_eq!(
-            flashmoe_load_options(Some(2048))
+            flashmoe_load_options(Some(2048), &UserConfig::default())
                 .unwrap()
                 .metal_working_set_limit_bytes,
             Some(2048 * 1024 * 1024)
         );
         assert_eq!(
-            flashmoe_load_options(None).unwrap(),
+            flashmoe_load_options(None, &UserConfig::default()).unwrap(),
             inference::flashmoe::FlashMoeLoadOptions::default()
         );
-        assert!(flashmoe_load_options(Some(usize::MAX)).is_err());
+        assert!(flashmoe_load_options(Some(usize::MAX), &UserConfig::default()).is_err());
     }
 
     #[test]
@@ -4484,6 +4487,20 @@ mod tests {
         let help = command.render_long_help().to_string();
         assert!(!help.contains("harness"));
         assert!(Cli::try_parse_from(["pb", "flashmoe", "infer", "2+2="]).is_err());
+    }
+
+    #[test]
+    fn command_socket_path_overrides_user_config() {
+        let mut config = UserConfig::default();
+        config.web.socket_path = Some(PathBuf::from("/tmp/configured.sock"));
+        assert_eq!(
+            resolve_socket_path(Some(PathBuf::from("/tmp/command.sock")), &config),
+            PathBuf::from("/tmp/command.sock")
+        );
+        assert_eq!(
+            resolve_socket_path(None, &config),
+            PathBuf::from("/tmp/configured.sock")
+        );
     }
 
     #[test]

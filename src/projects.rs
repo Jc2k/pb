@@ -55,6 +55,10 @@ pub fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 
 pub fn load_projects() -> Result<Vec<ProjectEntry>> {
     let path = registry_path()?;
+    load_projects_from(&path)
+}
+
+fn load_projects_from(path: &Path) -> Result<Vec<ProjectEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -73,6 +77,10 @@ pub fn load_projects() -> Result<Vec<ProjectEntry>> {
 }
 
 pub fn add_project(request: AddProjectRequest) -> Result<ProjectEntry> {
+    add_project_at(request, &registry_path()?)
+}
+
+fn add_project_at(request: AddProjectRequest, registry_path: &Path) -> Result<ProjectEntry> {
     let path = canonical_project_path(&request.path)?;
     let name = match request.name {
         Some(name) if !name.trim().is_empty() => name.trim().to_string(),
@@ -81,7 +89,7 @@ pub fn add_project(request: AddProjectRequest) -> Result<ProjectEntry> {
     validate_project_name(&name)?;
 
     let path_string = path.to_string_lossy().into_owned();
-    let existing_notify = load_projects()?
+    let existing_notify = load_projects_from(registry_path)?
         .into_iter()
         .find(|project| project.name == name || project.path == path_string)
         .map(|project| project.notify_on_finish)
@@ -94,11 +102,11 @@ pub fn add_project(request: AddProjectRequest) -> Result<ProjectEntry> {
         notify_on_finish: existing_notify,
     };
 
-    let mut projects = load_projects()?;
+    let mut projects = load_projects_from(registry_path)?;
     projects.retain(|project| project.name != name && project.path != entry.path);
     projects.push(entry.clone());
     sort_projects(&mut projects);
-    save_projects(&projects)?;
+    save_projects_to(registry_path, &projects)?;
     Ok(entry)
 }
 
@@ -114,19 +122,31 @@ pub fn remove_project(name: &str) -> Result<ProjectEntry> {
 }
 
 pub fn set_project_notifications(name: &str, notify_on_finish: bool) -> Result<ProjectEntry> {
+    set_project_notifications_at(&registry_path()?, name, notify_on_finish)
+}
+
+fn set_project_notifications_at(
+    registry_path: &Path,
+    name: &str,
+    notify_on_finish: bool,
+) -> Result<ProjectEntry> {
     validate_project_name(name)?;
-    let mut projects = load_projects()?;
+    let mut projects = load_projects_from(registry_path)?;
     let Some(project) = projects.iter_mut().find(|project| project.name == name) else {
         bail!("project not found: {name}");
     };
     project.notify_on_finish = notify_on_finish;
     let updated = project.clone();
-    save_projects(&projects)?;
+    save_projects_to(registry_path, &projects)?;
     Ok(updated)
 }
 
 fn save_projects(projects: &[ProjectEntry]) -> Result<()> {
     let path = registry_path()?;
+    save_projects_to(&path, projects)
+}
+
+fn save_projects_to(path: &Path, projects: &[ProjectEntry]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -175,24 +195,21 @@ mod tests {
     #[test]
     fn notification_toggle_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let registry = dir.path().join("projects.toml");
         let project_dir = dir.path().join("example");
         std::fs::create_dir(&project_dir).unwrap();
 
-        add_project(AddProjectRequest {
-            name: Some("example".to_string()),
-            path: project_dir.to_string_lossy().to_string(),
-        })
+        add_project_at(
+            AddProjectRequest {
+                name: Some("example".to_string()),
+                path: project_dir.to_string_lossy().to_string(),
+            },
+            &registry,
+        )
         .unwrap();
-        let updated = set_project_notifications("example", true).unwrap();
+        let updated = set_project_notifications_at(&registry, "example", true).unwrap();
         assert!(updated.notify_on_finish);
-        assert!(load_projects().unwrap()[0].notify_on_finish);
-
-        match old_home {
-            Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
+        assert!(load_projects_from(&registry).unwrap()[0].notify_on_finish);
     }
 
     #[test]

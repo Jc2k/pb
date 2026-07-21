@@ -290,11 +290,19 @@ impl WorkspaceManager {
 }
 
 pub fn default_state_root() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("PB_STATE_DIR") {
-        return Ok(PathBuf::from(path));
+    #[cfg(test)]
+    {
+        static TEST_STATE_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let root = TEST_STATE_ROOT.get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("pb-test-state-")
+                .tempdir()
+                .expect("create process-local pb test state root")
+        });
+        return Ok(root.path().to_path_buf());
     }
-    let base = dirs::data_local_dir().context("cannot determine local pb data directory")?;
-    Ok(base.join("pb").join("state"))
+    #[cfg(not(test))]
+    crate::config::UserConfig::load()?.effective_state_dir()
 }
 
 fn validate_adoption(

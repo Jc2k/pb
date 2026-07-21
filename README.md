@@ -112,7 +112,7 @@ When a session starts, pb initializes each enabled stdio MCP server, calls `tool
 - show the same agent progress contract used by the terminal queue adapter,
 - report `/api/status` so the macOS menu bar item can show when any session is running.
 
-`pb serve` also listens on a local Unix socket (override with `--socket-path`) so `pb queue` can submit sessions with the same defaults as the web form and attach to running session event streams.
+`pb serve` also listens on a local Unix socket configured with `web.socket_path`; `pb queue` and project commands use the same setting unless their `--socket-path` argument overrides it. The platform fallback uses `$XDG_RUNTIME_DIR/pb.sock` when available and `/tmp/pb-<uid>.sock` otherwise.
 
 ## Build and test
 

@@ -29,6 +29,7 @@
 4. **Web UI tests**: Add or update `webui/src/**/*.test.ts` tests for web UI behavior changes, and run `deno task test:web` before committing
 5. **Documentation parity**: When changing user-visible behavior or architectural guarantees, update the relevant curated chapter under `docs/user/` or `docs/architecture/` in the same commit and run `deno task test:docs`
 6. **FlashMoe architecture**: When changing FlashMoe data flow, scheduling, expert I/O, Metal kernels, or model-family behavior, keep `docs/flashmoe-architecture-parity-plan.md` aligned with the target architecture and current migration status.
+7. **No standalone environment controls**: User-visible pb behavior must use typed user/project configuration or an explicit CLI argument. Do not add `PB_*` environment flags or feature toggles. Parent-process environment reads belong only in `src/host_environment.rs` and must be limited to operating-system conventions or secret names explicitly declared by configuration. Child-process environment values and test-only process handoffs are separate, scoped mechanisms. `PB_GITHUB_CLIENT_ID` is an explicitly grandfathered build-time exception and must not be expanded or refactored without a dedicated decision.
 
 ## Documentation guidance
 

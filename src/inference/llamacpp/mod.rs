@@ -34,7 +34,6 @@ use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate
 const BATCH_SIZE: usize = 512;
 const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
 const LLAMA_SESSION_CACHE_VERSION: &str = "llamacpp-session-v1";
-const DEFAULT_LLAMA_SESSION_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Parameters for a single generation call.
 #[derive(Debug, Clone)]
@@ -94,6 +93,7 @@ pub struct LlamaCppBackend {
     chat_template: Option<TokenizerChatTemplate>,
     /// Path to the primary model GGUF file.
     pub model_path: PathBuf,
+    session_cache: crate::config::ResolvedSessionCacheConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +134,15 @@ fn suppress_logs() {
 /// The caller is responsible for resolving the file path (e.g. via
 /// [`crate::agent_core::find_model_in_cache_in`]).
 pub fn load_from_file(path: &Path, gpu_layers: u32) -> Result<LlamaCppBackend> {
+    let session_cache = crate::config::UserConfig::load()?.effective_llamacpp_session_cache();
+    load_from_file_with_cache(path, gpu_layers, session_cache)
+}
+
+fn load_from_file_with_cache(
+    path: &Path,
+    gpu_layers: u32,
+    session_cache: crate::config::ResolvedSessionCacheConfig,
+) -> Result<LlamaCppBackend> {
     suppress_logs();
     let mut backend = LlamaBackend::init().context("failed to initialize llama backend")?;
     backend.void_logs();
@@ -146,6 +155,7 @@ pub fn load_from_file(path: &Path, gpu_layers: u32) -> Result<LlamaCppBackend> {
         model: loaded_model,
         chat_template,
         model_path: path.to_owned(),
+        session_cache,
     })
 }
 
@@ -163,18 +173,19 @@ pub fn load_text_from_file(
     threads: Option<i32>,
     threads_batch: Option<i32>,
 ) -> Result<(LlamaCppBackend, Option<String>)> {
+    let session_cache = crate::config::UserConfig::load()?.effective_llamacpp_session_cache();
     let settings = LlamaSessionSettings {
         ctx_size,
         threads,
         threads_batch,
     };
-    let accelerated = load_from_file(path, gpu_layers)?;
+    let accelerated = load_from_file_with_cache(path, gpu_layers, session_cache.clone())?;
     let accelerated_probe = accelerated.new_text_context(settings).map(drop);
     match accelerated_probe {
         Ok(()) => Ok((accelerated, None)),
         Err(accelerated_error) if gpu_layers > 0 => {
             drop(accelerated);
-            let cpu = load_from_file(path, 0).with_context(|| {
+            let cpu = load_from_file_with_cache(path, 0, session_cache).with_context(|| {
                 format!(
                     "failed to reload llama.cpp model CPU-only after accelerated context setup failed: {accelerated_error:#}"
                 )
@@ -749,7 +760,7 @@ impl LlamaCppChatSession<'_> {
                     temporary.path().display()
                 )
             })?;
-        let max_bytes = llama_session_cache_max_bytes();
+        let max_bytes = self.backend.session_cache.max_bytes;
         let state_bytes = temporary.as_file().metadata()?.len();
         if state_bytes > max_bytes {
             tracing::warn!(
@@ -767,10 +778,15 @@ impl LlamaCppChatSession<'_> {
     }
 
     fn cache_path(&self, settings: LlamaSessionSettings) -> Option<PathBuf> {
-        if self.session_id.trim().is_empty() || llama_session_cache_disabled() {
+        if self.session_id.trim().is_empty() || !self.backend.session_cache.enabled {
             return None;
         }
-        let root = llama_session_cache_root()?;
+        let root = self
+            .backend
+            .session_cache
+            .root
+            .as_ref()?
+            .join(LLAMA_SESSION_CACHE_VERSION);
         Some(llama_session_cache_path(
             &root,
             &self.backend.model_path,
@@ -919,32 +935,6 @@ fn common_token_prefix_len(left: &[LlamaToken], right: &[LlamaToken]) -> usize {
         .zip(right)
         .take_while(|(left, right)| left == right)
         .count()
-}
-
-fn llama_session_cache_disabled() -> bool {
-    std::env::var("PB_LLAMA_SESSION_CACHE")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off"
-            )
-        })
-}
-
-fn llama_session_cache_max_bytes() -> u64 {
-    std::env::var("PB_LLAMA_SESSION_CACHE_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_LLAMA_SESSION_CACHE_MAX_BYTES)
-}
-
-fn llama_session_cache_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("PB_CACHE_DIR").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(root).join(LLAMA_SESSION_CACHE_VERSION));
-    }
-    dirs::cache_dir().map(|root| root.join("pb").join(LLAMA_SESSION_CACHE_VERSION))
 }
 
 fn llama_session_cache_path(

@@ -19,12 +19,21 @@ The user configuration file is `<config-dir>/pb/config.toml`. It covers:
 
 - web listen address, port, Unix socket path, and the macOS work-queue sleep preference;
 - model identifier, directory, context, sampling, and resource defaults;
+- storage roots and inference session-cache policy;
+- FlashMoe in-memory session and resident-runtime bounds;
 - global MCP and LSP server definitions;
 - an optional separate personal-memory repository.
 
 The web server binds to `127.0.0.1:8311` by default. Changing `web.listen` to `0.0.0.0` exposes the
 interface on available networks. pb does not add authentication or TLS merely because the address
 changed, so treat non-loopback binding as an explicit trust decision.
+
+The daemon and all CLI clients resolve the Unix socket in the same order: a command-specific
+`--socket-path`, `web.socket_path`, `$XDG_RUNTIME_DIR/pb.sock`, then `/tmp/pb-<uid>.sock`. The final
+fallback uses the numeric user ID rather than the mutable `USER` environment variable.
+
+pb-owned workspaces, leases, and managed cache records use the platform-local data directory by
+default. Set `storage.state_dir` to a non-empty absolute path to relocate them.
 
 ## Keep macOS awake while pb works
 
@@ -79,15 +88,22 @@ process can resume without prefilling the unchanged prefix. The cache key includ
 identity, context size, and a hash of the session id; exact token comparison invalidates changed
 system instructions, tools, templates, messages, and compaction.
 
-States live below the platform cache directory at `pb/llamacpp-session-v1/`. Set `PB_CACHE_DIR` to
-move pb's cache root, or set `PB_LLAMA_SESSION_CACHE=off` to disable disk snapshots while retaining
-the in-process context. `PB_LLAMA_SESSION_CACHE_MAX_BYTES` sets its byte budget; the default is 8
-GiB. pb writes replacements through a temporary owner-only cache directory. These files can be
-large because they contain the model's evaluated attention state and associated prompt tokens.
+States live below the platform cache directory at `pb/llamacpp-session-v1/`. Configure an absolute
+`storage.cache_dir` to move pb's inference-cache root. Set
+`inference.llamacpp_session_cache_enabled` to `false` to disable disk snapshots while retaining the
+in-process context. `inference.llamacpp_session_cache_max_bytes` sets its byte budget; the default
+is 8 GiB. pb writes replacements through a temporary owner-only cache directory. These files can
+be large because they contain the model's evaluated attention state and associated prompt tokens.
+
+```bash
+pb config set storage.cache_dir /absolute/path/to/pb-cache
+pb config set inference.llamacpp_session_cache_enabled false
+pb config set inference.llamacpp_session_cache_max_bytes 8589934592
+```
 
 FlashMoe keeps up to two checkpoints for each of the two most recently used logical sessions in
 memory by default: the safe rendered-prompt boundary and an evaluated generated-token head. Set
-`PB_FLASHMOE_MEMORY_SESSIONS` to another positive count. If canonical chat rendering preserves
+`flashmoe.memory_sessions` to another positive count. If canonical chat rendering preserves
 generated tokens exactly, the next pass resumes from the generated head; otherwise it falls back to
 the safe boundary. A stable first-system-message prefix is also content-addressed and may be shared
 by other sessions using the same model, tokenizer, template, tool schema, and system tokens.
@@ -105,15 +121,23 @@ ordinary request-scoped turns, preserving multi-turn tool execution without clai
 
 The web/service path retains loaded FlashMoe runtimes across managed turns. It retains up to two
 idle models by default and reaps an unused runtime after 15 minutes. Set
-`PB_FLASHMOE_RESIDENT_MODELS` or `PB_FLASHMOE_IDLE_SECONDS` to change those process-memory bounds.
+`flashmoe.resident_models` or `flashmoe.idle_seconds` to change those process-memory bounds.
 
-FlashMoe restart snapshots live below `pb/flashmoe-session-v1/`, or below
-`$PB_CACHE_DIR/flashmoe-session-v1/`. They are model-fingerprinted, content-addressed, owner-only,
-checksummed, and pruned to an 8 GiB byte budget. Set `PB_FLASHMOE_SESSION_CACHE_MAX_BYTES` to a
-different positive byte count or `PB_FLASHMOE_SESSION_CACHE=off` to retain memory reuse without
-writing prompt-derived state. Only the canonical prompt boundary is written for a session; the
-speculative generated head stays in memory, avoiding a second large durable write per turn. A
-checkpoint larger than the whole budget is skipped rather than making generation fail.
+FlashMoe restart snapshots live below `pb/flashmoe-session-v1/` in the configured inference-cache
+root. They are model-fingerprinted, content-addressed, owner-only, checksummed, and pruned to an 8
+GiB byte budget. Set `inference.flashmoe_session_cache_max_bytes` to a different positive byte count
+or `inference.flashmoe_session_cache_enabled` to `false` to retain memory reuse without writing
+prompt-derived state. Only the canonical prompt boundary is written for a session; the speculative
+generated head stays in memory, avoiding a second large durable write per turn. A checkpoint larger
+than the whole budget is skipped rather than making generation fail.
+
+```bash
+pb config set flashmoe.memory_sessions 2
+pb config set flashmoe.resident_models 2
+pb config set flashmoe.idle_seconds 900
+pb config set inference.flashmoe_session_cache_enabled false
+pb config set inference.flashmoe_session_cache_max_bytes 8589934592
+```
 
 For llama.cpp text sessions, pb probes the requested context after loading an accelerated model.
 If Metal can load the weights but cannot create that context, pb reports the degradation and
