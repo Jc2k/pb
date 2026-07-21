@@ -121,6 +121,10 @@ containment, task completion, artifact quality, wall time, and energy are report
 [reliability plan](task-completion-reliability-plan.md) defines the locked repeatability and corpus
 promotion gates.
 
+The run audit records every observed strict named check in its planned and executed check evidence,
+even though strict delivery does not emit the legacy handoff summary. Harness-owned next-path work
+unit guidance is recorded as positive control evidence rather than a model limitation.
+
 ### Prompt budget and bounded results
 
 Every model call is rendered and tokenized before it is charged to the invocation budget. The

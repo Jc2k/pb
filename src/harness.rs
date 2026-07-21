@@ -345,7 +345,11 @@ impl EventSink for HarnessEventSink {
             } => {
                 state.observations.push(Observation {
                     rank: 3,
-                    classification: "model_limitation",
+                    classification: if summary == "Next accepted-plan creation work unit" {
+                        "positive_evidence"
+                    } else {
+                        "model_limitation"
+                    },
                     title: nonempty_or(summary, "agent correction"),
                     detail: compact_detail(message),
                 });
@@ -443,6 +447,9 @@ impl EventSink for HarnessEventSink {
                 output_fingerprint,
                 ..
             } => {
+                if !state.audit.checks_planned.contains(check_id) {
+                    state.audit.checks_planned.push(check_id.clone());
+                }
                 if *reused {
                     state.audit.checks_reused += 1;
                 } else if skip_reason.is_some() {
@@ -2840,6 +2847,53 @@ mod tests {
         assert_eq!(audit.feedback_evidence_ids, vec!["check:web"]);
         assert_eq!(audit.commit_disposition.as_deref(), Some("created"));
         assert_eq!(audit.commit_oid.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn strict_check_and_work_unit_guidance_are_reported_truthfully() {
+        let parent = tempfile::tempdir().unwrap();
+        let events = parent.path().join("events.jsonl");
+        let run_events = parent.path().join("run-events.jsonl");
+        let mut sink = HarnessEventSink::new(
+            &events,
+            &run_events,
+            &events.with_extension("checkpoint.json"),
+        )
+        .unwrap();
+        sink.emit(AgentEvent::Correction {
+            message: "create alpha.txt now".to_string(),
+            summary: "Next accepted-plan creation work unit".to_string(),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        sink.emit(AgentEvent::CheckResult {
+            check_id: "exact_content".to_string(),
+            exit_status: 0,
+            success: true,
+            timed_out: false,
+            output: String::new(),
+            truncated: false,
+            duration_ms: 1,
+            fingerprint: "content".to_string(),
+            command: Some("test -f alpha.txt".to_string()),
+            cwd: Some(".".to_string()),
+            executor: Some("harness-contract".to_string()),
+            source: Some("executed".to_string()),
+            command_fingerprint: Some("command".to_string()),
+            dependency_outputs: BTreeMap::new(),
+            output_fingerprint: Some("output".to_string()),
+            reused: false,
+            skip_reason: None,
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+
+        let (observations, _, audit) = sink.snapshot().unwrap();
+        assert_eq!(audit.checks_planned, vec!["exact_content"]);
+        assert_eq!(audit.checks_executed, 1);
+        assert_eq!(audit.checks_passed, 1);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].classification, "positive_evidence");
     }
 
     #[test]

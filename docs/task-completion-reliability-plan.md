@@ -123,6 +123,7 @@ specific runtime shortcuts, and silent hosted-model fallback are not promotion s
 | --- | --- | --- | --- | --- |
 | 2026-07-21 | Fixture definition | TC1/TC2 tasks, contracts, and independent review procedure | Pending native execution | Build current release and run TC1 in a new preserved scratch root |
 | 2026-07-21 | Reporting | `scripts/summarize-harness-completion.ts` and synthetic tests | Machine-readable harness claims and efficiency metrics remain distinct from independent verification | Validate against preserved field runs and use for TC1 |
+| 2026-07-21 | TC1 native qualification 1 | scratch `/private/tmp/pb-tc1-ordered-create-1-20260721`, run `1784667572614-75379-0`, commit `f4da7a5a925f82a6c129850f284ff2731d8568d9` | Verified completion; exact check independently passed; clean worktree; 7 calls, 561,696 ms, 7.24 Wh; exposed two journal diagnostic defects | Fix strict planned-check audit and work-unit classification, then repeat TC1 with the locked settings |
 
 ## Completion audit
 
@@ -131,7 +132,7 @@ specific runtime shortcuts, and silent hosted-model fallback are not promotion s
   worktree.
 - [x] TC2 has an independent behavior check separate from model-authored tests.
 - [ ] Current release is rebuilt from the source under evaluation.
-- [ ] TC1 native qualification passes and its journal, events, Git state, and check are reviewed.
+- [x] TC1 native qualification passes and its journal, events, Git state, and check are reviewed.
 - [ ] TC1 repeats successfully 3/3 with locked settings.
 - [ ] TC2 reaches one independently verified completion.
 - [ ] TC3 corpus and aggregate report exist.
