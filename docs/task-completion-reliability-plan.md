@@ -72,8 +72,8 @@ Promotion gates:
 ### TC2 — useful coding
 
 The TC2 fixture requires a dependency-free slugify implementation, model-authored tests,
-documentation, an independent behavior check, the model test check, fresh review, semantic commit,
-and a clean worktree.
+documentation, an independent behavior check, an explicit no-remote-import check, the model test
+check, fresh review, semantic commit, and a clean worktree.
 
 Initial functional gate: one fully verified completion after TC1's first qualification. The first
 efficiency envelope is 12 model invocations, 30 minutes, and 15 Wh. Exceeding an efficiency bound

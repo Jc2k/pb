@@ -20263,10 +20263,11 @@ the next imagined action"#;
             crate::workflow::WorkflowStage::Implementing,
             crate::workflow::WorkflowStage::Repairing,
         ] {
-            assert_eq!(
-                ToolExposureState::for_turn(Some(stage), 1, Some("submit_implementation"), true,),
-                ToolExposureState::Authorized
-            );
+            let exposure =
+                ToolExposureState::for_turn(Some(stage), 1, Some("submit_implementation"), true);
+            assert!(exposure.allows("submit_implementation"));
+            assert!(!exposure.allows("run_check"));
+            assert!(!exposure.allows("write_file"));
         }
     }
 
@@ -20494,7 +20495,7 @@ the next imagined action"#;
     }
 
     #[test]
-    fn implementation_keeps_edit_tools_after_a_rejected_prose_final() {
+    fn unfinished_implementation_keeps_edit_tools_after_a_rejected_prose_final() {
         let repo = init_contract_test_repo();
         let request = workflow_request(AgentProfile::Build, repo.path());
         let mut contract = crate::workflow::StageContract::strict(
@@ -20504,10 +20505,12 @@ the next imagined action"#;
         )
         .unwrap();
         contract.max_steps = 2;
+        let mut context = stage_context();
+        context.creation_path_order = vec!["missing.txt".to_string()];
         let outcome = run_scripted_stage(
             &request,
             &contract,
-            stage_context(),
+            context,
             vec![
                 ScriptedCompletion {
                     content: "I am done without editing.".to_string(),
@@ -20528,7 +20531,8 @@ the next imagined action"#;
             Some(crate::workflow::StageSubmission::Replan { .. })
         ));
         assert!(outcome.generation_tool_names[1].contains(&"write_file".to_string()));
-        assert!(outcome.generation_tool_names[1].contains(&"submit_implementation".to_string()));
+        assert!(outcome.generation_tool_names[1].contains(&"request_replan".to_string()));
+        assert!(!outcome.generation_tool_names[1].contains(&"submit_implementation".to_string()));
     }
 
     #[test]

@@ -131,6 +131,11 @@ inputs and responses fail explicitly rather than being presented as complete evi
 
 Budgets apply across retries and advisors. Recovery can help express an allowed action, but it does
 not erase usage, broaden authority, or turn a partial result into success.
+When implementation or repair reaches its last ordinary turn with deterministic terminal
+preconditions ready, only the typed implementation submission remains exposed. This preserves a
+bounded opportunity to account for completed work; it does not infer completion, run a commit, or
+bypass the later harness-owned checks and fresh review. If preconditions are not ready, mutation
+authority remains unchanged and step exhaustion is still reported as incomplete.
 Repeated capped native actions remain one bounded failure sequence while workspace and evidence
 fingerprints are unchanged, even if an intervening action parses but then fails. A successful state
 transition or executed tool result resets that sequence; a truncated file-write payload is never

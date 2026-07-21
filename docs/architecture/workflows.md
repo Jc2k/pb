@@ -265,6 +265,12 @@ after checkpoint resume. Mixed create/modify/delete plans retain the ordinary mu
 because a single create ordering would not represent their dependencies. The executor still
 validates every call and final delta, so this narrowing does not grant authority or weaken the
 accepted plan.
+On the final ordinary implementation or repair turn, pb exposes only the typed implementation
+submission when its deterministic terminal preconditions are ready. This reserves closure capacity
+for small local models instead of letting a redundant diagnostic consume the stage budget. If a
+required creation path is still missing or another deterministic precondition is not ready, the
+ordinary authorized surface remains available; pb never synthesizes implementation accounting or
+waives its validation. Harness-owned checking still runs after the accepted submission.
 An edit tool receives mutation and progress credit only when repository bytes actually change.
 Identical replacements and edits fail without emitting a diff or invalidating existing evidence.
 

@@ -32,8 +32,9 @@ establish the TC1 repeatability gate.
 ## TC2 · useful local coding
 
 TC2 asks the model to implement, test, document, review, check, and commit a small dependency-free
-JavaScript module. `behavior` uses independent examples embedded in the trusted contract;
-`model_tests` separately executes the tests written by the model.
+JavaScript module. `behavior` uses independent examples embedded in the trusted contract,
+`dependency_free` rejects remote or package imports, and `model_tests` separately executes the tests
+written by the model.
 
 ```bash
 target/aarch64-apple-darwin/release/pb harness agent \
@@ -43,8 +44,9 @@ target/aarch64-apple-darwin/release/pb harness agent \
   "$(cat fixtures/harness-task-completion/tc2-task.txt)"
 ```
 
-TC2 is attempted only after TC1's first native qualification. A successful run must satisfy both
-checks and every strict workflow gate; attractive source or model-authored tests alone do not count.
+TC2 is attempted only after TC1's first native qualification. A successful run must satisfy all
+three checks and every strict workflow gate; attractive source or model-authored tests alone do not
+count.
 
 ## Independent review
 

@@ -11,6 +11,13 @@
       "timeout_seconds": 30
     },
     {
+      "id": "dependency_free",
+      "command": "! rg -n 'https?://|jsr:|npm:' slugify.mjs slugify.test.mjs README.md",
+      "cwd": ".",
+      "required": true,
+      "timeout_seconds": 30
+    },
+    {
       "id": "model_tests",
       "command": "deno test slugify.test.mjs",
       "cwd": ".",
@@ -22,7 +29,7 @@
   "review": {
     "required": true,
     "read_paths": ["slugify.mjs", "slugify.test.mjs", "README.md"],
-    "check_ids": ["behavior", "model_tests"]
+    "check_ids": ["behavior", "dependency_free", "model_tests"]
   },
   "workspace_clean": true
 }

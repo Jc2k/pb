@@ -29,15 +29,26 @@ impl ToolExposureState {
         let (Some(stage), Some(terminal_tool)) = (stage, terminal_tool) else {
             return Self::Authorized;
         };
-        if ordinary_steps_remaining > 2
-            || !matches!(
-                stage,
-                WorkflowStage::Planning
-                    | WorkflowStage::PlanRevision
-                    | WorkflowStage::PlanReview
-                    | WorkflowStage::CodeReview
-            )
-        {
+        if ordinary_steps_remaining > 2 {
+            return Self::Authorized;
+        }
+        if matches!(
+            stage,
+            WorkflowStage::Implementing | WorkflowStage::Repairing
+        ) {
+            return if ordinary_steps_remaining == 1 && terminal_ready {
+                Self::TerminalOnly { terminal_tool }
+            } else {
+                Self::Authorized
+            };
+        }
+        if !matches!(
+            stage,
+            WorkflowStage::Planning
+                | WorkflowStage::PlanRevision
+                | WorkflowStage::PlanReview
+                | WorkflowStage::CodeReview
+        ) {
             return Self::Authorized;
         }
         if ordinary_steps_remaining == 1 && terminal_ready {
@@ -224,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn se2_last_ready_turn_is_terminal_only_but_implementation_is_unchanged() {
+    fn se2_last_ready_turn_is_terminal_only_including_implementation() {
         let closure = ToolExposureState::for_turn(
             Some(WorkflowStage::PlanReview),
             1,
@@ -240,7 +251,17 @@ mod tests {
             Some("submit_implementation"),
             true,
         );
-        assert_eq!(implementation, ToolExposureState::Authorized);
+        assert!(implementation.allows("submit_implementation"));
+        assert!(!implementation.allows("run_check"));
+        assert!(!implementation.allows("write_file"));
+
+        let unfinished_implementation = ToolExposureState::for_turn(
+            Some(WorkflowStage::Implementing),
+            1,
+            Some("submit_implementation"),
+            false,
+        );
+        assert_eq!(unfinished_implementation, ToolExposureState::Authorized);
     }
 
     #[test]

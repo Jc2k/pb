@@ -439,7 +439,7 @@ mod tests {
                 "tc2",
                 include_str!("../fixtures/harness-task-completion/tc2-contract.json"),
                 3,
-                2,
+                3,
             ),
         ];
 
