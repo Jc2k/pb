@@ -229,6 +229,14 @@ turn's generated-token cap after reserving native-envelope and closing overhead.
 enforced again by recursive executor-side schema validation and appears in the stage anchor and
 invocation telemetry. Larger files are built from complete, loadable, atomic work units rather than
 partial JSON or partial filesystem writes.
+When every accepted plan path is a `create`, implementation and repair advance through those paths
+in plan order. While a path is missing, `write_file` is the only exposed built-in mutation tool and
+its path schema is bound to that exact next target; the typed implementation terminal remains
+hidden. A successful complete write advances the next turn to the next missing path, including
+after checkpoint resume. Mixed create/modify/delete plans retain the ordinary mutation surface
+because a single create ordering would not represent their dependencies. The executor still
+validates every call and final delta, so this narrowing does not grant authority or weaken the
+accepted plan.
 An edit tool receives mutation and progress credit only when repository bytes actually change.
 Identical replacements and edits fail without emitting a diff or invalidating existing evidence.
 

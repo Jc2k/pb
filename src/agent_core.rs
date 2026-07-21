@@ -569,6 +569,11 @@ pub struct AgentRequest {
     /// current workspace, never accepted from persisted input.
     #[serde(skip)]
     pub(crate) workflow_action_first_turn: bool,
+    /// Harness-owned ordered create paths from an accepted all-create plan. The stage runner uses
+    /// this to select one missing file work unit at a time; persisted/API requests cannot bind
+    /// model mutation paths.
+    #[serde(skip)]
+    pub(crate) workflow_creation_path_order: Vec<String>,
     /// Harness-owned complete-file evidence carried from the durable workflow checkpoint. It is
     /// validated against the active workspace before it seeds a fresh stage and cannot be supplied
     /// by persisted/API requests.
@@ -4476,14 +4481,20 @@ fn set_mutation_payload_char_limit(tools: &mut [BuiltInToolSchema], limit: usize
     }
 }
 
-fn set_mutation_target_path(tools: &mut [BuiltInToolSchema], target_path: &str) {
+fn set_tool_target_path(tools: &mut [BuiltInToolSchema], tool_name: &str, target_path: &str) {
     for tool in tools {
-        if !matches!(tool.name.as_str(), "write_file" | "replace_file") {
+        if tool.name != tool_name {
             continue;
         }
         if let Some(property) = tool.input_schema.pointer_mut("/properties/path") {
             property["enum"] = json!([target_path]);
         }
+    }
+}
+
+fn set_mutation_target_path(tools: &mut [BuiltInToolSchema], target_path: &str) {
+    for tool_name in ["write_file", "replace_file"] {
+        set_tool_target_path(tools, tool_name, target_path);
     }
 }
 
@@ -5077,6 +5088,7 @@ fn run_agent_steps(
     let mut progress_guard = ProgressGuard::default();
     let mut terminal_submission_only = false;
     let mut suppress_thinking = false;
+    let mut announced_creation_work_unit: Option<String> = None;
     let gate_state = RefCell::new(initial_gate_state(
         args,
         workspace_root,
@@ -5187,6 +5199,30 @@ fn run_agent_steps(
             timestamp_ms: Some(now_millis()),
         });
 
+        let creation_work_unit = args
+            .workflow_creation_path_order
+            .iter()
+            .find(|path| !workspace_root.join(path).exists())
+            .cloned();
+        if creation_work_unit != announced_creation_work_unit {
+            if let Some(path) = creation_work_unit.as_deref() {
+                let instruction = format!(
+                    "Harness creation work unit: the next missing accepted-plan path is {path}. Create that exact path now with one complete write_file payload within the current allowance. If the full implementation will not fit, write the smallest syntactically loadable scaffold that preserves a later edit path. Do not rewrite or delete an already-created plan path while this target is missing."
+                );
+                sink.emit(AgentEvent::Correction {
+                    message: instruction.clone(),
+                    summary: "Next accepted-plan creation work unit".to_string(),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+                messages.push(correction_chat_message(
+                    "Next accepted-plan creation work unit",
+                    &instruction,
+                ));
+            }
+            announced_creation_work_unit = creation_work_unit.clone();
+        }
+
         let terminal_tool = args.workflow_stage.and_then(workflow_terminal_tool_name);
         let readiness = workflow_terminal_readiness(args, &gate_state.borrow(), workspace_root)?;
         let terminal_precondition = readiness
@@ -5213,6 +5249,18 @@ fn run_agent_steps(
             terminal_precondition.is_none(),
         );
         scoped_tools.retain(|tool| exposure_state.allows(&tool.name));
+        if let Some(path) = creation_work_unit.as_deref() {
+            scoped_tools.retain(|tool| tool.name == "write_file" || !mutation_tool(&tool.name));
+            set_tool_target_path(&mut scoped_tools, "write_file", path);
+            if let Some(schema) = scoped_tools
+                .iter_mut()
+                .find(|tool| tool.name == "write_file")
+            {
+                schema.description.push_str(&format!(
+                    " This turn is restricted to the next missing accepted-plan path {path}."
+                ));
+            }
+        }
         let terminal_tools = terminal_submission_only
             .then(|| {
                 args.workflow_stage
@@ -8341,6 +8389,7 @@ pub(crate) struct StageContext {
     pub user_prompt: String,
     pub expected_content_fingerprint: Option<String>,
     pub action_first_turn: bool,
+    pub creation_path_order: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -8394,6 +8443,7 @@ fn run_stage(
     args.workflow_stage = Some(contract.stage);
     args.workflow_expected_content_fingerprint = context.expected_content_fingerprint.clone();
     args.workflow_action_first_turn = context.action_first_turn;
+    args.workflow_creation_path_order = context.creation_path_order.clone();
     // StageCapabilities is the authoritative allowlist. A legacy/direct-run allowlist must not
     // accidentally remove the required typed terminal action or add authority to this stage.
     args.tool_allowlist = None;
@@ -9927,6 +9977,8 @@ fn workflow_terminal_readiness(
         crate::workflow::WorkflowStage::Planning
             | crate::workflow::WorkflowStage::PlanRevision
             | crate::workflow::WorkflowStage::PlanReview
+            | crate::workflow::WorkflowStage::Implementing
+            | crate::workflow::WorkflowStage::Repairing
             | crate::workflow::WorkflowStage::CodeReview
     ) {
         return Ok(None);
@@ -9951,6 +10003,18 @@ fn workflow_terminal_readiness(
     {
         missing.push(format!(
             "stage content fingerprint is stale: expected {expected}, current {current_content_fingerprint}"
+        ));
+    }
+    if matches!(
+        stage,
+        crate::workflow::WorkflowStage::Implementing | crate::workflow::WorkflowStage::Repairing
+    ) && let Some(path) = args
+        .workflow_creation_path_order
+        .iter()
+        .find(|path| !workspace_root.join(path).exists())
+    {
+        missing.push(format!(
+            "accepted-plan creation path '{path}' is still missing"
         ));
     }
     if stage == crate::workflow::WorkflowStage::CodeReview {
@@ -10040,6 +10104,7 @@ fn delivery_stage_context(
                 ),
                 expected_content_fingerprint: Some(run.planning_content().fingerprint.clone()),
                 action_first_turn: false,
+                creation_path_order: Vec::new(),
             })
         }
         crate::workflow::WorkflowStage::PlanReview => {
@@ -10058,6 +10123,7 @@ fn delivery_stage_context(
                 ),
                 expected_content_fingerprint: Some(run.planning_content().fingerprint.clone()),
                 action_first_turn: false,
+                creation_path_order: Vec::new(),
             })
         }
         crate::workflow::WorkflowStage::Implementing
@@ -10081,6 +10147,7 @@ fn delivery_stage_context(
             let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
             let planned_path_state =
                 implementation_planned_path_state_json(run, &plan.artifact, &current)?;
+            let creation_path_order = plan_creation_path_order(&plan.artifact);
             Ok(StageContext {
                 system_prompt: "You are the implementation or repair stage of a harness-controlled delivery workflow. Implement exactly the accepted plan. A submit_implementation call only reports work; it never performs edits. When the plan requires a delta, first call the available write/edit tools in earlier turns, observe their results, and only then submit accounting for actual touched paths. Never report a touched path that you did not mutate. If validation reports an empty actual delta for a required change, call an edit tool next instead of repeating the submission. Built-in edits, configured run_task/run_check, and run_command are available, but run_command is only a journaled escape hatch and cannot earn check, review, or commit credit. You cannot commit. If the accepted plan is materially wrong, call request_replan. Otherwise account for every plan step and end only with submit_implementation using the exact current content fingerprint and actual touched paths.".to_string(),
                 user_prompt: format!(
@@ -10094,6 +10161,7 @@ fn delivery_stage_context(
                         &plan.artifact,
                         workspace_root,
                     ),
+                creation_path_order,
             })
         }
         crate::workflow::WorkflowStage::CodeReview => {
@@ -10130,6 +10198,7 @@ fn delivery_stage_context(
                 ),
                 expected_content_fingerprint: Some(checked_fingerprint.to_string()),
                 action_first_turn: false,
+                creation_path_order: Vec::new(),
             })
         }
         stage => bail!("cannot build planning context for {stage:?}"),
@@ -10187,6 +10256,23 @@ fn plan_is_unambiguous_missing_path_creation(
         }
     }
     saw_path
+}
+
+fn plan_creation_path_order(plan: &crate::workflow::PlanArtifact) -> Vec<String> {
+    if plan
+        .steps
+        .iter()
+        .flat_map(|step| step.paths.iter())
+        .any(|path| path.change != crate::workflow::PlannedChange::Create)
+    {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    plan.steps
+        .iter()
+        .flat_map(|step| step.paths.iter())
+        .filter_map(|path| seen.insert(path.path.clone()).then_some(path.path.clone()))
+        .collect()
 }
 
 fn delivery_repository_brief(
@@ -17035,6 +17121,7 @@ mod tests {
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
             workflow_action_first_turn: false,
+            workflow_creation_path_order: Vec::new(),
             workflow_stage_evidence: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
@@ -17112,6 +17199,7 @@ mod tests {
             user_prompt: "Complete this bounded stage.".to_string(),
             expected_content_fingerprint: None,
             action_first_turn: false,
+            creation_path_order: Vec::new(),
         }
     }
 
@@ -17216,6 +17304,36 @@ mod tests {
             schema("edit_file").pointer("/properties/old_text/maxLength"),
             Some(&json!(limit / 2))
         );
+    }
+
+    #[test]
+    fn all_create_plans_preserve_unique_creation_path_order() {
+        let mut plan = delivery_plan(
+            Some(("index.html", crate::workflow::PlannedChange::Create)),
+            Vec::new(),
+        )
+        .artifact;
+        plan.steps[0].paths.extend([
+            crate::workflow::PlanPath {
+                path: "styles.css".to_string(),
+                change: crate::workflow::PlannedChange::Create,
+            },
+            crate::workflow::PlanPath {
+                path: "index.html".to_string(),
+                change: crate::workflow::PlannedChange::Create,
+            },
+        ]);
+
+        assert_eq!(
+            plan_creation_path_order(&plan),
+            vec!["index.html".to_string(), "styles.css".to_string()]
+        );
+
+        plan.steps[0].paths.push(crate::workflow::PlanPath {
+            path: "existing.js".to_string(),
+            change: crate::workflow::PlannedChange::Modify,
+        });
+        assert!(plan_creation_path_order(&plan).is_empty());
     }
 
     #[test]
@@ -17457,6 +17575,86 @@ the next imagined action"#;
             .unwrap(),
             "contents"
         );
+    }
+
+    #[test]
+    fn implementation_advances_one_missing_creation_path_at_a_time() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        request.workflow_creation_path_order =
+            vec!["index.html".to_string(), "styles.css".to_string()];
+        request.max_steps = 4;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion(
+                    "write_file",
+                    json!({"path": "styles.css", "content": "body {}\n"}),
+                ),
+                tool_completion(
+                    "write_file",
+                    json!({"path": "index.html", "content": "<!doctype html>\n"}),
+                ),
+                tool_completion(
+                    "write_file",
+                    json!({"path": "styles.css", "content": "body {}\n"}),
+                ),
+                tool_completion("submit_implementation", json!({})),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert_eq!(outcome.tool_calls, 4);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("index.html")).unwrap(),
+            "<!doctype html>\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("styles.css")).unwrap(),
+            "body {}\n"
+        );
+        assert!(outcome.generation_tool_names[..3].iter().all(|names| {
+            names.contains(&"write_file".to_string())
+                && !names.contains(&"replace_file".to_string())
+                && !names.contains(&"apply_patch".to_string())
+                && !names.contains(&"submit_implementation".to_string())
+        }));
+        assert!(outcome.generation_tool_names[3].contains(&"submit_implementation".to_string()));
+
+        let rejected = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { tool, result, .. } if tool == "write_file" => {
+                    serde_json::from_str::<agent_tool_errors::ToolFailureEnvelope>(result).ok()
+                }
+                _ => None,
+            })
+            .expect("out-of-order write must be rejected by the scoped schema");
+        assert_eq!(
+            rejected.reason_code,
+            agent_tool_errors::ToolFailureReason::InvalidArgumentValue
+        );
+        assert!(rejected.message.contains("declared enum values"));
+        let announced_paths = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Correction {
+                    summary, message, ..
+                } if summary == "Next accepted-plan creation work unit" => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(announced_paths.len(), 2);
+        assert!(announced_paths[0].contains("index.html"));
+        assert!(announced_paths[1].contains("styles.css"));
     }
 
     #[test]
@@ -24939,6 +25137,7 @@ the next imagined action"#;
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
             workflow_action_first_turn: false,
+            workflow_creation_path_order: Vec::new(),
             workflow_stage_evidence: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
@@ -25016,6 +25215,7 @@ the next imagined action"#;
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
             workflow_action_first_turn: false,
+            workflow_creation_path_order: Vec::new(),
             workflow_stage_evidence: None,
             workflow_checkpoint: None,
             conversation_handoff: None,

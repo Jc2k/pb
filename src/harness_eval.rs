@@ -461,6 +461,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
         workflow_action_first_turn: false,
+        workflow_creation_path_order: Vec::new(),
         workflow_stage_evidence: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
@@ -528,6 +529,7 @@ fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
         workflow_action_first_turn: false,
+        workflow_creation_path_order: Vec::new(),
         workflow_stage_evidence: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
@@ -927,6 +929,7 @@ fn execute_workflow_assertion(
                     user_prompt: "plan".to_string(),
                     expected_content_fingerprint: None,
                     action_first_turn: false,
+                    creation_path_order: Vec::new(),
                 },
                 vec![
                     ScriptedCompletion {
@@ -986,6 +989,7 @@ fn execute_workflow_assertion(
                     user_prompt: "plan".to_string(),
                     expected_content_fingerprint: None,
                     action_first_turn: false,
+                    creation_path_order: Vec::new(),
                 },
                 vec![
                     ScriptedCompletion {
@@ -1139,6 +1143,7 @@ fn execute_workflow_assertion(
                     user_prompt: "implement".to_string(),
                     expected_content_fingerprint: None,
                     action_first_turn: false,
+                    creation_path_order: Vec::new(),
                 },
                 vec![
                     ScriptedCompletion {
@@ -2388,6 +2393,7 @@ fn run_real_model_fixture(
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
         workflow_action_first_turn: false,
+        workflow_creation_path_order: Vec::new(),
         workflow_stage_evidence: None,
         workflow_checkpoint: None,
         conversation_handoff: None,

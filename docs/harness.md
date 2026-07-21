@@ -202,6 +202,14 @@ turn on a native edit action. Later implementation turns, every repair turn, pla
 fresh review stages retain normal reasoning. The decision is derived once from the validated plan
 and current workspace; it is not a model option or environment toggle.
 
+For an accepted plan containing only `create` paths, implementation and repair also select the
+first still-missing path in plan order as the current work unit. Until that file exists, the native
+schema binds `write_file.path` to the exact target, hides the other built-in mutation tools, and
+hides `submit_implementation`. The next turn advances only after an atomic complete write, so a
+small loadable scaffold can preserve progress without drifting to another planned file. Existing
+files are skipped after resume. Plans that mix create, modify, or delete operations retain the
+normal edit surface because their dependencies cannot be represented by a single creation order.
+
 Each run creates a persistent scratch root under the system temporary directory unless
 `--scratch-dir` selects a new path. The layout is:
 
@@ -473,6 +481,12 @@ On implementation or repair, the stage prompt lists the current state of every p
 relative to the original task baseline. This state survives process restarts even though advisory
 TODOs do not: already-created or modified paths are explicit, missing paths remain explicit, and
 the model is warned not to retry `write_file` against an existing path.
+
+An all-create accepted plan additionally turns that durable state into a deterministic next-path
+schema. The first missing path in plan order is the only `write_file` target for the turn, and the
+implementation terminal stays unavailable until every planned creation exists. This is a
+model-control narrowing over the existing executor and checkpoint; it introduces no alternate
+scheduler or mutation authority.
 
 During a strict workflow stage, pb can recover a complete unwrapped JSON object, either plain or in
 one JSON code fence, when the exposed schemas identify exactly one tool. The sole special-case tie

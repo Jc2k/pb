@@ -225,14 +225,45 @@ cover target extraction, schema binding, post-generation rejection, token budget
 one-retry boundary; another full run is not justified until a focused native probe qualifies those
 controls.
 
+## Focused compact-recovery qualification — 2026-07-21
+
+The first focused stimulus, `1784597212436-69914-0`, was interrupted after Qwen represented the
+requested 2,000-character value as `'x'.repeat(2000)`, so it never exercised the payload bound. It
+did expose a separate P1 control defect: `--max-steps 1` still produced `1/8` in strict stages
+because the delivery orchestrator replaced the request ceiling with the workflow-policy limit.
+Commit `bbeb536a` now applies the lower bound cumulatively to every model-driven stage. A scripted
+delivery fixture proves `1/1` stage events and termination after one failed validation attempt;
+1,177 Rust tests and the rendered documentation checks passed.
+
+Two literal-source variants were preserved as experiment errors. Run `1784597921249-27451-0`
+proved the step fix live but Qwen emitted only a 287-byte undersized file within the 640-character
+schema. The attempted checkpoint split in `1784598178910-28254-0` raced the short implementation
+call and therefore did not create a valid resumed recovery experiment. Both remained visibly
+incomplete and unverified.
+
+Natural-output run `1784598393414-28929-0` then qualified the intended recovery control. Planning
+and fresh plan review passed at `1/1`. The first `write_file` stopped at the 640-character mutation
+allowance with `constraint_terminal_state=mutation_payload_limit`; its 850 serialized action
+characters were not executed. Compact recovery exposed one tool, named the exact original
+`target.js` path, reduced the content schema to 320 characters, and reduced the generation ceiling
+from 512 to 352 tokens. Qwen stayed on `target.js` and hit the smaller mutation limit after 119
+generated tokens. No larger retry followed, no file was created, and Git remained clean.
+
+The qualified run took 269,140 ms across four model calls, 13,579 prompt tokens, 1,048 generated
+tokens, and 3.03 Wh. It exited non-zero with `contract_status=unsatisfied`,
+`verified_completed=false`, and `termination_reason=step_limit`. This is positive containment and
+efficiency-control evidence: exact-target, proportional compact recovery is no longer the gate for
+another integrated run.
+
 ## Ranked follow-up
 
-1. Qualify exact-target, right-sized compact recovery with a focused native mutation probe before
-   paying for another full workflow. The deterministic fixtures are green; the live probe must show
-   that recovery cannot drift from its capped target or consume the original 4,096-token ceiling.
-2. Shape implementation actions around small complete scaffolds and exact later edits. The
-   controller should prefer the next missing accepted-plan path after a capped action rather than
-   letting a read/repair loop consume the remaining step budget.
+1. Qualify the implemented next-path work-unit control with a focused native all-create probe. The
+   deterministic fixture rejects an out-of-order write, binds `write_file` to the first missing
+   accepted-plan path, advances after its atomic creation, and withholds the implementation
+   terminal while another planned creation is missing.
+2. Retain exact-target, right-sized compact recovery as a regression gate. Native run
+   `1784598393414-28929-0` qualified the 320-character/352-token retry without path drift, cap
+   regrowth, or partial mutation.
 3. Retain the measured decode baseline and promotion gate. Profiling found no shared sampling-path
    change capable of the required 1.5x gain; do not promote an isolated checkpoint or Q4 fast path.
 4. Persist a compact authoritative evidence bundle and preserve stable prompt/tool prefixes across

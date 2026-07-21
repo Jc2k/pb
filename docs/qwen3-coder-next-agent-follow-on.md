@@ -1,6 +1,6 @@
 # Qwen3-Coder-Next Agent Performance Follow-on
 
-Status: **Integrated qualification incomplete; recovery hardening active.** Durable stage evidence, compact terminal schemas, Qwen
+Status: **Integrated qualification incomplete; next-path deterministic gate implemented.** Durable stage evidence, compact terminal schemas, Qwen
 native tool constraints, output-aware mutation bounds, strict-stage TODO removal,
 dependency-aware batch rejection, native telemetry, and true layer-major Qwen3-Coder-Next prefill
 are implemented. The prefill graph passed exact state and resource/performance promotion gates; the
@@ -12,7 +12,11 @@ verification when a strict workflow reached `Ready`. Explicit contract projectio
 pass an executable native qualification: the undersized artifact failed its trusted check, never
 reached review or commit, and ended unsatisfied and unverified. The locked integrated rerun then
 accepted plan/review but again stopped with only HTML/CSS; exact-target, right-sized compact
-recovery is now the focused gate before another full browser run.
+recovery has passed a focused native gate without path drift, cap regrowth, or partial mutation.
+The harness now steers all-create implementations toward one exact next missing accepted-plan path
+at a time. Its deterministic fixture rejects an out-of-order write, advances after the exact target
+exists, and keeps the implementation terminal hidden while another creation is missing. A focused
+native qualification remains before another full browser run.
 Decode has been profiled; no change was promoted because the measured sampling path cannot meet the
 1.5x gate.
 
@@ -67,6 +71,7 @@ The intended order is:
 | The final artifact was incomplete | model limitation, truthfully contained | Accepted fixture | Rerun only after the preceding deterministic improvements |
 | Strict `Ready` projected as verified with `contract_status=unspecified` | pb completion-reporting defect | P1 | Fixed and natively qualified with an explicit failing content contract |
 | Compact recovery drifted from capped `game.js` to existing `styles.css` and retained the 4,096-token ceiling | pb recovery control/efficiency defect | P2 | Bind the original target and derive a smaller retry token ceiling |
+| Harness `--max-steps 1` still exposed eight strict-stage steps | pb boundedness defect | P1 | Fixed in `bbeb536a`; request and policy ceilings now compose by minimum |
 
 The direct workflow schema, one-level string compatibility decoder, atomic rejection of truncated
 native batches, durable planned-path status, and sink-aware `ask_user` exposure are already shipped
@@ -87,10 +92,15 @@ The preserved evidence that drives implementation is deliberately small:
 | `1784588468585-81408-0` | trusted length check rejected a 263-character scaffold three times; bounded repair ended with no review or task commit | `unsatisfied`, unverified, non-zero terminal result plus independent byte audit |
 | `1784589577078-95753-0` | required-check planning repeated because the compact example omitted `acceptance[].check_ids` | classify as experiment error; expose the exact field in examples and corrections |
 | `1784590137641-98220-0` | first-turn plan/review and two files, then 53.7 Wh of capped/repeated CSS-directed actions; logic files remained absent | exact-target compact schema, proportional retry cap, and preserved unsatisfied terminal state |
+| `1784597212436-69914-0` | compressed-value stimulus did not reach the mutation cap but exposed ignored strict-stage request bounds | classify the stimulus as experiment error; enforce the request ceiling in strict delivery |
+| `1784597921249-27451-0` | live `1/1` qualification emitted a truthful undersized 287-byte literal without reaching compact recovery | positive step-bound evidence; classify artifact shortfall as model limitation |
+| `1784598178910-28254-0` | attempted two-phase checkpoint preparation raced the short implementation call | classify as experiment error; use a naturally oversized output fixture |
+| `1784598393414-28929-0` | exact `target.js` recovery used a 320-character schema and 352-token cap, then failed atomically with no file or cap regrowth | focused native qualification for compact recovery |
 
-The focused contract-backed acceptance gate passed, and the integrated run completed truthfully but
-did not produce a runnable game. The next justified model spend is a focused native compact-recovery
-probe. Another Phase 5 run waits for that smaller gate.
+The focused contract-backed acceptance and compact-recovery gates passed, while the integrated run
+completed truthfully without producing a runnable game. Deterministic next-missing-plan-path and
+small-work-unit steering now passes a scripted two-file fixture. A focused native qualification is
+the remaining gate before another Phase 5 run.
 
 ## Architectural invariants
 
