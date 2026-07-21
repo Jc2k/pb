@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 
 #[cfg(test)]
 use super::state::LinearAttentionLayout;
+#[cfg(test)]
 use super::types::GROUP_SIZE;
 use super::vision::{MropeAxis, MropePosition};
 use super::weights::{FullAttentionLayout, FullAttentionQLayout, RotaryPairing};
@@ -712,14 +713,15 @@ pub(crate) fn compare_scored_tokens(
         .then_with(|| left.0.cmp(&right.0))
 }
 
-pub fn top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
+#[cfg(test)]
+pub(crate) fn top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
     indexed.sort_by(compare_scored_tokens);
     indexed.truncate(k.min(indexed.len()));
     indexed
 }
 
-pub fn softmax_in_place(values: &mut [f32]) {
+pub(crate) fn softmax_in_place(values: &mut [f32]) {
     if values.is_empty() {
         return;
     }
@@ -737,7 +739,7 @@ pub fn softmax_in_place(values: &mut [f32]) {
     }
 }
 
-pub fn routing_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
+pub(crate) fn routing_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     let k = k.min(scores.len());
     let mut selected = vec![(0usize, -1.0e30f32); k];
     for (expert, score) in scores.iter().copied().enumerate() {
@@ -754,7 +756,7 @@ pub fn routing_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     selected
 }
 
-pub fn routing_softmax_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
+pub(crate) fn routing_softmax_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut probabilities = scores.to_vec();
     softmax_in_place(&mut probabilities);
     routing_top_k(&probabilities, k)
@@ -763,7 +765,7 @@ pub fn routing_softmax_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
 /// GLM/DeepSeek noaux-tc routing: correction bias affects selection only;
 /// returned weights are the unbiased sigmoid scores. Normalization and the
 /// routed scaling factor remain scheduler-owned.
-pub fn routing_sigmoid_noaux_top_k(
+pub(crate) fn routing_sigmoid_noaux_top_k(
     logits: &[f32],
     correction_bias: &[f32],
     k: usize,
@@ -817,7 +819,8 @@ pub(super) fn apply_rotary_interleaved_to_split_half(
     Ok(())
 }
 
-pub fn q4_fma_matvec(
+#[cfg(test)]
+pub(crate) fn q4_fma_matvec(
     packed: &[u8],
     input: &[f32],
     scales: &[f32],
@@ -828,7 +831,8 @@ pub fn q4_fma_matvec(
     q4_fma_matvec_with_group_size(packed, input, scales, biases, rows, cols, GROUP_SIZE)
 }
 
-pub fn q4_fma_matvec_with_group_size(
+#[cfg(test)]
+pub(crate) fn q4_fma_matvec_with_group_size(
     packed: &[u8],
     input: &[f32],
     scales: &[f32],
@@ -880,7 +884,7 @@ pub fn q4_fma_matvec_with_group_size(
     Ok(out)
 }
 
-pub fn q4_dequantize_rows_with_group_size(
+pub(crate) fn q4_dequantize_rows_with_group_size(
     packed: &[u8],
     scales: &[f32],
     biases: &[f32],

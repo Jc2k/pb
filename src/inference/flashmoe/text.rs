@@ -7,8 +7,8 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use super::deepseek::DeepSeekV4Tokenizer;
+use super::generation_progress::{GenerationProgress, report_generation_progress};
 use super::math::{compare_scored_tokens, softmax_in_place};
-use super::runtime::GenerationProgress;
 use super::types::*;
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
@@ -1566,15 +1566,6 @@ impl TopKCandidates {
 
     pub(super) fn into_sorted_vec(self) -> Vec<(usize, f32)> {
         self.values
-    }
-}
-
-pub(super) fn report_generation_progress<F>(progress: &GenerationProgress<'_>, message: F)
-where
-    F: FnOnce() -> String,
-{
-    if let Some(callback) = progress {
-        (callback.borrow_mut())(message());
     }
 }
 

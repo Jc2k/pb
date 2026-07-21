@@ -897,6 +897,42 @@ FlashMoe unsupported Qwen3-VL FixedQ4/Metal path: CMD3 shared-down implementatio
 - `legacy`: test-only compatibility and parity fixtures. It is not compiled into production and
   owns no target-architecture behavior.
 
+### Current internal module layout
+
+Status: **Shipped.** The ownership boundaries above are represented by internal modules rather than
+single catch-all implementation files:
+
+- `artifact` owns the quantized expert artifact vocabulary and the source-tensor traits shared by
+  dense conversion and expert packing. It depends on neither owner, so `weights` and `experts` do
+  not form a dependency cycle.
+- `weights` is split into `conversion` for pull-time canonicalization, `manifest` for serialized
+  tensor contracts and the runtime registry, and `store` for the resident mmap plus decoded/tiled
+  caches. Its root owns resolved projection and attention-binding construction.
+- `experts` is split into `packing` for direct and aggregate cache construction, `slots` for typed
+  fixed-Q4/MXFP4/dense/DeepSeek payload layouts, and `store` for layer readers, positioned I/O,
+  worker coordination, and resident slot mapping. Its root owns wire metadata and compatibility
+  conversion.
+- `scheduler` keeps graph sequencing in its root, command and handoff contracts in `protocol`, and
+  streamed/resident expert acquisition plus read metrics in `expert_access`.
+- `state` separates buffer/phase descriptors, recurrent and linear-attention state, KV/session
+  records, and generation lifecycle into `buffers`, `recurrent`, `kv_cache`, and `generation`.
+  Disk and memory session-cache policy lives in the sibling `session_cache` owner and depends on
+  state snapshots in one direction only.
+- `metal` separates diagnostics and bounded waits, Objective-C FFI, resource accounting and buffer
+  pooling, resident projection encoding, fused linear attention, Qwen attention/prefill execution,
+  and CMD3 planning. Qwen shader source is a standalone `qwen/shaders.metal` artifact rather than a
+  multi-thousand-line Rust string literal.
+- `runtime` keeps the engine and token/layer executor in its root, the ordered load transaction in
+  `loader`, and request/session generation orchestration in `generation`. The loaded engine holds a
+  closed `ResolvedModelExecutor` (`Qwen` or `DeepSeekV4`) instead of using an optional DeepSeek graph
+  as a model-family sentinel.
+- Large owner tests live under the shared `tests` tree or owner-local parity modules. Production
+  modules no longer contain multi-thousand-line inline test bodies.
+
+The `flashmoe` facade exports cache construction, model/planning selection, engine loading and
+pooling, request/result contracts, and vision adapters. Capability, scheduler, expert, math, shader,
+state, and storage implementation surfaces remain private to the backend.
+
 ## Reviewed Baseline
 
 Baseline reviewed on 2026-07-11:

@@ -7,10 +7,10 @@ use crate::inference::flashmoe::math::*;
 use crate::inference::flashmoe::metal::*;
 use crate::inference::flashmoe::model_family::*;
 use crate::inference::flashmoe::planning::*;
-use crate::inference::flashmoe::runtime::*;
 use crate::inference::flashmoe::scheduler::*;
 use crate::inference::flashmoe::state::*;
 use crate::inference::flashmoe::test_fixtures::*;
+use crate::inference::flashmoe::text::QwenTokenizer;
 use crate::inference::flashmoe::types::*;
 use std::sync::Arc;
 
@@ -1211,9 +1211,11 @@ fn router_scores_use_cached_full_tensor_matvec() {
         .build_score_projection_command(projection, 3)
         .unwrap();
 
-    let routing_command = store
-        .router_command_with_metal(None, command, &[0.5, -1.0, 2.0])
-        .unwrap();
+    let hidden = [0.5, -1.0, 2.0];
+    let execution = command.projection_execution().unwrap();
+    let score_plan = execution.score_plan(hidden.len()).unwrap();
+    let scores = store.router_scores(score_plan, &hidden).unwrap();
+    let routing_command = command.into_routing_command(scores).unwrap();
 
     assert_eq!(
         routing_command.source,
@@ -3079,7 +3081,7 @@ fn lm_head_logits_scores_full_vocab_in_cpu_fallback() {
     .unwrap();
     let store = DenseStore::open(dense_path, manifest_path).unwrap();
     let logits = store
-        .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+        .lm_head_logits("lm_head.weight", &[1.0, 1.0], tokenizer.vocab_size())
         .unwrap();
 
     assert_eq!(logits.len(), 3);
@@ -3140,7 +3142,7 @@ fn lm_head_logits_accepts_padded_vocab_rows() {
     .unwrap();
     let store = DenseStore::open(dense_path, manifest_path).unwrap();
     let logits = store
-        .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+        .lm_head_logits("lm_head.weight", &[1.0, 1.0], tokenizer.vocab_size())
         .unwrap();
 
     assert_eq!(logits, vec![2.0, 4.0, 6.0]);
@@ -3287,7 +3289,7 @@ fn lm_head_logits_rejects_missing_vocab_rows() {
     .unwrap();
     let store = DenseStore::open(dense_path, manifest_path).unwrap();
     let err = store
-        .lm_head_logits("lm_head.weight", &[1.0, 1.0], &tokenizer)
+        .lm_head_logits("lm_head.weight", &[1.0, 1.0], tokenizer.vocab_size())
         .unwrap_err();
     let message = err.to_string();
     assert!(message.contains("lm_head.weight"), "{err:#}");

@@ -18,7 +18,7 @@ use super::model_family::{
 use super::weights::ResidentDenseLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum FlashMoeGraphStage {
+pub(crate) enum FlashMoeGraphStage {
     TokenPositionInputPreparation,
     DeferredPreviousCmd3,
     Cmd1AttentionProjections,
@@ -31,7 +31,7 @@ pub enum FlashMoeGraphStage {
 }
 
 impl FlashMoeGraphStage {
-    pub const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::TokenPositionInputPreparation,
         Self::DeferredPreviousCmd3,
         Self::Cmd1AttentionProjections,
@@ -43,7 +43,7 @@ impl FlashMoeGraphStage {
         Self::LmHeadAndSampling,
     ];
 
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::TokenPositionInputPreparation => "token/position input preparation",
             Self::DeferredPreviousCmd3 => "deferred previous-layer CMD3 completion",
@@ -67,7 +67,8 @@ impl fmt::Display for FlashMoeGraphStage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlashMoeStagePlacement {
+#[allow(dead_code)]
+pub(crate) enum FlashMoeStagePlacement {
     InputAdapter,
     Metal,
     MetalWithCpuReduction,
@@ -77,22 +78,9 @@ pub enum FlashMoeStagePlacement {
     Sampler,
 }
 
-impl FlashMoeStagePlacement {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::InputAdapter => "input adapter",
-            Self::Metal => "Metal",
-            Self::MetalWithCpuReduction => "Metal with declared CPU reduction",
-            Self::CpuDeclared => "declared CPU",
-            Self::SchedulerIo => "scheduler I/O",
-            Self::SchedulerMemory => "scheduler memory",
-            Self::Sampler => "sampler",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlashMoeStageImplementation {
+#[allow(dead_code)]
+pub(crate) enum FlashMoeStageImplementation {
     QwenTextInput,
     DeepSeekV4TextInput,
     QwenVlTypedInput,
@@ -115,7 +103,7 @@ pub enum FlashMoeStageImplementation {
 }
 
 impl FlashMoeStageImplementation {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::QwenTextInput => "Qwen text token/position adapter",
             Self::DeepSeekV4TextInput => "DeepSeek V4 Flash text token/position adapter",
@@ -198,14 +186,14 @@ impl fmt::Display for FlashMoeStageImplementation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlashMoeStageCapability {
-    pub stage: FlashMoeGraphStage,
-    pub placement: FlashMoeStagePlacement,
-    pub implementation: FlashMoeStageImplementation,
+pub(crate) struct FlashMoeStageCapability {
+    pub(crate) stage: FlashMoeGraphStage,
+    pub(crate) placement: FlashMoeStagePlacement,
+    pub(crate) implementation: FlashMoeStageImplementation,
 }
 
 impl FlashMoeStageCapability {
-    pub const fn new(
+    pub(crate) const fn new(
         stage: FlashMoeGraphStage,
         placement: FlashMoeStagePlacement,
         implementation: FlashMoeStageImplementation,
@@ -219,7 +207,7 @@ impl FlashMoeStageCapability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlashMoeStatePolicy {
+pub(crate) enum FlashMoeStatePolicy {
     DeferredGpuNextLayer,
 }
 
@@ -280,21 +268,21 @@ impl QwenPrefillGraphCapability {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct FlashMoeCapabilityPlan {
-    pub family: QwenMoeFamily,
+pub(crate) struct FlashMoeCapabilityPlan {
+    pub(crate) family: QwenMoeFamily,
     pub(crate) input_adapter: FlashMoeInputAdapterCapability,
     pub(crate) dense_layout: ResidentDenseLayout,
     pub(crate) expert_storage: ExpertStoreExecutionDescriptor,
     pub(crate) qwen_prefill_graph: QwenPrefillGraphCapability,
     pub(crate) device: FlashMoeDeviceCapability,
-    pub routing: QwenMoeRoutingPlacement,
-    pub experts_per_layer: usize,
-    pub active_experts: usize,
-    pub routing_weight_normalization: QwenMoeRoutingWeightNormalization,
-    pub routed_expert_scale: f32,
-    pub state_policy: FlashMoeStatePolicy,
+    pub(crate) routing: QwenMoeRoutingPlacement,
+    pub(crate) experts_per_layer: usize,
+    pub(crate) active_experts: usize,
+    pub(crate) routing_weight_normalization: QwenMoeRoutingWeightNormalization,
+    pub(crate) routed_expert_scale: f32,
+    pub(crate) state_policy: FlashMoeStatePolicy,
     pub(crate) attention_layers: Box<[QwenMoeLayerKind]>,
-    pub stages: Vec<FlashMoeStageCapability>,
+    pub(crate) stages: Vec<FlashMoeStageCapability>,
 }
 
 impl FlashMoeCapabilityPlan {
@@ -850,7 +838,7 @@ impl FlashMoeCapabilityPlan {
     }
 
     #[cfg(test)]
-    pub fn for_model_layout(
+    pub(crate) fn for_model_layout(
         layout: &QwenMoeModelLayout,
     ) -> Result<Self, FlashMoeUnsupportedCapability> {
         validate_upstream_execution_policy(layout)?;
@@ -876,7 +864,7 @@ impl FlashMoeCapabilityPlan {
         )
     }
 
-    pub fn validate_complete(&self) -> Result<(), FlashMoeUnsupportedCapability> {
+    pub(crate) fn validate_complete(&self) -> Result<(), FlashMoeUnsupportedCapability> {
         for stage in FlashMoeGraphStage::ALL {
             if self.stage(stage).is_none() {
                 return Err(FlashMoeUnsupportedCapability::new(
@@ -889,7 +877,7 @@ impl FlashMoeCapabilityPlan {
         Ok(())
     }
 
-    pub fn stage(&self, stage: FlashMoeGraphStage) -> Option<&FlashMoeStageCapability> {
+    pub(crate) fn stage(&self, stage: FlashMoeGraphStage) -> Option<&FlashMoeStageCapability> {
         self.stages
             .iter()
             .find(|capability| capability.stage == stage)
@@ -1137,14 +1125,14 @@ fn require_deepseek_route_renormalization(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlashMoeUnsupportedCapability {
-    pub family: QwenMoeFamily,
-    pub stage: FlashMoeGraphStage,
-    pub reason: String,
+pub(crate) struct FlashMoeUnsupportedCapability {
+    pub(crate) family: QwenMoeFamily,
+    pub(crate) stage: FlashMoeGraphStage,
+    pub(crate) reason: String,
 }
 
 impl FlashMoeUnsupportedCapability {
-    pub fn new(
+    pub(crate) fn new(
         family: QwenMoeFamily,
         stage: FlashMoeGraphStage,
         reason: impl Into<String>,
@@ -1172,13 +1160,14 @@ impl Error for FlashMoeUnsupportedCapability {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::flashmoe::deepseek::DeepSeekV4Config;
     use crate::inference::flashmoe::experts::{DenseExpertDtype, FixedDenseExpertSlotSpec};
     use crate::inference::flashmoe::scheduler::{
         FlashMoeScheduledGraph, ScheduledAttentionMathImplementation,
     };
     use crate::inference::flashmoe::{
-        DEEPSEEK_V4_FLASH_MODEL, DeepSeekV4Config, GLM52_MODEL, QWEN3_CODER_NEXT_MODEL,
-        QWEN3_VL_MODEL, QWEN35_MODEL, QwenModelConfig,
+        DEEPSEEK_V4_FLASH_MODEL, GLM52_MODEL, QWEN3_CODER_NEXT_MODEL, QWEN3_VL_MODEL, QWEN35_MODEL,
+        QwenModelConfig,
     };
 
     fn config(json: &[u8]) -> QwenModelConfig {
