@@ -150,3 +150,23 @@ The approximate five command buffers per transformer layer and more than 535 MB 
 only 40 rows confirm that the promoted command is still host-synchronized between matrix phases.
 The existing traversal, parity, and scheduler evidence remains valid; promotion of a
 device-resident successor now additionally requires zero hidden/normed transfers between layers.
+
+### First owned matrix seam
+
+The first migration step retained post-attention residual and normalized matrices on Metal through
+the CPU routing boundary, then used a Metal gather to feed the scheduler's grouped expert rows
+without a CPU hidden-matrix copy. The same optimized binary and 40-token prompt returned the same
+greedy continuation `a` and reported:
+
+| Metric | Host-boundary baseline | First owned seam |
+| --- | ---: | ---: |
+| Metal command buffers | 239 | 239 |
+| host upload | 348,977,168 bytes | 160,310,288 bytes |
+| host readback | 186,818,560 bytes | 155,361,280 bytes |
+| request-end active/transient/in-flight | 0 / 0 / 0 | 0 / 0 / 0 |
+
+The first post-change run took 1,602 ms, so it is not a promotion result and does not satisfy the
+performance gate. Its purpose is narrower and conclusive: the transfer counters prove that the
+new ownership boundary is live, while unchanged continuation and balanced resources permit the
+migration to continue. Warm and long-prompt performance must be requalified after cross-layer
+hidden/next-norm ownership removes the remaining synchronizations.

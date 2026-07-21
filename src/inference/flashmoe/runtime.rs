@@ -1378,12 +1378,11 @@ impl MetalExecutionFacade {
     pub(super) fn qwen_layer_major_experts(
         &self,
         scheduled: &ScheduledLayerMajorExperts,
-        normed: &[f32],
-        residual: &[f32],
+        post_attention: &MetalLayerMajorPostAttention,
         shared: ScheduledSharedExpertPhaseRef<'_>,
     ) -> Result<Vec<f32>> {
         self.inner
-            .qwen_layer_major_experts(scheduled, normed, residual, shared)
+            .qwen_layer_major_experts(scheduled, post_attention, shared)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2865,15 +2864,15 @@ impl FlashMoeEngine {
         )?;
         let experts = self.scheduler.experts_per_layer();
         let active = self.scheduler.active_experts();
-        if post.router_scores.len() != rows.len() * experts {
+        if post.router_scores().len() != rows.len() * experts {
             bail!(
                 "Qwen layer-major router matrix has {} values, expected {}x{experts}",
-                post.router_scores.len(),
+                post.router_scores().len(),
                 rows.len()
             );
         }
         let row_routes = post
-            .router_scores
+            .router_scores()
             .chunks_exact(experts)
             .map(|scores| routing_softmax_top_k(scores, active))
             .collect::<Vec<_>>();
@@ -2886,12 +2885,9 @@ impl FlashMoeEngine {
             }
             SharedExpertLayerWeights::None => ScheduledSharedExpertPhaseRef::None,
         };
-        let hidden = self.metal.qwen_layer_major_experts(
-            &scheduled,
-            &post.normed,
-            &post.hidden,
-            shared_phase,
-        )?;
+        let hidden = self
+            .metal
+            .qwen_layer_major_experts(&scheduled, &post, shared_phase)?;
         if hidden.len() != hidden_values {
             bail!(
                 "Qwen layer-major expert output has {} values, expected {hidden_values}",

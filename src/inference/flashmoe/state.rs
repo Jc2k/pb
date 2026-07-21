@@ -207,6 +207,79 @@ impl FlashMoeGpuBufferDescriptor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlashMoeGpuMatrixDescriptor {
+    role: FlashMoeStateBufferRole,
+    rows: usize,
+    cols: usize,
+    values: usize,
+}
+
+impl FlashMoeGpuMatrixDescriptor {
+    pub(crate) fn new(role: FlashMoeStateBufferRole, rows: usize, cols: usize) -> Result<Self> {
+        if rows == 0 || cols == 0 {
+            bail!("FlashMoe GPU matrix requires non-zero geometry, got {rows}x{cols} for {role:?}");
+        }
+        let values = rows.checked_mul(cols).with_context(|| {
+            format!("FlashMoe GPU matrix geometry overflows usize: {rows}x{cols} for {role:?}")
+        })?;
+        Ok(Self {
+            role,
+            rows,
+            cols,
+            values,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hidden(rows: usize, width: usize) -> Result<Self> {
+        Self::new(FlashMoeStateBufferRole::Hidden, rows, width)
+    }
+
+    pub(crate) fn residual(rows: usize, width: usize) -> Result<Self> {
+        Self::new(FlashMoeStateBufferRole::Residual, rows, width)
+    }
+
+    pub(crate) fn normed(rows: usize, width: usize) -> Result<Self> {
+        Self::new(FlashMoeStateBufferRole::Normed, rows, width)
+    }
+
+    pub(crate) fn role(self) -> FlashMoeStateBufferRole {
+        self.role
+    }
+
+    pub(crate) fn rows(self) -> usize {
+        self.rows
+    }
+
+    pub(crate) fn cols(self) -> usize {
+        self.cols
+    }
+
+    pub(crate) fn values(self) -> usize {
+        self.values
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes(self) -> Result<usize> {
+        self.values
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("FlashMoe GPU matrix byte size overflows usize")
+    }
+
+    pub(crate) fn placement(self) -> FlashMoeStatePlacement {
+        FlashMoeStatePlacement::GpuResident
+    }
+
+    pub(crate) fn is_declared_graph_state(self) -> bool {
+        FlashMoeStateBufferRole::GENERATION_ROLES.contains(&self.role())
+            && self.placement() == FlashMoeStatePlacement::GpuResident
+            && self.rows() > 0
+            && self.cols() > 0
+            && self.values() == self.rows().saturating_mul(self.cols())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlashMoeStateBufferDescriptor {
     role: FlashMoeStateBufferRole,
     len: usize,
@@ -2819,6 +2892,29 @@ mod tests {
 
         assert_eq!(hidden.len(), 0);
         assert!(!hidden.is_declared_graph_state());
+    }
+
+    #[test]
+    fn gpu_matrix_descriptor_preserves_rows_columns_and_checked_bytes() {
+        let hidden = FlashMoeGpuMatrixDescriptor::hidden(17, 4096).unwrap();
+
+        assert_eq!(hidden.role(), FlashMoeStateBufferRole::Hidden);
+        assert_eq!(hidden.rows(), 17);
+        assert_eq!(hidden.cols(), 4096);
+        assert_eq!(hidden.values(), 17 * 4096);
+        assert_eq!(hidden.bytes().unwrap(), 17 * 4096 * 4);
+        assert_eq!(hidden.placement(), FlashMoeStatePlacement::GpuResident);
+        assert!(hidden.is_declared_graph_state());
+    }
+
+    #[test]
+    fn gpu_matrix_descriptor_rejects_empty_or_overflowing_geometry() {
+        assert!(FlashMoeGpuMatrixDescriptor::hidden(0, 4096).is_err());
+        assert!(FlashMoeGpuMatrixDescriptor::normed(17, 0).is_err());
+        assert!(
+            FlashMoeGpuMatrixDescriptor::new(FlashMoeStateBufferRole::RouterScores, usize::MAX, 2,)
+                .is_err()
+        );
     }
 
     #[test]

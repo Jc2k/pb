@@ -198,10 +198,12 @@ sampling-only decode change was promoted.
 ### Device-resident Qwen layer-major continuation
 
 Status: **Design record; implementation active.** The promoted command is layer-major in traversal
-and scheduler ownership, but its matrix phases remain host-synchronized: hidden/normed matrices
-are read back between dense, attention, post-attention, expert, and next-norm builders and uploaded
-again by the following phase. CPU top-10 routing is an intentional host boundary; complete hidden
-and normalized matrices are not.
+and scheduler ownership. Its first device-resident seam now keeps post-attention residual/normed
+matrices on Metal across CPU top-10 routing and feeds them directly to the common resident/streamed
+expert command; a Metal gather applies the scheduler's exact grouped-row order. Other matrix phases
+remain host-synchronized: attention output and post-expert hidden/next-norm state are still read back
+and uploaded by the following builder. CPU top-10 routing is an intentional host boundary; complete
+hidden and normalized matrices are not.
 
 The next graph keeps chunk hidden/normed state in a typed Metal owner across layer boundaries,
 reads back only authoritative routing/KV/session facts and the final row, and feeds the same
@@ -214,6 +216,11 @@ The first instrumented resident control processed 40 raw tokens in 793 ms while 
 command buffers, uploading 348,977,168 bytes, and reading back 186,818,560 bytes. Those measured
 host boundaries are now the baseline that the device-resident graph must remove; the request still
 ended with balanced buffers and commands.
+A same-prompt probe after the first owned seam preserved the greedy continuation `a`, kept the same
+239 prefill command count, reduced upload to 160,310,288 bytes and readback to 155,361,280 bytes,
+and again ended with zero active general buffers, transient expert buffers, or in-flight commands.
+This is migration evidence, not promotion evidence: complete cross-layer ownership and the locked
+performance gate remain open.
 
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by

@@ -24,7 +24,10 @@ pub(super) struct DeepSeekV4SessionSnapshot;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::deepseek_metal::DEEPSEEK_V4_METAL_SHADERS;
 use super::deepseek_metal::DEEPSEEK_V4_REQUIRED_METAL_KERNELS;
-use super::state::{FlashMoeExpertPhaseOutput, FlashMoeGpuBufferDescriptor};
+use super::state::{
+    FlashMoeExpertPhaseOutput, FlashMoeGpuBufferDescriptor, FlashMoeGpuMatrixDescriptor,
+    FlashMoeStateBufferRole,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::types::FlashMoeMetalResourceSnapshot;
 
@@ -68,6 +71,46 @@ pub(crate) struct MetalStateBuffer {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     buffer: MetalObjcId,
     state: FlashMoeGpuBufferDescriptor,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetalMatrixBuffer {
+    buffer: MetalObjcId,
+    state: FlashMoeGpuMatrixDescriptor,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalMatrixBuffer {
+    fn new(buffer: MetalObjcId, state: FlashMoeGpuMatrixDescriptor) -> anyhow::Result<Self> {
+        if buffer.is_null() {
+            anyhow::bail!("FlashMoe Metal matrix buffer requires a non-null buffer");
+        }
+        if !state.is_declared_graph_state() {
+            anyhow::bail!("FlashMoe Metal matrix buffer requires declared GPU matrix state");
+        }
+        Ok(Self { buffer, state })
+    }
+
+    pub(crate) fn buffer(self) -> MetalObjcId {
+        self.buffer
+    }
+
+    pub(crate) fn state(self) -> FlashMoeGpuMatrixDescriptor {
+        self.state
+    }
+
+    pub(crate) fn rows(self) -> usize {
+        self.state.rows()
+    }
+
+    pub(crate) fn cols(self) -> usize {
+        self.state.cols()
+    }
+
+    pub(crate) fn values(self) -> usize {
+        self.state.values()
+    }
 }
 
 impl MetalStateBuffer {
@@ -1271,6 +1314,7 @@ pub(crate) mod kernels {
     pub(crate) const SILU_PRODUCT: &str = "silu_product";
     pub(crate) const SHARED_EXPERT_ACTIVATION: &str = "shared_expert_activation";
     pub(crate) const COMBINE_EXPERT_PHASE: &str = "combine_expert_phase";
+    pub(crate) const QWEN_LAYER_MAJOR_GATHER: &str = "qwen_layer_major_gather";
     pub(crate) const QWEN_LAYER_MAJOR_COMBINE: &str = "qwen_layer_major_combine";
     pub(crate) const FILL_ZERO: &str = "fill_zero";
     pub(crate) const TOPK_VOCAB: &str = "topk_vocab";
@@ -1358,6 +1402,7 @@ const REQUIRED_FORWARD_KERNELS: &[&str] = &[
     kernels::SILU_PRODUCT,
     kernels::SHARED_EXPERT_ACTIVATION,
     kernels::COMBINE_EXPERT_PHASE,
+    kernels::QWEN_LAYER_MAJOR_GATHER,
     kernels::QWEN_LAYER_MAJOR_COMBINE,
     kernels::FILL_ZERO,
     kernels::TOPK_VOCAB,
@@ -1404,6 +1449,7 @@ pub(crate) struct MetalPipelineNameSet {
     pub(crate) silu_product: &'static str,
     pub(crate) shared_expert_activation: &'static str,
     pub(crate) combine_expert_phase: &'static str,
+    pub(crate) qwen_layer_major_gather: &'static str,
     pub(crate) qwen_layer_major_combine: &'static str,
     pub(crate) fill_zero: &'static str,
     pub(crate) topk_vocab: &'static str,
@@ -1451,6 +1497,7 @@ impl MetalPipelineNameSet {
             silu_product: kernels::SILU_PRODUCT,
             shared_expert_activation: kernels::SHARED_EXPERT_ACTIVATION,
             combine_expert_phase: kernels::COMBINE_EXPERT_PHASE,
+            qwen_layer_major_gather: kernels::QWEN_LAYER_MAJOR_GATHER,
             qwen_layer_major_combine: kernels::QWEN_LAYER_MAJOR_COMBINE,
             fill_zero: kernels::FILL_ZERO,
             topk_vocab: kernels::TOPK_VOCAB,
@@ -1498,6 +1545,7 @@ impl MetalPipelineNameSet {
             self.silu_product,
             self.shared_expert_activation,
             self.combine_expert_phase,
+            self.qwen_layer_major_gather,
             self.qwen_layer_major_combine,
             self.fill_zero,
             self.topk_vocab,
@@ -1546,6 +1594,7 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) silu_product_pipeline: T,
     pub(crate) shared_expert_activation_pipeline: T,
     pub(crate) combine_expert_phase_pipeline: T,
+    pub(crate) qwen_layer_major_gather_pipeline: T,
     pub(crate) qwen_layer_major_combine_pipeline: T,
     pub(crate) fill_zero_pipeline: T,
     pub(crate) topk_vocab_pipeline: T,
@@ -1592,6 +1641,7 @@ impl<T: Copy> MetalPipelineSet<T> {
         release(self.silu_product_pipeline);
         release(self.shared_expert_activation_pipeline);
         release(self.combine_expert_phase_pipeline);
+        release(self.qwen_layer_major_gather_pipeline);
         release(self.qwen_layer_major_combine_pipeline);
         release(self.fill_zero_pipeline);
         release(self.topk_vocab_pipeline);
@@ -1838,6 +1888,7 @@ impl MetalRuntime {
                 silu_product_pipeline: take_pipeline(names.silu_product),
                 shared_expert_activation_pipeline: take_pipeline(names.shared_expert_activation),
                 combine_expert_phase_pipeline: take_pipeline(names.combine_expert_phase),
+                qwen_layer_major_gather_pipeline: take_pipeline(names.qwen_layer_major_gather),
                 qwen_layer_major_combine_pipeline: take_pipeline(names.qwen_layer_major_combine),
                 fill_zero_pipeline: take_pipeline(names.fill_zero),
                 topk_vocab_pipeline: take_pipeline(names.topk_vocab),
@@ -2372,8 +2423,7 @@ impl MetalExecutionContext {
     pub(crate) fn qwen_layer_major_experts(
         &self,
         scheduled: &ScheduledLayerMajorExperts,
-        normed: &[f32],
-        residual: &[f32],
+        post_attention: &MetalLayerMajorPostAttention,
         shared: ScheduledSharedExpertPhaseRef<'_>,
     ) -> anyhow::Result<Vec<f32>> {
         let dense_weights = self
@@ -2386,7 +2436,7 @@ impl MetalExecutionContext {
             Arc::clone(&self.buffers),
             self.norm_epsilon,
         )
-        .execute_layer_major(scheduled, normed, residual, shared)
+        .execute_layer_major(scheduled, post_attention, shared)
     }
 
     pub(crate) fn qwen_rms_norm_rows(
@@ -3334,6 +3384,48 @@ struct MetalLayerMajorOneRowReference {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type MetalLayerMajorGroupPlan = (Vec<u32>, Vec<u32>, Vec<(usize, usize)>);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn qwen_layer_major_group_plan(
+    route_slots: &[usize],
+    unique_experts: usize,
+    active_experts: usize,
+) -> anyhow::Result<MetalLayerMajorGroupPlan> {
+    if route_slots.is_empty() || unique_experts == 0 || active_experts == 0 {
+        bail!("Qwen layer-major group plan requires non-empty routes and experts");
+    }
+    let mut routes_by_slot = vec![Vec::new(); unique_experts];
+    for (route, slot) in route_slots.iter().copied().enumerate() {
+        routes_by_slot
+            .get_mut(slot)
+            .with_context(|| {
+                format!("Qwen layer-major route {route} references missing expert slot {slot}")
+            })?
+            .push(route);
+    }
+    if routes_by_slot.iter().any(Vec::is_empty) {
+        bail!("Qwen layer-major unique expert union contains an unused slot");
+    }
+
+    let mut grouped_source_rows = Vec::with_capacity(route_slots.len());
+    let mut grouped_output_indices = vec![0u32; route_slots.len()];
+    let mut groups = Vec::with_capacity(routes_by_slot.len());
+    for routes in &routes_by_slot {
+        let start = grouped_source_rows.len();
+        for route in routes {
+            let row = route / active_experts;
+            grouped_source_rows
+                .push(u32::try_from(row).context("Qwen layer-major source row exceeds u32")?);
+            grouped_output_indices[*route] = u32::try_from(grouped_source_rows.len() - 1)
+                .context("Qwen layer-major grouped route index exceeds u32")?;
+        }
+        groups.push((start, routes.len()));
+    }
+    Ok((grouped_source_rows, grouped_output_indices, groups))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl<'a> MetalScheduledCmd3Builder<'a> {
     pub(crate) fn new(
         runtime: &'a MetalRuntime,
@@ -3435,24 +3527,25 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
     pub(crate) fn execute_layer_major(
         &self,
         scheduled: &ScheduledLayerMajorExperts,
-        normed: &[f32],
-        residual: &[f32],
+        post_attention: &MetalLayerMajorPostAttention,
         shared: ScheduledSharedExpertPhaseRef<'_>,
     ) -> anyhow::Result<Vec<f32>> {
         let rows = scheduled.rows();
         let active_experts = scheduled.active_experts();
-        let width = residual
-            .len()
-            .checked_div(rows.max(1))
-            .context("Qwen layer-major residual width division failed")?;
+        let normed = post_attention.normed();
+        let residual = post_attention.residual();
+        let width = residual.cols();
         let route_count = rows
             .checked_mul(active_experts)
             .context("Qwen layer-major route count overflow")?;
         if rows == 0
             || active_experts == 0
             || width == 0
-            || residual.len() != rows * width
-            || normed.len() != residual.len()
+            || residual.rows() != rows
+            || residual.state().role() != FlashMoeStateBufferRole::Residual
+            || normed.rows() != rows
+            || normed.cols() != width
+            || normed.state().role() != FlashMoeStateBufferRole::Normed
             || scheduled.route_slots().len() != route_count
             || scheduled.weights().len() != route_count
             || scheduled.experts().is_empty()
@@ -3460,48 +3553,28 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
             bail!(
                 "Qwen layer-major expert command has incompatible geometry layer={} rows={rows} width={width} active={active_experts} normed={} residual={} routes={} weights={} unique={}",
                 scheduled.layer(),
-                normed.len(),
-                residual.len(),
+                normed.values(),
+                residual.values(),
                 scheduled.route_slots().len(),
                 scheduled.weights().len(),
                 scheduled.experts().len()
             );
         }
 
-        let mut routes_by_slot = vec![Vec::new(); scheduled.experts().len()];
-        for (route, slot) in scheduled.route_slots().iter().copied().enumerate() {
-            routes_by_slot
-                .get_mut(slot)
-                .with_context(|| {
-                    format!("Qwen layer-major route {route} references missing expert slot {slot}")
-                })?
-                .push(route);
-        }
-        if routes_by_slot.iter().any(Vec::is_empty) {
-            bail!("Qwen layer-major unique expert union contains an unused slot");
-        }
-        let mut gathered = Vec::with_capacity(route_count * width);
-        let mut grouped_output_indices = vec![0u32; route_count];
-        let mut groups = Vec::with_capacity(routes_by_slot.len());
-        for routes in &routes_by_slot {
-            let start = gathered.len() / width;
-            for route in routes {
-                let row = route / active_experts;
-                gathered.extend_from_slice(&normed[row * width..(row + 1) * width]);
-                grouped_output_indices[*route] = u32::try_from(gathered.len() / width - 1)
-                    .context("Qwen layer-major grouped route index exceeds u32")?;
-            }
-            groups.push((start, routes.len()));
-        }
-        debug_assert_eq!(gathered.len(), route_count * width);
+        let (grouped_source_rows, grouped_output_indices, groups) = qwen_layer_major_group_plan(
+            scheduled.route_slots(),
+            scheduled.experts().len(),
+            active_experts,
+        )?;
+        debug_assert_eq!(grouped_source_rows.len(), route_count);
 
         objc2::rc::autoreleasepool(|_| unsafe {
             self.encode_and_execute_layer_major(
                 scheduled,
                 width,
-                &gathered,
                 normed,
                 residual,
+                &grouped_source_rows,
                 &grouped_output_indices,
                 &groups,
                 shared,
@@ -3701,9 +3774,9 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         &self,
         scheduled: &ScheduledLayerMajorExperts,
         width: usize,
-        gathered: &[f32],
-        normed: &[f32],
-        residual: &[f32],
+        normed: MetalMatrixBuffer,
+        residual: MetalMatrixBuffer,
+        grouped_source_rows: &[u32],
         grouped_output_indices: &[u32],
         groups: &[(usize, usize)],
         shared: ScheduledSharedExpertPhaseRef<'_>,
@@ -3738,12 +3811,14 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
 
             let mut phase_buffers = Vec::new();
             let setup = (|| -> anyhow::Result<_> {
-                let gathered_buffer =
-                    self.phase_buffer_with_bytes(f32_as_bytes(gathered), &mut phase_buffers)?;
-                let normed_buffer =
-                    self.phase_buffer_with_bytes(f32_as_bytes(normed), &mut phase_buffers)?;
-                let residual_buffer =
-                    self.phase_buffer_with_bytes(f32_as_bytes(residual), &mut phase_buffers)?;
+                let gathered_buffer = self.phase_buffer(
+                    route_count * width * std::mem::size_of::<f32>(),
+                    &mut phase_buffers,
+                )?;
+                let grouped_source_rows_buffer = self.phase_buffer_with_bytes(
+                    u32_as_bytes_slice(grouped_source_rows),
+                    &mut phase_buffers,
+                )?;
                 let weights_buffer = self.phase_buffer_with_bytes(
                     f32_as_bytes(scheduled.weights()),
                     &mut phase_buffers,
@@ -3784,8 +3859,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 )?;
                 Ok((
                     gathered_buffer,
-                    normed_buffer,
-                    residual_buffer,
+                    grouped_source_rows_buffer,
                     weights_buffer,
                     grouped_indices_buffer,
                     gate_buffer,
@@ -3798,8 +3872,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
             })();
             let (
                 gathered_buffer,
-                normed_buffer,
-                residual_buffer,
+                grouped_source_rows_buffer,
                 weights_buffer,
                 grouped_indices_buffer,
                 gate_buffer,
@@ -3838,6 +3911,25 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 usize,
                 Option<MetalLayerMajorOneRowReference>,
             )> {
+                let gathered_values = route_count
+                    .checked_mul(width)
+                    .context("Qwen layer-major gathered matrix size overflow")?;
+                let gathered_values_u32 = u32::try_from(gathered_values)
+                    .context("Qwen layer-major gathered matrix exceeds u32")?;
+                let width_u32 =
+                    u32::try_from(width).context("Qwen layer-major gather width exceeds u32")?;
+                msg_send_void1_id(
+                    encoder,
+                    sel("setComputePipelineState:"),
+                    self.runtime.pipelines.qwen_layer_major_gather_pipeline,
+                );
+                set_buffer(encoder, normed.buffer(), 0);
+                set_buffer(encoder, grouped_source_rows_buffer, 1);
+                set_buffer(encoder, gathered_buffer, 2);
+                set_bytes(encoder, u32_as_bytes(&width_u32), 3);
+                set_bytes(encoder, u32_as_bytes(&gathered_values_u32), 4);
+                dispatch_threads(encoder, gathered_values as u64);
+
                 let mut source_buffers = MetalExpertSourceBufferCache::default();
                 for (((payload, group), expert), slot_index) in payloads
                     .iter()
@@ -3930,14 +4022,14 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                         self.encode_layer_major_resident_matrix(
                             encoder,
                             &shared.gate,
-                            normed_buffer,
+                            normed.buffer(),
                             shared_gate,
                             rows,
                         )?;
                         self.encode_layer_major_resident_matrix(
                             encoder,
                             &shared.up,
-                            normed_buffer,
+                            normed.buffer(),
                             shared_up,
                             rows,
                         )?;
@@ -3945,7 +4037,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                             self.encode_layer_major_resident_matrix(
                                 encoder,
                                 router,
-                                normed_buffer,
+                                normed.buffer(),
                                 shared_router,
                                 rows,
                             )?;
@@ -3998,8 +4090,8 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                             width,
                             intermediate,
                             &payloads,
-                            normed_buffer,
-                            residual_buffer,
+                            normed.buffer(),
+                            residual.buffer(),
                             shared,
                             &mut phase_buffers,
                             &mut source_buffers,
@@ -4018,7 +4110,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     sel("setComputePipelineState:"),
                     self.runtime.pipelines.qwen_layer_major_combine_pipeline,
                 );
-                set_buffer(encoder, residual_buffer, 0);
+                set_buffer(encoder, residual.buffer(), 0);
                 set_buffer(encoder, shared_output_buffer, 1);
                 set_buffer(encoder, grouped_output_buffer, 2);
                 set_buffer(encoder, weights_buffer, 3);
@@ -6077,15 +6169,66 @@ impl MetalFusedLinearAttentionBuilder<'_> {
 pub(crate) struct MetalResidentProjectionBatchBuilder<'a> {
     runtime: &'a MetalRuntime,
     dense_weights: Option<&'a MetalDenseWeights>,
-    buffers: &'a MetalBufferPool,
+    buffers: &'a Arc<MetalBufferPool>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct MetalLayerMajorPostAttention {
-    pub(crate) hidden: Vec<f32>,
-    pub(crate) normed: Vec<f32>,
-    pub(crate) router_scores: Vec<f32>,
+    buffers: Arc<MetalBufferPool>,
+    residual: MetalMatrixBuffer,
+    normed: MetalMatrixBuffer,
+    router_scores: Vec<f32>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalLayerMajorPostAttention {
+    fn new(
+        buffers: Arc<MetalBufferPool>,
+        residual_buffer: MetalObjcId,
+        normed_buffer: MetalObjcId,
+        rows: usize,
+        width: usize,
+        router_scores: Vec<f32>,
+    ) -> Result<Self> {
+        if residual_buffer == normed_buffer {
+            bail!("Qwen layer-major post-attention matrices cannot alias");
+        }
+        let residual = MetalMatrixBuffer::new(
+            residual_buffer,
+            FlashMoeGpuMatrixDescriptor::residual(rows, width)?,
+        )?;
+        let normed = MetalMatrixBuffer::new(
+            normed_buffer,
+            FlashMoeGpuMatrixDescriptor::normed(rows, width)?,
+        )?;
+        Ok(Self {
+            buffers,
+            residual,
+            normed,
+            router_scores,
+        })
+    }
+
+    pub(crate) fn residual(&self) -> MetalMatrixBuffer {
+        self.residual
+    }
+
+    pub(crate) fn normed(&self) -> MetalMatrixBuffer {
+        self.normed
+    }
+
+    pub(crate) fn router_scores(&self) -> &[f32] {
+        &self.router_scores
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalLayerMajorPostAttention {
+    fn drop(&mut self) {
+        self.buffers
+            .recycle_or_release(&[self.residual.buffer(), self.normed.buffer()], false);
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6134,7 +6277,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
     pub(crate) fn new(
         runtime: &'a MetalRuntime,
         dense_weights: Option<&'a MetalDenseWeights>,
-        buffers: &'a MetalBufferPool,
+        buffers: &'a Arc<MetalBufferPool>,
     ) -> Self {
         Self {
             runtime,
@@ -8054,16 +8197,30 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                     }
                 }
             }
-            let output = MetalLayerMajorPostAttention {
-                hidden: self.buffers.read_f32_buffer(hidden_buffer, hidden_values),
-                normed: self.buffers.read_f32_buffer(normed_buffer, hidden_values),
-                router_scores: self.buffers.read_f32_buffer(router_buffer, router_values),
-            };
+            let router_scores = self.buffers.read_f32_buffer(router_buffer, router_values);
+            let output = MetalLayerMajorPostAttention::new(
+                Arc::clone(self.buffers),
+                hidden_buffer,
+                normed_buffer,
+                rows,
+                width,
+                router_scores,
+            );
             drop(encoding);
-            for buffer in buffers {
-                self.recycle(buffer);
+            match output {
+                Ok(output) => {
+                    for buffer in buffers {
+                        if buffer != hidden_buffer && buffer != normed_buffer {
+                            self.recycle(buffer);
+                        }
+                    }
+                    Ok(Some(output))
+                }
+                Err(error) => {
+                    self.recycle_or_release_buffers(&buffers, false);
+                    Err(error)
+                }
             }
-            Ok(Some(output))
         }
     }
 
@@ -11582,6 +11739,19 @@ kernel void combine_expert_phase(
     hidden[idx] = residual[idx] + moe + shared_weight * shared[idx];
 }
 
+kernel void qwen_layer_major_gather(
+    device const float* input [[buffer(0)]],
+    device const uint* source_rows [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    constant uint& values [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]) {
+    if (idx >= values) { return; }
+    uint output_row = idx / width;
+    uint col = idx - output_row * width;
+    output[idx] = input[source_rows[output_row] * width + col];
+}
+
 kernel void qwen_layer_major_combine(
     device const float* residual [[buffer(0)]],
     device const float* shared [[buffer(1)]],
@@ -12596,7 +12766,7 @@ mod tests {
                 vec![1, 2, 38, 3, 4, 5, 6, 7, 8],
                 vec![33, 37, 34, 35, 36],
                 vec![24, 25, 26, 41, 42, 43],
-                vec![9, 10, 11, 39, 12, 13, 14, 15, 40, 16],
+                vec![9, 10, 11, 39, 12, 13, 14, 15, 44, 40, 16],
                 vec![18, 19, 27, 28, 20, 21, 29, 30, 22, 23, 31, 32],
             ]
             .concat()
@@ -12633,6 +12803,7 @@ mod tests {
             silu_product_pipeline: 13,
             shared_expert_activation_pipeline: 14,
             combine_expert_phase_pipeline: 15,
+            qwen_layer_major_gather_pipeline: 44,
             qwen_layer_major_combine_pipeline: 40,
             fill_zero_pipeline: 16,
             topk_vocab_pipeline: 18,
@@ -12681,6 +12852,7 @@ mod tests {
             silu_product_pipeline: id,
             shared_expert_activation_pipeline: id,
             combine_expert_phase_pipeline: id,
+            qwen_layer_major_gather_pipeline: id,
             qwen_layer_major_combine_pipeline: id,
             fill_zero_pipeline: id,
             topk_vocab_pipeline: id,
@@ -12709,6 +12881,21 @@ mod tests {
             MetalBatchProjectionInput::Buffer { buffer: id, len: 7 }.len(),
             7
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn qwen_layer_major_group_plan_preserves_route_and_expert_order() {
+        let (source_rows, output_indices, groups) =
+            qwen_layer_major_group_plan(&[1, 0, 0, 1], 2, 2).unwrap();
+
+        assert_eq!(source_rows, vec![0, 1, 0, 1]);
+        assert_eq!(output_indices, vec![2, 0, 1, 3]);
+        assert_eq!(groups, vec![(0, 2), (2, 2)]);
+
+        assert!(qwen_layer_major_group_plan(&[0, 0], 2, 1).is_err());
+        assert!(qwen_layer_major_group_plan(&[2], 2, 1).is_err());
+        assert!(qwen_layer_major_group_plan(&[], 0, 0).is_err());
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

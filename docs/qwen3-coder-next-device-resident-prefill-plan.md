@@ -95,6 +95,13 @@ state ownership rather than traversal order or expert scheduling.
 
 ## Phase 1 — Introduce a typed chunk owner
 
+Status: **In progress.** Row-aware GPU matrix descriptors now bind role, rows, and width at the
+first live RAII-owned subgraph: post-attention residual and norm matrices remain on Metal across
+CPU top-10 routing and are consumed directly by the existing expert command. A Metal gather uses
+the scheduler's row/expert grouping, so this seam no longer materializes or reuploads grouped
+hidden rows on the CPU. The whole-chunk owner and its exact hidden/prepared-next-norm layer
+transition remain open rather than being represented by unbound metadata.
+
 Define row-aware GPU matrix descriptors rather than reusing scalar `len` descriptors. A
 `QwenPrefillChunkState` owns hidden and optional prepared-next-norm buffers, row count, width,
 start position, current layer, and resource-ledger leases. State transitions validate role,
@@ -189,9 +196,10 @@ Compatibility:
 ## Planned commits
 
 1. `perf: measure flashmoe prefill host boundaries`
-2. `refactor: own qwen prefill matrices on metal`
-3. `perf: chain qwen layer-major graph state`
-4. `perf: promote device-resident qwen prefill`
+2. `refactor: own qwen post-attention matrices on metal`
+3. `refactor: own qwen prefill matrices on metal`
+4. `perf: chain qwen layer-major graph state`
+5. `perf: promote device-resident qwen prefill`
 
 Each commit keeps `docs/flashmoe-architecture-parity-plan.md` aligned. Promotion evidence belongs
 in a new dated section of the existing prefill qualification record; a plan or unit test alone is
