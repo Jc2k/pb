@@ -2837,8 +2837,11 @@ impl Drop for PendingExpertLayerPrepare {
 #[derive(Clone, Copy)]
 struct DirectExpertWritePtr(*mut u8);
 
+// SAFETY: this pointer is only created from a caller-owned destination that is
+// kept alive and inaccessible until every worker joins. Each sent copy is used
+// for a validated, disjoint byte range; `slice_at` remains unsafe so callers
+// must uphold those range and lifetime invariants.
 unsafe impl Send for DirectExpertWritePtr {}
-unsafe impl Sync for DirectExpertWritePtr {}
 
 impl DirectExpertWritePtr {
     unsafe fn slice_at<'a>(self, offset: usize, len: usize) -> &'a mut [u8] {

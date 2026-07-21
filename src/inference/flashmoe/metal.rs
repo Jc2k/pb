@@ -751,6 +751,13 @@ pub(crate) struct MetalReusableBuffer {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// SAFETY: `id` is a retained MTLBuffer handle, which is not thread-affine. The
+// pool transfers only the handle and its immutable length between threads; all
+// ownership transitions are serialized by `MetalBufferPool`'s mutexes, and
+// command completion is observed before a buffer is recycled.
+unsafe impl Send for MetalReusableBuffer {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn best_fit_reusable_buffer_index(buffers: &[MetalReusableBuffer], len: usize) -> Option<usize> {
     buffers
         .iter()
@@ -2021,9 +2028,14 @@ pub(crate) struct DeepSeekMetalPipelineSet {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// SAFETY: the map is immutable after compilation and contains retained Metal
+// pipeline-state handles. Metal permits pipeline states to be shared while
+// separate command buffers are encoded on different threads.
 unsafe impl Send for DeepSeekMetalPipelineSet {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// SAFETY: see the `Send` rationale above; concurrent access only reads the
+// immutable pipeline map and retained pipeline-state objects.
 unsafe impl Sync for DeepSeekMetalPipelineSet {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2148,9 +2160,15 @@ pub(crate) struct MetalExecutionContext {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// SAFETY: Metal devices, command queues, pipeline states, and retained resource
+// handles may be used from multiple threads. Mutable host-side state is behind
+// mutexes, while buffer ownership and command completion are explicitly
+// serialized by the execution context and buffer pool.
 unsafe impl Send for MetalExecutionContext {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// SAFETY: see the `Send` rationale above. Shared access cannot reach mutable
+// host-side state without locking its owning mutex.
 unsafe impl Sync for MetalExecutionContext {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

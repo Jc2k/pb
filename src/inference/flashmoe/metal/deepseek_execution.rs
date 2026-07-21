@@ -958,9 +958,9 @@ pub(in crate::inference::flashmoe) struct DeepSeekV4SessionSnapshot {
     _bytes: usize,
 }
 
-// MTLBuffer objects are retained for the snapshot lifetime and Metal permits
-// command encoding and release from threads other than the allocating thread.
-// Access remains serialized by the resident FlashMoe engine mutex.
+// SAFETY: MTLBuffer objects are retained for the snapshot lifetime and Metal
+// permits command encoding and release from threads other than the allocating
+// thread. Access remains serialized by the resident FlashMoe engine mutex.
 unsafe impl Send for DeepSeekV4SessionSnapshot {}
 
 impl Drop for DeepSeekV4SessionSnapshot {

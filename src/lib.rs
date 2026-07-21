@@ -1433,6 +1433,7 @@ async fn mcp_setup_github(args: McpSetupGithubArgs) -> Result<()> {
 const BAKED_GITHUB_CLIENT_ID: Option<&str> = option_env!("PB_GITHUB_CLIENT_ID");
 
 fn github_mcp_server_config(runtime: &str, token_path: &Path) -> McpServerConfig {
+    let runtime = shell_single_quote(runtime);
     let token_path = shell_single_quote(&token_path.to_string_lossy());
     McpServerConfig {
         command: Some("sh".to_string()),
@@ -4979,8 +4980,23 @@ mod tests {
         assert!(config.env.is_empty());
         assert!(!command.contains("gh auth token"));
         assert!(command.contains("cat '/tmp/pb-github-token'"));
+        assert!(command.contains("exec 'docker' run"));
         assert!(command.contains("GITHUB_PERSONAL_ACCESS_TOKEN"));
         assert!(command.contains("ghcr.io/github/github-mcp-server"));
+    }
+
+    #[test]
+    fn github_mcp_server_config_quotes_runtime_paths() {
+        let config = github_mcp_server_config(
+            "/Applications/Container Runtime/bin/runtime's launcher",
+            Path::new("/tmp/pb-github-token"),
+        );
+        assert!(
+            config
+                .args
+                .join(" ")
+                .contains("exec '/Applications/Container Runtime/bin/runtime'\\''s launcher' run")
+        );
     }
 
     #[test]

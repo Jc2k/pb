@@ -83,6 +83,7 @@ pub fn begin(client_id: &str, redirect_uri: &str, scopes: &[&str]) -> Result<OAu
 }
 
 pub fn callback_path_for_state(state: &str) -> Result<PathBuf> {
+    validate_state_component(state)?;
     Ok(config_dir()?
         .join("github-oauth")
         .join(format!("{state}.toml")))
@@ -305,6 +306,16 @@ fn validate_state(expected_state: &str, callback: OAuthCallback) -> Result<OAuth
     Ok(callback)
 }
 
+fn validate_state_component(state: &str) -> Result<()> {
+    let is_urlsafe = state
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if state.is_empty() || state.len() > 128 || !is_urlsafe {
+        bail!("invalid OAuth state");
+    }
+    Ok(())
+}
+
 fn random_urlsafe(bytes: usize) -> Result<String> {
     let mut random = vec![0_u8; bytes];
     getrandom::getrandom(&mut random)
@@ -366,14 +377,16 @@ impl From<CallbackFile> for OAuthCallback {
 #[cfg(unix)]
 fn write_secret_file(path: &std::path::Path, contents: &str) -> Result<()> {
     use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut file = OpenOptions::new()
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .write(true)
         .mode(0o600)
         .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.set_len(0)?;
     file.write_all(contents.as_bytes())?;
     Ok(())
 }
@@ -412,5 +425,39 @@ mod tests {
     fn callback_query_requires_state() {
         let query = HashMap::from([("code".to_string(), "abc".to_string())]);
         assert!(callback_from_query(&query).is_err());
+    }
+
+    #[test]
+    fn callback_paths_reject_unsafe_state_components() {
+        for state in [
+            "",
+            "../callback",
+            "nested/callback",
+            "state.toml",
+            "state%2f",
+        ] {
+            assert!(
+                callback_path_for_state(state).is_err(),
+                "accepted {state:?}"
+            );
+        }
+        assert!(callback_path_for_state("valid_URL-safe-state_123").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_permissions_are_restricted_when_overwriting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("secret");
+        std::fs::write(&path, "old secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_secret_file(&path, "new secret").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new secret");
     }
 }

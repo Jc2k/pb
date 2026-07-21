@@ -470,6 +470,8 @@ struct IoReportDisplayReader {
     previous_at: Instant,
 }
 
+// SAFETY: the reader and its retained CoreFoundation objects are transferred
+// once to the sampler thread, then read and released only on that thread.
 unsafe impl Send for IoReportDisplayReader {}
 
 impl IoReportDisplayReader {
@@ -652,7 +654,8 @@ struct SmcConnection {
     key_info: HashMap<u32, SmcKeyInfo>,
 }
 
-// The connection is created and used only by the sampler thread after startup.
+// SAFETY: the connection is created and used only by the sampler thread after
+// startup, and is closed on that same thread when the reader is dropped.
 unsafe impl Send for SmcConnection {}
 
 impl SmcConnection {

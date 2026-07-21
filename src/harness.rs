@@ -228,7 +228,6 @@ impl HarnessEventSink {
     fn new(cumulative_path: &Path, run_path: &Path, workflow_checkpoint: &Path) -> Result<Self> {
         let cumulative_file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(cumulative_path)
             .with_context(|| {

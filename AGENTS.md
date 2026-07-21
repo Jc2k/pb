@@ -3,6 +3,8 @@
 ## Commands
 
 - `deno task build:web` - Build web UI assets (required before `cargo build`)
+- `cargo fmt --all -- --check` - Verify Rust formatting
+- `cargo clippy --all-targets --all-features -- -D warnings -A clippy::all -D clippy::correctness -D clippy::suspicious` - Enforce compiler warnings plus high-signal correctness and suspicious-code lints
 - `cargo test --all-targets` - Run Rust tests
 - `deno task test:web` - Run web UI tests
 - `deno task test:docs` - Build the mdBook site and validate rendered links, assets, fragments, and PWA metadata

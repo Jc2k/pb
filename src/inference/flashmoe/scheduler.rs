@@ -4337,9 +4337,9 @@ impl ScheduledExpertReadCoordinator {
                     let latency = read_started.elapsed();
                     let message = format!("{error:#}");
                     for issue in issues {
-                        self.core.finish_read(
+                        let recorded = self.core.finish_read(
                             issue.id,
-                            ScheduledExpertReadResponse {
+                            ScheduledExpertReadResponse::<()> {
                                 id: issue.id,
                                 queue_latency: Duration::ZERO,
                                 read_path: FLASHMOE_EXPERT_IO_POLICY.expert_read_path,
@@ -4348,7 +4348,11 @@ impl ScheduledExpertReadCoordinator {
                                 warm: issue.warm,
                                 result: Err(anyhow::anyhow!(message.clone())),
                             },
-                        )?;
+                        );
+                        debug_assert!(
+                            recorded.is_err(),
+                            "synthetic failed expert read unexpectedly succeeded"
+                        );
                     }
                     return Err(error);
                 }
@@ -8865,6 +8869,41 @@ mod tests {
             .read_unique_experts_into(0, &[3, 1], &mut destination, stride)
             .unwrap_err();
         assert!(descending.to_string().contains("sorted and unique"));
+    }
+
+    #[test]
+    fn direct_batch_read_records_every_issued_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        write_identity_fixed_q4_layer(temp.path(), 0, 512);
+        let spec = FixedQ4ExpertSlotSpec::new(tiny_fixed_q4_layout(), 2, 2).unwrap();
+        let store = ExpertSlotStore::open_with_fixed_q4(temp.path().to_path_buf(), spec).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(expert_layer_path(temp.path(), 0))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let mut layout = qwen35_layout();
+        layout.layers = 1;
+        let capabilities = FlashMoeCapabilityPlan::for_model_layout(&layout).unwrap();
+        let graph = FlashMoeScheduledGraph::from_capabilities(&capabilities).unwrap();
+        let mut scheduler = FlashMoeExecutionScheduler::new(graph, store).unwrap();
+        let stride = tiny_fixed_q4_layout().expert_bytes;
+        let mut destination = vec![0; 512 * stride];
+
+        let error = scheduler
+            .read_unique_experts_into(0, &[1, 2, 3, 7], &mut destination, stride)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("failed direct batch expert run"),
+            "{error:#}"
+        );
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.issued_reads, 4);
+        assert_eq!(snapshot.positioned_reads, 4);
+        assert_eq!(snapshot.read_failures, 4);
+        assert_eq!(snapshot.bytes_read, 0);
     }
 
     #[test]
