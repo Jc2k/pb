@@ -255,12 +255,27 @@ tokens, and 3.03 Wh. It exited non-zero with `contract_status=unsatisfied`,
 efficiency-control evidence: exact-target, proportional compact recovery is no longer the gate for
 another integrated run.
 
+## Focused next-path completion qualification — 2026-07-21
+
+The checked-in TC1 ordered-creation fixture then qualified the implemented next-path controller and
+the complete strict acceptance chain. Initial run `1784667572614-75379-0` created `alpha.txt` and
+`beta.txt` as two harness-selected atomic work units, passed the trusted exact-content check, earned
+fresh review evidence for both paths, and created semantic task commit
+`f4da7a5a925f82a6c129850f284ff2731d8568d9`. The journal, events, check, commit identity, delta, and
+clean worktree passed independent review.
+
+That run exposed and fixed two journal-only diagnostic defects. The post-fix release then passed
+three unchanged trials with `contract_status=satisfied`, `verified_completed=true`, zero rejected
+actions, one required check, fresh two-path review, a semantic commit, and a clean worktree in every
+run. The locked series used seven model calls per run; median wall time was 317,781 ms and median
+energy was 3.97 Wh. Full evidence is in the
+[TC1 report](task-completion-tc1.md).
+
 ## Ranked follow-up
 
-1. Qualify the implemented next-path work-unit control with a focused native all-create probe. The
-   deterministic fixture rejects an out-of-order write, binds `write_file` to the first missing
-   accepted-plan path, advances after its atomic creation, and withholds the implementation
-   terminal while another planned creation is missing.
+1. Retain the qualified next-path work-unit control as a regression gate. TC1 passed the initial
+   native qualification and 3/3 locked post-fix trials through check, fresh review, managed commit,
+   clean worktree, and verified completion.
 2. Retain exact-target, right-sized compact recovery as a regression gate. Native run
    `1784598393414-28929-0` qualified the 320-character/352-token retry without path drift, cap
    regrowth, or partial mutation.

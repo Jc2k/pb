@@ -15,8 +15,10 @@ accepted plan/review but again stopped with only HTML/CSS; exact-target, right-s
 recovery has passed a focused native gate without path drift, cap regrowth, or partial mutation.
 The harness now steers all-create implementations toward one exact next missing accepted-plan path
 at a time. Its deterministic fixture rejects an out-of-order write, advances after the exact target
-exists, and keeps the implementation terminal hidden while another creation is missing. A focused
-native qualification remains before another full browser run.
+exists, and keeps the implementation terminal hidden while another creation is missing. The focused
+native TC1 qualification and three unchanged post-fix trials passed through trusted check, fresh
+review, semantic commit, clean worktree, and verified completion. The smaller useful-coding TC2 gate
+now precedes another full browser run.
 Decode has been profiled; no change was promoted because the measured sampling path cannot meet the
 1.5x gate.
 
@@ -99,8 +101,9 @@ The preserved evidence that drives implementation is deliberately small:
 
 The focused contract-backed acceptance and compact-recovery gates passed, while the integrated run
 completed truthfully without producing a runnable game. Deterministic next-missing-plan-path and
-small-work-unit steering now passes a scripted two-file fixture. A focused native qualification is
-the remaining gate before another Phase 5 run.
+small-work-unit steering now pass a scripted two-file fixture, one initial native qualification, and
+3/3 locked post-fix TC1 trials. TC2 useful-coding qualification is the remaining small-task gate
+before another Phase 5 run.
 
 ## Architectural invariants
 
