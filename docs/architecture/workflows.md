@@ -178,9 +178,12 @@ disabled and, within the same global budget, use a larger output cap. A capped n
 or `replace_file` also receives at most one compact atomic retry inside that same stage step. That
 retry exposes only the attempted mutation tool, starts from the original authoritative messages
 rather than carrying the rejected oversized payload, and requests a complete loadable payload
-below half of the ordinary mutation allowance. The retry schema enforces that smaller limit rather
-than relying on the correction text alone. These recovery mechanics help the model express an
-allowed action; they never expose a new capability or waive a transition gate.
+below half of the ordinary mutation allowance. When the truncated call exposed its path, the retry
+schema binds that exact original target, and its generation-token ceiling is reduced to the smaller
+serialized payload allowance. The retry schema enforces those constraints rather than relying on
+the correction text alone; pb also rejects a parsed retry that changes the bound tool or path. A
+failed compact retry does not grow back to the original cap. These recovery mechanics help the
+model express an allowed action; they never expose a new capability or waive a transition gate.
 Retries consume model-invocation and generated-token budgets, but remain part of the same visible
 stage step. Stage-step accounting is checkpointed at the `StepStarted` boundary, so an action-only
 retry cannot prematurely terminalize a workflow while its result is still being recorded.

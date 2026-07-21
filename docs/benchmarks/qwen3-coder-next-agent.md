@@ -190,16 +190,51 @@ beyond the harness baseline. This qualifies the P1 reporting fix and is positive
 evidence. The remaining inability to construct or count the requested literal is a model limitation,
 not a reason to weaken the acceptance contract.
 
+## Contract-qualified integrated rerun — 2026-07-20
+
+The first integrated attempt, `1784589577078-95753-0`, was stopped after two planning calls because
+the canonical plan example omitted `acceptance[].check_ids`. Both otherwise coherent plans copied
+that shape and failed the new required-check validation. The interrupted 164,308 ms experiment used
+8,395 prompt tokens, 1,105 generated tokens, and 1.79 Wh. This was a supervisor experiment error
+caused by a clear pb correction-quality defect. Commit `60722808` added the field to the compact
+example, named it in validation feedback, and locked both behaviors with deterministic tests.
+
+Fresh run `1784590137641-98220-0` then accepted planning and plan review on their first submissions
+in 73,702 and 76,014 ms. Implementation created a complete 1,342-byte `index.html` and 6,019-byte
+`styles.css`. The stylesheet is visually ambitious but includes invalid declarations such as
+`display: flex:`, `y-height`, and `border radius`. Qwen's first attempted `game.js` reached the
+mutation limit after 542,263 ms and was rejected atomically. Its compact retry spent 849,110 ms and
+the full 4,096-token cap reproducing malformed `styles.css` through `write_file`, despite that path
+already existing. Later turns reread the stylesheet twice, read the HTML, and repeated the same
+failure on another capped write plus compact retry. No JavaScript or test file was created.
+
+The run ended after 5,705,443 ms with 12 model invocations, 141,658 prompt tokens, 16,309 generated
+tokens, and 53.7 Wh. The trusted Deno check cannot resolve the absent test module. There is no code
+review or task commit, both files remain untracked, and browser inspection was skipped because a
+static two-file shell cannot satisfy the game contract. pb exited non-zero with
+`contract_status=unsatisfied`, `verified_completed=false`, and `termination_reason=step_limit`.
+This is positive safety and reporting evidence, but the artifact-quality outcome remains a model
+failure amplified by expensive output shaping.
+
+The run also exposed a general P2 recovery-control defect. Same-step compact recovery constrained
+the tool and content length but not the original path or generated-token ceiling, allowing an
+expensive drift to an already-created file. Compact recovery now binds an extracted original path,
+rejects a parsed retry that changes that target, derives a lower token ceiling from the smaller
+character allowance, and cannot grow back to the original cap after failure. Deterministic fixtures
+cover target extraction, schema binding, post-generation rejection, token budgeting, and the
+one-retry boundary; another full run is not justified until a focused native probe qualifies those
+controls.
+
 ## Ranked follow-up
 
-1. Run the locked four-file workflow and browser contract. The targeted contract-backed gate now
-   rejects the false artifact truthfully, so another integrated run can produce useful evidence
-   without risking false verification.
-2. Retain the measured decode baseline and promotion gate. Profiling found no shared sampling-path
+1. Qualify exact-target, right-sized compact recovery with a focused native mutation probe before
+   paying for another full workflow. The deterministic fixtures are green; the live probe must show
+   that recovery cannot drift from its capped target or consume the original 4,096-token ceiling.
+2. Shape implementation actions around small complete scaffolds and exact later edits. The
+   controller should prefer the next missing accepted-plan path after a capped action rather than
+   letting a read/repair loop consume the remaining step budget.
+3. Retain the measured decode baseline and promotion gate. Profiling found no shared sampling-path
    change capable of the required 1.5x gain; do not promote an isolated checkpoint or Q4 fast path.
-3. Shape implementation actions around small complete scaffolds and exact later edits. The
-   controller should expose the enforced payload allowance prominently and prefer a bounded tail
-   patch after an authoritative read rather than a whole-file replacement.
 4. Persist a compact authoritative evidence bundle and preserve stable prompt/tool prefixes across
    recovery. The compact retry omitted the rejected payload but still spent 302,949 ms prefilling
    its changed 13,518-token prompt.
@@ -210,5 +245,5 @@ not a reason to weaken the acceptance contract.
    hidden thinking. For models trained with a real reasoning channel, disabling it can hurt
    ambiguous diagnosis; for Qwen3-Coder-Next the mode is unsupported, so enabling it would only
    create a misleading contract.
-7. Keep browser inspection last in the locked rerun: it cannot substitute for all four files, the
+7. Keep browser inspection last in any locked rerun: it cannot substitute for all four files, the
    named Deno check, fresh code review, semantic commit, and clean worktree.

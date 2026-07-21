@@ -4426,6 +4426,14 @@ fn mutation_payload_char_limit(max_tokens: i32) -> usize {
     .saturating_mul(CONSERVATIVE_MUTATION_CHARS_PER_TOKEN)
 }
 
+fn compact_mutation_retry_max_tokens(current_max_tokens: i32, payload_chars: usize) -> i32 {
+    let payload_tokens = payload_chars.div_ceil(CONSERVATIVE_MUTATION_CHARS_PER_TOKEN);
+    let payload_tokens = i32::try_from(payload_tokens).unwrap_or(i32::MAX);
+    NATIVE_ACTION_RESERVE_TOKENS
+        .saturating_add(payload_tokens)
+        .clamp(1, current_max_tokens.max(1))
+}
+
 fn apply_mutation_payload_limit(tools: &mut [BuiltInToolSchema], max_tokens: i32) -> usize {
     let limit = mutation_payload_char_limit(max_tokens);
     set_mutation_payload_char_limit(tools, limit);
@@ -4464,6 +4472,17 @@ fn set_mutation_payload_char_limit(tools: &mut [BuiltInToolSchema], limit: usize
             {
                 property["maxLength"] = json!(field_limit);
             }
+        }
+    }
+}
+
+fn set_mutation_target_path(tools: &mut [BuiltInToolSchema], target_path: &str) {
+    for tool in tools {
+        if !matches!(tool.name.as_str(), "write_file" | "replace_file") {
+            continue;
+        }
+        if let Some(property) = tool.input_schema.pointer_mut("/properties/path") {
+            property["enum"] = json!([target_path]);
         }
     }
 }
@@ -7854,6 +7873,87 @@ fn truncated_native_tool_name(output: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+fn truncated_native_mutation_path(output: &str) -> Option<String> {
+    let tail = output
+        .rsplit_once("<tool_call>")
+        .map(|(_, tail)| tail)
+        .unwrap_or(output);
+    if let Some(path) = json_string_field(tail, "path") {
+        return (!path.is_empty()).then_some(path);
+    }
+    for marker in ["<parameter=path>", "<｜DSML｜parameter name=\"path\">"] {
+        if let Some((_, value)) = tail.rsplit_once(marker) {
+            let path = value.split(['\n', '<']).next().unwrap_or_default().trim();
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn json_string_field(input: &str, field: &str) -> Option<String> {
+    let marker = format!("\"{field}\"");
+    let (_, suffix) = input.split_once(&marker)?;
+    let (_, suffix) = suffix.split_once(':')?;
+    let literal = suffix.trim_start();
+    if !literal.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, byte) in literal.as_bytes().iter().copied().enumerate().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return serde_json::from_str(&literal[..=index]).ok();
+        }
+    }
+    None
+}
+
+fn compact_mutation_action_error(
+    action: &AgentAction,
+    expected_tool: &str,
+    expected_path: Option<&str>,
+) -> Option<anyhow::Error> {
+    let (tool, arguments) = match action {
+        AgentAction::ToolCall {
+            tool, arguments, ..
+        } => (tool.as_str(), arguments),
+        AgentAction::ToolCalls { calls, .. } if calls.len() == 1 => {
+            (calls[0].tool.as_str(), &calls[0].arguments)
+        }
+        AgentAction::ToolCalls { calls, .. } => {
+            return Some(anyhow::anyhow!(
+                "compact mutation recovery requires exactly one {expected_tool} call, but the model returned {} calls",
+                calls.len()
+            ));
+        }
+        AgentAction::Final { .. } => {
+            return Some(anyhow::anyhow!(
+                "compact mutation recovery requires one {expected_tool} call"
+            ));
+        }
+    };
+    if tool != expected_tool {
+        return Some(anyhow::anyhow!(
+            "compact mutation recovery was restricted to {expected_tool}, but the model called {tool}"
+        ));
+    }
+    if let Some(expected_path) = expected_path {
+        let actual_path = arguments.get("path").and_then(Value::as_str);
+        if actual_path != Some(expected_path) {
+            return Some(anyhow::anyhow!(
+                "compact mutation recovery was restricted to path {expected_path:?}, but the model returned path {:?}",
+                actual_path.unwrap_or("<missing>")
+            ));
+        }
+    }
+    None
+}
+
 fn stable_hash(value: &(impl Hash + ?Sized)) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -11123,6 +11223,7 @@ fn generate_and_parse_action_with_retries(
     let mut retry_tools: Option<Vec<BuiltInToolSchema>> = None;
     let mut cap_growth_used = false;
     let mut compact_mutation_retry_used = false;
+    let mut compact_mutation_constraint: Option<(String, Option<String>)> = None;
 
     loop {
         let mut request = args.clone();
@@ -11223,16 +11324,40 @@ fn generate_and_parse_action_with_retries(
             }));
         }
         if !completion.tool_calls.is_empty() {
-            return Ok(Ok((
-                completion.content.clone(),
-                AgentAction::ToolCalls {
-                    calls: completion.tool_calls,
-                    thinking: non_empty_string(completion.content),
-                },
-            )));
+            let output = completion.content.clone();
+            let action = AgentAction::ToolCalls {
+                calls: completion.tool_calls,
+                thinking: non_empty_string(completion.content),
+            };
+            if let Some((expected_tool, expected_path)) = compact_mutation_constraint.as_ref()
+                && let Some(error) =
+                    compact_mutation_action_error(&action, expected_tool, expected_path.as_deref())
+            {
+                return Ok(Err(ParseFailure {
+                    output,
+                    error,
+                    finish_reason: completion.finish_reason,
+                }));
+            }
+            return Ok(Ok((output, action)));
         }
         match parse_action(&completion.content) {
-            Ok(action) => return Ok(Ok((completion.content, action))),
+            Ok(action) => {
+                if let Some((expected_tool, expected_path)) = compact_mutation_constraint.as_ref()
+                    && let Some(error) = compact_mutation_action_error(
+                        &action,
+                        expected_tool,
+                        expected_path.as_deref(),
+                    )
+                {
+                    return Ok(Err(ParseFailure {
+                        output: completion.content,
+                        error,
+                        finish_reason: completion.finish_reason,
+                    }));
+                }
+                return Ok(Ok((completion.content, action)));
+            }
             Err(error) => {
                 if let Some(action) = recover_unwrapped_workflow_tool_call(
                     args,
@@ -11302,6 +11427,8 @@ fn generate_and_parse_action_with_retries(
                 if !compact_mutation_retry_used && let Some(tool) = truncated_mutation {
                     compact_mutation_retry_used = true;
                     retry_reason = Some(AgentRetryReason::CompactMutationAfterTruncation);
+                    let target_path = truncated_native_mutation_path(&failure.output);
+                    compact_mutation_constraint = Some((tool.to_string(), target_path.clone()));
                     let mut compact_tools = tools
                         .iter()
                         .filter(|schema| schema.name == tool)
@@ -11309,14 +11436,32 @@ fn generate_and_parse_action_with_retries(
                         .collect::<Vec<_>>();
                     let target_chars = mutation_payload_char_limit(max_tokens) / 2;
                     set_mutation_payload_char_limit(&mut compact_tools, target_chars);
+                    if let Some(target_path) = target_path.as_deref() {
+                        set_mutation_target_path(&mut compact_tools, target_path);
+                    }
                     if let Some(schema) = compact_tools.first_mut() {
                         schema.description.push_str(&format!(
                             " Compact recovery permits at most {target_chars} content characters."
                         ));
+                        if let Some(target_path) = target_path.as_deref() {
+                            schema.description.push_str(&format!(
+                                " This retry is restricted to the original target {target_path}."
+                            ));
+                        }
                     }
                     retry_tools = Some(compact_tools);
+                    max_tokens = compact_mutation_retry_max_tokens(max_tokens, target_chars);
+                    cap_growth_used = true;
+                    let target_instruction = target_path.as_deref().map_or_else(
+                        String::new,
+                        |target_path| {
+                            format!(
+                                " Use the exact original target {target_path}; do not change paths."
+                            )
+                        },
+                    );
                     let instruction = format!(
-                        "The capped {tool} call was not executed. Retry {tool} now with one complete, syntactically loadable payload under {target_chars} characters. Keep only the smallest functional core; omit decoration, commentary, optional helpers, and repeated material. Do not include the rejected payload or read the missing target."
+                        "The capped {tool} call was not executed. Retry {tool} now with one complete, syntactically loadable payload under {target_chars} characters and within {max_tokens} generated tokens.{target_instruction} Keep only the smallest functional core; omit decoration, commentary, optional helpers, and repeated material. Do not include the rejected payload or read the missing target."
                     );
                     sink.emit(AgentEvent::Correction {
                         message: instruction.clone(),
@@ -17047,7 +17192,9 @@ mod tests {
     fn strict_mutation_schemas_publish_the_turn_payload_allowance() {
         let mut tools = all_builtin_tool_specs();
         let limit = apply_mutation_payload_limit(&mut tools, 1_024);
+        set_mutation_target_path(&mut tools, "game.js");
         assert_eq!(limit, 1_664);
+        assert_eq!(compact_mutation_retry_max_tokens(1_024, limit / 2), 608);
         let schema = |name: &str| {
             &tools
                 .iter()
@@ -17058,6 +17205,10 @@ mod tests {
         assert_eq!(
             schema("write_file").pointer("/properties/content/maxLength"),
             Some(&json!(limit))
+        );
+        assert_eq!(
+            schema("write_file").pointer("/properties/path/enum"),
+            Some(&json!(["game.js"]))
         );
         assert_eq!(
             schema("apply_patch").pointer("/properties/patch/maxLength"),
@@ -21304,6 +21455,7 @@ the next imagined action"#;
         assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
         assert_eq!(outcome.llm_invocations, 3);
         assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(outcome.generation_max_tokens, vec![256, 224, 256]);
         assert_eq!(
             events
                 .iter()
@@ -21339,6 +21491,47 @@ the next imagined action"#;
             AgentEvent::Correction { summary, message, .. }
                 if summary == "Retrying a compact atomic mutation"
                     && message.contains("under 64 characters")
+                    && message.contains("within 224 generated tokens")
+                    && message.contains("exact original target compact.txt")
+        )));
+    }
+
+    #[test]
+    fn compact_mutation_retry_cannot_drift_to_another_target() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 1;
+        request.turn_max_tokens_cap = Some(256);
+        request.workflow_action_first_turn = true;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                ScriptedCompletion {
+                    content: "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"game.js\",\"content\":\"unfinished".to_string(),
+                    truncated: true,
+                },
+                tool_completion(
+                    "write_file",
+                    json!({"path": "styles.css", "content": "drifted\n"}),
+                ),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(!outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert_eq!(outcome.llm_invocations, 2);
+        assert_eq!(outcome.tool_calls, 0);
+        assert!(!tmp.path().join("game.js").exists());
+        assert!(!tmp.path().join("styles.css").exists());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { message, .. }
+                if message.contains("restricted to path \"game.js\"")
+                    && message.contains("returned path \"styles.css\"")
         )));
     }
 
@@ -22927,13 +23120,22 @@ the next imagined action"#;
     }
 
     #[test]
-    fn detects_a_truncated_qwen_function_tail_after_complete_batch_members() {
+    fn detects_a_truncated_native_mutation_tool_and_target() {
         let output = concat!(
             "<tool_call>\n<function=todo>\n<parameter=op>complete\n</tool_call>\n",
-            "<tool_call>\n<function=write_file>\n<parameter=content>partial"
+            "<tool_call>\n<function=write_file>\n<parameter=path>game.js\n<parameter=content>partial"
         );
 
         assert_eq!(truncated_native_tool_name(output), Some("write_file"));
+        assert_eq!(
+            truncated_native_mutation_path(output).as_deref(),
+            Some("game.js")
+        );
+        let qwen = "<tool_call>{\"name\":\"replace_file\",\"arguments\":{\"path\":\"src/game.js\",\"content\":\"partial";
+        assert_eq!(
+            truncated_native_mutation_path(qwen).as_deref(),
+            Some("src/game.js")
+        );
     }
 
     #[test]

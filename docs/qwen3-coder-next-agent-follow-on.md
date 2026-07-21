@@ -1,6 +1,6 @@
 # Qwen3-Coder-Next Agent Performance Follow-on
 
-Status: **Integrated qualification ready.** Durable stage evidence, compact terminal schemas, Qwen
+Status: **Integrated qualification incomplete; recovery hardening active.** Durable stage evidence, compact terminal schemas, Qwen
 native tool constraints, output-aware mutation bounds, strict-stage TODO removal,
 dependency-aware batch rejection, native telemetry, and true layer-major Qwen3-Coder-Next prefill
 are implemented. The prefill graph passed exact state and resource/performance promotion gates; the
@@ -10,7 +10,9 @@ reached implementation but remained incomplete; browser qualification therefore 
 The first focused mutation probe confirmed complete bounded scaffolding but exposed false external
 verification when a strict workflow reached `Ready`. Explicit contract projection and gating now
 pass an executable native qualification: the undersized artifact failed its trusted check, never
-reached review or commit, and ended unsatisfied and unverified. The locked browser run is unblocked.
+reached review or commit, and ended unsatisfied and unverified. The locked integrated rerun then
+accepted plan/review but again stopped with only HTML/CSS; exact-target, right-sized compact
+recovery is now the focused gate before another full browser run.
 Decode has been profiled; no change was promoted because the measured sampling path cannot meet the
 1.5x gate.
 
@@ -64,6 +66,7 @@ The intended order is:
 | Qwen3-Coder-Next has no supported thinking mode | model contract | Accepted | Keep thinking off and retain deterministic workflow gates |
 | The final artifact was incomplete | model limitation, truthfully contained | Accepted fixture | Rerun only after the preceding deterministic improvements |
 | Strict `Ready` projected as verified with `contract_status=unspecified` | pb completion-reporting defect | P1 | Fixed and natively qualified with an explicit failing content contract |
+| Compact recovery drifted from capped `game.js` to existing `styles.css` and retained the 4,096-token ceiling | pb recovery control/efficiency defect | P2 | Bind the original target and derive a smaller retry token ceiling |
 
 The direct workflow schema, one-level string compatibility decoder, atomic rejection of truncated
 native batches, durable planned-path status, and sink-aware `ask_user` exposure are already shipped
@@ -82,10 +85,12 @@ The preserved evidence that drives implementation is deliberately small:
 | `1784586458472-40087-0` | 256-token plan review could not fit and stopped after three bounded parse failures | classify as experiment error; use the smallest cap that can express the terminal schema |
 | `1784586718611-40960-0` | bounded 290-byte scaffold followed by false implementation/review claims and `unspecified` yet verified completion | executable acceptance check plus strict contract projection/gating fixtures |
 | `1784588468585-81408-0` | trusted length check rejected a 263-character scaffold three times; bounded repair ended with no review or task commit | `unsatisfied`, unverified, non-zero terminal result plus independent byte audit |
+| `1784589577078-95753-0` | required-check planning repeated because the compact example omitted `acceptance[].check_ids` | classify as experiment error; expose the exact field in examples and corrections |
+| `1784590137641-98220-0` | first-turn plan/review and two files, then 53.7 Wh of capped/repeated CSS-directed actions; logic files remained absent | exact-target compact schema, proportional retry cap, and preserved unsatisfied terminal state |
 
-The focused contract-backed mutation gate has passed. It validated truthful acceptance and bounded
-output behavior without paying for the full browser fixture. Phase 5 is now the next justified
-integrated run.
+The focused contract-backed acceptance gate passed, and the integrated run completed truthfully but
+did not produce a runnable game. The next justified model spend is a focused native compact-recovery
+probe. Another Phase 5 run waits for that smaller gate.
 
 ## Architectural invariants
 

@@ -406,8 +406,11 @@ call keeps the existing terminal-only schema on that retry. If the result is sti
 gives a capped native `write_file` or `replace_file` at most one compact retry when applicable,
 with only that tool exposed and without the rejected payload in model context. The requested
 payload is below half the normal mutation allowance, the retry schema enforces that exact smaller
-bound, and the payload must remain complete and loadable. pb may
-then grow the cap once within the request limit; existing parse-loop thresholds remain authoritative.
+bound, its token ceiling is reduced accordingly, and its path is bound to the original target when
+that path was present before truncation. pb rejects a parsed retry that changes the compact tool or
+bound path. The payload must remain complete and loadable, and a failed compact retry does not grow
+back to the original cap. When compact recovery does not apply, pb may grow a truncated action cap
+once within the request limit; existing parse-loop thresholds remain authoritative.
 Every attempt reserves an invocation and records generated tokens before another retry is allowed,
 so the global invocation and token budgets cannot be bypassed by recovery.
 An action-only retry remains within its original stage step: durable stage-step accounting advances
