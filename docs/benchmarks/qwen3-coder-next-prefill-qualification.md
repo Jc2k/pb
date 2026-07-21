@@ -158,15 +158,21 @@ the CPU routing boundary, then used a Metal gather to feed the scheduler's group
 without a CPU hidden-matrix copy. The same optimized binary and 40-token prompt returned the same
 greedy continuation `a` and reported:
 
-| Metric | Host-boundary baseline | First owned seam |
-| --- | ---: | ---: |
-| Metal command buffers | 239 | 239 |
-| host upload | 348,977,168 bytes | 160,310,288 bytes |
-| host readback | 186,818,560 bytes | 155,361,280 bytes |
-| request-end active/transient/in-flight | 0 / 0 / 0 | 0 / 0 / 0 |
+| Metric | Host-boundary baseline | Owned post-attention | Owned expert output |
+| --- | ---: | ---: | ---: |
+| Metal command buffers | 239 | 239 | 192 |
+| host upload | 348,977,168 bytes | 160,310,288 bytes | 144,909,328 bytes |
+| host readback | 186,818,560 bytes | 155,361,280 bytes | 155,361,280 bytes |
+| request-end active/transient/in-flight | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
 
 The first post-change run took 1,602 ms, so it is not a promotion result and does not satisfy the
 performance gate. Its purpose is narrower and conclusive: the transfer counters prove that the
 new ownership boundary is live, while unchanged continuation and balanced resources permit the
 migration to continue. Warm and long-prompt performance must be requalified after cross-layer
 hidden/next-norm ownership removes the remaining synchronizations.
+
+The next step made hidden and optional next norm owned expert outputs and encoded next norm in the
+expert command. It preserved `a` and removed 47 commands plus 15,400,960 uploaded bytes. Its first
+post-change prefill took 1,948 ms and is likewise not promotion evidence. Unchanged readback proves
+that the remaining per-layer host materialization—not expert scheduling or norm dispatch—is the
+next cross-layer blocker.

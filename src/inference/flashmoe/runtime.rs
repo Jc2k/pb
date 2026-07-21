@@ -1380,12 +1380,14 @@ impl MetalExecutionFacade {
         scheduled: &ScheduledLayerMajorExperts,
         post_attention: &MetalLayerMajorPostAttention,
         shared: ScheduledSharedExpertPhaseRef<'_>,
-    ) -> Result<Vec<f32>> {
+        next_norm_weight: Option<&[f32]>,
+    ) -> Result<MetalQwenPrefillLayerOutput> {
         self.inner
-            .qwen_layer_major_experts(scheduled, post_attention, shared)
+            .qwen_layer_major_experts(scheduled, post_attention, shared, next_norm_weight)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(test)]
     pub(super) fn qwen_rms_norm_rows(
         &self,
         input: &[f32],
@@ -2885,27 +2887,41 @@ impl FlashMoeEngine {
             }
             SharedExpertLayerWeights::None => ScheduledSharedExpertPhaseRef::None,
         };
-        let hidden = self
-            .metal
-            .qwen_layer_major_experts(&scheduled, &post, shared_phase)?;
+        let next_norm_weight = if layer + 1 < self.config.num_hidden_layers {
+            let next_norm_name = layer_norm_tensor_name(layer + 1, "input_layernorm");
+            Some(
+                self.model_norm_weight(&next_norm_name, width)?
+                    .with_context(|| format!("missing Qwen layer-major norm {next_norm_name}"))?,
+            )
+        } else {
+            None
+        };
+        let layer_output = self.metal.qwen_layer_major_experts(
+            &scheduled,
+            &post,
+            shared_phase,
+            next_norm_weight.as_deref(),
+        )?;
+        if layer_output.layer() != layer
+            || layer_output.hidden().rows() != rows.len()
+            || layer_output.hidden().cols() != width
+            || layer_output.next_normed().is_some() != next_norm_weight.is_some()
+        {
+            bail!("Qwen layer-major expert output does not match the requested layer geometry");
+        }
+        let (hidden, next_normed) = layer_output.materialize();
         if hidden.len() != hidden_values {
             bail!(
                 "Qwen layer-major expert output has {} values, expected {hidden_values}",
                 hidden.len()
             );
         }
-        let next_normed = if layer + 1 < self.config.num_hidden_layers {
-            let next_norm_name = layer_norm_tensor_name(layer + 1, "input_layernorm");
-            let next_norm_weight = self
-                .model_norm_weight(&next_norm_name, width)?
-                .with_context(|| format!("missing Qwen layer-major norm {next_norm_name}"))?;
-            Some(
-                self.metal
-                    .qwen_rms_norm_rows(&hidden, &next_norm_weight, rows.len(), width)?,
-            )
-        } else {
-            None
-        };
+        if next_normed
+            .as_ref()
+            .is_some_and(|values| values.len() != hidden_values)
+        {
+            bail!("Qwen layer-major next norm does not match hidden matrix geometry");
+        }
         let mix_hashes = scheduled.route_mix_hashes().collect::<Vec<_>>();
         let elapsed = layer_started.elapsed();
         let per_row_elapsed = elapsed / u32::try_from(rows.len()).unwrap_or(u32::MAX);

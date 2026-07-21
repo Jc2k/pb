@@ -99,8 +99,10 @@ Status: **In progress.** Row-aware GPU matrix descriptors now bind role, rows, a
 first live RAII-owned subgraph: post-attention residual and norm matrices remain on Metal across
 CPU top-10 routing and are consumed directly by the existing expert command. A Metal gather uses
 the scheduler's row/expert grouping, so this seam no longer materializes or reuploads grouped
-hidden rows on the CPU. The whole-chunk owner and its exact hidden/prepared-next-norm layer
-transition remain open rather than being represented by unbound metadata.
+hidden rows on the CPU. The expert command now also returns an RAII-owned hidden matrix and optional
+prepared-next-norm matrix, computing that norm in the same command; the legacy layer-state recorder
+still materializes both before the next layer. The whole-chunk owner that passes those buffers into
+the following attention phase remains open rather than being represented by unbound metadata.
 
 Define row-aware GPU matrix descriptors rather than reusing scalar `len` descriptors. A
 `QwenPrefillChunkState` owns hidden and optional prepared-next-norm buffers, row count, width,

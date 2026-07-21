@@ -2425,7 +2425,8 @@ impl MetalExecutionContext {
         scheduled: &ScheduledLayerMajorExperts,
         post_attention: &MetalLayerMajorPostAttention,
         shared: ScheduledSharedExpertPhaseRef<'_>,
-    ) -> anyhow::Result<Vec<f32>> {
+        next_norm_weight: Option<&[f32]>,
+    ) -> anyhow::Result<MetalQwenPrefillLayerOutput> {
         let dense_weights = self
             .dense_weights
             .as_ref()
@@ -2436,9 +2437,10 @@ impl MetalExecutionContext {
             Arc::clone(&self.buffers),
             self.norm_epsilon,
         )
-        .execute_layer_major(scheduled, post_attention, shared)
+        .execute_layer_major(scheduled, post_attention, shared, next_norm_weight)
     }
 
+    #[cfg(test)]
     pub(crate) fn qwen_rms_norm_rows(
         &self,
         input: &[f32],
@@ -3529,7 +3531,8 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         scheduled: &ScheduledLayerMajorExperts,
         post_attention: &MetalLayerMajorPostAttention,
         shared: ScheduledSharedExpertPhaseRef<'_>,
-    ) -> anyhow::Result<Vec<f32>> {
+        next_norm_weight: Option<&[f32]>,
+    ) -> anyhow::Result<MetalQwenPrefillLayerOutput> {
         let rows = scheduled.rows();
         let active_experts = scheduled.active_experts();
         let normed = post_attention.normed();
@@ -3549,6 +3552,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
             || scheduled.route_slots().len() != route_count
             || scheduled.weights().len() != route_count
             || scheduled.experts().is_empty()
+            || next_norm_weight.is_some_and(|weight| weight.len() != width)
         {
             bail!(
                 "Qwen layer-major expert command has incompatible geometry layer={} rows={rows} width={width} active={active_experts} normed={} residual={} routes={} weights={} unique={}",
@@ -3578,6 +3582,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 &grouped_output_indices,
                 &groups,
                 shared,
+                next_norm_weight,
             )
         })
     }
@@ -3780,7 +3785,8 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
         grouped_output_indices: &[u32],
         groups: &[(usize, usize)],
         shared: ScheduledSharedExpertPhaseRef<'_>,
-    ) -> anyhow::Result<Vec<f32>> {
+        next_norm_weight: Option<&[f32]>,
+    ) -> anyhow::Result<MetalQwenPrefillLayerOutput> {
         unsafe {
             let rows = scheduled.rows();
             let active_experts = scheduled.active_experts();
@@ -3857,6 +3863,17 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     rows * width * std::mem::size_of::<f32>(),
                     &mut phase_buffers,
                 )?;
+                let next_norm = next_norm_weight
+                    .map(|weight| -> anyhow::Result<_> {
+                        let weight_buffer =
+                            self.phase_buffer_with_bytes(f32_as_bytes(weight), &mut phase_buffers)?;
+                        let output_buffer = self.phase_buffer(
+                            rows * width * std::mem::size_of::<f32>(),
+                            &mut phase_buffers,
+                        )?;
+                        Ok((weight_buffer, output_buffer))
+                    })
+                    .transpose()?;
                 Ok((
                     gathered_buffer,
                     grouped_source_rows_buffer,
@@ -3868,6 +3885,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     grouped_output_buffer,
                     shared_output_buffer,
                     hidden_buffer,
+                    next_norm,
                 ))
             })();
             let (
@@ -3881,6 +3899,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 grouped_output_buffer,
                 shared_output_buffer,
                 hidden_buffer,
+                next_norm,
             ) = match setup {
                 Ok(values) => values,
                 Err(error) => {
@@ -3909,6 +3928,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 MetalObjcId,
                 MetalObjcId,
                 usize,
+                Option<MetalObjcId>,
                 Option<MetalLayerMajorOneRowReference>,
             )> {
                 let gathered_values = route_count
@@ -4122,12 +4142,38 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 set_bytes(encoder, u32_as_bytes(&active_u32), 9);
                 set_bytes(encoder, u32_as_bytes(&shared_router_width_u32), 10);
                 dispatch_threads(encoder, (rows * width) as u64);
+                let next_normed_buffer = if let Some((weight_buffer, output_buffer)) = next_norm {
+                    msg_send_void1_id(
+                        encoder,
+                        sel("setComputePipelineState:"),
+                        self.runtime.pipelines.rms_norm_reduced_pipeline,
+                    );
+                    set_buffer(encoder, hidden_buffer, 0);
+                    set_buffer(encoder, weight_buffer, 1);
+                    set_buffer(encoder, output_buffer, 2);
+                    set_bytes(encoder, u32_as_bytes(&width_u32), 3);
+                    set_bytes(
+                        encoder,
+                        f32_as_bytes(std::slice::from_ref(&self.norm_epsilon)),
+                        4,
+                    );
+                    msg_send_void2_size(
+                        encoder,
+                        sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                        MetalDispatchSize::new(1, rows as u64, 1),
+                        MetalDispatchSize::new(256, 1, 1),
+                    );
+                    Some(output_buffer)
+                } else {
+                    None
+                };
                 Ok((
                     hidden_buffer,
                     grouped_output_buffer,
                     shared_output_buffer,
                     shared_router,
                     shared_router_width,
+                    next_normed_buffer,
                     one_row_reference,
                 ))
             })();
@@ -4137,6 +4183,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                 shared_output_buffer,
                 shared_router,
                 shared_router_width,
+                next_normed_buffer,
                 one_row_reference,
             ) = match encode_result {
                 Ok(result) => result,
@@ -4225,10 +4272,31 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     }
                 }
             }
-            let hidden = self.buffers.read_f32_buffer(hidden_buffer, rows * width);
             drop(encoding);
-            self.buffers.recycle_or_release_phase(phase_buffers, false);
-            Ok(hidden)
+            let output = MetalQwenPrefillLayerOutput::new(
+                Arc::clone(&self.buffers),
+                scheduled.layer(),
+                hidden_buffer,
+                next_normed_buffer,
+                rows,
+                width,
+            );
+            match output {
+                Ok(output) => {
+                    let transient = phase_buffers
+                        .into_iter()
+                        .filter(|phase| {
+                            phase.id != hidden_buffer && next_normed_buffer != Some(phase.id)
+                        })
+                        .collect();
+                    self.buffers.recycle_or_release_phase(transient, false);
+                    Ok(output)
+                }
+                Err(error) => {
+                    self.buffers.recycle_or_release_phase(phase_buffers, false);
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -6232,6 +6300,85 @@ impl Drop for MetalLayerMajorPostAttention {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct MetalQwenPrefillLayerOutput {
+    buffers: Arc<MetalBufferPool>,
+    layer: usize,
+    hidden: MetalMatrixBuffer,
+    next_normed: Option<MetalMatrixBuffer>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetalQwenPrefillLayerOutput {
+    fn new(
+        buffers: Arc<MetalBufferPool>,
+        layer: usize,
+        hidden_buffer: MetalObjcId,
+        next_normed_buffer: Option<MetalObjcId>,
+        rows: usize,
+        width: usize,
+    ) -> Result<Self> {
+        if next_normed_buffer == Some(hidden_buffer) {
+            bail!("Qwen prefill hidden and next-norm matrices cannot alias");
+        }
+        let hidden = MetalMatrixBuffer::new(
+            hidden_buffer,
+            FlashMoeGpuMatrixDescriptor::hidden(rows, width)?,
+        )?;
+        let next_normed = next_normed_buffer
+            .map(|buffer| {
+                MetalMatrixBuffer::new(
+                    buffer,
+                    FlashMoeGpuMatrixDescriptor::next_layer_normed(rows, width)?,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            buffers,
+            layer,
+            hidden,
+            next_normed,
+        })
+    }
+
+    pub(crate) fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn hidden(&self) -> MetalMatrixBuffer {
+        self.hidden
+    }
+
+    pub(crate) fn next_normed(&self) -> Option<MetalMatrixBuffer> {
+        self.next_normed
+    }
+
+    pub(crate) fn materialize(&self) -> (Vec<f32>, Option<Vec<f32>>) {
+        unsafe {
+            let hidden = self
+                .buffers
+                .read_f32_buffer(self.hidden.buffer(), self.hidden.values());
+            let next_normed = self.next_normed.map(|matrix| {
+                self.buffers
+                    .read_f32_buffer(matrix.buffer(), matrix.values())
+            });
+            (hidden, next_normed)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for MetalQwenPrefillLayerOutput {
+    fn drop(&mut self) {
+        let mut buffers = vec![self.hidden.buffer()];
+        if let Some(next_normed) = self.next_normed {
+            buffers.push(next_normed.buffer());
+        }
+        self.buffers.recycle_or_release(&buffers, false);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn encode_q4_mmap_multilinear(
     pipelines: &MetalPipelineSet<MetalObjcId>,
     encoder: MetalObjcId,
@@ -7852,6 +7999,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_rms_norm_rows(
         &self,
         input: &[f32],

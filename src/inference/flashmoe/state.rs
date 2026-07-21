@@ -230,7 +230,6 @@ impl FlashMoeGpuMatrixDescriptor {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn hidden(rows: usize, width: usize) -> Result<Self> {
         Self::new(FlashMoeStateBufferRole::Hidden, rows, width)
     }
@@ -241,6 +240,10 @@ impl FlashMoeGpuMatrixDescriptor {
 
     pub(crate) fn normed(rows: usize, width: usize) -> Result<Self> {
         Self::new(FlashMoeStateBufferRole::Normed, rows, width)
+    }
+
+    pub(crate) fn next_layer_normed(rows: usize, width: usize) -> Result<Self> {
+        Self::new(FlashMoeStateBufferRole::NextLayerNormed, rows, width)
     }
 
     pub(crate) fn role(self) -> FlashMoeStateBufferRole {

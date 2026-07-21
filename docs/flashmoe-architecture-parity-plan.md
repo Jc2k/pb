@@ -200,10 +200,12 @@ sampling-only decode change was promoted.
 Status: **Design record; implementation active.** The promoted command is layer-major in traversal
 and scheduler ownership. Its first device-resident seam now keeps post-attention residual/normed
 matrices on Metal across CPU top-10 routing and feeds them directly to the common resident/streamed
-expert command; a Metal gather applies the scheduler's exact grouped-row order. Other matrix phases
-remain host-synchronized: attention output and post-expert hidden/next-norm state are still read back
-and uploaded by the following builder. CPU top-10 routing is an intentional host boundary; complete
-hidden and normalized matrices are not.
+expert command; a Metal gather applies the scheduler's exact grouped-row order. That command now
+owns its hidden/optional next-norm output and computes next norm without a separate command or hidden
+reupload. Other matrix phases remain host-synchronized: attention output and post-expert
+hidden/next-norm state are still read back for legacy layer-state recording and the following
+builder. CPU top-10 routing is an intentional host boundary; complete hidden and normalized
+matrices are not.
 
 The next graph keeps chunk hidden/normed state in a typed Metal owner across layer boundaries,
 reads back only authoritative routing/KV/session facts and the final row, and feeds the same
@@ -221,6 +223,11 @@ A same-prompt probe after the first owned seam preserved the greedy continuation
 and again ended with zero active general buffers, transient expert buffers, or in-flight commands.
 This is migration evidence, not promotion evidence: complete cross-layer ownership and the locked
 performance gate remain open.
+A second migration probe moved next norm into the owned expert output. It preserved `a`, reduced
+the prefill command count from 239 to 192 and upload to 144,909,328 bytes, kept readback at
+155,361,280 bytes, and again balanced all request-scoped resources. The unchanged readback isolates
+the next task: remove the legacy per-layer host materialization before feeding the owned norm to the
+following layer.
 
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by
