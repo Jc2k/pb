@@ -331,7 +331,7 @@ tools = ["run_command"]
 question = "Allow this command?"
 
 [rules.params]
-command = { regex = "(^|\\s)(git push|gh pr create)(\\s|$)" }
+cmd = { regex = "(^|\\s)(git push|gh pr create)(\\s|$)" }
 
 [[rules]]
 name = "block recursive deletes"
@@ -340,11 +340,21 @@ profiles = ["build"]
 tools = ["run_command"]
 
 [rules.params]
-command = { regex = "rm\\s+-rf" }
+cmd = { regex = "rm\\s+-rf" }
 ```
+
+Exact tool names and their argument paths are validated when the session starts. A misspelled tool
+or argument makes the policy fail closed instead of silently leaving the call unmatched. Wildcard
+tool rules remain available when one rule intentionally spans several tool schemas, but the
+wildcard must match an exposed tool and every constrained argument must exist on at least one
+matching schema.
 
 Policy is evaluated in addition to workflow-stage capabilities. A policy can narrow an available
 tool call; it cannot make a tool available in a stage where the harness forbids it.
+
+Parameter matchers accept scalar literals or explicit `{ equals, contains, glob, regex, exists }`
+tables. Unknown root, rule, or matcher fields fail configuration loading, so a misspelled matcher
+cannot degrade into an inert literal object.
 
 ## MCP and LSP integrations
 
@@ -368,6 +378,7 @@ container_image = "ghcr.io/example/project-mcp:latest"
 workspace = "read_only" # none | read_only | read_write
 network = "none"        # none | session | egress
 cache_ids = []
+read_only_tools = ["search_*", "get_document"]
 
 [mcp.servers.example.capabilities.secret_env]
 API_TOKEN = "EXAMPLE_API_TOKEN"
@@ -377,8 +388,20 @@ Workspace, network, cache, and secret capabilities default to none for a contain
 values are resolved from the host environment at launch and are not written to project
 configuration, command arguments, or the session ledger.
 
+`read_only_tools` is a separate, operator-audited list of raw server tool names or `*` patterns.
+It defaults to empty. Only matching tools are exposed to current agents; server annotations are
+descriptive hints and cannot grant authority. pb currently has no external-mutation MCP workflow,
+so a mutating tool cannot be enabled merely by granting its service read-write workspace access.
+Unsupported dynamic schemas, duplicate normalized names, and failed discovery are exposed only as
+explicit integration status failures. Empty, oversized, or unmatched `read_only_tools` patterns
+also produce a status failure instead of silently broadening or pretending to expose a tool.
+
 Host-command MCP servers are less isolated. Container-backed sessions require such integrations to
 use a container image so pb can enforce workspace, cache, and network capabilities.
+When a container integration retains the older `container_runtime` field, pb treats it as an exact
+compatibility assertion against the runtime that owns the session. A mismatch fails startup rather
+than silently launching with a different runtime; the field does not create an independent runtime
+or cleanup domain for that one service.
 
 The GitHub setup flow uses a loopback OAuth callback and writes its token below the user
 configuration directory with owner-only mode on Unix:
@@ -386,6 +409,11 @@ configuration directory with owner-only mode on Unix:
 ```bash
 pb mcp setup github
 ```
+
+Setup establishes the server and credential path but deliberately leaves `read_only_tools` empty.
+Inspect the raw tool names reported by the server, then add only the operations you have audited as
+read-only. This prevents an updated external server from granting new authority through its own
+annotations.
 
 On macOS, Safari Technology Preview 247 or newer includes its own local MCP server. pb does not
 ship a separate WebDriver browser-control layer. Configure the preview server for the current
@@ -396,6 +424,9 @@ pb mcp setup safari
 ```
 
 The command points the project MCP entry at Safari Technology Preview's `safaridriver --mcp`.
+It also leaves `read_only_tools` empty; browser navigation, clicks, typing, and page-side actions are
+not read-only merely because they do not modify the repository. Add only genuinely observational
+raw tools after auditing the installed Safari server.
 Before starting an agent, enable **Developer > Enable remote automation and external agents** in
 Safari Technology Preview. Use `--driver-path` if the application is installed somewhere other
 than `/Applications`. Because this is a host-command MCP server, use it with a local execution

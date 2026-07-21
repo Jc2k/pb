@@ -15,6 +15,7 @@ updates, and provider publication are explicit paths across the machine boundary
 | FlashMoe session and shared-prefix states | `<platform-cache>/pb/flashmoe-session-v1` or `<storage.cache_dir>/flashmoe-session-v1` | Owner-only, content-addressed and byte-budgeted KV/MLA/recurrent checkpoints; contains token ids and prompt-derived state. |
 | Project configuration | `<repository>/.pb/` | Owned by the repository; may be committed intentionally. |
 | Session history and workflow checkpoints | Repository-local Git notes under `refs/notes/pb/sessions` | Kept locally until the session is deleted; may include bounded exact bytes from complete small-file reads for cross-stage evidence; Git notes are not pushed by ordinary branch pushes. |
+| Durable project memory | Repository-local `refs/pb/memory` | Evidence-backed Markdown outside the working tree and ordinary branch pushes; bounded to 500 entries and 4 MiB until the ref is changed or removed. |
 | Session containers, networks, workspaces, and services | Runtime-managed, session-owned resources | Reconciled and removed at terminal cleanup or expiry. |
 | Declared images and caches | Container/model runtime storage | May persist for reuse and garbage collection. |
 
@@ -27,8 +28,10 @@ Data crosses the local boundary when you choose a feature that requires it:
 
 - `pb pull` downloads model artifacts;
 - `pb self update` checks and downloads GitHub release assets;
-- public `web_search` or `web_fetch` tools send a query or URL to their configured service;
-- a remote MCP server receives the arguments supplied to one of its tools;
+- public `web_search` or `web_fetch` tools send a query or URL to the built-in search endpoint or
+  fetched destination; pb bypasses ambient proxies and accepts only validated public HTTP(S)
+  targets, but the request is still a disclosure;
+- a remote MCP server receives the arguments supplied to an operator-declared read-only tool;
 - a container or service with `network = "egress"` can reach external networks;
 - GitHub OAuth contacts GitHub and stores the returned token locally;
 - any shell command or configured task can perform network activity if its execution environment
@@ -57,7 +60,8 @@ For an offline-oriented project:
 
 1. Pull model artifacts before disconnecting.
 2. Keep `web.listen` on loopback.
-3. Disable remote MCP servers in `.pb/mcp.toml`.
+3. Disable remote MCP servers in `.pb/mcp.toml`, or keep a minimal audited
+   `capabilities.read_only_tools` list.
 4. Give container services `network = "none"` unless they need more.
 5. Add project policy rules that deny `web_search`, `web_fetch`, and network-capable shell commands.
 6. Review configured tasks: a broad shell task is a broad authority grant.

@@ -1340,6 +1340,9 @@ fn mcp_setup_safari(args: McpSetupSafariArgs) -> Result<()> {
             mcp::project_mcp_config_path(&root).display()
         );
         println!(
+            "No Safari tools are exposed yet. Audit the server's raw tool names and add only read-only operations to capabilities.read_only_tools in .pb/mcp.toml."
+        );
+        println!(
             "In Safari Technology Preview, enable Developer > Enable remote automation and external agents before starting the agent."
         );
         Ok(())
@@ -1422,6 +1425,9 @@ async fn mcp_setup_github(args: McpSetupGithubArgs) -> Result<()> {
         "GitHub MCP server '{}' saved to {}.",
         args.server_name,
         mcp::project_mcp_config_path(&root).display()
+    );
+    println!(
+        "No GitHub tools are exposed yet. Audit the server's raw tool names and add only read-only operations to capabilities.read_only_tools in .pb/mcp.toml."
     );
     println!("GitHub OAuth token saved to {}.", token_path.display());
     if let Some(repo) = current_github_repo(&root)? {
@@ -4983,6 +4989,7 @@ mod tests {
         assert!(command.contains("exec 'docker' run"));
         assert!(command.contains("GITHUB_PERSONAL_ACCESS_TOKEN"));
         assert!(command.contains("ghcr.io/github/github-mcp-server"));
+        assert!(config.capabilities.read_only_tools.is_empty());
     }
 
     #[test]
@@ -5011,6 +5018,7 @@ mod tests {
         assert_eq!(config.args, vec!["--mcp"]);
         assert!(config.env.is_empty());
         assert!(!config.disabled);
+        assert!(config.capabilities.read_only_tools.is_empty());
     }
 
     #[test]

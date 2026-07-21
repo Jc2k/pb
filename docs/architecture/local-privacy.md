@@ -76,8 +76,10 @@ runtime artifacts remain local for reuse after the operation.
 ### Public research
 
 Planning, review, discussion, implementation, and repair may expose public research tools. A query
-or fetched URL necessarily reaches the configured search/fetch service. Project policy can deny or
-ask for those tools when that is inappropriate.
+or fetched URL necessarily reaches the built-in search endpoint or fetched destination. The client
+does not use ambient proxies: it validates every URL and redirect, rejects credentials and any DNS
+set containing a private or special-use address, and pins the connection to one validated public
+answer. Responses are byte-bounded. These SSRF controls do not make a public query private.
 
 ### MCP and services
 
@@ -86,11 +88,18 @@ only the workspace, network, cache, and secret capabilities declared for it, but
 the service can communicate outside the session. Capability declaration makes the edge auditable;
 it does not make a third party private.
 
+Individual MCP tools are exposed only when their raw names match the operator-audited
+`capabilities.read_only_tools` list. Server annotations cannot authorize themselves, and the current
+workflow exposes no external MCP mutation. “Read-only” describes the operator's intended effect;
+it is not a confidentiality guarantee—arguments and reachable service data still cross that
+integration's boundary.
+
 Local host-command MCP servers stay on the machine but inherit the user's host permissions. Safari
 browser automation is one example: pb exposes Safari Technology Preview's own MCP tools when the
-server is configured, rather than owning a parallel WebDriver session. Page content, screenshots,
-console data, and other browser diagnostics flow from Safari to the local agent process. They do
-not become a network disclosure unless another enabled edge sends them elsewhere.
+server is configured and its desired raw tool names are explicitly classified read-only, rather
+than owning a parallel WebDriver session. Page content, screenshots, console data, and other browser
+diagnostics flow from Safari to the local agent process. They do not become a network disclosure
+unless another enabled edge sends them elsewhere.
 
 ### Commands
 
@@ -105,6 +114,7 @@ explicit local backend inherits host connectivity.
 | User-global | Model preferences, project registry, OAuth token | Stored below the user's config/data roots; not checked into a project. |
 | Repository-owned | `.pb/` configuration, source, acceptance facts | Visible to project collaborators if committed; secret values should not appear here. |
 | Session-owned | Task workspace, container, services, network, event stream, active/completed Goal checkpoints | Reconciled or removed when terminal/expired, except persisted history. |
+| Durable project memory | Evidence-backed Markdown entries under local `refs/pb/memory` | Outside the working tree and ordinary branch pushes; bounded and retained until that ref is changed or removed. |
 | Reusable local artifact | Model weights, images, declared caches, llama.cpp and FlashMoe session state | May survive sessions; managed separately from task cleanup. |
 | External disclosure | Search query, remote tool arguments, provider mutation | Occurs only through an enabled edge; governed by its provider and local policy. |
 

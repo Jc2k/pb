@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -19,6 +21,83 @@ const MIN_INSTRUCTION_EXCERPT_CHARS: usize = 240;
 const MAX_CHECK_EXCERPT_CHARS: usize = 480;
 const MAX_CHECK_BRIEF_CHARS: usize = 8_000;
 const MIN_INSPECTION_CHARS: usize = 512;
+const MAX_INSPECTION_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_INSPECTION_PROCESS_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INSTRUCTION_FILE_BYTES: u64 = 256 * 1024;
+
+fn read_bounded_bytes(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
+    let file =
+        File::open(path).with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat {label} {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        bail!(
+            "{label} {} exceeds the {max_bytes}-byte input bound",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "{label} {} grew beyond the {max_bytes}-byte input bound",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+fn run_bounded_command(mut command: Command, label: &str) -> Result<std::process::Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start {label}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("command stdout was unavailable")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("command stderr was unavailable")?;
+    let stdout_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .by_ref()
+            .take((MAX_INSPECTION_PROCESS_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .by_ref()
+            .take((MAX_INSPECTION_PROCESS_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for {label}"))?;
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("{label} stdout reader panicked"))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("{label} stderr reader panicked"))??;
+    if stdout.len() > MAX_INSPECTION_PROCESS_BYTES || stderr.len() > MAX_INSPECTION_PROCESS_BYTES {
+        bail!("{label} exceeded the {MAX_INSPECTION_PROCESS_BYTES}-byte output bound");
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct RepositoryBrief {
@@ -415,7 +494,7 @@ fn discover_project_instructions(
         if !path.is_file() {
             continue;
         }
-        let bytes = std::fs::read(&path)
+        let bytes = read_bounded_bytes(&path, MAX_INSTRUCTION_FILE_BYTES, "project instructions")
             .with_context(|| format!("failed to read project instructions {relative}"))?;
         if bytes.contains(&0) {
             continue;
@@ -633,8 +712,7 @@ fn content_kind(
     match content.kind.as_str() {
         "file" if status == ChangeStatus::Deleted => Ok(ReviewContentKind::Unknown),
         "file" => {
-            let bytes = std::fs::read(&absolute)
-                .with_context(|| format!("failed to inspect review path {}", absolute.display()))?;
+            let bytes = read_bounded_bytes(&absolute, MAX_INSPECTION_FILE_BYTES, "review path")?;
             Ok(if bytes.contains(&0) {
                 ReviewContentKind::Binary
             } else {
@@ -652,8 +730,7 @@ fn reviewable_text_file(path: &Path) -> Result<bool> {
     if !path.is_file() {
         return Ok(false);
     }
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to inspect review path {}", path.display()))?;
+    let bytes = read_bounded_bytes(path, MAX_INSPECTION_FILE_BYTES, "review path")?;
     Ok(!bytes.contains(&0))
 }
 
@@ -740,8 +817,12 @@ pub(crate) fn inspect_change(
     let current_path = workspace_root.join(&inspected_path);
     let (current_bytes, current_lines, current_sha256, reviewable_text) = if current_path.is_file()
     {
-        let bytes = std::fs::read(&current_path)
-            .with_context(|| format!("failed to read changed path {inspected_path}"))?;
+        let bytes = read_bounded_bytes(
+            &current_path,
+            MAX_INSPECTION_FILE_BYTES,
+            "changed review path",
+        )
+        .with_context(|| format!("failed to read changed path {inspected_path}"))?;
         let lines = (!bytes.contains(&0)).then(|| String::from_utf8_lossy(&bytes).lines().count());
         let sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
         (Some(bytes.len()), lines, sha256, !bytes.contains(&0))
@@ -775,8 +856,12 @@ pub(crate) fn inspect_change(
     let diff = render_path_diff(workspace_root, entry)?;
     let ranges = parse_new_hunk_ranges(&diff);
     let context = if reviewable_text {
-        let bytes = std::fs::read(&current_path)
-            .with_context(|| format!("failed to read changed text path {inspected_path}"))?;
+        let bytes = read_bounded_bytes(
+            &current_path,
+            MAX_INSPECTION_FILE_BYTES,
+            "changed review text",
+        )
+        .with_context(|| format!("failed to read changed text path {inspected_path}"))?;
         let text = String::from_utf8_lossy(&bytes);
         render_hunk_context(&text, &ranges, context_budget)
     } else {
@@ -851,9 +936,7 @@ fn render_path_diff(workspace_root: &Path, entry: &ChangeManifestEntry) -> Resul
         command.arg(previous);
     }
     command.arg(&entry.path);
-    let output = command
-        .output()
-        .context("failed to render focused change diff")?;
+    let output = run_bounded_command(command, "focused change diff")?;
     if !output.status.success() {
         bail!(
             "failed to render focused change diff for '{}': {}",

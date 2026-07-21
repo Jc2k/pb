@@ -42,6 +42,13 @@ where delivery may act. A task-owned workspace separates the user's baseline fro
 Promotion and commit checks prevent undeclared output or unrelated repository state from being
 quietly absorbed into the result.
 
+For built-in file mutation, “read before write” means the exact bytes read still match immediately
+before atomic replacement. A concurrent edit invalidates that evidence. Configured tasks stage and
+validate their complete declared output set before transactional promotion and restore earlier
+destinations if promotion fails. The agent cannot request recursive directory deletion.
+Structural moves are likewise limited to files and symlinks, so a single allowed path cannot hide
+a recursive subtree move.
+
 A broad task command is treated as broad authority, not described as a sandbox. The user remains
 responsible for how much authority project configuration grants.
 
@@ -53,6 +60,11 @@ only bounded read-only authority and cannot delegate or advance the caller.
 
 Project policy can make a permitted operation require approval or be denied. It cannot expose an
 operation the stage does not allow.
+
+The former model-owned `todo`, `git_commit`, and `git_revert` tools are retired from every current
+surface; plans, checkpoints, and managed commit stages own those concerns. Dynamic MCP tools are
+also fail-closed: only operator-declared read-only raw tool names are exposed, and server-provided
+effect annotations cannot authorize a call. External MCP mutation has no current workflow surface.
 
 ## Acceptance contract
 
@@ -100,11 +112,22 @@ A change-bearing Ready build carries evidence that is current for the managed co
 Evidence becomes stale after a relevant mutation. pb refreshes it or stops; it does not silently
 reuse a receipt for earlier content.
 
+File-read evidence binds the bytes actually returned, not merely a path observed at some point.
+In strict delivery and acceptance contracts, named check evidence comes only from `run_check(id)`;
+a similar `run_command` or `run_task` result is diagnostic evidence, not an acceptance receipt. A
+restored legacy/direct request may still route an exact configured guard command through the check
+runtime for compatibility, but that path cannot satisfy a strict workflow contract.
+
 ## Failure contract
 
 pb distinguishes failure modes instead of collapsing them into model prose. Blocked user input,
 unavailable executors, failed checks, exhausted repair, control violations, step limits,
 cancellation, and unsatisfied acceptance have distinct terminal paths.
+
+Tool failures preserve the distinction too. Command timeout, user cancellation, nonzero exit, and
+bounded output are structured results. MCP/LSP transport failures are distinct from remote
+application errors, so an application failure cannot cause an unsafe automatic replay. Oversized
+inputs and responses fail explicitly rather than being presented as complete evidence.
 
 Budgets apply across retries and advisors. Recovery can help express an allowed action, but it does
 not erase usage, broaden authority, or turn a partial result into success.

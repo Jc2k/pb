@@ -50,18 +50,68 @@ global call and token limits.
 Rules are first-match. An unmatched call is allowed, so policy should not be mistaken for a default-
 deny boundary. It is also subordinate to stage capabilities: it can narrow authority, never add it.
 
+Policy is compiled against the complete exposed tool-schema set before the session starts. Exact
+selectors must name an exposed tool and valid argument paths. Wildcard selectors must match at
+least one exposed tool, and every constrained argument must exist on at least one matching schema.
+Regular expressions are compiled eagerly. A stale or misspelled rule therefore stops the session
+instead of silently failing to protect the intended call.
+
 ### Managed repository boundary
 
 The workflow owns commit creation and checks the task workspace and expected repository state before
 committing. Task contracts can restrict allowed paths and require specific mutations or checks.
-Configured task outputs are promoted through controlled file operations; unexpected changes do not
-gain check or commit credit.
+Existing files can be changed only after a read of the exact current bytes, recorded by content
+fingerprint. Writes use synced temporary files and atomic no-clobber or replace operations, with a
+final stale-content check immediately before replacement. Recursive deletion is not exposed.
+
+Configured tasks run in an isolated snapshot. pb rejects Git-control changes, undeclared paths,
+unsafe symlinks, and boundedness violations before staging every output. Promotion is transactional:
+if one destination fails, previously promoted paths are restored. Unexpected changes do not gain
+check or commit credit, and `run_task` never substitutes for a named `run_check` receipt.
 
 ### Bounded execution
 
 Step, invocation, token, advisory, plan, and repair budgets cap model-driven work. The no-progress
 guard fingerprints repeated failed operations against unchanged workspace/evidence state and can
 block a call or terminate the run without spending another model turn.
+
+Host and managed commands drain stdout and stderr concurrently into one bounded result. They have
+explicit timeouts, distinguish cancellation from timeout and nonzero exit, and terminate the owned
+host process group or managed exec. Discovery, repository reads, integration configuration,
+connector responses, task promotion, vision input, web bodies, and durable memory each have byte,
+count, or time ceilings at their trust boundary.
+
+### Dynamic tools do not grant themselves authority
+
+An MCP server's annotations are treated as untrusted descriptive hints. A discovered tool is
+exposed only when its raw server name matches the operator-audited
+`capabilities.read_only_tools` declaration. pb currently has no workflow authority for external
+MCP mutation, so undeclared or mutating MCP tools remain hidden in every stage. The server's
+workspace/network/container capability declaration controls its environment but does not classify
+individual tool effects.
+
+MCP and LSP discovery reject unsupported schema keywords, oversized or unbounded discovery,
+normalized-name collisions, and malformed responses. An MCP `isError` result is a failed tool call.
+Only an operator-declared read-only tool that the server also marks idempotent can retry, and then
+only after a typed transport failure. LSP restarts follow the same typed transport boundary;
+protocol/application errors do not trigger blind replay.
+
+Container-backed connector processes remain resources of the session environment. A retained
+per-integration `container_runtime` value must match the owning session runtime or startup fails;
+it cannot silently select a second cleanup domain.
+
+### Network and media inputs are validated
+
+Public research accepts only HTTP(S). Every initial URL and redirect rejects embedded credentials,
+local names, and private or special-use addresses. pb resolves all answers, rejects the target if
+any answer is non-public, pins the connection to a validated address, bypasses ambient proxies, and
+fails on redirect or response-size ceilings. This controls pb's built-in research client; a shell
+command or configured integration can still implement its own network behavior.
+
+Vision accepts only a regular file inside the workspace or a path exactly registered as a session
+attachment, with prompt, file-size, and decoded-pixel limits. Durable memory treats entries as
+untrusted evidence, bounds repository and entry size, and lets an agent propose only facts, gotchas,
+procedures, and debt. A model-supplied field cannot approve a decision or preference.
 
 ### Goal control cannot self-amplify
 
@@ -111,7 +161,7 @@ ephemeral workspaces are session-owned.
 | Local execution backend | Commands run on the host with the user's OS permissions. Tool gating and policy still apply, but this is not filesystem, process, or network containment. |
 | Broad configured task or `run_command` | Shell authority is intentionally broad within its execution environment. Review tasks and add policy where needed. |
 | Unmatched policy call | Allowed. Add explicit rules for operations that need deny or approval behavior. |
-| Public research and remote MCP | Data can leave the machine when the tool is invoked. Stage gating is not a confidentiality proof. |
+| Public research and remote MCP | Data can leave the machine when the tool is invoked. URL validation and read-only tool classification are not confidentiality proofs about the remote service. |
 | Web listener | Loopback by default. A non-loopback listener is not automatically protected by authentication or TLS and is advertised through Bonjour for wake-on-HTTP. |
 | Container runtime | Isolation depends on the selected runtime and host configuration. Persistent images/caches remain outside the ephemeral resource lifecycle. |
 | Publication | Local Ready evidence does not authorize a push, pull request, merge, or provider-side mutation. |

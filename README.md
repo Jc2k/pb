@@ -52,7 +52,7 @@ local privacy boundaries, and contracts with the user; its Markdown source lives
 - `pb env pull <image>` / `pb env build` - configure the default Apple-container-backed project environment.
 - `pb env local [--init <cmd>]` - force the project environment to run commands locally from the repository root, useful for macOS-only builds that cannot run inside Apple containers.
 - `pb env start|status` - verify or inspect the configured project execution backend.
-- the local agent can use built-in workspace editing tools, a shared in-memory `todo(action,id,title,description,status,parent_id,note)` task list, plus read-only `web_search(query)` and `web_fetch(url)` actions for public web research. Configured MCP servers are discovered at session start and exposed to the model as `mcp_<server>_<tool>` tools alongside the built-ins. Agents can call `sub_agent(profile,task,max_steps)` for bounded read-only advice without bloating the primary conversation; advisory work runs against an isolated workspace snapshot, cannot delegate again, and returns a structurally truncated result.
+- the local agent can use bounded workspace read/edit tools plus public `web_search(query)` and `web_fetch(url)` research. Harness plans and checkpoints own task state; model-owned todo and Git-history tools are not exposed. Configured MCP servers are discovered at session start, but only raw tool names explicitly classified in `capabilities.read_only_tools` enter the model prompt as `mcp_<server>_<tool>`. Agents can call `sub_agent(profile,task,max_steps)` for bounded read-only advice without bloating the primary conversation; advisory work runs against an isolated workspace snapshot, cannot delegate again, and returns a structurally truncated result.
 - `pb serve` - start a Rust web server, the local Unix-socket RPC endpoint, and the embedded SPA for browser-based sessions.
 - `pb service start|stop|restart` - on macOS, control the installed launchd agents for `pb serve` and the menu bar item.
 
@@ -91,14 +91,19 @@ Global MCP servers live in `~/.config/pb/config.toml` under `[mcp.servers.<name>
 [mcp.servers.docs]
 command = "node"
 args = ["/absolute/path/to/docs-mcp-server.js"]
-working_directory = "/absolute/path/to/repo"
+working_directory = "."
 disabled = false
 
-[mcp.servers.docs.env]
-API_TOKEN = "..."
+[mcp.servers.docs.capabilities]
+read_only_tools = ["search_*", "get_document"]
 ```
 
-When a session starts, pb initializes each enabled stdio MCP server, calls `tools/list`, and adds those schemas to the LLM prompt. Tool calls are routed back through `tools/call` with the model-supplied arguments.
+When a session starts, pb initializes each enabled stdio MCP server and calls `tools/list`. It
+rejects schemas it cannot enforce and exposes only operator-audited read-only names. Server effect
+annotations are descriptive hints, not authority. Calls are routed back through `tools/call`; a
+reported MCP error is a failed call, and automatic replay is limited to an idempotent read-only
+operation after a typed transport failure. See the configuration guide for container capabilities
+and secret references.
 
 ## Web UI (`pb serve`)
 
@@ -181,7 +186,7 @@ tools = ["run_command", "mcp_github_*"]
 question = "Allow this tool call?"
 
 [rules.params]
-command = { contains = "npm install" }
+cmd = { contains = "npm install" }
 
 [[rules]]
 name = "block recursive deletes in build"
@@ -190,7 +195,7 @@ profiles = ["build"]
 tools = ["run_command"]
 
 [rules.params]
-command = { regex = "rm\\s+-rf" }
+cmd = { regex = "rm\\s+-rf" }
 ```
 
-Parameter filters use dot paths over the full tool argument JSON, including nested objects and array indexes, and support literal values or `{ equals, contains, glob, regex, exists }` matchers.
+Parameter filters use dot paths over the full tool argument JSON, including nested objects and array indexes, and support scalar literal values or `{ equals, contains, glob, regex, exists }` matchers. Unknown policy fields fail configuration loading.

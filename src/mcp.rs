@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
@@ -18,8 +19,11 @@ const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[
     MCP_PROTOCOL_VERSION,
 ];
 const MAX_MCP_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_MCP_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_MCP_TOOL_PAGES: usize = 64;
 const MAX_MCP_TOOLS: usize = 4096;
+const MAX_MCP_DISCOVERY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MCP_READ_ONLY_PATTERNS: usize = 1024;
 const MCP_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -48,6 +52,9 @@ pub struct McpCapabilities {
     pub workspace: crate::session_environment::ServiceWorkspaceAccess,
     pub network: crate::session_environment::ServiceNetworkAccess,
     pub cache_ids: Vec<String>,
+    /// Raw MCP tool names or `*` patterns the operator asserts are read-only. Server-supplied
+    /// annotations are descriptive metadata and cannot grant stage authority by themselves.
+    pub read_only_tools: Vec<String>,
     /// Container environment key -> host environment variable name. Values are resolved only at
     /// launch and are never written to project configuration, argv, or the session ledger.
     pub secret_env: BTreeMap<String, String>,
@@ -66,6 +73,22 @@ pub struct McpToolSpec {
     pub server_tool_name: String,
     pub description: String,
     pub input_schema: Value,
+    pub read_only: bool,
+    pub server_read_only_hint: bool,
+    pub destructive: bool,
+    pub idempotent: bool,
+    pub open_world: bool,
+    pub status_error: Option<String>,
+}
+
+impl McpToolSpec {
+    pub fn parallel_safe(&self) -> bool {
+        self.read_only && self.idempotent && !self.destructive
+    }
+
+    pub fn exposable(&self) -> bool {
+        self.read_only || self.status_error.is_some()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -79,7 +102,7 @@ pub struct McpToolRegistry {
 
 impl McpToolRegistry {
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        !self.tools.values().any(McpToolSpec::exposable)
     }
 
     pub fn tool(&self, name: &str) -> Option<&McpToolSpec> {
@@ -93,8 +116,7 @@ impl ProjectMcpConfig {
         if !path.exists() {
             return Ok(None);
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let text = read_bounded_utf8(&path, MAX_MCP_CONFIG_BYTES, "MCP config")?;
         toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
     }
 
@@ -112,6 +134,31 @@ impl ProjectMcpConfig {
 
 pub fn project_mcp_config_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".pb").join("mcp.toml")
+}
+
+fn read_bounded_utf8(path: &Path, max_bytes: u64, label: &str) -> Result<String> {
+    let file =
+        File::open(path).with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat {label} {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        bail!(
+            "{label} {} exceeds the {max_bytes}-byte input bound",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "{label} {} grew beyond the {max_bytes}-byte input bound",
+            path.display()
+        );
+    }
+    String::from_utf8(bytes).with_context(|| format!("{label} is not valid UTF-8"))
 }
 
 pub fn effective_servers(
@@ -209,7 +256,16 @@ fn discover_tools_inner(
         lease: lease.clone(),
         workspace_root: workspace_root.to_path_buf(),
     };
+    let mut collided_names = BTreeSet::new();
     for (server_name, server_config) in servers {
+        if let Err(error) = validate_read_only_tool_patterns(&server_config) {
+            insert_status_tool(
+                &mut registry,
+                &server_name,
+                &format!("MCP server {server_name} has invalid read_only_tools: {error}"),
+            );
+            continue;
+        }
         match McpClient::connect(&server_name, &server_config, workspace_root, lease.as_ref())
             .and_then(|mut client| {
                 let tools = client.list_tools()?;
@@ -219,8 +275,57 @@ fn discover_tools_inner(
                 registry
                     .sessions
                     .insert(server_name.clone(), Arc::new(Mutex::new(client)));
+                for pattern in &server_config.capabilities.read_only_tools {
+                    if !server_tools
+                        .iter()
+                        .any(|tool| wildcard_tool_name_match(pattern.trim(), &tool.name))
+                    {
+                        insert_status_tool(
+                            &mut registry,
+                            &server_name,
+                            &format!(
+                                "MCP read_only_tools pattern '{}' matched no raw tool reported by server {server_name}",
+                                pattern.trim()
+                            ),
+                        );
+                    }
+                }
                 for tool in server_tools {
                     let unique_name = unique_tool_name(&server_name, &tool.name);
+                    if collided_names.contains(&unique_name) {
+                        continue;
+                    }
+                    let input_schema = normalize_input_schema(tool.input_schema);
+                    if let Err(error) =
+                        crate::agent_tool_errors::validate_supported_schema(&input_schema)
+                    {
+                        insert_status_tool(
+                            &mut registry,
+                            &server_name,
+                            &format!(
+                                "MCP tool '{}' was rejected because its input schema cannot be enforced: {error}",
+                                tool.name
+                            ),
+                        );
+                        continue;
+                    }
+                    if let Some(existing) = registry.tools.remove(&unique_name) {
+                        collided_names.insert(unique_name.clone());
+                        insert_status_tool(
+                            &mut registry,
+                            &server_name,
+                            &format!(
+                                "MCP tool-name collision: '{}:{}' and '{}:{}' both normalize to '{unique_name}'; neither tool was exposed",
+                                existing.server_name,
+                                existing.server_tool_name,
+                                server_name,
+                                tool.name,
+                            ),
+                        );
+                        continue;
+                    }
+                    let annotations = tool.annotations.unwrap_or_default();
+                    let read_only = configured_read_only_tool(&server_config, &tool.name);
                     registry.tools.insert(
                         unique_name.clone(),
                         McpToolSpec {
@@ -230,28 +335,24 @@ fn discover_tools_inner(
                             description: tool.description.unwrap_or_else(|| {
                                 format!("Tool provided by MCP server {server_name}")
                             }),
-                            input_schema: normalize_input_schema(tool.input_schema),
+                            input_schema,
+                            read_only,
+                            server_read_only_hint: annotations.read_only_hint.unwrap_or(false),
+                            destructive: annotations.destructive_hint.unwrap_or(true),
+                            idempotent: read_only && annotations.idempotent_hint.unwrap_or(false),
+                            open_world: annotations.open_world_hint.unwrap_or(true),
+                            status_error: None,
                         },
                     );
                 }
             }
             Err(err) => {
-                let tool_name = unique_tool_name(&server_name, "status");
-                registry.tools.insert(
-                    tool_name.clone(),
-                    McpToolSpec {
-                        tool_name,
-                        server_name: server_name.clone(),
-                        server_tool_name: "status".to_string(),
-                        description: format!(
-                            "MCP server {server_name} was configured but tool discovery failed: {err:#}"
-                        ),
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {},
-                            "additionalProperties": false
-                        }),
-                    },
+                insert_status_tool(
+                    &mut registry,
+                    &server_name,
+                    &format!(
+                        "MCP server {server_name} was configured but tool discovery failed: {err:#}"
+                    ),
                 );
             }
         }
@@ -259,24 +360,64 @@ fn discover_tools_inner(
     registry
 }
 
+fn insert_status_tool(registry: &mut McpToolRegistry, server_name: &str, description: &str) {
+    let digest = crate::environment_lock::sha256(description.as_bytes());
+    let tool_name = format!("mcp_status_{}", &digest[..12]);
+    registry.tools.insert(
+        tool_name.clone(),
+        McpToolSpec {
+            tool_name,
+            server_name: server_name.to_string(),
+            server_tool_name: "status".to_string(),
+            description: description.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            read_only: true,
+            server_read_only_hint: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+            status_error: Some(description.to_string()),
+        },
+    );
+}
+
 pub fn call_tool(registry: &McpToolRegistry, tool_name: &str, arguments: &Value) -> Result<String> {
     let spec = registry
         .tool(tool_name)
         .with_context(|| format!("unknown MCP tool: {tool_name}"))?;
+    if !spec.exposable() {
+        bail!(
+            "MCP tool '{}' is not exposed because it is not operator-declared read-only",
+            spec.server_tool_name
+        );
+    }
     let server = registry
         .servers
         .get(&spec.server_name)
         .with_context(|| format!("MCP server '{}' is no longer configured", spec.server_name))?;
-    if spec.server_tool_name == "status" {
-        bail!(spec.description.clone());
+    if let Some(error) = &spec.status_error {
+        bail!(error.clone());
     }
     if let Some(session) = registry.sessions.get(&spec.server_name) {
         let mut client = session
             .lock()
             .map_err(|_| anyhow!("MCP session for {} is poisoned", spec.server_name))?;
-        match client.call_tool(&spec.server_tool_name, arguments) {
-            Ok(result) => return Ok(result),
+        match client.call_tool_request(&spec.server_tool_name, arguments) {
+            Ok(result) => return format_tool_result(&result),
             Err(first_error) => {
+                if !spec.idempotent || !is_mcp_transport_failure(&first_error) {
+                    return Err(first_error).with_context(|| {
+                        format!(
+                            "MCP tool '{}' failed without a retry-safe transport failure; pb will not retry it automatically",
+                            spec.server_tool_name,
+                        )
+                    });
+                }
+                client.shutdown_transport();
                 *client = McpClient::connect(
                     &spec.server_name,
                     server,
@@ -288,12 +429,14 @@ pub fn call_tool(registry: &McpToolRegistry, tool_name: &str, arguments: &Value)
                         "MCP request failed ({first_error:#}) and the bounded restart also failed"
                     )
                 })?;
-                return client.call_tool(&spec.server_tool_name, arguments);
+                let result = client.call_tool_request(&spec.server_tool_name, arguments)?;
+                return format_tool_result(&result);
             }
         }
     }
     let mut client = McpClient::connect(&spec.server_name, server, &registry.workspace_root, None)?;
-    client.call_tool(&spec.server_tool_name, arguments)
+    let result = client.call_tool_request(&spec.server_tool_name, arguments)?;
+    format_tool_result(&result)
 }
 
 fn unique_tool_name(server_name: &str, tool_name: &str) -> String {
@@ -302,6 +445,51 @@ fn unique_tool_name(server_name: &str, tool_name: &str) -> String {
         sanitize_tool_name(server_name),
         sanitize_tool_name(tool_name)
     )
+}
+
+fn configured_read_only_tool(config: &McpServerConfig, tool_name: &str) -> bool {
+    config.capabilities.read_only_tools.iter().any(|pattern| {
+        let pattern = pattern.trim();
+        !pattern.is_empty() && pattern.len() <= 256 && wildcard_tool_name_match(pattern, tool_name)
+    })
+}
+
+fn validate_read_only_tool_patterns(config: &McpServerConfig) -> Result<()> {
+    let patterns = &config.capabilities.read_only_tools;
+    if patterns.len() > MAX_MCP_READ_ONLY_PATTERNS {
+        bail!("more than {MAX_MCP_READ_ONLY_PATTERNS} patterns were configured");
+    }
+    for pattern in patterns {
+        let pattern = pattern.trim();
+        if pattern.is_empty() || pattern.len() > 256 {
+            bail!("each pattern must contain 1 to 256 bytes");
+        }
+    }
+    Ok(())
+}
+
+fn wildcard_tool_name_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    let mut remainder = value;
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if index == 0 && !pattern.starts_with('*') {
+            let Some(next) = remainder.strip_prefix(part) else {
+                return false;
+            };
+            remainder = next;
+        } else if let Some(position) = remainder.find(part) {
+            remainder = &remainder[position + part.len()..];
+        } else {
+            return false;
+        }
+    }
+    pattern.ends_with('*') || remainder.is_empty()
 }
 
 fn sanitize_tool_name(name: &str) -> String {
@@ -338,6 +526,20 @@ struct ServerTool {
     description: Option<String>,
     #[serde(default, rename = "inputSchema")]
     input_schema: Option<Value>,
+    #[serde(default)]
+    annotations: Option<ServerToolAnnotations>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ServerToolAnnotations {
+    #[serde(default, rename = "readOnlyHint")]
+    read_only_hint: Option<bool>,
+    #[serde(default, rename = "destructiveHint")]
+    destructive_hint: Option<bool>,
+    #[serde(default, rename = "idempotentHint")]
+    idempotent_hint: Option<bool>,
+    #[serde(default, rename = "openWorldHint")]
+    open_world_hint: Option<bool>,
 }
 
 enum McpClient {
@@ -397,6 +599,7 @@ impl McpClient {
 
     fn list_tools(&mut self) -> Result<Vec<ServerTool>> {
         let mut all_tools = Vec::new();
+        let mut discovery_bytes = 0usize;
         let mut cursor = None;
         let mut seen_cursors = BTreeSet::new();
         loop {
@@ -408,6 +611,10 @@ impl McpClient {
                 .get("tools")
                 .cloned()
                 .unwrap_or_else(|| Value::Array(vec![]));
+            discovery_bytes = discovery_bytes.saturating_add(serde_json::to_vec(&tools)?.len());
+            if discovery_bytes > MAX_MCP_DISCOVERY_BYTES {
+                bail!("MCP tools/list exceeded the {MAX_MCP_DISCOVERY_BYTES}-byte discovery limit");
+            }
             let page = serde_json::from_value::<Vec<ServerTool>>(tools)
                 .context("failed to parse MCP tools/list response")?;
             if all_tools.len().saturating_add(page.len()) > MAX_MCP_TOOLS {
@@ -433,15 +640,14 @@ impl McpClient {
         Ok(all_tools)
     }
 
-    fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<String> {
-        let result = self.request(
+    fn call_tool_request(&mut self, name: &str, arguments: &Value) -> Result<Value> {
+        self.request(
             "tools/call",
             json!({
                 "name": name,
                 "arguments": arguments,
             }),
-        )?;
-        Ok(format_tool_result(&result))
+        )
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -455,6 +661,12 @@ impl McpClient {
             Self::Stdio(client) => client.notify(method, params),
         }
     }
+
+    fn shutdown_transport(&mut self) {
+        match self {
+            Self::Stdio(client) => client.shutdown_transport(),
+        }
+    }
 }
 
 struct StdioMcpClient {
@@ -464,6 +676,27 @@ struct StdioMcpClient {
     next_id: u64,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct McpTransportFailure(String);
+
+impl std::fmt::Display for McpTransportFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for McpTransportFailure {}
+
+fn mcp_transport_failure(message: impl Into<String>) -> anyhow::Error {
+    anyhow!(McpTransportFailure(message.into()))
+}
+
+fn is_mcp_transport_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<McpTransportFailure>().is_some())
 }
 
 enum McpProcess {
@@ -478,10 +711,12 @@ impl McpProcess {
                 let deadline = Instant::now() + Duration::from_millis(500);
                 while Instant::now() < deadline {
                     if child.try_wait().ok().flatten().is_some() {
+                        terminate_host_process_group(child.id());
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                terminate_host_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -505,6 +740,12 @@ impl StdioMcpClient {
                 .as_deref()
                 .filter(|image| !image.trim().is_empty())
             {
+                let actual_runtime = lease.record()?.runtime_binary;
+                crate::container::ensure_service_runtime_matches(
+                    config.container_runtime.as_deref(),
+                    &actual_runtime,
+                    &format!("MCP server {server_name}"),
+                )?;
                 let mut service_env = config.env.clone();
                 for (container_key, host_key) in &config.capabilities.secret_env {
                     let value = crate::host_environment::configured_secret(host_key).with_context(
@@ -551,6 +792,11 @@ impl StdioMcpClient {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command_builder.process_group(0);
+            }
             let mut child = command_builder
                 .spawn()
                 .with_context(|| format!("failed to start MCP server {server_name}: {command}"))?;
@@ -591,16 +837,29 @@ impl StdioMcpClient {
             "method": method,
             "params": params,
         });
-        self.write_message(&message)?;
+        self.write_message(&message).map_err(|error| {
+            mcp_transport_failure(format!("failed to write MCP request {method}: {error:#}"))
+        })?;
         let deadline = Instant::now() + MCP_READ_TIMEOUT;
         loop {
             if Instant::now() > deadline {
-                bail!("timed out waiting for MCP response to {method}");
+                return Err(mcp_transport_failure(format!(
+                    "timed out waiting for MCP response to {method}"
+                )));
             }
-            let message = self.read_message(deadline)?;
+            let message = self.read_message(deadline).map_err(|error| {
+                mcp_transport_failure(format!(
+                    "failed to read MCP response to {method}: {error:#}"
+                ))
+            })?;
             if let Some(server_method) = message.get("method").and_then(Value::as_str) {
                 if let Some(server_id) = message.get("id").cloned() {
-                    self.respond_to_server_request(server_id, server_method)?;
+                    self.respond_to_server_request(server_id, server_method)
+                        .map_err(|error| {
+                            mcp_transport_failure(format!(
+                                "failed to answer MCP server request {server_method}: {error:#}"
+                            ))
+                        })?;
                 }
                 continue;
             }
@@ -659,6 +918,12 @@ impl StdioMcpClient {
 
 impl Drop for StdioMcpClient {
     fn drop(&mut self) {
+        self.shutdown_transport();
+    }
+}
+
+impl StdioMcpClient {
+    fn shutdown_transport(&mut self) {
         // MCP stdio shutdown is transport-owned: close input first, then give the server a bounded
         // grace period before terminating and removing its session-owned process/container.
         drop(self.stdin.take());
@@ -668,6 +933,21 @@ impl Drop for StdioMcpClient {
             let _ = thread.join();
         }
     }
+}
+
+fn terminate_host_process_group(process_id: u32) {
+    #[cfg(unix)]
+    // SAFETY: POSIX `kill` is called with a negated child process-group id and a valid signal
+    // number. It does not dereference memory; failure is intentionally best-effort during cleanup.
+    unsafe {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        let _ = kill(-(process_id as i32), SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = process_id;
 }
 
 fn drain_stderr(
@@ -744,7 +1024,17 @@ fn resolve_host_workdir(workspace_root: &Path, configured: Option<&Path>) -> Res
     Ok(candidate)
 }
 
-fn format_tool_result(result: &Value) -> String {
+fn format_tool_result(result: &Value) -> Result<String> {
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        bail!(
+            "MCP tool reported an error: {}",
+            format_tool_content(result)
+        );
+    }
+    Ok(format_tool_content(result))
+}
+
+fn format_tool_content(result: &Value) -> String {
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         let mut parts = Vec::new();
         for item in content {
@@ -968,6 +1258,290 @@ done
         assert_eq!(
             unique_tool_name("GitHub Enterprise", "search/repo"),
             "mcp_github_enterprise_search_repo"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_error_result_is_not_reported_as_success() {
+        let error = format_tool_result(&json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "permission denied"}]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("permission denied"), "{error}");
+    }
+
+    #[test]
+    fn mcp_annotations_drive_conservative_execution_metadata() {
+        let tool: ServerTool = serde_json::from_value(json!({
+            "name": "lookup",
+            "inputSchema": {"type": "object"},
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        }))
+        .unwrap();
+        let annotations = tool.annotations.unwrap();
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(true));
+        assert_eq!(annotations.open_world_hint, Some(false));
+    }
+
+    #[test]
+    fn server_annotations_cannot_self_authorize_tool_exposure() {
+        let config = McpServerConfig::default();
+        assert!(!configured_read_only_tool(&config, "lookup"));
+
+        let trusted = McpServerConfig {
+            capabilities: McpCapabilities {
+                read_only_tools: vec!["lookup".to_string(), "search_*".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(configured_read_only_tool(&trusted, "lookup"));
+        assert!(configured_read_only_tool(&trusted, "search_repositories"));
+        assert!(!configured_read_only_tool(&trusted, "delete_repository"));
+
+        let hidden_name = "mcp_fixture_lookup".to_string();
+        let registry = McpToolRegistry {
+            tools: BTreeMap::from([(
+                hidden_name.clone(),
+                McpToolSpec {
+                    tool_name: hidden_name.clone(),
+                    server_name: "fixture".to_string(),
+                    server_tool_name: "lookup".to_string(),
+                    description: "hidden".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    read_only: false,
+                    server_read_only_hint: true,
+                    destructive: false,
+                    idempotent: false,
+                    open_world: true,
+                    status_error: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        let error = call_tool(&registry, &hidden_name, &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not operator-declared read-only"), "{error}");
+    }
+
+    #[test]
+    fn read_only_tool_patterns_are_bounded_and_explicit() {
+        let empty = McpServerConfig {
+            capabilities: McpCapabilities {
+                read_only_tools: vec![" ".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(validate_read_only_tool_patterns(&empty).is_err());
+
+        let oversized = McpServerConfig {
+            capabilities: McpCapabilities {
+                read_only_tools: vec!["x".repeat(257)],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(validate_read_only_tool_patterns(&oversized).is_err());
+    }
+
+    #[test]
+    fn colliding_mcp_tool_names_are_removed_instead_of_overwritten() {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup","inputSchema":{"type":"object"}}]}}'
+      ;;
+  esac
+done
+"#;
+        let servers = ["a-b", "a/b"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    McpServerConfig {
+                        command: Some("sh".to_string()),
+                        args: vec!["-c".to_string(), script.to_string()],
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let registry = discover_tools(servers, workspace.path());
+
+        assert!(!registry.tools.contains_key("mcp_a_b_lookup"));
+        assert!(
+            registry
+                .tools
+                .values()
+                .any(|tool| tool.description.contains("tool-name collision"))
+        );
+    }
+
+    #[test]
+    fn non_idempotent_mcp_transport_failure_is_not_retried() {
+        let workspace = tempfile::tempdir().unwrap();
+        let marker = workspace.path().join("calls");
+        let marker = marker.display().to_string().replace('\'', "'\\''");
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"fixture","version":"1"}}}}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"mutate","inputSchema":{{"type":"object"}}}}]}}}}'
+      ;;
+    *'"method":"tools/call"'*)
+      printf 'x\n' >> '{marker}'
+      exit 1
+      ;;
+  esac
+done
+"#
+        );
+        let registry = discover_tools(
+            BTreeMap::from([(
+                "fixture".to_string(),
+                McpServerConfig {
+                    command: Some("sh".to_string()),
+                    args: vec!["-c".to_string(), script],
+                    capabilities: McpCapabilities {
+                        read_only_tools: vec!["mutate".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )]),
+            workspace.path(),
+        );
+
+        let error = call_tool(&registry, "mcp_fixture_mutate", &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("will not retry"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("calls")).unwrap(),
+            "x\n"
+        );
+    }
+
+    #[test]
+    fn idempotent_mcp_application_error_is_not_retried() {
+        let workspace = tempfile::tempdir().unwrap();
+        let marker = workspace.path().join("calls");
+        let marker = marker.display().to_string().replace('\'', "'\\''");
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"fixture","version":"1"}}}}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"lookup","inputSchema":{{"type":"object"}},"annotations":{{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true}}}}]}}}}'
+      ;;
+    *'"method":"tools/call"'*)
+      printf 'x\n' >> '{marker}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32000,"message":"application rejected request"}}}}'
+      ;;
+  esac
+done
+"#
+        );
+        let registry = discover_tools(
+            BTreeMap::from([(
+                "fixture".to_string(),
+                McpServerConfig {
+                    command: Some("sh".to_string()),
+                    args: vec!["-c".to_string(), script],
+                    capabilities: McpCapabilities {
+                        read_only_tools: vec!["lookup".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )]),
+            workspace.path(),
+        );
+
+        let error = call_tool(&registry, "mcp_fixture_lookup", &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("will not retry"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("calls")).unwrap(),
+            "x\n"
+        );
+    }
+
+    #[test]
+    fn idempotent_mcp_transport_failure_restarts_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let marker = workspace.path().join("launches");
+        let marker = marker.display().to_string().replace('\'', "'\\''");
+        let script = format!(
+            r#"
+printf 'x\n' >> '{marker}'
+launch_count=$(wc -l < '{marker}' | tr -d ' ')
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"fixture","version":"1"}}}}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"lookup","inputSchema":{{"type":"object"}},"annotations":{{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true}}}}]}}}}'
+      ;;
+    *'"method":"tools/call"'*)
+      if [ "$launch_count" = 1 ]; then
+        exit 1
+      fi
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"recovered"}}]}}}}'
+      ;;
+  esac
+done
+"#
+        );
+        let registry = discover_tools(
+            BTreeMap::from([(
+                "fixture".to_string(),
+                McpServerConfig {
+                    command: Some("sh".to_string()),
+                    args: vec!["-c".to_string(), script],
+                    capabilities: McpCapabilities {
+                        read_only_tools: vec!["lookup".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )]),
+            workspace.path(),
+        );
+
+        let result = call_tool(&registry, "mcp_fixture_lookup", &json!({})).unwrap();
+
+        assert_eq!(result, "recovered");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("launches")).unwrap(),
+            "x\nx\n"
         );
     }
 }

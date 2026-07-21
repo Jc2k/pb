@@ -54,8 +54,11 @@ See `docs/harness-contract-v1.example.json` for the complete shape.
 The agent receives `run_check(id)` only when the contract defines checks. The check command is
 trusted caller input; the model supplies only its ID. Each run records its exit status, bounded
 stdout/stderr, duration, timeout state, executor, command/input/output fingerprints, and evidence
-source. An exact canonical `run_command` invocation shares the same evidence ledger; unrelated
-commands do not satisfy named checks. Evidence becomes stale when its declared inputs,
+source. In strict delivery and trusted contracts, only `run_check(id)` earns named-check credit;
+`run_command` and `run_task` remain diagnostic or mutation tools even if their command text
+resembles a configured check. A restored legacy/direct request may route an exact configured guard
+through the check runtime for compatibility, but cannot use that path to satisfy a strict contract.
+Evidence becomes stale when its declared inputs,
 dependencies, command, executor, or outputs change. Contracts are parsed before model loading and
 their checks compile into the same workspace check graph used by deterministic handoff.
 
@@ -180,6 +183,12 @@ focused review inspection, and every mutation-capable tool remain uncached. Cach
 tool runtime/energy and are counted in the context snapshot for the model invocation that receives
 the replayed result.
 
+Built-in tool effects come from one runtime record used by exposure, batching, caching, progress,
+and execution. The retired `todo`, `git_commit`, and `git_revert` schemas are absent from current
+sessions and cannot be restored by an allowlist or policy. Dynamic MCP tools are exposed only from
+an operator-audited read-only name list; server annotations cannot add authority. Parallel MCP
+batches require every member to be both read-only and server-marked idempotent.
+
 Deterministic recovery is bounded. Repeated parse, artifact validation, identical-tool, plan-cycle,
 repair-cycle, invocation, token, stage-step, and advisory failures stop with explicit outcomes
 before another model turn can reinterpret the same fact. Strict workflow stages never use the old
@@ -256,6 +265,17 @@ Failed local `run_command` actions return the exit status and bounded combined s
 model, including diagnostics that the command redirected to stdout. This is the same bounded output
 recorded in the event stream, so a failed compiler or test invocation remains actionable without
 granting it completion evidence.
+
+The same bounded command runner covers host and managed execution. `run_command` defaults to 120
+seconds and accepts a maximum of 600 seconds. Timeout and user cancellation are distinct results;
+pb terminates the owned process group or managed exec while draining stdout and stderr concurrently.
+
+File mutations require an exact current-content fingerprint, use atomic no-clobber or replace
+operations, and reject stale concurrent edits. `mv` is limited to files and symlinks. `rm` operates
+on the final entry and can remove a file, symlink, or empty directory, not a recursive tree.
+`run_task` validates a bounded isolated snapshot, stages its complete declared
+output set, rejects Git-control/undeclared-path/unsafe-symlink changes, and rolls back destination
+paths if promotion fails.
 
 For a trusted contract, named check evidence is earned only by `run_check({"id":"..."})`. A raw
 `run_command` that exactly matches or extends the declared command remains ordinary shell evidence;

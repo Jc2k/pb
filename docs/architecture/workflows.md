@@ -153,8 +153,36 @@ its milestone, avoiding two canonical copies of workflow state.
 
 Tool schemas are derived from this matrix for every stage. A request-level allowlist and project
 policy can narrow the set further. Neither can broaden it.
-Strict stages do not expose the legacy conversational `todo` tool: the accepted plan, typed stage
-artifacts and checkpoint already own durable progress.
+The legacy model-owned `todo`, `git_commit`, and `git_revert` schemas are retired from every current
+surface. The accepted plan, typed stage artifacts, checkpoint, deterministic checks, and managed
+commit already own that state and authority. Persisted legacy sessions remain readable, but a new
+allowlist or policy cannot revive the retired tools.
+
+## Agent-tool runtime contract
+
+**Shipped.** Built-in tools have one central effect record for mutation, parallel safety,
+deterministic caching, useful progress, and retirement. Exposure, batching, caching, progress
+accounting, and execution all derive from that record instead of maintaining independent lists.
+Dynamic MCP tools carry an equivalent discovered effect record; LSP tools are read-only.
+
+The runtime applies these boundaries before a result can become evidence:
+
+| Surface | Enforced behavior |
+| --- | --- |
+| File reads and discovery | `read_file` accepts bounded UTF-8 files; glob, regex, and skill discovery have time/input ceilings; results are prompt-bounded with explicit continuation or failure rather than silent partial authority. |
+| File mutation | Existing files require an exact content fingerprint from the bytes actually read. Create and replace use synced temporary files and atomic no-clobber/replace operations; stale concurrent edits fail. `edit_file` requires one unique match. Diff events are bounded and identify truncation. |
+| Patch, move, and remove | `apply_patch` validates every path, checks the patch before applying it, and uses a bounded process. `mv` moves only a file or symlink and cannot overwrite. `rm` operates on the final filesystem entry and removes only a file, symlink, or empty directory; recursive directory mutation is not an agent capability. |
+| Configured tasks | `run_task` executes against an isolated snapshot, rejects Git-control or undeclared-path changes, bounds promoted path/file totals, validates symlinks, stages every output, and rolls back the destination set if promotion fails. It never earns named-check credit. |
+| Commands and checks | Host and managed commands drain stdout/stderr concurrently, cap combined output, have explicit timeouts, observe user cancellation, and stop the owned process group or managed exec. `run_command` defaults to 120 seconds and is capped at 600; configured checks/tasks use their validated timeout. |
+| Public research | Every URL and redirect is restricted to HTTP(S), resolved before connection, rejected if any answer is private/special-use, and pinned to the validated public address. Proxies are bypassed. Bodies are capped and oversized chunked responses fail instead of being returned as complete. |
+| Vision | A vision path must be inside the workspace or exactly match a session attachment. Inputs are regular files with byte and pixel ceilings. |
+| MCP | Only operator-declared `capabilities.read_only_tools` are exposed. Server annotations are untrusted hints. Unsupported schemas and normalized-name collisions become explicit status failures; `isError` is a failed call; only an operator-read-only, server-idempotent call is retried, and only after a typed transport failure. A configured service runtime must match the owning session runtime. |
+| LSP | Names cannot collide silently; documents/config/responses and the open-document set are bounded; language IDs follow file extensions; diagnostics wait for the current document version; only typed transport failures restart a server. A configured sidecar runtime must match the owning session runtime. |
+| Durable memory | Agent writes are byte/count bounded and evidence-backed. The agent can record only facts, gotchas, procedures, and debt. Decisions and preferences require a future controller-owned approval record and cannot be self-approved in tool arguments. Supersession requires active source and replacement entries. |
+
+Dynamic JSON schemas are admitted only when pb's recursive validator can enforce every supported
+keyword. Project policy selectors are validated against the resulting exposed schema set at session
+start, including unmatched wildcards, so misspellings fail closed.
 
 ## Freshness is part of correctness
 
@@ -240,9 +268,10 @@ accepted plan.
 An edit tool receives mutation and progress credit only when repository bytes actually change.
 Identical replacements and edits fail without emitting a diff or invalidating existing evidence.
 
-Local command failures retain their exit status and bounded stdout/stderr in structured tool
-feedback. Output redirected from stderr to stdout is still preserved. A failed command therefore
-provides actionable diagnostics while receiving no check or completion credit.
+Local and managed command failures retain their exit status and bounded stdout/stderr in structured
+tool feedback. Output redirected from stderr to stdout is still preserved. Timeout and user
+cancellation are distinct results and terminate the owned process group or managed exec. A failed
+command therefore provides actionable diagnostics while receiving no check or completion credit.
 
 The step-limit monitor parses explicit negative boolean fields as values, not keywords. A healthy
 checkpoint containing `off_track: no` or `blocked: no` can therefore grant its bounded extra step;

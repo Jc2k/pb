@@ -1124,6 +1124,24 @@ pub fn resolve_runtime_binary(configured: Option<&str>) -> Result<String> {
     resolve_runtime_binary_with(configured, preferred_runtime_binary())
 }
 
+/// Ensure that an integration's optional legacy per-service runtime selector agrees with the
+/// session runtime that will actually own and clean up the service.
+pub(crate) fn ensure_service_runtime_matches(
+    configured: Option<&str>,
+    actual: &str,
+    service_label: &str,
+) -> Result<()> {
+    let Some(configured) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if configured != actual {
+        bail!(
+            "{service_label} requires container runtime '{configured}', but its session is owned by runtime '{actual}'; use the session runtime or remove container_runtime"
+        );
+    }
+    Ok(())
+}
+
 fn resolve_runtime_binary_with(
     configured: Option<&str>,
     detected: Option<String>,
@@ -1679,6 +1697,19 @@ mod tests {
             "container"
         );
         assert!(resolve_runtime_binary_with(None, None).is_err());
+    }
+
+    #[test]
+    fn configured_service_runtime_cannot_be_silently_ignored() {
+        ensure_service_runtime_matches(Some("container"), "container", "MCP fixture").unwrap();
+        ensure_service_runtime_matches(None, "container", "MCP fixture").unwrap();
+        let error = ensure_service_runtime_matches(Some("podman"), "container", "MCP fixture")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("requires container runtime 'podman'"),
+            "{error}"
+        );
     }
 
     #[test]

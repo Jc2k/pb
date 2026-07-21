@@ -3,7 +3,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
@@ -11,7 +12,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_LSP_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_LSP_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_LSP_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_LSP_OPEN_DOCUMENTS: usize = 256;
 const LSP_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const LSP_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -74,6 +79,7 @@ pub struct LspToolSpec {
     pub operation: LspOperation,
     pub description: String,
     pub input_schema: Value,
+    pub status_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +115,7 @@ impl ProjectLspConfig {
         if !path.exists() {
             return Ok(None);
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let text = read_bounded_utf8(&path, MAX_LSP_CONFIG_BYTES, "LSP config")?;
         toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
     }
 
@@ -128,6 +133,31 @@ impl ProjectLspConfig {
 
 pub fn project_lsp_config_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".pb").join("lsp.toml")
+}
+
+fn read_bounded_utf8(path: &Path, max_bytes: u64, label: &str) -> Result<String> {
+    let file =
+        File::open(path).with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat {label} {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        bail!(
+            "{label} {} exceeds the {max_bytes}-byte input bound",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "{label} {} grew beyond the {max_bytes}-byte input bound",
+            path.display()
+        );
+    }
+    String::from_utf8(bytes).with_context(|| format!("{label} is not valid UTF-8"))
 }
 
 pub fn effective_servers(
@@ -219,6 +249,7 @@ fn discover_tools_inner(
         sessions: BTreeMap::new(),
         lease: lease.clone(),
     };
+    let mut collided_names = BTreeSet::new();
     for (server_name, config) in servers {
         match LspClient::connect(&server_name, &config, workspace_root, lease.as_ref()) {
             Ok(client) => {
@@ -234,6 +265,23 @@ fn discover_tools_inner(
                     LspOperation::Diagnostics,
                 ] {
                     let tool_name = unique_tool_name(&server_name, op.name());
+                    if collided_names.contains(&tool_name) {
+                        continue;
+                    }
+                    if let Some(existing) = registry.tools.remove(&tool_name) {
+                        collided_names.insert(tool_name.clone());
+                        insert_status_tool(
+                            &mut registry,
+                            &server_name,
+                            &format!(
+                                "LSP tool-name collision: server '{}' and server '{}' both normalize operation '{}' to '{tool_name}'; neither tool was exposed",
+                                existing.server_name,
+                                server_name,
+                                op.name(),
+                            ),
+                        );
+                        continue;
+                    }
                     registry.tools.insert(
                         tool_name.clone(),
                         LspToolSpec {
@@ -242,17 +290,41 @@ fn discover_tools_inner(
                             operation: op,
                             description: op.description(&server_name),
                             input_schema: op.input_schema(),
+                            status_error: None,
                         },
                     );
                 }
             }
             Err(err) => {
-                let tool_name = unique_tool_name(&server_name, "status");
-                registry.tools.insert(tool_name.clone(), LspToolSpec { tool_name, server_name: server_name.clone(), operation: LspOperation::Diagnostics, description: format!("LSP server {server_name} was configured but startup failed: {err:#}"), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}) });
+                insert_status_tool(
+                    &mut registry,
+                    &server_name,
+                    &format!("LSP server {server_name} was configured but startup failed: {err:#}"),
+                );
             }
         }
     }
     registry
+}
+
+fn insert_status_tool(registry: &mut LspToolRegistry, server_name: &str, description: &str) {
+    let digest = crate::environment_lock::sha256(description.as_bytes());
+    let tool_name = format!("lsp_status_{}_status", &digest[..12]);
+    registry.tools.insert(
+        tool_name.clone(),
+        LspToolSpec {
+            tool_name,
+            server_name: server_name.to_string(),
+            operation: LspOperation::Diagnostics,
+            description: description.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            status_error: Some(description.to_string()),
+        },
+    );
 }
 
 pub fn call_tool(
@@ -264,8 +336,8 @@ pub fn call_tool(
     let spec = registry
         .tool(tool_name)
         .with_context(|| format!("unknown LSP tool: {tool_name}"))?;
-    if spec.tool_name.ends_with("_status") {
-        bail!(spec.description.clone());
+    if let Some(error) = &spec.status_error {
+        bail!(error.clone());
     }
     let session = registry
         .sessions
@@ -277,10 +349,14 @@ pub fn call_tool(
     match client.call(spec.operation, workspace_root, arguments) {
         Ok(result) => Ok(result),
         Err(first_error) => {
+            if !recoverable_transport_error(&first_error) {
+                return Err(first_error);
+            }
             let config = registry
                 .servers
                 .get(&spec.server_name)
                 .context("LSP server configuration disappeared during restart")?;
+            client.shutdown_transport();
             *client = LspClient::connect(
                 &spec.server_name,
                 config,
@@ -293,6 +369,27 @@ pub fn call_tool(
             client.call(spec.operation, workspace_root, arguments)
         }
     }
+}
+
+#[derive(Debug)]
+struct LspTransportFailure(String);
+
+impl std::fmt::Display for LspTransportFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LspTransportFailure {}
+
+fn lsp_transport_failure(message: impl Into<String>) -> anyhow::Error {
+    anyhow!(LspTransportFailure(message.into()))
+}
+
+fn recoverable_transport_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<LspTransportFailure>().is_some())
 }
 
 impl LspOperation {
@@ -315,13 +412,13 @@ impl LspOperation {
     fn input_schema(self) -> Value {
         match self {
             Self::WorkspaceSymbols => {
-                json!({"type":"object","properties":{"query":{"type":"string","description":"Symbol query text."}},"required":["query"],"additionalProperties":false})
+                json!({"type":"object","properties":{"query":{"type":"string","description":"Symbol query text.","maxLength":4096}},"required":["query"],"additionalProperties":false})
             }
             Self::DocumentSymbols | Self::Diagnostics => {
-                json!({"type":"object","properties":{"path":{"type":"string","description":"Project-relative file path."}},"required":["path"],"additionalProperties":false})
+                json!({"type":"object","properties":{"path":{"type":"string","description":"Project-relative file path.","maxLength":4096}},"required":["path"],"additionalProperties":false})
             }
             _ => {
-                json!({"type":"object","properties":{"path":{"type":"string","description":"Project-relative file path."},"line":{"type":"integer","description":"1-indexed line number.","minimum":1},"character":{"type":"integer","description":"0-indexed UTF-16 character offset.","minimum":0}},"required":["path","line","character"],"additionalProperties":false})
+                json!({"type":"object","properties":{"path":{"type":"string","description":"Project-relative file path.","maxLength":4096},"line":{"type":"integer","description":"1-indexed line number.","minimum":1,"maximum":10000000},"character":{"type":"integer","description":"0-indexed UTF-16 character offset.","minimum":0,"maximum":10000000}},"required":["path","line","character"],"additionalProperties":false})
             }
         }
     }
@@ -332,8 +429,8 @@ struct LspClient {
     stdin: ChildStdin,
     stdout_reader: crate::jsonrpc::FramedJsonReader,
     next_id: u64,
-    diagnostics: BTreeMap<String, Value>,
-    language_id: String,
+    diagnostics: BTreeMap<String, DiagnosticSnapshot>,
+    language_ids: Vec<String>,
     root_uri: String,
     root_name: String,
     open_documents: BTreeMap<String, OpenDocument>,
@@ -344,6 +441,16 @@ struct LspClient {
 struct OpenDocument {
     version: u64,
     content_sha256: String,
+}
+
+struct DiagnosticSnapshot {
+    version: Option<u64>,
+    diagnostics: Value,
+}
+
+struct OpenDocumentState {
+    uri: String,
+    version: u64,
 }
 
 enum LspProcess {
@@ -364,6 +471,7 @@ impl LspProcess {
     fn shutdown(&mut self) {
         match self {
             Self::Host(child) => {
+                terminate_host_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -394,6 +502,12 @@ impl LspClient {
                 .as_deref()
                 .filter(|image| !image.trim().is_empty())
             {
+                let actual_runtime = lease.record()?.runtime_binary;
+                crate::container::ensure_service_runtime_matches(
+                    config.container_runtime.as_deref(),
+                    &actual_runtime,
+                    &format!("LSP server {server_name}"),
+                )?;
                 let mut service =
                     lease.spawn_service(crate::session_environment::SessionServiceSpec {
                         service_name: server_name.to_string(),
@@ -435,13 +549,20 @@ impl LspClient {
             }
         } else {
             let (command, args) = stdio_command(server_name, config, workspace_root)?;
-            let mut child = Command::new(&command)
+            let mut command_builder = Command::new(&command);
+            command_builder
                 .args(&args)
                 .current_dir(&cwd)
                 .envs(&config.env)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command_builder.process_group(0);
+            }
+            let mut child = command_builder
                 .spawn()
                 .with_context(|| format!("failed to start LSP server {server_name}: {command}"))?;
             let stdin = child
@@ -474,11 +595,7 @@ impl LspClient {
             stdout_reader,
             next_id: 1,
             diagnostics: BTreeMap::new(),
-            language_id: config
-                .language_ids
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "plaintext".to_string()),
+            language_ids: config.language_ids.clone(),
             root_uri: root_uri.clone(),
             root_name: root_name.clone(),
             open_documents: BTreeMap::new(),
@@ -503,20 +620,15 @@ impl LspClient {
                 json!({"query": string_arg(args, "query")?}),
             ),
             LspOperation::DocumentSymbols => {
-                let uri = self.open_document(workspace_root, args)?;
+                let document = self.open_document(workspace_root, args)?;
                 self.request_text(
                     "textDocument/documentSymbol",
-                    json!({"textDocument":{"uri":uri}}),
+                    json!({"textDocument":{"uri":document.uri}}),
                 )
             }
             LspOperation::Diagnostics => {
-                let uri = self.open_document(workspace_root, args)?;
-                Ok(self
-                    .diagnostics
-                    .get(&uri)
-                    .cloned()
-                    .unwrap_or_else(|| json!([]))
-                    .to_string())
+                let document = self.open_document(workspace_root, args)?;
+                Ok(self.wait_for_diagnostics(&document)?.to_string())
             }
             LspOperation::Hover => {
                 self.position_request(workspace_root, args, "textDocument/hover")
@@ -545,7 +657,7 @@ impl LspClient {
         workspace_root: &Path,
         args: &Value,
     ) -> Result<(String, Value)> {
-        let uri = self.open_document(workspace_root, args)?;
+        let document = self.open_document(workspace_root, args)?;
         let line = args
             .get("line")
             .and_then(Value::as_u64)
@@ -555,20 +667,20 @@ impl LspClient {
             .and_then(Value::as_u64)
             .context("character is required")?;
         Ok((
-            uri,
+            document.uri,
             json!({"line": line.saturating_sub(1), "character": character}),
         ))
     }
-    fn open_document(&mut self, workspace_root: &Path, args: &Value) -> Result<String> {
+    fn open_document(&mut self, workspace_root: &Path, args: &Value) -> Result<OpenDocumentState> {
         let path = string_arg(args, "path")?;
         let full = resolve_workspace_path(workspace_root, path)?;
-        let text = std::fs::read_to_string(&full)
-            .with_context(|| format!("failed to read {}", full.display()))?;
+        let text = read_bounded_utf8(&full, MAX_LSP_DOCUMENT_BYTES, "LSP document")?;
         let uri = path_to_uri(&full)?;
         let content_sha256 = crate::environment_lock::sha256(text.as_bytes());
         if let Some(document) = self.open_documents.get(&uri) {
             if document.content_sha256 != content_sha256 {
                 let version = document.version.saturating_add(1);
+                self.diagnostics.remove(&uri);
                 self.notify(
                     "textDocument/didChange",
                     json!({"textDocument":{"uri":uri,"version":version},"contentChanges":[{"text":text}]}),
@@ -582,9 +694,16 @@ impl LspClient {
                 );
             }
         } else {
+            if self.open_documents.len() >= MAX_LSP_OPEN_DOCUMENTS {
+                bail!(
+                    "LSP session reached the {MAX_LSP_OPEN_DOCUMENTS}-document bound; start a new session"
+                );
+            }
+            self.diagnostics.remove(&uri);
+            let language_id = language_id_for_path(&full, &self.language_ids);
             self.notify(
                 "textDocument/didOpen",
-                json!({"textDocument":{"uri":uri,"languageId":&self.language_id,"version":1,"text":text}}),
+                json!({"textDocument":{"uri":uri,"languageId":language_id,"version":1,"text":text}}),
             )?;
             self.open_documents.insert(
                 uri.clone(),
@@ -594,7 +713,44 @@ impl LspClient {
                 },
             );
         }
-        Ok(uri)
+        let version = self
+            .open_documents
+            .get(&uri)
+            .map(|document| document.version)
+            .context("opened LSP document state disappeared")?;
+        Ok(OpenDocumentState { uri, version })
+    }
+
+    fn wait_for_diagnostics(&mut self, document: &OpenDocumentState) -> Result<Value> {
+        let deadline = Instant::now() + LSP_DIAGNOSTIC_TIMEOUT;
+        loop {
+            if let Some(snapshot) = self.diagnostics.get(&document.uri)
+                && diagnostic_snapshot_is_fresh(snapshot, document.version)
+            {
+                return Ok(snapshot.diagnostics.clone());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for fresh diagnostics for document version {}",
+                    document.version
+                );
+            }
+            let message = self.read_message(deadline)?;
+            if let Some(method) = message.get("method").and_then(Value::as_str) {
+                if let Some(id) = message.get("id").cloned() {
+                    self.handle_server_request(
+                        id,
+                        method,
+                        message.get("params").cloned().unwrap_or(Value::Null),
+                    )?;
+                } else {
+                    self.handle_notification(
+                        method,
+                        message.get("params").cloned().unwrap_or(Value::Null),
+                    );
+                }
+            }
+        }
     }
     fn request_text(&mut self, method: &str, params: Value) -> Result<String> {
         Ok(self.request(method, params)?.to_string())
@@ -610,11 +766,16 @@ impl LspClient {
     ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.write(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
+        self.write(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            .map_err(|error| {
+                lsp_transport_failure(format!("failed to write LSP request {method}: {error:#}"))
+            })?;
         let deadline = Instant::now() + timeout;
         loop {
             if Instant::now() > deadline {
-                bail!("timed out waiting for LSP response to {method}");
+                return Err(lsp_transport_failure(format!(
+                    "timed out waiting for LSP response to {method}"
+                )));
             }
             let msg = self.read_message(deadline)?;
             if let Some(method) = msg.get("method").and_then(Value::as_str) {
@@ -643,6 +804,11 @@ impl LspClient {
     }
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         self.write(&json!({"jsonrpc":"2.0","method":method,"params":params}))
+            .map_err(|error| {
+                lsp_transport_failure(format!(
+                    "failed to write LSP notification {method}: {error:#}"
+                ))
+            })
     }
     fn write(&mut self, message: &Value) -> Result<()> {
         let body = serde_json::to_vec(message)?;
@@ -652,15 +818,20 @@ impl LspClient {
         Ok(())
     }
     fn read_message(&mut self, deadline: Instant) -> Result<Value> {
-        if let Some(status) = self.process.try_wait()? {
-            bail!(
+        if let Some(status) = self.process.try_wait().map_err(|error| {
+            lsp_transport_failure(format!("failed to poll LSP server: {error:#}"))
+        })? {
+            return Err(lsp_transport_failure(format!(
                 "LSP server exited with status {status}: {}",
                 self.stderr_text()
-            );
+            )));
         }
-        self.stdout_reader
-            .recv_until(deadline)
-            .with_context(|| format!("LSP response failed: {}", self.stderr_text()))
+        self.stdout_reader.recv_until(deadline).map_err(|error| {
+            lsp_transport_failure(format!(
+                "LSP response failed: {error:#}: {}",
+                self.stderr_text()
+            ))
+        })
     }
     fn stderr_text(&self) -> String {
         self.stderr_tail
@@ -671,13 +842,17 @@ impl LspClient {
     fn handle_notification(&mut self, method: &str, params: Value) {
         if method == "textDocument/publishDiagnostics"
             && let Some(uri) = params.get("uri").and_then(Value::as_str)
+            && self.open_documents.contains_key(uri)
         {
             self.diagnostics.insert(
                 uri.to_string(),
-                params
-                    .get("diagnostics")
-                    .cloned()
-                    .unwrap_or_else(|| json!([])),
+                DiagnosticSnapshot {
+                    version: params.get("version").and_then(Value::as_u64),
+                    diagnostics: params
+                        .get("diagnostics")
+                        .cloned()
+                        .unwrap_or_else(|| json!([])),
+                },
             );
         }
     }
@@ -700,7 +875,18 @@ impl LspClient {
             _ => Value::Null,
         };
         self.write(&json!({"jsonrpc":"2.0","id":id,"result":result}))
+            .map_err(|error| {
+                lsp_transport_failure(format!(
+                    "failed to answer LSP server request {method}: {error:#}"
+                ))
+            })
     }
+}
+
+fn diagnostic_snapshot_is_fresh(snapshot: &DiagnosticSnapshot, version: u64) -> bool {
+    snapshot
+        .version
+        .is_none_or(|published_version| published_version == version)
 }
 
 impl Drop for LspClient {
@@ -710,12 +896,33 @@ impl Drop for LspClient {
         }
         let _ = self.request_with_timeout("shutdown", Value::Null, Duration::from_secs(2));
         let _ = self.notify("exit", json!(null));
+        self.shutdown_transport();
+    }
+}
+
+impl LspClient {
+    fn shutdown_transport(&mut self) {
         self.process.shutdown();
         self.stdout_reader.join();
         if let Some(thread) = self.stderr_thread.take() {
             let _ = thread.join();
         }
     }
+}
+
+fn terminate_host_process_group(process_id: u32) {
+    #[cfg(unix)]
+    // SAFETY: POSIX `kill` is called with a negated child process-group id and a valid signal
+    // number. It does not dereference memory; failure is intentionally best-effort during cleanup.
+    unsafe {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        let _ = kill(-(process_id as i32), SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = process_id;
 }
 
 fn drain_stderr(
@@ -761,6 +968,9 @@ fn stdio_command(
 }
 
 fn resolve_workspace_path(root: &Path, path: &str) -> Result<PathBuf> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve LSP workspace {}", root.display()))?;
     let candidate = root.join(path);
     let full = candidate
         .canonicalize()
@@ -783,6 +993,41 @@ fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
         .and_then(Value::as_str)
         .with_context(|| format!("{name} is required"))
 }
+
+fn language_id_for_path(path: &Path, configured: &[String]) -> String {
+    if configured.len() == 1 {
+        return configured[0].clone();
+    }
+    let inferred = match path.extension().and_then(|extension| extension.to_str()) {
+        Some("rs") => Some("rust"),
+        Some("ts") => Some("typescript"),
+        Some("tsx") => Some("typescriptreact"),
+        Some("js") | Some("mjs") | Some("cjs") => Some("javascript"),
+        Some("jsx") => Some("javascriptreact"),
+        Some("py") => Some("python"),
+        Some("go") => Some("go"),
+        Some("java") => Some("java"),
+        Some("kt") | Some("kts") => Some("kotlin"),
+        Some("swift") => Some("swift"),
+        Some("c") | Some("h") => Some("c"),
+        Some("cc") | Some("cpp") | Some("cxx") | Some("hpp") => Some("cpp"),
+        Some("json") => Some("json"),
+        Some("yaml") | Some("yml") => Some("yaml"),
+        Some("html") => Some("html"),
+        Some("css") => Some("css"),
+        _ => None,
+    };
+    inferred
+        .and_then(|inferred| {
+            configured
+                .iter()
+                .find(|candidate| candidate.eq_ignore_ascii_case(inferred))
+                .cloned()
+        })
+        .or_else(|| configured.first().cloned())
+        .unwrap_or_else(|| inferred.unwrap_or("plaintext").to_string())
+}
+
 fn unique_tool_name(server: &str, op: &str) -> String {
     format!("lsp_{}_{}", sanitize(server), sanitize(op))
 }
@@ -851,5 +1096,56 @@ mod tests {
         assert!(uri.starts_with("file:///"));
         assert!(uri.ends_with("source%20%231.rs"));
         assert!(!uri.contains(' '));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_path_resolution_accepts_a_symlinked_workspace_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let linked = directory.path().join("linked");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("lib.rs"), "fn main() {}\n").unwrap();
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+        assert_eq!(
+            resolve_workspace_path(&linked, "lib.rs").unwrap(),
+            real.canonicalize().unwrap().join("lib.rs")
+        );
+    }
+
+    #[test]
+    fn language_ids_are_selected_per_file_extension() {
+        let configured = vec!["typescript".to_string(), "rust".to_string()];
+        assert_eq!(
+            language_id_for_path(Path::new("src/lib.rs"), &configured),
+            "rust"
+        );
+        assert_eq!(
+            language_id_for_path(Path::new("web/app.ts"), &configured),
+            "typescript"
+        );
+    }
+
+    #[test]
+    fn diagnostics_with_an_old_document_version_are_not_fresh() {
+        let stale = DiagnosticSnapshot {
+            version: Some(1),
+            diagnostics: json!([]),
+        };
+        let current = DiagnosticSnapshot {
+            version: Some(2),
+            diagnostics: json!([]),
+        };
+        assert!(!diagnostic_snapshot_is_fresh(&stale, 2));
+        assert!(diagnostic_snapshot_is_fresh(&current, 2));
+    }
+
+    #[test]
+    fn lsp_name_normalization_collisions_are_detectable() {
+        assert_eq!(
+            unique_tool_name("rust-analyzer", "diagnostics"),
+            unique_tool_name("rust/analyzer", "diagnostics")
+        );
     }
 }

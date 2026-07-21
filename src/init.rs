@@ -8,6 +8,8 @@
 //! Based on the detections it writes (or confirms) the project environment,
 //! workspace, strict workflow, and durable goal policy under `.pb/`, then
 //! prints a summary of what it found and what it configured.
+//! MCP tool-effect declarations such as `capabilities.read_only_tools` remain explicit operator
+//! configuration: `pb init` never infers that an external operation is read-only.
 
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};

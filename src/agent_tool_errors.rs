@@ -20,6 +20,7 @@ pub(crate) enum ToolFailureReason {
     PolicyDenied,
     ApprovalDenied,
     Timeout,
+    Cancelled,
     ToolUnavailable,
     ExecutionFailed,
 }
@@ -89,6 +90,8 @@ pub(crate) fn classify_error(message: &str) -> ToolFailureReason {
         ToolFailureReason::ReadRequired
     } else if lower.contains("not found") || lower.contains("does not exist") {
         ToolFailureReason::TargetNotFound
+    } else if lower.contains("cancelled by user") || lower.contains("canceled by user") {
+        ToolFailureReason::Cancelled
     } else if lower.contains("timed out") || lower.contains("timeout") {
         ToolFailureReason::Timeout
     } else if lower.contains("denied by policy") {
@@ -205,6 +208,165 @@ pub(crate) fn validate_arguments(schema: &Value, arguments: &Value) -> Option<Ar
     None
 }
 
+/// Validate that a dynamic tool schema uses only the JSON Schema subset enforced by
+/// `validate_arguments`. Rejecting unsupported validation keywords is safer than exposing a schema
+/// to the model while silently accepting arguments that violate it at execution time.
+pub(crate) fn validate_supported_schema(schema: &Value) -> Result<(), String> {
+    validate_supported_schema_at(schema, "$")?;
+    if !schema_declares_type(schema, "object") {
+        return Err("tool input schema at $ must declare type 'object'".to_string());
+    }
+    Ok(())
+}
+
+fn validate_supported_schema_at(schema: &Value, path: &str) -> Result<(), String> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| format!("schema at {path} must be an object"))?;
+    const SUPPORTED: &[&str] = &[
+        "type",
+        "description",
+        "title",
+        "default",
+        "enum",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minimum",
+        "maximum",
+    ];
+    for keyword in object.keys() {
+        if !SUPPORTED.contains(&keyword.as_str()) {
+            return Err(format!(
+                "schema at {path} uses unsupported validation keyword '{keyword}'"
+            ));
+        }
+    }
+    const TYPES: &[&str] = &[
+        "string", "integer", "number", "boolean", "array", "object", "null",
+    ];
+    if let Some(schema_type) = object.get("type") {
+        let types = match schema_type {
+            Value::String(kind) => vec![kind.as_str()],
+            Value::Array(kinds) if !kinds.is_empty() => kinds
+                .iter()
+                .map(|kind| {
+                    kind.as_str()
+                        .ok_or_else(|| format!("schema type array at {path} must contain strings"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(format!(
+                    "schema type at {path} must be a string or non-empty string array"
+                ));
+            }
+        };
+        for kind in types {
+            if !TYPES.contains(&kind) {
+                return Err(format!(
+                    "schema at {path} declares unsupported type '{kind}'"
+                ));
+            }
+        }
+    }
+    for keyword in ["description", "title"] {
+        if object.get(keyword).is_some_and(|value| !value.is_string()) {
+            return Err(format!("schema {keyword} at {path} must be a string"));
+        }
+    }
+    if let Some(properties) = object.get("properties") {
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| format!("schema properties at {path} must be an object"))?;
+        for (name, child) in properties {
+            validate_supported_schema_at(child, &format!("{path}.properties.{name}"))?;
+        }
+    }
+    if let Some(required) = object.get("required") {
+        let required = required
+            .as_array()
+            .ok_or_else(|| format!("schema required at {path} must be an array"))?;
+        let properties = object
+            .get("properties")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("schema required at {path} needs object properties"))?;
+        for field in required {
+            let field = field
+                .as_str()
+                .ok_or_else(|| format!("schema required at {path} must contain strings"))?;
+            if !properties.contains_key(field) {
+                return Err(format!(
+                    "schema required field '{field}' at {path} is not declared in properties"
+                ));
+            }
+        }
+    }
+    if let Some(items) = object.get("items") {
+        validate_supported_schema_at(items, &format!("{path}.items"))?;
+    }
+    if let Some(additional) = object.get("additionalProperties")
+        && !additional.is_boolean()
+    {
+        return Err(format!(
+            "schema additionalProperties at {path} must be a boolean"
+        ));
+    }
+    for keyword in ["minLength", "maxLength", "minItems", "maxItems"] {
+        if object
+            .get(keyword)
+            .is_some_and(|value| value.as_u64().is_none())
+        {
+            return Err(format!(
+                "schema {keyword} at {path} must be a non-negative integer"
+            ));
+        }
+    }
+    for (minimum, maximum) in [("minLength", "maxLength"), ("minItems", "maxItems")] {
+        if let (Some(minimum), Some(maximum)) = (
+            object.get(minimum).and_then(Value::as_u64),
+            object.get(maximum).and_then(Value::as_u64),
+        ) && minimum > maximum
+        {
+            return Err(format!(
+                "schema bounds at {path} have minimum above maximum"
+            ));
+        }
+    }
+    for keyword in ["minimum", "maximum"] {
+        if object.get(keyword).is_some_and(|value| !value.is_number()) {
+            return Err(format!("schema {keyword} at {path} must be a number"));
+        }
+    }
+    if let (Some(minimum), Some(maximum)) = (
+        object.get("minimum").and_then(Value::as_f64),
+        object.get("maximum").and_then(Value::as_f64),
+    ) && minimum > maximum
+    {
+        return Err(format!(
+            "schema numeric bounds at {path} have minimum above maximum"
+        ));
+    }
+    if let Some(values) = object.get("enum")
+        && !values.is_array()
+    {
+        return Err(format!("schema enum at {path} must be an array"));
+    }
+    Ok(())
+}
+
+fn schema_declares_type(schema: &Value, expected: &str) -> bool {
+    match schema.get("type") {
+        Some(Value::String(kind)) => kind == expected,
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
 fn schema_value_violation(value: &Value, schema: &Value, path: &str) -> Option<String> {
     if let Some(values) = schema.get("enum").and_then(Value::as_array)
         && !values.contains(value)
@@ -252,9 +414,24 @@ fn schema_value_violation(value: &Value, schema: &Value, path: &str) -> Option<S
             return Some(format!("argument '{path}' exceeds its declared maximum"));
         }
     }
-    if let Some(values) = value.as_array()
-        && let Some(items) = schema.get("items")
-    {
+    if let Some(values) = value.as_array() {
+        if schema
+            .get("maxItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|maximum| values.len() as u64 > maximum)
+        {
+            return Some(format!("argument '{path}' exceeds its declared maxItems"));
+        }
+        if schema
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|minimum| (values.len() as u64) < minimum)
+        {
+            return Some(format!("argument '{path}' is below its declared minItems"));
+        }
+        let Some(items) = schema.get("items") else {
+            return None;
+        };
         for (index, value) in values.iter().enumerate() {
             if !value_matches_schema_type(value, items) {
                 return Some(format!(
@@ -329,7 +506,7 @@ fn value_matches_schema_type(value: &Value, schema: &Value) -> bool {
             .iter()
             .filter_map(Value::as_str)
             .any(|kind| value_matches_type(value, kind)),
-        _ => true,
+        _ => false,
     }
 }
 
@@ -342,7 +519,7 @@ fn value_matches_type(value: &Value, kind: &str) -> bool {
         "array" => value.is_array(),
         "object" => value.is_object(),
         "null" => value.is_null(),
-        _ => true,
+        _ => false,
     }
 }
 
@@ -424,6 +601,14 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_has_a_distinct_failure_reason() {
+        assert_eq!(
+            classify_error("run_command cancelled by user"),
+            ToolFailureReason::Cancelled
+        );
+    }
+
+    #[test]
     fn ar2_schema_validation_reports_exact_required_and_typed_arguments() {
         let schema = json!({
             "type": "object",
@@ -490,6 +675,55 @@ mod tests {
                 &json!({"content": "okay", "items": [{"status": "pass"}]})
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn dynamic_schema_rejects_keywords_the_runtime_cannot_enforce() {
+        let error = validate_supported_schema(&json!({
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "pattern": "^[a-z]+$"}
+            }
+        }))
+        .unwrap_err();
+        assert!(error.contains("unsupported validation keyword 'pattern'"));
+    }
+
+    #[test]
+    fn dynamic_schema_rejects_unknown_types_and_invalid_required_fields() {
+        let unknown_type = validate_supported_schema(&json!({
+            "type": "object",
+            "properties": {"target": {"type": "path"}}
+        }))
+        .unwrap_err();
+        assert!(unknown_type.contains("unsupported type 'path'"));
+
+        let invalid_required = validate_supported_schema(&json!({
+            "type": "object",
+            "properties": {},
+            "required": ["missing"]
+        }))
+        .unwrap_err();
+        assert!(invalid_required.contains("is not declared in properties"));
+    }
+
+    #[test]
+    fn schema_validation_enforces_array_bounds() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": {"type": "string"}, "maxItems": 1}
+            },
+            "required": ["items"],
+            "additionalProperties": false
+        });
+        validate_supported_schema(&schema).unwrap();
+        assert_eq!(
+            validate_arguments(&schema, &json!({"items": ["one", "two"]}))
+                .unwrap()
+                .reason,
+            ToolFailureReason::InvalidArgumentValue
         );
     }
 
