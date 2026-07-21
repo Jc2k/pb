@@ -15,6 +15,8 @@ const AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const CALLBACK_PATH: &str = "/auth/github/callback";
 const CALLBACK_WAIT: Duration = Duration::from_secs(180);
+const OAUTH_STATE_BYTES: usize = 32;
+const OAUTH_STATE_LENGTH: usize = (OAUTH_STATE_BYTES * 4 + 2) / 3;
 
 #[derive(Debug, Clone)]
 pub struct OAuthRequest {
@@ -63,7 +65,7 @@ pub fn callback_bind_addr(listen: &str, port: u16) -> Result<SocketAddr> {
 }
 
 pub fn begin(client_id: &str, redirect_uri: &str, scopes: &[&str]) -> Result<OAuthRequest> {
-    let state = random_urlsafe(32)?;
+    let state = random_urlsafe(OAUTH_STATE_BYTES)?;
     let code_verifier = random_urlsafe(64)?;
     let code_challenge = pkce_challenge(&code_verifier);
     let mut url = Url::parse(AUTHORIZE_URL)?;
@@ -83,19 +85,34 @@ pub fn begin(client_id: &str, redirect_uri: &str, scopes: &[&str]) -> Result<OAu
 }
 
 pub fn callback_path_for_state(state: &str) -> Result<PathBuf> {
-    validate_state_component(state)?;
-    Ok(config_dir()?
-        .join("github-oauth")
-        .join(format!("{state}.toml")))
+    callback_state_path(state, "toml")
 }
 
-pub fn clear_callback(state: &str) -> Result<()> {
-    let path = callback_path_for_state(state)?;
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("failed to remove stale OAuth callback {}", path.display()))?;
+pub fn prepare_callback(state: &str) -> Result<()> {
+    let callback_path = callback_path_for_state(state)?;
+    remove_file_if_exists(&callback_path).with_context(|| {
+        format!(
+            "failed to remove stale OAuth callback {}",
+            callback_path.display()
+        )
+    })?;
+    let pending_path = pending_callback_path_for_state(state)?;
+    if let Some(parent) = pending_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    Ok(())
+    match write_secret_file(&pending_path, state) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = remove_file_if_exists(&pending_path);
+            Err(err).with_context(|| {
+                format!(
+                    "failed to prepare GitHub OAuth callback {}",
+                    pending_path.display()
+                )
+            })
+        }
+    }
 }
 
 pub fn persist_callback_from_query(query: &HashMap<String, String>) -> (StatusCode, String) {
@@ -131,6 +148,9 @@ pub fn try_start_callback_listener(addr: SocketAddr) -> Option<TcpListener> {
 }
 
 pub fn wait_for_callback(state: &str, listener: Option<TcpListener>) -> Result<OAuthCallback> {
+    let _pending_guard = PendingCallbackGuard {
+        path: pending_callback_path_for_state(state)?,
+    };
     let deadline = Instant::now() + CALLBACK_WAIT;
     while Instant::now() < deadline {
         if let Some(listener) = &listener {
@@ -269,6 +289,29 @@ fn callback_from_http_request(request: &str) -> Result<OAuthCallback> {
 
 fn persist_callback(callback: &OAuthCallback) -> Result<()> {
     let path = callback_path_for_state(&callback.state)?;
+    let pending_path = pending_callback_path_for_state(&callback.state)?;
+    persist_callback_to_paths(callback, &path, &pending_path)
+}
+
+fn persist_callback_to_paths(
+    callback: &OAuthCallback,
+    path: &std::path::Path,
+    pending_path: &std::path::Path,
+) -> Result<()> {
+    match std::fs::remove_file(pending_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!("GitHub OAuth callback state is not pending")
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to consume pending OAuth callback {}",
+                    pending_path.display()
+                )
+            });
+        }
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -310,10 +353,29 @@ fn validate_state_component(state: &str) -> Result<()> {
     let is_urlsafe = state
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-    if state.is_empty() || state.len() > 128 || !is_urlsafe {
+    if state.len() != OAUTH_STATE_LENGTH || !is_urlsafe {
         bail!("invalid OAuth state");
     }
     Ok(())
+}
+
+fn callback_state_path(state: &str, extension: &str) -> Result<PathBuf> {
+    validate_state_component(state)?;
+    Ok(config_dir()?
+        .join("github-oauth")
+        .join(format!("{state}.{extension}")))
+}
+
+fn pending_callback_path_for_state(state: &str) -> Result<PathBuf> {
+    callback_state_path(state, "pending")
+}
+
+fn remove_file_if_exists(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn random_urlsafe(bytes: usize) -> Result<String> {
@@ -371,6 +433,16 @@ impl From<CallbackFile> for OAuthCallback {
             error: file.error,
             error_description: file.error_description,
         }
+    }
+}
+
+struct PendingCallbackGuard {
+    path: PathBuf,
+}
+
+impl Drop for PendingCallbackGuard {
+    fn drop(&mut self) {
+        let _ = remove_file_if_exists(&self.path);
     }
 }
 
@@ -435,13 +507,45 @@ mod tests {
             "nested/callback",
             "state.toml",
             "state%2f",
+            &"A".repeat(OAUTH_STATE_LENGTH - 1),
+            &"A".repeat(OAUTH_STATE_LENGTH + 1),
         ] {
             assert!(
                 callback_path_for_state(state).is_err(),
                 "accepted {state:?}"
             );
         }
-        assert!(callback_path_for_state("valid_URL-safe-state_123").is_ok());
+        assert!(callback_path_for_state(&"A".repeat(OAUTH_STATE_LENGTH)).is_ok());
+    }
+
+    #[test]
+    fn callback_persistence_requires_and_consumes_pending_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = "A".repeat(OAUTH_STATE_LENGTH);
+        let callback = OAuthCallback {
+            state,
+            code: Some("code".to_string()),
+            error: None,
+            error_description: None,
+        };
+        let callback_path = directory.path().join("callback.toml");
+        let pending_path = directory.path().join("callback.pending");
+
+        let missing =
+            persist_callback_to_paths(&callback, &callback_path, &pending_path).unwrap_err();
+        assert!(missing.to_string().contains("is not pending"));
+
+        write_secret_file(&pending_path, &callback.state).unwrap();
+        persist_callback_to_paths(&callback, &callback_path, &pending_path).unwrap();
+
+        assert!(!pending_path.exists());
+        let persisted: CallbackFile =
+            toml::from_str(&std::fs::read_to_string(&callback_path).unwrap()).unwrap();
+        assert_eq!(persisted.state, callback.state);
+        assert_eq!(persisted.code.as_deref(), Some("code"));
+        let replay =
+            persist_callback_to_paths(&callback, &callback_path, &pending_path).unwrap_err();
+        assert!(replay.to_string().contains("is not pending"));
     }
 
     #[cfg(unix)]

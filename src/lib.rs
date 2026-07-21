@@ -1364,10 +1364,10 @@ async fn mcp_setup_github(args: McpSetupGithubArgs) -> Result<()> {
     let port = user_config.effective_web_port();
     let redirect_uri = github_oauth::redirect_uri(&listen, port);
     let request = github_oauth::begin(client_id, &redirect_uri, &["repo", "read:org"])?;
-    github_oauth::clear_callback(&request.state)?;
+    let callback_addr = github_oauth::callback_bind_addr(&listen, port)?;
+    github_oauth::prepare_callback(&request.state)?;
 
-    let callback_listener =
-        github_oauth::try_start_callback_listener(github_oauth::callback_bind_addr(&listen, port)?);
+    let callback_listener = github_oauth::try_start_callback_listener(callback_addr);
     if callback_listener.is_none() {
         println!(
             "Using existing pb serve callback endpoint at {}.",
