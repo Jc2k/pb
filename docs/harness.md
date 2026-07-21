@@ -19,6 +19,8 @@ explicit transition into delivery.
 The command blocks until `agent_core::run_agent` completes or fails. Existing web and `pb queue`
 session paths continue to use their normal daemon lifecycle. `journal.md` is initialized before model
 loading, so an interrupted run still leaves the scratch location and raw-event recovery guidance.
+`--max-steps` caps each model-driven strict stage as well as a direct agent run; when a workflow
+policy declares a lower stage limit, the lower bound wins.
 
 For a bounded active-Goal control experiment, a trusted caller may inject the same read-only model
 projection used by the daemon:

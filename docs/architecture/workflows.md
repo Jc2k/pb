@@ -171,7 +171,8 @@ a new invocation identifier cannot itself alter the checkpoint's refs fingerprin
 
 The workflow budgets stage steps, model invocations, generated tokens, advisory calls, plan cycles,
 and repair cycles. It also detects repeated no-progress operations against unchanged state and
-stops loops deterministically.
+stops loops deterministically. A request-level step ceiling narrows every model-driven stage; the
+lower of that ceiling and the compiled workflow policy is cumulative across validation attempts.
 
 When a model response is truncated before producing a valid action, pb can retry with thinking
 disabled and, within the same global budget, use a larger output cap. A capped native `write_file`

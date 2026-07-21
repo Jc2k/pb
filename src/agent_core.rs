@@ -8831,6 +8831,7 @@ fn run_delivery_workflow(
     let mut validation_signature: Option<u64> = None;
     let mut repeated_validation_failures = 0usize;
     let mut repair_context: Option<String> = None;
+    let stage_step_limit = args.max_steps.clamp(1, policy.limits.stage_steps);
 
     loop {
         if sink.should_pause() && !run.stage.is_terminal() {
@@ -8900,12 +8901,12 @@ fn run_delivery_workflow(
             bail!("delivery orchestrator cannot execute stage {stage:?}");
         }
         let consumed_stage_steps = run.counters.stage_steps.get(&stage).copied().unwrap_or(0);
-        if consumed_stage_steps >= policy.limits.stage_steps {
+        if consumed_stage_steps >= stage_step_limit {
             run.apply(crate::workflow::WorkflowEvent::Failed {
                 outcome: crate::workflow::WorkflowOutcome::StepLimit,
                 reason: format!(
                     "model stage {stage:?} exhausted its cumulative {}-step budget across validation attempts",
-                    policy.limits.stage_steps
+                    stage_step_limit
                 ),
             })?;
             return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
@@ -8917,10 +8918,7 @@ fn run_delivery_workflow(
         });
         let mut contract =
             crate::workflow::StageContract::strict(stage, policy.limits, args.max_tokens)?;
-        contract.max_steps = policy
-            .limits
-            .stage_steps
-            .saturating_sub(consumed_stage_steps);
+        contract.max_steps = stage_step_limit.saturating_sub(consumed_stage_steps);
         if stage == crate::workflow::WorkflowStage::CodeReview {
             let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
             if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
@@ -19105,6 +19103,65 @@ the next imagined action"#;
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn strict_delivery_honors_a_request_step_ceiling_below_policy() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
+        git_run(&["add", "existing.txt"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
+        let baseline = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let plan = delivery_plan(
+            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let invalid =
+            implementation_submission(&plan, &baseline.fingerprint, vec!["existing.txt"], false);
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.max_steps = 1;
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        request.turn_id = "turn-request-stage-budget".to_string();
+
+        let (outcome, generator, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                text_completion(invalid),
+                scripted_final("must remain unused"),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::StepLimit)
+        );
+        assert_eq!(
+            outcome
+                .checkpoint
+                .run
+                .counters
+                .stage_steps
+                .get(&crate::workflow::WorkflowStage::Implementing),
+            Some(&1)
+        );
+        assert!(
+            outcome
+                .checkpoint
+                .run
+                .blocked_reason
+                .as_deref()
+                .unwrap()
+                .contains("cumulative 1-step budget")
+        );
+        assert_eq!(generator.completions.len(), 1);
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            AgentEvent::StepStarted { max_steps, .. } if *max_steps != 1
+        )));
     }
 
     #[test]
