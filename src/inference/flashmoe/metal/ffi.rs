@@ -84,10 +84,9 @@ pub(crate) unsafe fn compile_pipeline(
     name: &str,
 ) -> anyhow::Result<MetalObjcId> {
     unsafe {
-        let function = new_function(library, name)?;
-        let pipeline = new_compute_pipeline(device, function)
+        let function = OwnedMetalObject::new(new_function(library, name)?)?;
+        let pipeline = new_compute_pipeline(device, function.id())
             .with_context(|| format!("failed to create {name} Metal pipeline"))?;
-        release(function);
         Ok(pipeline)
     }
 }

@@ -156,12 +156,17 @@ impl MetalResourceLedgerState {
     }
 
     pub(super) fn transition_buffer(&mut self, id: usize, class: MetalTrackedBufferClass) {
-        let Some(previous) = self.buffers.get(&id).copied() else {
+        if !self.transition_buffer_if_tracked(id, class) {
             debug_assert!(false, "untracked Metal buffer transition: {id:#x}");
-            return;
+        }
+    }
+
+    fn transition_buffer_if_tracked(&mut self, id: usize, class: MetalTrackedBufferClass) -> bool {
+        let Some(previous) = self.buffers.get(&id).copied() else {
+            return false;
         };
         if previous.class == class {
-            return;
+            return true;
         }
         self.counter_mut(previous.class).remove(previous.len);
         self.counter_mut(class).add(previous.len);
@@ -175,15 +180,22 @@ impl MetalResourceLedgerState {
             buffer.class = class;
         }
         self.update_ledger_high_water();
+        true
     }
 
     pub(super) fn release_buffer(&mut self, id: usize) {
-        let Some(previous) = self.buffers.remove(&id) else {
+        if !self.release_buffer_if_tracked(id) {
             debug_assert!(false, "untracked Metal buffer release: {id:#x}");
-            return;
+        }
+    }
+
+    fn release_buffer_if_tracked(&mut self, id: usize) -> bool {
+        let Some(previous) = self.buffers.remove(&id) else {
+            return false;
         };
         self.counter_mut(previous.class).remove(previous.len);
         self.buffer_releases = self.buffer_releases.saturating_add(1);
+        true
     }
 
     pub(super) fn snapshot(&self) -> FlashMoeMetalResourceSnapshot {
@@ -287,10 +299,30 @@ impl MetalResourceLedger {
             .release_buffer(id as usize);
     }
 
+    pub(super) fn release_buffer_on_drop(&self, id: MetalObjcId) {
+        super::synchronization::lock_for_drop(&self.state).release_buffer_if_tracked(id as usize);
+    }
+
+    pub(super) fn transition_buffer_on_drop(
+        &self,
+        id: MetalObjcId,
+        class: MetalTrackedBufferClass,
+    ) -> bool {
+        super::synchronization::lock_for_drop(&self.state)
+            .transition_buffer_if_tracked(id as usize, class)
+    }
+
     pub(super) fn record_resident_resources(&self, dense_bytes: usize, recurrent_bytes: usize) {
         let mut state = self.state.lock().expect("Metal resource ledger poisoned");
         state.resident_dense_bytes = dense_bytes;
         state.recurrent_state_bytes = recurrent_bytes;
+        state.update_ledger_high_water();
+    }
+
+    pub(super) fn clear_resident_resources_on_drop(&self) {
+        let mut state = super::synchronization::lock_for_drop(&self.state);
+        state.resident_dense_bytes = 0;
+        state.recurrent_state_bytes = 0;
         state.update_ledger_high_water();
     }
 
@@ -361,6 +393,12 @@ impl MetalResourceLedger {
         state.phase_cleanup_buffers = state.phase_cleanup_buffers.saturating_add(buffers);
     }
 
+    pub(super) fn record_phase_cleanup_on_drop(&self, buffers: usize) {
+        let mut state = super::synchronization::lock_for_drop(&self.state);
+        state.phase_cleanup_calls = state.phase_cleanup_calls.saturating_add(1);
+        state.phase_cleanup_buffers = state.phase_cleanup_buffers.saturating_add(buffers);
+    }
+
     pub(super) fn command_started(&self) {
         let mut state = self.state.lock().expect("Metal resource ledger poisoned");
         state.command_submissions = state.command_submissions.saturating_add(1);
@@ -378,8 +416,8 @@ impl MetalResourceLedger {
         state.host_readback_bytes = state.host_readback_bytes.saturating_add(bytes);
     }
 
-    pub(super) fn command_finished(&self) {
-        let mut state = self.state.lock().expect("Metal resource ledger poisoned");
+    pub(super) fn command_finished_on_drop(&self) {
+        let mut state = super::synchronization::lock_for_drop(&self.state);
         state.in_flight_commands = state.in_flight_commands.saturating_sub(1);
     }
 
@@ -754,6 +792,76 @@ impl MetalBufferPool {
         }
     }
 
+    unsafe fn recycle_into_pool_on_drop<const LIMIT: usize, F>(
+        &self,
+        pool: &Mutex<Vec<MetalReusableBuffer>>,
+        buffer: MetalObjcId,
+        release_buffer: F,
+    ) where
+        F: Fn(MetalObjcId) + Copy,
+    {
+        let len = unsafe { msg_send_usize0(buffer, sel("length")) };
+        let mut reusable = match pool.lock() {
+            Ok(reusable) => reusable,
+            Err(_) => {
+                self.resources.release_buffer_on_drop(buffer);
+                release_buffer(buffer);
+                return;
+            }
+        };
+        if reusable.len() < LIMIT {
+            if !self
+                .resources
+                .transition_buffer_on_drop(buffer, MetalTrackedBufferClass::Pooled)
+            {
+                drop(reusable);
+                release_buffer(buffer);
+                return;
+            }
+            reusable.push(MetalReusableBuffer::new(buffer, len));
+            return;
+        }
+        let Some(index) = reusable_buffer_replacement_index(&reusable, len) else {
+            drop(reusable);
+            self.resources.release_buffer_on_drop(buffer);
+            release_buffer(buffer);
+            return;
+        };
+        if !self
+            .resources
+            .transition_buffer_on_drop(buffer, MetalTrackedBufferClass::Pooled)
+        {
+            drop(reusable);
+            release_buffer(buffer);
+            return;
+        }
+        let evicted =
+            std::mem::replace(&mut reusable[index], MetalReusableBuffer::new(buffer, len));
+        drop(reusable);
+        self.resources.release_buffer_on_drop(evicted.id);
+        release_buffer(evicted.id);
+    }
+
+    unsafe fn recycle_on_drop(&self, buffer: MetalObjcId) {
+        unsafe {
+            self.recycle_into_pool_on_drop::<METAL_REUSABLE_BUFFER_POOL_LIMIT, _>(
+                &self.reusable,
+                buffer,
+                |buffer| release(buffer),
+            );
+        }
+    }
+
+    unsafe fn recycle_expert_staging_on_drop(&self, buffer: MetalObjcId) {
+        unsafe {
+            self.recycle_into_pool_on_drop::<METAL_REUSABLE_EXPERT_STAGING_POOL_LIMIT, _>(
+                &self.reusable_expert_staging,
+                buffer,
+                |buffer| purge_and_release_metal_buffer(buffer),
+            );
+        }
+    }
+
     pub(crate) fn recycle_or_release(&self, buffers: &[MetalObjcId], release_only: bool) {
         unsafe {
             for buffer in buffers.iter().copied() {
@@ -798,21 +906,58 @@ impl MetalBufferPool {
         }
     }
 
+    pub(crate) fn recycle_buffers_on_drop(&self, buffers: &[MetalObjcId]) {
+        unsafe {
+            for buffer in buffers.iter().copied() {
+                self.recycle_on_drop(buffer);
+            }
+        }
+    }
+
+    pub(crate) fn recycle_or_release_phase_on_drop(
+        &self,
+        buffers: Vec<MetalPhaseBuffer>,
+        release_only: bool,
+    ) {
+        self.resources.record_phase_cleanup_on_drop(buffers.len());
+        unsafe {
+            for buffer in buffers {
+                match buffer.class {
+                    MetalPhaseBufferClass::BorrowedExpert => release(buffer.id),
+                    MetalPhaseBufferClass::TransientExpert => {
+                        if release_only {
+                            self.resources.release_buffer_on_drop(buffer.id);
+                            purge_and_release_metal_buffer(buffer.id);
+                        } else {
+                            self.recycle_expert_staging_on_drop(buffer.id);
+                        }
+                    }
+                    MetalPhaseBufferClass::General => {
+                        if release_only {
+                            self.resources.release_buffer_on_drop(buffer.id);
+                            release(buffer.id);
+                        } else {
+                            self.recycle_on_drop(buffer.id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn release_all(&mut self) {
-        let reusable = self.reusable.get_mut().expect("metal buffer pool poisoned");
+        let reusable = super::synchronization::get_mut_for_drop(&mut self.reusable);
         unsafe {
             for buffer in reusable.drain(..) {
-                self.resources.release_buffer(buffer.id);
+                self.resources.release_buffer_on_drop(buffer.id);
                 release(buffer.id);
             }
         }
-        let expert_staging = self
-            .reusable_expert_staging
-            .get_mut()
-            .expect("metal expert staging pool poisoned");
+        let expert_staging =
+            super::synchronization::get_mut_for_drop(&mut self.reusable_expert_staging);
         unsafe {
             for buffer in expert_staging.drain(..) {
-                self.resources.release_buffer(buffer.id);
+                self.resources.release_buffer_on_drop(buffer.id);
                 purge_and_release_metal_buffer(buffer.id);
             }
         }
@@ -823,5 +968,53 @@ impl MetalBufferPool {
 impl Drop for MetalBufferPool {
     fn drop(&mut self) {
         self.release_all();
+    }
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    fn poison<T>(mutex: &Mutex<T>) {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = mutex.lock().expect("test mutex should start healthy");
+            panic!("intentional cleanup poison");
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn metal_buffer_pool_drop_recovers_poisoned_empty_pools() {
+        let pool = MetalBufferPool::default();
+        poison(&pool.reusable);
+        poison(&pool.reusable_expert_staging);
+
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(pool))).is_ok());
+    }
+
+    #[test]
+    fn metal_resource_drop_accounting_recovers_poisoned_ledger() {
+        let resources = MetalResourceLedger::default();
+        let buffer = 0x1000usize as MetalObjcId;
+        resources.register_buffer(buffer, 64, MetalTrackedBufferClass::ActiveGeneral);
+        resources.command_started();
+        poison(&resources.state);
+
+        assert!(resources.transition_buffer_on_drop(buffer, MetalTrackedBufferClass::Pooled));
+        resources.command_finished_on_drop();
+        resources.clear_resident_resources_on_drop();
+
+        {
+            let snapshot =
+                super::super::synchronization::lock_for_drop(&resources.state).snapshot();
+            assert_eq!(snapshot.pooled_buffers, 1);
+        }
+        resources.release_buffer_on_drop(buffer);
+        let snapshot = super::super::synchronization::lock_for_drop(&resources.state).snapshot();
+        assert_eq!(snapshot.ledger_live_bytes, 0);
+        assert_eq!(snapshot.active_general_buffers, 0);
+        assert_eq!(snapshot.in_flight_commands, 0);
     }
 }

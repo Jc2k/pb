@@ -54,10 +54,15 @@ architectural completion.
   polling finely enough that host-side wait granularity does not become a per-layer decode stage.
 - Retained Metal devices, queues, pipeline states, and dense mmap buffers are owned by typed RAII
   handles. Objective-C identifiers passed to encoding helpers are borrowed views; partial graph
-  compilation and later initialization failures release every successfully created object.
+  compilation and later initialization failures release every successfully created object. Metal
+  buffer-allocation transactions likewise retain their partial results in a scoped RAII guard until
+  ownership is transferred to resident or request state.
 - Rust-to-Metal argument blocks implement a no-uninitialized-bytes contract. Explicit zeroed ABI
-  padding and compile-time size assertions preserve the shader layout without exposing Rust padding
-  through `setBytes`.
+  padding plus compile-time size and per-field-offset assertions preserve the shader layout without
+  exposing Rust padding through `setBytes`.
+- Destructors recover poisoned synchronization only to finish owned-resource cleanup; normal runtime
+  operations continue surfacing poisoned state as an error. Healthy wrapper destruction preserves
+  bounded buffer reuse, while poisoned pools and failed commands release their buffers directly.
 - A pending parallel whole-layer `pread` owns the mutable lifetime of its destination until finish
   or drop joins every worker. Safe scheduler callers cannot access or release request staging while
   a worker may still write it.
@@ -66,7 +71,8 @@ architectural completion.
 - Per-token selected routes and their normalized weights use one validated inline collection with
   capacity for the shipped K=4/6/8/10 profiles. Route/weight cardinality cannot diverge, duplicate
   checks do not allocate a tree, and larger future K values retain the same API by spilling to the
-  collection's heap representation.
+  collection's heap representation. Top-k selection is seeded with negative infinity so every
+  finite `f32` router score remains selectable without introducing a finite score floor.
 - Resident projection validation is statically dispatched over borrowed dense, affine-Q4, or enum
   descriptors. Callers do not clone projection metadata merely to select a validation branch.
 
@@ -810,8 +816,9 @@ Metal buffer while the current buffer is consumed. A separate bounded worker pag
 next layer's exact load-resolved resident ranges. The buffers swap after the current fused expert
 command completes, eliminating the former page-cache-to-staging selected-expert copy. Shorter
 batches keep selected-only coalesced reads into one buffer; preparation errors are terminal and
-never retry through mmap, an application cache, or another runtime. Pending direct-write handles
-join during error unwinding so no worker can outlive its Metal destination. This is a deterministic
+never retry through mmap, an application cache, or another runtime. Pending direct-write and
+resident-page handles join during error unwinding so no worker can outlive its Metal destination or
+mapped source. This is a deterministic
 dispatch from loaded graph geometry and runtime token count, not a route prediction or failure
 fallback.
 
@@ -937,8 +944,11 @@ single catch-all implementation files:
   state snapshots in one direction only.
 - `metal` separates diagnostics and bounded waits, Objective-C FFI, resource accounting and buffer
   pooling, resident projection encoding, fused linear attention, Qwen attention/prefill execution,
-  and CMD3 planning. Qwen shader source is a standalone `qwen/shaders.metal` artifact rather than a
-  multi-thousand-line Rust string literal.
+  and CMD3 planning. Typed retained-object and command ownership lives in `ownership`; cleanup-only
+  poison recovery lives in `synchronization`. DeepSeek execution further separates host/shader ABI
+  assertions, request-buffer allocation, layer-ahead preparation, and resident-state lifecycle into
+  `abi`, `buffers`, `prepare`, and `state`. Qwen shader source is a standalone
+  `qwen/shaders.metal` artifact rather than a multi-thousand-line Rust string literal.
 - `runtime` keeps the engine and token/layer executor in its root, the ordered load transaction in
   `loader`, and request/session generation orchestration in `generation`. The loaded engine holds a
   closed `ResolvedModelExecutor` (`Qwen` or `DeepSeekV4`) instead of using an optional DeepSeek graph
@@ -1005,7 +1015,9 @@ Baseline reviewed on 2026-07-11:
 - `MetalRuntime` owns device discovery, shader-library compilation, the command queue, every
   required pipeline, partial-construction cleanup, and final release. `MetalExecutionContext`
   owns that runtime together with resident dense and recurrent state; `legacy.rs` no longer
-  compiles or releases Metal pipelines, queues, devices, or buffers.
+  compiles or releases Metal pipelines, queues, devices, or buffers. Function objects created while
+  compiling a pipeline are RAII-owned across pipeline-construction errors instead of relying on a
+  success-only release.
 - Production scheduled CMD3 now consumes typed GPU-resident post-attention state, scheduler-owned
   whole-expert slots, resident Q4/BF16/F16/F32 shared projections, routing weights, and typed output
   state in a
@@ -1047,6 +1059,10 @@ Baseline reviewed on 2026-07-11:
   referenced buffers; deferred CMD3 explicitly transfers its ended command buffer to the submission.
   The reusable pool uses best-fit allocation so tiny transients cannot consume cached whole-expert
   buffers, and under capacity pressure it retains larger buffers instead of the earliest small ones.
+  Drop paths preserve that reuse when pool ownership is healthy, recover poisoned cleanup locks
+  without panicking, and directly release buffers when a failed command or poisoned pool makes reuse
+  inappropriate. DeepSeek resident and request allocation transactions also release every partial
+  buffer set during errors or unwinding before publishing the completed state.
   Command buffers use Metal's unretained-reference mode because pb explicitly owns every encoded
   resource through synchronous completion or deferred-submission transfer. The RAII owner claims
   autoreleased command-buffer and encoder return values with Objective-C's return-value handshake,

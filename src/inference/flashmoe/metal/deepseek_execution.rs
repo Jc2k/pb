@@ -6,15 +6,23 @@ use std::thread;
 use anyhow::{Context, Result, bail};
 
 use super::super::deepseek::{
-    DeepSeekResidentDtype, DeepSeekResidentRange, DeepSeekResidentTensor, DeepSeekV4ExecutionGraph,
-    DeepSeekV4LayerGraph, deepseek_v4_router_probabilities, deepseek_v4_select_routes,
+    DeepSeekResidentDtype, DeepSeekResidentTensor, DeepSeekV4ExecutionGraph, DeepSeekV4LayerGraph,
+    deepseek_v4_router_probabilities, deepseek_v4_select_routes,
 };
 use super::super::experts::{DeepSeekGgufExpertSlotSpec, ExpertMlpProjection};
 use super::super::scheduler::{
-    FlashMoeExecutionScheduler, PendingScheduledExpertLayerPrepare,
-    ScheduledDeepSeekGgufExpertPhaseMlpPayload, ScheduledExpertPhaseMlpPayload, ScheduledExpertSet,
+    FlashMoeExecutionScheduler, ScheduledDeepSeekGgufExpertPhaseMlpPayload,
+    ScheduledExpertPhaseMlpPayload, ScheduledExpertSet,
 };
 use super::*;
+
+mod abi;
+use abi::bytes_of;
+mod buffers;
+use buffers::{MetalBufferAllocation, allocate_owned_buffer_uninitialized};
+mod prepare;
+use prepare::{finish_layer_prepare, issue_layer_prepare};
+mod state;
 
 const HIDDEN: usize = 4096;
 const HC: usize = 4;
@@ -37,27 +45,6 @@ const INDEX_WIDTH: usize = INDEX_HEADS * INDEX_HEAD_DIM;
 const INDEX_TOP_K: usize = 512;
 const RMS_EPS: f32 = 1.0e-6;
 const HC_EPS: f32 = 1.0e-6;
-const RESIDENT_LAYER_PREPARE_WORKERS: usize = 1;
-
-#[derive(Debug, Clone, Copy)]
-struct DeepSeekResidentPageRange {
-    byte_offset: usize,
-    byte_len: usize,
-}
-
-#[derive(Debug)]
-struct PendingDeepSeekResidentLayerPrepare {
-    layer: usize,
-    bytes: usize,
-    workers: Vec<thread::JoinHandle<Result<usize>>>,
-}
-
-#[derive(Debug)]
-struct PendingDeepSeekLayerPrepare<'a> {
-    expert: PendingScheduledExpertLayerPrepare<'a>,
-    resident: PendingDeepSeekResidentLayerPrepare,
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::NoUninit)]
 struct MatvecArgs {
@@ -852,26 +839,6 @@ struct MoeActivationArgs {
     clamp_value: f32,
 }
 
-// These sizes are the matching Metal Shading Language constant-argument ABI.
-// `NoUninit` proves every uploaded byte is initialized; the assertions pin the
-// host layout so field or padding changes cannot silently shift shader inputs.
-const _: () = {
-    assert!(size_of::<MatvecArgs>() == 112);
-    assert!(size_of::<MulMmArgs>() == 88);
-    assert!(size_of::<FlashAttentionPadArgs>() == 104);
-    assert!(size_of::<FlashAttentionBlockArgs>() == 48);
-    assert!(size_of::<FlashAttentionArgs>() == 192);
-    assert!(size_of::<MoeMapArgs>() == 48);
-    assert!(size_of::<MoeBatchMmArgs>() == 96);
-    assert!(size_of::<HcExpandArgs>() == 152);
-    assert!(size_of::<IndexedAttentionArgs>() == 112);
-    assert!(size_of::<Fp8Args>() == 104);
-    assert!(size_of::<RopeArgs>() == 144);
-    assert!(size_of::<IndexScoresArgs>() == 72);
-    assert!(size_of::<ArgsortArgs>() == 72);
-    assert!(size_of::<MoeMatvecArgs>() == 120);
-};
-
 #[derive(Debug)]
 struct DeepSeekLayerState {
     ratio: usize,
@@ -1022,87 +989,6 @@ impl Drop for DeepSeekV4SessionSnapshot {
                 release(buffer);
             }
         }
-    }
-}
-
-impl DeepSeekV4MetalState {
-    pub(super) unsafe fn release(&mut self) {
-        unsafe {
-            for buffer in self.owned.drain(..) {
-                super::release(buffer);
-            }
-        }
-        self.bytes = 0;
-    }
-
-    fn session_buffer_specs(&self, frontier: usize) -> Result<Vec<(MetalObjcId, usize)>> {
-        let mut buffers = Vec::with_capacity(self.layers.len() * 7 + 2);
-        for layer in &self.layers {
-            buffers.push((layer.raw, unsafe {
-                msg_send_usize0(layer.raw, sel("length"))
-            }));
-            if let Some(comp) = layer.comp {
-                let rows = frontier / layer.ratio;
-                let bytes = rows
-                    .checked_mul(HEAD_DIM * size_of::<f32>())
-                    .context("DeepSeek V4 compressed session snapshot size overflow")?
-                    .max(size_of::<f32>());
-                buffers.push((comp, bytes));
-                buffers.push((
-                    layer.comp_state_kv.expect("compressed KV frontier"),
-                    unsafe {
-                        msg_send_usize0(
-                            layer.comp_state_kv.expect("compressed KV frontier"),
-                            sel("length"),
-                        )
-                    },
-                ));
-                buffers.push((
-                    layer.comp_state_score.expect("compressed score frontier"),
-                    unsafe {
-                        msg_send_usize0(
-                            layer.comp_state_score.expect("compressed score frontier"),
-                            sel("length"),
-                        )
-                    },
-                ));
-            }
-            if let Some(index_comp) = layer.index_comp {
-                let rows = frontier / layer.ratio;
-                let bytes = rows
-                    .checked_mul(INDEX_HEAD_DIM * size_of::<f32>())
-                    .context("DeepSeek V4 index session snapshot size overflow")?
-                    .max(size_of::<f32>());
-                buffers.push((index_comp, bytes));
-                buffers.push((layer.index_state_kv.expect("index KV frontier"), unsafe {
-                    msg_send_usize0(
-                        layer.index_state_kv.expect("index KV frontier"),
-                        sel("length"),
-                    )
-                }));
-                buffers.push((
-                    layer.index_state_score.expect("index score frontier"),
-                    unsafe {
-                        msg_send_usize0(
-                            layer.index_state_score.expect("index score frontier"),
-                            sel("length"),
-                        )
-                    },
-                ));
-            }
-        }
-        for buffer in [self.scratch.cur_hc, self.scratch.output_hidden] {
-            buffers.push((buffer, unsafe { msg_send_usize0(buffer, sel("length")) }));
-        }
-        for (buffer, bytes) in &buffers {
-            let available = unsafe { msg_send_usize0(*buffer, sel("length")) };
-            if *bytes > available {
-                bail!(
-                    "DeepSeek V4 session snapshot needs {bytes} bytes from a {available}-byte buffer"
-                );
-            }
-        }
-        Ok(buffers)
     }
 }
 
@@ -3413,178 +3299,6 @@ fn read_hash_routes(
     Ok(selected)
 }
 
-fn deepseek_resident_page_ranges(
-    ranges: &[DeepSeekResidentRange],
-    mmap_len: usize,
-    page_size: usize,
-) -> Result<Vec<DeepSeekResidentPageRange>> {
-    if ranges.is_empty() || mmap_len == 0 || page_size == 0 || !page_size.is_power_of_two() {
-        bail!(
-            "DeepSeek resident layer preparation requires non-empty ranges, mmap bytes, and a power-of-two page size"
-        );
-    }
-    let mut pages = Vec::<DeepSeekResidentPageRange>::with_capacity(ranges.len());
-    for range in ranges {
-        let start = usize::try_from(range.byte_offset)?;
-        let len = usize::try_from(range.byte_len)?;
-        let end = start
-            .checked_add(len)
-            .context("DeepSeek resident layer preparation range overflow")?;
-        if len == 0 || end > mmap_len {
-            bail!(
-                "DeepSeek resident layer preparation range {start}..{end} is outside {mmap_len}-byte mmap"
-            );
-        }
-        let page_start = start & !(page_size - 1);
-        let page_end = end
-            .checked_add(page_size - 1)
-            .context("DeepSeek resident layer preparation page alignment overflow")?
-            & !(page_size - 1);
-        let page_end = page_end.min(mmap_len);
-        if let Some(previous) = pages.last_mut() {
-            let previous_end = previous
-                .byte_offset
-                .checked_add(previous.byte_len)
-                .context("DeepSeek resident layer preparation page range overflow")?;
-            if page_start <= previous_end {
-                previous.byte_len = page_end
-                    .max(previous_end)
-                    .checked_sub(previous.byte_offset)
-                    .context("DeepSeek resident layer preparation page merge underflow")?;
-                continue;
-            }
-        }
-        pages.push(DeepSeekResidentPageRange {
-            byte_offset: page_start,
-            byte_len: page_end - page_start,
-        });
-    }
-    Ok(pages)
-}
-
-fn touch_deepseek_resident_pages(
-    mmap: &memmap2::Mmap,
-    ranges: &[DeepSeekResidentPageRange],
-    page_size: usize,
-) -> Result<usize> {
-    let mut sink = 0u8;
-    let mut bytes = 0usize;
-    for range in ranges {
-        let end = range
-            .byte_offset
-            .checked_add(range.byte_len)
-            .context("DeepSeek resident layer preparation worker range overflow")?;
-        if range.byte_len == 0 || end > mmap.len() {
-            bail!(
-                "DeepSeek resident layer preparation worker range {}..{end} is outside {}-byte mmap",
-                range.byte_offset,
-                mmap.len()
-            );
-        }
-        let mut offset = range.byte_offset;
-        while offset < end {
-            // A volatile read from each file-backed VM page synchronously
-            // establishes residency without retaining an application buffer.
-            sink ^= unsafe { ptr::read_volatile(mmap.as_ptr().add(offset)) };
-            offset = offset
-                .checked_add(page_size)
-                .context("DeepSeek resident layer preparation page step overflow")?;
-        }
-        bytes = bytes
-            .checked_add(range.byte_len)
-            .context("DeepSeek resident layer preparation byte count overflow")?;
-    }
-    std::hint::black_box(sink);
-    Ok(bytes)
-}
-
-fn issue_deepseek_resident_layer_prepare(
-    dense: &MetalDenseWeights,
-    graph: &DeepSeekV4ExecutionGraph,
-    layer: usize,
-) -> Result<PendingDeepSeekResidentLayerPrepare> {
-    let declared = graph
-        .prefill_resident_layer_ranges
-        .get(layer)
-        .with_context(|| format!("DeepSeek resident preparation layer {layer} is not resolved"))?;
-    let page_size = metal_page_size();
-    let ranges = deepseek_resident_page_ranges(declared, dense.len, page_size)?;
-    let bytes = ranges.iter().try_fold(0usize, |total, range| {
-        total
-            .checked_add(range.byte_len)
-            .context("DeepSeek resident layer preparation byte count overflow")
-    })?;
-    let mmap = Arc::clone(&dense._mmap);
-    let workers = vec![thread::spawn(move || {
-        touch_deepseek_resident_pages(&mmap, &ranges, page_size)
-    })];
-    debug_assert_eq!(workers.len(), RESIDENT_LAYER_PREPARE_WORKERS);
-    Ok(PendingDeepSeekResidentLayerPrepare {
-        layer,
-        bytes,
-        workers,
-    })
-}
-
-fn finish_deepseek_resident_layer_prepare(
-    pending: PendingDeepSeekResidentLayerPrepare,
-) -> Result<()> {
-    let mut bytes = 0usize;
-    for worker in pending.workers {
-        let worker_bytes = worker.join().map_err(|_| {
-            anyhow::anyhow!(
-                "DeepSeek resident layer preparation worker panicked on layer {}",
-                pending.layer
-            )
-        })??;
-        bytes = bytes
-            .checked_add(worker_bytes)
-            .context("DeepSeek resident layer preparation completed byte count overflow")?;
-    }
-    if bytes != pending.bytes {
-        bail!(
-            "DeepSeek resident layer preparation completed {bytes} bytes for layer {}, expected {}",
-            pending.layer,
-            pending.bytes
-        );
-    }
-    Ok(())
-}
-
-fn issue_deepseek_layer_prepare<'a>(
-    dense: &MetalDenseWeights,
-    graph: &DeepSeekV4ExecutionGraph,
-    scheduler: &mut FlashMoeExecutionScheduler,
-    layer: usize,
-    destination: &'a mut [u8],
-) -> Result<PendingDeepSeekLayerPrepare<'a>> {
-    let resident = issue_deepseek_resident_layer_prepare(dense, graph, layer)?;
-    match unsafe { scheduler.issue_expert_layer_prepare_into(layer, destination) } {
-        Ok(expert) => Ok(PendingDeepSeekLayerPrepare { expert, resident }),
-        Err(expert_error) => match finish_deepseek_resident_layer_prepare(resident) {
-            Ok(()) => Err(expert_error),
-            Err(resident_error) => bail!(
-                "DeepSeek layer {layer} expert preparation issue failed: {expert_error:#}; resident preparation cleanup also failed: {resident_error:#}"
-            ),
-        },
-    }
-}
-
-fn finish_deepseek_layer_prepare(
-    scheduler: &mut FlashMoeExecutionScheduler,
-    pending: PendingDeepSeekLayerPrepare<'_>,
-) -> Result<()> {
-    let expert_result = scheduler.finish_expert_layer_prepare(pending.expert);
-    let resident_result = finish_deepseek_resident_layer_prepare(pending.resident);
-    match (expert_result, resident_result) {
-        (Ok(_), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(expert_error), Err(resident_error)) => bail!(
-            "DeepSeek layer preparation failed for expert stream: {expert_error:#}; resident stream also failed: {resident_error:#}"
-        ),
-    }
-}
-
 unsafe fn commit_deepseek_command(
     mut encoding: MetalCommandEncoding,
     phase: &'static str,
@@ -4137,10 +3851,6 @@ unsafe fn encode_batch_expert_layer(
     Ok(())
 }
 
-fn bytes_of<T: bytemuck::NoUninit>(value: &T) -> &[u8] {
-    bytemuck::bytes_of(value)
-}
-
 unsafe fn set_pipeline(encoder: MetalObjcId, pipeline: MetalObjcId) {
     unsafe { msg_send_void1_id(encoder, sel("setComputePipelineState:"), pipeline) }
 }
@@ -4179,446 +3889,6 @@ unsafe fn buffer_contents(buffer: MetalObjcId) -> *mut u8 {
     unsafe { msg_send_ptr0(buffer, sel("contents")).cast::<u8>() }
 }
 
-fn checked_bytes(elements: usize, label: &str) -> Result<usize> {
-    elements
-        .checked_mul(size_of::<f32>())
-        .with_context(|| format!("DeepSeek V4 {label} buffer size overflow"))
-}
-
-unsafe fn allocate_owned_buffer(
-    context: &MetalExecutionContext,
-    owned: &mut Vec<MetalObjcId>,
-    bytes: usize,
-    label: &str,
-) -> Result<MetalObjcId> {
-    let bytes = bytes.max(size_of::<f32>());
-    unsafe {
-        context
-            .buffers
-            .ensure_allocation_capacity(context.runtime.device, bytes)?;
-        let buffer = msg_send_id2_usize_u64(
-            context.runtime.device,
-            sel("newBufferWithLength:options:"),
-            bytes,
-            0,
-        );
-        if buffer.is_null() {
-            bail!("failed to allocate DeepSeek V4 Metal {label} buffer ({bytes} bytes)");
-        }
-        ptr::write_bytes(buffer_contents(buffer), 0, bytes);
-        context
-            .resources
-            .sample_device(context.runtime.device, false);
-        owned.push(buffer);
-        Ok(buffer)
-    }
-}
-
-unsafe fn allocate_owned_buffer_uninitialized(
-    context: &MetalExecutionContext,
-    owned: &mut Vec<MetalObjcId>,
-    bytes: usize,
-    label: &str,
-) -> Result<MetalObjcId> {
-    let bytes = bytes.max(size_of::<f32>());
-    unsafe {
-        context
-            .buffers
-            .ensure_allocation_capacity(context.runtime.device, bytes)?;
-        let buffer = msg_send_id2_usize_u64(
-            context.runtime.device,
-            sel("newBufferWithLength:options:"),
-            bytes,
-            0,
-        );
-        if buffer.is_null() {
-            bail!("failed to allocate DeepSeek V4 Metal {label} buffer ({bytes} bytes)");
-        }
-        context
-            .resources
-            .sample_device(context.runtime.device, false);
-        owned.push(buffer);
-        Ok(buffer)
-    }
-}
-
-impl DeepSeekBatchScratch {
-    unsafe fn allocate(
-        context: &MetalExecutionContext,
-        tokens: usize,
-        pos0: usize,
-        double_expert_staging: bool,
-    ) -> Result<Self> {
-        if tokens == 0 {
-            bail!("DeepSeek V4 batch prefill requires at least one token");
-        }
-        let expert_spec = DeepSeekGgufExpertSlotSpec::new(HIDDEN, EXPERT_WIDTH)?;
-        let mut owned = Vec::new();
-        let allocation = (|| -> Result<Self> {
-            let mut alloc_bytes = |bytes: usize, label: &str| unsafe {
-                allocate_owned_buffer_uninitialized(context, &mut owned, bytes, label)
-            };
-            let f32_bytes = |rows: usize, width: usize, label: &str| -> Result<usize> {
-                rows.checked_mul(width)
-                    .and_then(|values| values.checked_mul(size_of::<f32>()))
-                    .with_context(|| format!("DeepSeek V4 batch {label} size overflow"))
-            };
-            let hc_mix_width = 2 * HC + HC * HC;
-            let prefix_raw = pos0.min(RAW_CAP);
-            let raw_rows = prefix_raw
-                .checked_add(tokens)
-                .context("DeepSeek V4 raw batch context size overflow")?;
-            let max_comp = pos0
-                .checked_add(tokens)
-                .context("DeepSeek V4 compressed frontier overflow")?
-                / 4;
-            let max_comp = max_comp.max(1);
-            let max_flash_keys = raw_rows
-                .checked_add(max_comp)
-                .context("DeepSeek V4 FlashAttention key count overflow")?;
-            let flash_mask_bytes = tokens
-                .checked_mul(max_flash_keys)
-                .and_then(|values| values.checked_mul(size_of::<u16>()))
-                .context("DeepSeek V4 FlashAttention mask size overflow")?;
-            let flash_kv_bytes = max_flash_keys
-                .checked_mul(HEAD_DIM)
-                .and_then(|values| values.checked_mul(size_of::<u16>()))
-                .context("DeepSeek V4 FlashAttention KV staging size overflow")?;
-            let flash_pad_bytes = 64usize
-                .checked_mul(
-                    2usize
-                        .checked_mul(HEAD_DIM * size_of::<u16>())
-                        .and_then(|bytes| bytes.checked_add(tokens * size_of::<u16>()))
-                        .context("DeepSeek V4 FlashAttention pad row overflow")?,
-                )
-                .context("DeepSeek V4 FlashAttention pad size overflow")?;
-            let flash_block_bytes = max_flash_keys
-                .div_ceil(64)
-                .checked_mul(tokens.div_ceil(8))
-                .map(|bytes| bytes.next_multiple_of(32))
-                .context("DeepSeek V4 FlashAttention block-map size overflow")?;
-            let index_scratch_bytes = 2usize
-                .checked_mul(tokens)
-                .and_then(|values| values.checked_mul(max_comp.max(INDEX_TOP_K)))
-                .and_then(|values| values.checked_mul(size_of::<i32>()))
-                .context("DeepSeek V4 index top-k scratch size overflow")?;
-            let moe_map_bytes = EXPERTS
-                .checked_add(
-                    EXPERTS
-                        .checked_mul(tokens)
-                        .context("MoE map size overflow")?,
-                )
-                .and_then(|values| values.checked_mul(size_of::<i32>()))
-                .context("DeepSeek V4 MoE map byte size overflow")?;
-            let expert_staging_bytes = EXPERTS
-                .checked_mul(expert_spec.expert_bytes)
-                .context("DeepSeek V4 expert staging size overflow")?;
-
-            Ok(Self {
-                tokens,
-                token_ids: alloc_bytes(tokens * size_of::<u32>(), "batch token ids")?,
-                cur_hc: alloc_bytes(
-                    f32_bytes(tokens, HC_WIDTH, "current HC")?,
-                    "batch current HC",
-                )?,
-                next_hc: alloc_bytes(f32_bytes(tokens, HC_WIDTH, "next HC")?, "batch next HC")?,
-                flat_hc: alloc_bytes(f32_bytes(tokens, HC_WIDTH, "flat HC")?, "batch flat HC")?,
-                hc_mix: alloc_bytes(f32_bytes(tokens, hc_mix_width, "HC mix")?, "batch HC mix")?,
-                hc_split: alloc_bytes(
-                    f32_bytes(tokens, hc_mix_width, "HC split")?,
-                    "batch HC split",
-                )?,
-                attn_cur: alloc_bytes(
-                    f32_bytes(tokens, HIDDEN, "attention current")?,
-                    "batch attention current",
-                )?,
-                attn_norm: alloc_bytes(
-                    f32_bytes(tokens, HIDDEN, "attention norm")?,
-                    "batch attention norm",
-                )?,
-                qr: alloc_bytes(f32_bytes(tokens, Q_RANK, "query rank")?, "batch query rank")?,
-                qr_norm: alloc_bytes(
-                    f32_bytes(tokens, Q_RANK, "normalized query rank")?,
-                    "batch normalized query rank",
-                )?,
-                kv_raw: alloc_bytes(f32_bytes(tokens, HEAD_DIM, "raw KV")?, "batch raw KV")?,
-                kv: alloc_bytes(f32_bytes(tokens, HEAD_DIM, "KV")?, "batch KV")?,
-                raw_context: alloc_bytes(
-                    f32_bytes(
-                        if pos0 == 0 { 1 } else { raw_rows },
-                        HEAD_DIM,
-                        "raw context",
-                    )?,
-                    "batch raw context",
-                )?,
-                q: alloc_bytes(f32_bytes(tokens, Q_WIDTH, "query")?, "batch query")?,
-                heads: alloc_bytes(
-                    f32_bytes(tokens, Q_WIDTH, "attention heads")?,
-                    "batch attention heads",
-                )?,
-                attn_group: alloc_bytes(
-                    f32_bytes(tokens, GROUP_WIDTH, "attention group")?,
-                    "batch attention group",
-                )?,
-                attn_rank: alloc_bytes(
-                    f32_bytes(tokens, OUTPUT_RANK, "attention rank")?,
-                    "batch attention rank",
-                )?,
-                attn_low: alloc_bytes(
-                    f32_bytes(tokens, OUTPUT_LOW, "attention low rank")?,
-                    "batch attention low rank",
-                )?,
-                attn_out: alloc_bytes(
-                    f32_bytes(tokens, HIDDEN, "attention output")?,
-                    "batch attention output",
-                )?,
-                after_attn_hc: alloc_bytes(
-                    f32_bytes(tokens, HC_WIDTH, "post-attention HC")?,
-                    "batch post-attention HC",
-                )?,
-                ffn_cur: alloc_bytes(
-                    f32_bytes(tokens, HIDDEN, "FFN current")?,
-                    "batch FFN current",
-                )?,
-                ffn_norm: alloc_bytes(f32_bytes(tokens, HIDDEN, "FFN norm")?, "batch FFN norm")?,
-                router: alloc_bytes(f32_bytes(tokens, EXPERTS, "router")?, "batch router")?,
-                shared_gate: alloc_bytes(
-                    f32_bytes(tokens, EXPERT_WIDTH, "shared gate")?,
-                    "batch shared gate",
-                )?,
-                shared_up: alloc_bytes(
-                    f32_bytes(tokens, EXPERT_WIDTH, "shared up")?,
-                    "batch shared up",
-                )?,
-                shared_mid: alloc_bytes(
-                    f32_bytes(tokens, EXPERT_WIDTH, "shared mid")?,
-                    "batch shared mid",
-                )?,
-                shared_out: alloc_bytes(
-                    f32_bytes(tokens, HIDDEN, "shared output")?,
-                    "batch shared output",
-                )?,
-                route_selected: alloc_bytes(
-                    tokens * ACTIVE_EXPERTS * size_of::<i32>(),
-                    "batch selected experts",
-                )?,
-                route_weights: alloc_bytes(
-                    f32_bytes(tokens, ACTIVE_EXPERTS, "route weights")?,
-                    "batch route weights",
-                )?,
-                routed_mid: alloc_bytes(
-                    tokens * ACTIVE_EXPERTS * EXPERT_WIDTH * size_of::<u16>(),
-                    "batch routed mid",
-                )?,
-                routed_down: alloc_bytes(
-                    f32_bytes(tokens * ACTIVE_EXPERTS, HIDDEN, "routed down")?,
-                    "batch routed down",
-                )?,
-                routed_out: alloc_bytes(
-                    f32_bytes(tokens, HIDDEN, "routed output")?,
-                    "batch routed output",
-                )?,
-                moe_map: alloc_bytes(moe_map_bytes, "batch MoE expert map")?,
-                expert_staging: alloc_bytes(expert_staging_bytes, "batch expert staging")?,
-                expert_staging_alternate: double_expert_staging
-                    .then(|| alloc_bytes(expert_staging_bytes, "batch alternate expert staging"))
-                    .transpose()?,
-                expert_spec,
-                comp_kv: alloc_bytes(
-                    f32_bytes(tokens, 1024, "compressor KV")?,
-                    "batch compressor KV",
-                )?,
-                comp_score: alloc_bytes(
-                    f32_bytes(tokens, 1024, "compressor score")?,
-                    "batch compressor score",
-                )?,
-                index_q: alloc_bytes(
-                    f32_bytes(tokens, INDEX_WIDTH, "index query")?,
-                    "batch index query",
-                )?,
-                index_weights: alloc_bytes(
-                    f32_bytes(tokens, INDEX_HEADS, "index weights")?,
-                    "batch index weights",
-                )?,
-                index_scores: alloc_bytes(
-                    f32_bytes(tokens, max_comp, "index scores")?,
-                    "batch index scores",
-                )?,
-                index_selected: alloc_bytes(
-                    tokens * INDEX_TOP_K * size_of::<i32>(),
-                    "batch index selection",
-                )?,
-                index_sorted: alloc_bytes(
-                    tokens * INDEX_TOP_K * size_of::<i32>(),
-                    "batch sorted index selection",
-                )?,
-                index_topk_scratch: alloc_bytes(index_scratch_bytes, "batch index top-k scratch")?,
-                rope_positions: alloc_bytes(tokens * size_of::<i32>(), "batch RoPE positions")?,
-                comp_rope_positions: alloc_bytes(
-                    max_comp * size_of::<i32>(),
-                    "batch compressed RoPE positions",
-                )?,
-                flash_mask: alloc_bytes(flash_mask_bytes, "batch FlashAttention mask")?,
-                flash_kv: alloc_bytes(flash_kv_bytes, "batch FlashAttention KV")?,
-                flash_pad: alloc_bytes(flash_pad_bytes.max(1), "batch FlashAttention padding")?,
-                flash_blocks: alloc_bytes(flash_block_bytes.max(1), "batch FlashAttention blocks")?,
-                owned: std::mem::take(&mut owned),
-            })
-        })();
-        if allocation.is_err() {
-            for buffer in owned.drain(..) {
-                unsafe { release(buffer) };
-            }
-        }
-        allocation
-    }
-
-    fn alternate_expert_staging(&self) -> Result<MetalObjcId> {
-        self.expert_staging_alternate
-            .context("DeepSeek saturated batch graph did not allocate alternate expert staging")
-    }
-
-    fn advance_expert_staging(&mut self) -> Result<()> {
-        let alternate = self.alternate_expert_staging()?;
-        self.expert_staging_alternate = Some(self.expert_staging);
-        self.expert_staging = alternate;
-        Ok(())
-    }
-}
-
-impl DeepSeekV4MetalState {
-    unsafe fn allocate(
-        context: &MetalExecutionContext,
-        graph: &DeepSeekV4ExecutionGraph,
-        capacity: usize,
-    ) -> Result<Self> {
-        if capacity == 0 {
-            bail!("DeepSeek V4 Metal state requires a non-zero context capacity");
-        }
-        let mut owned = Vec::new();
-        let allocation = (|| -> Result<Self> {
-            let mut alloc = |elements: usize, label: &str| unsafe {
-                allocate_owned_buffer(context, &mut owned, checked_bytes(elements, label)?, label)
-            };
-            let mut layers = Vec::with_capacity(graph.layers.len());
-            for &ratio in &graph.config.compress_ratios {
-                let comp_cap = if ratio == 0 { 0 } else { capacity / ratio };
-                let raw = alloc(RAW_CAP * HEAD_DIM, "raw KV ring")?;
-                let (comp, comp_state_kv, comp_state_score) = if ratio == 0 {
-                    (None, None, None)
-                } else {
-                    let width = if ratio == 4 { 1024 } else { 512 };
-                    let state_rows = if ratio == 4 { 8 } else { 128 };
-                    (
-                        Some(alloc(comp_cap.max(1) * HEAD_DIM, "compressed KV cache")?),
-                        Some(alloc(state_rows * width, "compressor KV frontier")?),
-                        Some(alloc(state_rows * width, "compressor score frontier")?),
-                    )
-                };
-                let (index_comp, index_state_kv, index_state_score) = if ratio == 4 {
-                    (
-                        Some(alloc(comp_cap.max(1) * INDEX_HEAD_DIM, "indexer KV cache")?),
-                        Some(alloc(8 * 256, "indexer KV frontier")?),
-                        Some(alloc(8 * 256, "indexer score frontier")?),
-                    )
-                } else {
-                    (None, None, None)
-                };
-                layers.push(DeepSeekLayerState {
-                    ratio,
-                    comp_cap,
-                    raw,
-                    comp,
-                    comp_state_kv,
-                    comp_state_score,
-                    index_comp,
-                    index_state_kv,
-                    index_state_score,
-                });
-            }
-            let scratch = DeepSeekScratch {
-                cur_hc: alloc(HC_WIDTH, "current HC")?,
-                attn_hc: alloc(HC_WIDTH, "attention HC")?,
-                next_hc: alloc(HC_WIDTH, "next HC")?,
-                flat_hc: alloc(HC_WIDTH, "normalized HC")?,
-                hc_mix: alloc(24, "HC mix")?,
-                hc_split: alloc(24, "HC split")?,
-                attn_cur: alloc(HIDDEN, "attention current")?,
-                attn_norm: alloc(HIDDEN, "attention norm")?,
-                qr: alloc(Q_RANK, "query rank")?,
-                qr_norm: alloc(Q_RANK, "normalized query rank")?,
-                kv_raw: alloc(HEAD_DIM, "projected KV")?,
-                kv: alloc(HEAD_DIM, "normalized KV")?,
-                q: alloc(Q_WIDTH, "projected query")?,
-                heads: alloc(Q_WIDTH, "attention heads")?,
-                attn_low: alloc(OUTPUT_LOW, "attention low rank")?,
-                attn_out: alloc(HIDDEN, "attention output")?,
-                ffn_cur: alloc(HIDDEN, "FFN current")?,
-                ffn_norm: alloc(HIDDEN, "FFN norm")?,
-                router: alloc(EXPERTS, "router logits")?,
-                shared_gate: alloc(EXPERT_WIDTH, "shared gate")?,
-                shared_up: alloc(EXPERT_WIDTH, "shared up")?,
-                shared_mid: alloc(EXPERT_WIDTH, "shared mid")?,
-                shared_out: alloc(HIDDEN, "shared output")?,
-                routed_gate: alloc(ACTIVE_EXPERTS * EXPERT_WIDTH, "routed gates")?,
-                routed_up: alloc(ACTIVE_EXPERTS * EXPERT_WIDTH, "routed ups")?,
-                routed_mid: alloc(ACTIVE_EXPERTS * EXPERT_WIDTH, "routed mids")?,
-                routed_out: alloc(HIDDEN, "routed output")?,
-                route_weights: alloc(ACTIVE_EXPERTS, "route weights")?,
-                comp_kv: alloc(1024, "compressor projection")?,
-                comp_score: alloc(1024, "compressor scores")?,
-                index_q: alloc(INDEX_WIDTH, "index query")?,
-                index_weights: alloc(INDEX_HEADS, "index weights")?,
-                index_scores: alloc(capacity.div_ceil(4).max(1), "index scores")?,
-                index_selected: alloc(INDEX_TOP_K, "index selection")?,
-                index_topk_scratch: alloc(capacity.div_ceil(4).max(1) * 2, "index top-k scratch")?,
-                output_pre: alloc(HC, "output HC mix")?,
-                output_hidden: alloc(HIDDEN, "output hidden")?,
-                logits: alloc(129_280, "output logits")?,
-            };
-            let bytes = owned.iter().try_fold(0usize, |sum, &buffer| unsafe {
-                sum.checked_add(msg_send_usize0(buffer, sel("length")))
-                    .context("DeepSeek V4 Metal resident-state byte count overflow")
-            })?;
-            Ok(Self {
-                capacity,
-                next_position: 0,
-                layers,
-                scratch,
-                owned: std::mem::take(&mut owned),
-                bytes,
-            })
-        })();
-        if allocation.is_err() {
-            for buffer in owned.drain(..) {
-                unsafe { release(buffer) };
-            }
-        }
-        allocation
-    }
-
-    unsafe fn reset(&mut self) {
-        unsafe {
-            for &buffer in &self.owned {
-                let len = msg_send_usize0(buffer, sel("length"));
-                ptr::write_bytes(buffer_contents(buffer), 0, len);
-            }
-            for layer in &self.layers {
-                for score in [layer.comp_state_score, layer.index_state_score]
-                    .into_iter()
-                    .flatten()
-                {
-                    let len = msg_send_usize0(score, sel("length")) / size_of::<f32>();
-                    let values =
-                        std::slice::from_raw_parts_mut(buffer_contents(score).cast::<f32>(), len);
-                    values.fill(f32::NEG_INFINITY);
-                }
-            }
-        }
-        self.next_position = 0;
-    }
-}
-
 impl MetalExecutionContext {
     pub(crate) fn prepare_deepseek_v4_state(
         &self,
@@ -4636,9 +3906,7 @@ impl MetalExecutionContext {
                 .as_ref()
                 .is_none_or(|state| state.capacity != capacity)
             {
-                if let Some(mut previous) = guard.take() {
-                    previous.release();
-                }
+                drop(guard.take());
                 *guard = Some(DeepSeekV4MetalState::allocate(self, graph, capacity)?);
             }
             guard.as_mut().expect("DeepSeek state allocated").reset();
@@ -4664,7 +3932,7 @@ impl MetalExecutionContext {
             .as_ref()
             .context("DeepSeek V4 Metal state was not prepared before session capture")?;
         let specs = state.session_buffer_specs(state.next_position)?;
-        let mut owned = Vec::with_capacity(specs.len());
+        let mut owned = MetalBufferAllocation::with_capacity(specs.len());
         let allocation = (|| -> Result<DeepSeekV4SessionSnapshot> {
             let mut copies = Vec::with_capacity(specs.len());
             let mut bytes = 0usize;
@@ -4686,17 +3954,13 @@ impl MetalExecutionContext {
             Ok(DeepSeekV4SessionSnapshot {
                 frontier: state.next_position,
                 buffers: owned
-                    .drain(..)
+                    .take()
+                    .into_iter()
                     .zip(specs.iter().map(|(_, len)| *len))
                     .collect(),
                 _bytes: bytes,
             })
         })();
-        if allocation.is_err() {
-            for buffer in owned.drain(..) {
-                unsafe { release(buffer) };
-            }
-        }
         allocation
     }
 
@@ -4786,7 +4050,7 @@ impl MetalExecutionContext {
             let destination = unsafe {
                 std::slice::from_raw_parts_mut(buffer_contents(batch.expert_staging), staging_len)
             };
-            Some(issue_deepseek_layer_prepare(
+            Some(issue_layer_prepare(
                 dense,
                 graph,
                 scheduler,
@@ -4842,14 +4106,14 @@ impl MetalExecutionContext {
         for (layer, graph_layer) in graph.layers.iter().enumerate() {
             pending_layer_prepare
                 .take()
-                .map(|pending| finish_deepseek_layer_prepare(scheduler, pending))
+                .map(|pending| finish_layer_prepare(scheduler, pending))
                 .transpose()?;
             if prepare_layers && layer + 1 < graph.layers.len() {
                 let alternate_staging = batch.alternate_expert_staging()?;
                 let destination = unsafe {
                     std::slice::from_raw_parts_mut(buffer_contents(alternate_staging), staging_len)
                 };
-                pending_layer_prepare = Some(issue_deepseek_layer_prepare(
+                pending_layer_prepare = Some(issue_layer_prepare(
                     dense,
                     graph,
                     scheduler,
@@ -5394,33 +4658,6 @@ mod tests {
         assert_eq!(multi.parts, 2);
         assert_eq!(multi.block_top, INDEX_TOP_K);
         assert_eq!(multi.work_width, INDEX_TOP_K + 1);
-    }
-
-    #[test]
-    fn resident_prepare_geometry_page_aligns_and_coalesces_declared_tensors() {
-        let ranges = deepseek_resident_page_ranges(
-            &[
-                DeepSeekResidentRange {
-                    byte_offset: 4_096,
-                    byte_len: 4_096,
-                },
-                DeepSeekResidentRange {
-                    byte_offset: 12_288,
-                    byte_len: 8_192,
-                },
-                DeepSeekResidentRange {
-                    byte_offset: 40_960,
-                    byte_len: 4_096,
-                },
-            ],
-            65_536,
-            16_384,
-        )
-        .unwrap();
-
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].byte_offset, 0);
-        assert_eq!(ranges[0].byte_len, 49_152);
     }
 
     #[test]

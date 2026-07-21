@@ -749,7 +749,7 @@ fn routing_top_k_iter(
     k: usize,
 ) -> InlineRoutePairs {
     let k = k.min(available);
-    let mut selected = InlineRoutePairs::from_elem((0usize, -1.0e30f32), k);
+    let mut selected = InlineRoutePairs::from_elem((0usize, f32::NEG_INFINITY), k);
     for (expert, score) in scores {
         let mut minimum = 0;
         for candidate in 1..k {
@@ -1287,6 +1287,21 @@ mod tests {
         assert!(!routing_top_k(&scores, 8).spilled());
         assert!(!routing_top_k(&scores, 10).spilled());
         assert!(routing_top_k(&scores, 11).spilled());
+    }
+
+    #[test]
+    fn routing_softmax_accepts_finite_scores_below_previous_sentinel() {
+        let selected = routing_softmax_top_k(&[-2.0e30, -3.0e30, -4.0e30], 2);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(expert, _)| *expert)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(selected.iter().all(|(_, score)| score.is_finite()));
+        assert!((selected.iter().map(|(_, score)| score).sum::<f32>() - 1.0).abs() < 1e-6);
     }
 
     #[test]

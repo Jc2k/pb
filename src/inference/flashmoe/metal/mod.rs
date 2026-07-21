@@ -4,11 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ffi::{CStr, CString, c_char, c_void};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::marker::PhantomData;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ptr;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::ptr::NonNull;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::{Arc, Mutex};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -21,11 +17,17 @@ mod diagnostics;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod ffi;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod ownership;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod resources;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod synchronization;
 
 pub(crate) use diagnostics::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use ffi::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use ownership::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use resources::*;
 
@@ -52,7 +54,6 @@ use super::state::{
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::types::FlashMoeMetalResourceSnapshot;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::experts::{
     EXPERT_SCALE_BIAS_DTYPE_BF16, EXPERT_SCALE_BIAS_DTYPE_F32, ReusableExpertBytes,
@@ -290,7 +291,8 @@ impl MetalPersistentExpertBuffer {
 impl Drop for MetalPersistentExpertBuffer {
     fn drop(&mut self) {
         unsafe {
-            self.resources.release_buffer(self.buffer as MetalObjcId);
+            self.resources
+                .release_buffer_on_drop(self.buffer as MetalObjcId);
             release(self.buffer as MetalObjcId);
         }
     }
@@ -944,191 +946,6 @@ impl<T: Copy> MetalPipelineSet<T> {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
-struct MetalObject;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalDevice;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalCommandQueue;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalPipelineState;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalBuffer;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[repr(transparent)]
-#[derive(Debug)]
-struct RetainedMetalObject<K> {
-    id: NonNull<c_void>,
-    _kind: PhantomData<K>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-type OwnedMetalObject = RetainedMetalObject<MetalObject>;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<K> RetainedMetalObject<K> {
-    /// # Safety
-    ///
-    /// `id` must be either null or a valid +1 retained Objective-C object.
-    /// A successful value transfers that retain and sends `release` on drop.
-    unsafe fn new(id: MetalObjcId) -> anyhow::Result<Self> {
-        let id = NonNull::new(id)
-            .ok_or_else(|| anyhow::anyhow!("failed to create required Flash-MoE Metal object"))?;
-        Ok(Self {
-            id,
-            _kind: PhantomData,
-        })
-    }
-
-    fn id(&self) -> MetalObjcId {
-        self.id.as_ptr()
-    }
-
-    #[cfg(test)]
-    fn into_raw(self) -> MetalObjcId {
-        let object = std::mem::ManuallyDrop::new(self);
-        object.id()
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn keep_retained<K>(
-    object: RetainedMetalObject<K>,
-    owners: &mut Vec<RetainedMetalObject<K>>,
-) -> MetalObjcId {
-    let id = object.id();
-    owners.push(object);
-    id
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<K> Drop for RetainedMetalObject<K> {
-    fn drop(&mut self) {
-        unsafe { release(self.id()) }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalCommandLease {
-    resources: Arc<MetalResourceLedger>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalCommandLease {
-    fn new(resources: Arc<MetalResourceLedger>) -> Self {
-        resources.command_started();
-        Self { resources }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for MetalCommandLease {
-    fn drop(&mut self) {
-        self.resources.command_finished();
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
-struct MetalCommandEncoding {
-    command_buffer: MetalObjcId,
-    encoder: MetalObjcId,
-    ended: bool,
-    command_lease: Option<MetalCommandLease>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl MetalCommandEncoding {
-    unsafe fn new(
-        command_queue: MetalObjcId,
-        resources: Arc<MetalResourceLedger>,
-        command_buffer_error: &'static str,
-        encoder_error: &'static str,
-    ) -> anyhow::Result<Self> {
-        unsafe {
-            // Every encoded resource is held explicitly until completion (or transferred to a
-            // deferred submission), so the command buffer does not need to retain it again.
-            let command_buffer = retain_autoreleased_return_value(msg_send_id0(
-                command_queue,
-                sel("commandBufferWithUnretainedReferences"),
-            ));
-            if command_buffer.is_null() {
-                anyhow::bail!(command_buffer_error);
-            }
-            let encoder = retain_autoreleased_return_value(msg_send_id0(
-                command_buffer,
-                sel("computeCommandEncoder"),
-            ));
-            if encoder.is_null() {
-                release(command_buffer);
-                anyhow::bail!(encoder_error);
-            }
-            Ok(Self {
-                command_buffer,
-                encoder,
-                ended: false,
-                command_lease: Some(MetalCommandLease::new(resources)),
-            })
-        }
-    }
-
-    fn command_buffer(&self) -> MetalObjcId {
-        self.command_buffer
-    }
-
-    fn encoder(&self) -> MetalObjcId {
-        self.encoder
-    }
-
-    unsafe fn end_encoding(&mut self) {
-        unsafe {
-            if !self.ended {
-                msg_send_void0(self.encoder, sel("endEncoding"));
-                self.ended = true;
-            }
-        }
-    }
-
-    unsafe fn into_command_buffer(mut self) -> (MetalObjcId, MetalCommandLease) {
-        unsafe {
-            self.end_encoding();
-            release(self.encoder);
-            self.encoder = ptr::null_mut();
-            let command_buffer = self.command_buffer;
-            self.command_buffer = ptr::null_mut();
-            let command_lease = self
-                .command_lease
-                .take()
-                .expect("Metal command encoding is missing its resource lease");
-            (command_buffer, command_lease)
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for MetalCommandEncoding {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.encoder.is_null() {
-                self.end_encoding();
-                release(self.encoder);
-            }
-            release(self.command_buffer);
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
 pub(crate) struct MetalRuntime {
     pub(crate) device: MetalObjcId,
     pub(crate) command_queue: MetalObjcId,
@@ -1461,15 +1278,11 @@ unsafe impl Sync for MetalExecutionContext {}
 impl Drop for MetalExecutionContext {
     fn drop(&mut self) {
         unsafe {
-            if let Ok(linear_state) = self.linear_attention_state.get_mut() {
-                release_linear_attention_state(linear_state);
-            }
-            if let Ok(deepseek_state) = self.deepseek_state.get_mut()
-                && let Some(mut state) = deepseek_state.take()
-            {
-                state.release();
-            }
-            self.resources.record_resident_resources(0, 0);
+            release_linear_attention_state(synchronization::get_mut_for_drop(
+                &mut self.linear_attention_state,
+            ));
+            drop(synchronization::get_mut_for_drop(&mut self.deepseek_state).take());
+            self.resources.clear_resident_resources_on_drop();
         }
     }
 }
@@ -3247,7 +3060,7 @@ impl Drop for MetalScheduledCmd3Submission {
         objc2::rc::autoreleasepool(|_| unsafe {
             let wait = wait_for_metal_command_buffer(command_buffer, &self.context);
             release(command_buffer);
-            self.buffers.recycle_or_release_phase(
+            self.buffers.recycle_or_release_phase_on_drop(
                 self.phase_buffers.take().unwrap_or_default(),
                 wait.is_err(),
             );

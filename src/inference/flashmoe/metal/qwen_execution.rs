@@ -94,7 +94,7 @@ impl MetalQwenAttentionRows {
 impl Drop for MetalQwenAttentionRows {
     fn drop(&mut self) {
         self.buffers
-            .recycle_or_release(&[self.values.buffer()], false);
+            .recycle_buffers_on_drop(&[self.values.buffer()]);
     }
 }
 
@@ -144,7 +144,7 @@ impl MetalLayerMajorPostAttention {
 impl Drop for MetalLayerMajorPostAttention {
     fn drop(&mut self) {
         self.buffers
-            .recycle_or_release(&[self.residual.buffer(), self.normed.buffer()], false);
+            .recycle_buffers_on_drop(&[self.residual.buffer(), self.normed.buffer()]);
     }
 }
 
@@ -210,7 +210,7 @@ impl Drop for MetalQwenPrefillLayerOutput {
         if let Some(next_normed) = self.next_normed {
             buffers.push(next_normed.buffer());
         }
-        self.buffers.recycle_or_release(&buffers, false);
+        self.buffers.recycle_buffers_on_drop(&buffers);
     }
 }
 
