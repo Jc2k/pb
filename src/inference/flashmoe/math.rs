@@ -527,6 +527,107 @@ pub(super) fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
 
+// Qwen3-Coder-Next's gated full attention crosses the CPU/GPU boundary in the
+// scalar reference but remains on Metal in layer-major prefill. libSystem and
+// Metal intentionally use different expf approximations, so use one explicit
+// f32 expansion on both sides of that boundary. The degree-12 range-reduced
+// polynomial stays within one f32 ulp of libSystem expf over the finite range
+// observed by the gate while making every operation and rounding point shared.
+#[derive(Clone, Copy)]
+struct QwenFloatPair {
+    hi: f32,
+    lo: f32,
+}
+
+impl QwenFloatPair {
+    const fn from_bits(hi: u32, lo: u32) -> Self {
+        Self {
+            hi: f32::from_bits(hi),
+            lo: f32::from_bits(lo),
+        }
+    }
+
+    fn normalize(hi: f32, lo: f32) -> Self {
+        let sum = hi + lo;
+        Self {
+            hi: sum,
+            lo: lo - (sum - hi),
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        let sum = self.hi + other.hi;
+        let other_virtual = sum - self.hi;
+        let mut error = (self.hi - (sum - other_virtual)) + (other.hi - other_virtual);
+        error += self.lo + other.lo;
+        Self::normalize(sum, error)
+    }
+
+    fn multiply(self, other: Self) -> Self {
+        let product = self.hi * other.hi;
+        let mut error = self.hi.mul_add(other.hi, -product);
+        error += self.hi * other.lo;
+        error += self.lo * other.hi;
+        error += self.lo * other.lo;
+        Self::normalize(product, error)
+    }
+}
+
+const QWEN_EXP_LOG2_E: QwenFloatPair = QwenFloatPair::from_bits(0x3fb8_aa3b, 0x32a5_7060);
+const QWEN_EXP_LN_2: QwenFloatPair = QwenFloatPair::from_bits(0x3f31_7218, 0xb102_e308);
+const QWEN_EXP_COEFFICIENTS: [QwenFloatPair; 13] = [
+    QwenFloatPair::from_bits(0x3f80_0000, 0x0000_0000),
+    QwenFloatPair::from_bits(0x3f80_0000, 0x0000_0000),
+    QwenFloatPair::from_bits(0x3f00_0000, 0x0000_0000),
+    QwenFloatPair::from_bits(0x3e2a_aaab, 0xb1aa_aaab),
+    QwenFloatPair::from_bits(0x3d2a_aaab, 0xb0aa_aaab),
+    QwenFloatPair::from_bits(0x3c08_8889, 0xafee_eeef),
+    QwenFloatPair::from_bits(0x3ab6_0b61, 0xae13_e93f),
+    QwenFloatPair::from_bits(0x3950_0d01, 0xac3f_cbfd),
+    QwenFloatPair::from_bits(0x37d0_0d01, 0xaabf_cbfd),
+    QwenFloatPair::from_bits(0x3638_ef1d, 0x292a_d8e6),
+    QwenFloatPair::from_bits(0x3493_f27e, 0xa808_760a),
+    QwenFloatPair::from_bits(0x32d7_322b, 0x25fe_a89c),
+    QwenFloatPair::from_bits(0x310f_76c7, 0x24ff_8d8a),
+];
+
+fn qwen_attention_exp(value: f32) -> f32 {
+    let input = QwenFloatPair { hi: value, lo: 0.0 };
+    let scaled = input.multiply(QWEN_EXP_LOG2_E);
+    let exponent = (scaled.hi + scaled.lo).round_ties_even() as i32;
+    let residual = input.add(
+        QwenFloatPair {
+            hi: -(exponent as f32),
+            lo: 0.0,
+        }
+        .multiply(QWEN_EXP_LN_2),
+    );
+    let mut polynomial = QWEN_EXP_COEFFICIENTS[12];
+    for coefficient in QWEN_EXP_COEFFICIENTS[..12].iter().rev() {
+        polynomial = coefficient.add(polynomial.multiply(residual));
+    }
+    let (polynomial, exponent) = if exponent == 128 {
+        (polynomial.multiply(QwenFloatPair { hi: 2.0, lo: 0.0 }), 127)
+    } else {
+        (polynomial, exponent)
+    };
+    let scale = f32::from_bits(((exponent + 127) as u32) << 23);
+    polynomial.hi * scale + polynomial.lo * scale
+}
+
+pub(super) fn qwen_attention_sigmoid(value: f32) -> f32 {
+    if value.is_nan() {
+        return value;
+    }
+    if value >= 17.0 {
+        return 1.0;
+    }
+    if value <= -88.722_84 {
+        return 0.0;
+    }
+    1.0 / (1.0 + qwen_attention_exp(-value))
+}
+
 #[cfg(test)]
 pub(super) fn cpu_dense_matvec(
     weights: &[f32],
@@ -1104,6 +1205,23 @@ mod tests {
         let mut weights: Vec<f32> = selected.iter().map(|(_, score)| *score).collect();
         softmax_in_place(&mut weights);
         assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qwen_attention_sigmoid_is_deterministic_and_tracks_libm() {
+        for value in [
+            -80.0, -12.0, -3.0, -0.849_401, 0.0, 0.849_401, 3.0, 12.0, 16.0,
+        ] {
+            let actual = qwen_attention_sigmoid(value);
+            let reference = sigmoid(value);
+            assert!(
+                actual.to_bits().abs_diff(reference.to_bits()) <= 1,
+                "Qwen attention sigmoid at {value} produced {actual:?}, reference {reference:?}"
+            );
+        }
+        assert_eq!(qwen_attention_sigmoid(17.0).to_bits(), 1.0f32.to_bits());
+        assert_eq!(qwen_attention_sigmoid(-89.0).to_bits(), 0.0f32.to_bits());
+        assert!(qwen_attention_sigmoid(f32::NAN).is_nan());
     }
 
     #[test]

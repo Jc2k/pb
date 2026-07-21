@@ -197,37 +197,33 @@ sampling-only decode change was promoted.
 
 ### Device-resident Qwen layer-major continuation
 
-Status: **Design record; implementation active.** The promoted command is layer-major in traversal
-and scheduler ownership. Its first device-resident seam now keeps post-attention residual/normed
-matrices on Metal across CPU top-10 routing and feeds them directly to the common resident/streamed
-expert command; a Metal gather applies the scheduler's exact grouped-row order. That command now
-owns its hidden/optional next-norm output and computes next norm without a separate command or hidden
-reupload. Other matrix phases remain host-synchronized: attention output and post-expert
-hidden/next-norm state are still read back for legacy layer-state recording and the following
-builder. CPU top-10 routing is an intentional host boundary; complete hidden and normalized
-matrices are not.
+Status: **Shipped and natively qualified.** A typed chunk owner now keeps hidden and prepared-next-
+norm matrices on Metal across every transformer layer. Linear-attention input/output projections,
+token-order recurrence, full-attention Q/K/V preparation and causal attention, post-attention
+residual/norm/router projection, grouped routed/shared experts, combine, and next norm are encoded
+against that owner. CPU top-10 router candidates, full-attention KV/session records, opt-in parity
+fingerprints, and the final normalized row are the only host-visible semantic boundaries; ordinary
+generation no longer constructs the synthetic router/recurrent fingerprint trace.
 
-The next graph keeps chunk hidden/normed state in a typed Metal owner across layer boundaries,
-reads back only authoritative routing/KV/session facts and the final row, and feeds the same
-resident or scheduler-acquired expert union into one shared affine-Q4 matrix command. The shipped
-matrix command remains the production reference until exact state, transfer/synchronization,
-resource, resident/streamed, and performance gates pass. The implementation sequence and promotion
-contract are defined in the
-[device-resident prefill graph plan](qwen3-coder-next-device-resident-prefill-plan.md).
-The first instrumented resident control processed 40 raw tokens in 793 ms while creating 239 Metal
-command buffers, uploading 348,977,168 bytes, and reading back 186,818,560 bytes. Those measured
-host boundaries are now the baseline that the device-resident graph must remove; the request still
-ended with balanced buffers and commands.
-A same-prompt probe after the first owned seam preserved the greedy continuation `a`, kept the same
-239 prefill command count, reduced upload to 160,310,288 bytes and readback to 155,361,280 bytes,
-and again ended with zero active general buffers, transient expert buffers, or in-flight commands.
-This is migration evidence, not promotion evidence: complete cross-layer ownership and the locked
-performance gate remain open.
-A second migration probe moved next norm into the owned expert output. It preserved `a`, reduced
-the prefill command count from 239 to 192 and upload to 144,909,328 bytes, kept readback at
-155,361,280 bytes, and again balanced all request-scoped resources. The unchanged readback isolates
-the next task: remove the legacy per-layer host materialization before feeding the owned norm to the
-following layer.
+Resident and streamed execution use the same affine-Q4 matrix command and exact route/combine
+order. The scheduler still makes one immutable prepared policy choice: resident graphs clone the
+complete mapped expert union with zero reads, while streamed graphs issue scheduler-owned parallel
+`pread` for the sorted unique layer union and retain no expert identity after request scratch is
+released. The BF16 affine-Q4 matrix kernel now computes two input rows per weight traversal. Each
+row retains the scalar lane/FMA/reduction order, and the focused 2,048-column BF16 Metal fixture is
+bit-identical to independent scalar Metal commands while remaining numerically consistent with the
+CPU reference. The optimization applies to resident dense, resident expert, and streamed expert
+buffers through the common builder.
+
+The conservative locked 4,354-token result is 38.369 seconds at 113.47 token/s: 1.5556x faster
+than the prior 59.685-second matrix command and 17.973x faster than the preserved scalar result. The
+long request used 109 Metal commands, uploaded 324,617,488 bytes, read back 642,031,616 bytes, and
+peaked at 46,419,214,336 allocated bytes, 3.1963% over the resident baseline. It ended with zero
+active general buffers, transient expert buffers, and in-flight commands. Exact resident/forced-
+streamed state parity passed zero/restored prefixes, 17/7-row chunks, and 31/32/33-token thresholds.
+The implementation contract and complete evidence are retained in the
+[device-resident graph plan](qwen3-coder-next-device-resident-prefill-plan.md) and
+[prefill qualification](benchmarks/qwen3-coder-next-prefill-qualification.md).
 
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by
@@ -1626,7 +1622,7 @@ Current capability matrix:
 | Family | Dense/expert layout | Graph/load status | Correctness evidence |
 | --- | --- | --- | --- |
 | Qwen3.5 MoE | Resident Q4 / fixed-Q4 slots | Supported | Linked parity, all-target, release, real smoke |
-| Qwen3-Coder-Next | Resident affine Q4 / complete resident or fixed-Q4 streamed expert slots selected at graph preparation | Supported with `mlx-community/Qwen3-Coder-Next-4bit`; exact affine-Q4 graphs promote long suffixes to layer-major prefill; explicit GGUF remains llama.cpp | Nine-shard cache build, 48-layer/512-expert/K=10 real load, resident and forced-streamed graph decisions, exact zero/restored/chunk state parity, 59.685-second 4,354-token qualification, deterministic native inference, and upstream MLX-LM raw-token parity |
+| Qwen3-Coder-Next | Resident affine Q4 / complete resident or fixed-Q4 streamed expert slots selected at graph preparation | Supported with `mlx-community/Qwen3-Coder-Next-4bit`; exact affine-Q4 graphs promote long suffixes to the device-resident layer-major graph; explicit GGUF remains llama.cpp | Nine-shard cache build, 48-layer/512-expert/K=10 real load, resident and forced-streamed graph decisions, exact zero/restored/chunk/threshold state parity, 38.369-second 4,354-token qualification, balanced resource ledger, deterministic native inference, and upstream MLX-LM raw-token parity |
 | Qwen3 MoE text | Resident Q4 / fixed-Q4 slots | Supported through the unified graph with `mlx-community/Qwen3-30B-A3B-4bit` | Linked K=8 parity, 48-layer/128-expert cache build, real load/infer, and raw-output parity with upstream MLX-LM |
 | Qwen3-VL MoE | Resident Q4 / fixed-Q4 slots | Supported through the unified graph and typed vision executor with `mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit` | Adapter/capability parity, stale-index header import, 48-layer/128-expert cache build, real text inference, and real image request through the shared decoder |
 | Qwen3/Qwen3-VL full attention | Resident BF16/F16/F32 dense / fixed-Q4 slots | Resolved unified graph | Descriptor/capability parity plus mixed CMD1, per-layout CMD2, and padded-row LM-head local-Metal parity; real checkpoint pending |

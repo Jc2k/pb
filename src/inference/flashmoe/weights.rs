@@ -4866,44 +4866,6 @@ impl DenseStore {
         Ok(outputs)
     }
 
-    pub(super) fn project_resident_tensors_from_cpu_matrix(
-        &self,
-        metal: &MetalExecutionFacade,
-        specs: &[DenseProjectionRequest<'_>],
-        input_rows: usize,
-        input_cols: usize,
-        input: &[f32],
-    ) -> Result<Vec<Vec<f32>>> {
-        if specs.is_empty() {
-            bail!("FlashMoe scheduled resident projection matrix has no projections");
-        }
-        let expected = input_rows
-            .checked_mul(input_cols)
-            .context("resident projection matrix input size overflow")?;
-        if input.len() != expected {
-            bail!(
-                "FlashMoe scheduled resident projection matrix has {} values, expected {input_rows}x{input_cols}={expected}",
-                input.len()
-            );
-        }
-        metal.require_resident_dense_weights()?;
-        let mut projections = Vec::with_capacity(specs.len());
-        for spec in specs {
-            let projection = self
-                .resident_mmap_projection(spec.tensor_name, spec.output_width, input_cols)?
-                .with_context(|| {
-                    format!(
-                        "FlashMoe unsupported scheduled resident projection matrix: missing projection {}",
-                        spec.tensor_name
-                    )
-                })?;
-            projections.push(projection);
-        }
-        let (outputs, _, _) =
-            metal.resident_mmap_projection_matrix(&projections, input_rows, input_cols, input)?;
-        Ok(outputs)
-    }
-
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_mla_input_projections_with_metal(

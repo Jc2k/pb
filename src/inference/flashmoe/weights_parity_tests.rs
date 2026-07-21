@@ -1564,15 +1564,21 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
         values: Vec<f32>,
     ) -> BatchTensor {
         let shape = vec![rows, cols];
-        let quantized = quantize_q4(&values, &shape, group_size).unwrap();
-        let layout = dense_q4_layout(&shape, group_size).unwrap();
+        let mut quantized = quantize_q4(&values, &shape, group_size).unwrap();
+        let layout =
+            dense_q4_layout_with_scale_bias_dtype(&shape, group_size, EXPERT_SCALE_BIAS_DTYPE_BF16)
+                .unwrap();
         let runtime_offset = bytes.len() as u64;
         bytes.extend_from_slice(&quantized.values);
-        for scale in &quantized.scales {
-            bytes.extend_from_slice(&scale.to_le_bytes());
+        for scale in &mut quantized.scales {
+            let bits = f32_to_bf16_bits(*scale);
+            bytes.extend_from_slice(&bits.to_le_bytes());
+            *scale = f32::from_bits((bits as u32) << 16);
         }
-        for bias in &quantized.biases {
-            bytes.extend_from_slice(&bias.to_le_bytes());
+        for bias in &mut quantized.biases {
+            let bits = f32_to_bf16_bits(*bias);
+            bytes.extend_from_slice(&bits.to_le_bytes());
+            *bias = f32::from_bits((bits as u32) << 16);
         }
         let byte_len = bytes.len() as u64 - runtime_offset;
         assert_eq!(byte_len as usize, layout.total_bytes);
@@ -1589,8 +1595,8 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
     let tmp = tempfile::tempdir().unwrap();
     let plan = plan_unchecked(QWEN35_MODEL, tmp.path());
     fs::create_dir_all(&plan.runtime_dir).unwrap();
-    let cols = 16;
-    let group_size = 8;
+    let cols = 2_048;
+    let group_size = 64;
     let mut bytes = Vec::new();
     let tensors = vec![
         append_q4_tensor(
@@ -1641,7 +1647,7 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
                 quantization: TensorQuantization::Q4 {
                     group_size,
                     format: DENSE_Q4_FORMAT.to_string(),
-                    scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_F32.to_string(),
+                    scale_bias_dtype: EXPERT_SCALE_BIAS_DTYPE_BF16.to_string(),
                 },
                 q4_sources: None,
             })
@@ -1705,8 +1711,6 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
     let (actual, _timing, dispatches) = metal
         .resident_mmap_matvec_batch(&projections, &input)
         .unwrap();
-    let single_row_actual = actual.clone();
-
     assert_eq!(dispatches, 1);
     assert_eq!(actual.len(), tensors.len());
     for (projection_idx, (actual, tensor)) in actual.iter().zip(tensors.iter()).enumerate() {
@@ -1722,7 +1726,7 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
         .unwrap();
         for (row, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
             assert!(
-                (*actual - *expected).abs() < 1e-4,
+                (*actual - *expected).abs() <= expected.abs().max(1.0) * 2e-6,
                 "projection {projection_idx} row {row}: Metal q4 batch mmap {actual} diverged from CPU reference {expected}"
             );
         }
@@ -1733,28 +1737,56 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
         .enumerate()
         .map(|(index, value)| value * -0.375 + index as f32 * 0.0125)
         .collect::<Vec<_>>();
-    let matrix_input = [input.as_slice(), second_input.as_slice()].concat();
+    let third_input = input
+        .iter()
+        .enumerate()
+        .map(|(index, value)| value * 0.8125 - (index % 29) as f32 * 0.03125)
+        .collect::<Vec<_>>();
+    let scalar_rows = [
+        input.as_slice(),
+        second_input.as_slice(),
+        third_input.as_slice(),
+    ]
+    .into_iter()
+    .map(|row| {
+        metal
+            .resident_mmap_matvec_batch(&projections, row)
+            .unwrap()
+            .0
+    })
+    .collect::<Vec<_>>();
+    let matrix_input = [
+        input.as_slice(),
+        second_input.as_slice(),
+        third_input.as_slice(),
+    ]
+    .concat();
     let (matrix_actual, _, matrix_dispatches) = metal
-        .resident_mmap_projection_matrix(&projections, 2, cols, &matrix_input)
+        .resident_mmap_projection_matrix(&projections, 3, cols, &matrix_input)
         .unwrap();
     assert_eq!(matrix_dispatches, 1);
     for (projection_idx, (actual, tensor)) in matrix_actual.iter().zip(tensors.iter()).enumerate() {
-        assert_eq!(actual.len(), 2 * tensor.shape[0]);
-        assert_eq!(
-            actual[..tensor.shape[0]]
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            single_row_actual[projection_idx]
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            "projection {projection_idx} one-row matrix must exactly match scalar batch"
-        );
-        for (input_row, row_input) in [input.as_slice(), second_input.as_slice()]
-            .into_iter()
-            .enumerate()
+        assert_eq!(actual.len(), 3 * tensor.shape[0]);
+        for (input_row, row_input) in [
+            input.as_slice(),
+            second_input.as_slice(),
+            third_input.as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
         {
+            let row_start = input_row * tensor.shape[0];
+            assert_eq!(
+                actual[row_start..row_start + tensor.shape[0]]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                scalar_rows[input_row][projection_idx]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "projection {projection_idx} input {input_row} matrix must exactly match scalar batch"
+            );
             let expected = q4_fma_matvec_with_group_size(
                 &tensor.quantized.values,
                 row_input,
@@ -1765,14 +1797,13 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
                 group_size,
             )
             .unwrap();
-            let row_start = input_row * tensor.shape[0];
             for (row, (actual, expected)) in actual[row_start..row_start + tensor.shape[0]]
                 .iter()
                 .zip(expected.iter())
                 .enumerate()
             {
                 assert!(
-                    (*actual - *expected).abs() < 1e-4,
+                    (*actual - *expected).abs() <= expected.abs().max(1.0) * 2e-6,
                     "projection {projection_idx} input {input_row} row {row}: Metal q4 matrix {actual} diverged from CPU reference {expected}"
                 );
             }
@@ -1783,11 +1814,15 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
         .map(|index| 0.75 + index as f32 * 0.03125)
         .collect::<Vec<_>>();
     let matrix_norm = metal
-        .qwen_rms_norm_rows(&matrix_input, &norm_weight, 2, cols)
+        .qwen_rms_norm_rows(&matrix_input, &norm_weight, 3, cols)
         .unwrap();
-    for (row, row_input) in [input.as_slice(), second_input.as_slice()]
-        .into_iter()
-        .enumerate()
+    for (row, row_input) in [
+        input.as_slice(),
+        second_input.as_slice(),
+        third_input.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let scalar_norm = metal
             .qwen_rms_norm_rows(row_input, &norm_weight, 1, cols)
@@ -1859,6 +1894,60 @@ fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
                 "Qwen causal attention row {query_row} dimension {dimension}: Metal {actual} diverged from CPU {expected}"
             );
         }
+    }
+
+    let query_gates = (0..queries.len())
+        .map(|index| ((index as f32 + 0.25) * 0.071).sin() * 12.0)
+        .collect::<Vec<_>>();
+    let gated_attention = metal
+        .qwen_causal_attention_rows_owned(
+            &queries,
+            &keys,
+            &values,
+            Some(&query_gates),
+            query_rows,
+            prefix_rows,
+            query_heads,
+            kv_heads,
+            head_dim,
+        )
+        .unwrap()
+        .materialize();
+    let unit_values = vec![1.0; values.len()];
+    let metal_sigmoid = metal
+        .qwen_causal_attention_rows_owned(
+            &queries,
+            &keys,
+            &unit_values,
+            Some(&query_gates),
+            query_rows,
+            prefix_rows,
+            query_heads,
+            kv_heads,
+            head_dim,
+        )
+        .unwrap()
+        .materialize();
+    for (index, (actual, gate)) in metal_sigmoid.iter().zip(query_gates.iter()).enumerate() {
+        let expected = qwen_attention_sigmoid(*gate);
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "Qwen Metal sigmoid {index} must match Rust exactly: gate={gate:?} Metal={actual:?} CPU={expected:?}"
+        );
+    }
+    for (index, ((actual, ungated), gate)) in gated_attention
+        .iter()
+        .zip(attention.iter())
+        .zip(query_gates.iter())
+        .enumerate()
+    {
+        let expected = *ungated * qwen_attention_sigmoid(*gate);
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "Qwen causal attention gate {index} must exactly match the scalar CPU boundary: gate={gate:?} ungated={ungated:?} Metal={actual:?} CPU={expected:?}"
+        );
     }
 }
 

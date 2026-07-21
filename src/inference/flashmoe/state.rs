@@ -234,6 +234,10 @@ impl FlashMoeGpuMatrixDescriptor {
         Self::new(FlashMoeStateBufferRole::Hidden, rows, width)
     }
 
+    pub(crate) fn attention_values(rows: usize, width: usize) -> Result<Self> {
+        Self::new(FlashMoeStateBufferRole::AttentionValues, rows, width)
+    }
+
     pub(crate) fn residual(rows: usize, width: usize) -> Result<Self> {
         Self::new(FlashMoeStateBufferRole::Residual, rows, width)
     }
@@ -764,6 +768,18 @@ impl FlashMoeRecurrentState {
     pub(crate) fn value(self) -> u64 {
         self.value
     }
+
+    pub(crate) fn layer_state_record(
+        self,
+        position: usize,
+        layer: usize,
+    ) -> FlashMoeLayerStateRecord {
+        FlashMoeLayerStateRecord {
+            position,
+            layer,
+            recurrent_value: self.value(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -785,14 +801,6 @@ impl FlashMoeTokenState {
             hidden: FlashMoeCpuBuffer::hidden(hidden_values),
             next_layer_normed: None,
             recurrent: FlashMoeRecurrentState::new(recurrent_seed),
-        }
-    }
-
-    pub(crate) fn from_recurrent_value(hidden_values: Vec<f32>, recurrent_value: u64) -> Self {
-        Self {
-            hidden: FlashMoeCpuBuffer::hidden(hidden_values),
-            next_layer_normed: None,
-            recurrent: FlashMoeRecurrentState::new(recurrent_value),
         }
     }
 
@@ -862,6 +870,7 @@ impl FlashMoeTokenState {
         self.recurrent.mix_active_expert(expert_hash, weight);
     }
 
+    #[cfg(test)]
     pub(crate) fn recurrent_value(&self) -> u64 {
         self.recurrent.value()
     }
@@ -871,11 +880,7 @@ impl FlashMoeTokenState {
         position: usize,
         layer: usize,
     ) -> FlashMoeLayerStateRecord {
-        FlashMoeLayerStateRecord {
-            position,
-            layer,
-            recurrent_value: self.recurrent_value(),
-        }
+        self.recurrent.layer_state_record(position, layer)
     }
 
     #[cfg(test)]
@@ -1751,6 +1756,38 @@ impl KvCache {
         Ok(())
     }
 
+    /// Record one contiguous layer-major recurrent trace after validating the
+    /// shared graph coordinates once. The scalar path retains the typed
+    /// single-record API; a prefill matrix would otherwise repeat identical
+    /// placement, layer, and capacity checks for every row in the layer.
+    pub(crate) fn record_layer_state_values(
+        &mut self,
+        start_position: usize,
+        layer: usize,
+        states: impl ExactSizeIterator<Item = u64>,
+    ) -> Result<()> {
+        if layer >= self.layers {
+            bail!("KV cache layer {layer} exceeds layer count {}", self.layers);
+        }
+        let rows = states.len();
+        let end_position = start_position
+            .checked_add(rows)
+            .context("layer-major recurrent trace position overflow")?;
+        if end_position > self.capacity {
+            bail!(
+                "KV cache layer-major range {start_position}..{end_position} exceeds capacity {}",
+                self.capacity
+            );
+        }
+        self.layer_states.reserve(rows);
+        self.layer_states.extend(
+            states
+                .enumerate()
+                .map(|(row, value)| (start_position + row, layer, value)),
+        );
+        Ok(())
+    }
+
     pub(super) fn record_layer_state_record(
         &mut self,
         record: FlashMoeLayerStateRecord,
@@ -2615,6 +2652,30 @@ mod tests {
     }
 
     #[test]
+    fn layer_major_recurrent_trace_batch_matches_typed_scalar_records() {
+        let mut scalar = KvCache::new(3, 8);
+        let mut layer_major = KvCache::new(3, 8);
+        for (position, value) in [41, 42, 43].into_iter().enumerate() {
+            scalar.record_layer_state(position + 2, 1, value).unwrap();
+        }
+        layer_major
+            .record_layer_state_values(2, 1, [41, 42, 43].into_iter())
+            .unwrap();
+        assert_eq!(layer_major.layer_states, scalar.layer_states);
+
+        assert!(
+            layer_major
+                .record_layer_state_values(7, 1, [1, 2].into_iter())
+                .is_err()
+        );
+        assert!(
+            layer_major
+                .record_layer_state_values(0, 3, [1].into_iter())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn prefill_state_digest_canonicalizes_token_and_layer_major_record_order() {
         let mut token_major = KvCache::new(2, 2);
         let mut layer_major = KvCache::new(2, 2);
@@ -3146,6 +3207,21 @@ mod tests {
         let mut state = FlashMoeRecurrentState::new(10);
         state.mix_active_expert(7, 0.0);
         assert_eq!(state.value(), 17);
+    }
+
+    #[test]
+    fn recurrent_state_records_the_same_layer_fingerprint_as_token_state() {
+        let mut recurrent = FlashMoeRecurrentState::new(41);
+        let mut token = FlashMoeTokenState::new(vec![1.0, 2.0], 41);
+        for (hash, weight) in [(3, 0.25), (u64::MAX - 7, -0.0), (19, 1.5)] {
+            recurrent.mix_active_expert(hash, weight);
+            token.mix_active_expert(hash, weight);
+        }
+
+        assert_eq!(
+            recurrent.layer_state_record(17, 9),
+            token.layer_state_record(17, 9)
+        );
     }
 
     #[test]

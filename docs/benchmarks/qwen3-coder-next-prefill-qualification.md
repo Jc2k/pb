@@ -176,3 +176,61 @@ expert command. It preserved `a` and removed 47 commands plus 15,400,960 uploade
 post-change prefill took 1,948 ms and is likewise not promotion evidence. Unchanged readback proves
 that the remaining per-layer host materialization—not expert scheduling or norm dispatch—is the
 next cross-layer blocker.
+
+## 2026-07-21 device-resident graph promotion
+
+The completed graph gives each chunk one typed Metal owner for hidden and prepared-next-norm
+matrices. Linear and full attention consume that owner directly; post-attention reads back only the
+router matrix; the existing scheduler resolves the resident mapped or streamed positioned-read
+expert union; and the common expert command produces the following layer's owner. Non-session,
+non-parity generation reads only the final normalized row. Router/recurrent fingerprints are
+computed only when state qualification explicitly requests them.
+
+The shared BF16 affine-Q4 matrix kernel now evaluates two input rows per weight traversal. Each row
+keeps the previous packed-word lane order, FMA sequence, and simd reduction, so the optimization
+does not change scalar bits. A vector-accumulator prototype produced a faster 36,029 ms run but was
+rejected when a clean release parity pass exposed state divergence. The promoted kernel shares
+weight/scale/bias loads but uses two interleaved scalar accumulators. Its focused local-Metal
+fixture exercises BF16 scale/bias at 2,048 columns and requires two shared rows plus an odd tail to
+match independent scalar Metal commands bit-for-bit before the real checkpoint matrix is run.
+
+Exact release-checkpoint qualification produced:
+
+| Expert graph | Prefix | Forced chunk / threshold | Result |
+| --- | ---: | ---: | --- |
+| complete resident corpus | 0 | 17 rows | exact after 40 fresh tokens |
+| complete resident corpus | 10 cached + 30 fresh | 7 rows | warm and restored prefixes exact |
+| forced 32 GiB streamed scheduler | 0 | 17 rows | exact after 40 fresh tokens |
+| forced 32 GiB streamed scheduler | 10 cached + 30 fresh | 7 rows | warm and restored prefixes exact |
+| complete resident corpus | 0 | 31 / 32 / 33 tokens | exact at every promotion boundary |
+
+The comparison includes final hidden, aggregate and per-layer full-attention KV,
+router/recurrent trace, and Metal linear-attention state fingerprints. Resident and streamed
+resource runs both ended with zero active general buffers, zero transient expert buffers, and zero
+in-flight commands. Streamed execution retained `streamed_parallel_pread`; resident execution
+retained `resident_complete_corpus` and issued no expert reads.
+
+The conservative cold locked-frontier result used the existing 4,354-token `a a ... a` geometry:
+
+| Metric | Device-resident result | Gate/reference |
+| --- | ---: | ---: |
+| fresh tokens | 4,354 | locked 4–5k frontier |
+| prefill wall time | 38,369 ms | target ≤39,790 ms |
+| prefill throughput | 113.474 token/s | report |
+| speedup over 59,685 ms matrix graph | 1.5556x | target ≥1.5x |
+| speedup over 689,600 ms scalar | 17.973x | report |
+| Metal command buffers | 109 | one graph boundary |
+| host upload | 324,617,488 bytes | measured copies |
+| host readback | 642,031,616 bytes | router plus KV/session boundary |
+| peak allocation | 46,419,214,336 bytes | report |
+| additional allocation | 1,437,728,768 bytes (3.1963%) | at most 5% |
+| request-end active/transient/in-flight | 0 / 0 / 0 | required |
+
+The promoted 38,369 ms run supplied the allocation and final-balance evidence above and returned
+`a`, matching the preserved scalar and upstream raw-token continuation. The exact release binary
+then repeated scalar/layer-major parity at 40 tokens with a forced 17-row boundary. The required
+raw `2+2=` native smoke exited zero with `5`.
+
+Compatibility remained independently selected: harness run `1784613903182-90218-0` explicitly
+loaded the four-shard `Qwen3-Coder-Next-Q4_K_M` GGUF through llama.cpp, made one 512-prompt-token
+invocation, and returned `4`. No FlashMoe failure or fallback participated in that run.

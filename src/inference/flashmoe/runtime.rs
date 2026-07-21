@@ -1335,18 +1335,25 @@ impl MetalExecutionFacade {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn qwen_linear_attention_matrix(
+    pub(super) fn qwen_linear_attention_graph(
         &self,
         layout: LinearAttentionLayout,
         bindings: &LinearAttentionResidentBindings,
         rows: usize,
-        qkv: &[f32],
-        z: &[f32],
-        beta: &[f32],
-        alpha: &[f32],
-    ) -> Result<Vec<f32>> {
-        self.inner
-            .qwen_linear_attention_matrix(layout, bindings, rows, qkv, z, beta, alpha)
+        width: usize,
+        input: MetalBatchProjectionInput<'_>,
+        residual: MetalBatchProjectionInput<'_>,
+        post_norm_weight: &[f32],
+    ) -> Result<MetalLayerMajorPostAttention> {
+        self.inner.qwen_linear_attention_graph(
+            layout,
+            bindings,
+            rows,
+            width,
+            input,
+            residual,
+            post_norm_weight,
+        )
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1358,8 +1365,8 @@ impl MetalExecutionFacade {
         rows: usize,
         attention_width: usize,
         width: usize,
-        attention: &[f32],
-        residual: &[f32],
+        attention: MetalBatchProjectionInput<'_>,
+        residual: MetalBatchProjectionInput<'_>,
         post_norm_weight: &[f32],
     ) -> Result<MetalLayerMajorPostAttention> {
         self.inner.qwen_post_attention_matrix(
@@ -1384,6 +1391,15 @@ impl MetalExecutionFacade {
     ) -> Result<MetalQwenPrefillLayerOutput> {
         self.inner
             .qwen_layer_major_experts(scheduled, post_attention, shared, next_norm_weight)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn qwen_final_norm_last_row(
+        &self,
+        state: &MetalQwenPrefillLayerOutput,
+        weight: &[f32],
+    ) -> Result<Vec<f32>> {
+        self.inner.qwen_final_norm_last_row(state, weight)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1418,6 +1434,7 @@ impl MetalExecutionFacade {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn resident_mmap_projection_matrix(
         &self,
         projections: &[ResidentMmapMatvecProjection],
@@ -1479,6 +1496,65 @@ impl MetalExecutionFacade {
             );
             bail!("Qwen causal-attention rows require Apple Silicon Metal")
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qwen_causal_attention_rows_owned(
+        &self,
+        queries: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        query_gates: Option<&[f32]>,
+        query_rows: usize,
+        prefix_rows: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<MetalQwenAttentionRows> {
+        self.inner.qwen_causal_attention_rows_owned(
+            queries,
+            keys,
+            values,
+            query_gates,
+            query_rows,
+            prefix_rows,
+            query_heads,
+            kv_heads,
+            head_dim,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qwen_full_attention_graph(
+        &self,
+        projections: &[ResidentMmapMatvecProjection; 3],
+        input: MetalBatchProjectionInput<'_>,
+        rows: usize,
+        prefix_rows: usize,
+        layout: FullAttentionLayout,
+        q_norm_weight: &[f32],
+        k_norm_weight: &[f32],
+        rope_sin: &[f32],
+        rope_cos: &[f32],
+        prefix_keys: &[f32],
+        prefix_values: &[f32],
+    ) -> Result<MetalQwenFullAttentionOutput> {
+        self.inner.qwen_full_attention_graph(
+            projections,
+            input,
+            rows,
+            prefix_rows,
+            layout,
+            q_norm_weight,
+            k_norm_weight,
+            rope_sin,
+            rope_cos,
+            prefix_keys,
+            prefix_values,
+        )
     }
 
     pub(super) fn resident_glm_mla_absorbed_attention(
@@ -2508,7 +2584,7 @@ impl FlashMoeEngine {
 
         if let Some(q_gate) = q_gate {
             for (value, gate) in attended.iter_mut().zip(q_gate.iter()) {
-                *value *= sigmoid(*gate);
+                *value *= qwen_attention_sigmoid(*gate);
             }
         }
         if let Some(buckets) = attention_buckets {
@@ -2522,24 +2598,15 @@ impl FlashMoeEngine {
         &self,
         layer: usize,
         rows: &[QwenTokenExecutionOutput],
-        normed: &[f32],
+        normed: MetalBatchProjectionInput<'_>,
         start_position: usize,
         kv_cache: &mut KvCache,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<MetalQwenAttentionRows> {
         if rows.is_empty() {
             bail!("Qwen layer-major full attention requires at least one row");
         }
         let runtime = &self.runtime;
         let layout = runtime.full_attention_layout(layer)?;
-        for row in rows {
-            if row.hidden.len() != runtime.width {
-                bail!(
-                    "Qwen layer-major hidden row has {} values, expected {} at layer {layer}",
-                    row.hidden.len(),
-                    runtime.width
-                );
-            }
-        }
         let expected_normed = rows
             .len()
             .checked_mul(runtime.width)
@@ -2557,41 +2624,26 @@ impl FlashMoeEngine {
             layout.kv_width,
         )?;
         let input_specs = input_requests.requests();
-        let mut projections = self.dense.project_resident_tensors_from_cpu_matrix(
-            &self.metal,
-            &input_specs,
-            rows.len(),
-            runtime.width,
-            normed,
-        )?;
-        let values = projections
-            .pop()
-            .context("missing layer-major self_attn.v_proj matrix")?;
-        let keys = projections
-            .pop()
-            .context("missing layer-major self_attn.k_proj matrix")?;
-        let queries = projections
-            .pop()
-            .context("missing layer-major self_attn.q_proj matrix")?;
-        let expected_queries = rows
-            .len()
-            .checked_mul(layout.q_projection_width)
-            .context("layer-major query matrix size overflow")?;
-        let expected_kv = rows
-            .len()
-            .checked_mul(layout.kv_width)
-            .context("layer-major KV matrix size overflow")?;
-        if queries.len() != expected_queries
-            || keys.len() != expected_kv
-            || values.len() != expected_kv
-        {
-            bail!(
-                "Qwen layer-major projection geometry mismatch at layer {layer}: q={} expected={expected_queries}, k={} v={} expected_kv={expected_kv}",
-                queries.len(),
-                keys.len(),
-                values.len()
+        let mut projections = Vec::with_capacity(3);
+        for spec in input_specs {
+            projections.push(
+                self.dense
+                    .resident_mmap_projection(spec.tensor_name, spec.output_width, runtime.width)?
+                    .with_context(|| {
+                        format!(
+                            "missing Qwen full-attention graph projection {}",
+                            spec.tensor_name
+                        )
+                    })?,
             );
         }
+        let projections: [ResidentMmapMatvecProjection; 3] =
+            projections.try_into().map_err(|projections: Vec<_>| {
+                anyhow::anyhow!(
+                    "Qwen full-attention graph resolved {} projections, expected three",
+                    projections.len()
+                )
+            })?;
 
         let q_norm_name = layer_norm_tensor_name(layer, "self_attn.q_norm");
         let k_norm_name = layer_norm_tensor_name(layer, "self_attn.k_norm");
@@ -2608,150 +2660,86 @@ impl FlashMoeEngine {
                 1_000_000.0
             }
         });
-        let mut normalized_queries = Vec::with_capacity(rows.len() * layout.q_width);
-        let mut query_gates = Vec::with_capacity(rows.len());
+        let rotary_half = layout.rotary_dim / 2;
+        let mut rope_sin = Vec::with_capacity(rows.len() * rotary_half);
+        let mut rope_cos = Vec::with_capacity(rows.len() * rotary_half);
         for row_index in 0..rows.len() {
             let position = start_position + row_index;
-            let q_start = row_index * layout.q_projection_width;
-            let kv_start = row_index * layout.kv_width;
-            let (mut q, q_gate) = split_q_projection(
-                queries[q_start..q_start + layout.q_projection_width].to_vec(),
-                layout,
-            )?;
-            let mut k = keys[kv_start..kv_start + layout.kv_width].to_vec();
-            let v = values[kv_start..kv_start + layout.kv_width].to_vec();
-            let rope_position = FlashMoeTokenInput::text(0, position).rope_position();
-            apply_full_attention_qk_norm_and_rotary(
-                &mut q,
-                &mut k,
-                layout,
-                rope_position,
+            let rotations = split_half_rope_rotations(
+                FlashMoeTokenInput::text(0, position).rope_position(),
+                layout.head_dim,
+                layout.rotary_dim,
                 theta,
                 self.config.text_mrope_section(),
-                Some(&q_norm_w),
-                Some(&k_norm_w),
-            )?;
-            let kv_record = FlashMoeFullAttentionKvRecord::new(position, layer, k, v);
-            self.resolve_full_attention_kv_state(position, layer, layout, &kv_record)?;
-            kv_cache.record_kv_record(kv_record)?;
-            normalized_queries.extend(q);
-            query_gates.push(q_gate);
+            );
+            if rotations.len() != rotary_half {
+                bail!(
+                    "Qwen full-attention layer {layer} produced {} rotations, expected {rotary_half}",
+                    rotations.len()
+                );
+            }
+            for (sin, cos) in rotations {
+                rope_sin.push(sin);
+                rope_cos.push(cos);
+            }
         }
-        let end_position = start_position + rows.len() - 1;
-        let records = kv_cache.keys_values(end_position, layer)?;
-        if records.len() != start_position + rows.len() {
+        let records = kv_cache.keys_values(start_position.saturating_sub(1), layer)?;
+        if records.len() != start_position {
             bail!(
-                "Qwen layer-major attention layer {layer} expected {} KV rows through position {end_position}, found {}",
-                start_position + rows.len(),
+                "Qwen full-attention layer {layer} expected {start_position} prefix KV rows, found {}",
                 records.len()
             );
         }
-        let mut all_keys = Vec::with_capacity(records.len() * layout.kv_width);
-        let mut all_values = Vec::with_capacity(records.len() * layout.kv_width);
+        let mut prefix_keys = Vec::with_capacity(records.len() * layout.kv_width);
+        let mut prefix_values = Vec::with_capacity(records.len() * layout.kv_width);
         for (key, value) in records {
             if key.len() != layout.kv_width || value.len() != layout.kv_width {
                 bail!(
-                    "Qwen layer-major attention layer {layer} encountered KV widths {}/{}, expected {}",
+                    "Qwen full-attention layer {layer} encountered prefix KV widths {}/{}, expected {}",
                     key.len(),
                     value.len(),
                     layout.kv_width
                 );
             }
-            all_keys.extend_from_slice(key);
-            all_values.extend_from_slice(value);
+            prefix_keys.extend_from_slice(key);
+            prefix_values.extend_from_slice(value);
         }
-        let mut output = self.metal.qwen_causal_attention_rows(
-            &normalized_queries,
-            &all_keys,
-            &all_values,
+        let output = self.metal.qwen_full_attention_graph(
+            &projections,
+            normed,
             rows.len(),
             start_position,
-            layout.num_q_heads,
-            layout.kv_heads,
-            layout.head_dim,
+            layout,
+            &q_norm_w,
+            &k_norm_w,
+            &rope_sin,
+            &rope_cos,
+            &prefix_keys,
+            &prefix_values,
         )?;
-        for (row_index, q_gate) in query_gates.into_iter().enumerate() {
-            if let Some(q_gate) = q_gate {
-                let start = row_index * layout.q_width;
-                for (value, gate) in output[start..start + layout.q_width]
-                    .iter_mut()
-                    .zip(q_gate.iter())
-                {
-                    *value *= sigmoid(*gate);
-                }
-            }
+        let expected_current = rows
+            .len()
+            .checked_mul(layout.kv_width)
+            .context("Qwen full-attention current KV size overflow")?;
+        if output.current_keys().len() != expected_current
+            || output.current_values().len() != expected_current
+        {
+            bail!("Qwen full-attention graph returned incompatible current KV geometry");
         }
-        Ok(output)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn linear_attention_output_matrix_values(
-        &self,
-        layer: usize,
-        rows: usize,
-        normed: &[f32],
-    ) -> Result<Vec<f32>> {
-        let layout = self.runtime.linear_attention_layout(layer)?;
-        let bindings = self.linear_attention_weights.require(layer)?;
-        let (mut projections, _, _) = self.metal.resident_mmap_projection_matrix(
-            &bindings.input_projections,
-            rows,
-            self.runtime.width,
-            normed,
-        )?;
-        if rows == 1 {
-            let (scalar_projections, _, _) = self
-                .metal
-                .resident_mmap_matvec_batch(&bindings.input_projections, normed)?;
-            if scalar_projections.len() != projections.len() {
-                bail!(
-                    "Qwen one-row linear-attention input projection counts differ at layer {layer}: matrix={} scalar={}",
-                    projections.len(),
-                    scalar_projections.len()
-                );
-            }
-            for ((projection, actual), expected) in bindings
-                .input_projections
-                .iter()
-                .zip(projections.iter())
-                .zip(scalar_projections.iter())
-            {
-                if actual.len() != expected.len() {
-                    bail!(
-                        "Qwen one-row linear-attention input projection widths differ at layer {layer} for {}: matrix={} scalar={}",
-                        projection.tensor_name(),
-                        actual.len(),
-                        expected.len()
-                    );
-                }
-                if let Some((index, (actual, expected))) = actual
-                    .iter()
-                    .zip(expected.iter())
-                    .enumerate()
-                    .find(|(_, (actual, expected))| actual.to_bits() != expected.to_bits())
-                {
-                    bail!(
-                        "Qwen one-row linear-attention input projection parity failed at layer {layer} for {} index={index}: matrix={actual} scalar={expected} delta={}",
-                        projection.tensor_name(),
-                        (actual - expected).abs()
-                    );
-                }
-            }
+        for row_index in 0..rows.len() {
+            let position = start_position + row_index;
+            let start = row_index * layout.kv_width;
+            let end = start + layout.kv_width;
+            let kv_record = FlashMoeFullAttentionKvRecord::new(
+                position,
+                layer,
+                output.current_keys()[start..end].to_vec(),
+                output.current_values()[start..end].to_vec(),
+            );
+            self.resolve_full_attention_kv_state(position, layer, layout, &kv_record)?;
+            kv_cache.record_kv_record(kv_record)?;
         }
-        let alpha = projections
-            .pop()
-            .context("missing layer-major linear-attention alpha matrix")?;
-        let beta = projections
-            .pop()
-            .context("missing layer-major linear-attention beta matrix")?;
-        let z = projections
-            .pop()
-            .context("missing layer-major linear-attention Z matrix")?;
-        let qkv = projections
-            .pop()
-            .context("missing layer-major linear-attention QKV matrix")?;
-        self.metal
-            .qwen_linear_attention_matrix(layout, bindings, rows, &qkv, &z, &beta, &alpha)
+        Ok(output.into_attention())
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2761,8 +2749,8 @@ impl FlashMoeEngine {
         rows: usize,
         attention_width: usize,
         out_proj_name: &str,
-        attention: &[f32],
-        residual: &[f32],
+        attention: MetalBatchProjectionInput<'_>,
+        residual: MetalBatchProjectionInput<'_>,
     ) -> Result<MetalLayerMajorPostAttention> {
         let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
         let post_norm_weight = self
@@ -2793,11 +2781,12 @@ impl FlashMoeEngine {
         &mut self,
         layer: usize,
         rows: &mut [QwenTokenExecutionOutput],
-        prepared_input_norm: Option<&[f32]>,
+        previous: Option<&MetalQwenPrefillLayerOutput>,
         start_position: usize,
         kv_cache: &mut KvCache,
+        record_recurrent_trace: bool,
         row_timings: &mut [Option<FlashMoeTokenTiming>],
-    ) -> Result<Option<Vec<f32>>> {
+    ) -> Result<MetalQwenPrefillLayerOutput> {
         if rows.is_empty() || rows.len() != row_timings.len() {
             bail!("Qwen layer-major layer requires aligned non-empty rows and timings");
         }
@@ -2807,63 +2796,134 @@ impl FlashMoeEngine {
             .len()
             .checked_mul(width)
             .context("Qwen layer-major hidden matrix size overflow")?;
-        let mut residual = Vec::with_capacity(hidden_values);
-        let mut normed = Vec::with_capacity(hidden_values);
-        for row in rows.iter() {
-            if row.hidden.len() != width {
+        if let Some(previous) = previous {
+            if previous.layer() + 1 != layer
+                || previous.hidden().rows() != rows.len()
+                || previous.hidden().cols() != width
+                || previous
+                    .next_normed()
+                    .is_none_or(|normed| normed.rows() != rows.len() || normed.cols() != width)
+            {
                 bail!(
-                    "Qwen layer-major row width {} does not match {width} at layer {layer}",
-                    row.hidden.len()
+                    "Qwen layer-major device input does not match layer {layer} geometry {}x{width}",
+                    rows.len()
                 );
             }
-            residual.extend_from_slice(&row.hidden);
-        }
-        if let Some(prepared) = prepared_input_norm {
-            if prepared.len() != hidden_values {
-                bail!(
-                    "Qwen layer-major prepared input norm has {} values, expected {hidden_values} at layer {layer}",
-                    prepared.len()
-                );
-            }
-            normed.extend_from_slice(prepared);
         } else {
-            let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
             for row in rows.iter() {
-                normed.extend(self.rms_norm_with_model_weight(&input_norm_name, &row.hidden)?);
+                if row.hidden.len() != width {
+                    bail!(
+                        "Qwen layer-major row width {} does not match {width} at layer {layer}",
+                        row.hidden.len()
+                    );
+                }
             }
         }
-        let (attention, attention_width, out_proj_name, layer_kind) =
-            if self.runtime.is_linear_attention_layer(layer) {
-                let layout = self.runtime.linear_attention_layout(layer)?;
+
+        let post_norm_name = layer_norm_tensor_name(layer, "post_attention_layernorm");
+        let post_norm_weight = self
+            .model_norm_weight(&post_norm_name, width)?
+            .with_context(|| format!("missing Qwen layer-major norm {post_norm_name}"))?;
+        let (post, layer_kind) = if self.runtime.is_linear_attention_layer(layer) {
+            let layout = self.runtime.linear_attention_layout(layer)?;
+            let bindings = self.linear_attention_weights.require(layer)?;
+            if let Some(previous) = previous {
+                let normed = previous
+                    .next_normed()
+                    .context("Qwen layer-major device input is missing its prepared norm")?;
                 (
-                    self.linear_attention_output_matrix_values(layer, rows.len(), &normed)?,
-                    layout.total_value_width,
-                    linear_attention_tensor_name(layer, "out_proj"),
+                    self.metal.qwen_linear_attention_graph(
+                        layout,
+                        bindings,
+                        rows.len(),
+                        width,
+                        MetalBatchProjectionInput::Buffer {
+                            buffer: normed.buffer(),
+                            len: normed.values(),
+                        },
+                        MetalBatchProjectionInput::Buffer {
+                            buffer: previous.hidden().buffer(),
+                            len: previous.hidden().values(),
+                        },
+                        &post_norm_weight,
+                    )?,
                     FlashMoeLayerKind::LinearAttention,
                 )
             } else {
-                let layout = self.runtime.full_attention_layout(layer)?;
+                let mut residual = Vec::with_capacity(hidden_values);
+                let mut normed = Vec::with_capacity(hidden_values);
+                let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
+                for row in rows.iter() {
+                    residual.extend_from_slice(&row.hidden);
+                    normed.extend(self.rms_norm_with_model_weight(&input_norm_name, &row.hidden)?);
+                }
                 (
-                    self.full_attention_output_matrix_values(
-                        layer,
-                        rows,
-                        &normed,
-                        start_position,
-                        kv_cache,
+                    self.metal.qwen_linear_attention_graph(
+                        layout,
+                        bindings,
+                        rows.len(),
+                        width,
+                        MetalBatchProjectionInput::Cpu(&normed),
+                        MetalBatchProjectionInput::Cpu(&residual),
+                        &post_norm_weight,
                     )?,
-                    layout.q_width,
-                    attention_tensor_name(layer, "o_proj"),
-                    FlashMoeLayerKind::FullAttention,
+                    FlashMoeLayerKind::LinearAttention,
+                )
+            }
+        } else {
+            let mut residual_cpu = Vec::new();
+            let mut normed_cpu = Vec::new();
+            let (residual, normed) = if let Some(previous) = previous {
+                let next_normed = previous
+                    .next_normed()
+                    .context("Qwen full-attention device input is missing its prepared norm")?;
+                (
+                    MetalBatchProjectionInput::Buffer {
+                        buffer: previous.hidden().buffer(),
+                        len: previous.hidden().values(),
+                    },
+                    MetalBatchProjectionInput::Buffer {
+                        buffer: next_normed.buffer(),
+                        len: next_normed.values(),
+                    },
+                )
+            } else {
+                residual_cpu.reserve(hidden_values);
+                normed_cpu.reserve(hidden_values);
+                let input_norm_name = layer_norm_tensor_name(layer, "input_layernorm");
+                for row in rows.iter() {
+                    residual_cpu.extend_from_slice(&row.hidden);
+                    normed_cpu
+                        .extend(self.rms_norm_with_model_weight(&input_norm_name, &row.hidden)?);
+                }
+                (
+                    MetalBatchProjectionInput::Cpu(&residual_cpu),
+                    MetalBatchProjectionInput::Cpu(&normed_cpu),
                 )
             };
-        let post = self.post_attention_output_matrix_values(
-            layer,
-            rows.len(),
-            attention_width,
-            &out_proj_name,
-            &attention,
-            &residual,
-        )?;
+            let layout = self.runtime.full_attention_layout(layer)?;
+            let attention = self.full_attention_output_matrix_values(
+                layer,
+                rows,
+                normed,
+                start_position,
+                kv_cache,
+            )?;
+            (
+                self.post_attention_output_matrix_values(
+                    layer,
+                    rows.len(),
+                    layout.q_width,
+                    &attention_tensor_name(layer, "o_proj"),
+                    MetalBatchProjectionInput::Buffer {
+                        buffer: attention.values().buffer(),
+                        len: attention.values().values(),
+                    },
+                    residual,
+                )?,
+                FlashMoeLayerKind::FullAttention,
+            )
+        };
         let experts = self.scheduler.experts_per_layer();
         let active = self.scheduler.active_experts();
         if post.router_scores().len() != rows.len() * experts {
@@ -2909,36 +2969,25 @@ impl FlashMoeEngine {
         {
             bail!("Qwen layer-major expert output does not match the requested layer geometry");
         }
-        let (hidden, next_normed) = layer_output.materialize();
-        if hidden.len() != hidden_values {
-            bail!(
-                "Qwen layer-major expert output has {} values, expected {hidden_values}",
-                hidden.len()
-            );
-        }
-        if next_normed
-            .as_ref()
-            .is_some_and(|values| values.len() != hidden_values)
-        {
-            bail!("Qwen layer-major next norm does not match hidden matrix geometry");
-        }
-        let mix_hashes = scheduled.route_mix_hashes().collect::<Vec<_>>();
         let elapsed = layer_started.elapsed();
         let per_row_elapsed = elapsed / u32::try_from(rows.len()).unwrap_or(u32::MAX);
-        for row_index in 0..rows.len() {
-            let mut state = FlashMoeTokenState::from_recurrent_value(
-                hidden[row_index * width..(row_index + 1) * width].to_vec(),
-                rows[row_index].recurrent_value,
-            );
-            let route_start = row_index * active;
-            for route in route_start..route_start + active {
-                state.mix_active_expert(mix_hashes[route], scheduled.weights()[route]);
+        if record_recurrent_trace {
+            let mix_hashes = scheduled.route_mix_hashes().collect::<Vec<_>>();
+            for row_index in 0..rows.len() {
+                let mut recurrent = FlashMoeRecurrentState::new(rows[row_index].recurrent_value);
+                let route_start = row_index * active;
+                for route in route_start..route_start + active {
+                    recurrent.mix_active_expert(mix_hashes[route], scheduled.weights()[route]);
+                }
+                rows[row_index].recurrent_value = recurrent.value();
             }
-            let layer_state = state.layer_state_record(start_position + row_index, layer);
-            let (row_hidden, recurrent_value) = state.into_hidden_and_recurrent();
-            rows[row_index].hidden = row_hidden;
-            rows[row_index].recurrent_value = recurrent_value;
-            kv_cache.record_layer_state_record(layer_state)?;
+            kv_cache.record_layer_state_values(
+                start_position,
+                layer,
+                rows.iter().map(|row| row.recurrent_value),
+            )?;
+        }
+        for row_index in 0..rows.len() {
             if let Some(timing) = row_timings[row_index].as_mut() {
                 let mut layer_timing = FlashMoeLayerTiming {
                     layer,
@@ -2952,7 +3001,7 @@ impl FlashMoeEngine {
                 timing.layers.push(layer_timing);
             }
         }
-        Ok(next_normed)
+        Ok(layer_output)
     }
 
     fn mla_attention_output_values(
@@ -3894,6 +3943,7 @@ impl FlashMoeEngine {
                         kv_cache,
                         request.prefill_mode,
                         request.prefill_chunk_tokens,
+                        request.prefill_state_summary,
                         detailed,
                         progress.clone(),
                     )?
@@ -3927,6 +3977,7 @@ impl FlashMoeEngine {
                         kv_cache,
                         request.prefill_mode,
                         request.prefill_chunk_tokens,
+                        request.prefill_state_summary,
                         detailed,
                         progress.clone(),
                     )?
@@ -3957,6 +4008,7 @@ impl FlashMoeEngine {
                         kv_cache,
                         request.prefill_mode,
                         request.prefill_chunk_tokens,
+                        request.prefill_state_summary,
                         detailed,
                         progress.clone(),
                     )?
@@ -4341,6 +4393,7 @@ impl FlashMoeEngine {
         kv_cache: &mut KvCache,
         prefill_mode: NativePrefillMode,
         prefill_chunk_tokens: Option<usize>,
+        record_prefill_state: bool,
         mut timing: Option<&mut FlashMoeGenerationTiming>,
         progress: GenerationProgress<'_>,
     ) -> Result<Vec<f32>> {
@@ -4445,6 +4498,7 @@ impl FlashMoeEngine {
                 end_position,
                 chunk_tokens,
                 kv_cache,
+                record_prefill_state,
                 timing,
                 progress,
             );
@@ -4528,6 +4582,7 @@ impl FlashMoeEngine {
         end_position: usize,
         chunk_tokens: usize,
         kv_cache: &mut KvCache,
+        record_prefill_state: bool,
         mut timing: Option<&mut FlashMoeGenerationTiming>,
         progress: GenerationProgress<'_>,
     ) -> Result<Vec<f32>> {
@@ -4566,37 +4621,50 @@ impl FlashMoeEngine {
                                 ^ (self.plan.model.len() as u64),
                         });
                     }
-                    let mut prepared_input_norm = None;
+                    let mut device_state = None;
                     for layer in 0..self.config.num_hidden_layers {
-                        prepared_input_norm = self.forward_qwen_layer_major_matrix(
+                        let next = self.forward_qwen_layer_major_matrix(
                             layer,
                             &mut rows,
-                            prepared_input_norm.as_deref(),
+                            device_state.as_ref(),
                             chunk_start,
                             kv_cache,
+                            record_prefill_state,
                             &mut row_timings,
                         )?;
+                        device_state = Some(next);
                     }
-                    for (row, token_timing) in rows.iter_mut().zip(row_timings.iter_mut()) {
-                        let norm_started = OptionalInstant::now(token_timing.is_some());
-                        row.hidden =
-                            self.rms_norm_with_model_weight("model.norm.weight", &row.hidden)?;
+                    let final_state = device_state
+                        .context("Qwen layer-major prefill graph produced no layer output")?;
+                    let final_norm_weight = self
+                        .model_norm_weight("model.norm.weight", self.runtime.width)?
+                        .context("missing Qwen final norm weight")?;
+                    let norm_started = OptionalInstant::now(timing.is_some());
+                    let hidden = self
+                        .metal
+                        .qwen_final_norm_last_row(&final_state, &final_norm_weight)?;
+                    if hidden.len() != self.runtime.width {
+                        bail!("Qwen layer-major final hidden row has incompatible geometry");
+                    }
+                    let norm_elapsed = norm_started.elapsed();
+                    let final_timing_index = row_timings.len().saturating_sub(1);
+                    for (index, token_timing) in row_timings.iter_mut().enumerate() {
                         if let Some(token_timing) = token_timing {
-                            token_timing.buckets.combine_norm += norm_started.elapsed();
                             token_timing.buckets.total_wall = token_timing
                                 .layers
                                 .iter()
                                 .map(|layer| layer.buckets.total_wall)
-                                .sum::<Duration>()
-                                + norm_started.elapsed();
+                                .sum::<Duration>();
+                            if index == final_timing_index {
+                                token_timing.buckets.combine_norm += norm_elapsed;
+                                token_timing.buckets.total_wall += norm_elapsed;
+                            }
                         }
                     }
                     if let Some(timing) = timing.as_deref_mut() {
                         timing.tokens.extend(row_timings.into_iter().flatten());
                     }
-                    rows.pop()
-                        .map(|row| row.hidden)
-                        .context("Qwen layer-major prefill chunk produced no hidden state")
+                    Ok(hidden)
                 })?;
                 self.metal.inner.finish_token_boundary(chunk_end - 1)?;
                 last_hidden = Some(hidden);
@@ -4620,6 +4688,7 @@ impl FlashMoeEngine {
                 end_position,
                 chunk_tokens,
                 kv_cache,
+                record_prefill_state,
                 timing,
                 progress,
             );

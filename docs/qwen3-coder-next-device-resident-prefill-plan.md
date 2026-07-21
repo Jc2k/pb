@@ -1,6 +1,6 @@
 # Qwen3-Coder-Next device-resident prefill graph
 
-Status: **Design record; implementation active.**
+Status: **Implemented and natively qualified on 2026-07-21.**
 
 This plan continues the shipped Qwen3-Coder-Next layer-major matrix command into a genuinely
 device-resident layer-major prefill graph. The built-in FlashMoe runner is the implementation
@@ -95,14 +95,11 @@ state ownership rather than traversal order or expert scheduling.
 
 ## Phase 1 — Introduce a typed chunk owner
 
-Status: **In progress.** Row-aware GPU matrix descriptors now bind role, rows, and width at the
-first live RAII-owned subgraph: post-attention residual and norm matrices remain on Metal across
-CPU top-10 routing and are consumed directly by the existing expert command. A Metal gather uses
-the scheduler's row/expert grouping, so this seam no longer materializes or reuploads grouped
-hidden rows on the CPU. The expert command now also returns an RAII-owned hidden matrix and optional
-prepared-next-norm matrix, computing that norm in the same command; the legacy layer-state recorder
-still materializes both before the next layer. The whole-chunk owner that passes those buffers into
-the following attention phase remains open rather than being represented by unbound metadata.
+Status: **Implemented and qualified.** Row-aware GPU matrix descriptors bind role, rows, width,
+layer, placement, and one RAII owner. Post-attention residual/norm matrices survive CPU top-10
+routing, the scheduler's grouped-row order is gathered on Metal, and the expert command returns the
+hidden/optional next-norm owner consumed by the following layer. Ordinary requests materialize only
+the final normalized row; complete state fingerprints remain an explicit qualification boundary.
 
 Define row-aware GPU matrix descriptors rather than reusing scalar `len` descriptors. A
 `QwenPrefillChunkState` owns hidden and optional prepared-next-norm buffers, row count, width,
@@ -118,6 +115,8 @@ Gate: state-transition tests reject wrong roles, rows, widths, layers, and doubl
 resource snapshot returns to its pre-request live counts after success and injected failure.
 
 ## Phase 2 — Keep dense, attention, and post-attention state on Metal
+
+Status: **Implemented and qualified.**
 
 Extend resident projection matrix builders to accept typed input buffers and return typed output
 buffers. Q/K normalization, rotary application, causal attention, output projection, residual add,
@@ -137,6 +136,8 @@ state parity. Telemetry shows no hidden/normed host transfer between layers.
 
 ## Phase 3 — Join router, scheduler, and expert output
 
+Status: **Implemented and qualified for both resident and streamed expert policy.**
+
 Post-attention returns a typed residual/norm owner plus only the router score matrix to the host.
 CPU softmax/top-10 preserves the current row-local order and exact weights. The existing scheduler
 reduces routes to the sorted unique expert union and resolves resident mapped slots or streamed
@@ -154,10 +155,12 @@ and all state fingerprints match the scalar and shipped matrix references.
 
 ## Phase 4 — Resolve one production graph
 
-Capability preparation gains a distinct device-resident graph capability only when every required
-dense, attention, recurrent, expert, and state binding exists. `auto` continues to use the promoted
-shipped matrix command until the new graph passes all gates. Hidden harness modes can force the
-shipped matrix reference and device-resident candidate inside one loaded runtime.
+Status: **Promoted.**
+
+Capability preparation exposes layer-major prefill only when every required dense, attention,
+recurrent, expert, and state binding exists. `auto` now selects the qualified device-resident graph
+for the same resource-resolved suffix geometry. Hidden harness modes force the scalar reference,
+the production graph, restored prefixes, and smaller chunk boundaries inside one loaded runtime.
 
 There is no runtime probe/fallback. An explicit candidate request that cannot reserve or encode its
 declared graph fails before mutation of prompt state. After promotion, `auto` selects the new graph
@@ -194,6 +197,28 @@ Compatibility:
 - the required native one-token smoke exits zero with a sensible answer; and
 - an explicit GGUF request still resolves and executes through llama.cpp without sharing the new
   FlashMoe graph state.
+
+## Qualification outcome
+
+The locked 4,354-token resident prompt completed in 38,369 ms at 113.47 token/s, 1.5556x faster
+than the shipped 59,685 ms matrix reference and 17.973x faster than the preserved 689.6-second
+scalar baseline. The resource-ledger run supplied the allocation evidence below. This conservative
+result clears the 1.5x target; the sub-30-second stretch target remains open.
+
+The long graph submitted 109 Metal commands, uploaded 324,617,488 bytes, and read back 642,031,616
+bytes: router scores and full-attention KV records account for the host-visible long-sequence
+boundary, while hidden and normalized matrices stay device-owned across layers. Peak allocation
+was 46,419,214,336 bytes, 1,437,728,768 bytes (3.1963%) above the 44,981,485,568-byte resident
+baseline. The request ended with zero active general buffers, transient expert buffers, and
+in-flight commands.
+
+Exact state parity passed for resident and forced-32-GiB streamed policy, zero and restored
+prefixes, forced 17/7-row chunks, and 31/32/33-token thresholds. The native raw `2+2=` smoke
+returned `5`; an explicit split Qwen3-Coder-Next GGUF selected llama.cpp independently and returned
+`4`. The common BF16 affine-Q4 matrix kernel reuses each weight traversal for two input rows without
+changing either row's scalar accumulation order. Its focused 2,048-column BF16 Metal fixture makes
+three matrix rows, including an odd tail, match independent scalar Metal commands bit-for-bit and
+remain numerically consistent with the CPU reference.
 
 ## Planned commits
 
