@@ -8,7 +8,7 @@ pub(crate) struct MetalPostAttentionPrep {
     pub(crate) input: ScheduledCmd3MetalPostAttentionInput,
     pub(crate) state: FlashMoePostAttentionPrepState,
     pub(crate) width: usize,
-    pub(crate) active: Vec<(usize, f32)>,
+    pub(crate) active: InlineRoutePairs,
     routing_command: Option<ScheduledRoutingCommand>,
 }
 
@@ -18,10 +18,11 @@ impl MetalPostAttentionPrep {
         layer: usize,
         width: usize,
         expert_count: usize,
-        active: Vec<(usize, f32)>,
+        active: impl Into<InlineRoutePairs>,
         residual_buffer: MetalObjcId,
         normed_buffer: MetalObjcId,
     ) -> anyhow::Result<Self> {
+        let active = active.into();
         let state = FlashMoePostAttentionPrepState::new(layer, width, expert_count, active.len());
         if !state.is_declared_graph_state() {
             anyhow::bail!(

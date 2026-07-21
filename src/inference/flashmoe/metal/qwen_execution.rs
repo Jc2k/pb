@@ -239,7 +239,7 @@ unsafe fn encode_q4_mmap_multilinear(
             sel("setComputePipelineState:"),
             pipelines.q4_mmap_multilinear_bf16_scale_bias_pipeline,
         );
-        set_buffer(encoder, dense_weights.buffer, 0);
+        set_buffer(encoder, dense_weights.buffer(), 0);
         set_buffer(encoder, input_buffer, 1);
         set_buffer(encoder, output_buffer, 2);
         set_bytes(encoder, u64_as_bytes(&projection.packed_byte_offset), 3);
@@ -502,16 +502,8 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
         validate_resident_projection(q_a, input_len, dense_weights.len)?;
         validate_resident_projection(kv_a, input_len, dense_weights.len)?;
         validate_resident_projection(q_b, q_a.output_width(), dense_weights.len)?;
-        validate_resident_projection(
-            &ResidentMmapMatvecProjection::Q4(embed_q.clone()),
-            input.nope_dim,
-            dense_weights.len,
-        )?;
-        validate_resident_projection(
-            &ResidentMmapMatvecProjection::Q4(unembed_out.clone()),
-            input.latent_rank,
-            dense_weights.len,
-        )?;
+        validate_resident_projection(embed_q, input.nope_dim, dense_weights.len)?;
+        validate_resident_projection(unembed_out, input.latent_rank, dense_weights.len)?;
 
         let query_width = input
             .heads
@@ -1137,11 +1129,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 projection.scale_bias_dtype,
             );
         }
-        validate_resident_projection(
-            &ResidentMmapMatvecProjection::Q4(projection.clone()),
-            projection.cols,
-            dense_weights.len,
-        )?;
+        validate_resident_projection(projection, projection.cols, dense_weights.len)?;
 
         unsafe {
             let input_buffer = self.buffer_with_bytes(f32_as_bytes(inputs))?;
@@ -1273,16 +1261,8 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                 input.scale,
             );
         }
-        validate_resident_projection(
-            &ResidentMmapMatvecProjection::Q4(embed_q.clone()),
-            embed_q.cols,
-            dense_weights.len,
-        )?;
-        validate_resident_projection(
-            &ResidentMmapMatvecProjection::Q4(unembed_out.clone()),
-            input.latent_rank,
-            dense_weights.len,
-        )?;
+        validate_resident_projection(embed_q, embed_q.cols, dense_weights.len)?;
+        validate_resident_projection(unembed_out, input.latent_rank, dense_weights.len)?;
 
         unsafe {
             let mut buffers = Vec::with_capacity(8);
@@ -1546,7 +1526,7 @@ impl<'a> MetalResidentProjectionBatchBuilder<'a> {
                     self.pipelines.q4_mmap_batch_pipeline
                 },
             );
-            set_buffer(encoder, dense_weights.buffer, 0);
+            set_buffer(encoder, dense_weights.buffer(), 0);
             set_buffer(encoder, input_buffer, 1);
             set_buffer(encoder, output_buffer, 2);
             set_buffer(encoder, packed_offsets_buffer, 3);

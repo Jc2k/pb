@@ -20,7 +20,7 @@ use crate::inference::flashmoe::state::{
 };
 use crate::inference::flashmoe::weights::{
     DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, ResidentMmapMatvecProjection,
-    RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
+    ResidentStaticDtype, RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
     SharedExpertPhaseResidentProjections, SharedExpertPhaseWeights,
 };
 use crate::inference::flashmoe::{GROUP_SIZE, QWEN35_MODEL, QwenModelConfig, QwenMoeModelLayout};
@@ -661,7 +661,7 @@ fn execution_scheduler_resolves_cmd1_cmd2_and_routing_with_one_graph_owner() {
 
     assert_eq!(routing.layer, 3);
     assert_eq!(routing.active_experts, 2);
-    assert_eq!(routing.routes, vec![(4, 3.0), (1, 2.0)]);
+    assert_eq!(routing.routes.as_slice(), &[(4, 3.0), (1, 2.0)]);
     assert_eq!(
         routed.identity.output_handoff,
         ScheduledCmd3OutputHandoff::DeferredToNextLayer
@@ -1466,7 +1466,7 @@ fn qwen35_resident_shared_cmd3_metal_output_matches_layer_reference() {
                     ResidentMmapMatvecProjection::Dense(DenseMmapMatvecProjection {
                         tensor_name: tensor_name.to_string(),
                         byte_offset,
-                        dtype: dtype.to_string(),
+                        dtype: ResidentStaticDtype::from_declared(dtype).unwrap(),
                         rows,
                         cols: width,
                         output_width: rows,
@@ -1620,7 +1620,7 @@ fn dummy_router_projection(
         binding: RouterScoreProjectionBinding::ResidentDense(DenseMmapMatvecProjection {
             tensor_name,
             byte_offset: 4096,
-            dtype: "F32".to_string(),
+            dtype: ResidentStaticDtype::F32,
             rows: experts,
             cols: hidden_width,
             output_width: experts,
@@ -2550,7 +2550,10 @@ fn scheduled_routing_validates_preselected_fused_prep_candidates() {
     let selected = routing
         .validate_preselected(&[(7, 3.0), (1, 2.0), (3, 1.0), (5, 0.0)])
         .unwrap();
-    assert_eq!(selected, vec![(7, 3.0), (1, 2.0), (3, 1.0), (5, 0.0)]);
+    assert_eq!(
+        selected.as_slice(),
+        &[(7, 3.0), (1, 2.0), (3, 1.0), (5, 0.0)]
+    );
 
     let duplicate_err = routing
         .validate_preselected(&[(7, 3.0), (1, 2.0), (7, 1.0), (5, 0.0)])
@@ -2652,7 +2655,7 @@ fn scheduled_routing_builds_command_from_preselected_candidates() {
         command.source,
         ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
     );
-    assert_eq!(command.routes, vec![(7, 0.75), (1, 0.25)]);
+    assert_eq!(command.routes.as_slice(), &[(7, 0.75), (1, 0.25)]);
 }
 
 #[test]
@@ -2977,7 +2980,7 @@ fn scheduled_cmd2_output_builds_preselected_routing_command() {
         routing.source,
         ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
     );
-    assert_eq!(routing.routes, vec![(7, 0.75), (3, 0.25)]);
+    assert_eq!(routing.routes.as_slice(), &[(7, 0.75), (3, 0.25)]);
 }
 
 #[test]
@@ -3018,7 +3021,7 @@ fn scheduled_cmd2_command_builds_preselected_routing_command() {
         routing.source,
         ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK
     );
-    assert_eq!(routing.routes, vec![(7, 0.75), (3, 0.25)]);
+    assert_eq!(routing.routes.as_slice(), &[(7, 0.75), (3, 0.25)]);
 
     let err = command
         .command_from_post_attention_prep_routes(
@@ -4098,9 +4101,10 @@ fn scheduled_expert_routes_renormalize_and_scale_full_softmax_probabilities() {
     let expected = [0.25 * 2.0 / 9.0, 0.25 * 6.0 / 9.0, 0.25 * 1.0 / 9.0];
 
     assert_eq!(scheduled.layer, 12);
+    assert!(scheduled.uses_inline_storage());
     assert_eq!(
-        scheduled.routes,
-        vec![
+        scheduled.routes(),
+        &[
             ExpertRoute {
                 expert: 7,
                 score: 0.2,
@@ -4115,8 +4119,8 @@ fn scheduled_expert_routes_renormalize_and_scale_full_softmax_probabilities() {
             },
         ]
     );
-    assert_eq!(scheduled.weights.len(), expected.len());
-    for (actual, expected) in scheduled.weights.iter().zip(expected.iter()) {
+    assert_eq!(scheduled.weights().len(), expected.len());
+    for (actual, expected) in scheduled.weights().iter().zip(expected.iter()) {
         assert!((actual - expected).abs() < 1e-6);
     }
 }
@@ -4139,10 +4143,10 @@ fn deepseek_routes_apply_the_fixed_selected_sum_floor_without_affecting_standard
     )
     .unwrap();
 
-    assert!((deepseek.weights[0] - 1.5e-6 / 6.103515625e-5).abs() < 1.0e-7);
-    assert!((deepseek.weights[1] - 3.0e-6 / 6.103515625e-5).abs() < 1.0e-7);
-    assert!((standard.weights[0] - 0.5).abs() < 1.0e-6);
-    assert!((standard.weights[1] - 1.0).abs() < 1.0e-6);
+    assert!((deepseek.weights()[0] - 1.5e-6 / 6.103515625e-5).abs() < 1.0e-7);
+    assert!((deepseek.weights()[1] - 3.0e-6 / 6.103515625e-5).abs() < 1.0e-7);
+    assert!((standard.weights()[0] - 0.5).abs() < 1.0e-6);
+    assert!((standard.weights()[1] - 1.0).abs() < 1.0e-6);
 }
 
 #[test]
@@ -4172,7 +4176,7 @@ fn scheduled_expert_routes_resolve_from_routing_command() {
     assert_eq!(scheduled.layer, 12);
     assert_eq!(scheduled.expert_ids().collect::<Vec<_>>(), vec![7, 3, 9]);
     let expected = [0.25 * 2.0 / 9.0, 0.25 * 6.0 / 9.0, 0.25 * 1.0 / 9.0];
-    for (actual, expected) in scheduled.weights.iter().zip(expected.iter()) {
+    for (actual, expected) in scheduled.weights().iter().zip(expected.iter()) {
         assert!((actual - expected).abs() < 1e-6);
     }
 }
@@ -4198,7 +4202,7 @@ fn active_expert_scheduler_issues_routed_read_set_from_command() {
     assert!(!issued.issues()[1].warm);
     let routes = issued.into_routes();
     let expected = [0.25 * 0.25, 0.25 * 0.75];
-    for (actual, expected) in routes.weights.iter().zip(expected.iter()) {
+    for (actual, expected) in routes.weights().iter().zip(expected.iter()) {
         assert!((actual - expected).abs() < 1e-6);
     }
 
@@ -4239,7 +4243,7 @@ fn scheduled_read_coordinator_streams_routed_slots_in_order() {
         vec![7, 1, 3]
     );
     let expected = [0.54, 0.27, 0.09];
-    for (actual, expected) in scheduled.weights.iter().zip(expected) {
+    for (actual, expected) in scheduled.weights().iter().zip(expected) {
         assert!((actual - expected).abs() <= 1e-6);
     }
     let first = coordinator.snapshot();
@@ -4677,8 +4681,8 @@ fn pending_scheduled_expert_set_owns_read_receivers_and_routes() {
 
     assert_eq!(routes.layer, 5);
     assert_eq!(
-        routes.routes,
-        vec![ExpertRoute {
+        routes.routes(),
+        &[ExpertRoute {
             expert: 9,
             score: 1.25
         }]

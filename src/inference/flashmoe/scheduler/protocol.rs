@@ -879,13 +879,16 @@ impl ScheduledRoutingTopK {
         ScheduledRouterScoreProjectionCommand::new(self, projection, hidden_width)
     }
 
-    pub(crate) fn command_from_routes(&self, routes: Vec<(usize, f32)>) -> ScheduledRoutingCommand {
+    pub(crate) fn command_from_routes(
+        &self,
+        routes: impl Into<InlineRoutePairs>,
+    ) -> ScheduledRoutingCommand {
         ScheduledRoutingCommand {
             routing: *self,
             layer: self.layer,
             active_experts: self.active_experts,
             source: self.source,
-            routes,
+            routes: routes.into(),
         }
     }
 
@@ -948,7 +951,7 @@ impl ScheduledRoutingTopK {
         })
     }
 
-    pub(crate) fn select_from_scores<TScores>(&self, scores: &TScores) -> Result<Vec<(usize, f32)>>
+    pub(crate) fn select_from_scores<TScores>(&self, scores: &TScores) -> Result<InlineRoutePairs>
     where
         TScores: ScheduledRoutingScores,
     {
@@ -1038,10 +1041,7 @@ impl ScheduledRoutingTopK {
         self.select_command_from_scores(scores)
     }
 
-    pub(crate) fn validate_preselected(
-        &self,
-        routes: &[(usize, f32)],
-    ) -> Result<Vec<(usize, f32)>> {
+    pub(crate) fn validate_preselected(&self, routes: &[(usize, f32)]) -> Result<InlineRoutePairs> {
         if self.source != ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK {
             bail!(
                 "FlashMoe scheduled routing source {:?} must submit router scores, not preselected candidates",
@@ -1056,7 +1056,7 @@ impl ScheduledRoutingTopK {
                 active_experts
             );
         }
-        let mut seen = BTreeSet::new();
+        let mut validated = InlineRoutePairs::with_capacity(routes.len());
         for (expert, score) in routes.iter().copied() {
             if expert >= self.experts {
                 bail!(
@@ -1072,11 +1072,12 @@ impl ScheduledRoutingTopK {
                     score
                 );
             }
-            if !seen.insert(expert) {
+            if validated.iter().any(|(selected, _)| *selected == expert) {
                 bail!("FlashMoe scheduled routing selected expert {expert} more than once");
             }
+            validated.push((expert, score));
         }
-        Ok(routes.to_vec())
+        Ok(validated)
     }
 
     pub(crate) fn command_from_preselected(
@@ -1122,7 +1123,7 @@ pub(crate) struct ScheduledRoutingCommand {
     pub(crate) layer: usize,
     pub(crate) active_experts: usize,
     pub(crate) source: ScheduledRoutingCandidateSource,
-    pub(crate) routes: Vec<(usize, f32)>,
+    pub(crate) routes: InlineRoutePairs,
 }
 
 impl ScheduledRoutingCommand {
@@ -1156,8 +1157,7 @@ impl ScheduledRoutingCommand {
                 self.active_experts
             );
         }
-        let mut seen = BTreeSet::new();
-        for (expert, score) in self.routes.iter().copied() {
+        for (index, (expert, score)) in self.routes.iter().copied().enumerate() {
             if expert >= self.routing.experts {
                 bail!(
                     "FlashMoe scheduled routing command selected expert {} outside expert count {}",
@@ -1165,7 +1165,10 @@ impl ScheduledRoutingCommand {
                     self.routing.experts
                 );
             }
-            if !seen.insert(expert) {
+            if self.routes[..index]
+                .iter()
+                .any(|(selected, _)| *selected == expert)
+            {
                 bail!("FlashMoe scheduled routing command selected expert {expert} more than once");
             }
             if !score.is_finite() {
@@ -1799,7 +1802,7 @@ where
                 scheduled.len()
             );
         }
-        for (route, expert) in scheduled.routes.iter().zip(scheduled.experts.iter()) {
+        for (route, expert) in scheduled.routes().iter().zip(scheduled.experts.iter()) {
             let expert_layer = expert.scheduled_expert_layer();
             let expert_id = expert.scheduled_expert_id();
             if expert_layer != scheduled.layer || expert_id != route.expert {
@@ -2068,7 +2071,7 @@ where
             position: self.position,
             layer: self.scheduled.layer,
             experts: self.scheduled.experts.clone(),
-            weights: &self.scheduled.weights,
+            weights: self.scheduled.weights(),
             input: self.input,
             input_state: self.input_state,
             shared: self.shared,

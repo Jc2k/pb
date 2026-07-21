@@ -52,6 +52,23 @@ architectural completion.
   state through the unified path. Do not restore the old architecture to hide the error.
 - Synchronous Metal completion retains the bounded timeout and terminal-status diagnostics while
   polling finely enough that host-side wait granularity does not become a per-layer decode stage.
+- Retained Metal devices, queues, pipeline states, and dense mmap buffers are owned by typed RAII
+  handles. Objective-C identifiers passed to encoding helpers are borrowed views; partial graph
+  compilation and later initialization failures release every successfully created object.
+- Rust-to-Metal argument blocks implement a no-uninitialized-bytes contract. Explicit zeroed ABI
+  padding and compile-time size assertions preserve the shader layout without exposing Rust padding
+  through `setBytes`.
+- A pending parallel whole-layer `pread` owns the mutable lifetime of its destination until finish
+  or drop joins every worker. Safe scheduler callers cannot access or release request staging while
+  a worker may still write it.
+- Resident dense dtypes are parsed into a closed enum during graph resolution. Validation and Metal
+  dispatch use exhaustive typed matches rather than reparsing strings in the execution path.
+- Per-token selected routes and their normalized weights use one validated inline collection with
+  capacity for the shipped K=4/6/8/10 profiles. Route/weight cardinality cannot diverge, duplicate
+  checks do not allocate a tree, and larger future K values retain the same API by spilling to the
+  collection's heap representation.
+- Resident projection validation is statically dispatched over borrowed dense, affine-Q4, or enum
+  descriptors. Callers do not clone projection metadata merely to select a validation branch.
 
 ## Upstream Parity Contract
 

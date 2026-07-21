@@ -4,7 +4,11 @@ use std::collections::{BTreeMap, HashMap};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ffi::{CStr, CString, c_char, c_void};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::marker::PhantomData;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::ptr;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::ptr::NonNull;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::{Arc, Mutex};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -55,7 +59,7 @@ use super::experts::{
     expert_scale_bias_dtype_size,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::math::{routing_sigmoid_noaux_top_k, routing_softmax_top_k};
+use super::math::{InlineRoutePairs, routing_sigmoid_noaux_top_k, routing_softmax_top_k};
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::ScheduledQ4ExpertPhaseMlpPayload;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -388,19 +392,31 @@ impl MetalLinearAttentionLayerState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct MetalDenseWeights {
-    pub(crate) buffer: MetalObjcId,
+    buffer: RetainedMetalObject<MetalBuffer>,
     _mmap: Arc<memmap2::Mmap>,
     pub(crate) len: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MetalDenseWeights {
-    pub(crate) fn new(buffer: MetalObjcId, mmap: Arc<memmap2::Mmap>, len: usize) -> Self {
-        Self {
-            buffer,
+    /// # Safety
+    ///
+    /// `buffer` must be a valid +1 retained Metal buffer whose no-copy bytes
+    /// are backed by `mmap`. This value releases the buffer before the mmap.
+    pub(crate) unsafe fn new(
+        buffer: MetalObjcId,
+        mmap: Arc<memmap2::Mmap>,
+        len: usize,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            buffer: unsafe { RetainedMetalObject::new(buffer)? },
             _mmap: mmap,
             len,
-        }
+        })
+    }
+
+    pub(crate) fn buffer(&self) -> MetalObjcId {
+        self.buffer.id()
     }
 }
 
@@ -820,10 +836,13 @@ impl MetalPipelineNameSet {
 
 #[derive(Debug)]
 pub(crate) struct MetalPipelineSet<T> {
+    #[allow(dead_code)]
     pub(crate) q4_pipeline: T,
     pub(crate) q4_bf16_scale_bias_pipeline: T,
     pub(crate) mxfp4_e8m0_pipeline: T,
+    #[allow(dead_code)]
     pub(crate) q4_swiglu_pipeline: T,
+    #[allow(dead_code)]
     pub(crate) q4_swiglu_bf16_scale_bias_pipeline: T,
     pub(crate) q4_mmap_pipeline: T,
     pub(crate) q4_mmap_bf16_scale_bias_pipeline: T,
@@ -842,14 +861,17 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) dense_matrix_f32_pipeline: T,
     pub(crate) rms_norm_reduced_pipeline: T,
     pub(crate) residual_rms_norm_pipeline: T,
+    #[allow(dead_code)]
     pub(crate) attention_pipeline: T,
     pub(crate) qwen_prepare_qkv_rows_pipeline: T,
     pub(crate) qwen_causal_attention_rows_pipeline: T,
     pub(crate) qwen_apply_attention_gate_pipeline: T,
     pub(crate) qwen_final_rms_norm_row_pipeline: T,
+    #[allow(dead_code)]
     pub(crate) expert_mlp_pipeline: T,
     pub(crate) silu_product_pipeline: T,
     pub(crate) shared_expert_activation_pipeline: T,
+    #[allow(dead_code)]
     pub(crate) combine_expert_phase_pipeline: T,
     pub(crate) qwen_layer_major_gather_pipeline: T,
     pub(crate) qwen_layer_major_combine_pipeline: T,
@@ -868,6 +890,7 @@ pub(crate) struct MetalPipelineSet<T> {
     pub(crate) linear_gated_rms_norm_f32_pipeline: T,
 }
 
+#[cfg(test)]
 impl<T: Copy> MetalPipelineSet<T> {
     pub(crate) fn release_with(&self, mut release: impl FnMut(T)) {
         release(self.q4_pipeline);
@@ -921,32 +944,75 @@ impl<T: Copy> MetalPipelineSet<T> {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
-struct OwnedMetalObject(MetalObjcId);
+struct MetalObject;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl OwnedMetalObject {
-    fn new(id: MetalObjcId) -> anyhow::Result<Self> {
-        if id.is_null() {
-            anyhow::bail!("failed to create required Flash-MoE Metal object");
-        }
-        Ok(Self(id))
+#[derive(Debug)]
+struct MetalDevice;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalCommandQueue;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalPipelineState;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct MetalBuffer;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(transparent)]
+#[derive(Debug)]
+struct RetainedMetalObject<K> {
+    id: NonNull<c_void>,
+    _kind: PhantomData<K>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type OwnedMetalObject = RetainedMetalObject<MetalObject>;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<K> RetainedMetalObject<K> {
+    /// # Safety
+    ///
+    /// `id` must be either null or a valid +1 retained Objective-C object.
+    /// A successful value transfers that retain and sends `release` on drop.
+    unsafe fn new(id: MetalObjcId) -> anyhow::Result<Self> {
+        let id = NonNull::new(id)
+            .ok_or_else(|| anyhow::anyhow!("failed to create required Flash-MoE Metal object"))?;
+        Ok(Self {
+            id,
+            _kind: PhantomData,
+        })
     }
 
     fn id(&self) -> MetalObjcId {
-        self.0
+        self.id.as_ptr()
     }
 
-    fn into_raw(mut self) -> MetalObjcId {
-        let id = self.0;
-        self.0 = ptr::null_mut();
-        id
+    #[cfg(test)]
+    fn into_raw(self) -> MetalObjcId {
+        let object = std::mem::ManuallyDrop::new(self);
+        object.id()
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for OwnedMetalObject {
+fn keep_retained<K>(
+    object: RetainedMetalObject<K>,
+    owners: &mut Vec<RetainedMetalObject<K>>,
+) -> MetalObjcId {
+    let id = object.id();
+    owners.push(object);
+    id
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<K> Drop for RetainedMetalObject<K> {
     fn drop(&mut self) {
-        unsafe { release(self.0) }
+        unsafe { release(self.id()) }
     }
 }
 
@@ -1067,6 +1133,9 @@ pub(crate) struct MetalRuntime {
     pub(crate) device: MetalObjcId,
     pub(crate) command_queue: MetalObjcId,
     pub(crate) pipelines: MetalPipelineSet<MetalObjcId>,
+    _pipeline_states: Vec<RetainedMetalObject<MetalPipelineState>>,
+    _command_queue: RetainedMetalObject<MetalCommandQueue>,
+    _device: RetainedMetalObject<MetalDevice>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1076,7 +1145,8 @@ impl MetalRuntime {
         names: MetalPipelineNameSet,
     ) -> anyhow::Result<Self> {
         unsafe {
-            let device = OwnedMetalObject::new(metal_default_device()).map_err(|_| {
+            let device = RetainedMetalObject::<MetalDevice>::new(metal_default_device())
+                .map_err(|_| {
                 anyhow::anyhow!(
                     "Metal is required for Flash-MoE on ARM macOS, but no default Metal device is available"
                 )
@@ -1113,32 +1183,40 @@ impl MetalRuntime {
                 anyhow::bail!("failed to compile precise Qwen Metal shader library: {error}");
             }
             let precise_library = OwnedMetalObject::new(precise_library_id)?;
-            let precise_qwen_prepare = OwnedMetalObject::new(compile_pipeline(
-                device.id(),
-                precise_library.id(),
-                names.qwen_prepare_qkv_rows,
-            )?)?;
-            let precise_qwen_attention_gate = OwnedMetalObject::new(compile_pipeline(
-                device.id(),
-                precise_library.id(),
-                names.qwen_apply_attention_gate,
-            )?)?;
-            let precise_qwen_final_norm = OwnedMetalObject::new(compile_pipeline(
-                device.id(),
-                precise_library.id(),
-                names.qwen_final_rms_norm_row,
-            )?)?;
+            let precise_qwen_prepare =
+                RetainedMetalObject::<MetalPipelineState>::new(compile_pipeline(
+                    device.id(),
+                    precise_library.id(),
+                    names.qwen_prepare_qkv_rows,
+                )?)?;
+            let precise_qwen_attention_gate =
+                RetainedMetalObject::<MetalPipelineState>::new(compile_pipeline(
+                    device.id(),
+                    precise_library.id(),
+                    names.qwen_apply_attention_gate,
+                )?)?;
+            let precise_qwen_final_norm =
+                RetainedMetalObject::<MetalPipelineState>::new(compile_pipeline(
+                    device.id(),
+                    precise_library.id(),
+                    names.qwen_final_rms_norm_row,
+                )?)?;
             let mut compiled = BTreeMap::new();
             for name in names.kernel_names() {
                 compiled.insert(
                     name,
-                    OwnedMetalObject::new(compile_pipeline(device.id(), library.id(), name)?)?,
+                    RetainedMetalObject::<MetalPipelineState>::new(compile_pipeline(
+                        device.id(),
+                        library.id(),
+                        name,
+                    )?)?,
                 );
             }
-            let command_queue =
-                OwnedMetalObject::new(msg_send_id0(device.id(), sel("newCommandQueue"))).map_err(
-                    |_| anyhow::anyhow!("failed to create Flash-MoE Metal command queue"),
-                )?;
+            let command_queue = RetainedMetalObject::<MetalCommandQueue>::new(msg_send_id0(
+                device.id(),
+                sel("newCommandQueue"),
+            ))
+            .map_err(|_| anyhow::anyhow!("failed to create Flash-MoE Metal command queue"))?;
             compiled
                 .remove(names.qwen_prepare_qkv_rows)
                 .expect("compiled fast Qwen QKV preparation pipeline disappeared");
@@ -1148,14 +1226,17 @@ impl MetalRuntime {
             compiled
                 .remove(names.qwen_final_rms_norm_row)
                 .expect("compiled fast Qwen final-norm pipeline disappeared");
-            let precise_qwen_prepare = precise_qwen_prepare.into_raw();
-            let precise_qwen_attention_gate = precise_qwen_attention_gate.into_raw();
-            let precise_qwen_final_norm = precise_qwen_final_norm.into_raw();
+            let mut pipeline_states = Vec::with_capacity(names.kernel_names().len());
+            let precise_qwen_prepare = keep_retained(precise_qwen_prepare, &mut pipeline_states);
+            let precise_qwen_attention_gate =
+                keep_retained(precise_qwen_attention_gate, &mut pipeline_states);
+            let precise_qwen_final_norm =
+                keep_retained(precise_qwen_final_norm, &mut pipeline_states);
             let mut take_pipeline = |name: &'static str| -> MetalObjcId {
-                compiled
+                let pipeline = compiled
                     .remove(name)
-                    .expect("compiled Metal pipeline name disappeared")
-                    .into_raw()
+                    .expect("compiled Metal pipeline name disappeared");
+                keep_retained(pipeline, &mut pipeline_states)
             };
             let pipelines = MetalPipelineSet {
                 q4_pipeline: take_pipeline(names.q4),
@@ -1214,22 +1295,16 @@ impl MetalRuntime {
                 linear_gated_rms_norm_f32_pipeline: take_pipeline(names.linear_gated_rms_norm_f32),
             };
             debug_assert!(compiled.is_empty());
+            let device_id = device.id();
+            let command_queue_id = command_queue.id();
             Ok(Self {
-                device: device.into_raw(),
-                command_queue: command_queue.into_raw(),
+                device: device_id,
+                command_queue: command_queue_id,
                 pipelines,
+                _pipeline_states: pipeline_states,
+                _command_queue: command_queue,
+                _device: device,
             })
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for MetalRuntime {
-    fn drop(&mut self) {
-        unsafe {
-            self.pipelines.release_with(|pipeline| release(pipeline));
-            release(self.command_queue);
-            release(self.device);
         }
     }
 }
@@ -1238,6 +1313,7 @@ impl Drop for MetalRuntime {
 #[derive(Debug)]
 pub(crate) struct DeepSeekMetalPipelineSet {
     pipelines: BTreeMap<&'static str, MetalObjcId>,
+    _pipeline_states: Vec<RetainedMetalObject<MetalPipelineState>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1273,6 +1349,8 @@ impl DeepSeekMetalPipelineSet {
             }
             let library = OwnedMetalObject::new(library_id)?;
             let mut pipelines = BTreeMap::new();
+            let mut pipeline_states =
+                Vec::with_capacity(DEEPSEEK_V4_REQUIRED_METAL_KERNELS.len() + 1);
             for &name in DEEPSEEK_V4_REQUIRED_METAL_KERNELS {
                 let constants: &[(u64, u64, &[u8])] = match name {
                     "kernel_mul_mv_q8_0_f32"
@@ -1309,12 +1387,13 @@ impl DeepSeekMetalPipelineSet {
                     ],
                     _ => &[],
                 };
-                let pipeline = OwnedMetalObject::new(if constants.is_empty() {
-                    compile_pipeline(device, library.id(), name)?
-                } else {
-                    compile_pipeline_with_constants(device, library.id(), name, constants)?
-                })?;
-                pipelines.insert(name, pipeline.into_raw());
+                let pipeline =
+                    RetainedMetalObject::<MetalPipelineState>::new(if constants.is_empty() {
+                        compile_pipeline(device, library.id(), name)?
+                    } else {
+                        compile_pipeline_with_constants(device, library.id(), name, constants)?
+                    })?;
+                pipelines.insert(name, keep_retained(pipeline, &mut pipeline_states));
             }
             let no_pad_constants: &[(u64, u64, &[u8])] = &[
                 (300, 53, &[1]),
@@ -1327,17 +1406,21 @@ impl DeepSeekMetalPipelineSet {
                 (321, 29, &512i32.to_ne_bytes()),
                 (322, 29, &8i32.to_ne_bytes()),
             ];
-            let no_pad = OwnedMetalObject::new(compile_pipeline_with_constants(
-                device,
-                library.id(),
-                "kernel_flash_attn_ext_f16_dk512_dv512",
-                no_pad_constants,
-            )?)?;
+            let no_pad =
+                RetainedMetalObject::<MetalPipelineState>::new(compile_pipeline_with_constants(
+                    device,
+                    library.id(),
+                    "kernel_flash_attn_ext_f16_dk512_dv512",
+                    no_pad_constants,
+                )?)?;
             pipelines.insert(
                 "kernel_flash_attn_ext_f16_dk512_dv512_nopad",
-                no_pad.into_raw(),
+                keep_retained(no_pad, &mut pipeline_states),
             );
-            Ok(Self { pipelines })
+            Ok(Self {
+                pipelines,
+                _pipeline_states: pipeline_states,
+            })
         }
     }
 
@@ -1349,20 +1432,8 @@ impl DeepSeekMetalPipelineSet {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for DeepSeekMetalPipelineSet {
-    fn drop(&mut self) {
-        unsafe {
-            for pipeline in self.pipelines.values().copied() {
-                release(pipeline);
-            }
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct MetalExecutionContext {
-    runtime: MetalRuntime,
     deepseek_pipelines: Option<DeepSeekMetalPipelineSet>,
     dense_weights: Option<MetalDenseWeights>,
     linear_attention_state: Mutex<MetalLinearAttentionStateCache>,
@@ -1370,6 +1441,8 @@ pub(crate) struct MetalExecutionContext {
     buffers: Arc<MetalBufferPool>,
     resources: Arc<MetalResourceLedger>,
     norm_epsilon: f32,
+    // Device-backed fields above must drop before their runtime and device.
+    runtime: MetalRuntime,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1388,9 +1461,6 @@ unsafe impl Sync for MetalExecutionContext {}
 impl Drop for MetalExecutionContext {
     fn drop(&mut self) {
         unsafe {
-            if let Some(dense_weights) = self.dense_weights.take() {
-                release(dense_weights.buffer);
-            }
             if let Ok(linear_state) = self.linear_attention_state.get_mut() {
                 release_linear_attention_state(linear_state);
             }
@@ -4213,7 +4283,7 @@ impl<'a> MetalScheduledCmd3Builder<'a> {
                     }
                     self.encode_layer_major_q4_matrix_from_buffer(
                         encoder,
-                        self.dense_weights.buffer,
+                        self.dense_weights.buffer(),
                         projection.packed_byte_offset,
                         projection.scales_byte_offset,
                         projection.biases_byte_offset,

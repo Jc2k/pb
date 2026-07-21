@@ -53,17 +53,18 @@ struct PendingDeepSeekResidentLayerPrepare {
 }
 
 #[derive(Debug)]
-struct PendingDeepSeekLayerPrepare {
-    expert: PendingScheduledExpertLayerPrepare,
+struct PendingDeepSeekLayerPrepare<'a> {
+    expert: PendingScheduledExpertLayerPrepare<'a>,
     resident: PendingDeepSeekResidentLayerPrepare,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct MatvecArgs {
     ne00: i32,
     ne01: i32,
     ne02: i32,
+    _pad0: u32,
     nb00: u64,
     nb01: u64,
     nb02: u64,
@@ -71,6 +72,7 @@ struct MatvecArgs {
     ne10: i32,
     ne11: i32,
     ne12: i32,
+    _pad1: u32,
     nb10: u64,
     nb11: u64,
     nb12: u64,
@@ -99,6 +101,7 @@ impl MatvecArgs {
             ne00: i32::try_from(input)?,
             ne01: i32::try_from(output)?,
             ne02: 1,
+            _pad0: 0,
             nb00: block_bytes as u64,
             nb01: row_bytes as u64,
             nb02: (row_bytes * output) as u64,
@@ -106,6 +109,7 @@ impl MatvecArgs {
             ne10: i32::try_from(input)?,
             ne11: 1,
             ne12: 1,
+            _pad1: 0,
             nb10: size_of::<f32>() as u64,
             nb11: (input * size_of::<f32>()) as u64,
             nb12: (input * size_of::<f32>()) as u64,
@@ -120,7 +124,7 @@ impl MatvecArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct MulMmArgs {
     ne00: i32,
     ne02: i32,
@@ -128,6 +132,7 @@ struct MulMmArgs {
     nb02: u64,
     nb03: u64,
     ne12: i32,
+    _pad0: u32,
     nb10: u64,
     nb11: u64,
     nb12: u64,
@@ -136,6 +141,7 @@ struct MulMmArgs {
     ne1: i32,
     r2: i16,
     r3: i16,
+    _pad1: u32,
 }
 
 impl MulMmArgs {
@@ -155,6 +161,7 @@ impl MulMmArgs {
                     .context("batch weight size overflow")?,
             )?,
             ne12: 1,
+            _pad0: 0,
             nb10: size_of::<f32>() as u64,
             nb11: (input * size_of::<f32>()) as u64,
             nb12: (input * tokens * size_of::<f32>()) as u64,
@@ -163,12 +170,13 @@ impl MulMmArgs {
             ne1: i32::try_from(tokens)?,
             r2: 1,
             r3: 1,
+            _pad1: 0,
         })
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct EmbeddingBatchArgs {
     tokens: u32,
     hidden: u32,
@@ -176,20 +184,20 @@ struct EmbeddingBatchArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct CopyArgs {
     elements: u32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct SwigluBatchArgs {
     elements: u32,
     clamp: f32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct RawStoreBatchArgs {
     tokens: u32,
     raw_cap: u32,
@@ -198,7 +206,7 @@ struct RawStoreBatchArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct RawContextBatchArgs {
     tokens: u32,
     prefix_raw: u32,
@@ -208,7 +216,7 @@ struct RawContextBatchArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct GroupCopyArgs {
     tokens: u32,
     groups: u32,
@@ -218,7 +226,7 @@ struct GroupCopyArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct CompressorPrefillArgs {
     tokens: u32,
     width: u32,
@@ -228,7 +236,7 @@ struct CompressorPrefillArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct AttentionMaskArgs {
     tokens: u32,
     raw_rows: u32,
@@ -239,11 +247,12 @@ struct AttentionMaskArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct FlashAttentionPadArgs {
     ne11: i32,
     ne_12_2: i32,
     ne_12_3: i32,
+    _pad0: u32,
     nb11: u64,
     nb12: u64,
     nb13: u64,
@@ -253,30 +262,33 @@ struct FlashAttentionPadArgs {
     ne31: i32,
     ne32: i32,
     ne33: i32,
+    _pad1: u32,
     nb31: u64,
     nb32: u64,
     nb33: u64,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct FlashAttentionBlockArgs {
     ne01: i32,
     ne30: i32,
     ne31: i32,
     ne32: i32,
     ne33: i32,
+    _pad0: u32,
     nb31: u64,
     nb32: u64,
     nb33: u64,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct FlashAttentionArgs {
     ne01: i32,
     ne02: i32,
     ne03: i32,
+    _pad0: u32,
     nb01: u64,
     nb02: u64,
     nb03: u64,
@@ -288,12 +300,14 @@ struct FlashAttentionArgs {
     nb12: u64,
     nb13: u64,
     ns20: i32,
+    _pad1: u32,
     nb21: u64,
     nb22: u64,
     nb23: u64,
     ne31: i32,
     ne32: i32,
     ne33: i32,
+    _pad2: u32,
     nb31: u64,
     nb32: u64,
     nb33: u64,
@@ -306,10 +320,11 @@ struct FlashAttentionArgs {
     m1: f32,
     n_head_log2: i32,
     logit_softcap: f32,
+    _pad3: u32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct TopkMaskArgs {
     ne00: i64,
     ne01: i64,
@@ -322,11 +337,12 @@ struct TopkMaskArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct MoeMapArgs {
     ne02: i32,
     ne10: i32,
     ne11: i32,
+    _pad0: u32,
     nb11: u64,
     nb12: u64,
     ne21: i32,
@@ -335,7 +351,7 @@ struct MoeMapArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct MoeBatchMmArgs {
     ne00: i32,
     ne02: i32,
@@ -343,6 +359,7 @@ struct MoeBatchMmArgs {
     nb02: u64,
     nb03: u64,
     ne11: i32,
+    _pad0: u32,
     nb10: u64,
     nb11: u64,
     nb12: u64,
@@ -353,6 +370,7 @@ struct MoeBatchMmArgs {
     ne1: i32,
     r2: i16,
     r3: i16,
+    _pad1: u32,
 }
 
 impl MoeBatchMmArgs {
@@ -378,6 +396,7 @@ impl MoeBatchMmArgs {
             nb02: expert_bytes as u64,
             nb03: (total_experts * expert_bytes) as u64,
             ne11: i32::try_from(input_rows)?,
+            _pad0: 0,
             nb10: input_element_bytes as u64,
             nb11: rhs_row_bytes as u64,
             nb12: (input_rows * rhs_row_bytes) as u64,
@@ -388,12 +407,13 @@ impl MoeBatchMmArgs {
             ne1: i32::try_from(selected)?,
             r2: 1,
             r3: 1,
+            _pad1: 0,
         })
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct MoeSum6Args {
     width: u32,
     tokens: u32,
@@ -402,7 +422,7 @@ struct MoeSum6Args {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct HcSplitNormArgs {
     n_embd: i64,
     n_hc: i32,
@@ -448,7 +468,7 @@ impl HcSplitNormArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct HcExpandArgs {
     n_embd: i64,
     n_hc: i64,
@@ -469,6 +489,7 @@ struct HcExpandArgs {
     nb1: u64,
     nb2: u64,
     has_add: i32,
+    _pad0: u32,
 }
 
 impl HcExpandArgs {
@@ -497,12 +518,13 @@ impl HcExpandArgs {
             nb1: (HIDDEN * size_of::<f32>()) as u64,
             nb2: (HC_WIDTH * size_of::<f32>()) as u64,
             has_add: 0,
+            _pad0: 0,
         }
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct RmsArgs {
     width: u32,
     rows: u32,
@@ -511,7 +533,7 @@ struct RmsArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct EmbeddingArgs {
     token: u32,
     hidden: u32,
@@ -519,7 +541,7 @@ struct EmbeddingArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct CompressorArgs {
     width: u32,
     head_dim: u32,
@@ -529,7 +551,7 @@ struct CompressorArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct AttentionArgs {
     n_head: u32,
     head_dim: u32,
@@ -546,7 +568,7 @@ struct AttentionArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct IndexedAttentionArgs {
     n_tokens: u32,
     n_head: u32,
@@ -568,10 +590,11 @@ struct IndexedAttentionArgs {
     dst_token_stride: u64,
     dst_head_stride: u64,
     scale: f32,
+    _pad1: u32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct OutputCollapseArgs {
     hidden: u32,
     eps: f32,
@@ -579,7 +602,7 @@ struct OutputCollapseArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct KvStoreArgs {
     head_dim: i32,
     n_rot: i32,
@@ -587,7 +610,7 @@ struct KvStoreArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct Fp8Args {
     ne00: i64,
     ne01: i64,
@@ -602,10 +625,11 @@ struct Fp8Args {
     nb2: u64,
     nb3: u64,
     n_rot: i32,
+    _pad0: u32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct RopeArgs {
     ne00: i64,
     ne01: i64,
@@ -630,6 +654,7 @@ struct RopeArgs {
     beta_fast: f32,
     beta_slow: f32,
     src2: bool,
+    _pad0: [u8; 7],
 }
 
 impl RopeArgs {
@@ -675,12 +700,13 @@ impl RopeArgs {
             beta_fast: 32.0,
             beta_slow: 1.0,
             src2: false,
+            _pad0: [0; 7],
         })
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct IndexQatArgs {
     n_rows: u32,
     head_dim: u32,
@@ -688,7 +714,7 @@ struct IndexQatArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct IndexScoresArgs {
     n_comp: u32,
     n_tokens: u32,
@@ -702,10 +728,11 @@ struct IndexScoresArgs {
     index_row_stride: u64,
     score_token_stride: u64,
     scale: f32,
+    _pad0: u32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct ArgsortArgs {
     ne00: i32,
     ne01: i32,
@@ -720,10 +747,11 @@ struct ArgsortArgs {
     ne2: i32,
     ne3: i32,
     top_k: i32,
+    _pad0: u32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct ArgsortMergeArgs {
     ne00: i64,
     ne01: i64,
@@ -742,7 +770,7 @@ struct ArgsortMergeArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct MoeMatvecArgs {
     nei0: i32,
     nei1: i32,
@@ -750,6 +778,7 @@ struct MoeMatvecArgs {
     ne00: i32,
     ne01: i32,
     ne02: i32,
+    _pad0: u32,
     nb00: u64,
     nb01: u64,
     nb02: u64,
@@ -764,6 +793,7 @@ struct MoeMatvecArgs {
     ne1: i32,
     nb1: u64,
     nr0: i32,
+    _pad1: u32,
 }
 
 impl MoeMatvecArgs {
@@ -789,6 +819,7 @@ impl MoeMatvecArgs {
             ne00: i32::try_from(cols)?,
             ne01: i32::try_from(rows)?,
             ne02: i32::try_from(total_experts)?,
+            _pad0: 0,
             nb00: (row_bytes / blocks) as u64,
             nb01: row_bytes as u64,
             nb02: expert_bytes as u64,
@@ -803,12 +834,13 @@ impl MoeMatvecArgs {
             ne1: ACTIVE_EXPERTS as i32,
             nb1: (rows * size_of::<f32>()) as u64,
             nr0: i32::try_from(nr0)?,
+            _pad1: 0,
         })
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 struct MoeActivationArgs {
     width: u32,
     rows: u32,
@@ -819,6 +851,26 @@ struct MoeActivationArgs {
     write_clamped: u32,
     clamp_value: f32,
 }
+
+// These sizes are the matching Metal Shading Language constant-argument ABI.
+// `NoUninit` proves every uploaded byte is initialized; the assertions pin the
+// host layout so field or padding changes cannot silently shift shader inputs.
+const _: () = {
+    assert!(size_of::<MatvecArgs>() == 112);
+    assert!(size_of::<MulMmArgs>() == 88);
+    assert!(size_of::<FlashAttentionPadArgs>() == 104);
+    assert!(size_of::<FlashAttentionBlockArgs>() == 48);
+    assert!(size_of::<FlashAttentionArgs>() == 192);
+    assert!(size_of::<MoeMapArgs>() == 48);
+    assert!(size_of::<MoeBatchMmArgs>() == 96);
+    assert!(size_of::<HcExpandArgs>() == 152);
+    assert!(size_of::<IndexedAttentionArgs>() == 112);
+    assert!(size_of::<Fp8Args>() == 104);
+    assert!(size_of::<RopeArgs>() == 144);
+    assert!(size_of::<IndexScoresArgs>() == 72);
+    assert!(size_of::<ArgsortArgs>() == 72);
+    assert!(size_of::<MoeMatvecArgs>() == 120);
+};
 
 #[derive(Debug)]
 struct DeepSeekLayerState {
@@ -1177,7 +1229,7 @@ unsafe fn encode_matvec(
     unsafe {
         set_pipeline(encoder, pipelines.require(kernel)?);
         set_bytes(encoder, bytes_of(&args), 0);
-        set_buffer_with_offset(encoder, dense.buffer, weight_offset as u64, 1);
+        set_buffer_with_offset(encoder, dense.buffer(), weight_offset as u64, 1);
         set_buffer_with_offset(encoder, input, input_offset as u64, 2);
         set_buffer_with_offset(encoder, output, output_offset as u64, 3);
         set_threadgroup_memory(encoder, 256, 0);
@@ -1255,7 +1307,7 @@ unsafe fn encode_batch_matmul(
     unsafe {
         set_pipeline(encoder, pipelines.require(kernel)?);
         set_bytes(encoder, bytes_of(&args), 0);
-        set_buffer_with_offset(encoder, dense.buffer, weight_offset as u64, 1);
+        set_buffer_with_offset(encoder, dense.buffer(), weight_offset as u64, 1);
         set_buffer_with_offset(encoder, input, input_offset as u64, 2);
         set_buffer_with_offset(encoder, output, output_offset as u64, 3);
         set_threadgroup_memory(encoder, 8192, 0);
@@ -1292,7 +1344,7 @@ unsafe fn encode_rms(
         set_bytes(encoder, bytes_of(&args), 0);
         set_buffer_with_offset(encoder, input, input_offset as u64, 1);
         if let Some(weight) = weight {
-            set_buffer_with_offset(encoder, dense.buffer, weight.byte_offset, 2);
+            set_buffer_with_offset(encoder, dense.buffer(), weight.byte_offset, 2);
         } else {
             set_buffer(encoder, input, 2);
         }
@@ -1389,12 +1441,12 @@ unsafe fn encode_hc_pre(
         );
         set_bytes(encoder, bytes_of(&HcSplitNormArgs::one()), 0);
         set_buffer(encoder, state.hc_mix, 1);
-        set_buffer_with_offset(encoder, dense.buffer, scale.byte_offset, 2);
-        set_buffer_with_offset(encoder, dense.buffer, base.byte_offset, 3);
+        set_buffer_with_offset(encoder, dense.buffer(), scale.byte_offset, 2);
+        set_buffer_with_offset(encoder, dense.buffer(), base.byte_offset, 3);
         set_buffer(encoder, input_hc, 4);
         set_buffer(encoder, state.hc_split, 5);
         set_buffer(encoder, current, 6);
-        set_buffer_with_offset(encoder, dense.buffer, norm.byte_offset, 7);
+        set_buffer_with_offset(encoder, dense.buffer(), norm.byte_offset, 7);
         set_buffer(encoder, normalized, 8);
         set_threadgroup_memory(encoder, (HIDDEN + 4 + 32) * size_of::<f32>(), 0);
         dispatch_groups(encoder, (1, 1, 1), (1024, 1, 1));
@@ -1464,12 +1516,12 @@ unsafe fn encode_batch_hc_pre(
         );
         set_bytes(encoder, bytes_of(&HcSplitNormArgs::batch(batch.tokens)), 0);
         set_buffer(encoder, batch.hc_mix, 1);
-        set_buffer_with_offset(encoder, dense.buffer, scale.byte_offset, 2);
-        set_buffer_with_offset(encoder, dense.buffer, base.byte_offset, 3);
+        set_buffer_with_offset(encoder, dense.buffer(), scale.byte_offset, 2);
+        set_buffer_with_offset(encoder, dense.buffer(), base.byte_offset, 3);
         set_buffer(encoder, input_hc, 4);
         set_buffer(encoder, batch.hc_split, 5);
         set_buffer(encoder, current, 6);
-        set_buffer_with_offset(encoder, dense.buffer, norm.byte_offset, 7);
+        set_buffer_with_offset(encoder, dense.buffer(), norm.byte_offset, 7);
         set_buffer(encoder, normalized, 8);
         set_threadgroup_memory(encoder, (HIDDEN + 4 + 32) * size_of::<f32>(), 0);
         dispatch_groups(encoder, (batch.tokens as u64, 1, 1), (1024, 1, 1));
@@ -1528,6 +1580,7 @@ unsafe fn encode_fp8_row(
         nb2: (width * size_of::<f32>()) as u64,
         nb3: (width * size_of::<f32>()) as u64,
         n_rot: 64,
+        _pad0: 0,
     };
     unsafe {
         set_pipeline(
@@ -1568,6 +1621,7 @@ unsafe fn encode_fp8_rows(
         nb2: (row_bytes * rows) as u64,
         nb3: (row_bytes * rows) as u64,
         n_rot: 64,
+        _pad0: 0,
     };
     unsafe {
         set_pipeline(
@@ -1645,7 +1699,7 @@ unsafe fn encode_compressor(
         set_bytes(encoder, bytes_of(&args), 0);
         set_buffer(encoder, scratch.comp_kv, 1);
         set_buffer(encoder, scratch.comp_score, 2);
-        set_buffer_with_offset(encoder, dense.buffer, ape.byte_offset, 3);
+        set_buffer_with_offset(encoder, dense.buffer(), ape.byte_offset, 3);
         set_buffer(encoder, state_kv, 4);
         set_buffer(encoder, state_score, 5);
         set_buffer(encoder, cache, 6);
@@ -1771,7 +1825,7 @@ unsafe fn encode_batch_compressor(
         set_bytes(encoder, bytes_of(&args), 0);
         set_buffer(encoder, projected_kv, 1);
         set_buffer(encoder, projected_score, 2);
-        set_buffer_with_offset(encoder, dense.buffer, ape.byte_offset, 3);
+        set_buffer_with_offset(encoder, dense.buffer(), ape.byte_offset, 3);
         set_buffer(encoder, state_kv, 4);
         set_buffer(encoder, state_score, 5);
         set_buffer(encoder, cache, 6);
@@ -1900,6 +1954,7 @@ unsafe fn encode_index_topk(
         ne2: 1,
         ne3: 1,
         top_k: i32::try_from(block_top)?,
+        _pad0: 0,
     };
     let scratch_row_bytes = work_width * size_of::<i32>();
     let mut current_offset = 0usize;
@@ -2002,6 +2057,7 @@ unsafe fn encode_batch_index_topk(
         ne2: 1,
         ne3: 1,
         top_k: i32::try_from(block_top)?,
+        _pad0: 0,
     };
     let scratch_plane_bytes = work_width
         .checked_mul(batch.tokens)
@@ -2134,6 +2190,7 @@ unsafe fn encode_batch_indexed_attention(
         dst_token_stride: (Q_WIDTH * size_of::<f32>()) as u64,
         dst_head_stride: (HEAD_DIM * size_of::<f32>()) as u64,
         scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+        _pad1: 0,
     };
     unsafe {
         set_pipeline(
@@ -2153,7 +2210,7 @@ unsafe fn encode_batch_indexed_attention(
         );
         set_buffer(encoder, comp, 3);
         set_buffer(encoder, batch.index_sorted, 4);
-        set_buffer_with_offset(encoder, dense.buffer, sinks.byte_offset, 5);
+        set_buffer_with_offset(encoder, dense.buffer(), sinks.byte_offset, 5);
         set_buffer(encoder, batch.heads, 6);
         set_threadgroup_memory(encoder, 128 * 4 * size_of::<u16>(), 0);
         dispatch_groups(
@@ -2267,6 +2324,7 @@ unsafe fn encode_batch_flash_attention(
                 ne11: i32::try_from(n_keys)?,
                 ne_12_2: 1,
                 ne_12_3: 1,
+                _pad0: 0,
                 nb11: row_f16 as u64,
                 nb12: (n_keys * row_f16) as u64,
                 nb13: (n_keys * row_f16) as u64,
@@ -2276,6 +2334,7 @@ unsafe fn encode_batch_flash_attention(
                 ne31: i32::try_from(tokens)?,
                 ne32: 1,
                 ne33: 1,
+                _pad1: 0,
                 nb31: (n_keys * size_of::<u16>()) as u64,
                 nb32: mask_bytes as u64,
                 nb33: mask_bytes as u64,
@@ -2295,6 +2354,7 @@ unsafe fn encode_batch_flash_attention(
             ne31: i32::try_from(tokens)?,
             ne32: 1,
             ne33: 1,
+            _pad0: 0,
             nb31: (n_keys * size_of::<u16>()) as u64,
             nb32: mask_bytes as u64,
             nb33: mask_bytes as u64,
@@ -2309,6 +2369,7 @@ unsafe fn encode_batch_flash_attention(
             ne01: i32::try_from(tokens)?,
             ne02: HEADS as i32,
             ne03: 1,
+            _pad0: 0,
             nb01: (HEADS * row_f32) as u64,
             nb02: row_f32 as u64,
             nb03: (tokens * HEADS * row_f32) as u64,
@@ -2320,12 +2381,14 @@ unsafe fn encode_batch_flash_attention(
             nb12: (n_keys * row_f16) as u64,
             nb13: (n_keys * row_f16) as u64,
             ns20: HEAD_DIM as i32,
+            _pad1: 0,
             nb21: row_f16 as u64,
             nb22: (n_keys * row_f16) as u64,
             nb23: (n_keys * row_f16) as u64,
             ne31: i32::try_from(tokens)?,
             ne32: 1,
             ne33: 1,
+            _pad2: 0,
             nb31: (n_keys * size_of::<u16>()) as u64,
             nb32: mask_bytes as u64,
             nb33: mask_bytes as u64,
@@ -2338,6 +2401,7 @@ unsafe fn encode_batch_flash_attention(
             m1: 0.0,
             n_head_log2: 0,
             logit_softcap: 0.0,
+            _pad3: 0,
         };
         let pipeline = if has_kvpad {
             "kernel_flash_attn_ext_f16_dk512_dv512"
@@ -2350,7 +2414,7 @@ unsafe fn encode_batch_flash_attention(
         set_buffer(encoder, batch.flash_kv, 2);
         set_buffer(encoder, batch.flash_kv, 3);
         set_buffer(encoder, batch.flash_mask, 4);
-        set_buffer_with_offset(encoder, dense.buffer, sinks.byte_offset, 5);
+        set_buffer_with_offset(encoder, dense.buffer(), sinks.byte_offset, 5);
         set_buffer(encoder, batch.flash_pad, 6);
         set_buffer(encoder, batch.flash_blocks, 7);
         set_buffer(encoder, batch.heads, 8);
@@ -2397,6 +2461,7 @@ unsafe fn encode_attention(
             dst_token_stride: (HEADS as u64) * row_stride,
             dst_head_stride: row_stride,
             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            _pad1: 0,
         };
         unsafe {
             set_pipeline(
@@ -2414,7 +2479,7 @@ unsafe fn encode_attention(
                 3,
             );
             set_buffer(encoder, scratch.index_selected, 4);
-            set_buffer_with_offset(encoder, sinks.0.buffer, sinks.1.byte_offset, 5);
+            set_buffer_with_offset(encoder, sinks.0.buffer(), sinks.1.byte_offset, 5);
             set_buffer(encoder, scratch.heads, 6);
             set_threadgroup_memory(encoder, 16 * 128 * size_of::<[u16; 4]>(), 0);
             dispatch_groups(encoder, (1, HEADS.div_ceil(8) as u64, 1), (32, 8, 1));
@@ -2446,7 +2511,7 @@ unsafe fn encode_attention(
         set_buffer(encoder, layer_state.raw, 2);
         set_buffer(encoder, comp, 3);
         set_buffer(encoder, scratch.index_selected, 4);
-        set_buffer_with_offset(encoder, sinks.0.buffer, sinks.1.byte_offset, 5);
+        set_buffer_with_offset(encoder, sinks.0.buffer(), sinks.1.byte_offset, 5);
         set_buffer(encoder, scratch.heads, 6);
         set_threadgroup_memory(encoder, 12 * size_of::<f32>(), 0);
         dispatch_groups(encoder, (HEADS as u64, 1, 1), (128, 1, 1));
@@ -2688,6 +2753,7 @@ unsafe fn encode_layer_pre_expert(
                     index_row_stride: (INDEX_HEAD_DIM * size_of::<f32>()) as u64,
                     score_token_stride: (n_comp * size_of::<f32>()) as u64,
                     scale: 1.0 / (INDEX_WIDTH as f32).sqrt(),
+                    _pad0: 0,
                 };
                 set_pipeline(
                     encoder,
@@ -2752,7 +2818,7 @@ unsafe fn encode_layer_pre_expert(
         set_bytes(encoder, bytes_of(&HcExpandArgs::one()), 1);
         set_buffer_with_offset(
             encoder,
-            dense.buffer,
+            dense.buffer(),
             graph_layer.attn_output_b.byte_offset,
             2,
         );
@@ -2794,11 +2860,16 @@ unsafe fn encode_layer_pre_expert(
         set_bytes(encoder, bytes_of(&MatvecArgs::q8(HIDDEN, EXPERT_WIDTH)?), 0);
         set_buffer_with_offset(
             encoder,
-            dense.buffer,
+            dense.buffer(),
             graph_layer.shared_gate.byte_offset,
             1,
         );
-        set_buffer_with_offset(encoder, dense.buffer, graph_layer.shared_up.byte_offset, 2);
+        set_buffer_with_offset(
+            encoder,
+            dense.buffer(),
+            graph_layer.shared_up.byte_offset,
+            2,
+        );
         set_buffer(encoder, scratch.ffn_norm, 3);
         set_buffer(encoder, scratch.shared_gate, 4);
         set_buffer(encoder, scratch.shared_up, 5);
@@ -3068,6 +3139,7 @@ unsafe fn encode_batch_pre_expert_layer(
                     index_row_stride: (INDEX_HEAD_DIM * size_of::<f32>()) as u64,
                     score_token_stride: (n_comp * size_of::<f32>()) as u64,
                     scale: 1.0 / (INDEX_WIDTH as f32).sqrt(),
+                    _pad0: 0,
                 };
                 set_pipeline(
                     encoder,
@@ -3479,20 +3551,14 @@ fn finish_deepseek_resident_layer_prepare(
     Ok(())
 }
 
-fn issue_deepseek_layer_prepare(
+fn issue_deepseek_layer_prepare<'a>(
     dense: &MetalDenseWeights,
     graph: &DeepSeekV4ExecutionGraph,
     scheduler: &mut FlashMoeExecutionScheduler,
     layer: usize,
-    expert_staging: MetalObjcId,
-    expert_bytes: usize,
-) -> Result<PendingDeepSeekLayerPrepare> {
+    destination: &'a mut [u8],
+) -> Result<PendingDeepSeekLayerPrepare<'a>> {
     let resident = issue_deepseek_resident_layer_prepare(dense, graph, layer)?;
-    let staging_len = EXPERTS
-        .checked_mul(expert_bytes)
-        .context("DeepSeek saturated expert staging length overflow")?;
-    let destination =
-        unsafe { std::slice::from_raw_parts_mut(buffer_contents(expert_staging), staging_len) };
     match unsafe { scheduler.issue_expert_layer_prepare_into(layer, destination) } {
         Ok(expert) => Ok(PendingDeepSeekLayerPrepare { expert, resident }),
         Err(expert_error) => match finish_deepseek_resident_layer_prepare(resident) {
@@ -3506,7 +3572,7 @@ fn issue_deepseek_layer_prepare(
 
 fn finish_deepseek_layer_prepare(
     scheduler: &mut FlashMoeExecutionScheduler,
-    pending: PendingDeepSeekLayerPrepare,
+    pending: PendingDeepSeekLayerPrepare<'_>,
 ) -> Result<()> {
     let expert_result = scheduler.finish_expert_layer_prepare(pending.expert);
     let resident_result = finish_deepseek_resident_layer_prepare(pending.resident);
@@ -3674,7 +3740,7 @@ unsafe fn encode_layer_experts(
         set_bytes(encoder, bytes_of(&HcExpandArgs::one()), 1);
         set_buffer_with_offset(
             encoder,
-            dense.buffer,
+            dense.buffer(),
             graph_layer.shared_down.byte_offset,
             2,
         );
@@ -3934,6 +4000,7 @@ unsafe fn encode_batch_expert_layer(
         ne02: EXPERTS as i32,
         ne10: HIDDEN as i32,
         ne11: 1,
+        _pad0: 0,
         nb11: (HIDDEN * size_of::<f32>()) as u64,
         nb12: (HIDDEN * size_of::<f32>()) as u64,
         ne21: i32::try_from(batch.tokens)?,
@@ -4070,8 +4137,8 @@ unsafe fn encode_batch_expert_layer(
     Ok(())
 }
 
-fn bytes_of<T>(value: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+fn bytes_of<T: bytemuck::NoUninit>(value: &T) -> &[u8] {
+    bytemuck::bytes_of(value)
 }
 
 unsafe fn set_pipeline(encoder: MetalObjcId, pipeline: MetalObjcId) {
@@ -4712,14 +4779,19 @@ impl MetalExecutionContext {
         let prepare_layers = tokens.len() >= graph.prefill_layer_prepare_min_tokens;
         let mut batch =
             unsafe { DeepSeekBatchScratch::allocate(self, tokens.len(), pos0, prepare_layers)? };
+        let staging_len = EXPERTS
+            .checked_mul(batch.expert_spec.expert_bytes)
+            .context("DeepSeek saturated expert staging length overflow")?;
         let mut pending_layer_prepare = if prepare_layers {
+            let destination = unsafe {
+                std::slice::from_raw_parts_mut(buffer_contents(batch.expert_staging), staging_len)
+            };
             Some(issue_deepseek_layer_prepare(
                 dense,
                 graph,
                 scheduler,
                 0,
-                batch.expert_staging,
-                batch.expert_spec.expert_bytes,
+                destination,
             )?)
         } else {
             None
@@ -4757,7 +4829,7 @@ impl MetalExecutionContext {
             );
             set_bytes(encoder, bytes_of(&embedding), 0);
             set_buffer(encoder, batch.token_ids, 1);
-            set_buffer_with_offset(encoder, dense.buffer, graph.embedding.byte_offset, 2);
+            set_buffer_with_offset(encoder, dense.buffer(), graph.embedding.byte_offset, 2);
             set_buffer(encoder, batch.cur_hc, 3);
             dispatch_groups(
                 encoder,
@@ -4773,13 +4845,16 @@ impl MetalExecutionContext {
                 .map(|pending| finish_deepseek_layer_prepare(scheduler, pending))
                 .transpose()?;
             if prepare_layers && layer + 1 < graph.layers.len() {
+                let alternate_staging = batch.alternate_expert_staging()?;
+                let destination = unsafe {
+                    std::slice::from_raw_parts_mut(buffer_contents(alternate_staging), staging_len)
+                };
                 pending_layer_prepare = Some(issue_deepseek_layer_prepare(
                     dense,
                     graph,
                     scheduler,
                     layer + 1,
-                    batch.alternate_expert_staging()?,
-                    batch.expert_spec.expert_bytes,
+                    destination,
                 )?);
             }
             let ratio = state.layers[layer].ratio;
@@ -4965,9 +5040,14 @@ impl MetalExecutionContext {
             set_bytes(encoder, bytes_of(&args), 0);
             set_buffer(encoder, state.scratch.cur_hc, 1);
             set_buffer(encoder, state.scratch.output_pre, 2);
-            set_buffer_with_offset(encoder, dense.buffer, graph.output_hc_scale.byte_offset, 3);
-            set_buffer_with_offset(encoder, dense.buffer, graph.output_hc_base.byte_offset, 4);
-            set_buffer_with_offset(encoder, dense.buffer, graph.output_norm.byte_offset, 5);
+            set_buffer_with_offset(
+                encoder,
+                dense.buffer(),
+                graph.output_hc_scale.byte_offset,
+                3,
+            );
+            set_buffer_with_offset(encoder, dense.buffer(), graph.output_hc_base.byte_offset, 4);
+            set_buffer_with_offset(encoder, dense.buffer(), graph.output_norm.byte_offset, 5);
             set_buffer(encoder, state.scratch.output_hidden, 6);
             set_threadgroup_memory(encoder, 32, 0);
             dispatch_groups(encoder, (1, 1, 1), (256, 1, 1));
@@ -5025,7 +5105,7 @@ impl MetalExecutionContext {
                     .require("kernel_pb_dsv4_embedding_hc4")?,
             );
             set_bytes(encoder, bytes_of(&embedding), 0);
-            set_buffer_with_offset(encoder, dense.buffer, graph.embedding.byte_offset, 1);
+            set_buffer_with_offset(encoder, dense.buffer(), graph.embedding.byte_offset, 1);
             set_buffer(encoder, state.scratch.cur_hc, 2);
             dispatch_groups(encoder, (HC_WIDTH.div_ceil(256) as u64, 1, 1), (256, 1, 1));
             commit_deepseek_command(encoding, "deepseek_embedding", position, None)?;
@@ -5073,16 +5153,16 @@ impl MetalExecutionContext {
                 hash_selected.as_ref().map(|values| values.as_slice()),
             )?;
             let scheduled = scheduler.read_preselected_experts(layer, &routes)?;
-            if scheduled.layer != layer || scheduled.weights.len() != ACTIVE_EXPERTS {
+            if scheduled.layer != layer || scheduled.weights().len() != ACTIVE_EXPERTS {
                 bail!(
                     "DeepSeek V4 scheduler returned inconsistent layer/weight count {}/{} for layer {layer}",
                     scheduled.layer,
-                    scheduled.weights.len()
+                    scheduled.weights().len()
                 );
             }
             unsafe {
                 ptr::copy_nonoverlapping(
-                    scheduled.weights.as_ptr(),
+                    scheduled.weights().as_ptr(),
                     buffer_contents(state.scratch.route_weights).cast::<f32>(),
                     ACTIVE_EXPERTS,
                 );
@@ -5160,9 +5240,14 @@ impl MetalExecutionContext {
             set_bytes(encoder, bytes_of(&args), 0);
             set_buffer(encoder, state.scratch.cur_hc, 1);
             set_buffer(encoder, state.scratch.output_pre, 2);
-            set_buffer_with_offset(encoder, dense.buffer, graph.output_hc_scale.byte_offset, 3);
-            set_buffer_with_offset(encoder, dense.buffer, graph.output_hc_base.byte_offset, 4);
-            set_buffer_with_offset(encoder, dense.buffer, graph.output_norm.byte_offset, 5);
+            set_buffer_with_offset(
+                encoder,
+                dense.buffer(),
+                graph.output_hc_scale.byte_offset,
+                3,
+            );
+            set_buffer_with_offset(encoder, dense.buffer(), graph.output_hc_base.byte_offset, 4);
+            set_buffer_with_offset(encoder, dense.buffer(), graph.output_norm.byte_offset, 5);
             set_buffer(encoder, state.scratch.output_hidden, 6);
             set_threadgroup_memory(encoder, 32, 0);
             dispatch_groups(encoder, (1, 1, 1), (256, 1, 1));

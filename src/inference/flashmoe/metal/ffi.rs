@@ -250,7 +250,7 @@ pub(crate) fn wrap_dense_mmap_as_metal_buffer(
             tracing::debug!(len, "failed to wrap dense mmap as resident Metal buffer");
             return Ok(None);
         }
-        Ok(Some(MetalDenseWeights::new(buffer, mmap, len)))
+        Ok(Some(MetalDenseWeights::new(buffer, mmap, len)?))
     }
 }
 

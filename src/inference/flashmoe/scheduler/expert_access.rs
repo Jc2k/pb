@@ -11,7 +11,7 @@ impl ExpertRoute {
         Self { expert, score }
     }
 
-    pub(crate) fn from_scores(routes: &[(usize, f32)]) -> Result<Vec<Self>> {
+    pub(crate) fn from_scores(routes: &[(usize, f32)]) -> Result<InlineExpertRoutes> {
         routes
             .iter()
             .copied()
@@ -36,17 +36,37 @@ impl ExpertRoute {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct ValidatedRouteWeights {
+    routes: InlineExpertRoutes,
+    weights: InlineRouteWeights,
+}
+
+impl ValidatedRouteWeights {
+    fn new(routes: InlineExpertRoutes, weights: InlineRouteWeights) -> Self {
+        debug_assert_eq!(routes.len(), weights.len());
+        Self { routes, weights }
+    }
+
+    fn routes(&self) -> &[ExpertRoute] {
+        &self.routes
+    }
+
+    fn weights(&self) -> &[f32] {
+        &self.weights
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScheduledExpertRoutes {
     pub(crate) layer: usize,
-    pub(crate) routes: Vec<ExpertRoute>,
-    pub(crate) weights: Vec<f32>,
+    route_weights: ValidatedRouteWeights,
 }
 
 impl ScheduledExpertRoutes {
     #[cfg(test)]
     pub(crate) fn from_routes(
         layer: usize,
-        routes: Vec<ExpertRoute>,
+        routes: impl Into<InlineExpertRoutes>,
         routed_expert_scale: f32,
     ) -> Result<Self> {
         Self::from_routes_with_policy(
@@ -59,17 +79,18 @@ impl ScheduledExpertRoutes {
 
     pub(crate) fn from_routes_with_policy(
         layer: usize,
-        routes: Vec<ExpertRoute>,
+        routes: impl Into<InlineExpertRoutes>,
         normalization: QwenMoeRoutingWeightNormalization,
         routed_expert_scale: f32,
     ) -> Result<Self> {
+        let routes = routes.into();
         if !(routed_expert_scale.is_finite() && routed_expert_scale > 0.0) {
             bail!("routed expert scale must be positive and finite");
         }
         for route in &routes {
             route.validate()?;
         }
-        let mut weights: Vec<f32> = routes.iter().map(|route| route.score).collect();
+        let mut weights: InlineRouteWeights = routes.iter().map(|route| route.score).collect();
         match normalization {
             QwenMoeRoutingWeightNormalization::RenormalizeSelected => {
                 let sum = weights.iter().sum::<f32>();
@@ -109,8 +130,7 @@ impl ScheduledExpertRoutes {
         }
         Ok(Self {
             layer,
-            routes,
-            weights,
+            route_weights: ValidatedRouteWeights::new(routes, weights),
         })
     }
 
@@ -152,15 +172,27 @@ impl ScheduledExpertRoutes {
 
     #[cfg(test)]
     pub(crate) fn expert_ids(&self) -> impl Iterator<Item = usize> + '_ {
-        self.routes.iter().map(|route| route.expert)
+        self.routes().iter().map(|route| route.expert)
+    }
+
+    pub(crate) fn routes(&self) -> &[ExpertRoute] {
+        self.route_weights.routes()
+    }
+
+    pub(crate) fn weights(&self) -> &[f32] {
+        self.route_weights.weights()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_inline_storage(&self) -> bool {
+        !self.route_weights.routes.spilled() && !self.route_weights.weights.spilled()
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScheduledExpertBatch<T> {
     pub(crate) layer: usize,
-    pub(crate) routes: Vec<ExpertRoute>,
-    pub(crate) weights: Vec<f32>,
+    route_weights: ValidatedRouteWeights,
     pub(crate) experts: Arc<[T]>,
 }
 
@@ -169,32 +201,31 @@ impl<T> ScheduledExpertBatch<T> {
         routes: ScheduledExpertRoutes,
         experts: Vec<T>,
     ) -> Result<ScheduledExpertBatch<T>> {
-        if experts.len() != routes.routes.len() {
+        if experts.len() != routes.routes().len() {
             bail!(
                 "scheduled expert batch has {} experts for {} routes on layer {}",
                 experts.len(),
-                routes.routes.len(),
-                routes.layer
-            );
-        }
-        if routes.weights.len() != routes.routes.len() {
-            bail!(
-                "scheduled expert batch has {} weights for {} routes on layer {}",
-                routes.weights.len(),
-                routes.routes.len(),
+                routes.routes().len(),
                 routes.layer
             );
         }
         Ok(Self {
             layer: routes.layer,
-            routes: routes.routes,
-            weights: routes.weights,
+            route_weights: routes.route_weights,
             experts: Arc::from(experts),
         })
     }
 
     pub(crate) fn len(&self) -> usize {
         self.experts.len()
+    }
+
+    pub(crate) fn routes(&self) -> &[ExpertRoute] {
+        self.route_weights.routes()
+    }
+
+    pub(crate) fn weights(&self) -> &[f32] {
+        self.route_weights.weights()
     }
 
     #[cfg(test)]
@@ -629,7 +660,7 @@ impl ActiveExpertReadScheduler {
     ) -> Result<ScheduledExpertReadSet> {
         let routes = self.scheduled_routes_from_command(command)?;
         let issues = routes
-            .routes
+            .routes()
             .iter()
             .map(|route| self.issue_read(routes.layer, route.expert))
             .collect();
@@ -642,15 +673,15 @@ impl ActiveExpertReadScheduler {
         experts: Vec<T>,
         mut identify: impl FnMut(&T) -> (usize, usize),
     ) -> Result<ScheduledExpertSet<T>> {
-        if experts.len() != scheduled_routes.routes.len() {
+        if experts.len() != scheduled_routes.routes().len() {
             bail!(
                 "expert scheduler returned {} experts for {} routed entries on layer {}",
                 experts.len(),
-                scheduled_routes.routes.len(),
+                scheduled_routes.routes().len(),
                 scheduled_routes.layer
             );
         }
-        for (route, expert) in scheduled_routes.routes.iter().zip(experts.iter()) {
+        for (route, expert) in scheduled_routes.routes().iter().zip(experts.iter()) {
             let (expert_layer, expert_id) = identify(expert);
             if expert_layer != scheduled_routes.layer || expert_id != route.expert {
                 bail!(
@@ -752,7 +783,7 @@ impl ScheduledResidentExpertTable {
     ) -> Result<ScheduledExpertSet<Arc<ScheduledExpertSlot>>> {
         let routes = self.core.scheduled_routes_from_command(command)?;
         let experts = routes
-            .routes
+            .routes()
             .iter()
             .map(|route| self.slot(routes.layer, route.expert))
             .collect::<Result<Vec<_>>>()?;
@@ -846,12 +877,16 @@ impl ScheduledExpertAccessCoordinator {
         }
     }
 
-    pub(crate) unsafe fn issue_layer_prepare_into(
+    /// # Safety
+    ///
+    /// `destination` must remain allocated and exclusively borrowed until
+    /// the returned guard is finished or dropped.
+    pub(crate) unsafe fn issue_layer_prepare_into<'a>(
         &self,
         layer: usize,
-        destination: &mut [u8],
+        destination: &'a mut [u8],
         workers: usize,
-    ) -> Result<PendingExpertLayerPrepare> {
+    ) -> Result<PendingExpertLayerPrepare<'a>> {
         match self {
             Self::Streamed(coordinator) => unsafe {
                 coordinator.issue_layer_prepare_into(layer, destination, workers)
@@ -864,7 +899,7 @@ impl ScheduledExpertAccessCoordinator {
 
     pub(crate) fn finish_layer_prepare(
         &self,
-        pending: PendingExpertLayerPrepare,
+        pending: PendingExpertLayerPrepare<'_>,
     ) -> Result<ExpertLayerPrepareSummary> {
         match self {
             Self::Streamed(coordinator) => coordinator.finish_layer_prepare(pending),
@@ -1089,12 +1124,16 @@ impl ScheduledExpertReadCoordinator {
         Ok(summary)
     }
 
-    pub(crate) unsafe fn issue_layer_prepare_into(
+    /// # Safety
+    ///
+    /// `destination` must remain allocated and exclusively borrowed until
+    /// the returned guard is finished or dropped.
+    pub(crate) unsafe fn issue_layer_prepare_into<'a>(
         &self,
         layer: usize,
-        destination: &mut [u8],
+        destination: &'a mut [u8],
         workers: usize,
-    ) -> Result<PendingExpertLayerPrepare> {
+    ) -> Result<PendingExpertLayerPrepare<'a>> {
         unsafe {
             self.store
                 .issue_layer_prepare_into(layer, destination, workers)
@@ -1103,7 +1142,7 @@ impl ScheduledExpertReadCoordinator {
 
     pub(crate) fn finish_layer_prepare(
         &self,
-        pending: PendingExpertLayerPrepare,
+        pending: PendingExpertLayerPrepare<'_>,
     ) -> Result<ExpertLayerPrepareSummary> {
         pending.finish()
     }

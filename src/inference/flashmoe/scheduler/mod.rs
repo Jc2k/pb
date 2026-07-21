@@ -9,7 +9,7 @@ use super::experts::{
     ExpertSlotDescriptor, ExpertSlotStore, ExpertStorageLayout, FLASHMOE_EXPERT_IO_POLICY,
     PendingExpertLayerPrepare, Q4MatvecPayload, Q4MatvecSource, ReusableExpertBytes,
 };
-use super::math::routing_softmax_top_k;
+use super::math::{InlineRoutePairs, routing_softmax_top_k};
 #[cfg(test)]
 use super::math::{routing_top_k, softmax_in_place, top_k};
 use super::model_family::{QwenMoeFamily, QwenMoeLayerKind, QwenMoeRoutingWeightNormalization};
@@ -26,12 +26,15 @@ use super::weights::{
     SharedExpertPhaseWeights,
 };
 use anyhow::{Context, Result, bail};
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 const BATCH_EXPERT_READ_WORKERS: usize = 8;
+type InlineExpertRoutes = SmallVec<[ExpertRoute; 10]>;
+type InlineRouteWeights = SmallVec<[f32; 10]>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FlashMoeScheduledGraph {
@@ -441,9 +444,9 @@ pub(crate) struct FlashMoeExecutionScheduler {
 }
 
 #[derive(Debug)]
-pub(crate) struct PendingScheduledExpertLayerPrepare {
+pub(crate) struct PendingScheduledExpertLayerPrepare<'a> {
     layer: usize,
-    pending: PendingExpertLayerPrepare,
+    pending: PendingExpertLayerPrepare<'a>,
 }
 
 /// Scheduler-resolved expert working set for one layer-major token matrix.
@@ -679,17 +682,20 @@ impl FlashMoeExecutionScheduler {
     /// access implementation. Resident graphs clone mapped slots without
     /// issuing reads; streamed graphs issue one scheduler-owned parallel pread
     /// for each unique expert.
-    pub(crate) fn resolve_layer_major_experts(
+    pub(crate) fn resolve_layer_major_experts<TRoutes>(
         &mut self,
         layer: usize,
-        row_routes: &[Vec<(usize, f32)>],
-    ) -> Result<ScheduledLayerMajorExperts> {
+        row_routes: &[TRoutes],
+    ) -> Result<ScheduledLayerMajorExperts>
+    where
+        TRoutes: AsRef<[(usize, f32)]>,
+    {
         if row_routes.is_empty() {
             bail!("FlashMoe layer-major routing requires at least one token row");
         }
         let active_experts = self.graph.active_experts();
         let mut normalized_rows = Vec::with_capacity(row_routes.len());
-        let mut unique_ids = BTreeSet::new();
+        let mut seen_experts = vec![false; self.graph.experts_per_layer()];
         for routes in row_routes {
             let command = self
                 .graph
@@ -699,21 +705,24 @@ impl FlashMoeExecutionScheduler {
                     active_experts,
                     ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
                 )?
-                .command_from_preselected(routes)?;
+                .command_from_preselected(routes.as_ref())?;
             let normalized = self.expert_access.normalize_routes(&command)?;
-            if normalized.routes.len() != active_experts
-                || normalized.weights.len() != active_experts
-            {
+            if normalized.routes().len() != active_experts {
                 bail!(
-                    "FlashMoe layer-major row resolved {} routes and {} weights, expected K={active_experts} at layer {layer}",
-                    normalized.routes.len(),
-                    normalized.weights.len()
+                    "FlashMoe layer-major row resolved {} routes, expected K={active_experts} at layer {layer}",
+                    normalized.routes().len()
                 );
             }
-            unique_ids.extend(normalized.routes.iter().map(|route| route.expert));
+            for route in normalized.routes() {
+                seen_experts[route.expert] = true;
+            }
             normalized_rows.push(normalized);
         }
-        let unique_ids = unique_ids.into_iter().collect::<Vec<_>>();
+        let unique_ids = seen_experts
+            .into_iter()
+            .enumerate()
+            .filter_map(|(expert, selected)| selected.then_some(expert))
+            .collect::<Vec<_>>();
         let experts = self.expert_access.acquire_unique(layer, &unique_ids)?;
         if experts.len() != unique_ids.len() {
             bail!(
@@ -735,7 +744,11 @@ impl FlashMoeExecutionScheduler {
         let mut route_slots = Vec::with_capacity(route_count);
         let mut weights = Vec::with_capacity(route_count);
         for normalized in normalized_rows {
-            for (route, weight) in normalized.routes.iter().zip(normalized.weights) {
+            for (route, weight) in normalized
+                .routes()
+                .iter()
+                .zip(normalized.weights().iter().copied())
+            {
                 route_slots.push(*slot_by_id.get(&route.expert).with_context(|| {
                     format!(
                         "FlashMoe layer-major unique expert union omitted layer {layer} expert {}",
@@ -812,11 +825,17 @@ impl FlashMoeExecutionScheduler {
     /// Start a fixed whole-layer positioned stream directly into a
     /// graph-owned request staging allocation. The caller must not access or
     /// release the destination until `finish_expert_layer_prepare` returns.
-    pub(crate) unsafe fn issue_expert_layer_prepare_into(
+    ///
+    /// # Safety
+    ///
+    /// The destination allocation must stay at a stable address until the
+    /// returned guard is finished or dropped. The guard carries its exclusive
+    /// borrow so safe code cannot reuse the slice early.
+    pub(crate) unsafe fn issue_expert_layer_prepare_into<'a>(
         &mut self,
         layer: usize,
-        destination: &mut [u8],
-    ) -> Result<PendingScheduledExpertLayerPrepare> {
+        destination: &'a mut [u8],
+    ) -> Result<PendingScheduledExpertLayerPrepare<'a>> {
         if layer >= self.graph.attention_layers.len() {
             bail!(
                 "FlashMoe expert layer staging {layer} is outside resolved layer count {}",
@@ -837,7 +856,7 @@ impl FlashMoeExecutionScheduler {
 
     pub(crate) fn finish_expert_layer_prepare(
         &mut self,
-        pending: PendingScheduledExpertLayerPrepare,
+        pending: PendingScheduledExpertLayerPrepare<'_>,
     ) -> Result<ExpertLayerPrepareSummary> {
         if pending.pending.layer() != pending.layer {
             bail!(
@@ -908,7 +927,7 @@ impl FlashMoeExecutionScheduler {
         let expert_mixes = scheduled
             .experts
             .iter()
-            .zip(scheduled.weights.iter().copied())
+            .zip(scheduled.weights().iter().copied())
             .map(|(expert, weight)| (expert.mix_hash(), weight))
             .collect();
         let submit_started = Instant::now();

@@ -302,7 +302,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                     set_buffer_with_offset(encoder, projection_buffer, qkv_offset, 1);
                     set_buffer_with_offset(
                         encoder,
-                        dense_weights.buffer,
+                        dense_weights.buffer(),
                         static_tensors.conv_weight.byte_offset,
                         2,
                     );
@@ -346,13 +346,13 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                     set_buffer_with_offset(encoder, projection_buffer, beta_offset, 1);
                     set_buffer_with_offset(
                         encoder,
-                        dense_weights.buffer,
+                        dense_weights.buffer(),
                         static_tensors.a_log.byte_offset,
                         2,
                     );
                     set_buffer_with_offset(
                         encoder,
-                        dense_weights.buffer,
+                        dense_weights.buffer(),
                         static_tensors.dt_bias.byte_offset,
                         3,
                     );
@@ -407,7 +407,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
                     set_buffer_with_offset(encoder, projection_buffer, z_offset, 1);
                     set_buffer_with_offset(
                         encoder,
-                        dense_weights.buffer,
+                        dense_weights.buffer(),
                         static_tensors.norm_weight.byte_offset,
                         2,
                     );
@@ -770,7 +770,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
             set_buffer_with_offset(encoder, projection_buffer, qkv_offset, 1);
             set_buffer_with_offset(
                 encoder,
-                dense_weights.buffer,
+                dense_weights.buffer(),
                 static_tensors.conv_weight.byte_offset,
                 2,
             );
@@ -822,13 +822,13 @@ impl MetalFusedLinearAttentionBuilder<'_> {
             set_buffer_with_offset(encoder, projection_buffer, beta_offset, 1);
             set_buffer_with_offset(
                 encoder,
-                dense_weights.buffer,
+                dense_weights.buffer(),
                 static_tensors.a_log.byte_offset,
                 2,
             );
             set_buffer_with_offset(
                 encoder,
-                dense_weights.buffer,
+                dense_weights.buffer(),
                 static_tensors.dt_bias.byte_offset,
                 3,
             );
@@ -891,7 +891,7 @@ impl MetalFusedLinearAttentionBuilder<'_> {
             set_buffer_with_offset(encoder, projection_buffer, z_offset, 1);
             set_buffer_with_offset(
                 encoder,
-                dense_weights.buffer,
+                dense_weights.buffer(),
                 static_tensors.norm_weight.byte_offset,
                 2,
             );

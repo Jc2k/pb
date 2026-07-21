@@ -1639,6 +1639,7 @@ fn pending_layer_prepare_drop_joins_direct_destination_workers() {
         layer: 0,
         bytes: 0,
         workers: vec![worker],
+        destination: std::marker::PhantomData,
     };
     let (drop_finished_tx, drop_finished_rx) = mpsc::channel();
     let dropper = thread::spawn(move || {

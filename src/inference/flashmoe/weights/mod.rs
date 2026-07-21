@@ -1317,20 +1317,12 @@ impl RouterScoreProjectionDescriptor {
     ) -> Result<Self> {
         match &entry.quantization {
             TensorQuantization::None => {
-                let Some(element_size) = dense_dtype_size(&entry.dtype) else {
-                    bail!(
-                        "Flash-MoE router tensor {} has unsupported dtype {}",
-                        tensor_name,
-                        entry.dtype
-                    );
-                };
                 let projection = DenseMmapMatvecProjection::from_entry(
                     tensor_name,
                     entry,
                     store_len,
                     experts,
                     hidden_width,
-                    element_size,
                 )?;
                 Ok(Self {
                     layer,
@@ -2004,7 +1996,7 @@ pub(crate) fn apply_qwen_norm_weight_semantics(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResidentStaticDtype {
     Bf16,
     F16,
@@ -2012,7 +2004,7 @@ pub(crate) enum ResidentStaticDtype {
 }
 
 impl ResidentStaticDtype {
-    fn from_declared(dtype: &str) -> Option<Self> {
+    pub(crate) fn from_declared(dtype: &str) -> Option<Self> {
         match dtype.to_ascii_uppercase().as_str() {
             "BF16" | "BFLOAT16" => Some(Self::Bf16),
             "F16" | "FLOAT16" | "FP16" => Some(Self::F16),
@@ -2029,7 +2021,7 @@ impl ResidentStaticDtype {
         }
     }
 
-    const fn element_size(&self) -> usize {
+    pub(crate) const fn element_size(self) -> usize {
         match self {
             Self::Bf16 | Self::F16 => 2,
             Self::F32 => 4,
@@ -2090,19 +2082,16 @@ impl ResidentStaticTensorRef {
     }
 }
 
+#[cfg(test)]
 fn dense_dtype_size(dtype: &str) -> Option<usize> {
-    match dtype.to_ascii_uppercase().as_str() {
-        "BF16" | "BFLOAT16" | "F16" | "FLOAT16" | "FP16" => Some(2),
-        "F32" | "FLOAT32" | "FP32" => Some(4),
-        _ => None,
-    }
+    ResidentStaticDtype::from_declared(dtype).map(ResidentStaticDtype::element_size)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DenseMmapMatvecProjection {
     pub(crate) tensor_name: String,
     pub(crate) byte_offset: u64,
-    pub(crate) dtype: String,
+    pub(crate) dtype: ResidentStaticDtype,
     pub(crate) rows: usize,
     pub(crate) cols: usize,
     pub(crate) output_width: usize,
@@ -2115,8 +2104,14 @@ impl DenseMmapMatvecProjection {
         store_len: u64,
         output_width: usize,
         input_len: usize,
-        element_size: usize,
     ) -> Result<Self> {
+        let dtype = ResidentStaticDtype::from_declared(&entry.dtype).with_context(|| {
+            format!(
+                "resident dense projection {tensor_name} has unsupported dtype {}",
+                entry.dtype
+            )
+        })?;
+        let element_size = dtype.element_size();
         let (rows, cols) =
             validate_dense_matvec_shape(entry, tensor_name, output_width, input_len)?;
         let row_bytes = cols
@@ -2141,7 +2136,7 @@ impl DenseMmapMatvecProjection {
         Ok(Self {
             tensor_name: tensor_name.to_string(),
             byte_offset: entry.byte_offset,
-            dtype: entry.dtype.clone(),
+            dtype,
             rows,
             cols,
             output_width,
@@ -2341,22 +2336,13 @@ impl ResidentMmapMatvecProjection {
                 })?;
                 Ok(Self::Q4(projection))
             }
-            TensorQuantization::None => {
-                let element_size = dense_dtype_size(&entry.dtype).with_context(|| {
-                    format!(
-                        "resident dense projection {tensor_name} has unsupported dtype {}",
-                        entry.dtype
-                    )
-                })?;
-                Ok(Self::Dense(DenseMmapMatvecProjection::from_entry(
-                    tensor_name,
-                    entry,
-                    store_len,
-                    output_width,
-                    input_len,
-                    element_size,
-                )?))
-            }
+            TensorQuantization::None => Ok(Self::Dense(DenseMmapMatvecProjection::from_entry(
+                tensor_name,
+                entry,
+                store_len,
+                output_width,
+                input_len,
+            )?)),
             TensorQuantization::Gguf { .. } => bail!(
                 "resident projection {tensor_name} requires a model-family GGUF graph binding"
             ),

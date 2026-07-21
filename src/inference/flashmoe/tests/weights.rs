@@ -719,7 +719,7 @@ fn dense_mmap_projection_stride_uses_runtime_cols() {
     let projection = DenseMmapMatvecProjection {
         tensor_name: "model.layers.0.self_attn.q_proj.weight".to_string(),
         byte_offset: 4096,
-        dtype: "BF16".to_string(),
+        dtype: ResidentStaticDtype::Bf16,
         rows: 16,
         cols: 32,
         output_width: 64,
@@ -746,7 +746,6 @@ fn dense_mmap_projection_descriptor_resolves_entry_bounds() {
         256,
         4,
         8,
-        2,
     )
     .unwrap();
 
@@ -794,6 +793,18 @@ fn resident_projection_binding_resolves_bf16_f16_and_f32_without_layout_probe() 
         error.to_string().contains("unsupported dtype I8"),
         "{error:#}"
     );
+}
+
+#[test]
+fn resident_static_dtype_canonicalizes_supported_manifest_aliases() {
+    for (declared, expected) in [
+        ("bfloat16", ResidentStaticDtype::Bf16),
+        ("fp16", ResidentStaticDtype::F16),
+        ("float32", ResidentStaticDtype::F32),
+    ] {
+        assert_eq!(ResidentStaticDtype::from_declared(declared), Some(expected));
+    }
+    assert_eq!(ResidentStaticDtype::from_declared("I8"), None);
 }
 
 #[test]
@@ -1798,13 +1809,13 @@ fn shared_expert_weight_table_resolves_all_resident_dense_layouts_at_load() {
                 let ResidentMmapMatvecProjection::Dense(projection) = projection else {
                     panic!("{dtype} fixture resolved a Q4 projection");
                 };
-                assert_eq!(projection.dtype, dtype);
+                assert_eq!(projection.dtype.as_str(), dtype);
             }
             let ResidentMmapMatvecProjection::Dense(router) = shared.router.as_ref().unwrap()
             else {
                 panic!("{dtype} fixture resolved a Q4 router projection");
             };
-            assert_eq!(router.dtype, dtype);
+            assert_eq!(router.dtype.as_str(), dtype);
             assert_eq!(
                 shared.validated_shape().unwrap(),
                 SharedExpertPhaseShape::new(4, 2, 3).unwrap()

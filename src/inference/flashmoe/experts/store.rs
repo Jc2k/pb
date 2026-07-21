@@ -223,10 +223,11 @@ pub(crate) struct DirectExpertReadSummary {
 }
 
 #[derive(Debug)]
-pub(crate) struct PendingExpertLayerPrepare {
+pub(crate) struct PendingExpertLayerPrepare<'a> {
     pub(crate) layer: usize,
     pub(crate) bytes: u64,
     pub(crate) workers: Vec<thread::JoinHandle<Result<ExpertLayerPrepareWorkerSummary>>>,
+    pub(crate) destination: std::marker::PhantomData<&'a mut [u8]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -241,7 +242,7 @@ pub(crate) struct ExpertLayerPrepareSummary {
     pub(crate) bytes_read: u64,
 }
 
-impl PendingExpertLayerPrepare {
+impl PendingExpertLayerPrepare<'_> {
     pub(crate) fn layer(&self) -> usize {
         self.layer
     }
@@ -289,7 +290,7 @@ impl PendingExpertLayerPrepare {
     }
 }
 
-impl Drop for PendingExpertLayerPrepare {
+impl Drop for PendingExpertLayerPrepare<'_> {
     fn drop(&mut self) {
         // Direct request staging is caller-owned. A primary execution error
         // may unwind before the explicit finish point, so never let a worker
@@ -643,12 +644,17 @@ impl ExpertSlotStore {
         Ok(slots)
     }
 
-    pub(crate) unsafe fn issue_layer_prepare_into(
+    /// # Safety
+    ///
+    /// The destination must remain allocated at the same address until the
+    /// returned guard is finished or dropped. Its mutable borrow prevents
+    /// safe callers from otherwise accessing the bytes during that interval.
+    pub(crate) unsafe fn issue_layer_prepare_into<'a>(
         &self,
         layer: usize,
-        destination: &mut [u8],
+        destination: &'a mut [u8],
         workers: usize,
-    ) -> Result<PendingExpertLayerPrepare> {
+    ) -> Result<PendingExpertLayerPrepare<'a>> {
         unsafe {
             ExpertLayerReader::issue_layer_prepare_into(
                 self.layer_reader(layer)?,
@@ -663,11 +669,16 @@ impl ExpertLayerReader {
     /// Start a fixed whole-layer positioned read directly into caller-owned
     /// request staging. The caller must keep the destination alive and avoid
     /// all access until the returned handle is finished.
-    unsafe fn issue_layer_prepare_into(
+    ///
+    /// # Safety
+    ///
+    /// `destination` must not move or alias worker-visible storage until the
+    /// returned guard is finished or dropped and has joined every worker.
+    unsafe fn issue_layer_prepare_into<'a>(
         reader: Arc<Self>,
-        destination: &mut [u8],
+        destination: &'a mut [u8],
         workers: usize,
-    ) -> Result<PendingExpertLayerPrepare> {
+    ) -> Result<PendingExpertLayerPrepare<'a>> {
         let (slot_bytes, layer_bytes) = reader.validate_layer_prepare()?;
         if destination.len() != layer_bytes {
             bail!(
@@ -725,6 +736,7 @@ impl ExpertLayerReader {
             layer: reader.metadata.layer,
             bytes: u64::try_from(layer_bytes)?,
             workers: handles,
+            destination: std::marker::PhantomData,
         })
     }
 

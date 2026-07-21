@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use smallvec::SmallVec;
 
 #[cfg(test)]
 use super::state::LinearAttentionLayout;
@@ -6,6 +7,9 @@ use super::state::LinearAttentionLayout;
 use super::types::GROUP_SIZE;
 use super::vision::{MropeAxis, MropePosition};
 use super::weights::{FullAttentionLayout, FullAttentionQLayout, RotaryPairing};
+
+pub(crate) const INLINE_ROUTE_CAPACITY: usize = 10;
+pub(crate) type InlineRoutePairs = SmallVec<[(usize, f32); INLINE_ROUTE_CAPACITY]>;
 
 #[cfg(test)]
 pub(super) fn reorder_grouped_linear_qkv_projection(
@@ -739,10 +743,14 @@ pub(crate) fn softmax_in_place(values: &mut [f32]) {
     }
 }
 
-pub(crate) fn routing_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let k = k.min(scores.len());
-    let mut selected = vec![(0usize, -1.0e30f32); k];
-    for (expert, score) in scores.iter().copied().enumerate() {
+fn routing_top_k_iter(
+    scores: impl IntoIterator<Item = (usize, f32)>,
+    available: usize,
+    k: usize,
+) -> InlineRoutePairs {
+    let k = k.min(available);
+    let mut selected = InlineRoutePairs::from_elem((0usize, -1.0e30f32), k);
+    for (expert, score) in scores {
         let mut minimum = 0;
         for candidate in 1..k {
             if selected[candidate].1 < selected[minimum].1 {
@@ -756,10 +764,22 @@ pub(crate) fn routing_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     selected
 }
 
-pub(crate) fn routing_softmax_top_k(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let mut probabilities = scores.to_vec();
-    softmax_in_place(&mut probabilities);
-    routing_top_k(&probabilities, k)
+pub(crate) fn routing_top_k(scores: &[f32], k: usize) -> InlineRoutePairs {
+    routing_top_k_iter(scores.iter().copied().enumerate(), scores.len(), k)
+}
+
+pub(crate) fn routing_softmax_top_k(scores: &[f32], k: usize) -> InlineRoutePairs {
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum = scores.iter().map(|score| (*score - max).exp()).sum::<f32>();
+    let mut selected = routing_top_k(scores, k);
+    let inverse_sum = (sum > 0.0 && sum.is_finite()).then(|| sum.recip());
+    for (_, score) in &mut selected {
+        *score = (*score - max).exp();
+        if let Some(inverse_sum) = inverse_sum {
+            *score *= inverse_sum;
+        }
+    }
+    selected
 }
 
 /// GLM/DeepSeek noaux-tc routing: correction bias affects selection only;
@@ -769,7 +789,7 @@ pub(crate) fn routing_sigmoid_noaux_top_k(
     logits: &[f32],
     correction_bias: &[f32],
     k: usize,
-) -> Result<Vec<(usize, f32)>> {
+) -> Result<InlineRoutePairs> {
     if logits.len() != correction_bias.len() {
         bail!(
             "sigmoid/noaux router logits length {} does not match correction bias length {}",
@@ -777,18 +797,24 @@ pub(crate) fn routing_sigmoid_noaux_top_k(
             correction_bias.len()
         );
     }
-    let raw = logits
-        .iter()
-        .map(|score| 1.0 / (1.0 + (-score).exp()))
-        .collect::<Vec<_>>();
-    let choice = raw
-        .iter()
-        .zip(correction_bias)
-        .map(|(score, bias)| score + bias)
-        .collect::<Vec<_>>();
-    Ok(routing_top_k(&choice, k)
+    let selected = routing_top_k_iter(
+        logits
+            .iter()
+            .zip(correction_bias)
+            .enumerate()
+            .map(|(expert, (score, bias))| {
+                let raw = 1.0 / (1.0 + (-score).exp());
+                (expert, raw + bias)
+            }),
+        logits.len(),
+        k,
+    );
+    Ok(selected
         .into_iter()
-        .map(|(expert, _)| (expert, raw[expert]))
+        .map(|(expert, _)| {
+            let score = logits[expert];
+            (expert, 1.0 / (1.0 + (-score).exp()))
+        })
         .collect())
 }
 
@@ -1232,6 +1258,7 @@ mod tests {
     fn routing_stage_preserves_upstream_replacement_slot_order() {
         let scores = [0.1, 2.0, -1.0, 3.0, 0.5, 2.5, -0.2, 1.5, 4.0];
         let selected = routing_top_k(&scores, 4);
+        assert!(!selected.spilled());
         assert_eq!(
             selected
                 .iter()
@@ -1241,6 +1268,7 @@ mod tests {
         );
 
         let selected = routing_softmax_top_k(&scores, 4);
+        assert!(!selected.spilled());
         assert_eq!(
             selected
                 .iter()
@@ -1248,6 +1276,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![5, 1, 8, 3]
         );
+    }
+
+    #[test]
+    fn routing_uses_inline_storage_for_shipped_k_values_and_spills_for_larger_k() {
+        let scores = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+
+        assert!(!routing_top_k(&scores, 4).spilled());
+        assert!(!routing_top_k(&scores, 6).spilled());
+        assert!(!routing_top_k(&scores, 8).spilled());
+        assert!(!routing_top_k(&scores, 10).spilled());
+        assert!(routing_top_k(&scores, 11).spilled());
     }
 
     #[test]

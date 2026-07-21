@@ -560,7 +560,7 @@ fn post_attention_prep_builds_declared_cmd3_metal_input() {
     .unwrap();
 
     assert_eq!(prep.width, 8);
-    assert_eq!(prep.active, vec![(2, 0.75), (5, 0.25)]);
+    assert_eq!(prep.active.as_slice(), &[(2, 0.75), (5, 0.25)]);
     assert!(prep.routing_command().is_none());
     assert_eq!(prep.input.state(), prep.state);
     assert!(prep.state.is_declared_graph_state());
@@ -1620,7 +1620,7 @@ fn test_fused_prep_routing_command(
         layer,
         active_experts: routes.len(),
         source: ScheduledRoutingCandidateSource::FusedMetalPostAttentionPrepCpuTopK,
-        routes: routes.to_vec(),
+        routes: routes.iter().copied().collect(),
     }
 }
 
@@ -2445,7 +2445,7 @@ fn resident_glm_mla_fused_attention_matches_two_command_reference() {
 #[ignore = "requires a local Metal device"]
 fn recurrent_session_snapshot_round_trips_metal_recurrent_buffers() {
     let device = unsafe { OwnedMetalObject::new(metal_default_device()).unwrap() };
-    let allocate = |len: usize, label: &str| {
+    let allocate = |len: usize, label: &str| unsafe {
         OwnedMetalObject::new(allocate_zeroed_buffer(device.id(), len * 4, label).unwrap()).unwrap()
     };
     let conv_state = allocate(2, "test recurrent conv state");
@@ -2593,9 +2593,11 @@ fn metal_dense_weights_hold_buffer_len_and_mmap_owner() {
             .unwrap(),
     );
     let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
-    let dense = MetalDenseWeights::new(id, Arc::clone(&mmap), 16);
+    let dense = std::mem::ManuallyDrop::new(unsafe {
+        MetalDenseWeights::new(id, Arc::clone(&mmap), 16).unwrap()
+    });
 
-    assert_eq!(dense.buffer, id);
+    assert_eq!(dense.buffer(), id);
     assert_eq!(dense.len, 16);
     assert_eq!(Arc::strong_count(&mmap), 2);
 }
@@ -2610,7 +2612,8 @@ fn resident_topk_builder_rejects_invalid_bindings_before_encoding() {
             .unwrap(),
     );
     let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
-    let dense = MetalDenseWeights::new(id, mmap, 128);
+    let dense =
+        std::mem::ManuallyDrop::new(unsafe { MetalDenseWeights::new(id, mmap, 128).unwrap() });
     let buffers = MetalBufferPool::default();
     let pipelines = test_objc_pipeline_set(id);
     let builder = MetalResidentTopKBuilder::new(id, id, &pipelines, &dense, &buffers);
@@ -2665,7 +2668,8 @@ fn cmd2_resident_builder_rejects_state_width_mismatch_before_encoding() {
             .unwrap(),
     );
     let id = std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr();
-    let dense = MetalDenseWeights::new(id, mmap, 4096);
+    let dense =
+        std::mem::ManuallyDrop::new(unsafe { MetalDenseWeights::new(id, mmap, 4096).unwrap() });
     let buffers = MetalBufferPool::default();
     let pipelines = test_objc_pipeline_set(id);
     let builder =
