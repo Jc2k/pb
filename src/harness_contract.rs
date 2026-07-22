@@ -195,7 +195,13 @@ impl AgentContract {
     }
 
     pub fn prompt_summary(&self) -> String {
-        serde_json::to_string_pretty(self)
+        let Ok(mut summary) = serde_json::to_value(self) else {
+            return "(contract could not be rendered)".to_string();
+        };
+        if let Some(summary) = summary.as_object_mut() {
+            summary.remove("work_unit_guidance");
+        }
+        serde_json::to_string_pretty(&summary)
             .unwrap_or_else(|_| "(contract could not be rendered)".to_string())
     }
 
@@ -460,6 +466,8 @@ mod tests {
             contract.work_unit_guidance.get("src/game.js"),
             Some(&"Keep it compact.".to_string())
         );
+        assert!(!contract.prompt_summary().contains("work_unit_guidance"));
+        assert!(!contract.prompt_summary().contains("Keep it compact."));
 
         let outside: HarnessContractDocument = serde_json::from_str(
             r#"{"version":1,"allowed_paths":["src/game.js"],"work_unit_guidance":{"README.md":"Do not edit."}}"#,
