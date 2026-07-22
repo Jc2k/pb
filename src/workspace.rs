@@ -162,9 +162,12 @@ impl ContentSnapshot {
             let relative = std::str::from_utf8(raw_path)
                 .context("workspace contains a non-UTF-8 tracked or untracked path")?;
             let normalized = relative.replace('\\', "/");
+            let (kind, bytes) = path_content(repo_root, relative)?;
+            if kind == "missing" {
+                continue;
+            }
             fingerprint.update((raw_path.len() as u64).to_le_bytes());
             fingerprint.update(raw_path);
-            let (kind, bytes) = path_content(repo_root, relative)?;
             fingerprint.update(kind.as_bytes());
             fingerprint.update(&bytes);
             let mut path_digest = Sha256::new();
@@ -819,6 +822,46 @@ mod tests {
         );
         std::fs::remove_file(focus.join("main.rs")).unwrap();
         assert!(context.task_changed_paths().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tracked_deletion_content_identity_survives_staging_and_commit() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("obsolete.txt"), "obsolete\n").unwrap();
+        for args in [
+            &["add", "obsolete.txt"][..],
+            &["commit", "-m", "test: seed obsolete file"][..],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repo.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let baseline = ContentSnapshot::capture(repo.path()).unwrap();
+
+        std::fs::remove_file(repo.path().join("obsolete.txt")).unwrap();
+        let deleted = ContentSnapshot::capture(repo.path()).unwrap();
+        assert_ne!(deleted.fingerprint, baseline.fingerprint);
+        assert!(!deleted.paths.contains_key("obsolete.txt"));
+
+        for args in [
+            &["add", "--all"][..],
+            &["commit", "-m", "test: remove obsolete file"][..],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repo.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert_eq!(ContentSnapshot::capture(repo.path()).unwrap(), deleted);
     }
 
     #[test]
