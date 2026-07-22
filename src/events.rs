@@ -434,7 +434,6 @@ pub enum AgentEvent {
     },
     HarnessExperimentConfigured {
         observation_rendering: crate::workflow::ObservationRendering,
-        controller_delete_elision: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -1013,13 +1012,11 @@ impl EventEnvelope {
             },
             AgentEvent::HarnessExperimentConfigured {
                 observation_rendering,
-                controller_delete_elision,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::HarnessExperimentConfigured {
                     observation_rendering,
-                    controller_delete_elision,
                     timestamp_ms: Some(now),
                 },
             },

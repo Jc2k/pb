@@ -569,14 +569,6 @@ pub struct HarnessAgentArgs {
     #[arg(long, value_name = "PATH")]
     pub goal_context: Option<PathBuf>,
 
-    /// Experiment-only rendering for deterministic controller observations
-    #[arg(long, value_enum, default_value_t = crate::workflow::ObservationRendering::Native)]
-    pub observation_rendering: crate::workflow::ObservationRendering,
-
-    /// Permit the harness-only conservative controller deletion experiment
-    #[arg(long, hide = true)]
-    pub controller_delete_elision: bool,
-
     /// Model identifier; defaults to the configured model
     #[arg(long)]
     pub model: Option<String>,
@@ -1151,17 +1143,7 @@ async fn run_serve() -> Result<()> {
         max_tokens: user_config.effective_max_tokens(),
         turn_max_tokens_cap: None,
         tool_allowlist: None,
-        action_elision: user_config.effective_action_elision(),
-        observation_rendering: match user_config.effective_action_elision() {
-            crate::workflow::ActionElisionMode::Off => {
-                crate::workflow::ObservationRendering::Native
-            }
-            crate::workflow::ActionElisionMode::ReviewOnly
-            | crate::workflow::ActionElisionMode::Safe => {
-                crate::workflow::ObservationRendering::ControllerBlock
-            }
-        },
-        controller_delete_elision: user_config.effective_controller_delete_elision(),
+        observation_rendering: crate::workflow::ObservationRendering::ControllerBlock,
         accept_existing_workspace_changes: false,
         ctx_size: user_config.effective_ctx_size(),
         threads: user_config.effective_threads(),

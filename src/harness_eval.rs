@@ -477,9 +477,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         max_tokens: 256,
         turn_max_tokens_cap: Some(256),
         tool_allowlist: Some(fixture.tool_allowlist.clone()),
-        action_elision: crate::workflow::ActionElisionMode::Off,
         observation_rendering: crate::workflow::ObservationRendering::Native,
-        controller_delete_elision: false,
         accept_existing_workspace_changes: false,
         ctx_size: SCRIPTED_EVAL_CONTEXT_SIZE,
         threads: None,
@@ -554,9 +552,7 @@ fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
             "run_command".to_string(),
             "sub_agent".to_string(),
         ]),
-        action_elision: crate::workflow::ActionElisionMode::Off,
         observation_rendering: crate::workflow::ObservationRendering::Native,
-        controller_delete_elision: false,
         accept_existing_workspace_changes: false,
         ctx_size: SCRIPTED_EVAL_CONTEXT_SIZE,
         threads: None,
@@ -2247,7 +2243,7 @@ pub fn run_eval_command(args: HarnessEvalArgs) -> Result<()> {
     Ok(())
 }
 
-const ACTION_ELISION_EVAL_SCHEMA_VERSION: u32 = 1;
+const ACTION_ELISION_EVAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 struct ActionElisionEvalConfiguration {
@@ -2299,11 +2295,11 @@ struct ActionElisionEvalSummary {
     fixture_workspace_fingerprint: String,
     configuration_sha256: String,
     configuration: ActionElisionEvalConfiguration,
-    controller_results_byte_identical: bool,
     native_and_controller_results_byte_identical: Option<bool>,
-    controller_inputs_locked_outside_representation: bool,
-    controller_tool_schemas_identical: bool,
-    controller_action_ids_identical: bool,
+    fixture_inputs_identical: bool,
+    controller_observation_recorded: bool,
+    controller_input_matches_receipt: bool,
+    controller_prompt_is_truthful_block: bool,
     protocol_pass: bool,
     arms: Vec<ActionElisionArmRecord>,
 }
@@ -2422,8 +2418,6 @@ pub fn run_action_elision_eval_command(args: HarnessActionElisionEvalArgs) -> Re
     for rendering in [
         crate::workflow::ObservationRendering::Native,
         crate::workflow::ObservationRendering::ControllerBlock,
-        crate::workflow::ObservationRendering::DisclosedToolTranscript,
-        crate::workflow::ObservationRendering::CompatibilityToolTranscript,
     ] {
         run_git(&workspace, &["reset", "--hard", &baseline_oid])?;
         let status = git_output(&workspace, &["status", "--porcelain"])?;
@@ -2460,7 +2454,6 @@ pub fn run_action_elision_eval_command(args: HarnessActionElisionEvalArgs) -> Re
         })?;
         let mut checkpoint = crate::workflow::WorkflowCheckpoint::new(run)?;
         bind_workflow_checkpoint_runtime(&mut checkpoint, &graph, &workspace)?;
-        let controller = rendering.is_controller();
         let request = AgentRequest {
             task: task.to_string(),
             turn_id: "action-elision-eval-turn".to_string(),
@@ -2483,13 +2476,7 @@ pub fn run_action_elision_eval_command(args: HarnessActionElisionEvalArgs) -> Re
             max_tokens: args.max_tokens,
             turn_max_tokens_cap: Some(args.max_tokens),
             tool_allowlist: None,
-            action_elision: if controller {
-                crate::workflow::ActionElisionMode::Safe
-            } else {
-                crate::workflow::ActionElisionMode::Off
-            },
             observation_rendering: rendering,
-            controller_delete_elision: false,
             accept_existing_workspace_changes: false,
             ctx_size: args.ctx_size,
             threads: args.threads,
@@ -2514,7 +2501,6 @@ pub fn run_action_elision_eval_command(args: HarnessActionElisionEvalArgs) -> Re
         };
         let mut events = vec![AgentEvent::HarnessExperimentConfigured {
             observation_rendering: rendering,
-            controller_delete_elision: false,
             timestamp_ms: None,
         }];
         let outcome =
@@ -2548,50 +2534,6 @@ pub fn run_action_elision_eval_command(args: HarnessActionElisionEvalArgs) -> Re
         ));
     }
 
-    let controller_arms = arms
-        .iter()
-        .filter(|arm| arm.rendering != crate::workflow::ObservationRendering::Native);
-    let observation_hashes = controller_arms
-        .clone()
-        .filter_map(|arm| {
-            arm.first_input
-                .as_ref()
-                .and_then(|input| input.observation_result_sha256.clone())
-        })
-        .collect::<HashSet<_>>();
-    let normalized_hashes = controller_arms
-        .clone()
-        .filter_map(|arm| {
-            arm.first_input
-                .as_ref()
-                .map(|input| input.normalized_input_sha256.clone())
-        })
-        .collect::<HashSet<_>>();
-    let tool_hashes = controller_arms
-        .clone()
-        .filter_map(|arm| {
-            arm.first_input
-                .as_ref()
-                .map(|input| input.tool_schema_sha256.clone())
-        })
-        .collect::<HashSet<_>>();
-    let action_ids = controller_arms
-        .filter_map(|arm| arm.controller_action_id.clone())
-        .collect::<HashSet<_>>();
-    let controller_results_byte_identical = observation_hashes.len() == 1
-        && arms.iter().skip(1).all(|arm| {
-            arm.first_input
-                .as_ref()
-                .and_then(|input| input.observation_result_sha256.as_ref())
-                .is_some()
-        });
-    let controller_inputs_locked_outside_representation = normalized_hashes.len() == 1;
-    let controller_tool_schemas_identical = tool_hashes.len() == 1;
-    let controller_action_ids_identical = action_ids.len() == 1;
-    let protocol_pass = controller_results_byte_identical
-        && controller_inputs_locked_outside_representation
-        && controller_tool_schemas_identical
-        && controller_action_ids_identical;
     let native_and_controller_results_byte_identical = arms
         .first()
         .and_then(|arm| arm.read_result_sha256.as_ref())
@@ -2600,6 +2542,29 @@ pub fn run_action_elision_eval_command(args: HarnessActionElisionEvalArgs) -> Re
                 .skip(1)
                 .all(|arm| arm.read_result_sha256.as_deref() == Some(native.as_str()))
         });
+    let fixture_inputs_identical = arms
+        .iter()
+        .all(|arm| arm.fixture_fingerprint_before == baseline_snapshot.fingerprint);
+    let controller_arm = arms
+        .iter()
+        .find(|arm| arm.rendering == crate::workflow::ObservationRendering::ControllerBlock);
+    let controller_observation_recorded = controller_arm
+        .and_then(|arm| arm.controller_action_id.as_ref())
+        .is_some();
+    let controller_input_matches_receipt = controller_arm.is_some_and(|arm| {
+        arm.first_input.as_ref().is_some_and(|input| {
+            input.observation_action_id.as_ref() == arm.controller_action_id.as_ref()
+                && input.observation_result_sha256.is_some()
+        })
+    });
+    let controller_prompt_is_truthful_block = controller_arm
+        .and_then(|arm| arm.first_input.as_ref())
+        .is_some_and(recorded_input_has_truthful_controller_block);
+    let protocol_pass = native_and_controller_results_byte_identical == Some(true)
+        && fixture_inputs_identical
+        && controller_observation_recorded
+        && controller_input_matches_receipt
+        && controller_prompt_is_truthful_block;
     let summary = ActionElisionEvalSummary {
         schema_version: ACTION_ELISION_EVAL_SCHEMA_VERSION,
         fixture_sha256,
@@ -2607,11 +2572,11 @@ pub fn run_action_elision_eval_command(args: HarnessActionElisionEvalArgs) -> Re
         fixture_workspace_fingerprint: baseline_snapshot.fingerprint,
         configuration_sha256,
         configuration,
-        controller_results_byte_identical,
         native_and_controller_results_byte_identical,
-        controller_inputs_locked_outside_representation,
-        controller_tool_schemas_identical,
-        controller_action_ids_identical,
+        fixture_inputs_identical,
+        controller_observation_recorded,
+        controller_input_matches_receipt,
+        controller_prompt_is_truthful_block,
         protocol_pass,
         arms,
     };
@@ -2638,21 +2603,47 @@ pub fn run_action_elision_eval_command(args: HarnessActionElisionEvalArgs) -> Re
             "output_dir": output_dir,
             "fixture_sha256": &summary.fixture_sha256,
             "configuration_sha256": &summary.configuration_sha256,
-            "controller_results_byte_identical": summary.controller_results_byte_identical,
             "native_and_controller_results_byte_identical":
                 summary.native_and_controller_results_byte_identical,
-            "controller_inputs_locked_outside_representation":
-                summary.controller_inputs_locked_outside_representation,
-            "controller_tool_schemas_identical": summary.controller_tool_schemas_identical,
-            "controller_action_ids_identical": summary.controller_action_ids_identical,
+            "fixture_inputs_identical": summary.fixture_inputs_identical,
+            "controller_observation_recorded": summary.controller_observation_recorded,
+            "controller_input_matches_receipt": summary.controller_input_matches_receipt,
+            "controller_prompt_is_truthful_block": summary.controller_prompt_is_truthful_block,
             "protocol_pass": summary.protocol_pass,
             "arms": compact_arms,
         }))?
     );
     if !protocol_pass {
-        bail!("action-elision evaluator rejected non-locked controller arms");
+        bail!("deterministic-action evaluator rejected an unsafe or non-equivalent controller arm");
     }
     Ok(())
+}
+
+fn recorded_input_has_truthful_controller_block(input: &RecordedGenerationInput) -> bool {
+    let controller_messages = input
+        .messages
+        .iter()
+        .filter(|message| {
+            message.pointer("/prompt_tool_result/actual_origin")
+                == Some(&serde_json::Value::String("controller".to_string()))
+        })
+        .collect::<Vec<_>>();
+    controller_messages.len() == 1
+        && controller_messages[0]
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            == Some("user")
+        && controller_messages[0]
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+        && controller_messages[0]
+            .get("tool_call_id")
+            .is_some_and(serde_json::Value::is_null)
+        && controller_messages[0]
+            .pointer("/prompt_tool_result/prompt_representation")
+            .and_then(serde_json::Value::as_str)
+            == Some("controller_block")
 }
 
 fn action_elision_model_artifact_digest(
@@ -2960,9 +2951,7 @@ fn run_real_model_fixture(
         max_tokens: configuration.max_tokens,
         turn_max_tokens_cap: Some(configuration.max_tokens),
         tool_allowlist: Some(fixture.tool_allowlist.clone()),
-        action_elision: crate::workflow::ActionElisionMode::Off,
         observation_rendering: crate::workflow::ObservationRendering::Native,
-        controller_delete_elision: false,
         accept_existing_workspace_changes: false,
         ctx_size: configuration.ctx_size,
         threads: configuration.threads,

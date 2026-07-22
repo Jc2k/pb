@@ -12,18 +12,20 @@ import { goalStageLabel } from "../lib/goalUtils";
 import { SCROLL_THRESHOLD } from "../lib/constants";
 import {
   formatStartTime,
-  groupToolEvents,
+  groupActionEvents,
+  isControllerActionEvent,
   sessionPageDocumentTitle,
   sessionTitle,
 } from "../lib/helpers";
 import {
+  ActionGroupBubble,
+  ControllerActionDrawerItem,
   DrawerPanel,
   InitialUserMessage,
   MessageBubble,
   SessionActivity,
   TodoDrawer,
   ToolDrawerSummary,
-  ToolGroupBubble,
 } from "../components/Session";
 import {
   buildTodoTasks,
@@ -411,15 +413,15 @@ export function SessionPage() {
                 />
               )
               : (
-                groupToolEvents(chatEventsWithOnlyLatestStep(events)).map(
+                groupActionEvents(chatEventsWithOnlyLatestStep(events)).map(
                   (grouped, i) => {
-                    if ((grouped as any).type === "tool_group") {
-                      const tc = (grouped as any).toolCalls;
+                    if ("type" in grouped && grouped.type === "action_group") {
                       return (
-                        <ToolGroupBubble
+                        <ActionGroupBubble
                           key={i}
-                          toolCalls={tc}
-                          toolResults={(grouped as any).toolResults}
+                          toolCalls={grouped.toolCalls}
+                          toolResults={grouped.toolResults}
+                          controllerActions={grouped.controllerActions}
                         />
                       );
                     }
@@ -460,25 +462,26 @@ export function SessionPage() {
               )
               : null}
             <DrawerPanel
-              title="Tools"
-              icon="bi bi-tools"
-              count={events.filter((e) => e.event.type === "tool_call").length}
+              title="Actions"
+              icon="bi bi-lightning-charge"
+              count={events.filter((e) =>
+                e.event.type === "tool_call" || isControllerActionEvent(e)
+              ).length}
             >
               {(() => {
-                const toolEvents = events.filter(
-                  (e) =>
-                    e.event.type === "tool_call" ||
-                    e.event.type === "tool_result",
+                const controllerActions = events.filter(isControllerActionEvent);
+                const actionEvents = events.filter(
+                  (e) => e.event.type === "tool_call" || isControllerActionEvent(e),
                 );
 
-                if (toolEvents.length === 0) {
+                if (actionEvents.length === 0) {
                   return (
                     <div className="empty-detail compact">
-                      <i className="bi bi-file-earmark-code"></i>
-                      <h3>No tools yet</h3>
+                      <i className="bi bi-lightning-charge"></i>
+                      <h3>No actions yet</h3>
                       <p>
-                        Inspect files, commands, and outputs without cluttering
-                        the main session.
+                        Model tool calls and safe routine actions by pb will
+                        appear here with their actor clearly identified.
                       </p>
                     </div>
                   );
@@ -486,9 +489,19 @@ export function SessionPage() {
 
                 const summaries = buildToolSummaries(events);
 
-                return summaries.map((summary) => (
-                  <ToolDrawerSummary key={summary.toolName} summary={summary} />
-                ));
+                return (
+                  <>
+                    {controllerActions.map((envelope, index) => (
+                      <ControllerActionDrawerItem
+                        key={`controller-${index}`}
+                        envelope={envelope}
+                      />
+                    ))}
+                    {summaries.map((summary) => (
+                      <ToolDrawerSummary key={summary.toolName} summary={summary} />
+                    ))}
+                  </>
+                );
               })()}
             </DrawerPanel>
 

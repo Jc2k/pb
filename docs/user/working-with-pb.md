@@ -45,6 +45,22 @@ You may see pb pause for a planning question when a missing choice would materia
 work. Answering that question updates the user-owned contract; it does not hand the model a general
 permission to improvise.
 
+### Actions in web and terminal
+
+pb performs narrowly safe routine work—such as an eligible file read or changed-path inspection—
+without asking the model to choose the obvious next action. This is intrinsic workflow behavior.
+The model receives one explicit pb-owned context block, never a fabricated assistant tool call.
+
+The web transcript and **Actions** drawer show model tool calls and deterministic pb actions in one
+place. Every item carries an actor badge: **Model** for a model-issued tool and **pb** for controller
+work. Reads show their full or bounded-range coverage; deletion states that the path was tracked and
+Git-recoverable. The terminal uses the corresponding `tool` and `pb action` labels.
+
+If a file is missing, binary, symlinked, stale, oversized, or cannot fit the bounded prompt safely,
+pb does not pretend it was read. The normal model/tool path remains available. Automatic deletion
+has stricter gates and applies only to a unique accepted tracked-clean path that is unchanged and
+recoverable from Git.
+
 ## Goal
 
 **Shipped.** Use **Goal** when one durable objective needs several sequential, bounded Build

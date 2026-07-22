@@ -59,27 +59,43 @@ export function sessionPageDocumentTitle(
   return `pb session: ${sessionTitle(session)}`;
 }
 
-export function groupToolEvents(
+export type ActionGroup = {
+  type: "action_group";
+  toolCalls: EventEnvelope[];
+  toolResults: EventEnvelope[];
+  controllerActions: EventEnvelope[];
+};
+
+export function isControllerActionEvent(event: EventEnvelope): boolean {
+  return event.event.type === "controller_observation" ||
+    event.event.type === "controller_closure" ||
+    event.event.type === "controller_mutation";
+}
+
+export function groupActionEvents(
   events: EventEnvelope[],
-): (
-  | EventEnvelope
-  | {
-      type: "tool_group";
-      toolCalls: EventEnvelope[];
-      toolResults: EventEnvelope[];
-    }
-)[] {
-  const grouped: (
-    | EventEnvelope
-    | {
-      type: "tool_group";
-      toolCalls: EventEnvelope[];
-      toolResults: EventEnvelope[];
-    }
-  )[] = [];
+): (EventEnvelope | ActionGroup)[] {
+  const grouped: (EventEnvelope | ActionGroup)[] = [];
 
   let currentToolCalls: EventEnvelope[] = [];
   let currentToolResults: EventEnvelope[] = [];
+  let currentControllerActions: EventEnvelope[] = [];
+
+  const flush = () => {
+    if (
+      currentToolCalls.length === 0 && currentToolResults.length === 0 &&
+      currentControllerActions.length === 0
+    ) return;
+    grouped.push({
+      type: "action_group",
+      toolCalls: [...currentToolCalls],
+      toolResults: [...currentToolResults],
+      controllerActions: [...currentControllerActions],
+    });
+    currentToolCalls = [];
+    currentToolResults = [];
+    currentControllerActions = [];
+  };
 
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
@@ -91,27 +107,15 @@ export function groupToolEvents(
       currentToolCalls.length > currentToolResults.length
     ) {
       currentToolResults.push(event);
+    } else if (isControllerActionEvent(event)) {
+      currentControllerActions.push(event);
     } else {
-      if (currentToolCalls.length > 0 || currentToolResults.length > 0) {
-        grouped.push({
-          type: "tool_group",
-          toolCalls: [...currentToolCalls],
-          toolResults: [...currentToolResults],
-        });
-        currentToolCalls = [];
-        currentToolResults = [];
-      }
+      flush();
       grouped.push(event);
     }
   }
 
-  if (currentToolCalls.length > 0 || currentToolResults.length > 0) {
-    grouped.push({
-      type: "tool_group",
-      toolCalls: [...currentToolCalls],
-      toolResults: [...currentToolResults],
-    });
-  }
+  flush();
 
   return grouped;
 }

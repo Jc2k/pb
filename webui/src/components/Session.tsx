@@ -141,18 +141,55 @@ export function DiffView({ diff }: { diff: string }) {
 
 /* ─── message bubble component for grouping ────────────────── */
 
-export function ToolGroupBubble({
+function controllerActionPresentation(event: AgentEvent): {
+  label: string;
+  detail: string;
+  icon: string;
+} | null {
+  switch (event.type) {
+    case "controller_observation":
+      return {
+        label: `${
+          event.receipt.operation === "read_file" ? "Read" : "Inspected"
+        } ${event.receipt.path}`,
+        detail: event.receipt.coverage === "full"
+          ? `${event.receipt.observed_bytes.toLocaleString()} bytes · full coverage`
+          : `${event.receipt.observed_bytes.toLocaleString()} bytes · bounded ranges`,
+        icon: event.receipt.operation === "read_file"
+          ? "bi bi-file-earmark-text"
+          : "bi bi-search",
+      };
+    case "controller_closure":
+      return {
+        label: "Closed no-change work",
+        detail: event.reason,
+        icon: "bi bi-check2-circle",
+      };
+    case "controller_mutation":
+      return {
+        label: `Deleted ${event.receipt.path}`,
+        detail: "Tracked · Git-recoverable",
+        icon: "bi bi-trash3",
+      };
+    default:
+      return null;
+  }
+}
+
+export function ActionGroupBubble({
   toolCalls,
   toolResults,
+  controllerActions,
 }: {
   toolCalls: EventEnvelope[];
   toolResults: EventEnvelope[];
+  controllerActions: EventEnvelope[];
 }) {
   const [isOpen, setIsOpen] = useState(false);
 
-  if (toolCalls.length === 0) return null;
+  if (toolCalls.length === 0 && controllerActions.length === 0) return null;
 
-  const collapseId = `tools-${Math.random().toString(36).substr(2, 9)}`;
+  const collapseId = `actions-${Math.random().toString(36).substr(2, 9)}`;
 
   const toolItems = toolCalls
     .map((e, i) => {
@@ -169,24 +206,49 @@ export function ToolGroupBubble({
       detailText = getToolDetail(e, result);
 
       return (
-        <div key={i} className={`tool-item ${statusClass}`}>
+        <div key={`model-${i}`} className={`tool-item ${statusClass}`}>
           <i className={iconClass}></i>
-          <span>{friendlyName}</span>
+          <span className="action-label">
+            <span className="action-actor model">Model</span>
+            <span>{friendlyName}</span>
+          </span>
           {detailText && <small>{detailText}</small>}
         </div>
       );
     })
     .filter(Boolean);
 
-  const toolNames = toolCalls
+  const controllerItems = controllerActions.map((envelope, index) => {
+    const presentation = controllerActionPresentation(envelope.event);
+    if (!presentation) return null;
+    return (
+      <div key={`pb-${index}`} className="tool-item success pb-action">
+        <i className={presentation.icon}></i>
+        <span className="action-label">
+          <span className="action-actor pb">pb</span>
+          <span>{presentation.label}</span>
+        </span>
+        <small>{presentation.detail}</small>
+      </div>
+    );
+  }).filter(Boolean);
+
+  const actionNames = toolCalls
     .map((e, i) => {
       if (e.event.type === "tool_call") {
         return TOOL_FRIENDLY_NAMES[e.event.tool] || e.event.tool;
       }
       return "";
     })
+    .concat(controllerActions.map((envelope) =>
+      controllerActionPresentation(envelope.event)?.label || ""
+    ))
     .filter(Boolean)
     .join(" · ");
+  const actionCount = toolCalls.length + controllerActions.length;
+  const actionSummary = toolCalls.length === 0
+    ? `pb handled ${actionCount} routine ${actionCount === 1 ? "action" : "actions"}`
+    : `${actionCount} ${actionCount === 1 ? "action" : "actions"}`;
 
   return (
     <article className="message-row compact tool-message">
@@ -198,19 +260,40 @@ export function ToolGroupBubble({
           type="button"
         >
           <span>
-            <i className="bi bi-tools"></i> {toolCalls.length} tools used
+            <i className="bi bi-lightning-charge"></i> {actionSummary}
           </span>
-          <span className="tool-names">{toolNames}</span>
+          <span className="tool-names">{actionNames}</span>
           <i
             className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
           >
           </i>
         </button>
         <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
-          <div className="tool-list">{toolItems}</div>
+          <div className="tool-list">{controllerItems}{toolItems}</div>
         </div>
       </div>
     </article>
+  );
+}
+
+export function ControllerActionDrawerItem({ envelope }: { envelope: EventEnvelope }) {
+  const presentation = controllerActionPresentation(envelope.event);
+  if (!presentation) return null;
+  const timestampMs = "timestamp_ms" in envelope.event
+    ? envelope.event.timestamp_ms
+    : undefined;
+  return (
+    <div className="drawer-item controller-action-drawer-item">
+      <span>
+        <i className={presentation.icon}></i>
+        <span>
+          <span className="action-actor pb">pb</span>
+          <strong>{presentation.label}</strong>
+          <small>{presentation.detail}</small>
+        </span>
+      </span>
+      {timestampMs && <time>{formatEventTime(timestampMs)}</time>}
+    </div>
   );
 }
 
@@ -305,6 +388,7 @@ export function ToolDrawerSummary({ summary }: { summary: ToolSummary }) {
       >
         <span>
           <i className={summary.icon}></i>
+          <span className="action-actor model">Model</span>
           {summary.friendlyName}
         </span>
         <span className="drawer-count">
@@ -1037,6 +1121,12 @@ function activityLabel(envelope: EventEnvelope): string | undefined {
       return `${TOOL_FRIENDLY_NAMES[event.tool] || event.tool} started`;
     case "tool_result":
       return "Tool result received";
+    case "controller_observation":
+      return `pb ${event.receipt.operation === "read_file" ? "read" : "inspected"} ${event.receipt.path}`;
+    case "controller_closure":
+      return "pb closed no-change work";
+    case "controller_mutation":
+      return `pb deleted ${event.receipt.path}`;
     case "user_question":
       return "Waiting for an answer";
     case "user_answer":

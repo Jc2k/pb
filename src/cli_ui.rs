@@ -22,14 +22,10 @@ pub fn render_event(event: &AgentEvent) {
         }
         AgentEvent::HarnessExperimentConfigured {
             observation_rendering,
-            controller_delete_elision,
             ..
         } => print_header(
             "harness experiment",
-            &format!(
-                "observation_rendering={}; controller_delete_elision={controller_delete_elision}",
-                observation_rendering.as_str()
-            ),
+            &format!("observation_rendering={}", observation_rendering.as_str()),
         ),
         AgentEvent::ConversationTurnStarted { intent, task, .. } => {
             print_header("turn", &format!("{intent:?}: {task}"));
@@ -134,20 +130,18 @@ pub fn render_event(event: &AgentEvent) {
         } => print_header("reasoning", content),
         AgentEvent::ToolCall { tool, .. } => print_header("tool", tool),
         AgentEvent::ControllerObservation { receipt, .. } => print_header(
-            "controller observation",
-            &format!(
-                "{} {} ({}, {})",
+            "pb action",
+            &format_controller_observation(
                 receipt.operation.as_str(),
-                receipt.path,
+                &receipt.path,
                 receipt.coverage.as_str(),
-                receipt.prompt_representation.as_str()
+                receipt.observed_bytes,
             ),
         ),
-        AgentEvent::ControllerClosure { reason, .. } => print_header("controller closure", reason),
-        AgentEvent::ControllerMutation { receipt, .. } => print_header(
-            "controller mutation",
-            &format!("delete {} ({})", receipt.path, receipt.action_id),
-        ),
+        AgentEvent::ControllerClosure { reason, .. } => print_header("pb action", reason),
+        AgentEvent::ControllerMutation { receipt, .. } => {
+            print_header("pb action", &format_controller_delete(&receipt.path))
+        }
         AgentEvent::ToolBatch {
             call_count,
             useful_count,
@@ -458,5 +452,35 @@ fn format_energy(joules: f64) -> String {
         format!("{:.2} Wh", joules / 3_600.0)
     } else {
         format!("{:.3} kWh", joules / 3_600_000.0)
+    }
+}
+
+fn format_controller_observation(
+    operation: &str,
+    path: &str,
+    coverage: &str,
+    observed_bytes: usize,
+) -> String {
+    format!("{operation} {path} · {coverage} coverage · {observed_bytes} bytes")
+}
+
+fn format_controller_delete(path: &str) -> String {
+    format!("deleted {path} · tracked and Git-recoverable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_controller_actions_are_explicit_and_recovery_aware() {
+        assert_eq!(
+            format_controller_observation("read_file", "src/lib.rs", "full", 42),
+            "read_file src/lib.rs · full coverage · 42 bytes"
+        );
+        assert_eq!(
+            format_controller_delete("obsolete.rs"),
+            "deleted obsolete.rs · tracked and Git-recoverable"
+        );
     }
 }

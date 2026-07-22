@@ -122,7 +122,6 @@ struct WorkflowConfigMetadata {
 struct HarnessRunAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     observation_rendering: Option<crate::workflow::ObservationRendering>,
-    controller_delete_elision_enabled: bool,
     controller_observations: usize,
     controller_observation_prompt_bytes: usize,
     #[serde(default)]
@@ -328,11 +327,9 @@ impl EventSink for HarnessEventSink {
             }
             AgentEvent::HarnessExperimentConfigured {
                 observation_rendering,
-                controller_delete_elision,
                 ..
             } => {
                 state.audit.observation_rendering = Some(*observation_rendering);
-                state.audit.controller_delete_elision_enabled = *controller_delete_elision;
             }
             AgentEvent::ControllerObservation { receipt, .. } => {
                 state.audit.controller_observations += 1;
@@ -731,14 +728,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     println!("pb harness: run_events={}", layout.run_events.display());
     println!("pb harness: run_journal={}", layout.run_journal.display());
     println!("pb harness: resumed={}", layout.resumed);
-    println!(
-        "pb harness: observation_rendering={}",
-        args.observation_rendering.as_str()
-    );
-    println!(
-        "pb harness: controller_delete_elision={}",
-        args.controller_delete_elision
-    );
+    println!("pb harness: deterministic_actions=controller_block");
 
     let user_config = UserConfig::load()?;
     let model_dir = args
@@ -804,13 +794,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
                 .map(|tool| (*tool).to_string())
                 .collect(),
         ),
-        action_elision: if args.observation_rendering.is_controller() {
-            crate::workflow::ActionElisionMode::Safe
-        } else {
-            crate::workflow::ActionElisionMode::Off
-        },
-        observation_rendering: args.observation_rendering,
-        controller_delete_elision: args.controller_delete_elision,
+        observation_rendering: crate::workflow::ObservationRendering::ControllerBlock,
         accept_existing_workspace_changes: layout.resumed,
         ctx_size: args
             .ctx_size
@@ -860,8 +844,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         &layout.workflow_checkpoint,
     )?;
     sink.emit(AgentEvent::HarnessExperimentConfigured {
-        observation_rendering: args.observation_rendering,
-        controller_delete_elision: args.controller_delete_elision,
+        observation_rendering: crate::workflow::ObservationRendering::ControllerBlock,
         timestamp_ms: Some(now_millis()),
     });
     if let Some(goal) = goal_context.as_ref() {
@@ -1714,14 +1697,13 @@ fn write_journal(
         audit.goal_amendment_requests,
         audit.goal_budget_requests,
     ));
-    journal.push_str("\n## Controller action-elision audit\n\n");
+    journal.push_str("\n## Deterministic controller actions\n\n");
     journal.push_str(&format!(
-        "- Observation rendering: `{}`\n- Controller deletion enabled: `{}`\n- Observations / prompt bytes: `{}` / `{}`\n- Observation coverage: `{}`\n- Controller mutations / closures: `{}` / `{}`\n",
+        "- Observation rendering: `{}`\n- Observations / prompt bytes: `{}` / `{}`\n- Observation coverage: `{}`\n- Controller mutations / closures: `{}` / `{}`\n",
         audit
             .observation_rendering
             .map(crate::workflow::ObservationRendering::as_str)
             .unwrap_or("none"),
-        audit.controller_delete_elision_enabled,
         audit.controller_observations,
         audit.controller_observation_prompt_bytes,
         serde_json::to_string(&audit.controller_observation_coverage)
@@ -2412,7 +2394,6 @@ mod tests {
         .unwrap();
         sink.emit(AgentEvent::HarnessExperimentConfigured {
             observation_rendering: crate::workflow::ObservationRendering::ControllerBlock,
-            controller_delete_elision: false,
             timestamp_ms: None,
         });
         sink.emit(AgentEvent::ControllerObservation {

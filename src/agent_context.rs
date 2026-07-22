@@ -259,16 +259,7 @@ fn completed_tool_groups(messages: &[ChatMessage]) -> Vec<(usize, usize)> {
                 end += 1;
             }
             if end > index + 1 {
-                let controller_owned = messages[index + 1..end].iter().any(|message| {
-                    message
-                        .prompt_tool_result
-                        .as_ref()
-                        .and_then(|metadata| metadata.actual_origin.as_deref())
-                        == Some("controller")
-                });
-                if !controller_owned {
-                    groups.push((index, end));
-                }
+                groups.push((index, end));
                 index = end;
                 continue;
             }
@@ -543,21 +534,11 @@ mod tests {
     }
 
     #[test]
-    fn controller_tool_transcript_is_not_compacted_into_false_partial_coverage() {
+    fn truthful_controller_context_block_is_not_a_model_tool_group() {
         let messages = vec![
             ChatMessage::text("system", "SYSTEM"),
             ChatMessage::text("user", "TASK"),
-            ChatMessage::assistant_with_tool_calls(
-                "",
-                vec![AgentToolCall {
-                    id: Some("controller-read".to_string()),
-                    tool: "read_file".to_string(),
-                    arguments: json!({"path":"small.txt"}),
-                }],
-            ),
-            ChatMessage::tool_result_with_metadata(
-                "read_file".to_string(),
-                Some("controller-read".to_string()),
+            ChatMessage::context_receipt(
                 "x".repeat(1_600),
                 PromptToolResultMetadata {
                     arguments_sha256: normalized_arguments_sha256(&json!({"path":"small.txt"})),
@@ -567,19 +548,22 @@ mod tests {
                     workspace_fingerprint: Some("a".repeat(64)),
                     evidence_effects: "read_before_write".to_string(),
                     actual_origin: Some("controller".to_string()),
-                    prompt_representation: Some("disclosed_tool_transcript".to_string()),
+                    prompt_representation: Some("controller_block".to_string()),
                     observation_coverage: Some("full".to_string()),
                     observation_action_id: Some("controller-read".to_string()),
                     ..PromptToolResultMetadata::default()
                 },
             ),
         ];
-        let prepared = prepare_prompt(&messages, 560, 100, 0, measured).unwrap();
+        let prepared = prepare_prompt(&messages, 2_048, 100, 0, measured).unwrap();
         assert_eq!(prepared.compacted_messages, 0);
         assert_eq!(prepared.messages.len(), messages.len());
-        assert_eq!(prepared.messages[3].content, messages[3].content);
+        assert_eq!(prepared.messages[2].role, "user");
+        assert!(prepared.messages[2].tool_calls.is_empty());
+        assert!(prepared.messages[2].tool_call_id.is_none());
+        assert_eq!(prepared.messages[2].content, messages[2].content);
         assert_eq!(
-            prepared.messages[3]
+            prepared.messages[2]
                 .prompt_tool_result
                 .as_ref()
                 .unwrap()

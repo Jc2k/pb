@@ -3,7 +3,7 @@ import { equal } from "node:assert/strict";
 import type { EventEnvelope } from "../types/index";
 import {
   getAvatarForProfile,
-  groupToolEvents,
+  groupActionEvents,
   handoffNotificationTitle,
   projectName,
   projectSettingsPath,
@@ -72,20 +72,33 @@ Deno.test("every named agent profile has a packaged avatar", async () => {
   }
 });
 
-Deno.test("groupToolEvents groups contiguous tool calls with their results", () => {
+Deno.test("groupActionEvents groups model and pb actions while preserving actors", () => {
   const events: EventEnvelope[] = [
     { version: "1", event: { type: "reasoning", content: "thinking", profile: "build" } },
     { version: "1", event: { type: "tool_call", tool: "read_file", arguments: { path: "Cargo.toml" } } },
     { version: "1", event: { type: "tool_result", tool: "read_file", result: "[package]" } },
+    {
+      version: "1",
+      event: {
+        type: "controller_closure",
+        workflow_id: "workflow-1",
+        stage: "implementing",
+        reason: "Trusted no-change contract",
+      },
+    },
     { version: "1", event: { type: "final", content: "done", profile: "build" } },
   ];
 
-  const grouped = groupToolEvents(events);
+  const grouped = groupActionEvents(events);
 
   equal(grouped.length, 3);
-  equal((grouped[1] as { type: string }).type, "tool_group");
+  equal((grouped[1] as { type: string }).type, "action_group");
   equal((grouped[1] as { toolCalls: EventEnvelope[] }).toolCalls.length, 1);
   equal((grouped[1] as { toolResults: EventEnvelope[] }).toolResults.length, 1);
+  equal(
+    (grouped[1] as { controllerActions: EventEnvelope[] }).controllerActions.length,
+    1,
+  );
 });
 
 Deno.test("projectSettingsPath encodes project names under the project URL", () => {

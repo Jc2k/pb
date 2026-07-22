@@ -247,12 +247,17 @@ Deno.test("session workspace separates user chat from assistant transcript conte
 
   ok(page.includes('className="app-shell session-shell"'));
   ok(page.includes("Session details"));
+  ok(page.includes('title="Actions"'));
   ok(page.includes('title="Plan"'));
   ok(page.includes('title="Activity"'));
   ok(page.includes("<SessionActivity events={events} />"));
   ok(component.includes("assistant-message assistant-transcript"));
   ok(component.includes("<strong>You</strong>"));
   ok(component.includes("function activityLabel"));
+  ok(component.includes('className="action-actor model"'));
+  ok(component.includes('className="action-actor pb"'));
+  ok(component.includes("export function ToolDrawerSummary"));
+  ok(component.includes("Closed no-change work"));
   ok(component.includes('className="transcript-diff"'));
   ok(
     css.includes(

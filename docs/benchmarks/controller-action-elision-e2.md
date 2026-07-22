@@ -2,7 +2,10 @@
 
 Captured: 2026-07-22
 
-Plan: [Controller-owned deterministic action elision](../controller-action-elision-plan.md)
+> Subsequent product decision: transcript-shaped renderings and user modes were removed. pb now
+> uses intrinsic, truthful controller blocks; this report preserves the historical qualification.
+
+Plan: [Deterministic controller actions](../controller-action-elision-plan.md)
 
 This qualification tests the accepted-plan read boundary with one immutable fixture and four
 renderings. It closes the byte-lock defect from E1 and informs the production representation

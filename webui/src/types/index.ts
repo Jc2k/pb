@@ -1,12 +1,7 @@
 export type AgentEvent =
   | {
     type: "harness_experiment_configured";
-    observation_rendering:
-      | "native"
-      | "controller_block"
-      | "disclosed_tool_transcript"
-      | "compatibility_tool_transcript";
-    controller_delete_elision: boolean;
+    observation_rendering: "native" | "controller_block";
     timestamp_ms?: number;
   }
   | {
@@ -223,10 +218,7 @@ export type AgentEvent =
       version: number;
       action_id: string;
       actual_origin: "controller";
-      prompt_representation:
-        | "controller_block"
-        | "disclosed_tool_transcript"
-        | "compatibility_tool_transcript";
+      prompt_representation: "controller_block";
       stage: WorkflowStage;
       work_unit_id?: string;
       operation: "read_file" | "inspect_change";

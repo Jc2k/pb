@@ -71,15 +71,15 @@ before execution and roll back earlier members after an execution failure. Diagn
 cannot mint selected-check evidence and are rejected if they alter repository or Git control state.
 Optional contract `work_unit_guidance` is size-bounded advisory prompt text for an exact allowed
 path; it grants no capability, scope, evidence, progress, or stage transition.
-Default-off controller action elision preserves the same boundary. The effective mode is copied
-from typed user configuration by the daemon and is skipped in stored/API request serialization.
-Production uses a truthful controller block; prompt-local synthetic calls exist only in hidden
-experiments and never become durable model actions. Full controller reads may grant
+Intrinsic deterministic controller actions preserve the same boundary and cannot be configured or
+overridden by stored/API request fields. Production uses one truthful controller user/context
+block; there are no prompt-local synthetic assistant calls. Full controller reads may grant
 read-before-write only for the exact revalidated fingerprint; diagnostic excerpts grant only
 range-confined edits; review observations grant inspection coverage but no verdict authority.
-Automatic deletion requires `safe` plus a separate local opt-in and rejects directories, dirty or
-untracked content, adopted work, stale fingerprints, forbidden paths, and ambiguous targets;
-eligible tracked deletions remain recoverable from Git.
+Automatic deletion rejects directories, oversized files, dirty or untracked content, adopted work,
+stale fingerprints, forbidden paths, non-required mutation contracts, and ambiguous targets;
+eligible tracked deletions remain recoverable from Git. A tracked symlink is removed without
+following its target.
 
 Configured tasks run in an isolated snapshot. pb rejects Git-control changes, undeclared paths,
 unsafe symlinks, and boundedness violations before staging every output. Promotion is transactional:

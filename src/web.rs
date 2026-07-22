@@ -461,7 +461,7 @@ pub async fn run_server_with_ready(
             return Err(err);
         }
     };
-    let restored_sessions = restore_sessions(&project_entries, &defaults);
+    let restored_sessions = restore_sessions(&project_entries);
     let project_usage = build_project_usage_cache(&restored_sessions);
     let user_config = match crate::config::UserConfig::load() {
         Ok(config) => config,
@@ -3579,24 +3579,19 @@ async fn watch_session(
     Ok(())
 }
 
-fn restore_sessions(
-    project_entries: &[ProjectEntry],
-    defaults: &AgentRequest,
-) -> HashMap<String, SessionState> {
+fn restore_sessions(project_entries: &[ProjectEntry]) -> HashMap<String, SessionState> {
     session_store::restore_registered_sessions(project_entries)
         .into_iter()
         .map(session_from_persisted)
         .map(|(session_id, mut session)| {
-            apply_server_action_elision_policy(&mut session.request_template, defaults);
+            apply_intrinsic_controller_actions(&mut session.request_template);
             (session_id, session)
         })
         .collect()
 }
 
-fn apply_server_action_elision_policy(request: &mut AgentRequest, defaults: &AgentRequest) {
-    request.action_elision = defaults.action_elision;
-    request.observation_rendering = defaults.observation_rendering;
-    request.controller_delete_elision = defaults.controller_delete_elision;
+fn apply_intrinsic_controller_actions(request: &mut AgentRequest) {
+    request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
 }
 
 fn build_project_usage_cache(
@@ -4027,9 +4022,7 @@ mod workflow_tests {
             max_tokens: 1,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
-            action_elision: crate::workflow::ActionElisionMode::Off,
             observation_rendering: crate::workflow::ObservationRendering::Native,
-            controller_delete_elision: false,
             accept_existing_workspace_changes: false,
             ctx_size: 128,
             threads: None,
@@ -4055,39 +4048,26 @@ mod workflow_tests {
     }
 
     #[test]
-    fn persisted_or_client_fields_cannot_enable_action_elision_without_server_policy() {
+    fn persisted_or_client_fields_cannot_disable_intrinsic_controller_actions() {
         let directory = tempfile::tempdir().unwrap();
         let template = request(directory.path());
         let mut value = serde_json::to_value(&template).unwrap();
-        assert!(value.get("action_elision").is_none());
         assert!(value.get("observation_rendering").is_none());
-        assert!(value.get("controller_delete_elision").is_none());
         value["action_elision"] = serde_json::json!("safe");
-        value["observation_rendering"] = serde_json::json!("compatibility_tool_transcript");
-        value["controller_delete_elision"] = serde_json::json!(true);
+        value["observation_rendering"] = serde_json::json!("native");
+        value["controller_delete_elision"] = serde_json::json!(false);
 
         let mut restored: AgentRequest = serde_json::from_value(value).unwrap();
-        assert_eq!(
-            restored.action_elision,
-            crate::workflow::ActionElisionMode::Off
-        );
         assert_eq!(
             restored.observation_rendering,
             crate::workflow::ObservationRendering::Native
         );
-        assert!(!restored.controller_delete_elision);
 
-        let mut defaults = request(directory.path());
-        defaults.action_elision = crate::workflow::ActionElisionMode::Safe;
-        defaults.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
-        defaults.controller_delete_elision = true;
-        apply_server_action_elision_policy(&mut restored, &defaults);
-        assert_eq!(restored.action_elision, defaults.action_elision);
+        apply_intrinsic_controller_actions(&mut restored);
         assert_eq!(
             restored.observation_rendering,
-            defaults.observation_rendering
+            crate::workflow::ObservationRendering::ControllerBlock
         );
-        assert!(restored.controller_delete_elision);
     }
 
     #[test]

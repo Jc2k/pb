@@ -544,17 +544,10 @@ pub struct AgentRequest {
     /// Optional native-tool allowlist for bounded direct harness runs.
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
-    /// Server-owned production policy for controller-executed deterministic actions. Persisted and
-    /// API payloads cannot enable it.
+    /// Internal native control versus pb's truthful controller representation. Product requests
+    /// always use the controller block; the hidden evaluator owns the native comparison.
     #[serde(skip)]
-    pub action_elision: crate::workflow::ActionElisionMode,
-    /// Hidden harness experiment selecting how controller-executed deterministic observations are
-    /// represented to the model. Production uses only the explicit controller block when enabled.
-    #[serde(skip)]
-    pub observation_rendering: crate::workflow::ObservationRendering,
-    /// Separate server-owned opt-in for the conservative tracked-clean deletion path.
-    #[serde(skip)]
-    pub controller_delete_elision: bool,
+    pub(crate) observation_rendering: crate::workflow::ObservationRendering,
     /// Allow an explicitly resumed task to satisfy the change gate with pending workspace changes.
     #[serde(default)]
     pub accept_existing_workspace_changes: bool,
@@ -5566,8 +5559,7 @@ fn run_agent_steps(
                 ));
             }
         }
-        if args.action_elision == crate::workflow::ActionElisionMode::Safe
-            && args.controller_delete_elision
+        if args.observation_rendering.is_controller()
             && let Some(unit) = work_units
                 .as_ref()
                 .and_then(crate::workflow::WorkUnitLedger::active)
@@ -5591,8 +5583,7 @@ fn run_agent_steps(
                 .collect::<BTreeSet<_>>();
             ledger.reconcile(&current, &evidence_paths)?;
         }
-        if args.action_elision.allows_read()
-            && args.observation_rendering.is_controller()
+        if args.observation_rendering.is_controller()
             && let Some(unit) = work_units
                 .as_ref()
                 .and_then(crate::workflow::WorkUnitLedger::active)
@@ -11431,8 +11422,7 @@ fn controller_no_change_implementation(
     run: &crate::workflow::WorkflowRun,
     workspace_root: &Path,
 ) -> Result<Option<crate::workflow::ArtifactEnvelope<crate::workflow::ImplementationArtifact>>> {
-    if !args.action_elision.allows_closure()
-        || !args.observation_rendering.is_controller()
+    if !args.observation_rendering.is_controller()
         || run.stage != crate::workflow::WorkflowStage::Implementing
         || !args.contract.as_ref().is_some_and(|contract| {
             contract.mutation == crate::harness_contract::MutationRequirement::Forbidden
@@ -12136,8 +12126,7 @@ fn recorded_generation_input(
         "messages": message_values,
         "tools": tool_values,
     }))?;
-    let normalized_messages =
-        normalized_recorded_messages(messages, observation_action_id.as_deref());
+    let normalized_messages = normalized_recorded_messages(messages);
     let normalized_bytes = serde_json::to_vec(&json!({
         "messages": normalized_messages,
         "tools": tool_values,
@@ -12179,31 +12168,14 @@ fn recorded_chat_message(message: &ChatMessage) -> Value {
     })
 }
 
-fn normalized_recorded_messages(
-    messages: &[ChatMessage],
-    observation_action_id: Option<&str>,
-) -> Vec<Value> {
-    let synthetic_id =
-        observation_action_id.map(|action_id| format!("pb-controller-observation-{action_id}"));
+fn normalized_recorded_messages(messages: &[ChatMessage]) -> Vec<Value> {
     let mut inserted_observation = false;
     let mut normalized = Vec::with_capacity(messages.len());
     for message in messages {
         let belongs_to_observation = message
             .prompt_tool_result
             .as_ref()
-            .is_some_and(|metadata| metadata.actual_origin.as_deref() == Some("controller"))
-            || synthetic_id.as_ref().is_some_and(|synthetic_id| {
-                message.tool_call_id.as_deref() == Some(synthetic_id.as_str())
-                    || message
-                        .tool_calls
-                        .iter()
-                        .any(|call| call.id.as_deref() == Some(synthetic_id.as_str()))
-                    || message.content.contains(synthetic_id)
-                    || observation_action_id.is_some_and(|action_id| {
-                        message.content.contains("prompt representation only")
-                            && message.content.contains(action_id)
-                    })
-            });
+            .is_some_and(|metadata| metadata.actual_origin.as_deref() == Some("controller"));
         if belongs_to_observation {
             if !inserted_observation {
                 normalized.push(json!({"controller_observation": "representation_placeholder"}));
@@ -14220,12 +14192,6 @@ fn controller_observation_messages(
     Vec<ChatMessage>,
 )> {
     let arguments = json!({"path": receipt.path});
-    let synthetic_id = format!("pb-controller-observation-{}", receipt.action_id);
-    let tool_call = AgentToolCall {
-        id: Some(synthetic_id.clone()),
-        tool: receipt.operation.as_str().to_string(),
-        arguments: arguments.clone(),
-    };
     let controller_block = format!(
         "pb controller observation (actual_origin=controller; action_id={}; operation={}; path={}; coverage={}):\n{}",
         receipt.action_id,
@@ -14234,22 +14200,8 @@ fn controller_observation_messages(
         receipt.coverage.as_str(),
         result
     );
-    let disclosure = format!(
-        "pb executed deterministic {} on the model's behalf. The following assistant/tool pair is prompt representation only; actual_origin=controller; action_id={}; it is not a model-authored tool call.",
-        receipt.operation.as_str(),
-        receipt.action_id
-    );
     receipt.prompt_bytes = match receipt.prompt_representation {
         crate::workflow::ObservationRendering::ControllerBlock => controller_block.len(),
-        crate::workflow::ObservationRendering::DisclosedToolTranscript => disclosure
-            .len()
-            .saturating_add(result.len())
-            .saturating_add(arguments.to_string().len())
-            .saturating_add(synthetic_id.len()),
-        crate::workflow::ObservationRendering::CompatibilityToolTranscript => result
-            .len()
-            .saturating_add(arguments.to_string().len())
-            .saturating_add(synthetic_id.len()),
         crate::workflow::ObservationRendering::Native => {
             bail!("native rendering cannot carry a controller observation")
         }
@@ -14257,31 +14209,7 @@ fn controller_observation_messages(
     receipt.included_in_prompt = receipt.prompt_bytes > 0;
     receipt.validate()?;
     let metadata = controller_observation_metadata(&receipt, &arguments, result);
-    let messages = match receipt.prompt_representation {
-        crate::workflow::ObservationRendering::ControllerBlock => {
-            vec![ChatMessage::context_receipt(controller_block, metadata)]
-        }
-        crate::workflow::ObservationRendering::DisclosedToolTranscript => vec![
-            ChatMessage::text("system", disclosure),
-            ChatMessage::assistant_with_tool_calls("", vec![tool_call]),
-            ChatMessage::tool_result_with_metadata(
-                receipt.operation.as_str().to_string(),
-                Some(synthetic_id),
-                result.to_string(),
-                metadata,
-            ),
-        ],
-        crate::workflow::ObservationRendering::CompatibilityToolTranscript => vec![
-            ChatMessage::assistant_with_tool_calls("", vec![tool_call]),
-            ChatMessage::tool_result_with_metadata(
-                receipt.operation.as_str().to_string(),
-                Some(synthetic_id),
-                result.to_string(),
-                metadata,
-            ),
-        ],
-        crate::workflow::ObservationRendering::Native => unreachable!(),
-    };
+    let messages = vec![ChatMessage::context_receipt(controller_block, metadata)];
     Ok((receipt, messages))
 }
 
@@ -14355,8 +14283,7 @@ fn build_controller_review_observations(
         ControllerObservationOrigin, ObservationCoverage, ObservationRange,
     };
 
-    if !args.action_elision.allows_review()
-        || !args.observation_rendering.is_controller()
+    if !args.observation_rendering.is_controller()
         || args.workflow_stage != Some(crate::workflow::WorkflowStage::CodeReview)
     {
         return Ok(Vec::new());
@@ -14661,8 +14588,7 @@ fn build_controller_read_observation(
         WorkUnitState,
     };
 
-    if !args.action_elision.allows_read()
-        || !args.observation_rendering.is_controller()
+    if !args.observation_rendering.is_controller()
         || !matches!(
             unit.state,
             WorkUnitState::EvidenceNeeded | WorkUnitState::DiagnosticFailed
@@ -14922,9 +14848,7 @@ fn maybe_execute_controller_delete(
     messages: &mut Vec<ChatMessage>,
     sink: &mut dyn EventSink,
 ) -> Result<bool> {
-    if args.action_elision != crate::workflow::ActionElisionMode::Safe
-        || !args.observation_rendering.is_controller()
-        || !args.controller_delete_elision
+    if !args.observation_rendering.is_controller()
         || args.workflow_stage != Some(crate::workflow::WorkflowStage::Implementing)
         || unit.operation != crate::workflow::PlannedChange::Delete
         || !matches!(
@@ -15017,7 +14941,7 @@ fn maybe_execute_controller_delete(
         timestamp_ms: Some(now_millis()),
     });
     messages.push(correction_chat_message(
-        "Harness controller deletion",
+        "pb deterministic deletion",
         &format!(
             "actual_origin=controller; action_id={}; deleted accepted tracked unchanged path {}; this is a controller fact, not a model tool call, review verdict, check result, or completion claim.",
             receipt.action_id, receipt.path
@@ -20153,9 +20077,7 @@ mod tests {
             max_tokens,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
-            action_elision: crate::workflow::ActionElisionMode::Off,
             observation_rendering: crate::workflow::ObservationRendering::Native,
-            controller_delete_elision: false,
             accept_existing_workspace_changes: false,
             ctx_size: 8192,
             threads: None,
@@ -20475,7 +20397,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_tool_transcripts_are_not_replayed_into_model_context() {
+    fn fabricated_tool_transcripts_are_not_replayed_into_model_context() {
         let fabricated = r#"```json
 {"type":"tool_call","tool":"write_file","arguments":{"path":"game.js","content":"ok"}}
 ```
@@ -20527,74 +20449,37 @@ the next imagined action"#;
     }
 
     #[test]
-    fn controller_rendering_arms_preserve_truthful_metadata_without_durable_model_calls() {
-        for (rendering, roles) in [
-            (
-                crate::workflow::ObservationRendering::ControllerBlock,
-                vec!["user"],
-            ),
-            (
-                crate::workflow::ObservationRendering::DisclosedToolTranscript,
-                vec!["system", "assistant", "tool"],
-            ),
-            (
-                crate::workflow::ObservationRendering::CompatibilityToolTranscript,
-                vec!["assistant", "tool"],
-            ),
-        ] {
-            let (receipt, messages) =
-                controller_observation_messages(test_controller_receipt(rendering), "test")
-                    .unwrap();
-            assert_eq!(
-                messages
-                    .iter()
-                    .map(|message| message.role)
-                    .collect::<Vec<_>>(),
-                roles
-            );
-            assert!(receipt.prompt_bytes > 0);
-            let metadata = messages
-                .iter()
-                .find_map(|message| message.prompt_tool_result.as_ref())
-                .unwrap();
-            assert_eq!(metadata.actual_origin.as_deref(), Some("controller"));
-            assert_eq!(
-                metadata.observation_action_id.as_deref(),
-                Some("controller-action")
-            );
-            assert_eq!(
-                metadata.prompt_representation.as_deref(),
-                Some(rendering.as_str())
-            );
-        }
+    fn controller_rendering_is_a_truthful_context_block_without_model_tool_calls() {
+        let rendering = crate::workflow::ObservationRendering::ControllerBlock;
+        let (receipt, messages) =
+            controller_observation_messages(test_controller_receipt(rendering), "test").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert!(messages[0].tool_calls.is_empty());
+        assert!(messages[0].tool_call_id.is_none());
+        assert!(receipt.prompt_bytes > 0);
+        let metadata = messages[0].prompt_tool_result.as_ref().unwrap();
+        assert_eq!(metadata.actual_origin.as_deref(), Some("controller"));
+        assert_eq!(
+            metadata.observation_action_id.as_deref(),
+            Some("controller-action")
+        );
+        assert_eq!(
+            metadata.prompt_representation.as_deref(),
+            Some("controller_block")
+        );
     }
 
     #[test]
-    fn controller_rendering_inputs_are_byte_locked_outside_the_declared_representation() {
-        let mut normalized = BTreeSet::new();
-        let mut result_hashes = BTreeSet::new();
-        let mut action_ids = BTreeSet::new();
-        for rendering in [
-            crate::workflow::ObservationRendering::ControllerBlock,
-            crate::workflow::ObservationRendering::DisclosedToolTranscript,
-            crate::workflow::ObservationRendering::CompatibilityToolTranscript,
-        ] {
-            let (_, mut observation) =
-                controller_observation_messages(test_controller_receipt(rendering), "test")
-                    .unwrap();
-            let mut messages = vec![
-                ChatMessage::text("system", "locked system"),
-                ChatMessage::text("user", "locked task"),
-            ];
-            messages.append(&mut observation);
-            let recorded = recorded_generation_input(0, &messages, &[]).unwrap();
-            normalized.insert(recorded.normalized_input_sha256);
-            result_hashes.insert(recorded.observation_result_sha256.unwrap());
-            action_ids.insert(recorded.observation_action_id.unwrap());
+    fn legacy_transcript_rendering_names_migrate_to_truthful_controller_blocks() {
+        for legacy in ["disclosed_tool_transcript", "compatibility_tool_transcript"] {
+            let rendering: crate::workflow::ObservationRendering =
+                serde_json::from_value(json!(legacy)).unwrap();
+            assert_eq!(
+                rendering,
+                crate::workflow::ObservationRendering::ControllerBlock
+            );
         }
-        assert_eq!(normalized.len(), 1);
-        assert_eq!(result_hashes.len(), 1);
-        assert_eq!(action_ids.len(), 1);
     }
 
     #[test]
@@ -20610,7 +20495,6 @@ the next imagined action"#;
         let snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
-        request.action_elision = crate::workflow::ActionElisionMode::Safe;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         let mut unit = crate::workflow::WorkUnit {
             id: "step:0".to_string(),
@@ -20647,14 +20531,6 @@ the next imagined action"#;
                 .content
                 .ends_with(&expected_native_result)
         );
-
-        request.action_elision = crate::workflow::ActionElisionMode::Off;
-        assert!(
-            build_controller_read_observation(&request, &unit, repo.path(), None)
-                .unwrap()
-                .is_none()
-        );
-        request.action_elision = crate::workflow::ActionElisionMode::Safe;
 
         let large = (1..=2_000)
             .map(|line| format!("const value_{line} = {line};"))
@@ -20718,7 +20594,7 @@ the next imagined action"#;
     }
 
     #[test]
-    fn controller_delete_requires_safe_mode_and_preserves_truthful_origin() {
+    fn controller_delete_is_intrinsic_but_requires_a_current_tracked_clean_file() {
         let repo = init_contract_test_repo();
         std::fs::write(repo.path().join("game.js"), "tracked baseline\n").unwrap();
         git_run(&["add", "game.js"], repo.path()).unwrap();
@@ -20738,46 +20614,30 @@ the next imagined action"#;
         };
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
-        request.action_elision = crate::workflow::ActionElisionMode::ReviewOnly;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
-        request.controller_delete_elision = true;
         let gate = RefCell::new(GateState::default());
         let mut messages = Vec::new();
         let mut sink = CapturingWorkflowSink::default();
 
-        assert!(
-            !maybe_execute_controller_delete(
-                &request,
-                &unit,
-                repo.path(),
-                &gate,
-                &mut messages,
-                &mut sink,
-            )
-            .unwrap()
-        );
-        assert!(repo.path().join("game.js").exists());
-
-        request.action_elision = crate::workflow::ActionElisionMode::Safe;
-        request.controller_delete_elision = false;
-        assert!(
-            !maybe_execute_controller_delete(
-                &request,
-                &unit,
-                repo.path(),
-                &gate,
-                &mut messages,
-                &mut sink,
-            )
-            .unwrap()
-        );
-        request.controller_delete_elision = true;
         let mut stale_unit = unit.clone();
         stale_unit.current_path_fingerprint = Some("stale".to_string());
         assert!(
             !maybe_execute_controller_delete(
                 &request,
                 &stale_unit,
+                repo.path(),
+                &gate,
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        let mut adopted_unit = unit.clone();
+        adopted_unit.adopted = true;
+        assert!(
+            !maybe_execute_controller_delete(
+                &request,
+                &adopted_unit,
                 repo.path(),
                 &gate,
                 &mut messages,
@@ -20798,6 +20658,81 @@ the next imagined action"#;
             .unwrap()
         );
         std::fs::write(repo.path().join("game.js"), "tracked baseline\n").unwrap();
+
+        std::fs::write(repo.path().join("untracked.js"), "not recoverable\n").unwrap();
+        let untracked_snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let untracked_fingerprint = untracked_snapshot.paths["untracked.js"].fingerprint.clone();
+        let untracked_unit = crate::workflow::WorkUnit {
+            id: "delete:untracked".to_string(),
+            plan_step_id: "delete".to_string(),
+            operation: crate::workflow::PlannedChange::Delete,
+            path: "untracked.js".to_string(),
+            baseline_path_fingerprint: Some(untracked_fingerprint.clone()),
+            invocation_path_fingerprint: Some(untracked_fingerprint.clone()),
+            current_path_fingerprint: Some(untracked_fingerprint),
+            adopted: false,
+            state: crate::workflow::WorkUnitState::EvidenceNeeded,
+        };
+        assert!(
+            !maybe_execute_controller_delete(
+                &request,
+                &untracked_unit,
+                repo.path(),
+                &gate,
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        assert!(repo.path().join("untracked.js").exists());
+
+        std::fs::create_dir(repo.path().join("directory")).unwrap();
+        let mut directory_unit = untracked_unit.clone();
+        directory_unit.id = "delete:directory".to_string();
+        directory_unit.path = "directory".to_string();
+        assert!(
+            !maybe_execute_controller_delete(
+                &request,
+                &directory_unit,
+                repo.path(),
+                &gate,
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        assert!(repo.path().join("directory").is_dir());
+
+        request.contract = Some(normalized_test_contract("true"));
+        assert!(
+            !maybe_execute_controller_delete(
+                &request,
+                &unit,
+                repo.path(),
+                &gate,
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        request.contract.as_mut().unwrap().mutation =
+            crate::harness_contract::MutationRequirement::Required;
+        request.contract.as_mut().unwrap().allowed_paths = vec!["other.js".to_string()];
+        assert!(
+            maybe_execute_controller_delete(
+                &request,
+                &unit,
+                repo.path(),
+                &gate,
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("game.js")
+        );
+        assert!(repo.path().join("game.js").exists());
+        request.contract.as_mut().unwrap().allowed_paths = vec!["game.js".to_string()];
         assert!(
             maybe_execute_controller_delete(
                 &request,
@@ -20823,6 +20758,111 @@ the next imagined action"#;
             AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. }
         )));
         assert!(messages[0].content.contains("actual_origin=controller"));
+    }
+
+    #[test]
+    fn controller_delete_rejects_large_tracked_files() {
+        let repo = init_contract_test_repo();
+        let path = repo.path().join("game.js");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_READ_FILE_BYTES.saturating_add(1)).unwrap();
+        git_run(&["add", "game.js"], repo.path()).unwrap();
+        git_run(
+            &["commit", "-m", "test: add large deletion fixture"],
+            repo.path(),
+        )
+        .unwrap();
+        let snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let fingerprint = snapshot.paths["game.js"].fingerprint.clone();
+        let unit = crate::workflow::WorkUnit {
+            id: "delete:large".to_string(),
+            plan_step_id: "delete".to_string(),
+            operation: crate::workflow::PlannedChange::Delete,
+            path: "game.js".to_string(),
+            baseline_path_fingerprint: Some(fingerprint.clone()),
+            invocation_path_fingerprint: Some(fingerprint.clone()),
+            current_path_fingerprint: Some(fingerprint),
+            adopted: false,
+            state: crate::workflow::WorkUnitState::EvidenceNeeded,
+        };
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
+        let mut messages = Vec::new();
+        let mut sink = CapturingWorkflowSink::default();
+
+        assert!(
+            !maybe_execute_controller_delete(
+                &request,
+                &unit,
+                repo.path(),
+                &RefCell::new(GateState::default()),
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        assert!(path.exists());
+        assert!(messages.is_empty());
+        assert!(sink.events.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controller_delete_removes_a_tracked_symlink_without_following_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("target.txt"), "preserve me\n").unwrap();
+        symlink("target.txt", repo.path().join("game.js")).unwrap();
+        git_run(&["add", "target.txt", "game.js"], repo.path()).unwrap();
+        git_run(
+            &["commit", "-m", "test: add symlink deletion fixture"],
+            repo.path(),
+        )
+        .unwrap();
+        let snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let fingerprint = snapshot.paths["game.js"].fingerprint.clone();
+        let unit = crate::workflow::WorkUnit {
+            id: "delete:symlink".to_string(),
+            plan_step_id: "delete".to_string(),
+            operation: crate::workflow::PlannedChange::Delete,
+            path: "game.js".to_string(),
+            baseline_path_fingerprint: Some(fingerprint.clone()),
+            invocation_path_fingerprint: Some(fingerprint.clone()),
+            current_path_fingerprint: Some(fingerprint),
+            adopted: false,
+            state: crate::workflow::WorkUnitState::EvidenceNeeded,
+        };
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
+        let mut messages = Vec::new();
+        let mut sink = CapturingWorkflowSink::default();
+
+        assert!(
+            maybe_execute_controller_delete(
+                &request,
+                &unit,
+                repo.path(),
+                &RefCell::new(GateState::default()),
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        assert!(!std::fs::symlink_metadata(repo.path().join("game.js")).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("target.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ControllerMutation { receipt, .. }
+                if receipt.path == "game.js"
+                    && receipt.tracked
+                    && receipt.recovery.contains("Git baseline")
+        )));
     }
 
     #[test]
@@ -20866,21 +20906,12 @@ the next imagined action"#;
         run.apply(crate::workflow::WorkflowEvent::PlanReviewSubmitted { review })
             .unwrap();
         let mut request = workflow_request(AgentProfile::Build, repo.path());
-        request.action_elision = crate::workflow::ActionElisionMode::Safe;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         let mut contract = normalized_test_contract("true");
         contract.mutation = crate::harness_contract::MutationRequirement::Forbidden;
         contract.allowed_paths.clear();
         request.contract = Some(contract);
         reconcile_work_unit_ledger(&mut run, request.contract.as_ref(), repo.path()).unwrap();
-
-        request.action_elision = crate::workflow::ActionElisionMode::ReviewOnly;
-        assert!(
-            controller_no_change_implementation(&request, &run, repo.path())
-                .unwrap()
-                .is_none()
-        );
-        request.action_elision = crate::workflow::ActionElisionMode::Safe;
 
         let implementation = controller_no_change_implementation(&request, &run, repo.path())
             .unwrap()
@@ -20916,7 +20947,6 @@ the next imagined action"#;
         std::fs::write(repo.path().join("game.js"), "export const answer = 42;\n").unwrap();
         let mut request = workflow_request(AgentProfile::Review, repo.path());
         request.workflow_stage = Some(crate::workflow::WorkflowStage::CodeReview);
-        request.action_elision = crate::workflow::ActionElisionMode::ReviewOnly;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         request.repository_context = Some(repository);
         let gate = RefCell::new(GateState::default());
@@ -20940,13 +20970,6 @@ the next imagined action"#;
         assert!(controller_observations_are_current(repo.path(), &candidates).unwrap());
         std::fs::write(repo.path().join("game.js"), "export const answer = 43;\n").unwrap();
         assert!(!controller_observations_are_current(repo.path(), &candidates).unwrap());
-
-        request.action_elision = crate::workflow::ActionElisionMode::Off;
-        assert!(
-            build_controller_review_observations(&request, repo.path(), &gate)
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]
@@ -22505,7 +22528,6 @@ the next imagined action"#;
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         request.ctx_size = 32_768;
         request.repository_context = Some(repository);
-        request.action_elision = crate::workflow::ActionElisionMode::Safe;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         let completion = json!({
             "id": "implementation-inline",
@@ -29522,9 +29544,7 @@ the next imagined action"#;
             max_tokens: 2048,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
-            action_elision: crate::workflow::ActionElisionMode::Off,
             observation_rendering: crate::workflow::ObservationRendering::Native,
-            controller_delete_elision: false,
             accept_existing_workspace_changes: false,
             ctx_size: 4096,
             threads: None,
@@ -29604,9 +29624,7 @@ the next imagined action"#;
             max_tokens: 2048,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
-            action_elision: crate::workflow::ActionElisionMode::Off,
             observation_rendering: crate::workflow::ObservationRendering::Native,
-            controller_delete_elision: false,
             accept_existing_workspace_changes: false,
             ctx_size: 4096,
             threads: None,

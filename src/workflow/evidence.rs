@@ -16,68 +16,21 @@ const MAX_STAGE_EVIDENCE_BYTES: usize = 64 * 1024;
 const MAX_CONTROLLER_OBSERVATIONS: usize = 64;
 pub const MAX_STAGE_EVIDENCE_ENTRY_BYTES: usize = 16 * 1024;
 
-/// Controller-owned deterministic actions that production agent runs may elide.
+/// Internal native control versus pb's truthful production representation.
 ///
-/// This is deliberately separate from [`ObservationRendering`]. Production policy decides whether
-/// pb may perform an action; hidden harness experiments decide how the resulting bytes are shown.
+/// The aliases keep old preserved events readable; no transcript-shaped rendering remains
+/// executable or configurable.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ActionElisionMode {
-    #[default]
-    Off,
-    ReviewOnly,
-    Safe,
-}
-
-impl ActionElisionMode {
-    pub const fn allows_read(self) -> bool {
-        matches!(self, Self::Safe)
-    }
-
-    pub const fn allows_review(self) -> bool {
-        matches!(self, Self::ReviewOnly | Self::Safe)
-    }
-
-    pub const fn allows_closure(self) -> bool {
-        matches!(self, Self::Safe)
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::ReviewOnly => "review_only",
-            Self::Safe => "safe",
-        }
-    }
-}
-
-impl std::fmt::Display for ActionElisionMode {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ActionElisionMode {
-    type Err = String;
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value {
-            "off" => Ok(Self::Off),
-            "review_only" => Ok(Self::ReviewOnly),
-            "safe" => Ok(Self::Safe),
-            _ => Err("expected off, review_only, or safe".to_string()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
 pub enum ObservationRendering {
+    #[serde(rename = "native")]
     #[default]
     Native,
+    #[serde(
+        rename = "controller_block",
+        alias = "disclosed_tool_transcript",
+        alias = "compatibility_tool_transcript"
+    )]
     ControllerBlock,
-    DisclosedToolTranscript,
-    CompatibilityToolTranscript,
 }
 
 impl ObservationRendering {
@@ -89,8 +42,6 @@ impl ObservationRendering {
         match self {
             Self::Native => "native",
             Self::ControllerBlock => "controller_block",
-            Self::DisclosedToolTranscript => "disclosed_tool_transcript",
-            Self::CompatibilityToolTranscript => "compatibility_tool_transcript",
         }
     }
 }

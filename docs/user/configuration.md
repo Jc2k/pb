@@ -19,7 +19,7 @@ The user configuration file is `<config-dir>/pb/config.toml`. It covers:
 
 - web listen address, port, Unix socket path, and the macOS work-queue sleep preference;
 - model identifier, directory, context, sampling, and resource defaults;
-- default-off controller action-elision and conservative deletion policy;
+- intrinsic deterministic controller-action safety policy;
 - storage roots and inference session-cache policy;
 - FlashMoe in-memory session and resident-runtime bounds;
 - global MCP and LSP server definitions;
@@ -36,38 +36,23 @@ fallback uses the numeric user ID rather than the mutable `USER` environment var
 pb-owned workspaces, leases, and managed cache records use the platform-local data directory by
 default. Set `storage.state_dir` to a non-empty absolute path to relocate them.
 
-## Controller action elision
+## Deterministic controller actions
 
-**Configurable, default off.** pb can execute narrowly deterministic local observations in the
-controller and provide their exact result to the local model without spending a separate model
-turn on tool selection. The production prompt always labels this as a controller observation; the
-tool-transcript representations used by the hidden evaluator are not accepted here.
+**Shipped, intrinsic.** pb performs a narrowly defined set of uniquely determined local actions
+without spending a model turn on choosing them. This is workflow behavior, not a preference: there
+is no `agent.action_elision` or `agent.controller_delete_elision` setting, request field, environment
+toggle, or web switch.
 
-```bash
-pb config set agent.action_elision review_only
-pb config set agent.action_elision safe
-pb config set agent.action_elision off
-```
+Eligible complete reads, diagnostic ranges, and review inspections are supplied to the local model
+as an explicit pb-owned context block. They are never rendered as a fabricated assistant tool call.
+Missing, unreadable, binary, symlinked, stale, oversized, or context-ineligible files fall back to
+ordinary model tools. Automatic deletion is limited to a unique accepted-plan deletion whose file
+or symlink is tracked, clean, unchanged, fresh, bounded, allowed, and Git-recoverable; directories,
+untracked or adopted content, dirty files, and stale fingerprints are rejected.
 
-`review_only` may preload fresh, exact changed-path inspections for code review. `safe` additionally
-permits eligible small-file reads, exact failed-diagnostic ranges, and structural completion fusion.
-Missing, unreadable, binary, stale, oversized, or context-ineligible files fall back to native model
-tools. `off` is the immediate rollback and remains the default until the corresponding qualification
-matrix supports a broader default.
-
-Conservative automatic deletion has a separate opt-in and is inert unless the mode is `safe`:
-
-```bash
-pb config set agent.controller_delete_elision true
-```
-
-It applies only to a unique accepted-plan deletion whose tracked file or symlink is clean, unchanged,
-fresh, and Git-recoverable. Directories, untracked or adopted content, dirty files, ambiguous paths,
-and stale fingerprints remain model-owned or blocked. Set `agent.action_elision` to `off` to disable
-all action elision in one step; the stored deletion preference alone grants no authority. These are
-user-level local controller settings, not project policy, request fields, environment switches, or
-network features. Restart `pb serve` after changing them so new and restored tasks receive the new
-server-owned policy.
+Older configuration files containing the retired `[agent]` keys still load. pb ignores those values
+and omits the section the next time it saves the configuration. `pb config get/set` rejects the
+retired keys rather than implying that they control current workflow safety.
 
 ## Keep macOS awake while pb works
 

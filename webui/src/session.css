@@ -640,8 +640,35 @@ article.user div.message-container {
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+.action-label {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+}
+.action-actor {
+    flex: 0 0 auto;
+    border-radius: 999px;
+    padding: 0.08rem 0.38rem;
+    font-size: 0.62rem;
+    font-weight: 750;
+    letter-spacing: 0.03em;
+    line-height: 1.25;
+    text-transform: uppercase;
+}
+.action-actor.model {
+    background: #eef2f6;
+    color: #475569;
+}
+.action-actor.pb {
+    background: #ede9fe;
+    color: #6d28d9;
+}
 .tool-item.success i {
     color: #16a34a;
+}
+.tool-item.pb-action i {
+    color: #7c3aed;
 }
 .tool-item.active i {
     color: #0d6efd;
@@ -724,6 +751,27 @@ article.user div.message-container {
 
 .drawer-tool-group {
     margin-bottom: 0.65rem;
+}
+
+.controller-action-drawer-item {
+    margin-bottom: 0.65rem;
+    align-items: flex-start;
+}
+
+.controller-action-drawer-item > span > span {
+    display: grid;
+    gap: 0.18rem;
+}
+
+.controller-action-drawer-item strong {
+    font-size: 0.8rem;
+    font-weight: 650;
+}
+
+.controller-action-drawer-item small,
+.controller-action-drawer-item time {
+    color: var(--muted);
+    font-size: 0.7rem;
 }
 
 .drawer-count {

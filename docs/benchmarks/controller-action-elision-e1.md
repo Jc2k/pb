@@ -2,7 +2,10 @@
 
 Captured: 2026-07-22
 
-Plan: [Controller-owned deterministic action elision](../controller-action-elision-plan.md)
+> Subsequent product decision: transcript-shaped renderings were removed. pb now uses intrinsic,
+> truthful controller blocks only; this report preserves the historical experiment.
+
+Plan: [Deterministic controller actions](../controller-action-elision-plan.md)
 
 This first preserved real-model screen tests the fresh-review observation path. It is qualification
 evidence for the hidden harness implementation, not a prompt-representation promotion decision.
