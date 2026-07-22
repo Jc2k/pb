@@ -5504,11 +5504,11 @@ fn run_agent_steps(
                         unit.id, unit.path, unit.operation
                     ),
                     (_, crate::workflow::WorkUnitState::DiagnosticFailed) => format!(
-                        "Harness diagnostic repair unit {}: read the complete current bytes of {} again. Evidence collected before the failed diagnostic was invalidated.",
+                        "Harness diagnostic repair unit {}: read the complete current bytes of {} again. Evidence collected before the failed diagnostic was invalidated. The latest preview may list multiple failed checks; after this read, repair every listed failure together instead of fixing only the first one.",
                         unit.id, unit.path
                     ),
                     (_, crate::workflow::WorkUnitState::DiagnosticRepairReady) => format!(
-                        "Harness diagnostic repair unit {}: repair only {} with target-bound replace_file or edit_file. This repair authority does not reopen any other accepted-plan path.",
+                        "Harness diagnostic repair unit {}: repair only {} with target-bound replace_file or edit_file. Address every failure from the latest diagnostic in one mutation; a partial repair consumes another evidence-and-repair cycle. This repair authority does not reopen any other accepted-plan path. Do not request replan when this exact path can satisfy the listed failures.",
                         unit.id, unit.path
                     ),
                     (
@@ -10861,6 +10861,8 @@ fn delivery_stage_context(
             let (graph_sha256, repository_brief_json) = delivery_repository_brief(run, graph)?;
             let handoff = serde_json::to_string_pretty(&run.task)?;
             let acceptance_projection_note = contract_plan_projection_note(contract);
+            let contract_path_state_note =
+                contract_planning_path_state_note(contract, run.planning_content());
             let prior_challenges = run
                 .plan_review
                 .as_ref()
@@ -10870,7 +10872,7 @@ fn delivery_stage_context(
             Ok(StageContext {
                 system_prompt: "You are the planning stage of a harness-controlled delivery workflow. You have read-only repository tools. Produce a concrete, structurally complete plan tied to real workspace component/check ids and repository-relative paths. Resolve genuinely blocking human ambiguity with ask_user when that tool is exposed; otherwise record a truthful open question instead of inventing an answer. End only by calling submit_plan; prose final responses cannot advance the workflow.".to_string(),
                 user_prompt: format!(
-                    "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}\n\nBounded repository brief (full normalized graph SHA-256 {graph_sha256} remains the validation authority):\n{repository_brief_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{acceptance_projection_note}\n\n{evidence_note}\n\n{handoff_note}\n\n{PLAN_SUBMISSION_GUIDANCE}{correction}",
+                    "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}\n\n{contract_path_state_note}\n\nBounded repository brief (full normalized graph SHA-256 {graph_sha256} remains the validation authority):\n{repository_brief_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{acceptance_projection_note}\n\n{evidence_note}\n\n{handoff_note}\n\n{PLAN_SUBMISSION_GUIDANCE}{correction}",
                     run.task,
                     run.planning_content().fingerprint,
                 ),
@@ -15401,6 +15403,43 @@ fn contract_plan_projection_note(
     )
 }
 
+fn contract_planning_path_state_note(
+    contract: Option<&crate::harness_contract::AgentContract>,
+    snapshot: &crate::workspace::ContentSnapshot,
+) -> String {
+    let Some(contract) = contract else {
+        return "Contract planning path state: no harness contract paths were supplied."
+            .to_string();
+    };
+    if contract.mutation == crate::harness_contract::MutationRequirement::Forbidden {
+        return "Contract planning path state: mutation is forbidden; submit a truthful no-change plan with no path operations."
+            .to_string();
+    }
+    let states = contract
+        .allowed_paths
+        .iter()
+        .map(|path| {
+            if snapshot.paths.contains_key(path) {
+                json!({
+                    "path": path,
+                    "state": "exists",
+                    "valid_next_changes": ["modify", "delete"]
+                })
+            } else {
+                json!({
+                    "path": path,
+                    "state": "missing",
+                    "valid_next_changes": ["create"]
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "Contract planning path state at this exact snapshot (authoritative for each path's next change enum even when the task's historical wording says create): {}",
+        Value::Array(states)
+    )
+}
+
 fn project_contract_plan_checks(
     mut plan: crate::workflow::ArtifactEnvelope<crate::workflow::PlanArtifact>,
     contract: Option<&crate::harness_contract::AgentContract>,
@@ -18932,6 +18971,18 @@ the next imagined action"#;
         let projection_note = contract_plan_projection_note(Some(&contract));
         assert!(projection_note.contains("[logic, review_gate]"));
         assert!(projection_note.contains("Do not spend output copying"));
+        let missing_snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let missing_path_note =
+            contract_planning_path_state_note(Some(&contract), &missing_snapshot);
+        assert!(missing_path_note.contains(r#""path":"game.js""#));
+        assert!(missing_path_note.contains(r#""state":"missing""#));
+        assert!(missing_path_note.contains(r#""valid_next_changes":["create"]"#));
+        std::fs::write(repo.path().join("game.js"), "present\n").unwrap();
+        let existing_snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let existing_path_note =
+            contract_planning_path_state_note(Some(&contract), &existing_snapshot);
+        assert!(existing_path_note.contains(r#""state":"exists""#));
+        assert!(existing_path_note.contains(r#""valid_next_changes":["modify","delete"]"#));
         assert_eq!(
             projected_plan.artifact.acceptance[0].check_ids,
             vec!["logic", "review_gate"]
@@ -19507,6 +19558,30 @@ the next imagined action"#;
             })
             .collect::<Vec<_>>();
         assert_eq!(bound_paths, vec!["alpha.txt", "alpha.txt"]);
+        let repair_instructions = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Correction {
+                    summary, message, ..
+                } if summary == "Active accepted-plan work unit" => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            repair_instructions
+                .iter()
+                .any(|message| message.contains("repair every listed failure together"))
+        );
+        assert!(
+            repair_instructions
+                .iter()
+                .any(|message| message.contains("Address every failure"))
+        );
+        assert!(
+            repair_instructions
+                .iter()
+                .any(|message| message.contains("Do not request replan"))
+        );
     }
 
     #[test]
