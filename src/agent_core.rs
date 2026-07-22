@@ -410,7 +410,7 @@ impl AgentProfile {
         !matches!(self, Self::Build | Self::Scout)
     }
 
-    fn teammate_name(self) -> &'static str {
+    pub(crate) const fn teammate_name(self) -> &'static str {
         match self {
             Self::Build => "Kate Libby",
             Self::Scout => "Ramon Sanchez",
@@ -2338,6 +2338,8 @@ fn run_agent_inner<S: EventSink>(
         sink.emit(AgentEvent::Correction {
             message,
             summary: "using host execution for an Apple-only component".to_string(),
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(args.profile),
             nesting_depth: Some(0),
             timestamp_ms: Some(now_millis()),
         });
@@ -2402,6 +2404,8 @@ fn run_agent_inner<S: EventSink>(
                     sink.emit(AgentEvent::Correction {
                         message,
                         summary: "using CPU-only llama.cpp fallback for this session".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
                         nesting_depth: Some(0),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -2676,7 +2680,7 @@ fn run_agent_inner<S: EventSink>(
         && (!reached_final || unexpected_root_mutation)
     {
         sink.emit(AgentEvent::TeamMessage {
-            actor: crate::events::TeamActor::Automation(crate::events::AutomationActor::Handoff),
+            actor: crate::events::TeamActor::workflow_steward(),
             tone: crate::events::TeamMessageTone::Warning,
             message: "The task stopped before handoff.".to_string(),
             detail: Some(format!("termination reason: {termination_reason}")),
@@ -5487,6 +5491,8 @@ fn run_agent_steps(
                 message: "The user cancelled this run; repository content and collected evidence are being preserved."
                     .to_string(),
                 summary: "Run cancelled".to_string(),
+                actor: crate::events::TeamActor::workflow_steward(),
+                assisting_profile: Some(args.profile),
                 nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                 timestamp_ms: Some(now_millis()),
             });
@@ -5505,6 +5511,8 @@ fn run_agent_steps(
                 message: "The user requested a goal pause; the current workflow is checkpointing before another model or tool action."
                     .to_string(),
                 summary: "Goal pausing".to_string(),
+                actor: crate::events::TeamActor::workflow_steward(),
+                assisting_profile: Some(args.profile),
                 nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                 timestamp_ms: Some(now_millis()),
             });
@@ -5550,6 +5558,8 @@ fn run_agent_steps(
                 sink.emit(AgentEvent::Correction {
                     message: feedback.clone(),
                     summary: "Harness diagnostic preview".to_string(),
+                    actor: crate::events::TeamActor::workflow_steward(),
+                    assisting_profile: Some(args.profile),
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
@@ -5723,6 +5733,8 @@ fn run_agent_steps(
                 sink.emit(AgentEvent::Correction {
                     message: instruction.clone(),
                     summary: "Active accepted-plan work unit".to_string(),
+                    actor: crate::events::TeamActor::workflow_steward(),
+                    assisting_profile: Some(args.profile),
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
@@ -5737,6 +5749,8 @@ fn run_agent_steps(
                 sink.emit(AgentEvent::Correction {
                     message: instruction.clone(),
                     summary: "Next accepted-plan creation work unit".to_string(),
+                    actor: crate::events::TeamActor::workflow_steward(),
+                    assisting_profile: Some(args.profile),
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
@@ -5869,6 +5883,8 @@ fn run_agent_steps(
             sink.emit(AgentEvent::Correction {
                 message: checkpoint.clone(),
                 summary: "Workflow closure checkpoint".to_string(),
+                actor: crate::events::TeamActor::workflow_steward(),
+                assisting_profile: Some(args.profile),
                 nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                 timestamp_ms: Some(now_millis()),
             });
@@ -6005,6 +6021,8 @@ fn run_agent_steps(
                 sink.emit(AgentEvent::Correction {
                     message: error_msg.clone(),
                     summary: parse_summary.clone(),
+                    actor: crate::events::TeamActor::workflow_steward(),
+                    assisting_profile: Some(args.profile),
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
@@ -6081,6 +6099,8 @@ fn run_agent_steps(
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
                         summary: "Workflow stage submission required".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -6127,12 +6147,14 @@ fn run_agent_steps(
                         } else {
                             "Completion gate blocked final response".to_string()
                         },
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
                     sink.emit(AgentEvent::TeamMessage {
                         actor: crate::events::TeamActor::Automation(
-                            crate::events::AutomationActor::Handoff,
+                            crate::events::AutomationActor::Trinity,
                         ),
                         tone: crate::events::TeamMessageTone::Warning,
                         message: if args.contract.is_some() {
@@ -6211,7 +6233,7 @@ fn run_agent_steps(
                                 };
                                 sink.emit(AgentEvent::TeamMessage {
                                     actor: crate::events::TeamActor::Automation(
-                                        crate::events::AutomationActor::Handoff,
+                                        crate::events::AutomationActor::Trinity,
                                     ),
                                     tone: crate::events::TeamMessageTone::Error,
                                     message: if failure_count >= MAX_IDENTICAL_GATE_FAILURES {
@@ -6256,6 +6278,8 @@ fn run_agent_steps(
                                 message: feedback.clone(),
                                 summary: "The handoff teammate returned failed checks for repair"
                                     .to_string(),
+                                actor: crate::events::TeamActor::workflow_steward(),
+                                assisting_profile: Some(args.profile),
                                 nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                                 timestamp_ms: Some(now_millis()),
                             });
@@ -6326,12 +6350,14 @@ fn run_agent_steps(
                         sink.emit(AgentEvent::Correction {
                             message: feedback.clone(),
                             summary: "Task requirements remain after handoff".to_string(),
+                            actor: crate::events::TeamActor::workflow_steward(),
+                            assisting_profile: Some(args.profile),
                             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                             timestamp_ms: Some(now_millis()),
                         });
                         sink.emit(AgentEvent::TeamMessage {
                             actor: crate::events::TeamActor::Automation(
-                                crate::events::AutomationActor::Handoff,
+                                crate::events::AutomationActor::Trinity,
                             ),
                             tone: crate::events::TeamMessageTone::Warning,
                             message: "The checks are done, but some task requirements are still missing. This needs another pass."
@@ -6552,6 +6578,8 @@ fn run_agent_steps(
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
                         summary: "Repeated tool call detected".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -6717,6 +6745,8 @@ fn run_agent_steps(
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
                         summary: "Repeated tool call detected".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -7115,12 +7145,14 @@ fn run_final_grace(
                     sink.emit(AgentEvent::Correction {
                         message: feedback.clone(),
                         summary: "Task requirements remain after final handoff".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
                     sink.emit(AgentEvent::TeamMessage {
                         actor: crate::events::TeamActor::Automation(
-                            crate::events::AutomationActor::Handoff,
+                            crate::events::AutomationActor::Trinity,
                         ),
                         tone: crate::events::TeamMessageTone::Warning,
                         message: "The checks are done, but some task requirements are still missing. This needs another pass."
@@ -7330,6 +7362,8 @@ fn run_step_limit_monitor(
         sink.emit(AgentEvent::Correction {
             message: format!("step-limit monitor skipped: {error}"),
             summary: "Advisory budget exhausted".to_string(),
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(args.profile),
             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
@@ -7775,12 +7809,14 @@ fn execute_tool_calls(
             sink.emit(AgentEvent::ToolCall {
                 tool: call.tool.clone(),
                 arguments: call.arguments.clone(),
+                actor: Some(crate::events::TeamActor::agent(env.args.profile)),
                 nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
                 timestamp_ms: Some(now_millis()),
             });
             sink.emit(AgentEvent::ToolResult {
                 tool: call.tool.clone(),
                 result: feedback.clone(),
+                actor: Some(crate::events::TeamActor::agent(env.args.profile)),
                 duration_ms: Some(0),
                 energy_joules: None,
                 energy_kwh: None,
@@ -7814,6 +7850,8 @@ fn execute_tool_calls(
         sink.emit(AgentEvent::Correction {
             message: feedback,
             summary: "Dependent tool batch rejected".to_string(),
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(env.args.profile),
             nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
@@ -7845,6 +7883,7 @@ fn execute_tool_calls(
         sink.emit(AgentEvent::ToolCall {
             tool: call.tool.clone(),
             arguments: call.arguments.clone(),
+            actor: Some(crate::events::TeamActor::agent(env.args.profile)),
             nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
@@ -8232,6 +8271,8 @@ fn execute_tool_calls(
             sink.emit(AgentEvent::Correction {
                 message: result.clone(),
                 summary: format!("{} tool call was not executed successfully", tool),
+                actor: crate::events::TeamActor::workflow_steward(),
+                assisting_profile: Some(env.args.profile),
                 nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
                 timestamp_ms: Some(now_millis()),
             });
@@ -8264,6 +8305,7 @@ fn execute_tool_calls(
         sink.emit(AgentEvent::ToolResult {
             tool: tool.clone(),
             result: result.clone(),
+            actor: Some(crate::events::TeamActor::agent(env.args.profile)),
             duration_ms: Some(duration_ms),
             energy_joules: energy.map(|estimate| estimate.joules),
             energy_kwh: energy.map(|estimate| estimate.kwh),
@@ -8952,6 +8994,8 @@ fn grant_work_unit_progress_turn(
             gate.earned_work_unit_ids.len()
         ),
         summary: "Work-unit progress earned one bounded turn".to_string(),
+        actor: crate::events::TeamActor::workflow_steward(),
+        assisting_profile: None,
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
@@ -9093,6 +9137,8 @@ fn record_progress_warning(
     sink.emit(AgentEvent::Correction {
         message: feedback.to_string(),
         summary: "No-progress tool outcome detected".to_string(),
+        actor: crate::events::TeamActor::workflow_steward(),
+        assisting_profile: None,
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
@@ -9115,6 +9161,8 @@ fn record_blocked_tool_loop(
     sink.emit(AgentEvent::Correction {
         message: feedback.to_string(),
         summary: "Repeated tool call blocked".to_string(),
+        actor: crate::events::TeamActor::workflow_steward(),
+        assisting_profile: None,
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
@@ -9897,6 +9945,9 @@ fn run_delivery_workflow(
                 stage,
                 reason: "trusted no-mutation contract and empty task delta produced a structural no-change receipt"
                     .to_string(),
+                actor: crate::events::TeamActor::workflow_steward(),
+                assisting_profile: Some(args.profile),
+                nesting_depth: None,
                 timestamp_ms: Some(now_millis()),
             });
             run.apply(crate::workflow::WorkflowEvent::ImplementationSubmitted {
@@ -10317,6 +10368,8 @@ fn run_delivery_workflow(
                 sink.emit(AgentEvent::Correction {
                     message: feedback.clone(),
                     summary: "Workflow artifact validation failed".to_string(),
+                    actor: crate::events::TeamActor::workflow_steward(),
+                    assisting_profile: None,
                     nesting_depth: None,
                     timestamp_ms: Some(now_millis()),
                 });
@@ -12985,6 +13038,8 @@ fn generate_and_parse_action_with_retries(
                     sink.emit(AgentEvent::Correction {
                         message: truncation_action_retry_instruction(args, retry_scope),
                         summary: "Retrying truncated action with thinking disabled".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -13041,6 +13096,8 @@ fn generate_and_parse_action_with_retries(
                     sink.emit(AgentEvent::Correction {
                         message: instruction.clone(),
                         summary: "Retrying a compact atomic mutation".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -14447,6 +14504,8 @@ fn maybe_inject_controller_review_observations(
         messages.extend(candidate.prompt_messages);
         sink.emit(AgentEvent::ControllerObservation {
             receipt: candidate.receipt,
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(args.profile),
             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
@@ -14808,6 +14867,8 @@ fn maybe_inject_controller_read_observation(
     messages.extend(candidate.prompt_messages);
     sink.emit(AgentEvent::ControllerObservation {
         receipt: candidate.receipt,
+        actor: crate::events::TeamActor::workflow_steward(),
+        assisting_profile: Some(args.profile),
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
@@ -14938,6 +14999,9 @@ fn maybe_execute_controller_delete(
     });
     sink.emit(AgentEvent::ControllerMutation {
         receipt: receipt.clone(),
+        actor: crate::events::TeamActor::workflow_steward(),
+        assisting_profile: Some(args.profile),
+        nesting_depth: None,
         timestamp_ms: Some(now_millis()),
     });
     messages.push(correction_chat_message(
@@ -22575,8 +22639,12 @@ the next imagined action"#;
         assert_eq!(generator.generation_tool_names.len(), 4);
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::ToolResult { tool, result, .. }
-                if tool == "edit_file" && result.contains("inline_completion=accepted")
+            AgentEvent::ToolResult {
+                tool,
+                result,
+                actor: Some(crate::events::TeamActor::Agent(AgentProfile::Build)),
+                ..
+            } if tool == "edit_file" && result.contains("inline_completion=accepted")
         )));
         assert_eq!(
             events
@@ -22584,6 +22652,32 @@ the next imagined action"#;
                 .filter(|event| matches!(event, AgentEvent::ControllerObservation { .. }))
                 .count(),
             2
+        );
+        let controller_observations = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ControllerObservation {
+                    actor,
+                    assisting_profile,
+                    ..
+                } => Some((actor, assisting_profile)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(controller_observations.len(), 2);
+        assert!(controller_observations.iter().all(|(actor, _)| matches!(
+            actor,
+            crate::events::TeamActor::Automation(crate::events::AutomationActor::Trinity)
+        )));
+        assert!(
+            controller_observations
+                .iter()
+                .any(|(_, profile)| **profile == Some(AgentProfile::Build))
+        );
+        assert!(
+            controller_observations
+                .iter()
+                .any(|(_, profile)| **profile == Some(AgentProfile::Review))
         );
         assert!(!events.iter().any(|event| matches!(
             event,

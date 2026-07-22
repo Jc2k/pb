@@ -646,7 +646,7 @@ article.user div.message-container {
     align-items: center;
     gap: 0.45rem;
 }
-.action-actor {
+.action-origin {
     flex: 0 0 auto;
     border-radius: 999px;
     padding: 0.08rem 0.38rem;
@@ -655,19 +655,29 @@ article.user div.message-container {
     letter-spacing: 0.03em;
     line-height: 1.25;
     text-transform: uppercase;
-}
-.action-actor.model {
     background: #eef2f6;
     color: #475569;
 }
-.action-actor.pb {
+
+.team-message .action-origin,
+.correction-message .action-origin,
+.automatic-action .action-origin {
     background: #ede9fe;
     color: #6d28d9;
 }
+
+.action-bubble {
+    min-width: min(34rem, 100%);
+}
+
+.action-author-line {
+    flex-wrap: wrap;
+}
+
 .tool-item.success i {
     color: #16a34a;
 }
-.tool-item.pb-action i {
+.tool-item.automatic-action i {
     color: #7c3aed;
 }
 .tool-item.active i {
@@ -753,25 +763,69 @@ article.user div.message-container {
     margin-bottom: 0.65rem;
 }
 
-.controller-action-drawer-item {
+.action-drawer-item {
     margin-bottom: 0.65rem;
     align-items: flex-start;
+    justify-content: flex-start;
+    gap: 0.65rem;
 }
 
-.controller-action-drawer-item > span > span {
+.drawer-action-avatar {
+    width: 2rem;
+    height: 2rem;
+    flex: 0 0 2rem;
+    border-radius: 50%;
+    object-fit: cover;
+}
+
+.drawer-item .drawer-action-copy {
+    min-width: 0;
+    flex: 1;
     display: grid;
-    gap: 0.18rem;
+    gap: 0.45rem;
 }
 
-.controller-action-drawer-item strong {
+.drawer-item .drawer-action-author {
+    display: grid;
+    gap: 0.08rem;
+}
+
+.drawer-item .drawer-action-detail {
+    display: grid;
+    grid-template-columns: 1rem minmax(0, 1fr);
+    align-items: start;
+    gap: 0.4rem;
+}
+
+.drawer-item .drawer-action-detail > span {
+    min-width: 0;
+    display: grid;
+    gap: 0.12rem;
+}
+
+.action-drawer-item strong,
+.drawer-action-author strong,
+.drawer-action-detail strong {
     font-size: 0.8rem;
     font-weight: 650;
 }
 
-.controller-action-drawer-item small,
-.controller-action-drawer-item time {
+.action-drawer-item small,
+.drawer-action-author small,
+.drawer-action-detail small,
+.action-drawer-item time {
     color: var(--muted);
     font-size: 0.7rem;
+}
+
+.action-drawer-item time {
+    flex: 0 0 auto;
+    margin-left: auto;
+}
+
+.correction-bubble {
+    border-color: #ddd6fe;
+    background: #faf8ff;
 }
 
 .drawer-count {

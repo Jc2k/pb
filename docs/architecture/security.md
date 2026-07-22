@@ -81,6 +81,12 @@ stale fingerprints, forbidden paths, non-required mutation contracts, and ambigu
 eligible tracked deletions remain recoverable from Git. A tracked symlink is removed without
 following its target.
 
+Character presentation is not an authority boundary. Profile characters describe who requested a
+model tool; Trinity describes deterministic controller and handoff work. The structured event type,
+controller receipt, origin, coverage, fingerprints, and recovery metadata remain authoritative and
+visible as secondary provenance. UI grouping never converts controller work into a synthetic model
+call, and legacy events without model attribution are not assigned to a character by inference.
+
 Configured tasks run in an isolated snapshot. pb rejects Git-control changes, undeclared paths,
 unsafe symlinks, and boundedness violations before staging every output. Promotion is transactional:
 if one destination fails, previously promoted paths are restored. Unexpected changes do not gain

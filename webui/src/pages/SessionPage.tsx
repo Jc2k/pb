@@ -18,18 +18,17 @@ import {
   sessionTitle,
 } from "../lib/helpers";
 import {
+  ActionDrawerItem,
   ActionGroupBubble,
-  ControllerActionDrawerItem,
   DrawerPanel,
   InitialUserMessage,
   MessageBubble,
   SessionActivity,
   TodoDrawer,
-  ToolDrawerSummary,
 } from "../components/Session";
 import {
+  buildActionTimeline,
   buildTodoTasks,
-  buildToolSummaries,
   chatEventsWithOnlyLatestStep,
   latestAssistantProfile,
 } from "../lib/sessionUtils";
@@ -419,6 +418,8 @@ export function SessionPage() {
                       return (
                         <ActionGroupBubble
                           key={i}
+                          actor={grouped.actor}
+                          assistingProfile={grouped.assistingProfile}
                           toolCalls={grouped.toolCalls}
                           toolResults={grouped.toolResults}
                           controllerActions={grouped.controllerActions}
@@ -469,36 +470,28 @@ export function SessionPage() {
               ).length}
             >
               {(() => {
-                const controllerActions = events.filter(isControllerActionEvent);
-                const actionEvents = events.filter(
-                  (e) => e.event.type === "tool_call" || isControllerActionEvent(e),
-                );
+                const actionTimeline = buildActionTimeline(events);
 
-                if (actionEvents.length === 0) {
+                if (actionTimeline.length === 0) {
                   return (
                     <div className="empty-detail compact">
                       <i className="bi bi-lightning-charge"></i>
                       <h3>No actions yet</h3>
                       <p>
-                        Model tool calls and safe routine actions by pb will
-                        appear here with their actor clearly identified.
+                        Teammate actions will appear here with their origin and
+                        responsibility clearly identified.
                       </p>
                     </div>
                   );
                 }
 
-                const summaries = buildToolSummaries(events);
-
                 return (
                   <>
-                    {controllerActions.map((envelope, index) => (
-                      <ControllerActionDrawerItem
-                        key={`controller-${index}`}
-                        envelope={envelope}
+                    {actionTimeline.map((item, index) => (
+                      <ActionDrawerItem
+                        key={`action-${index}`}
+                        item={item}
                       />
-                    ))}
-                    {summaries.map((summary) => (
-                      <ToolDrawerSummary key={summary.toolName} summary={summary} />
                     ))}
                   </>
                 );

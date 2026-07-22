@@ -209,6 +209,7 @@ export type AgentEvent =
     type: "tool_call";
     tool: string;
     arguments: unknown;
+    actor?: TeamActor;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -235,9 +236,13 @@ export type AgentEvent =
         sha256: string;
       }>;
       included_in_prompt: boolean;
-      authority_effects: Array<"prompt_context" | "read_before_write" | "review_coverage">;
+      authority_effects: Array<
+        "prompt_context" | "read_before_write" | "review_coverage"
+      >;
       fallback_reason?: string;
     };
+    actor?: TeamActor;
+    assisting_profile?: string;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -246,6 +251,9 @@ export type AgentEvent =
     workflow_id: string;
     stage: WorkflowStage;
     reason: string;
+    actor?: TeamActor;
+    assisting_profile?: string;
+    nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
@@ -266,6 +274,9 @@ export type AgentEvent =
       adopted: boolean;
       recovery: string;
     };
+    actor?: TeamActor;
+    assisting_profile?: string;
+    nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
@@ -282,6 +293,7 @@ export type AgentEvent =
     type: "tool_result";
     tool: string;
     result: string;
+    actor?: TeamActor;
     duration_ms?: number;
     energy_joules?: number;
     energy_kwh?: number;
@@ -368,6 +380,8 @@ export type AgentEvent =
     type: "correction";
     message: string;
     summary?: string;
+    actor?: TeamActor;
+    assisting_profile?: string;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -542,7 +556,7 @@ export type AgentEvent =
 
 export type TeamActor =
   | { kind: "agent"; id: string }
-  | { kind: "automation"; id: "handoff" };
+  | { kind: "automation"; id: "trinity" | "handoff" };
 
 export type TeamMessageTone = "info" | "success" | "warning" | "error";
 

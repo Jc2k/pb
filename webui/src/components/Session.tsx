@@ -1,5 +1,5 @@
 import type React from "react";
-import { Fragment, useState } from "react";
+import { Fragment, useId, useState } from "react";
 import type { AgentEvent, EventEnvelope, SessionItem } from "../types";
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "../lib/constants";
 import {
@@ -16,7 +16,7 @@ import {
   profileName,
   TODO_STATUS_LABELS,
 } from "../lib/sessionUtils";
-import type { TodoTask, ToolSummary } from "../lib/sessionUtils";
+import type { ActionTimelineItem, TodoTask } from "../lib/sessionUtils";
 import { parseRichText } from "../lib/richText";
 import {
   formatEnergy,
@@ -25,6 +25,7 @@ import {
   metricEnergyJoules,
   metricRuntimeMs,
 } from "../lib/energy";
+import { teamActorPresentation, workflowStewardActor } from "../lib/team";
 
 function formatHumanDurationMs(ms?: number): string {
   if (ms === undefined) return "an unknown amount of time";
@@ -177,19 +178,24 @@ function controllerActionPresentation(event: AgentEvent): {
 }
 
 export function ActionGroupBubble({
+  actor,
+  assistingProfile,
   toolCalls,
   toolResults,
   controllerActions,
 }: {
+  actor?: import("../types").TeamActor;
+  assistingProfile?: string;
   toolCalls: EventEnvelope[];
   toolResults: EventEnvelope[];
   controllerActions: EventEnvelope[];
 }) {
   const [isOpen, setIsOpen] = useState(false);
+  const collapseId = useId();
 
   if (toolCalls.length === 0 && controllerActions.length === 0) return null;
 
-  const collapseId = `actions-${Math.random().toString(36).substr(2, 9)}`;
+  const teammate = teamActorPresentation(actor);
 
   const toolItems = toolCalls
     .map((e, i) => {
@@ -209,7 +215,6 @@ export function ActionGroupBubble({
         <div key={`model-${i}`} className={`tool-item ${statusClass}`}>
           <i className={iconClass}></i>
           <span className="action-label">
-            <span className="action-actor model">Model</span>
             <span>{friendlyName}</span>
           </span>
           {detailText && <small>{detailText}</small>}
@@ -222,10 +227,12 @@ export function ActionGroupBubble({
     const presentation = controllerActionPresentation(envelope.event);
     if (!presentation) return null;
     return (
-      <div key={`pb-${index}`} className="tool-item success pb-action">
+      <div
+        key={`automatic-${index}`}
+        className="tool-item success automatic-action"
+      >
         <i className={presentation.icon}></i>
         <span className="action-label">
-          <span className="action-actor pb">pb</span>
           <span>{presentation.label}</span>
         </span>
         <small>{presentation.detail}</small>
@@ -240,56 +247,97 @@ export function ActionGroupBubble({
       }
       return "";
     })
-    .concat(controllerActions.map((envelope) =>
-      controllerActionPresentation(envelope.event)?.label || ""
-    ))
+    .concat(
+      controllerActions.map((envelope) =>
+        controllerActionPresentation(envelope.event)?.label || ""
+      ),
+    )
     .filter(Boolean)
     .join(" · ");
   const actionCount = toolCalls.length + controllerActions.length;
-  const actionSummary = toolCalls.length === 0
-    ? `pb handled ${actionCount} routine ${actionCount === 1 ? "action" : "actions"}`
+  const assisting = assistingProfile
+    ? profileName(assistingProfile)
+    : undefined;
+  const actionSummary = actor?.kind === "automation"
+    ? `${actionCount} routine ${actionCount === 1 ? "action" : "actions"}${
+      assisting ? ` while assisting ${assisting}` : ""
+    }`
     : `${actionCount} ${actionCount === 1 ? "action" : "actions"}`;
+  const firstEvent = toolCalls[0] || controllerActions[0];
+  const timestampMs = firstEvent && "timestamp_ms" in firstEvent.event
+    ? firstEvent.event.timestamp_ms
+    : undefined;
 
   return (
-    <article className="message-row compact tool-message">
-      <div className="bubble thought-bubble">
-        <button
-          className={`tool-strip${isOpen ? "" : " collapsed"}`}
-          onClick={() => setIsOpen(!isOpen)}
-          aria-expanded={isOpen}
-          type="button"
-        >
-          <span>
-            <i className="bi bi-lightning-charge"></i> {actionSummary}
-          </span>
-          <span className="tool-names">{actionNames}</span>
-          <i
-            className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
+    <article className="bot message-row assistant-message compact tool-message">
+      <div className="bot-avatar action-avatar">
+        <img src={teammate.avatar} alt={teammate.name} />
+      </div>
+      <div className="message-container">
+        <div className="author-line action-author-line">
+          <strong>{teammate.name}</strong>
+          <span>{teammate.role}</span>
+          <span className="action-origin">{teammate.provenance}</span>
+          {timestampMs ? <time>{formatEventTime(timestampMs)}</time> : null}
+        </div>
+        <div className="bubble thought-bubble action-bubble">
+          <button
+            className={`tool-strip${isOpen ? "" : " collapsed"}`}
+            onClick={() => setIsOpen(!isOpen)}
+            aria-expanded={isOpen}
+            aria-controls={collapseId}
+            type="button"
           >
-          </i>
-        </button>
-        <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
-          <div className="tool-list">{controllerItems}{toolItems}</div>
+            <span>
+              <i className="bi bi-lightning-charge"></i> {actionSummary}
+            </span>
+            <span className="tool-names">{actionNames}</span>
+            <i
+              className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
+            >
+            </i>
+          </button>
+          <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
+            <div className="tool-list">{controllerItems}{toolItems}</div>
+          </div>
         </div>
       </div>
     </article>
   );
 }
 
-export function ControllerActionDrawerItem({ envelope }: { envelope: EventEnvelope }) {
-  const presentation = controllerActionPresentation(envelope.event);
-  if (!presentation) return null;
-  const timestampMs = "timestamp_ms" in envelope.event
-    ? envelope.event.timestamp_ms
+export function ActionDrawerItem({ item }: { item: ActionTimelineItem }) {
+  const teammate = teamActorPresentation(item.actor);
+  const controller = controllerActionPresentation(item.envelope.event);
+  const tool = item.envelope.event.type === "tool_call"
+    ? item.envelope.event
+    : undefined;
+  if (!controller && !tool) return null;
+  const label = controller?.label ||
+    (tool ? TOOL_FRIENDLY_NAMES[tool.tool] || tool.tool : "Action");
+  const detail = controller?.detail ||
+    (tool ? getToolDetail(item.envelope, item.result) : null);
+  const icon = controller?.icon ||
+    (tool
+      ? TOOL_ICONS[tool.tool] || "bi bi-file-earmark-text"
+      : "bi bi-lightning-charge");
+  const timestampMs = "timestamp_ms" in item.envelope.event
+    ? item.envelope.event.timestamp_ms
     : undefined;
   return (
-    <div className="drawer-item controller-action-drawer-item">
-      <span>
-        <i className={presentation.icon}></i>
-        <span>
-          <span className="action-actor pb">pb</span>
-          <strong>{presentation.label}</strong>
-          <small>{presentation.detail}</small>
+    <div className="drawer-item action-drawer-item">
+      <img className="drawer-action-avatar" src={teammate.avatar} alt="" />
+      <span className="drawer-action-copy">
+        <span className="drawer-action-author">
+          <strong>{teammate.name}</strong>
+          <small>{teammate.role} · {teammate.provenance}</small>
+        </span>
+        <span className="drawer-action-detail">
+          <i className={icon}></i>
+          <span>
+            <strong>{label}</strong>
+            {detail ? <small>{detail}</small> : null}
+          </span>
         </span>
       </span>
       {timestampMs && <time>{formatEventTime(timestampMs)}</time>}
@@ -375,46 +423,6 @@ export function TodoDrawer({ tasks }: { tasks: TodoTask[] }) {
   );
 }
 
-export function ToolDrawerSummary({ summary }: { summary: ToolSummary }) {
-  const [isOpen, setIsOpen] = useState(false);
-
-  return (
-    <div className="drawer-tool-group">
-      <button
-        className="drawer-item"
-        onClick={() => setIsOpen(!isOpen)}
-        aria-expanded={isOpen}
-        type="button"
-      >
-        <span>
-          <i className={summary.icon}></i>
-          <span className="action-actor model">Model</span>
-          {summary.friendlyName}
-        </span>
-        <span className="drawer-count">
-          <strong>{summary.count}</strong>
-          <i
-            className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
-          >
-          </i>
-        </span>
-      </button>
-      {isOpen && (
-        <ol className="drawer-tool-details">
-          {summary.items.map((item, index) => (
-            <li key={`${summary.toolName}-${index}`}>
-              <span className="drawer-detail-text">{item.detail}</span>
-              {item.timestampMs && (
-                <time>{formatEventTime(item.timestampMs)}</time>
-              )}
-            </li>
-          ))}
-        </ol>
-      )}
-    </div>
-  );
-}
-
 function ErrorEventBubble({
   event,
 }: {
@@ -475,16 +483,38 @@ function CorrectionNotice({
 }) {
   const text = (event.summary || event.message || "Agent framework correction")
     .trim();
+  const teammate = teamActorPresentation(event.actor || workflowStewardActor());
+  const detail = event.message.trim() === text ? "" : event.message.trim();
 
   return (
     <article
-      className="session-correction"
-      aria-label="Agent framework correction"
+      className="bot message-row assistant-message compact correction-message"
+      aria-label={`Correction from ${teammate.name}`}
     >
-      <span>{text}</span>
-      {event.timestamp_ms
-        ? <time>{formatEventTime(event.timestamp_ms)}</time>
-        : null}
+      <div className="bot-avatar team-avatar">
+        <img src={teammate.avatar} alt={teammate.name} />
+      </div>
+      <div className="message-container">
+        <div className="author-line">
+          <strong>{teammate.name}</strong>
+          <span>{teammate.role}</span>
+          <span className="action-origin">{teammate.provenance}</span>
+          {event.timestamp_ms
+            ? <time>{formatEventTime(event.timestamp_ms)}</time>
+            : null}
+        </div>
+        <div className="bubble thought-bubble correction-bubble">
+          <p>{text}</p>
+          {detail
+            ? (
+              <details>
+                <summary>Details</summary>
+                <p>{detail}</p>
+              </details>
+            )
+            : null}
+        </div>
+      </div>
     </article>
   );
 }
@@ -576,6 +606,7 @@ function TeamMessageBubble({
 }) {
   const event = envelope.event;
   if (event.type !== "team_message") return null;
+  const teammate = teamActorPresentation(event.actor);
 
   const index = events.indexOf(envelope);
   const priorEvents = events.slice(0, index < 0 ? events.length : index);
@@ -619,12 +650,13 @@ function TeamMessageBubble({
       className={`bot message-row assistant-message team-message tone-${event.tone}`}
     >
       <div className="bot-avatar team-avatar">
-        <img src={getAvatarForProfile("monitor")} alt="Trinity Walker" />
+        <img src={teammate.avatar} alt={teammate.name} />
       </div>
       <div className="message-container">
         <div className="author-line">
-          <strong>Trinity Walker</strong>
-          <span>Team handoff</span>
+          <strong>{teammate.name}</strong>
+          <span>{teammate.role}</span>
+          <span className="action-origin">{teammate.provenance}</span>
           {event.timestamp_ms
             ? <time>{formatEventTime(event.timestamp_ms)}</time>
             : null}
@@ -1118,15 +1150,25 @@ function activityLabel(envelope: EventEnvelope): string | undefined {
     case "started":
       return "Session started";
     case "tool_call":
-      return `${TOOL_FRIENDLY_NAMES[event.tool] || event.tool} started`;
+      return `${teamActorPresentation(event.actor).name} started ${
+        TOOL_FRIENDLY_NAMES[event.tool] || event.tool
+      }`;
     case "tool_result":
       return "Tool result received";
     case "controller_observation":
-      return `pb ${event.receipt.operation === "read_file" ? "read" : "inspected"} ${event.receipt.path}`;
+      return `${
+        teamActorPresentation(event.actor || workflowStewardActor()).name
+      } ${
+        event.receipt.operation === "read_file" ? "read" : "inspected"
+      } ${event.receipt.path}`;
     case "controller_closure":
-      return "pb closed no-change work";
+      return `${
+        teamActorPresentation(event.actor || workflowStewardActor()).name
+      } closed no-change work`;
     case "controller_mutation":
-      return `pb deleted ${event.receipt.path}`;
+      return `${
+        teamActorPresentation(event.actor || workflowStewardActor()).name
+      } deleted ${event.receipt.path}`;
     case "user_question":
       return "Waiting for an answer";
     case "user_answer":

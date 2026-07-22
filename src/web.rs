@@ -1840,6 +1840,8 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
             message: "Cancellation requested. Repository content and workflow evidence will be preserved."
                 .to_string(),
             summary: "Cancellation requested".to_string(),
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(session.request_template.profile),
             nesting_depth: None,
             timestamp_ms: Some(now_millis()),
         },

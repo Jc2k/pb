@@ -58,6 +58,9 @@ Deterministic controller actions do not add another data path. Eligible file byt
 inspections, typed receipts, prompt blocks, and evaluator artifacts remain on the same local
 controller, local model, session, and explicitly selected scratch/output roots. The intrinsic
 behavior adds no telemetry, hosted inference fallback, remote persistence, or network authority.
+Durable actor fields contain only a local profile or workflow-steward identity and optional
+assisting profile. Character presentation adds no network request and does not send repository
+content to a separate service.
 
 Durable Goal orchestration remains in this local core. Objectives, criteria, accepted and retired
 plan versions, milestone evidence, budgets, model-requested changes, and user acceptance are stored

@@ -698,9 +698,7 @@ mod tests {
                     timestamp_ms: None,
                 }),
                 EventEnvelope::new(AgentEvent::TeamMessage {
-                    actor: crate::events::TeamActor::Automation(
-                        crate::events::AutomationActor::Handoff,
-                    ),
+                    actor: crate::events::TeamActor::workflow_steward(),
                     tone: crate::events::TeamMessageTone::Success,
                     message: "Everything affected passed.".to_string(),
                     detail: Some("cargo test --all-targets".to_string()),
@@ -722,7 +720,7 @@ mod tests {
             &restored[0].events[1].event,
             AgentEvent::TeamMessage {
                 actor: crate::events::TeamActor::Automation(
-                    crate::events::AutomationActor::Handoff
+                    crate::events::AutomationActor::Trinity
                 ),
                 message,
                 evidence_ids,

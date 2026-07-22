@@ -52,8 +52,8 @@ The focused controller fixtures prove:
 | No-change closure | Only a structurally empty accepted plan under a trusted mutation-forbidden contract closes automatically |
 | Delete containment | Stale, adopted, dirty, untracked, directory, forbidden, optional-contract, and oversized targets do not execute |
 | Delete recovery | A tracked-clean file deletion emits controller provenance; a tracked symlink deletion removes the link without following or changing its target |
-| Terminal presentation | Controller reads and deletions format as `pb action`; deletion states Git recovery |
-| Web presentation | Contiguous model and controller events form one action group while retaining separate `Model` and `pb` actors |
+| Terminal presentation | Actions name the responsible teammate and retain model-requested or automatic provenance; deletion states Git recovery |
+| Web presentation | Profile characters own model-requested groups; Trinity owns automatic groups and corrections; the drawer preserves chronology and structured provenance |
 
 ## Preserved local-model runs
 
@@ -92,7 +92,55 @@ coverage, current workspace/path/content hashes, one hash-bound included range, 
 `inspect_change` model tool call in that run. The next and only review model action is
 `submit_code_review`.
 
+## Character attribution qualification
+
+A fresh strict-workflow run exercised the durable teammate attribution added after the controller
+action qualification. It created one exact file, ran one named check diagnostically and
+authoritatively, required fresh review, created a semantic commit, and finished with a clean
+workspace.
+
+| Field | Value |
+| --- | --- |
+| Source baseline | `bbf59e5edb29a7a1db793d72cfa7f722cf7c3e98` plus the attribution changes recorded here |
+| Release binary SHA-256 | `2c3a32f4758709cfbb4be07923d201e2123645dbcf4a981b6e3c45facee08d38` |
+| Contract SHA-256 | `1227d847eca2715e69ac6ea800400b065925a8bd673e138169c4aeb4fb9bc6ef` |
+| Run ID | `1784762062494-24350-0` |
+| Model | `hf://mlx-community/Qwen3-Coder-Next-4bit` |
+| Model calls / session tokens | 5 / 20,944 |
+| Controller observations | 1 full `inspect_change`, 1,083 prompt bytes |
+| Checks | 2 passed, 0 failed |
+| Scratch commit | `0cdd829` (`feat: create answer.txt with answer=42`) |
+| Outcome | Ready, contract satisfied, verified completed |
+| Events SHA-256 | `285ebd2177e824d26d4721f80c49a251ec5e870d5eea842ee724493d4d10faf4` |
+
+The raw run contains five model tool-call/result pairs. Every pair has an explicit profile actor:
+Plan for `submit_plan`, Review for both review submissions, and Build for `write_file` plus
+`submit_implementation`. The single controller observation records `actual_origin=controller`,
+`prompt_representation=controller_block`, actor `automation/trinity`, and assisting profile Review.
+All three deterministic corrections record Trinity; the two corrections with active profile context
+also record Build as the assisting profile. There are zero actorless current-run tool events and zero
+model `inspect_change` calls.
+
+The event order is truthful: Kate's real `write_file` call creates the file, Trinity's controller
+observation supplies bounded full review context, and Eugene's next model action is
+`submit_code_review`. Terminal output presents the same sequence as model-requested profile actions,
+automatic Trinity corrections, and an automatic Trinity action. A live browser check also rendered
+Trinity as `Team steward · Automatic`, model prose under the active profile character, historical
+actorless tools as `Agent · Earlier session · Legacy action`, a chronological action drawer, and no
+horizontal overflow.
+
 ## Ranked observations
+
+### P1 — Character attribution stayed truthful across every surface
+
+- Classification: positive evidence.
+- Evidence: preserved run `1784762062494-24350-0`, its actor-bearing tool events and controller
+  receipt, terminal transcript, and the live browser check.
+- Impact: users can understand autonomous work as teammate activity without losing the distinction
+  between model requests, deterministic automation, and historical data.
+- Disposition: production-qualified.
+- Recommendation: retain actor round-trip, actorless legacy fallback, no-synthetic-tool, terminal,
+  web grouping, and chronological drawer tests as release gates.
 
 ### P1 — Controller admission and provenance held
 
@@ -145,6 +193,7 @@ diagnostics and did not grant acceptance evidence.
 
 - Fallback scratch: `/private/tmp/pb-deterministic-actions-qualification-20260722`
 - Positive scratch: `/private/tmp/pb-deterministic-actions-positive-20260722`
+- Character-attribution scratch: `/private/tmp/pb-character-attribution-qualification-20260722`
 - Each scratch contains the contract, workspace, cumulative `events.jsonl`, per-run events,
   `journal.md`, workflow checkpoint, run index, checks, diff, and task-owned commit.
 

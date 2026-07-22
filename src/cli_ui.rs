@@ -1,4 +1,4 @@
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, TeamActor};
 
 pub fn render_event(event: &AgentEvent) {
     match event {
@@ -124,13 +124,13 @@ pub fn render_event(event: &AgentEvent) {
             print_header("model", &format!("loading {model}"));
         }
         AgentEvent::Reasoning {
-            content,
-            profile: _,
-            ..
-        } => print_header("reasoning", content),
-        AgentEvent::ToolCall { tool, .. } => print_header("tool", tool),
-        AgentEvent::ControllerObservation { receipt, .. } => print_header(
-            "pb action",
+            content, profile, ..
+        } => print_header(profile.teammate_name(), content),
+        AgentEvent::ToolCall { tool, actor, .. } => {
+            print_header(&action_label(*actor, "agent action"), tool)
+        }
+        AgentEvent::ControllerObservation { receipt, actor, .. } => print_header(
+            &action_label(Some(*actor), "automatic action"),
             &format_controller_observation(
                 receipt.operation.as_str(),
                 &receipt.path,
@@ -138,10 +138,13 @@ pub fn render_event(event: &AgentEvent) {
                 receipt.observed_bytes,
             ),
         ),
-        AgentEvent::ControllerClosure { reason, .. } => print_header("pb action", reason),
-        AgentEvent::ControllerMutation { receipt, .. } => {
-            print_header("pb action", &format_controller_delete(&receipt.path))
+        AgentEvent::ControllerClosure { reason, actor, .. } => {
+            print_header(&action_label(Some(*actor), "automatic action"), reason)
         }
+        AgentEvent::ControllerMutation { receipt, actor, .. } => print_header(
+            &action_label(Some(*actor), "automatic action"),
+            &format_controller_delete(&receipt.path),
+        ),
         AgentEvent::ToolBatch {
             call_count,
             useful_count,
@@ -160,6 +163,7 @@ pub fn render_event(event: &AgentEvent) {
         ),
         AgentEvent::ToolResult {
             result,
+            actor,
             duration_ms,
             energy_joules,
             average_power_watts,
@@ -179,10 +183,11 @@ pub fn render_event(event: &AgentEvent) {
             if let Some(calls) = energy_shared_calls.filter(|calls| *calls > 1) {
                 details.push(format!("shared across {calls} parallel calls"));
             }
+            let actor_label = action_result_label(*actor);
             let label = if details.is_empty() {
-                "tool result".to_string()
+                actor_label
             } else {
-                format!("tool result ({})", details.join(", "))
+                format!("{actor_label} ({})", details.join(", "))
             };
             print_block(&label, result);
         }
@@ -217,8 +222,8 @@ pub fn render_event(event: &AgentEvent) {
                 &format!("{executor_id} ({kind}, {state}) {detail}"),
             );
         }
-        AgentEvent::TeamMessage { message, .. } => {
-            print_block("team", message);
+        AgentEvent::TeamMessage { actor, message, .. } => {
+            print_block(&actor_message_label(*actor), message);
         }
         AgentEvent::HandoffSummary { summary, .. } => {
             print_header("handoff", &format!("{:?}", summary.outcome));
@@ -296,14 +301,20 @@ pub fn render_event(event: &AgentEvent) {
             ..
         } => print_block(&format!("answer {question_id}"), answer),
         AgentEvent::Correction {
-            summary, message, ..
+            actor,
+            summary,
+            message,
+            ..
         } => {
             let body = if summary.trim().is_empty() {
                 message
             } else {
                 summary
             };
-            print_header("correction", body);
+            print_header(
+                &format!("{} · automatic correction", actor.display_name()),
+                body,
+            );
         }
         AgentEvent::SubAgentStarted {
             profile,
@@ -468,9 +479,41 @@ fn format_controller_delete(path: &str) -> String {
     format!("deleted {path} · tracked and Git-recoverable")
 }
 
+fn action_label(actor: Option<TeamActor>, fallback: &str) -> String {
+    match actor {
+        Some(actor @ TeamActor::Agent(_)) => {
+            format!("{} action · model-requested", actor.display_name())
+        }
+        Some(actor @ TeamActor::Automation(_)) => {
+            format!("{} action · automatic", actor.display_name())
+        }
+        None => format!("{fallback} · legacy origin"),
+    }
+}
+
+fn action_result_label(actor: Option<TeamActor>) -> String {
+    match actor {
+        Some(actor @ TeamActor::Agent(_)) => {
+            format!("{} action result · model-requested", actor.display_name())
+        }
+        Some(actor @ TeamActor::Automation(_)) => {
+            format!("{} action result · automatic", actor.display_name())
+        }
+        None => "tool result · legacy origin".to_string(),
+    }
+}
+
+fn actor_message_label(actor: TeamActor) -> String {
+    match actor {
+        TeamActor::Agent(_) => actor.display_name().to_string(),
+        TeamActor::Automation(_) => format!("{} · automatic", actor.display_name()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_core::AgentProfile;
 
     #[test]
     fn terminal_controller_actions_are_explicit_and_recovery_aware() {
@@ -481,6 +524,22 @@ mod tests {
         assert_eq!(
             format_controller_delete("obsolete.rs"),
             "deleted obsolete.rs · tracked and Git-recoverable"
+        );
+    }
+
+    #[test]
+    fn terminal_action_labels_use_the_responsible_teammate() {
+        assert_eq!(
+            action_label(Some(TeamActor::agent(AgentProfile::Build)), "agent action"),
+            "Kate Libby action · model-requested"
+        );
+        assert_eq!(
+            action_label(Some(TeamActor::workflow_steward()), "automatic action"),
+            "Trinity Walker action · automatic"
+        );
+        assert_eq!(
+            action_label(None, "agent action"),
+            "agent action · legacy origin"
         );
     }
 }

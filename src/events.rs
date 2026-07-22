@@ -63,14 +63,40 @@ pub enum FinalGraceStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationActor {
+    /// Legacy durable identity used by sessions written before automation was
+    /// presented as a stable teammate.
     Handoff,
+    Trinity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum TeamActor {
     Agent(AgentProfile),
     Automation(AutomationActor),
+}
+
+impl TeamActor {
+    pub const fn agent(profile: AgentProfile) -> Self {
+        Self::Agent(profile)
+    }
+
+    pub const fn workflow_steward() -> Self {
+        Self::Automation(AutomationActor::Trinity)
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Agent(profile) => profile.teammate_name(),
+            Self::Automation(AutomationActor::Handoff | AutomationActor::Trinity) => {
+                "Trinity Walker"
+            }
+        }
+    }
+}
+
+fn workflow_steward_actor() -> TeamActor {
+    TeamActor::workflow_steward()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -649,6 +675,8 @@ pub enum AgentEvent {
     ToolCall {
         tool: String,
         arguments: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<TeamActor>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -656,6 +684,10 @@ pub enum AgentEvent {
     },
     ControllerObservation {
         receipt: crate::workflow::ControllerObservationReceipt,
+        #[serde(default = "workflow_steward_actor")]
+        actor: TeamActor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assisting_profile: Option<AgentProfile>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -665,11 +697,23 @@ pub enum AgentEvent {
         workflow_id: String,
         stage: crate::workflow::WorkflowStage,
         reason: String,
+        #[serde(default = "workflow_steward_actor")]
+        actor: TeamActor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assisting_profile: Option<AgentProfile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
     ControllerMutation {
         receipt: crate::workflow::ControllerMutationReceipt,
+        #[serde(default = "workflow_steward_actor")]
+        actor: TeamActor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assisting_profile: Option<AgentProfile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -687,6 +731,8 @@ pub enum AgentEvent {
     ToolResult {
         tool: String,
         result: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<TeamActor>,
         #[serde(skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -813,6 +859,10 @@ pub enum AgentEvent {
         message: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
+        #[serde(default = "workflow_steward_actor")]
+        actor: TeamActor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assisting_profile: Option<AgentProfile>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1374,6 +1424,7 @@ impl EventEnvelope {
             AgentEvent::ToolCall {
                 tool,
                 arguments,
+                actor,
                 nesting_depth,
                 ..
             } => Self {
@@ -1381,18 +1432,23 @@ impl EventEnvelope {
                 event: AgentEvent::ToolCall {
                     tool,
                     arguments,
+                    actor,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
             AgentEvent::ControllerObservation {
                 receipt,
+                actor,
+                assisting_profile,
                 nesting_depth,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::ControllerObservation {
                     receipt,
+                    actor,
+                    assisting_profile,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
@@ -1401,6 +1457,9 @@ impl EventEnvelope {
                 workflow_id,
                 stage,
                 reason,
+                actor,
+                assisting_profile,
+                nesting_depth,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
@@ -1408,13 +1467,25 @@ impl EventEnvelope {
                     workflow_id,
                     stage,
                     reason,
+                    actor,
+                    assisting_profile,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
-            AgentEvent::ControllerMutation { receipt, .. } => Self {
+            AgentEvent::ControllerMutation {
+                receipt,
+                actor,
+                assisting_profile,
+                nesting_depth,
+                ..
+            } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::ControllerMutation {
                     receipt,
+                    actor,
+                    assisting_profile,
+                    nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
@@ -1441,6 +1512,7 @@ impl EventEnvelope {
             AgentEvent::ToolResult {
                 tool,
                 result,
+                actor,
                 duration_ms,
                 energy_joules,
                 energy_kwh,
@@ -1453,6 +1525,7 @@ impl EventEnvelope {
                 event: AgentEvent::ToolResult {
                     tool,
                     result,
+                    actor,
                     duration_ms,
                     energy_joules,
                     energy_kwh,
@@ -1629,6 +1702,8 @@ impl EventEnvelope {
             AgentEvent::Correction {
                 message,
                 summary,
+                actor,
+                assisting_profile,
                 nesting_depth,
                 ..
             } => Self {
@@ -1636,6 +1711,8 @@ impl EventEnvelope {
                 event: AgentEvent::Correction {
                     message,
                     summary,
+                    actor,
+                    assisting_profile,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
@@ -1878,6 +1955,96 @@ mod tests {
                 contract_status: ContractStatus::Unspecified,
                 verified_completed: false,
                 termination_reason: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn action_actor_provenance_round_trips() {
+        let envelope = EventEnvelope::with_timestamp(AgentEvent::ToolCall {
+            tool: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+            actor: Some(TeamActor::agent(AgentProfile::Review)),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        let restored: EventEnvelope =
+            serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            restored.event,
+            AgentEvent::ToolCall {
+                actor: Some(TeamActor::Agent(AgentProfile::Review)),
+                timestamp_ms: Some(_),
+                ..
+            }
+        ));
+
+        let envelope = EventEnvelope::with_timestamp(AgentEvent::ControllerClosure {
+            workflow_id: "workflow-1".to_string(),
+            stage: crate::workflow::WorkflowStage::Implementing,
+            reason: "No change required".to_string(),
+            actor: TeamActor::workflow_steward(),
+            assisting_profile: Some(AgentProfile::Build),
+            nesting_depth: Some(1),
+            timestamp_ms: None,
+        });
+        let restored: EventEnvelope =
+            serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            restored.event,
+            AgentEvent::ControllerClosure {
+                actor: TeamActor::Automation(AutomationActor::Trinity),
+                assisting_profile: Some(AgentProfile::Build),
+                nesting_depth: Some(1),
+                timestamp_ms: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_actions_remain_readable_without_inventing_model_attribution() {
+        let legacy_tool = r#"{
+            "version":"v1",
+            "event":{"type":"tool_call","tool":"read_file","arguments":{"path":"README.md"}}
+        }"#;
+        let envelope: EventEnvelope = serde_json::from_str(legacy_tool).unwrap();
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::ToolCall { actor: None, .. }
+        ));
+
+        let legacy_controller = r#"{
+            "version":"v1",
+            "event":{
+                "type":"controller_closure",
+                "workflow_id":"workflow-1",
+                "stage":"implementing",
+                "reason":"No change required"
+            }
+        }"#;
+        let envelope: EventEnvelope = serde_json::from_str(legacy_controller).unwrap();
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::ControllerClosure {
+                actor: TeamActor::Automation(AutomationActor::Trinity),
+                assisting_profile: None,
+                nesting_depth: None,
+                ..
+            }
+        ));
+
+        let legacy_correction = r#"{
+            "version":"v1",
+            "event":{"type":"correction","message":"Try again","summary":"Retrying"}
+        }"#;
+        let envelope: EventEnvelope = serde_json::from_str(legacy_correction).unwrap();
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::Correction {
+                actor: TeamActor::Automation(AutomationActor::Trinity),
+                assisting_profile: None,
                 ..
             }
         ));

@@ -2,12 +2,69 @@
 import { deepEqual, equal } from "node:assert/strict";
 import type { EventEnvelope } from "../types/index";
 import {
+  buildActionTimeline,
   buildToolSummaries,
   chatEventsWithOnlyLatestStep,
   errorSummary,
   getToolDetail,
   latestAssistantProfile,
 } from "./sessionUtils.ts";
+
+Deno.test("buildActionTimeline preserves chronology and actor provenance", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "1",
+      event: {
+        type: "tool_call",
+        tool: "read_file",
+        arguments: { path: "src/lib.rs" },
+        actor: { kind: "agent", id: "review" },
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "controller_observation",
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "review",
+        receipt: {
+          version: 1,
+          action_id: "observe-1",
+          actual_origin: "controller",
+          prompt_representation: "controller_block",
+          stage: "code_review",
+          operation: "inspect_change",
+          path: "src/lib.rs",
+          workspace_fingerprint: "workspace",
+          path_fingerprint: "path",
+          content_sha256: "content",
+          coverage: "full",
+          observed_bytes: 10,
+          prompt_bytes: 10,
+          included_ranges: [],
+          included_in_prompt: true,
+          authority_effects: ["review_coverage"],
+        },
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "tool_result",
+        tool: "read_file",
+        result: "contents",
+        actor: { kind: "agent", id: "review" },
+      },
+    },
+  ];
+
+  const timeline = buildActionTimeline(events);
+  equal(timeline.length, 2);
+  equal(timeline[0].actor?.kind, "agent");
+  equal(timeline[0].result?.event.type, "tool_result");
+  equal(timeline[1].actor?.kind, "automation");
+  equal(timeline[1].assistingProfile, "review");
+});
 
 Deno.test("getToolDetail shows session_title call title", () => {
   const call: EventEnvelope = {
@@ -62,7 +119,14 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
 
 Deno.test("buildToolSummaries shows joules, power, and parallel measurement scope", () => {
   const events: EventEnvelope[] = [
-    { version: "1", event: { type: "tool_call", tool: "web_search", arguments: { query: "power" } } },
+    {
+      version: "1",
+      event: {
+        type: "tool_call",
+        tool: "web_search",
+        arguments: { query: "power" },
+      },
+    },
     {
       version: "1",
       event: {
@@ -118,7 +182,6 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
     ["started", "step_started"],
   );
 });
-
 
 Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated by final message", () => {
   const events: EventEnvelope[] = [
@@ -226,7 +289,8 @@ Deno.test("errorSummary prefers explicit error summaries", () => {
     errorSummary({
       type: "error",
       summary: "Invalid pb JSON action on step 10/12",
-      message: "Invalid pb JSON action on step 10/12: failed to parse agent JSON action",
+      message:
+        "Invalid pb JSON action on step 10/12: failed to parse agent JSON action",
     }),
     "Invalid pb JSON action on step 10/12",
   );

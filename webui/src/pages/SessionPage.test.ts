@@ -152,17 +152,18 @@ Deno.test("paused session composer keeps resume action at intrinsic width", asyn
   ok(!css.includes(".composer .btn {"));
 });
 
-Deno.test("session corrections render as centered plain notices", async () => {
+Deno.test("session corrections render as truthful steward messages", async () => {
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
   const css = await Deno.readTextFile("webui/src/session.css");
   const types = await Deno.readTextFile("webui/src/types/index.ts");
 
   ok(types.includes('type: "correction"'));
   ok(component.includes('case "correction"'));
-  ok(component.includes('className="session-correction"'));
-  ok(css.includes(".session-correction"));
-  ok(css.includes("align-self: center;"));
-  ok(!css.includes(".session-correction .bubble"));
+  ok(component.includes("function CorrectionNotice"));
+  ok(component.includes("workflowStewardActor()"));
+  ok(component.includes("Correction from ${teammate.name}"));
+  ok(component.includes('className="action-origin"'));
+  ok(css.includes(".correction-bubble"));
 });
 
 Deno.test("final assistant messages use profile avatars", async () => {
@@ -174,11 +175,7 @@ Deno.test("final assistant messages use profile avatars", async () => {
       "<img src={getAvatarForProfile(profile)} alt={profileName(profile)} />",
     ),
   );
-  ok(
-    component.includes(
-      '<img src={getAvatarForProfile("monitor")} alt="Trinity Walker" />',
-    ),
-  );
+  ok(component.includes("teamActorPresentation(event.actor)"));
   ok(!component.includes("/avatar-monitor.png"));
   ok(component.includes('case "final"'));
   ok(!component.includes('case "final":\n      const ffd'));
@@ -244,6 +241,7 @@ Deno.test("session workspace separates user chat from assistant transcript conte
   const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
   const css = await Deno.readTextFile("webui/src/session.css");
+  const team = await Deno.readTextFile("webui/src/lib/team.ts");
 
   ok(page.includes('className="app-shell session-shell"'));
   ok(page.includes("Session details"));
@@ -254,9 +252,11 @@ Deno.test("session workspace separates user chat from assistant transcript conte
   ok(component.includes("assistant-message assistant-transcript"));
   ok(component.includes("<strong>You</strong>"));
   ok(component.includes("function activityLabel"));
-  ok(component.includes('className="action-actor model"'));
-  ok(component.includes('className="action-actor pb"'));
-  ok(component.includes("export function ToolDrawerSummary"));
+  ok(component.includes('className="action-origin"'));
+  ok(component.includes("export function ActionDrawerItem"));
+  ok(page.includes("buildActionTimeline(events)"));
+  ok(team.includes('provenance: "Model-requested"'));
+  ok(team.includes('provenance: "Automatic"'));
   ok(component.includes("Closed no-change work"));
   ok(component.includes('className="transcript-diff"'));
   ok(
@@ -285,7 +285,7 @@ Deno.test("handoff feedback renders as a teammate with expandable evidence", asy
   ok(types.includes('type: "handoff_summary"'));
   ok(types.includes("handoff_outcome"));
   ok(component.includes("function TeamMessageBubble"));
-  ok(component.includes("Trinity Walker"));
+  ok(component.includes("teamActorPresentation(event.actor)"));
   ok(component.includes("What I ran"));
   ok(component.includes("check.command"));
   ok(component.includes("summary.affected_components"));

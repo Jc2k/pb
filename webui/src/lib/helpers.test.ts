@@ -13,20 +13,41 @@ import {
 } from "./helpers.ts";
 
 Deno.test("sessionTitle prefers a trimmed title and falls back to the task", () => {
-  equal(sessionTitle({ title: "  Fix login  ", task: "Investigate auth" }), "Fix login");
-  equal(sessionTitle({ title: "   ", task: "Investigate auth" }), "Investigate auth");
-  equal(sessionTitle({ title: null, task: "Investigate auth" }), "Investigate auth");
+  equal(
+    sessionTitle({ title: "  Fix login  ", task: "Investigate auth" }),
+    "Fix login",
+  );
+  equal(
+    sessionTitle({ title: "   ", task: "Investigate auth" }),
+    "Investigate auth",
+  );
+  equal(
+    sessionTitle({ title: null, task: "Investigate auth" }),
+    "Investigate auth",
+  );
 });
 
 Deno.test("handoff notifications use team outcome language", () => {
-  equal(handoffNotificationTitle("ready", "completed"), "The team wrapped this up");
-  equal(handoffNotificationTitle("no_change", "completed"), "The team left the code untouched");
-  equal(handoffNotificationTitle("checks_failed", "failed"), "This needs another pass");
+  equal(
+    handoffNotificationTitle("ready", "completed"),
+    "The team wrapped this up",
+  );
+  equal(
+    handoffNotificationTitle("no_change", "completed"),
+    "The team left the code untouched",
+  );
+  equal(
+    handoffNotificationTitle("checks_failed", "failed"),
+    "This needs another pass",
+  );
   equal(
     handoffNotificationTitle("executor_unavailable", "failed"),
     "The team needs help to continue",
   );
-  equal(handoffNotificationTitle(undefined, "failed"), "The task stopped before handoff");
+  equal(
+    handoffNotificationTitle(undefined, "failed"),
+    "The task stopped before handoff",
+  );
 });
 
 Deno.test("sessionPageDocumentTitle follows updated session title", () => {
@@ -72,11 +93,30 @@ Deno.test("every named agent profile has a packaged avatar", async () => {
   }
 });
 
-Deno.test("groupActionEvents groups model and pb actions while preserving actors", () => {
+Deno.test("groupActionEvents separates profile and steward actions", () => {
   const events: EventEnvelope[] = [
-    { version: "1", event: { type: "reasoning", content: "thinking", profile: "build" } },
-    { version: "1", event: { type: "tool_call", tool: "read_file", arguments: { path: "Cargo.toml" } } },
-    { version: "1", event: { type: "tool_result", tool: "read_file", result: "[package]" } },
+    {
+      version: "1",
+      event: { type: "reasoning", content: "thinking", profile: "build" },
+    },
+    {
+      version: "1",
+      event: {
+        type: "tool_call",
+        tool: "read_file",
+        arguments: { path: "Cargo.toml" },
+        actor: { kind: "agent", id: "build" },
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "tool_result",
+        tool: "read_file",
+        result: "[package]",
+        actor: { kind: "agent", id: "build" },
+      },
+    },
     {
       version: "1",
       event: {
@@ -84,21 +124,36 @@ Deno.test("groupActionEvents groups model and pb actions while preserving actors
         workflow_id: "workflow-1",
         stage: "implementing",
         reason: "Trusted no-change contract",
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "build",
       },
     },
-    { version: "1", event: { type: "final", content: "done", profile: "build" } },
+    {
+      version: "1",
+      event: { type: "final", content: "done", profile: "build" },
+    },
   ];
 
   const grouped = groupActionEvents(events);
 
-  equal(grouped.length, 3);
+  equal(grouped.length, 4);
   equal((grouped[1] as { type: string }).type, "action_group");
+  equal(
+    (grouped[1] as { actor: { id: string } }).actor.id,
+    "build",
+  );
   equal((grouped[1] as { toolCalls: EventEnvelope[] }).toolCalls.length, 1);
   equal((grouped[1] as { toolResults: EventEnvelope[] }).toolResults.length, 1);
   equal(
-    (grouped[1] as { controllerActions: EventEnvelope[] }).controllerActions.length,
+    (grouped[2] as { controllerActions: EventEnvelope[] }).controllerActions
+      .length,
     1,
   );
+  equal(
+    (grouped[2] as { actor: { id: string } }).actor.id,
+    "trinity",
+  );
+  equal((grouped[2] as { assistingProfile: string }).assistingProfile, "build");
 });
 
 Deno.test("projectSettingsPath encodes project names under the project URL", () => {

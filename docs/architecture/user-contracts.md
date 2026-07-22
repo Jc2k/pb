@@ -143,6 +143,10 @@ content-derived action identity, and current fingerprints. The receipt is revali
 before prompt admission. Partial ranges never claim complete observation or grant whole-file
 replacement. A controller observation is one explicit user/context block with no model tool call,
 and it cannot supply an approval, check result, review judgment, or semantic completion claim.
+In user-facing transcripts, Trinity Walker may speak for this deterministic workflow stewardship,
+but the durable event continues to record controller origin, the assisting profile, and its receipt.
+Model-requested actions are attributed to that profile's character. Actorless legacy tool events
+remain labelled as legacy instead of acquiring a guessed character.
 In strict delivery and acceptance contracts, named check evidence comes only from `run_check(id)`;
 a similar `run_command` or `run_task` result is diagnostic evidence, not an acceptance receipt. A
 restored legacy/direct request may still route an exact configured guard command through the check

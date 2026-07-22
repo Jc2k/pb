@@ -328,8 +328,11 @@ cannot be disabled or broadened by persisted/API request fields.
 Production uses one explicit controller-labelled user/context block. pb never fabricates an
 assistant tool call or tool result. The hidden evaluator retains only a native-read control arm and
 the production controller-block arm. The controller records actual origin, exact full/range
-coverage, fingerprints, and content-derived action identity. Model tools and pb actions remain
-distinct durable events.
+coverage, fingerprints, and content-derived action identity. Model tools and controller actions
+remain distinct durable events. Each new model tool event also records the active profile
+character. Controller actions and deterministic corrections record Trinity Walker as the workflow
+steward plus the profile she is assisting when that context is available. Older tool events without
+an actor remain explicitly unattributed rather than inheriting a nearby profile.
 
 An exact active small-file observation may satisfy read-before-write only while its current
 fingerprint and complete prompt bytes remain valid. A failed-diagnostic range permits only an edit
@@ -340,9 +343,12 @@ deletion is intrinsic but limited to a unique tracked, clean, unchanged, bounded
 Git recovery. The accepted plan, active work unit, allowed path, current identity, and Git state are
 all revalidated first; an attached contract must explicitly require mutation.
 
-Terminal output labels these events `pb action`. The web transcript and **Actions** drawer combine
-them with model tools for readability while labelling each item `pb` or `Model`, so presentation
-never changes provenance.
+Terminal output and the web transcript present actions as work by teammates: the active profile
+character owns a model-requested tool action, while Trinity owns automatic observation, closure,
+mutation, correction, and handoff work. `Model-requested` and `Automatic` remain visible secondary
+provenance labels, and the **Actions** drawer preserves event chronology. Character attribution is
+presentation over typed events; it never changes a controller event into a model tool call or
+claims that a model requested an automatic action.
 
 Content fingerprints identify present worktree entries and bytes, independently of Git index
 bookkeeping. In particular, the synthetic tracked-`missing` entry visible before staging a deletion

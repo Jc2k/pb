@@ -621,7 +621,7 @@ fn emit_summary(sink: &mut dyn EventSink, summary: HandoffSummary, nesting_depth
 }
 
 fn handoff_actor() -> TeamActor {
-    TeamActor::Automation(AutomationActor::Handoff)
+    TeamActor::Automation(AutomationActor::Trinity)
 }
 
 fn natural_list(values: &[&str]) -> String {

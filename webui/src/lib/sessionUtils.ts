@@ -1,6 +1,9 @@
-import type { AgentEvent, EventEnvelope } from "../types";
+import type { AgentEvent, EventEnvelope, TeamActor } from "../types";
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "./constants";
 import { formatEnergy, formatPower } from "./energy";
+import { teamActorKey, workflowStewardActor } from "./team";
+
+export { profileJobTitle, profileName } from "./team";
 
 export interface ToolSummaryItem {
   detail: string;
@@ -13,6 +16,13 @@ export interface ToolSummary {
   icon: string;
   count: number;
   items: ToolSummaryItem[];
+}
+
+export interface ActionTimelineItem {
+  actor?: TeamActor;
+  assistingProfile?: string;
+  envelope: EventEnvelope;
+  result?: EventEnvelope;
 }
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "blocked";
@@ -39,7 +49,6 @@ export function getToolDetail(
   toolResult?: EventEnvelope,
 ): string | null {
   if (toolCall.event.type !== "tool_call") return null;
-
 
   const args = toolCall.event.arguments as Record<string, unknown>;
 
@@ -69,10 +78,9 @@ export function getToolDetail(
       const query = args.query as string;
       if (!query) return "";
       if (!toolResult) return `${query} (pending)`;
-      const skillMatches =
-        toolResult.event.type === "tool_result"
-          ? toolResult.event.result.match(/name: /g)?.length || 0
-          : 0;
+      const skillMatches = toolResult.event.type === "tool_result"
+        ? toolResult.event.result.match(/name: /g)?.length || 0
+        : 0;
       return `${query} (${skillMatches} skills)`;
     }
     case "skill": {
@@ -82,7 +90,9 @@ export function getToolDetail(
       return name;
     }
     case "mv":
-      return `from ${(args.source as string) || ""} to ${(args.destination as string) || ""}`;
+      return `from ${(args.source as string) || ""} to ${
+        (args.destination as string) || ""
+      }`;
     case "rm": {
       const filePath = args ? (args.path as string) : undefined;
       return filePath || "(no path)";
@@ -107,7 +117,9 @@ export function getToolDetail(
         try {
           const parsed = JSON.parse(toolResult.event.result);
           if (Array.isArray(parsed)) return `${parsed.length} items`;
-          if (typeof parsed === "object" && parsed !== null) return `result (${Object.keys(parsed).length} fields)`;
+          if (typeof parsed === "object" && parsed !== null) {
+            return `result (${Object.keys(parsed).length} fields)`;
+          }
         } catch {
           const result = toolResult.event.result;
           if (result.length < 80) return result.replace(/\n/g, " ");
@@ -152,19 +164,26 @@ export function buildTodoTasks(events: EventEnvelope[]): TodoTask[] {
     if (event.event.type !== "tool_result") return;
     const resultTool = event.event.tool;
     const callIndex = pendingCalls.findIndex(
-      (call) => call.event.type === "tool_call" && call.event.tool === resultTool,
+      (call) =>
+        call.event.type === "tool_call" && call.event.tool === resultTool,
     );
-    const call = callIndex >= 0 ? pendingCalls.splice(callIndex, 1)[0] : undefined;
+    const call = callIndex >= 0
+      ? pendingCalls.splice(callIndex, 1)[0]
+      : undefined;
     if (event.event.tool !== "todo") return;
     const parsedTasks = parseTodoTasks(event.event.result);
     if (!parsedTasks) return;
-    const action =
-      call?.event.type === "tool_call"
-        ? ((call.event.arguments as Record<string, unknown> | undefined)?.action as string | undefined)
-        : undefined;
+    const action = call?.event.type === "tool_call"
+      ? ((call.event.arguments as Record<string, unknown> | undefined)
+        ?.action as string | undefined)
+      : undefined;
     if (action === "list") tasks.clear();
     parsedTasks.forEach((task) => {
-      tasks.set(task.id, { ...tasks.get(task.id), ...task, timestampMs: event.event.timestamp_ms });
+      tasks.set(task.id, {
+        ...tasks.get(task.id),
+        ...task,
+        timestampMs: event.event.timestamp_ms,
+      });
     });
   });
 
@@ -189,7 +208,51 @@ export function buildToolSummaries(events: EventEnvelope[]): ToolSummary[] {
   return Object.values(summaries);
 }
 
-function addToolSummaryItem(summaries: Record<string, ToolSummary>, call: EventEnvelope, result?: EventEnvelope) {
+export function buildActionTimeline(
+  events: EventEnvelope[],
+): ActionTimelineItem[] {
+  const items: ActionTimelineItem[] = [];
+  const pending: ActionTimelineItem[] = [];
+
+  events.forEach((envelope) => {
+    const event = envelope.event;
+    if (event.type === "tool_call") {
+      const item = { actor: event.actor, envelope };
+      items.push(item);
+      pending.push(item);
+      return;
+    }
+    if (event.type === "tool_result") {
+      const index = pending.findIndex((item) =>
+        item.envelope.event.type === "tool_call" &&
+        item.envelope.event.tool === event.tool &&
+        teamActorKey(item.actor) === teamActorKey(event.actor)
+      );
+      const item = index >= 0 ? pending.splice(index, 1)[0] : undefined;
+      if (item) item.result = envelope;
+      return;
+    }
+    if (
+      event.type === "controller_observation" ||
+      event.type === "controller_closure" ||
+      event.type === "controller_mutation"
+    ) {
+      items.push({
+        actor: event.actor || workflowStewardActor(),
+        assistingProfile: event.assisting_profile,
+        envelope,
+      });
+    }
+  });
+
+  return items;
+}
+
+function addToolSummaryItem(
+  summaries: Record<string, ToolSummary>,
+  call: EventEnvelope,
+  result?: EventEnvelope,
+) {
   if (call.event.type !== "tool_call") return;
   const toolName = call.event.tool;
   if (!summaries[toolName]) {
@@ -203,13 +266,17 @@ function addToolSummaryItem(summaries: Record<string, ToolSummary>, call: EventE
   }
   summaries[toolName].count++;
   const detail = getToolDetail(call, result) || "(no details)";
-  const durationMs = result?.event.type === "tool_result" ? result.event.duration_ms : undefined;
+  const durationMs = result?.event.type === "tool_result"
+    ? result.event.duration_ms
+    : undefined;
   const duration = durationMs === undefined
     ? ""
     : durationMs < 1000
-      ? ` · ${durationMs} ms`
-      : ` · ${(durationMs / 1000).toFixed(1)} s`;
-  const energyJoules = result?.event.type === "tool_result" ? result.event.energy_joules : undefined;
+    ? ` · ${durationMs} ms`
+    : ` · ${(durationMs / 1000).toFixed(1)} s`;
+  const energyJoules = result?.event.type === "tool_result"
+    ? result.event.energy_joules
+    : undefined;
   const averagePower = result?.event.type === "tool_result"
     ? result.event.average_power_watts
     : undefined;
@@ -218,8 +285,12 @@ function addToolSummaryItem(summaries: Record<string, ToolSummary>, call: EventE
     : undefined;
   const energy = energyJoules === undefined
     ? ""
-    : ` · ${formatEnergy(energyJoules)}${averagePower === undefined ? "" : ` at ${formatPower(averagePower)}`}${
-      sharedCalls && sharedCalls > 1 ? ` across ${sharedCalls} parallel calls` : ""
+    : ` · ${formatEnergy(energyJoules)}${
+      averagePower === undefined ? "" : ` at ${formatPower(averagePower)}`
+    }${
+      sharedCalls && sharedCalls > 1
+        ? ` across ${sharedCalls} parallel calls`
+        : ""
     }`;
   summaries[toolName].items.push({
     detail: `${detail}${duration}${energy}`,
@@ -248,8 +319,14 @@ function isTransientActivityEvent(event: EventEnvelope): boolean {
     event.event.type === "step_started";
 }
 
-function withoutDuplicateSessionSummary(event: EventEnvelope, previousFinalContent?: string): EventEnvelope {
-  if (event.event.type !== "session_summary" || !event.event.summary || !previousFinalContent) {
+function withoutDuplicateSessionSummary(
+  event: EventEnvelope,
+  previousFinalContent?: string,
+): EventEnvelope {
+  if (
+    event.event.type !== "session_summary" || !event.event.summary ||
+    !previousFinalContent
+  ) {
     return event;
   }
 
@@ -264,35 +341,46 @@ function withoutDuplicateSessionSummary(event: EventEnvelope, previousFinalConte
   };
 }
 
-export function chatEventsWithOnlyLatestStep(events: EventEnvelope[]): EventEnvelope[] {
+export function chatEventsWithOnlyLatestStep(
+  events: EventEnvelope[],
+): EventEnvelope[] {
   let lastFinalContent: string | undefined;
   const chatEvents = events
     .filter((event) => !isHiddenChatEvent(event))
     .map((event) => {
-      const normalized = withoutDuplicateSessionSummary(event, lastFinalContent);
+      const normalized = withoutDuplicateSessionSummary(
+        event,
+        lastFinalContent,
+      );
       if (event.event.type === "final") lastFinalContent = event.event.content;
       return normalized;
     });
   const lastVisibleIndex = chatEvents.length - 1;
   return chatEvents.filter((event, index) => {
-    if (isTransientActivityEvent(event) && index !== lastVisibleIndex) return false;
+    if (isTransientActivityEvent(event) && index !== lastVisibleIndex) {
+      return false;
+    }
     if (
       event.event.type === "team_message" &&
       event.event.actor.kind === "automation" &&
-      event.event.actor.id === "handoff" &&
+      (event.event.actor.id === "handoff" ||
+        event.event.actor.id === "trinity") &&
       event.event.tone === "info"
     ) {
       return !chatEvents.slice(index + 1).some((later) =>
         later.event.type === "team_message" &&
         later.event.actor.kind === "automation" &&
-        later.event.actor.id === "handoff"
+        (later.event.actor.id === "handoff" ||
+          later.event.actor.id === "trinity")
       );
     }
     return true;
   });
 }
 
-export function latestAssistantProfile(events: EventEnvelope[]): string | undefined {
+export function latestAssistantProfile(
+  events: EventEnvelope[],
+): string | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i].event;
     if (
@@ -309,35 +397,9 @@ export function latestAssistantProfile(events: EventEnvelope[]): string | undefi
   return undefined;
 }
 
-export function profileName(profile: string): string {
-  switch (profile) {
-    case "plan": return "Dade Murphy";
-    case "build": return "Kate Libby";
-    case "review": return "Eugene Belford";
-    case "scout": return "Ramon Sanchez";
-    case "explore": return "Paul Cook";
-    case "research": return "Emmanuel Goldstein";
-    case "monitor": return "Trinity Walker";
-    case "ask": return "Joey Pardella";
-    default: return "Jon Appleseed";
-  }
-}
-
-export function profileJobTitle(profile: string): string {
-  switch (profile) {
-    case "plan": return "Ticket Goblin";
-    case "build": return "Patch Crafter";
-    case "review": return "Review Gremlin";
-    case "scout": return "Env Scout";
-    case "explore": return "Repo Mapper";
-    case "research": return "Web Sleuth";
-    case "monitor": return "Progress Monitor";
-    case "ask": return "Question Wrangler";
-    default: return "Unknown";
-  }
-}
-
-export function errorSummary(event: Extract<AgentEvent, { type: "error" }>): string {
+export function errorSummary(
+  event: Extract<AgentEvent, { type: "error" }>,
+): string {
   const summary = event.summary?.trim();
   if (summary) return summary;
   const message = String(event.message || "").trim();

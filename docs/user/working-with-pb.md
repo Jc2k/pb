@@ -51,10 +51,16 @@ pb performs narrowly safe routine work—such as an eligible file read or change
 without asking the model to choose the obvious next action. This is intrinsic workflow behavior.
 The model receives one explicit pb-owned context block, never a fabricated assistant tool call.
 
-The web transcript and **Actions** drawer show model tool calls and deterministic pb actions in one
-place. Every item carries an actor badge: **Model** for a model-issued tool and **pb** for controller
-work. Reads show their full or bounded-range coverage; deletion states that the path was tracked and
-Git-recoverable. The terminal uses the corresponding `tool` and `pb action` labels.
+The web transcript and **Actions** drawer show this work as messages and actions from the team. The
+active profile character owns tools the model requested—for example, Kate owns Build tool calls.
+Trinity Walker, the team steward, owns automatic reads, changed-path inspection, safe deletion,
+no-change closure, corrections, and handoff work. Each action also says **Model-requested** or
+**Automatic**, so the friendlier character metaphor does not hide provenance. Reads show their full
+or bounded-range coverage; deletion states that the path was tracked and Git-recoverable. The
+terminal uses the same character-first attribution and provenance.
+
+Sessions saved before actor attribution remain readable. Their model tool actions appear as
+**Legacy action** rather than being guessed from the closest chat message.
 
 If a file is missing, binary, symlinked, stale, oversized, or cannot fit the bounded prompt safely,
 pb does not pretend it was read. The normal model/tool path remains available. Automatic deletion

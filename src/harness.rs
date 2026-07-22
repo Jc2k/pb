@@ -2424,6 +2424,8 @@ mod tests {
                 ],
                 fallback_reason: None,
             },
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(crate::agent_core::AgentProfile::Build),
             nesting_depth: None,
             timestamp_ms: None,
         });
@@ -2444,6 +2446,8 @@ mod tests {
         sink.emit(AgentEvent::Correction {
             message: "mutation denied".to_string(),
             summary: "Tool not available".to_string(),
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(crate::agent_core::AgentProfile::Build),
             nesting_depth: None,
             timestamp_ms: None,
         });
@@ -2566,7 +2570,7 @@ mod tests {
         );
         assert!(journal.contains("Rejected workflow actions: `1`"));
         assert!(journal.contains("Evidence invalidations: `1`"));
-        assert!(journal.contains("## Controller action-elision audit"));
+        assert!(journal.contains("## Deterministic controller actions"));
         assert!(journal.contains("Observation rendering: `controller_block`"));
         assert!(journal.contains("Observations / prompt bytes: `1` / `64`"));
         assert!(journal.contains("Observation coverage: `{"));
@@ -2903,7 +2907,7 @@ mod tests {
             timestamp_ms: None,
         });
         sink.emit(AgentEvent::TeamMessage {
-            actor: crate::events::TeamActor::Automation(crate::events::AutomationActor::Handoff),
+            actor: crate::events::TeamActor::workflow_steward(),
             tone: crate::events::TeamMessageTone::Warning,
             message: "The web check needs attention.".to_string(),
             detail: Some("failed".to_string()),
@@ -2962,6 +2966,8 @@ mod tests {
         sink.emit(AgentEvent::Correction {
             message: "create alpha.txt now".to_string(),
             summary: "Next accepted-plan creation work unit".to_string(),
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(crate::agent_core::AgentProfile::Build),
             nesting_depth: None,
             timestamp_ms: None,
         });

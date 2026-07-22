@@ -28,17 +28,19 @@ model as one explicit user/context message labelled `actual_origin=controller` a
 
 ## Actions and actors
 
-The durable event stream distinguishes model tool calls from pb actions. Web and terminal surfaces
-present both in one action timeline without merging their authorship:
+The durable event stream distinguishes model tool calls from controller actions. Web and terminal
+surfaces present both as teammate work without merging their authorship:
 
-| Actor | Examples | Presentation |
+| Responsible teammate | Examples | Secondary provenance |
 | --- | --- | --- |
-| Model | `edit_file`, `run_check`, `submit_code_review` | `Model` in the web action list; `tool` in terminal output |
-| pb | eligible read, changed-path inspection, no-change closure, safe deletion | `pb` in the web action list; `pb action` in terminal output |
+| Active profile character, such as Kate or Eugene | `edit_file`, `run_check`, `submit_code_review` | `Model-requested` |
+| Trinity Walker, team steward | eligible read, changed-path inspection, no-change closure, safe deletion, deterministic correction, handoff | `Automatic` |
 
-The web session's **Actions** panel contains both categories, and the compact transcript entry uses
-the same actor labels. pb actions are also included in the activity history. A controller action
-never emits a model `tool_call` or `tool_result` event.
+The web session's **Actions** panel contains both categories in event order, and the compact
+transcript entry uses the same character identity. Controller actions are also included in the
+activity history. A controller action never emits a model `tool_call` or `tool_result` event. New
+events persist actor and assisting-profile metadata; actorless legacy model tools remain visibly
+unattributed rather than borrowing a nearby character.
 
 ## Eligibility and fallback
 
@@ -108,7 +110,8 @@ The test matrix covers:
   and oversized targets;
 - tracked-clean file deletion and tracked symlink deletion without following the target;
 - durable controller events without model tool-call events; and
-- web grouping that preserves `Model` and `pb` actor labels.
+- web grouping that separates profile-character and Trinity action ownership while retaining
+  `Model-requested` and `Automatic` provenance.
 
 ### Locked native/controller evaluator
 

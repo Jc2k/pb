@@ -1,5 +1,17 @@
-import type { EventEnvelope, HandoffOutcome, InstalledIntegration, MarketplaceIntegration, ProjectEntry, ProjectUsageStats, SessionItem } from "../types/index";
+import type {
+  EventEnvelope,
+  HandoffOutcome,
+  InstalledIntegration,
+  MarketplaceIntegration,
+  ProjectEntry,
+  ProjectUsageStats,
+  SessionItem,
+  TeamActor,
+} from "../types/index";
 import { metricEnergyJoules, metricRuntimeMs } from "./energy";
+import { teamActorKey, workflowStewardActor } from "./team";
+
+export { getAvatarForProfile } from "./team";
 
 export function uniqueIntegrations<
   T extends Pick<MarketplaceIntegration, "kind" | "name" | "container_image">,
@@ -13,7 +25,9 @@ export function uniqueIntegrations<
   });
 }
 
-export function uniqueInstalledIntegrations(entries: InstalledIntegration[]): InstalledIntegration[] {
+export function uniqueInstalledIntegrations(
+  entries: InstalledIntegration[],
+): InstalledIntegration[] {
   const seen = new Set<string>();
   return entries.filter((entry) => {
     const key = `${entry.kind}:${entry.name}:${entry.container_image}`;
@@ -23,33 +37,21 @@ export function uniqueInstalledIntegrations(entries: InstalledIntegration[]): In
   });
 }
 
-export function isIntegrationInstalled(item: MarketplaceIntegration, installed: InstalledIntegration[]): boolean {
+export function isIntegrationInstalled(
+  item: MarketplaceIntegration,
+  installed: InstalledIntegration[],
+): boolean {
   return installed.some((entry) =>
-    entry.kind === item.kind && (entry.container_image === item.container_image || entry.name === item.name)
+    entry.kind === item.kind &&
+    (entry.container_image === item.container_image || entry.name === item.name)
   );
-}
-
-
-export function getAvatarForProfile(profile: string): string {
-  const validProfiles = [
-    "build",
-    "scout",
-    "review",
-    "explore",
-    "plan",
-    "ask",
-    "research",
-    "monitor",
-  ];
-  if (validProfiles.includes(profile)) {
-    return `/static/images/avatar-${profile}.png`;
-  }
-  return "/static/images/avatar.png";
 }
 
 /* ─── helpers ────────────────────────────────────────────────── */
 
-export function sessionTitle(session: Pick<SessionItem, "task" | "title">): string {
+export function sessionTitle(
+  session: Pick<SessionItem, "task" | "title">,
+): string {
   return session.title?.trim() || session.task;
 }
 
@@ -61,6 +63,8 @@ export function sessionPageDocumentTitle(
 
 export type ActionGroup = {
   type: "action_group";
+  actor?: TeamActor;
+  assistingProfile?: string;
   toolCalls: EventEnvelope[];
   toolResults: EventEnvelope[];
   controllerActions: EventEnvelope[];
@@ -80,6 +84,8 @@ export function groupActionEvents(
   let currentToolCalls: EventEnvelope[] = [];
   let currentToolResults: EventEnvelope[] = [];
   let currentControllerActions: EventEnvelope[] = [];
+  let currentActor: TeamActor | undefined;
+  let currentAssistingProfile: string | undefined;
 
   const flush = () => {
     if (
@@ -88,6 +94,8 @@ export function groupActionEvents(
     ) return;
     grouped.push({
       type: "action_group",
+      actor: currentActor,
+      assistingProfile: currentAssistingProfile,
       toolCalls: [...currentToolCalls],
       toolResults: [...currentToolResults],
       controllerActions: [...currentControllerActions],
@@ -95,19 +103,50 @@ export function groupActionEvents(
     currentToolCalls = [];
     currentToolResults = [];
     currentControllerActions = [];
+    currentActor = undefined;
+    currentAssistingProfile = undefined;
+  };
+
+  const beginOrSwitchGroup = (
+    actor: TeamActor | undefined,
+    assistingProfile?: string,
+  ) => {
+    const hasActions = currentToolCalls.length > 0 ||
+      currentToolResults.length > 0 || currentControllerActions.length > 0;
+    if (
+      hasActions &&
+      (teamActorKey(currentActor) !== teamActorKey(actor) ||
+        currentAssistingProfile !== assistingProfile)
+    ) flush();
+    const groupIsEmpty = currentToolCalls.length === 0 &&
+      currentToolResults.length === 0 && currentControllerActions.length === 0;
+    if (groupIsEmpty) {
+      currentActor = actor;
+      currentAssistingProfile = assistingProfile;
+    }
   };
 
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
 
     if (event.event.type === "tool_call") {
+      beginOrSwitchGroup(event.event.actor);
       currentToolCalls.push(event);
     } else if (
       event.event.type === "tool_result" &&
       currentToolCalls.length > currentToolResults.length
     ) {
+      beginOrSwitchGroup(event.event.actor);
       currentToolResults.push(event);
-    } else if (isControllerActionEvent(event)) {
+    } else if (
+      event.event.type === "controller_observation" ||
+      event.event.type === "controller_closure" ||
+      event.event.type === "controller_mutation"
+    ) {
+      beginOrSwitchGroup(
+        event.event.actor || workflowStewardActor(),
+        event.event.assisting_profile,
+      );
       currentControllerActions.push(event);
     } else {
       flush();
@@ -119,7 +158,6 @@ export function groupActionEvents(
 
   return grouped;
 }
-
 
 export function projectSettingsPath(projectName: string): string {
   return `/projects/${encodeURIComponent(projectName)}/settings`;
@@ -136,12 +174,18 @@ export async function ensureNotificationPermission(): Promise<boolean> {
   return (await Notification.requestPermission()) === "granted";
 }
 
-export async function notifySessionFinished(session: SessionItem, projects: ProjectEntry[]) {
+export async function notifySessionFinished(
+  session: SessionItem,
+  projects: ProjectEntry[],
+) {
   if (session.status !== "completed" && session.status !== "failed") return;
   const project = projects.find((entry) => entry.path === session.workdir);
   if (!project?.notify_on_finish) return;
   if (!(await ensureNotificationPermission())) return;
-  const title = handoffNotificationTitle(session.handoff_outcome, session.status);
+  const title = handoffNotificationTitle(
+    session.handoff_outcome,
+    session.status,
+  );
   const body = `${project.name}: ${sessionTitle(session)}`;
   const url = `/sessions/${session.session_id}`;
   const registration = await navigator.serviceWorker?.getRegistration?.();
@@ -155,7 +199,10 @@ export async function notifySessionFinished(session: SessionItem, projects: Proj
     });
     return;
   }
-  const notification = new Notification(title, { body, icon: "/apple-touch-icon.png" });
+  const notification = new Notification(title, {
+    body,
+    icon: "/apple-touch-icon.png",
+  });
   notification.onclick = () => {
     window.focus();
     window.location.href = url;
@@ -167,14 +214,22 @@ export function handoffNotificationTitle(
   status: SessionItem["status"],
 ): string {
   switch (outcome) {
-    case "ready": return "The team wrapped this up";
-    case "no_change": return "The team left the code untouched";
+    case "ready":
+      return "The team wrapped this up";
+    case "no_change":
+      return "The team left the code untouched";
     case "checks_failed":
-    case "repair_exhausted": return "This needs another pass";
+    case "repair_exhausted":
+      return "This needs another pass";
     case "executor_unavailable":
-    case "commit_blocked": return "The team needs help to continue";
-    case "incomplete": return "The task stopped before handoff";
-    default: return status === "completed" ? "The team wrapped this up" : "The task stopped before handoff";
+    case "commit_blocked":
+      return "The team needs help to continue";
+    case "incomplete":
+      return "The task stopped before handoff";
+    default:
+      return status === "completed"
+        ? "The team wrapped this up"
+        : "The task stopped before handoff";
   }
 }
 
@@ -184,8 +239,10 @@ export function projectName(workdir?: string): string {
   return parts[parts.length - 1] || workdir;
 }
 
-
-export function usageStatsForToday(sessions: SessionItem[], now = new Date()): ProjectUsageStats {
+export function usageStatsForToday(
+  sessions: SessionItem[],
+  now = new Date(),
+): ProjectUsageStats {
   const startOfToday = new Date(now);
   startOfToday.setHours(0, 0, 0, 0);
   const startMs = startOfToday.getTime();
@@ -202,10 +259,14 @@ export function usageStatsForToday(sessions: SessionItem[], now = new Date()): P
       const endedAt = metrics.ended_at_ms ?? session.updated_at_ms;
       const startedAt = metrics.started_at_ms ?? Math.max(0, endedAt - runtime);
       const interval = Math.max(1, endedAt - startedAt);
-      const overlap = Math.max(0, Math.min(endedAt, endMs) - Math.max(startedAt, startMs));
+      const overlap = Math.max(
+        0,
+        Math.min(endedAt, endMs) - Math.max(startedAt, startMs),
+      );
       if (overlap <= 0) return;
       const share = Math.min(1, overlap / interval);
-      totals.tokens += (metrics.prompt_tokens + metrics.generated_tokens) * share;
+      totals.tokens += (metrics.prompt_tokens + metrics.generated_tokens) *
+        share;
       totals.runtime_ms += runtime * share;
       totals.tool_calls += metrics.tool_calls * share;
       const energy = metricEnergyJoules(metrics);
