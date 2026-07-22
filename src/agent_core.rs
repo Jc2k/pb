@@ -5556,10 +5556,14 @@ fn run_agent_steps(
                     ),
                     (_, crate::workflow::WorkUnitState::StructurallyComplete) => String::new(),
                 };
-                let instruction = if unit.state == crate::workflow::WorkUnitState::MutationReady {
+                let instruction = if matches!(
+                    unit.state,
+                    crate::workflow::WorkUnitState::MutationReady
+                        | crate::workflow::WorkUnitState::DiagnosticRepairReady
+                ) {
                     format!(
                         "{instruction}{}",
-                        contract_work_unit_check_ids(args.contract.as_ref(), &unit.path)
+                        contract_work_unit_guidance(args.contract.as_ref(), &unit.path)
                     )
                 } else {
                     instruction
@@ -15471,28 +15475,18 @@ fn contract_planning_path_state_note(
     ))
 }
 
-fn contract_work_unit_check_ids(
+fn contract_work_unit_guidance(
     contract: Option<&crate::harness_contract::AgentContract>,
     path: &str,
 ) -> String {
     let Some(contract) = contract else {
         return String::new();
     };
-    let mut check_ids = contract
-        .checks
-        .iter()
-        .filter(|check| check.required && check.diagnostic_eligible)
-        .filter(|check| check.command.contains(path))
-        .map(|check| check.id.as_str())
-        .collect::<Vec<_>>();
-    check_ids.sort_unstable();
-    check_ids.dedup();
-    if check_ids.is_empty() {
+    let Some(guidance) = contract.work_unit_guidance.get(path) else {
         return String::new();
-    }
+    };
     format!(
-        "\nCurrent work-unit verifier obligations (guidance only; no evidence is granted): [{}]. Make this mutation satisfy every named obligation.",
-        check_ids.join(", ")
+        "\nTrusted work-unit guidance (advisory only; it grants no evidence or authority): {guidance}"
     )
 }
 
@@ -18961,6 +18955,7 @@ the next imagined action"#;
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Optional,
             allowed_paths: vec!["game.js".to_string()],
+            work_unit_guidance: BTreeMap::new(),
             checks: vec![crate::harness_contract::AgentCheckContract {
                 id: "logic".to_string(),
                 command: "true".to_string(),
@@ -18993,6 +18988,10 @@ the next imagined action"#;
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Required,
             allowed_paths: vec!["game.js".to_string()],
+            work_unit_guidance: BTreeMap::from([(
+                "game.js".to_string(),
+                "Keep this implementation compact.".to_string(),
+            )]),
             checks: vec![
                 crate::harness_contract::AgentCheckContract {
                     id: "logic".to_string(),
@@ -19028,10 +19027,10 @@ the next imagined action"#;
         assert!(projection_note.contains("[logic, review_gate]"));
         assert!(projection_note.contains("Do not spend output copying"));
         assert_eq!(
-            contract_work_unit_check_ids(Some(&contract), "game.js"),
-            "\nCurrent work-unit verifier obligations (guidance only; no evidence is granted): [logic]. Make this mutation satisfy every named obligation."
+            contract_work_unit_guidance(Some(&contract), "game.js"),
+            "\nTrusted work-unit guidance (advisory only; it grants no evidence or authority): Keep this implementation compact."
         );
-        assert!(contract_work_unit_check_ids(Some(&contract), "other.js").is_empty());
+        assert!(contract_work_unit_guidance(Some(&contract), "other.js").is_empty());
         let missing_snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
         let missing_path_note =
             contract_planning_path_state_note(Some(&contract), &missing_snapshot);
@@ -19489,6 +19488,7 @@ the next imagined action"#;
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Required,
             allowed_paths: vec!["alpha.txt".to_string()],
+            work_unit_guidance: BTreeMap::new(),
             checks: vec![crate::harness_contract::AgentCheckContract {
                 id: "preview".to_string(),
                 command: "echo 'alpha.txt: broken'; exit 1".to_string(),
@@ -19559,6 +19559,10 @@ the next imagined action"#;
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Required,
             allowed_paths: vec!["alpha.txt".to_string()],
+            work_unit_guidance: BTreeMap::from([(
+                "alpha.txt".to_string(),
+                "Keep the repaired file compact.".to_string(),
+            )]),
             checks: vec![crate::harness_contract::AgentCheckContract {
                 id: "preview".to_string(),
                 command:
@@ -19641,6 +19645,11 @@ the next imagined action"#;
             repair_instructions
                 .iter()
                 .any(|message| message.contains("Do not request replan"))
+        );
+        assert!(
+            repair_instructions
+                .iter()
+                .any(|message| message.contains("Keep the repaired file compact."))
         );
         assert!(repair_instructions.iter().any(|message| {
             message.contains("Latest failed-check obligations")
@@ -20637,6 +20646,7 @@ the next imagined action"#;
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Required,
             allowed_paths: vec!["existing.txt".to_string()],
+            work_unit_guidance: BTreeMap::new(),
             checks: vec![crate::harness_contract::AgentCheckContract {
                 id: check_id.clone(),
                 command: contract_check.command.clone(),
@@ -22337,6 +22347,7 @@ the next imagined action"#;
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Optional,
             allowed_paths: vec!["game.js".to_string()],
+            work_unit_guidance: BTreeMap::new(),
             checks: vec![crate::harness_contract::HarnessCheckDocument {
                 id: "logic".to_string(),
                 command: command.to_string(),
@@ -22358,6 +22369,7 @@ the next imagined action"#;
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Optional,
             allowed_paths: Vec::new(),
+            work_unit_guidance: BTreeMap::new(),
             checks: Vec::new(),
             commit: crate::harness_contract::HarnessCommitContract::default(),
             review: crate::harness_contract::HarnessReviewContract::default(),
@@ -22693,6 +22705,7 @@ the next imagined action"#;
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Required,
             allowed_paths: vec!["change.txt".to_string()],
+            work_unit_guidance: BTreeMap::new(),
             checks: Vec::new(),
             commit: crate::harness_contract::HarnessCommitContract::default(),
             review: crate::harness_contract::HarnessReviewContract::default(),
@@ -23045,6 +23058,7 @@ the next imagined action"#;
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Required,
             allowed_paths: vec!["change.txt".to_string()],
+            work_unit_guidance: BTreeMap::new(),
             checks: vec![crate::harness_contract::HarnessCheckDocument {
                 id: "logic".to_string(),
                 command: "true".to_string(),

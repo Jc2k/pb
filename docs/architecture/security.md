@@ -69,6 +69,8 @@ The model does not need to supply its target path; pb resolves it from the accep
 records the resolved path in the tool event. Bounded multi-create batches validate every member
 before execution and roll back earlier members after an execution failure. Diagnostic previews
 cannot mint selected-check evidence and are rejected if they alter repository or Git control state.
+Optional contract `work_unit_guidance` is size-bounded advisory prompt text for an exact allowed
+path; it grants no capability, scope, evidence, progress, or stage transition.
 
 Configured tasks run in an isolated snapshot. pb rejects Git-control changes, undeclared paths,
 unsafe symlinks, and boundedness violations before staging every output. Promotion is transactional:

@@ -284,6 +284,11 @@ batch whose ordered paths come from the ledger. Every payload and destination va
 first create; an execution failure rolls back already-created members. A complete transition
 advances the ledger after a normal turn or checkpoint resume, while an incomplete, stale, or
 out-of-order transition keeps the typed implementation terminal hidden.
+An acceptance contract may attach a bounded advisory hint to an exact allowed path. pb repeats only
+the active mutation-ready unit's hint in the dynamic prompt suffix; the canonical tool schema stays
+unchanged. The hint cannot select or advance a unit, grant authority or evidence, or satisfy any
+workflow gate. This is the supported way to give a weaker local model concise path-specific
+constraints without projecting raw verifier commands into its action context.
 On the final ordinary implementation or repair turn, pb exposes only the typed implementation
 submission when its deterministic terminal preconditions are ready. This reserves closure capacity
 for small local models instead of letting a redundant diagnostic consume the stage budget. If a

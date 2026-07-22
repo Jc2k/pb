@@ -2,6 +2,9 @@
   "version": 1,
   "mutation": "required",
   "allowed_paths": ["game.js", "game-logic.test.mjs"],
+  "work_unit_guidance": {
+    "game-logic.test.mjs": "Keep the test file compact and dependency-free; use only local imports and local assertion helpers."
+  },
   "checks": [
     {
       "id": "logic",

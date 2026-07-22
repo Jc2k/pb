@@ -36,6 +36,11 @@
         "version": 1,
         "mutation": "required",
         "allowed_paths": ["slugify.mjs", "slugify.test.mjs", "README.md"],
+        "work_unit_guidance": {
+          "slugify.mjs": "Keep the module compact. Export named slugify and implement only the requested lowercase, ASCII non-alphanumeric run replacement, and edge trimming.",
+          "slugify.test.mjs": "Keep the test file compact and dependency-free: import only ./slugify.mjs, define a tiny local assertion helper, and use one Deno.test to cover the requested cases. Never use HTTP(S), jsr:, npm:, or package imports.",
+          "README.md": "Keep the README short: state the exact transform and show one local ./slugify.mjs import example."
+        },
         "checks": [
           {
             "id": "behavior",
@@ -245,6 +250,10 @@
         "version": 1,
         "mutation": "required",
         "allowed_paths": ["legacy.txt", "README.md"],
+        "work_unit_guidance": {
+          "legacy.txt": "Delete this obsolete file.",
+          "README.md": "Replace the legacy-support sentence with exactly: The current workflow is supported."
+        },
         "checks": [{
           "id": "removed_and_documented",
           "command": "test ! -e legacy.txt && rg -q 'current workflow is supported' README.md",
@@ -306,6 +315,10 @@
         "version": 1,
         "mutation": "required",
         "allowed_paths": ["counter.mjs", "counter.test.mjs"],
+        "work_unit_guidance": {
+          "counter.mjs": "Preserve increment and add only the named decrement export.",
+          "counter.test.mjs": "Keep the test file compact and dependency-free: import only ./counter.mjs, define a tiny local assertion helper, and use one Deno.test covering increment and decrement."
+        },
         "checks": [
           {
             "id": "tests",
@@ -348,6 +361,10 @@
         "version": 1,
         "mutation": "required",
         "allowed_paths": ["formatter.mjs", "formatter.test.mjs"],
+        "work_unit_guidance": {
+          "formatter.mjs": "This adopted file already has the required upper and lower exports; preserve it unless a trusted check proves it is wrong.",
+          "formatter.test.mjs": "Keep the test file compact and dependency-free: import only ./formatter.mjs, define a tiny local assertion helper, and use one Deno.test covering upper and lower."
+        },
         "checks": [
           {
             "id": "behavior",

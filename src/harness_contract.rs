@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail};
@@ -8,6 +8,9 @@ const HARNESS_CONTRACT_VERSION: u32 = 1;
 const DEFAULT_CHECK_TIMEOUT_SECONDS: u64 = 60;
 const MAX_CHECK_TIMEOUT_SECONDS: u64 = 3600;
 const MAX_DIAGNOSTIC_TIMEOUT_SECONDS: u64 = 60;
+const MAX_WORK_UNIT_GUIDANCE_ENTRIES: usize = 64;
+const MAX_WORK_UNIT_GUIDANCE_BYTES: usize = 512;
+const MAX_TOTAL_WORK_UNIT_GUIDANCE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +65,8 @@ pub struct HarnessContractDocument {
     #[serde(default)]
     pub allowed_paths: Vec<String>,
     #[serde(default)]
+    pub work_unit_guidance: BTreeMap<String, String>,
+    #[serde(default)]
     pub checks: Vec<HarnessCheckDocument>,
     #[serde(default)]
     pub commit: HarnessCommitContract,
@@ -86,6 +91,8 @@ pub struct AgentContract {
     pub version: u32,
     pub mutation: MutationRequirement,
     pub allowed_paths: Vec<String>,
+    #[serde(default)]
+    pub work_unit_guidance: BTreeMap<String, String>,
     pub checks: Vec<AgentCheckContract>,
     pub commit: HarnessCommitContract,
     pub review: HarnessReviewContract,
@@ -110,6 +117,8 @@ impl HarnessContractDocument {
         }
 
         let allowed_paths = normalize_unique_paths("allowed_paths", self.allowed_paths, false)?;
+        let work_unit_guidance =
+            normalize_work_unit_guidance(self.work_unit_guidance, &allowed_paths)?;
         let review_read_paths =
             normalize_unique_paths("review.read_paths", self.review.read_paths, false)?;
         let mut check_ids = HashSet::new();
@@ -163,6 +172,7 @@ impl HarnessContractDocument {
             version: self.version,
             mutation: self.mutation,
             allowed_paths,
+            work_unit_guidance,
             checks,
             commit: self.commit,
             review: HarnessReviewContract {
@@ -303,6 +313,43 @@ fn normalize_unique_paths(field: &str, paths: Vec<String>, allow_dot: bool) -> R
     Ok(normalized)
 }
 
+fn normalize_work_unit_guidance(
+    guidance: BTreeMap<String, String>,
+    allowed_paths: &[String],
+) -> Result<BTreeMap<String, String>> {
+    if guidance.len() > MAX_WORK_UNIT_GUIDANCE_ENTRIES {
+        bail!("work_unit_guidance may contain at most {MAX_WORK_UNIT_GUIDANCE_ENTRIES} entries");
+    }
+    let allowed_paths = allowed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut total_bytes = 0_usize;
+    let mut normalized = BTreeMap::new();
+    for (raw_path, raw_guidance) in guidance {
+        let path = normalize_relative_path(&raw_path, false)
+            .with_context(|| format!("invalid work_unit_guidance path '{raw_path}'"))?;
+        if !allowed_paths.is_empty() && !allowed_paths.contains(path.as_str()) {
+            bail!("work_unit_guidance path '{path}' is not listed in allowed_paths");
+        }
+        let guidance = raw_guidance.trim().to_string();
+        if guidance.is_empty() {
+            bail!("work_unit_guidance for '{path}' must not be empty");
+        }
+        if guidance.len() > MAX_WORK_UNIT_GUIDANCE_BYTES {
+            bail!("work_unit_guidance for '{path}' exceeds {MAX_WORK_UNIT_GUIDANCE_BYTES} bytes");
+        }
+        total_bytes = total_bytes.saturating_add(guidance.len());
+        if total_bytes > MAX_TOTAL_WORK_UNIT_GUIDANCE_BYTES {
+            bail!("work_unit_guidance exceeds {MAX_TOTAL_WORK_UNIT_GUIDANCE_BYTES} total bytes");
+        }
+        if normalized.insert(path.clone(), guidance).is_some() {
+            bail!("work_unit_guidance contains duplicate normalized path '{path}'");
+        }
+    }
+    Ok(normalized)
+}
+
 fn normalize_unique_ids(field: &str, ids: Vec<String>) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut normalized = Vec::with_capacity(ids.len());
@@ -400,6 +447,50 @@ mod tests {
         assert_eq!(contract.checks[0].timeout_seconds, 60);
         assert!(contract.checks[0].required);
         assert!(!contract.checks[0].diagnostic_eligible);
+    }
+
+    #[test]
+    fn work_unit_guidance_is_bounded_and_scoped_to_allowed_paths() {
+        let document: HarnessContractDocument = serde_json::from_str(
+            r#"{"version":1,"allowed_paths":["src/game.js"],"work_unit_guidance":{"src/./game.js":" Keep it compact. "}}"#,
+        )
+        .unwrap();
+        let contract = document.normalize().unwrap();
+        assert_eq!(
+            contract.work_unit_guidance.get("src/game.js"),
+            Some(&"Keep it compact.".to_string())
+        );
+
+        let outside: HarnessContractDocument = serde_json::from_str(
+            r#"{"version":1,"allowed_paths":["src/game.js"],"work_unit_guidance":{"README.md":"Do not edit."}}"#,
+        )
+        .unwrap();
+        assert!(
+            outside
+                .normalize()
+                .unwrap_err()
+                .to_string()
+                .contains("not listed in allowed_paths")
+        );
+
+        let oversized = "x".repeat(MAX_WORK_UNIT_GUIDANCE_BYTES + 1);
+        let oversized = HarnessContractDocument {
+            version: 1,
+            mutation: MutationRequirement::Optional,
+            allowed_paths: vec!["game.js".to_string()],
+            work_unit_guidance: BTreeMap::from([("game.js".to_string(), oversized)]),
+            checks: Vec::new(),
+            commit: HarnessCommitContract::default(),
+            review: HarnessReviewContract::default(),
+            workspace_clean: false,
+        };
+        assert!(
+            oversized
+                .normalize()
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds 512 bytes")
+        );
     }
 
     #[test]

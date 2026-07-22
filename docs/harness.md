@@ -51,6 +51,14 @@ Version 1 can require a final mutation, restrict changed paths, define named che
 semantic commits, require a clean worktree, and state the exact paths/checks a review must inspect.
 See `docs/harness-contract-v1.example.json` for the complete shape.
 
+The optional `work_unit_guidance` object maps exact normalized task paths to short trusted hints.
+pb repeats only the active path's hint when that typed work unit is ready to mutate. Guidance is
+limited to 64 entries, 512 bytes per path, and 4,096 bytes total; when `allowed_paths` is nonempty,
+every guided path must be allowed. It is advisory prompt material only: it cannot select a path,
+grant read or mutation authority, satisfy a check or review, advance a stage, or earn progress. This
+gives a small local model a concise implementation constraint without copying verifier commands or
+opaque check identifiers into every turn.
+
 An individual check may set `"diagnostic_eligible": true`. After all typed work units are
 structurally complete, pb may run that check once as fingerprint-bound repair feedback. The preview
 cannot satisfy any required-check or review gate; authoritative checking reruns it after the model's

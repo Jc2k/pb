@@ -109,6 +109,11 @@ that exact artifact to fresh plan review. Additional checks remain model-selecte
 implementation scope remain model-proposed and contract-validated; projection cannot turn an
 allowed path into a required mutation or add user intent.
 
+An optional bounded `work_unit_guidance` map may give an exact task path a concise advisory hint.
+It is trusted prompt context, not an acceptance fact: the hint cannot choose a path, authorize a
+mutation, earn progress, satisfy a check or review, or advance the workflow. pb validates guided
+paths against nonempty `allowed_paths` and surfaces only the active mutation-ready path's text.
+
 Checks may opt into `diagnostic_eligible`. Such a check can run early only after structural work-unit
 completion. Its result is repair feedback, not acceptance evidence: required checks rerun after the
 typed implementation artifact, and only that authoritative run can satisfy checking, review,

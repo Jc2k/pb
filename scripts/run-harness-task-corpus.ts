@@ -130,6 +130,39 @@ export function validateCorpus(value: unknown): TaskCorpus {
     if (new Set(allowedPaths).size !== allowedPaths.length) {
       throw new Error(`${id}.contract.allowed_paths contains duplicates`);
     }
+    const workUnitGuidance = requireObject(
+      contract.work_unit_guidance ?? {},
+      `${id}.contract.work_unit_guidance`,
+    );
+    if (Object.keys(workUnitGuidance).length > 64) {
+      throw new Error(`${id}.contract.work_unit_guidance has more than 64 entries`);
+    }
+    let guidanceBytes = 0;
+    for (const [rawPath, rawGuidance] of Object.entries(workUnitGuidance)) {
+      const path = validateRelativePath(
+        rawPath,
+        `${id}.contract.work_unit_guidance path`,
+      );
+      if (allowedPaths.length > 0 && !allowedPaths.includes(path)) {
+        throw new Error(
+          `${id}.contract.work_unit_guidance path is not allowed: ${path}`,
+        );
+      }
+      const guidance = requireString(
+        rawGuidance,
+        `${id}.contract.work_unit_guidance[${path}]`,
+      );
+      const bytes = new TextEncoder().encode(guidance.trim()).length;
+      if (bytes > 512) {
+        throw new Error(
+          `${id}.contract.work_unit_guidance[${path}] exceeds 512 bytes`,
+        );
+      }
+      guidanceBytes += bytes;
+    }
+    if (guidanceBytes > 4096) {
+      throw new Error(`${id}.contract.work_unit_guidance exceeds 4096 bytes`);
+    }
     if (!Array.isArray(contract.checks)) {
       throw new Error(`${id}.contract.checks must be an array`);
     }
