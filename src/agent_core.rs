@@ -5025,6 +5025,7 @@ struct GateState {
     earned_work_unit_ids: BTreeSet<String>,
     diagnostic_preview_fingerprint: Option<String>,
     diagnostic_failed_paths: BTreeSet<String>,
+    diagnostic_failure_feedback: Option<String>,
     delivery_proposal: Option<crate::workflow::DeliveryProposal>,
     requested_delivery: Option<crate::workflow::ConversationHandoff>,
     goal_proposal: Option<crate::goal::GoalProposal>,
@@ -5498,18 +5499,28 @@ fn run_agent_steps(
             });
         if announced != announced_work_unit {
             if let Some(unit) = active_work_unit.as_ref() {
+                let diagnostic_obligations = gate_state
+                    .borrow()
+                    .diagnostic_failure_feedback
+                    .as_deref()
+                    .map(|feedback| {
+                        format!(
+                            "\nLatest failed-check obligations for this repair (address every item):\n{feedback}"
+                        )
+                    })
+                    .unwrap_or_default();
                 let instruction = match (unit.operation, unit.state) {
                     (_, crate::workflow::WorkUnitState::EvidenceNeeded) => format!(
                         "Harness work unit {}: observe the complete current bytes of {} with read_file before its {:?} mutation can become eligible.",
                         unit.id, unit.path, unit.operation
                     ),
                     (_, crate::workflow::WorkUnitState::DiagnosticFailed) => format!(
-                        "Harness diagnostic repair unit {}: read the complete current bytes of {} again. Evidence collected before the failed diagnostic was invalidated. The latest preview may list multiple failed checks; after this read, repair every listed failure together instead of fixing only the first one.",
-                        unit.id, unit.path
+                        "Harness diagnostic repair unit {}: read the complete current bytes of {} again. Evidence collected before the failed diagnostic was invalidated. The latest preview may list multiple failed checks; after this read, repair every listed failure together instead of fixing only the first one.{}",
+                        unit.id, unit.path, diagnostic_obligations
                     ),
                     (_, crate::workflow::WorkUnitState::DiagnosticRepairReady) => format!(
-                        "Harness diagnostic repair unit {}: repair only {} with target-bound replace_file or edit_file. Address every failure from the latest diagnostic in one mutation; a partial repair consumes another evidence-and-repair cycle. This repair authority does not reopen any other accepted-plan path. Do not request replan when this exact path can satisfy the listed failures.",
-                        unit.id, unit.path
+                        "Harness diagnostic repair unit {}: repair only {} with target-bound replace_file or edit_file. Address every failure from the latest diagnostic in one mutation; a partial repair consumes another evidence-and-repair cycle. This repair authority does not reopen any other accepted-plan path. Do not request replan when this exact path can satisfy the listed failures.{}",
+                        unit.id, unit.path, diagnostic_obligations
                     ),
                     (
                         crate::workflow::PlannedChange::Create,
@@ -8804,6 +8815,8 @@ fn run_work_unit_diagnostic_previews(
     let mut gate = gate_state.borrow_mut();
     gate.diagnostic_preview_fingerprint = Some(current.fingerprint);
     gate.diagnostic_failed_paths = focused_paths.clone();
+    gate.diagnostic_failure_feedback =
+        (!failed.is_empty()).then(|| truncate_chars(&failed.join("\n"), 4_000));
     drop(gate);
     if failed.is_empty() {
         Ok(Some(
@@ -19591,6 +19604,10 @@ the next imagined action"#;
                 .iter()
                 .any(|message| message.contains("Do not request replan"))
         );
+        assert!(repair_instructions.iter().any(|message| {
+            message.contains("Latest failed-check obligations")
+                && message.contains("preview (status 1): alpha.txt: broken")
+        }));
     }
 
     #[test]
