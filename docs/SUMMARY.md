@@ -41,6 +41,7 @@
   - [S6 · Model evaluation](benchmarks/small-model-agent-s6.md)
   - [DeepSeek V4 Flash field run](benchmarks/deepseek-v4-flash-agent.md)
 - [Verified task-completion reliability](task-completion-reliability-plan.md)
+  - [Controller-owned deterministic action elision](controller-action-elision-plan.md)
   - [TC1 · Verified completion](benchmarks/task-completion-tc1.md)
   - [TC2 · Useful coding](benchmarks/task-completion-tc2.md)
   - [TC3 · Controller baseline](benchmarks/task-completion-tc3-baseline.md)

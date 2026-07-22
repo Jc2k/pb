@@ -9,6 +9,10 @@ which established safe control behavior, and the
 [Qwen3-Coder-Next performance follow-on](qwen3-coder-next-agent-follow-on.md), which owns the current
 native model/runtime qualification.
 
+The proposed [controller-owned action-elision follow-on](controller-action-elision-plan.md) is a
+design record, not shipped behavior. Its first gate compares explicit controller evidence with
+disclosed and undisclosed tool-compatible prompt transcripts before any production read elision.
+
 ## Outcome
 
 pb should complete useful local coding tasks through accepted planning, fresh plan review, bounded
