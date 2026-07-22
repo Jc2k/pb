@@ -3,7 +3,7 @@
   "mutation": "required",
   "allowed_paths": ["slugify.mjs", "slugify.test.mjs", "README.md"],
   "work_unit_guidance": {
-    "slugify.test.mjs": "Keep the test file compact and dependency-free: import only ./slugify.mjs, define a tiny local assertion helper, and use one Deno.test to cover the requested cases. Never use HTTP(S), jsr:, npm:, or package imports."
+    "slugify.test.mjs": "Keep the test file compact and dependency-free: import only ./slugify.mjs, define a tiny local assertion helper, and use one Deno.test to cover the requested cases. Compute expected values literally from the rule; for example, slugify('100% sure') is '100-sure'. Never use HTTP(S), jsr:, npm:, or package imports."
   },
   "checks": [
     {
