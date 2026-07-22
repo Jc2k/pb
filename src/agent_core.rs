@@ -4677,9 +4677,7 @@ fn scope_tools_to_work_unit(tools: &mut Vec<BuiltInToolSchema>, unit: &crate::wo
 
 fn bind_work_unit_target(
     call: &mut AgentToolCall,
-    args: &AgentRequest,
-    gate_state: &GateState,
-    workspace_root: &Path,
+    active_work_unit: Option<&crate::workflow::WorkUnit>,
 ) -> Result<()> {
     if !matches!(
         call.tool.as_str(),
@@ -4687,19 +4685,9 @@ fn bind_work_unit_target(
     ) {
         return Ok(());
     }
-    let Some(mut ledger) = args.workflow_work_units.clone() else {
+    let Some(unit) = active_work_unit else {
         return Ok(());
     };
-    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
-    let exact_evidence_paths = gate_state
-        .stage_evidence
-        .read_paths()
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    ledger.reconcile(&current, &exact_evidence_paths)?;
-    let unit = ledger
-        .active()
-        .context("target-bound tool called with no active work unit")?;
     let arguments = call
         .arguments
         .as_object_mut()
@@ -4904,6 +4892,7 @@ struct ToolExecutionEnv<'a> {
     gate_state: &'a RefCell<GateState>,
     read_cache: &'a RefCell<DeterministicReadCache>,
     exposed_tools: Vec<BuiltInToolSchema>,
+    active_work_unit: Option<crate::workflow::WorkUnit>,
     workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
     nesting_depth: usize,
 }
@@ -6296,6 +6285,7 @@ fn run_agent_steps(
                         gate_state: &gate_state,
                         read_cache: &read_cache,
                         exposed_tools: generation_tools.to_vec(),
+                        active_work_unit: active_work_unit.clone(),
                         workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
                     },
@@ -6460,6 +6450,7 @@ fn run_agent_steps(
                         gate_state: &gate_state,
                         read_cache: &read_cache,
                         exposed_tools: generation_tools.to_vec(),
+                        active_work_unit: active_work_unit.clone(),
                         workspace_checks: workspace_checks.as_ref(),
                         nesting_depth,
                     },
@@ -7659,12 +7650,7 @@ fn execute_tool_calls(
     let mut runnable = Vec::new();
     let mut results = Vec::new();
     for mut call in calls {
-        bind_work_unit_target(
-            &mut call,
-            env.args,
-            &env.gate_state.borrow(),
-            env.workspace_root,
-        )?;
+        bind_work_unit_target(&mut call, env.active_work_unit.as_ref())?;
         sink.emit(AgentEvent::ToolCall {
             tool: call.tool.clone(),
             arguments: call.arguments.clone(),
@@ -19428,6 +19414,99 @@ the next imagined action"#;
             AgentEvent::CheckResult { source: Some(source), .. }
                 if source == "diagnostic_preview"
         )));
+    }
+
+    #[test]
+    fn diagnostic_repair_binds_the_live_reopened_work_unit() {
+        let repo = init_contract_test_repo();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let plan = delivery_plan(
+            Some(("alpha.txt", crate::workflow::PlannedChange::Create)),
+            vec!["preview".to_string()],
+        );
+        std::fs::write(repo.path().join("alpha.txt"), "broken\n").unwrap();
+        let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let ledger = crate::workflow::WorkUnitLedger::from_plan(
+            &plan.id,
+            &plan.sha256,
+            &plan.artifact,
+            &repository.task_baseline.content,
+            &repository.invocation_baseline.content,
+            &current,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(ledger.structurally_complete());
+
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        request.workflow_work_units = Some(ledger);
+        request.repository_context = Some(repository);
+        request.max_steps = 3;
+        request.contract = Some(crate::harness_contract::AgentContract {
+            version: 1,
+            mutation: crate::harness_contract::MutationRequirement::Required,
+            allowed_paths: vec!["alpha.txt".to_string()],
+            checks: vec![crate::harness_contract::AgentCheckContract {
+                id: "preview".to_string(),
+                command:
+                    "test \"$(cat alpha.txt)\" = fixed || { echo 'alpha.txt: broken'; exit 1; }"
+                        .to_string(),
+                cwd: ".".to_string(),
+                required: true,
+                diagnostic_eligible: true,
+                timeout_seconds: 2,
+            }],
+            commit: crate::harness_contract::HarnessCommitContract::default(),
+            review: crate::harness_contract::HarnessReviewContract::default(),
+            workspace_clean: false,
+        });
+
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({})),
+                tool_completion("replace_file", json!({"content": "fixed\n"})),
+                tool_completion(
+                    "submit_implementation",
+                    json!({
+                        "id": "implementation-1",
+                        "steps": [{
+                            "step_id": "step-delivery",
+                            "status": "completed",
+                            "summary": "repaired the diagnosed file"
+                        }],
+                        "summary": "repaired the diagnosed file",
+                        "semantic_commit_subject": "fix: repair diagnosed file"
+                    }),
+                ),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("alpha.txt")).unwrap(),
+            "fixed\n"
+        );
+        assert!(outcome.generation_tool_names[0].contains(&"read_file".to_string()));
+        assert!(outcome.generation_tool_names[1].contains(&"replace_file".to_string()));
+        let bound_paths = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall {
+                    tool, arguments, ..
+                } if matches!(tool.as_str(), "read_file" | "replace_file") => {
+                    arguments.get("path").and_then(Value::as_str)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bound_paths, vec!["alpha.txt", "alpha.txt"]);
     }
 
     #[test]
