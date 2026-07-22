@@ -1,6 +1,7 @@
 # Verified task-completion reliability
 
-Status: **Active; Work-Unit Controller v2 implemented, W6 native qualification pending**
+Status: **Active; Work-Unit Controller v2 qualified for TC1/TC2 and targeted TC3 conversions; full
+W6 TC3 rerun pending**
 
 This record tracks pb's move from protocol-safe local agent runs to repeatable, externally verified
 coding-task completion. It complements the [small-model reliability plan](small-model-agent-reliability-plan.md),
@@ -136,8 +137,8 @@ reimplementing those controls.
 | W2 | P0 | implemented | Expose stable target-bound workflow mutations and bounded atomic batches for independent creations | Harness-bound path insertion, operation-only tool exposure, batch validation/rollback, and malformed-batch fixtures pass |
 | W3 | P1 | implemented | Grant bounded work only after unique progress and run explicitly eligible cheap diagnostics without final evidence credit | Per-unit/max-four progress credit and diagnostic-preview isolation/focus fixtures pass |
 | W4 | P1 | implemented | Project trusted implementation and review skeleton fields while retaining model-authored completion and review judgments | Resume/adopted projection and existing artifact validators pass deterministic tests |
-| W5 | P2 | implemented; measurement pending | Make work-unit prompt and tool prefixes byte-stable and measure cacheable versus fresh prefill | Cross-target tool schema identity passes; summary reports rendered, cached-prefix, and fresh-prefill tokens separately |
-| W6 | P2 | pending | Qualify TC1, TC2, TC3, and supported local model tiers | TC1 3/3 at no more than 6 calls; TC2 3/3 at no more than 12 calls; TC3 at least 9/11; zero false completion or forbidden mutation |
+| W5 | P2 | qualified | Make work-unit prompt and tool prefixes byte-stable and measure cacheable versus fresh prefill | Cross-target tool schema identity passes; the locked TC2 series reports rendered, cached-prefix, and fresh-prefill tokens separately |
+| W6 | P2 | partial | Qualify TC1, TC2, TC3, and supported local model tiers | TC1 is 3/3 at 6 calls; TC2 is 3/3 at 7 calls with the efficiency target passed; two targeted W0 failure conversions reach the 9/11 floor only when combined with unchanged W0 successes; a final-source 11-case rerun and model-tier comparison remain |
 
 ### W1 target state
 
@@ -205,6 +206,9 @@ TC2 must also improve wall time and energy by at least 25% from its qualified 1,
 | 2026-07-21 | TC3 candidate corpus | `fixtures/harness-task-completion/corpus.json`, `scripts/run-harness-task-corpus.ts`, Deno preparation tests, Rust contract normalization test | 11 safe offline cases across 11 categories; reproducible seeded and resumed scratch preparation; aggregate native results not yet claimed | Execute preserved cases, audit every claimed success, and publish aggregate functional and efficiency results |
 | 2026-07-22 | W0 TC3 baseline | 11 corrected-contract preserved native runs; [aggregate report](benchmarks/task-completion-tc3-baseline.md) | 7/11 verified, zero false completion/forbidden mutation; median 10 calls, 400,020 ms, 4.62 Wh; one confirmed resumed-work accounting defect | Qualify Work-Unit Controller v2 against the same cases |
 | 2026-07-22 | W1–W5 deterministic implementation | typed checkpoint ledger, target-bound/batched creates, unique progress credits, diagnostic previews, trusted submission projection, stable-schema and reporting fixtures | Controller path implemented without weakening authoritative check/review/commit gates; full quality and native W6 qualification pending | Run full quality suite, rebuild release, then execute locked TC1/TC2/TC3 comparisons |
+| 2026-07-22 | W6 TC1 controller series | three preserved `pb-wucv2-tc1-fixed-*` runs; [qualification report](benchmarks/task-completion-work-unit-v2.md) | 3/3 verified at exactly 6 calls; exact bytes, checks, reviews, semantic commits, and clean states independently audited | Retain as the ordered-create regression gate |
+| 2026-07-22 | W6 TC2 controller series | three preserved `pb-wucv2-tc2-final-*` runs; [qualification report](benchmarks/task-completion-work-unit-v2.md) | 3/3 verified at 7 calls; median 586,630 ms and 6.11 Wh, improving the qualified baseline by 49.7% wall time and 52.6% energy | Retain the literal local expectation as advisory-only active-unit guidance |
+| 2026-07-22 | W6 targeted TC3 conversions | adopted resume run `1784729407708-57538-0`; final delete/modify run `1784732727735-57336-0`; [qualification report](benchmarks/task-completion-work-unit-v2.md) | Both prior W0 failures verified with clean semantic commits. Qualification exposed and fixed carried-fingerprint, tracked-deletion advancement, and post-commit content-identity defects | Run all 11 cases on one final source before claiming a new aggregate |
 
 ## Completion audit
 
@@ -219,4 +223,7 @@ TC2 must also improve wall time and energy by at least 25% from its qualified 1,
 - [x] TC3 candidate corpus and single-case runner exist.
 - [x] TC3 aggregate native-model report exists.
 - [x] Highest-value evidenced acceptance-projection gap is fixed and regression-tested.
+- [x] Work-Unit Controller v2 passes locked TC1 and TC2 native repeatability gates.
+- [x] Adopted/resumed and delete/modify W0 failures have independently audited verified conversions.
+- [ ] All 11 TC3 cases are rerun on one final source for a current aggregate.
 - [ ] External same-model comparison is recorded.

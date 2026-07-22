@@ -272,9 +272,11 @@ partial JSON or partial filesystem writes.
 After plan review, pb persists an ordered, typed work-unit ledger in the workflow checkpoint. Every
 planned create, modify, or delete records its plan step, operation, path, task/invocation/current
 fingerprints, adopted-work provenance, and structural state. Modify and delete units require a
-complete fingerprint-current read before mutation. A task-owned delta present at invocation can
-satisfy structural progress as adopted work without requiring the current model to claim that it
-authored those bytes. A forbidden-mutation contract has an initialized empty ledger.
+complete fingerprint-current read before mutation. Revalidated complete-file evidence carried from
+planning seeds the same path and byte fingerprint in the implementation gate, so it does not force
+a duplicate model read. A task-owned delta present at invocation can satisfy structural progress as
+adopted work without requiring the current model to claim that it authored those bytes. A
+forbidden-mutation contract has an initialized empty ledger.
 
 Implementation and repair expose only the active unit's operation. The target path is omitted from
 the model-required arguments and inserted by pb into the durable call immediately before schema,
@@ -315,6 +317,11 @@ for every step and owns status, summaries, and the proposed semantic commit subj
 pb similarly projects the checked fingerprint while the fresh reviewer owns assessments, findings,
 and verdict. Existing artifact validators still reject missing steps, paths outside the plan, stale
 state, incomplete work, or unsupported review conclusions.
+
+Content fingerprints identify present worktree entries and bytes, independently of Git index
+bookkeeping. In particular, the synthetic tracked-`missing` entry visible before staging a deletion
+is excluded. Staging and committing an already-reviewed deletion therefore preserve the checked
+content identity, while restoring or changing any worktree path still invalidates its evidence.
 
 Local and managed command failures retain their exit status and bounded stdout/stderr in structured
 tool feedback. Output redirected from stderr to stdout is still preserved. Timeout and user

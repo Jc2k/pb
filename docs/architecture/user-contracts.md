@@ -132,7 +132,9 @@ A change-bearing Ready build carries evidence that is current for the managed co
 - bounded usage and terminal outcome records.
 
 Evidence becomes stale after a relevant mutation. pb refreshes it or stops; it does not silently
-reuse a receipt for earlier content.
+reuse a receipt for earlier content. Git staging or committing does not itself change that content
+identity: tracked-deletion sentinels are excluded, so a reviewed deletion keeps the same fingerprint
+through the managed commit while any actual worktree-byte change invalidates the receipt.
 
 File-read evidence binds the bytes actually returned, not merely a path observed at some point.
 In strict delivery and acceptance contracts, named check evidence comes only from `run_check(id)`;
