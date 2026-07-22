@@ -5284,6 +5284,11 @@ fn initial_gate_state(
         .transpose()?
         .unwrap_or_default();
     let read_paths = stage_evidence.read_paths().map(str::to_string).collect();
+    let read_content_fingerprints = stage_evidence
+        .entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.content_sha256.clone()))
+        .collect();
     let earned_work_unit_ids = args
         .workflow_work_units
         .as_ref()
@@ -5291,6 +5296,7 @@ fn initial_gate_state(
         .unwrap_or_default();
     Ok(GateState {
         read_paths,
+        read_content_fingerprints,
         stage_evidence,
         earned_work_unit_ids,
         wrote_file,
@@ -25014,10 +25020,27 @@ the next imagined action"#;
         let current = initial_gate_state(&request, repo.path(), false).unwrap();
         assert!(current.read_paths.contains("evidence.txt"));
         assert_eq!(current.stage_evidence.entries.len(), 1);
+        let expected_sha256 = crate::environment_lock::sha256(b"observed\n");
+        assert_eq!(
+            current
+                .read_content_fingerprints
+                .get("evidence.txt")
+                .map(String::as_str),
+            Some(expected_sha256.as_str())
+        );
+        let evidence_path = resolve_workspace_path(repo.path(), "evidence.txt", true).unwrap();
+        ensure_file_was_read(
+            &RefCell::new(current),
+            repo.path(),
+            &evidence_path,
+            "evidence.txt",
+        )
+        .unwrap();
 
         std::fs::write(repo.path().join("evidence.txt"), "changed\n").unwrap();
         let stale = initial_gate_state(&request, repo.path(), false).unwrap();
         assert!(!stale.read_paths.contains("evidence.txt"));
+        assert!(stale.read_content_fingerprints.is_empty());
         assert!(stale.stage_evidence.entries.is_empty());
     }
 
