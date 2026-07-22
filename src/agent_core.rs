@@ -544,11 +544,15 @@ pub struct AgentRequest {
     /// Optional native-tool allowlist for bounded direct harness runs.
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
+    /// Server-owned production policy for controller-executed deterministic actions. Persisted and
+    /// API payloads cannot enable it.
+    #[serde(skip)]
+    pub action_elision: crate::workflow::ActionElisionMode,
     /// Hidden harness experiment selecting how controller-executed deterministic observations are
-    /// represented to the model. Product callers always retain the native default.
+    /// represented to the model. Production uses only the explicit controller block when enabled.
     #[serde(skip)]
     pub observation_rendering: crate::workflow::ObservationRendering,
-    /// Hidden harness-only authority for the separately gated conservative deletion experiment.
+    /// Separate server-owned opt-in for the conservative tracked-clean deletion path.
     #[serde(skip)]
     pub controller_delete_elision: bool,
     /// Allow an explicitly resumed task to satisfy the change gate with pending workspace changes.
@@ -5562,7 +5566,8 @@ fn run_agent_steps(
                 ));
             }
         }
-        if args.controller_delete_elision
+        if args.action_elision == crate::workflow::ActionElisionMode::Safe
+            && args.controller_delete_elision
             && let Some(unit) = work_units
                 .as_ref()
                 .and_then(crate::workflow::WorkUnitLedger::active)
@@ -5586,7 +5591,8 @@ fn run_agent_steps(
                 .collect::<BTreeSet<_>>();
             ledger.reconcile(&current, &evidence_paths)?;
         }
-        if args.observation_rendering.is_controller()
+        if args.action_elision.allows_read()
+            && args.observation_rendering.is_controller()
             && let Some(unit) = work_units
                 .as_ref()
                 .and_then(crate::workflow::WorkUnitLedger::active)
@@ -9236,6 +9242,16 @@ trait CompletionEngine {
         enable_thinking: bool,
     ) -> Result<PromptMeasurement>;
 
+    fn rendered_prompt_identity(
+        &mut self,
+        _args: &AgentRequest,
+        _messages: &[ChatMessage],
+        _tools: &[BuiltInToolSchema],
+        _enable_thinking: bool,
+    ) -> Result<Option<(String, usize)>> {
+        Ok(None)
+    }
+
     fn generate(
         &mut self,
         args: &AgentRequest,
@@ -11415,7 +11431,8 @@ fn controller_no_change_implementation(
     run: &crate::workflow::WorkflowRun,
     workspace_root: &Path,
 ) -> Result<Option<crate::workflow::ArtifactEnvelope<crate::workflow::ImplementationArtifact>>> {
-    if !args.observation_rendering.is_controller()
+    if !args.action_elision.allows_closure()
+        || !args.observation_rendering.is_controller()
         || run.stage != crate::workflow::WorkflowStage::Implementing
         || !args.contract.as_ref().is_some_and(|contract| {
             contract.mutation == crate::harness_contract::MutationRequirement::Forbidden
@@ -12057,6 +12074,278 @@ pub(crate) struct LocalModelEvalOutcome {
     pub termination_reason: TerminationReason,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RecordedGenerationInput {
+    pub generation_index: usize,
+    pub input_sha256: String,
+    pub normalized_input_sha256: String,
+    pub tool_schema_sha256: String,
+    pub observation_action_id: Option<String>,
+    pub observation_result_sha256: Option<String>,
+    pub rendered_prompt_sha256: Option<String>,
+    pub rendered_prompt_bytes: Option<usize>,
+    pub messages: Vec<Value>,
+    pub tools: Vec<Value>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalModelDeliveryOutcome {
+    pub workflow: crate::workflow::WorkflowCheckpoint,
+    pub reached_final: bool,
+    pub verified_completed: bool,
+    pub termination_reason: TerminationReason,
+    pub llm_invocations: usize,
+    pub tool_calls: usize,
+    pub generation_inputs: Vec<RecordedGenerationInput>,
+}
+
+fn recorded_generation_input(
+    generation_index: usize,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+) -> Result<RecordedGenerationInput> {
+    let observation_action_id = messages.iter().find_map(|message| {
+        message
+            .prompt_tool_result
+            .as_ref()
+            .and_then(|metadata| metadata.observation_action_id.clone())
+    });
+    let observation_result = messages.iter().find_map(|message| {
+        let metadata = message.prompt_tool_result.as_ref()?;
+        if metadata.actual_origin.as_deref() != Some("controller") {
+            return None;
+        }
+        if message.role == "tool" {
+            return Some(message.content.clone());
+        }
+        message
+            .content
+            .split_once("):\n")
+            .map(|(_, result)| result.to_string())
+    });
+    let message_values = messages
+        .iter()
+        .map(recorded_chat_message)
+        .collect::<Vec<_>>();
+    let tool_values = tools
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to serialize action-elision prompt tools")?;
+    let input_bytes = serde_json::to_vec(&json!({
+        "messages": message_values,
+        "tools": tool_values,
+    }))?;
+    let normalized_messages =
+        normalized_recorded_messages(messages, observation_action_id.as_deref());
+    let normalized_bytes = serde_json::to_vec(&json!({
+        "messages": normalized_messages,
+        "tools": tool_values,
+    }))?;
+    let tool_bytes = serde_json::to_vec(&tool_values)?;
+    Ok(RecordedGenerationInput {
+        generation_index,
+        input_sha256: crate::environment_lock::sha256(&input_bytes),
+        normalized_input_sha256: crate::environment_lock::sha256(&normalized_bytes),
+        tool_schema_sha256: crate::environment_lock::sha256(&tool_bytes),
+        observation_action_id,
+        observation_result_sha256: observation_result
+            .as_deref()
+            .map(|result| crate::environment_lock::sha256(result.as_bytes())),
+        rendered_prompt_sha256: None,
+        rendered_prompt_bytes: None,
+        messages: message_values,
+        tools: tool_values,
+    })
+}
+
+fn recorded_chat_message(message: &ChatMessage) -> Value {
+    json!({
+        "role": message.role,
+        "content": message.content,
+        "tool_calls": message.tool_calls.iter().map(|call| json!({
+            "id": call.id,
+            "tool": call.tool,
+            "arguments": call.arguments,
+        })).collect::<Vec<_>>(),
+        "tool_call_id": message.tool_call_id,
+        "name": message.name,
+        "prompt_tool_result": message.prompt_tool_result.as_ref().map(|metadata| json!({
+            "actual_origin": metadata.actual_origin,
+            "prompt_representation": metadata.prompt_representation,
+            "observation_coverage": metadata.observation_coverage,
+            "observation_action_id": metadata.observation_action_id,
+        })),
+    })
+}
+
+fn normalized_recorded_messages(
+    messages: &[ChatMessage],
+    observation_action_id: Option<&str>,
+) -> Vec<Value> {
+    let synthetic_id =
+        observation_action_id.map(|action_id| format!("pb-controller-observation-{action_id}"));
+    let mut inserted_observation = false;
+    let mut normalized = Vec::with_capacity(messages.len());
+    for message in messages {
+        let belongs_to_observation = message
+            .prompt_tool_result
+            .as_ref()
+            .is_some_and(|metadata| metadata.actual_origin.as_deref() == Some("controller"))
+            || synthetic_id.as_ref().is_some_and(|synthetic_id| {
+                message.tool_call_id.as_deref() == Some(synthetic_id.as_str())
+                    || message
+                        .tool_calls
+                        .iter()
+                        .any(|call| call.id.as_deref() == Some(synthetic_id.as_str()))
+                    || message.content.contains(synthetic_id)
+                    || observation_action_id.is_some_and(|action_id| {
+                        message.content.contains("prompt representation only")
+                            && message.content.contains(action_id)
+                    })
+            });
+        if belongs_to_observation {
+            if !inserted_observation {
+                normalized.push(json!({"controller_observation": "representation_placeholder"}));
+                inserted_observation = true;
+            }
+        } else {
+            normalized.push(recorded_chat_message(message));
+        }
+    }
+    normalized
+}
+
+struct PromptRecordingEngine<'a> {
+    inner: &'a mut dyn CompletionEngine,
+    inputs: &'a mut Vec<RecordedGenerationInput>,
+}
+
+impl CompletionEngine for PromptRecordingEngine<'_> {
+    fn supports_thinking(&self) -> Result<bool> {
+        self.inner.supports_thinking()
+    }
+
+    fn measure_prompt(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
+    ) -> Result<PromptMeasurement> {
+        self.inner
+            .measure_prompt(args, messages, tools, enable_thinking)
+    }
+
+    fn generate(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
+    ) -> Result<CompletionOutput> {
+        let rendered =
+            self.inner
+                .rendered_prompt_identity(args, messages, tools, enable_thinking)?;
+        let mut input = recorded_generation_input(self.inputs.len(), messages, tools)?;
+        if let Some((sha256, bytes)) = rendered {
+            input.rendered_prompt_sha256 = Some(sha256);
+            input.rendered_prompt_bytes = Some(bytes);
+        }
+        self.inputs.push(input);
+        self.inner.generate(args, messages, tools, enable_thinking)
+    }
+
+    fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
+        self.inner.persist_session_cache(session_id)
+    }
+}
+
+/// Run a strict delivery checkpoint against the selected local engine while preserving each exact
+/// semantic generation input for byte-lock and provenance audits.
+pub(crate) fn run_local_model_delivery_workflow(
+    engine: &mut LocalModelEvalEngine,
+    args: &AgentRequest,
+    workspace_root: &Path,
+    sink: &mut dyn EventSink,
+) -> Result<LocalModelDeliveryOutcome> {
+    let command_backend = CommandBackend::Local {
+        workspace_root: workspace_root.to_path_buf(),
+    };
+    let mcp_registry = McpToolRegistry::default();
+    let lsp_registry = LspToolRegistry::default();
+    let policy_config = PolicyConfig::default();
+    let mut generation_inputs = Vec::new();
+    let outcome = match engine {
+        LocalModelEvalEngine::LlamaCpp(llamacpp) => {
+            let mut generator = LlamaCompletionEngine::new(llamacpp, &args.session_id);
+            let mut recording = PromptRecordingEngine {
+                inner: &mut generator,
+                inputs: &mut generation_inputs,
+            };
+            run_delivery_workflow(
+                &mut recording,
+                TextBackendKind::LlamaCpp,
+                Some(llamacpp),
+                args,
+                workspace_root,
+                workspace_root,
+                Some(&command_backend),
+                None,
+                &mcp_registry,
+                &lsp_registry,
+                &policy_config,
+                None,
+                None,
+                sink,
+            )?
+        }
+        LocalModelEvalEngine::FlashMoe(flashmoe) => {
+            let mut generator = BorrowedFlashMoeCompletionEngine { engine: flashmoe };
+            let mut recording = PromptRecordingEngine {
+                inner: &mut generator,
+                inputs: &mut generation_inputs,
+            };
+            run_delivery_workflow(
+                &mut recording,
+                TextBackendKind::FlashMoe,
+                None,
+                args,
+                workspace_root,
+                workspace_root,
+                Some(&command_backend),
+                None,
+                &mcp_registry,
+                &lsp_registry,
+                &policy_config,
+                None,
+                None,
+                sink,
+            )?
+        }
+    };
+    Ok(LocalModelDeliveryOutcome {
+        workflow: outcome.checkpoint,
+        reached_final: outcome.step.reached_final,
+        verified_completed: outcome.step.verified_completed,
+        termination_reason: outcome.step.termination_reason,
+        llm_invocations: outcome.step.metrics.llm_invocations,
+        tool_calls: outcome.step.metrics.tool_calls,
+        generation_inputs,
+    })
+}
+
+pub(crate) fn bind_workflow_checkpoint_runtime(
+    checkpoint: &mut crate::workflow::WorkflowCheckpoint,
+    graph: &crate::workspace::WorkspaceGraph,
+    workspace_root: &Path,
+) -> Result<()> {
+    checkpoint.run.workspace_graph_sha256 = workflow_graph_sha256(graph)?;
+    checkpoint.run.git_control = Some(git_control_state(workspace_root)?);
+    *checkpoint = crate::workflow::WorkflowCheckpoint::new(checkpoint.run.clone())?;
+    Ok(())
+}
+
 pub(crate) fn run_local_model_eval_steps(
     engine: &mut LocalModelEvalEngine,
     args: &AgentRequest,
@@ -12183,6 +12472,19 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         })
     }
 
+    fn rendered_prompt_identity(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        _enable_thinking: bool,
+    ) -> Result<Option<(String, usize)>> {
+        let request = llama_chat_request(args, messages, tools)?;
+        self.llamacpp
+            .rendered_chat_prompt_identity(&request)
+            .map(Some)
+    }
+
     fn generate(
         &mut self,
         args: &AgentRequest,
@@ -12259,6 +12561,20 @@ impl CompletionEngine for FlashMoeCompletionEngine {
         measure_flashmoe_prompt(&engine, args, messages, tools, enable_thinking)
     }
 
+    fn rendered_prompt_identity(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
+    ) -> Result<Option<(String, usize)>> {
+        let engine = self.runtime.lock()?;
+        let request = flashmoe_structured_request(args, messages, tools, enable_thinking)?;
+        engine
+            .rendered_structured_prompt_identity(&request)
+            .map(Some)
+    }
+
     fn generate(
         &mut self,
         args: &AgentRequest,
@@ -12297,6 +12613,19 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
         enable_thinking: bool,
     ) -> Result<PromptMeasurement> {
         measure_flashmoe_prompt(self.engine, args, messages, tools, enable_thinking)
+    }
+
+    fn rendered_prompt_identity(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        tools: &[BuiltInToolSchema],
+        enable_thinking: bool,
+    ) -> Result<Option<(String, usize)>> {
+        let request = flashmoe_structured_request(args, messages, tools, enable_thinking)?;
+        self.engine
+            .rendered_structured_prompt_identity(&request)
+            .map(Some)
     }
 
     fn generate(
@@ -14002,6 +14331,20 @@ fn controller_observations_survive_preflight(
     Ok(observation_survived && prepared.measurement.prompt_tokens <= target)
 }
 
+fn controller_observations_are_current(
+    workspace_root: &Path,
+    candidates: &[PreparedControllerObservation],
+) -> Result<bool> {
+    let snapshot = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    Ok(candidates.iter().all(|candidate| {
+        candidate.receipt.workspace_fingerprint == snapshot.fingerprint
+            && snapshot
+                .paths
+                .get(&candidate.receipt.path)
+                .is_some_and(|path| path.fingerprint == candidate.receipt.path_fingerprint)
+    }))
+}
+
 fn build_controller_review_observations(
     args: &AgentRequest,
     workspace_root: &Path,
@@ -14012,7 +14355,8 @@ fn build_controller_review_observations(
         ControllerObservationOrigin, ObservationCoverage, ObservationRange,
     };
 
-    if !args.observation_rendering.is_controller()
+    if !args.action_elision.allows_review()
+        || !args.observation_rendering.is_controller()
         || args.workflow_stage != Some(crate::workflow::WorkflowStage::CodeReview)
     {
         return Ok(Vec::new());
@@ -14075,7 +14419,7 @@ fn build_controller_review_observations(
             "inspect_change\n{path}\n{}\n{}\n{}",
             snapshot.fingerprint,
             path_content.fingerprint,
-            now_millis()
+            crate::environment_lock::sha256(result.as_bytes())
         );
         let action_id = format!("{:x}", Sha256::digest(action_material.as_bytes()));
         let receipt = crate::workflow::ControllerObservationReceipt {
@@ -14140,6 +14484,9 @@ fn maybe_inject_controller_review_observations(
             &candidates,
         )?
     {
+        return Ok(false);
+    }
+    if !controller_observations_are_current(workspace_root, &candidates)? {
         return Ok(false);
     }
     let contract_fingerprint = args
@@ -14314,7 +14661,8 @@ fn build_controller_read_observation(
         WorkUnitState,
     };
 
-    if !args.observation_rendering.is_controller()
+    if !args.action_elision.allows_read()
+        || !args.observation_rendering.is_controller()
         || !matches!(
             unit.state,
             WorkUnitState::EvidenceNeeded | WorkUnitState::DiagnosticFailed
@@ -14326,20 +14674,23 @@ fn build_controller_read_observation(
     {
         return Ok(None);
     }
-    let resolved = resolve_workspace_entry_path(workspace_root, &unit.path, true)?;
-    let metadata = std::fs::symlink_metadata(&resolved).with_context(|| {
-        format!(
-            "failed to inspect controller observation path {}",
-            unit.path
-        )
-    })?;
+    let Ok(resolved) = resolve_workspace_entry_path(workspace_root, &unit.path, true) else {
+        return Ok(None);
+    };
+    let Ok(metadata) = std::fs::symlink_metadata(&resolved) else {
+        return Ok(None);
+    };
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() > MAX_READ_FILE_BYTES
     {
         return Ok(None);
     }
-    let bytes = read_bounded_file_bytes(&resolved, MAX_READ_FILE_BYTES, "controller observation")?;
+    let Ok(bytes) =
+        read_bounded_file_bytes(&resolved, MAX_READ_FILE_BYTES, "controller observation")
+    else {
+        return Ok(None);
+    };
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return Ok(None);
     };
@@ -14355,13 +14706,20 @@ fn build_controller_read_observation(
         .split_inclusive('\n')
         .count()
         .max(usize::from(!text.is_empty()));
-    let full_windows = [(1, total_lines.max(1))];
-    let (full_result, full_ranges) =
-        render_controller_file_ranges(&unit.path, text, &full_windows, result_budget);
-    let full_coverage = text.is_empty()
-        || (full_ranges.len() == 1
-            && full_ranges[0].start_byte == 0
-            && full_ranges[0].end_byte == text.len());
+    let full_result = render_bounded_read_file(&unit.path, text, 1, None, result_budget);
+    let full_coverage = !full_result.contains("[read_file continuation]")
+        && !full_result.contains("(no complete line fits the current read-result budget)");
+    let full_ranges = if text.is_empty() {
+        Vec::new()
+    } else if full_coverage {
+        vec![ObservationRange {
+            start_byte: 0,
+            end_byte: text.len(),
+            sha256: crate::environment_lock::sha256(text.as_bytes()),
+        }]
+    } else {
+        Vec::new()
+    };
     let (coverage, result, included_ranges) =
         if full_coverage && text.len() <= crate::workflow::MAX_STAGE_EVIDENCE_ENTRY_BYTES {
             (ObservationCoverage::Full, full_result, full_ranges)
@@ -14381,13 +14739,27 @@ fn build_controller_read_observation(
         } else {
             return Ok(None);
         };
+    let result = append_workflow_content_fingerprint(
+        args,
+        ControllerObservationOperation::ReadFile.as_str(),
+        workspace_root,
+        result,
+    )?;
+    let included_range_material = included_ranges
+        .iter()
+        .map(|range| format!("{}:{}:{}", range.start_byte, range.end_byte, range.sha256))
+        .collect::<Vec<_>>()
+        .join("\n");
     let action_material = format!(
-        "{:?}\n{}\n{}\n{}\n{}",
+        "read_file\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         args.workflow_stage,
         unit.id,
         unit.path,
+        snapshot.fingerprint,
         path_content.fingerprint,
-        now_millis()
+        crate::environment_lock::sha256(&bytes),
+        coverage.as_str(),
+        included_range_material
     );
     let action_id = format!("{:x}", Sha256::digest(action_material.as_bytes()));
     let arguments = json!({"path": unit.path});
@@ -14483,6 +14855,9 @@ fn maybe_inject_controller_read_observation(
     )? {
         return Ok(false);
     }
+    if !controller_observations_are_current(workspace_root, std::slice::from_ref(&candidate))? {
+        return Ok(false);
+    }
     {
         let mut gate = gate_state.borrow_mut();
         gate.read_paths.insert(candidate.receipt.path.clone());
@@ -14547,7 +14922,8 @@ fn maybe_execute_controller_delete(
     messages: &mut Vec<ChatMessage>,
     sink: &mut dyn EventSink,
 ) -> Result<bool> {
-    if !args.observation_rendering.is_controller()
+    if args.action_elision != crate::workflow::ActionElisionMode::Safe
+        || !args.observation_rendering.is_controller()
         || !args.controller_delete_elision
         || args.workflow_stage != Some(crate::workflow::WorkflowStage::Implementing)
         || unit.operation != crate::workflow::PlannedChange::Delete
@@ -14557,8 +14933,8 @@ fn maybe_execute_controller_delete(
                 | crate::workflow::WorkUnitState::MutationReady
         )
         || unit.adopted
-        || !args.contract.as_ref().is_some_and(|contract| {
-            contract.mutation == crate::harness_contract::MutationRequirement::Required
+        || args.contract.as_ref().is_some_and(|contract| {
+            contract.mutation != crate::harness_contract::MutationRequirement::Required
         })
     {
         return Ok(false);
@@ -19777,6 +20153,7 @@ mod tests {
             max_tokens,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            action_elision: crate::workflow::ActionElisionMode::Off,
             observation_rendering: crate::workflow::ObservationRendering::Native,
             controller_delete_elision: false,
             accept_existing_workspace_changes: false,
@@ -20193,6 +20570,34 @@ the next imagined action"#;
     }
 
     #[test]
+    fn controller_rendering_inputs_are_byte_locked_outside_the_declared_representation() {
+        let mut normalized = BTreeSet::new();
+        let mut result_hashes = BTreeSet::new();
+        let mut action_ids = BTreeSet::new();
+        for rendering in [
+            crate::workflow::ObservationRendering::ControllerBlock,
+            crate::workflow::ObservationRendering::DisclosedToolTranscript,
+            crate::workflow::ObservationRendering::CompatibilityToolTranscript,
+        ] {
+            let (_, mut observation) =
+                controller_observation_messages(test_controller_receipt(rendering), "test")
+                    .unwrap();
+            let mut messages = vec![
+                ChatMessage::text("system", "locked system"),
+                ChatMessage::text("user", "locked task"),
+            ];
+            messages.append(&mut observation);
+            let recorded = recorded_generation_input(0, &messages, &[]).unwrap();
+            normalized.insert(recorded.normalized_input_sha256);
+            result_hashes.insert(recorded.observation_result_sha256.unwrap());
+            action_ids.insert(recorded.observation_action_id.unwrap());
+        }
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(result_hashes.len(), 1);
+        assert_eq!(action_ids.len(), 1);
+    }
+
+    #[test]
     fn controller_read_selects_full_small_files_and_diagnostic_ranges_only() {
         let repo = init_contract_test_repo();
         std::fs::write(repo.path().join("game.js"), "const answer = 41;\n").unwrap();
@@ -20205,6 +20610,7 @@ the next imagined action"#;
         let snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        request.action_elision = crate::workflow::ActionElisionMode::Safe;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         let mut unit = crate::workflow::WorkUnit {
             id: "step:0".to_string(),
@@ -20220,11 +20626,35 @@ the next imagined action"#;
         let small = build_controller_read_observation(&request, &unit, repo.path(), None)
             .unwrap()
             .unwrap();
+        let repeated = build_controller_read_observation(&request, &unit, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(small.receipt.action_id, repeated.receipt.action_id);
         assert_eq!(
             small.receipt.coverage,
             crate::workflow::ObservationCoverage::Full
         );
         assert!(small.stage_entry.is_some());
+        let expected_native_result = append_workflow_content_fingerprint(
+            &request,
+            "read_file",
+            repo.path(),
+            render_bounded_read_file("game.js", "const answer = 41;\n", 1, None, 16_000),
+        )
+        .unwrap();
+        assert!(
+            small.prompt_messages[0]
+                .content
+                .ends_with(&expected_native_result)
+        );
+
+        request.action_elision = crate::workflow::ActionElisionMode::Off;
+        assert!(
+            build_controller_read_observation(&request, &unit, repo.path(), None)
+                .unwrap()
+                .is_none()
+        );
+        request.action_elision = crate::workflow::ActionElisionMode::Safe;
 
         let large = (1..=2_000)
             .map(|line| format!("const value_{line} = {line};"))
@@ -20259,10 +20689,36 @@ the next imagined action"#;
             .unwrap()
             .is_none()
         );
+
+        unit.path = "missing.js".to_string();
+        assert!(
+            build_controller_read_observation(&request, &unit, repo.path(), None)
+                .unwrap()
+                .is_none()
+        );
+
+        unit.path = "game.js".to_string();
+        unit.state = crate::workflow::WorkUnitState::EvidenceNeeded;
+        std::fs::write(repo.path().join("game.js"), [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(
+            build_controller_read_observation(&request, &unit, repo.path(), None)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(
+            repo.path().join("game.js"),
+            vec![b'x'; usize::try_from(MAX_READ_FILE_BYTES.saturating_add(1)).unwrap()],
+        )
+        .unwrap();
+        assert!(
+            build_controller_read_observation(&request, &unit, repo.path(), None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
-    fn controller_delete_requires_explicit_contract_and_preserves_truthful_origin() {
+    fn controller_delete_requires_safe_mode_and_preserves_truthful_origin() {
         let repo = init_contract_test_repo();
         std::fs::write(repo.path().join("game.js"), "tracked baseline\n").unwrap();
         git_run(&["add", "game.js"], repo.path()).unwrap();
@@ -20282,15 +20738,66 @@ the next imagined action"#;
         };
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        request.action_elision = crate::workflow::ActionElisionMode::ReviewOnly;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         request.controller_delete_elision = true;
-        let mut contract = normalized_test_contract("true");
-        contract.mutation = crate::harness_contract::MutationRequirement::Required;
-        request.contract = Some(contract);
         let gate = RefCell::new(GateState::default());
         let mut messages = Vec::new();
         let mut sink = CapturingWorkflowSink::default();
 
+        assert!(
+            !maybe_execute_controller_delete(
+                &request,
+                &unit,
+                repo.path(),
+                &gate,
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        assert!(repo.path().join("game.js").exists());
+
+        request.action_elision = crate::workflow::ActionElisionMode::Safe;
+        request.controller_delete_elision = false;
+        assert!(
+            !maybe_execute_controller_delete(
+                &request,
+                &unit,
+                repo.path(),
+                &gate,
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        request.controller_delete_elision = true;
+        let mut stale_unit = unit.clone();
+        stale_unit.current_path_fingerprint = Some("stale".to_string());
+        assert!(
+            !maybe_execute_controller_delete(
+                &request,
+                &stale_unit,
+                repo.path(),
+                &gate,
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        std::fs::write(repo.path().join("game.js"), "dirty local edit\n").unwrap();
+        assert!(
+            !maybe_execute_controller_delete(
+                &request,
+                &unit,
+                repo.path(),
+                &gate,
+                &mut messages,
+                &mut sink,
+            )
+            .unwrap()
+        );
+        std::fs::write(repo.path().join("game.js"), "tracked baseline\n").unwrap();
         assert!(
             maybe_execute_controller_delete(
                 &request,
@@ -20359,12 +20866,21 @@ the next imagined action"#;
         run.apply(crate::workflow::WorkflowEvent::PlanReviewSubmitted { review })
             .unwrap();
         let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.action_elision = crate::workflow::ActionElisionMode::Safe;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         let mut contract = normalized_test_contract("true");
         contract.mutation = crate::harness_contract::MutationRequirement::Forbidden;
         contract.allowed_paths.clear();
         request.contract = Some(contract);
         reconcile_work_unit_ledger(&mut run, request.contract.as_ref(), repo.path()).unwrap();
+
+        request.action_elision = crate::workflow::ActionElisionMode::ReviewOnly;
+        assert!(
+            controller_no_change_implementation(&request, &run, repo.path())
+                .unwrap()
+                .is_none()
+        );
+        request.action_elision = crate::workflow::ActionElisionMode::Safe;
 
         let implementation = controller_no_change_implementation(&request, &run, repo.path())
             .unwrap()
@@ -20400,6 +20916,7 @@ the next imagined action"#;
         std::fs::write(repo.path().join("game.js"), "export const answer = 42;\n").unwrap();
         let mut request = workflow_request(AgentProfile::Review, repo.path());
         request.workflow_stage = Some(crate::workflow::WorkflowStage::CodeReview);
+        request.action_elision = crate::workflow::ActionElisionMode::ReviewOnly;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         request.repository_context = Some(repository);
         let gate = RefCell::new(GateState::default());
@@ -20419,6 +20936,17 @@ the next imagined action"#;
                 .contains(&crate::workflow::ControllerObservationAuthority::ReviewCoverage)
         );
         assert!(!receipt.permits_read_before_write());
+
+        assert!(controller_observations_are_current(repo.path(), &candidates).unwrap());
+        std::fs::write(repo.path().join("game.js"), "export const answer = 43;\n").unwrap();
+        assert!(!controller_observations_are_current(repo.path(), &candidates).unwrap());
+
+        request.action_elision = crate::workflow::ActionElisionMode::Off;
+        assert!(
+            build_controller_review_observations(&request, repo.path(), &gate)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -21977,6 +22505,7 @@ the next imagined action"#;
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         request.ctx_size = 32_768;
         request.repository_context = Some(repository);
+        request.action_elision = crate::workflow::ActionElisionMode::Safe;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         let completion = json!({
             "id": "implementation-inline",
@@ -28993,6 +29522,7 @@ the next imagined action"#;
             max_tokens: 2048,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            action_elision: crate::workflow::ActionElisionMode::Off,
             observation_rendering: crate::workflow::ObservationRendering::Native,
             controller_delete_elision: false,
             accept_existing_workspace_changes: false,
@@ -29074,6 +29604,7 @@ the next imagined action"#;
             max_tokens: 2048,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            action_elision: crate::workflow::ActionElisionMode::Off,
             observation_rendering: crate::workflow::ObservationRendering::Native,
             controller_delete_elision: false,
             accept_existing_workspace_changes: false,

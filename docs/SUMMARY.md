@@ -43,6 +43,7 @@
 - [Verified task-completion reliability](task-completion-reliability-plan.md)
   - [Controller-owned deterministic action elision](controller-action-elision-plan.md)
     - [E1 · Prompt-rendering screen](benchmarks/controller-action-elision-e1.md)
+    - [E2 · Production qualification](benchmarks/controller-action-elision-e2.md)
   - [TC1 · Verified completion](benchmarks/task-completion-tc1.md)
   - [TC2 · Useful coding](benchmarks/task-completion-tc2.md)
   - [TC3 · Controller baseline](benchmarks/task-completion-tc3-baseline.md)

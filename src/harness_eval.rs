@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -11,12 +11,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::agent_core::{
-    AgentProfile, AgentRequest, LocalModelEvalEngine, LocalModelEvalOutcome, ScriptedAgentOutcome,
-    ScriptedCompletion, StageContext, run_local_model_eval_steps, run_scripted_agent_steps,
-    run_scripted_delivery_workflow, run_scripted_stage,
+    AgentProfile, AgentRequest, LocalModelDeliveryOutcome, LocalModelEvalEngine,
+    LocalModelEvalOutcome, RecordedGenerationInput, ScriptedAgentOutcome, ScriptedCompletion,
+    StageContext, bind_workflow_checkpoint_runtime, run_local_model_delivery_workflow,
+    run_local_model_eval_steps, run_scripted_agent_steps, run_scripted_delivery_workflow,
+    run_scripted_stage,
 };
 use crate::events::{AgentEvent, ContractStatus};
-use crate::{HarnessEvalArgs, HarnessEvalSuite, config::UserConfig};
+use crate::{HarnessActionElisionEvalArgs, HarnessEvalArgs, HarnessEvalSuite, config::UserConfig};
 
 const CONTROL_FIXTURES: &str = include_str!("../fixtures/harness-control-fixtures.json");
 const HARNESS_EVAL_SCHEMA_VERSION: u32 = 3;
@@ -475,6 +477,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         max_tokens: 256,
         turn_max_tokens_cap: Some(256),
         tool_allowlist: Some(fixture.tool_allowlist.clone()),
+        action_elision: crate::workflow::ActionElisionMode::Off,
         observation_rendering: crate::workflow::ObservationRendering::Native,
         controller_delete_elision: false,
         accept_existing_workspace_changes: false,
@@ -551,6 +554,7 @@ fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
             "run_command".to_string(),
             "sub_agent".to_string(),
         ]),
+        action_elision: crate::workflow::ActionElisionMode::Off,
         observation_rendering: crate::workflow::ObservationRendering::Native,
         controller_delete_elision: false,
         accept_existing_workspace_changes: false,
@@ -2243,6 +2247,546 @@ pub fn run_eval_command(args: HarnessEvalArgs) -> Result<()> {
     Ok(())
 }
 
+const ACTION_ELISION_EVAL_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize)]
+struct ActionElisionEvalConfiguration {
+    model: String,
+    backend: String,
+    model_dir: String,
+    max_steps: usize,
+    max_tokens: i32,
+    ctx_size: u32,
+    threads: Option<i32>,
+    threads_batch: Option<i32>,
+    gpu_layers: u32,
+    temperature: f32,
+    top_k: i32,
+    seed: u32,
+    model_artifact_digest_kind: String,
+    model_artifact_sha256: String,
+    pb_executable_sha256: String,
+    pb_source_commit: String,
+    pb_source_tree_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActionElisionArmRecord {
+    rendering: crate::workflow::ObservationRendering,
+    fixture_fingerprint_before: String,
+    reached_final: bool,
+    verified_completed: bool,
+    workflow_outcome: Option<crate::workflow::WorkflowOutcome>,
+    termination_reason: String,
+    llm_invocations: usize,
+    tool_calls: usize,
+    first_model_action: Option<String>,
+    final_content_sha256: String,
+    final_content: String,
+    read_result_sha256: Option<String>,
+    controller_action_id: Option<String>,
+    first_input: Option<RecordedGenerationInput>,
+    events_file: String,
+    prompts_file: String,
+    artifact_file: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActionElisionEvalSummary {
+    schema_version: u32,
+    fixture_sha256: String,
+    fixture_content_sha256: String,
+    fixture_workspace_fingerprint: String,
+    configuration_sha256: String,
+    configuration: ActionElisionEvalConfiguration,
+    controller_results_byte_identical: bool,
+    native_and_controller_results_byte_identical: Option<bool>,
+    controller_inputs_locked_outside_representation: bool,
+    controller_tool_schemas_identical: bool,
+    controller_action_ids_identical: bool,
+    protocol_pass: bool,
+    arms: Vec<ActionElisionArmRecord>,
+}
+
+pub fn run_action_elision_eval_command(args: HarnessActionElisionEvalArgs) -> Result<()> {
+    if args.output_dir.exists() {
+        let mut entries = std::fs::read_dir(&args.output_dir)
+            .with_context(|| format!("failed to inspect {}", args.output_dir.display()))?;
+        if entries.next().is_some() {
+            bail!(
+                "action-elision output directory must be empty: {}",
+                args.output_dir.display()
+            );
+        }
+    } else {
+        std::fs::create_dir_all(&args.output_dir)
+            .with_context(|| format!("failed to create {}", args.output_dir.display()))?;
+    }
+    let output_dir = args
+        .output_dir
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", args.output_dir.display()))?;
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .context("failed to resolve the pb source root")?;
+    if output_dir.starts_with(&source_root) {
+        bail!(
+            "action-elision output directory must be outside the pb source tree: {}",
+            output_dir.display()
+        );
+    }
+    let workspace = output_dir.join("workspace");
+    std::fs::create_dir(&workspace)
+        .with_context(|| format!("failed to create {}", workspace.display()))?;
+    let fixture_files = BTreeMap::from([(
+        "existing.txt".to_string(),
+        "The answer is 41.\n".to_string(),
+    )]);
+    initialize_fixture_workspace(&workspace, &fixture_files)?;
+    let baseline_oid = git_output(&workspace, &["rev-parse", "HEAD"])?;
+    let baseline_snapshot = crate::workspace::ContentSnapshot::capture(&workspace)?;
+    let fixture_content_sha256 = crate::environment_lock::sha256(b"The answer is 41.\n");
+    let task = "Change existing.txt from `The answer is 41.` to `The answer is 42.`. Do not change any other path.";
+    let plan = workflow_fixture_plan(Vec::new())?;
+    let policy = crate::workflow::WorkflowConfigDocument::default().compile()?;
+    let fixture_sha256 =
+        crate::environment_lock::sha256(&serde_json::to_vec(&serde_json::json!({
+            "task": task,
+            "files": fixture_files,
+            "plan_sha256": plan.sha256,
+            "policy_sha256": policy.sha256,
+        }))?);
+
+    let user_config = UserConfig::load()?;
+    let models_root = args
+        .model_dir
+        .clone()
+        .or_else(|| user_config.effective_model_dir())
+        .unwrap_or_else(crate::default_models_dir);
+    let mut engine = LocalModelEvalEngine::load(&args.model, &models_root, args.gpu_layers)?;
+    ensure_flashmoe_eval_policy(
+        engine.backend_name(),
+        crate::inference::flashmoe::HARNESS_RESOURCE_POLICY_VERSION,
+    )?;
+    let (model_artifact_digest_kind, model_artifact_sha256) =
+        action_elision_model_artifact_digest(&args.model, &models_root, engine.backend_name())?;
+    let pb_executable = std::env::current_exe().context("failed to resolve the pb executable")?;
+    let configuration = ActionElisionEvalConfiguration {
+        model: args.model.clone(),
+        backend: engine.backend_name().to_string(),
+        model_dir: models_root
+            .canonicalize()
+            .unwrap_or(models_root.clone())
+            .display()
+            .to_string(),
+        max_steps: args.max_steps,
+        max_tokens: args.max_tokens,
+        ctx_size: args.ctx_size,
+        threads: args.threads,
+        threads_batch: args.threads_batch,
+        gpu_layers: args.gpu_layers,
+        temperature: args.temperature,
+        top_k: args.top_k,
+        seed: args.seed,
+        model_artifact_digest_kind,
+        model_artifact_sha256,
+        pb_executable_sha256: sha256_file(&pb_executable)?,
+        pb_source_commit: git_output(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &["rev-parse", "HEAD"],
+        )?,
+        pb_source_tree_fingerprint: crate::workspace::ContentSnapshot::capture(Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        )))
+        .context("failed to fingerprint the pb source tree")?
+        .fingerprint,
+    };
+    let configuration_sha256 =
+        crate::environment_lock::sha256(&serde_json::to_vec(&configuration)?);
+    write_pretty_json(&output_dir.join("configuration.json"), &configuration)?;
+    write_pretty_json(
+        &output_dir.join("fixture-manifest.json"),
+        &serde_json::json!({
+            "fixture_sha256": fixture_sha256,
+            "content_sha256": fixture_content_sha256,
+            "workspace_fingerprint": baseline_snapshot.fingerprint,
+            "baseline_oid": baseline_oid,
+            "task": task,
+            "files": fixture_files,
+            "plan": plan,
+            "policy_sha256": policy.sha256,
+        }),
+    )?;
+
+    let mut arms = Vec::new();
+    for rendering in [
+        crate::workflow::ObservationRendering::Native,
+        crate::workflow::ObservationRendering::ControllerBlock,
+        crate::workflow::ObservationRendering::DisclosedToolTranscript,
+        crate::workflow::ObservationRendering::CompatibilityToolTranscript,
+    ] {
+        run_git(&workspace, &["reset", "--hard", &baseline_oid])?;
+        let status = git_output(&workspace, &["status", "--porcelain"])?;
+        if !status.is_empty() {
+            bail!(
+                "fixture workspace contains unexpected paths before {} arm: {status}",
+                rendering.as_str()
+            );
+        }
+        let current = crate::workspace::ContentSnapshot::capture(&workspace)?;
+        if current.fingerprint != baseline_snapshot.fingerprint {
+            bail!(
+                "fixture fingerprint changed before {} arm",
+                rendering.as_str()
+            );
+        }
+        let arm_dir = output_dir.join(rendering.as_str());
+        std::fs::create_dir(&arm_dir)
+            .with_context(|| format!("failed to create {}", arm_dir.display()))?;
+        let graph = crate::workspace::WorkspaceGraph::legacy(&[]);
+        let repository = crate::workspace::RepositoryContext::capture(&workspace, &workspace)?;
+        let mut run = crate::workflow::WorkflowRun::start(
+            "action-elision-eval-workflow",
+            "action-elision-eval-turn",
+            task,
+            policy.clone(),
+            repository.clone(),
+        )?;
+        plan.artifact
+            .validate(&graph, &run.repository.task_baseline.content)?;
+        run.apply(crate::workflow::WorkflowEvent::PlanSubmitted { plan: plan.clone() })?;
+        run.apply(crate::workflow::WorkflowEvent::PlanReviewSubmitted {
+            review: workflow_fixture_plan_review(&plan, crate::workflow::ReviewVerdict::Pass)?,
+        })?;
+        let mut checkpoint = crate::workflow::WorkflowCheckpoint::new(run)?;
+        bind_workflow_checkpoint_runtime(&mut checkpoint, &graph, &workspace)?;
+        let controller = rendering.is_controller();
+        let request = AgentRequest {
+            task: task.to_string(),
+            turn_id: "action-elision-eval-turn".to_string(),
+            intent: Some(crate::workflow::TurnIntent::Deliver),
+            workflow_policy: Some(policy.clone()),
+            workflow_stage: None,
+            workflow_expected_content_fingerprint: None,
+            workflow_action_first_turn: false,
+            workflow_creation_path_order: Vec::new(),
+            workflow_work_units: None,
+            workflow_stage_evidence: None,
+            workflow_checkpoint: Some(checkpoint),
+            conversation_handoff: None,
+            legacy_prompt_owned_delivery: false,
+            model: args.model.clone(),
+            model_dir: Some(models_root.clone()),
+            workdir: Some(workspace.clone()),
+            branch: Some("harness-eval".to_string()),
+            max_steps: args.max_steps,
+            max_tokens: args.max_tokens,
+            turn_max_tokens_cap: Some(args.max_tokens),
+            tool_allowlist: None,
+            action_elision: if controller {
+                crate::workflow::ActionElisionMode::Safe
+            } else {
+                crate::workflow::ActionElisionMode::Off
+            },
+            observation_rendering: rendering,
+            controller_delete_elision: false,
+            accept_existing_workspace_changes: false,
+            ctx_size: args.ctx_size,
+            threads: args.threads,
+            threads_batch: args.threads_batch,
+            gpu_layers: args.gpu_layers,
+            temperature: args.temperature,
+            profile: AgentProfile::Build,
+            infer_profile: false,
+            sub_agent_depth: 0,
+            repository_less: false,
+            top_k: args.top_k,
+            seed: args.seed,
+            environment: None,
+            environment_evidence_context: None,
+            workspace_graph: Some(graph),
+            repository_context: Some(repository),
+            prior_check_evidence: crate::checks::CheckEvidenceLedger::default(),
+            session_id: format!("action-elision-eval-{}", rendering.as_str()),
+            attachments: Vec::new(),
+            goal_context: None,
+            contract: None,
+        };
+        let mut events = vec![AgentEvent::HarnessExperimentConfigured {
+            observation_rendering: rendering,
+            controller_delete_elision: false,
+            timestamp_ms: None,
+        }];
+        let outcome =
+            run_local_model_delivery_workflow(&mut engine, &request, &workspace, &mut |event| {
+                events.push(event)
+            })?;
+        let final_content = std::fs::read_to_string(workspace.join("existing.txt"))
+            .context("action-elision fixture target is missing or not UTF-8")?;
+        let events_path = arm_dir.join("events.jsonl");
+        write_events_jsonl(&events_path, &events)?;
+        let prompts_path = arm_dir.join("generation-inputs.json");
+        write_pretty_json(&prompts_path, &outcome.generation_inputs)?;
+        let artifact_path = arm_dir.join("existing.txt");
+        std::fs::write(&artifact_path, &final_content)
+            .with_context(|| format!("failed to write {}", artifact_path.display()))?;
+        let controller_action_id = events.iter().find_map(|event| match event {
+            AgentEvent::ControllerObservation { receipt, .. } => Some(receipt.action_id.clone()),
+            _ => None,
+        });
+        arms.push(action_elision_arm_record(
+            rendering,
+            current.fingerprint,
+            outcome,
+            &events,
+            final_content,
+            controller_action_id,
+            &output_dir,
+            &events_path,
+            &prompts_path,
+            &artifact_path,
+        ));
+    }
+
+    let controller_arms = arms
+        .iter()
+        .filter(|arm| arm.rendering != crate::workflow::ObservationRendering::Native);
+    let observation_hashes = controller_arms
+        .clone()
+        .filter_map(|arm| {
+            arm.first_input
+                .as_ref()
+                .and_then(|input| input.observation_result_sha256.clone())
+        })
+        .collect::<HashSet<_>>();
+    let normalized_hashes = controller_arms
+        .clone()
+        .filter_map(|arm| {
+            arm.first_input
+                .as_ref()
+                .map(|input| input.normalized_input_sha256.clone())
+        })
+        .collect::<HashSet<_>>();
+    let tool_hashes = controller_arms
+        .clone()
+        .filter_map(|arm| {
+            arm.first_input
+                .as_ref()
+                .map(|input| input.tool_schema_sha256.clone())
+        })
+        .collect::<HashSet<_>>();
+    let action_ids = controller_arms
+        .filter_map(|arm| arm.controller_action_id.clone())
+        .collect::<HashSet<_>>();
+    let controller_results_byte_identical = observation_hashes.len() == 1
+        && arms.iter().skip(1).all(|arm| {
+            arm.first_input
+                .as_ref()
+                .and_then(|input| input.observation_result_sha256.as_ref())
+                .is_some()
+        });
+    let controller_inputs_locked_outside_representation = normalized_hashes.len() == 1;
+    let controller_tool_schemas_identical = tool_hashes.len() == 1;
+    let controller_action_ids_identical = action_ids.len() == 1;
+    let protocol_pass = controller_results_byte_identical
+        && controller_inputs_locked_outside_representation
+        && controller_tool_schemas_identical
+        && controller_action_ids_identical;
+    let native_and_controller_results_byte_identical = arms
+        .first()
+        .and_then(|arm| arm.read_result_sha256.as_ref())
+        .map(|native| {
+            arms.iter()
+                .skip(1)
+                .all(|arm| arm.read_result_sha256.as_deref() == Some(native.as_str()))
+        });
+    let summary = ActionElisionEvalSummary {
+        schema_version: ACTION_ELISION_EVAL_SCHEMA_VERSION,
+        fixture_sha256,
+        fixture_content_sha256,
+        fixture_workspace_fingerprint: baseline_snapshot.fingerprint,
+        configuration_sha256,
+        configuration,
+        controller_results_byte_identical,
+        native_and_controller_results_byte_identical,
+        controller_inputs_locked_outside_representation,
+        controller_tool_schemas_identical,
+        controller_action_ids_identical,
+        protocol_pass,
+        arms,
+    };
+    write_pretty_json(&output_dir.join("summary.json"), &summary)?;
+    let compact_arms = summary
+        .arms
+        .iter()
+        .map(|arm| {
+            serde_json::json!({
+                "rendering": &arm.rendering,
+                "workflow_outcome": &arm.workflow_outcome,
+                "termination_reason": &arm.termination_reason,
+                "llm_invocations": arm.llm_invocations,
+                "tool_calls": arm.tool_calls,
+                "first_model_action": &arm.first_model_action,
+                "final_content_sha256": &arm.final_content_sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": summary.schema_version,
+            "output_dir": output_dir,
+            "fixture_sha256": &summary.fixture_sha256,
+            "configuration_sha256": &summary.configuration_sha256,
+            "controller_results_byte_identical": summary.controller_results_byte_identical,
+            "native_and_controller_results_byte_identical":
+                summary.native_and_controller_results_byte_identical,
+            "controller_inputs_locked_outside_representation":
+                summary.controller_inputs_locked_outside_representation,
+            "controller_tool_schemas_identical": summary.controller_tool_schemas_identical,
+            "controller_action_ids_identical": summary.controller_action_ids_identical,
+            "protocol_pass": summary.protocol_pass,
+            "arms": compact_arms,
+        }))?
+    );
+    if !protocol_pass {
+        bail!("action-elision evaluator rejected non-locked controller arms");
+    }
+    Ok(())
+}
+
+fn action_elision_model_artifact_digest(
+    model: &str,
+    models_root: &Path,
+    backend: &str,
+) -> Result<(String, String)> {
+    if backend == "llama_cpp" {
+        let path = crate::agent_core::find_model_in_cache_in(models_root, model)?;
+        return Ok(("selected_gguf_sha256".to_string(), sha256_file(&path)?));
+    }
+    let plan = crate::inference::flashmoe::plan(model, models_root)
+        .context("FlashMoe evaluator backend had no reproducible model plan")?;
+    let mut digest = Sha256::new();
+    for path in [
+        &plan.tensor_manifest,
+        &plan.model_config,
+        &plan.tokenizer,
+        &plan.tokenizer_config,
+        &plan.chat_template,
+    ] {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let bytes = std::fs::read(&canonical)
+            .with_context(|| format!("failed to fingerprint {}", canonical.display()))?;
+        digest.update(canonical.to_string_lossy().as_bytes());
+        digest.update([0]);
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(&bytes);
+    }
+    for path in [&plan.non_expert_weights, &plan.experts_dir] {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        digest.update(path.to_string_lossy().as_bytes());
+        digest.update([0]);
+        digest.update(metadata.len().to_le_bytes());
+    }
+    Ok((
+        "flashmoe_runtime_manifest_sha256".to_string(),
+        format!("{:x}", digest.finalize()),
+    ))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn action_elision_arm_record(
+    rendering: crate::workflow::ObservationRendering,
+    fixture_fingerprint_before: String,
+    outcome: LocalModelDeliveryOutcome,
+    events: &[AgentEvent],
+    final_content: String,
+    controller_action_id: Option<String>,
+    output_dir: &Path,
+    events_path: &Path,
+    prompts_path: &Path,
+    artifact_path: &Path,
+) -> ActionElisionArmRecord {
+    let first_model_action = events.iter().find_map(|event| match event {
+        AgentEvent::ToolCall { tool, .. } => Some(format!("tool:{tool}")),
+        _ => None,
+    });
+    let native_read_result_sha256 = events.iter().find_map(|event| match event {
+        AgentEvent::ToolResult { tool, result, .. } if tool == "read_file" => {
+            Some(crate::environment_lock::sha256(result.as_bytes()))
+        }
+        _ => None,
+    });
+    let first_input = outcome.generation_inputs.first().cloned();
+    let read_result_sha256 = first_input
+        .as_ref()
+        .and_then(|input| input.observation_result_sha256.clone())
+        .or(native_read_result_sha256);
+    ActionElisionArmRecord {
+        rendering,
+        fixture_fingerprint_before,
+        reached_final: outcome.reached_final,
+        verified_completed: outcome.verified_completed,
+        workflow_outcome: outcome.workflow.run.outcome,
+        termination_reason: outcome.termination_reason.to_string(),
+        llm_invocations: outcome.llm_invocations,
+        tool_calls: outcome.tool_calls,
+        first_model_action,
+        final_content_sha256: crate::environment_lock::sha256(final_content.as_bytes()),
+        final_content,
+        read_result_sha256,
+        controller_action_id,
+        first_input,
+        events_file: relative_output_path(output_dir, events_path),
+        prompts_file: relative_output_path(output_dir, prompts_path),
+        artifact_file: relative_output_path(output_dir, artifact_path),
+    }
+}
+
+fn relative_output_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn write_pretty_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    serde_json::to_writer_pretty(BufWriter::new(file), value)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn write_events_jsonl(path: &Path, events: &[AgentEvent]) -> Result<()> {
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+    );
+    for event in events {
+        serde_json::to_writer(&mut writer, event)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 fn selected_control_fixtures(
     corpus: &ControlFixtureCorpus,
     suite: HarnessEvalSuite,
@@ -2416,6 +2960,7 @@ fn run_real_model_fixture(
         max_tokens: configuration.max_tokens,
         turn_max_tokens_cap: Some(configuration.max_tokens),
         tool_allowlist: Some(fixture.tool_allowlist.clone()),
+        action_elision: crate::workflow::ActionElisionMode::Off,
         observation_rendering: crate::workflow::ObservationRendering::Native,
         controller_delete_elision: false,
         accept_existing_workspace_changes: false,

@@ -318,22 +318,28 @@ pb similarly projects the checked fingerprint while the fresh reviewer owns asse
 and verdict. Existing artifact validators still reject missing steps, paths outside the plan, stale
 state, incomplete work, or unsupported review conclusions.
 
-### Experimental controller action elision
+### Controller action elision
 
-**Configurable on the hidden harness only.** A typed observation-rendering argument can let pb
-execute a uniquely determined local observation before a model turn. Normal daemon, desktop, and
-web workflows continue to expose native model tools. The controller records its actual origin and
-exact full/range coverage even when the experimental prompt representation resembles an assistant
-tool transcript; prompt-only calls are not durable model actions and grant no progress or review
-authority.
+**Configurable, default off.** A server-owned user setting can let pb execute a uniquely determined
+local observation before a model turn. `review_only` permits fresh review inspection; `safe` also
+permits eligible reads, ranges, and structural closure. The immediate rollback is `off`. A separate
+boolean gates conservative deletion and is inert outside `safe`. Persisted/API request fields cannot
+enable or broaden this policy, and a restored task receives the daemon's current policy.
+
+Production always uses an explicit controller-labelled prompt block. The hidden harness additionally
+compares disclosed and undisclosed assistant/tool transcript renderings, but prompt-only calls are
+not durable model actions and grant no progress or review authority. The controller records actual
+origin, exact full/range coverage, fingerprints, and content-derived action identity independently
+of representation.
 
 An exact active small-file observation may satisfy read-before-write only while its current
 fingerprint and complete prompt bytes remain valid. A failed-diagnostic range permits only an edit
 whose old text lies wholly inside an included byte window. Fresh review inspection is injected only
 when every required changed path fits, and the reviewer still authors assessments, findings, and
-verdict. Optional completion fields on a successful final mutation remain model-authored. The
-additional automatic-delete experiment is separately gated and limited to a unique tracked, clean,
-unchanged plan deletion with Git recovery.
+verdict. Optional completion fields on a successful final mutation remain model-authored. Automatic
+deletion is separately default-off and limited to a unique tracked, clean, unchanged plan deletion
+with Git recovery. A configured preference is not delete authority: the accepted plan, active work
+unit, allowed path, current identity, and Git state are all revalidated first.
 
 Content fingerprints identify present worktree entries and bytes, independently of Git index
 bookkeeping. In particular, the synthetic tracked-`missing` entry visible before staging a deletion

@@ -19,6 +19,7 @@ The user configuration file is `<config-dir>/pb/config.toml`. It covers:
 
 - web listen address, port, Unix socket path, and the macOS work-queue sleep preference;
 - model identifier, directory, context, sampling, and resource defaults;
+- default-off controller action-elision and conservative deletion policy;
 - storage roots and inference session-cache policy;
 - FlashMoe in-memory session and resident-runtime bounds;
 - global MCP and LSP server definitions;
@@ -34,6 +35,39 @@ fallback uses the numeric user ID rather than the mutable `USER` environment var
 
 pb-owned workspaces, leases, and managed cache records use the platform-local data directory by
 default. Set `storage.state_dir` to a non-empty absolute path to relocate them.
+
+## Controller action elision
+
+**Configurable, default off.** pb can execute narrowly deterministic local observations in the
+controller and provide their exact result to the local model without spending a separate model
+turn on tool selection. The production prompt always labels this as a controller observation; the
+tool-transcript representations used by the hidden evaluator are not accepted here.
+
+```bash
+pb config set agent.action_elision review_only
+pb config set agent.action_elision safe
+pb config set agent.action_elision off
+```
+
+`review_only` may preload fresh, exact changed-path inspections for code review. `safe` additionally
+permits eligible small-file reads, exact failed-diagnostic ranges, and structural completion fusion.
+Missing, unreadable, binary, stale, oversized, or context-ineligible files fall back to native model
+tools. `off` is the immediate rollback and remains the default until the corresponding qualification
+matrix supports a broader default.
+
+Conservative automatic deletion has a separate opt-in and is inert unless the mode is `safe`:
+
+```bash
+pb config set agent.controller_delete_elision true
+```
+
+It applies only to a unique accepted-plan deletion whose tracked file or symlink is clean, unchanged,
+fresh, and Git-recoverable. Directories, untracked or adopted content, dirty files, ambiguous paths,
+and stale fingerprints remain model-owned or blocked. Set `agent.action_elision` to `off` to disable
+all action elision in one step; the stored deletion preference alone grants no authority. These are
+user-level local controller settings, not project policy, request fields, environment switches, or
+network features. Restart `pb serve` after changing them so new and restored tasks receive the new
+server-owned policy.
 
 ## Keep macOS awake while pb works
 

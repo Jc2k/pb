@@ -1,28 +1,32 @@
 # Controller-owned deterministic action elision
 
-Status: **Configurable on the hidden harness; real-model prompt-rendering qualification required
-before production promotion**
+Status: **Default-off production implementation complete; truthful controller rendering is the only
+production representation, while non-off defaults and transcript renderings remain unpromoted**
 
 This follow-on explores whether pb can save local-model invocations by executing uniquely determined
 observations and bookkeeping in the controller. It extends the
 [verified task-completion reliability plan](task-completion-reliability-plan.md) and its typed
-work-unit controller. The experiment is implemented as an opt-in `pb harness agent` capability;
-normal daemon, desktop, and web requests retain native model tool calls. The qualification and
-production-promotion items in this record are not shipped guarantees.
+work-unit controller. The mechanism is available to normal daemon, desktop, and web workflows
+through a typed, default-off user policy. Prompt-transcript research remains confined to the hidden
+harness, and a non-off default is not a shipped guarantee.
 
 ## Implementation status
 
 | Step | Current state |
 | --- | --- |
 | E0 | **Configurable:** hidden harness rendering enum, typed receipts, truthful durable provenance, and prompt-only compatibility call IDs. |
-| E1 | **Open qualification:** the four rendering arms and audit counters exist; the [initial preserved screen](benchmarks/controller-action-elision-e1.md) qualified safe review elision but did not satisfy the byte-locked read comparison required for representation selection. |
+| E1 | **Qualified representation screen:** the [initial review screen](benchmarks/controller-action-elision-e1.md) and [byte-locked two-tier read qualification](benchmarks/controller-action-elision-e2.md) support the truthful controller block and provide no evidence for transcript-shaped production rendering. |
 | E2 | **Configurable:** controller observations carry validated operation, coverage, fingerprints, ranges, prompt bytes, and authority effects alongside ordinary stage evidence. |
 | E3 | **Configurable:** candidate prompts use the active model's renderer/tokenizer and admit observations only below 55% of usable prompt capacity without compacting their bytes. |
 | E4 | **Configurable:** exact active small UTF-8 files can be fully observed and seed read-before-write evidence; ineligible inputs fall back to native reads. |
 | E5 | **Configurable:** exact failed-diagnostic anchors can produce hash-bound ranges and range-confined edits; replacement and unobserved edits remain blocked. |
 | E6 | **Configurable:** fresh review may receive all required `inspect_change` results at once, without controller-authored assessments or verdicts. |
 | E7 | **Configurable:** a successful final mutation may carry model-authored completion fields; structurally empty mutation-forbidden work can close as controller-owned no-change. |
-| E8 | **Configurable only behind an additional hidden harness flag:** narrowly eligible tracked clean deletions retain controller origin and Git recovery; production promotion remains a separate decision. |
+| E8 | **Configurable, separately default off:** narrowly eligible tracked clean deletions retain controller origin and Git recovery and require `safe` plus an explicit user opt-in. |
+| E9 | **Implemented, default off:** typed user policy is server-owned, skipped in request persistence, reapplied to restored tasks, and has a one-step `off` rollback. |
+| E10 | **Implemented:** action IDs are content-derived, prompt admission revalidates workspace/path identity, and ordinary read eligibility failures fall back to native tools. |
+| E11 | **Implemented and screened on 4B/7B:** the hidden four-arm continuation command preserves fixture/configuration, source/model identity, semantic and rendered prompt digests, events, and artifacts and rejects non-locked controller arms. The broader promotion matrix remains open. |
+| E12 | **Default-off production gate passed; default promotion open:** typed policy, rollback, provenance, fallback, and scripted safety checks ship without promoting a non-off default or transcript representation. |
 
 ## Outcome
 
@@ -32,10 +36,37 @@ non-authorizing, and independently auditable. The optimization must preserve ver
 fresh evidence, allowed-path restrictions, review independence, managed commit ownership, and local
 privacy.
 
-The first question is deliberately empirical: a tool-trained local model may behave better when a
+One question remains deliberately empirical: a tool-trained local model may behave better when a
 controller-executed read is rendered in the familiar assistant-tool-call/tool-result shape than when
-the same bytes appear in a prose controller block. pb must measure that possibility before choosing
-the production representation.
+the same bytes appear in a prose controller block. pb measures that possibility, including the
+undisclosed compatibility arm, but does not make safe production rollout depend on it. The truthful
+controller block is the sole production candidate. A transcript rendering remains harness-only
+unless the locked experiment independently clears its stricter provenance and behavior threshold.
+
+## Production closure decision
+
+Production behavior is owned by the local pb controller, not by request payloads or model output.
+It uses a typed user setting rather than a hidden environment toggle:
+
+```toml
+[agent]
+action_elision = "off"          # off | review_only | safe
+controller_delete_elision = false
+```
+
+The rollout contract is:
+
+- `off` preserves native model tool selection and is the immediate rollback;
+- `review_only` permits only fresh, exact controller-owned review observations;
+- `safe` additionally permits eligible reads, range observations, and structural closure fusion;
+- deletion requires `safe` plus the separate explicit boolean, and defaults to disabled; and
+- normal production always renders an explicit controller block. Transcript choices remain
+  accepted only on the hidden harness.
+
+The first release defaults to `off`. Promotion to a non-off default is a separate evidence-backed
+change: `review_only` requires the repeated review matrix, while `safe` also requires the locked read,
+range, stale-state, and closure matrices. This makes the implementation deployable and recoverable
+without silently converting incomplete qualification into a default guarantee.
 
 ## Truth boundary
 
@@ -115,7 +146,7 @@ Promotion proof:
 - serialization, checkpoint, compaction, and event/journal tests preserve actual origin;
 - no prompt renderer changes gate state or the result bytes;
 - an interrupted or failed controller read creates no successful synthetic transcript;
-- the production configuration and tool schemas remain unchanged.
+- production accepts only the truthful controller block and never exposes rendering selection.
 
 ## E1 — compatibility-transcript experiment
 
@@ -136,10 +167,26 @@ benefit, if any, must be separated from the invocation saved by controller execu
 4. **Compatibility tool transcript.** The prompt contains the assistant tool call and result without
    the disclosure line; durable provenance still says controller.
 
-Model, model digest, chat template, tool schemas, context size, generation cap, sampling, seed,
-task, contract, workspace bytes, evidence, result truncation, and cache conditions remain locked.
-The controller arms must use byte-identical results. The native arm's extra generation is reported
+Model, model digest, chat template, context size, generation cap, sampling, seed, task, contract,
+workspace bytes, evidence, result truncation, and cache conditions remain locked. The three
+controller arms use identical tool schemas and byte-identical results. The native arm initially
+exposes the read required by its evidence state; after a successful read, its result bytes and
+post-read continuation are compared with the controller arms. Its extra generation is reported
 separately rather than normalized away.
+
+Arm preparation is immutable and independently checkable. A canonical fixture root is hashed before
+any run, cloned once per arm, and rejected if its manifest differs. The eligible controller
+observation is prepared from those frozen bytes and its exact operation result is saved as a fixture
+artifact. All controller arms consume that same byte sequence; action IDs, timestamps, check
+durations, scratch paths, and other volatile values are excluded from the compared prompt suffix.
+The evaluator saves the complete rendered prompt digest, observation-result digest, model/runtime
+digest, fixture manifest, sampling settings, event log, and final artifact manifest for each arm.
+
+The read experiment starts at the immediate-continuation boundary: an accepted plan and unique
+active path are fixed before the compared generation. In the native arm the model must request the
+read; in controller arms the exact result is already present. This avoids measuring whether the
+model happened to propose the expected plan instead of measuring its response to the four
+representations.
 
 ### Fixture matrix
 
@@ -197,7 +244,8 @@ supported local tier confirms it or the rendering is explicitly scoped by typed 
 
 ## E2 — production observation receipt
 
-After E1 chooses a representation, introduce a versioned controller observation in workflow state.
+Production introduces a versioned controller observation in workflow state using the truthful block.
+E1 can still justify a later, separately reviewed harness-to-production rendering change.
 It records origin, current fingerprints, coverage, prompt representation, persistence, and
 invalidation. The event stream and journal show the receipt independently of its model-facing
 rendering.
@@ -217,8 +265,8 @@ the generation reserve, safety margin, and compaction target, then assigns the r
 budget only to the active work unit. Evidence is selected in this order:
 
 1. complete current content;
-2. exact failed-diagnostic or changed-hunk ranges;
-3. exact accepted symbol/search anchors;
+2. exact failed-diagnostic ranges;
+3. exact typed contract anchors when a future contract schema carries them;
 4. metadata-only receipt; or
 5. the existing model read/search surface.
 
@@ -250,9 +298,10 @@ ranges and metadata. A range-bound edit records the file hash, byte interval, in
 boundaries, and exact old-text or patch anchor. It cannot authorize replacement outside observed
 ranges.
 
-Deterministic range sources are limited to exact diagnostic locations, changed diff hunks, accepted
-symbols, or explicit contract anchors. If none exists, pb retains `ripgrep` and ranged `read_file`
-instead of guessing relevance.
+Initial production range sources are limited to exact failed-diagnostic locations. Changed hunks are
+already exact review observations rather than edit authority. Symbols and contract anchors become
+eligible only when a trusted typed producer is added; pb never infers them from prose. If no exact
+source exists, pb retains `ripgrep` and ranged `read_file` instead of guessing relevance.
 
 ## E6 — fresh review inspection elision
 
@@ -278,14 +327,77 @@ checks and any substantive review remain unchanged.
 
 ## E8 — conservative automatic deletion
 
-Automatic deletion is last and initially harness-only. It requires a unique active delete in an
+Automatic deletion is last and separately default-off. It requires a unique active delete in an
 accepted and freshly reviewed plan, deliver intent, explicit contract/policy allowance, a tracked
 unchanged file or symlink, exact baseline/invocation identity, and no adopted or untracked bytes.
 Directories, ambiguous resolution, dirty content, untracked files, and user-owned partial work are
 ineligible. Symlink deletion unlinks the link and never follows it.
 
-Product promotion requires a separate approval and recovery decision. A model tool call remains the
-fallback; the controller does not broaden destructive authority merely to save a step.
+Product promotion requires `safe` mode plus the separate local deletion opt-in. The setting is not
+itself delete authority: all freshness, uniqueness, tracked-clean, accepted-plan, allowed-path, and
+Git-recovery conditions still have to pass. A model tool call remains the fallback; the controller
+does not broaden destructive authority merely to save a step.
+
+## E9 — production policy ownership and rollback
+
+Add the typed user settings above and copy their effective values into each server-owned agent
+request. Client/session payloads and restored checkpoints cannot enable or broaden the policy.
+Harness fixtures continue to select their explicit arm independently. Configuration validation,
+effective-value reporting, and documentation must make these facts observable:
+
+- absence means `off` and deletion disabled;
+- an unknown mode is rejected;
+- deletion is inert unless `safe` is also effective;
+- changing to `off` affects newly started work without data migration; and
+- no mode adds network access, telemetry, remote inference, or remote persistence.
+
+## E10 — invalidation, fallback, and idempotence
+
+Controller observations use content-derived action IDs rather than clocks or scratch-root names.
+Immediately before prompt admission, pb revalidates the workspace, path identity, content hash, and
+coverage hashes recorded by the receipt. A mismatch discards the candidate and returns to native
+tool selection without progress credit.
+
+Missing, unreadable, disallowed, oversized, binary, symlinked, or context-ineligible content is a
+normal eligibility miss rather than a workflow failure. It cannot produce a successful prompt
+transcript or mutation evidence. Repeated preparation over identical state yields the same receipt
+identity and cannot grant duplicate authority. Cancellation and checkpoint restore repeat the same
+validation before reuse.
+
+## E11 — byte-locked evaluator and promotion evidence
+
+Add a deterministic harness fixture for the immediate-continuation experiment and machine-readable
+arm comparison. It rejects non-identical controller result bytes, prompt inputs that differ outside
+the declared representation, fixture mutation before generation, or missing provenance artifacts.
+It reports the native extra invocation separately and compares first continuation, verified final
+artifact, safety events, tokens, latency, and energy where available.
+
+Preserved qualification covers at least:
+
+- small full-file modify, irrelevant full read, missing/read-failure, and context rejection;
+- exact diagnostic range, large file, huge line, invalid UTF-8, stale mutation, and multiple paths;
+- review of small, large, deleted, renamed, symlink, and binary changes;
+- fused completion with valid, invalid, incomplete, and stale model-authored fields;
+- no-change work with required and forbidden mutation contracts; and
+- deletion success plus dirty, untracked, ambiguous, stale, symlink, and recovery cases.
+
+Run scripted coverage first, then preserved real-model trials on each supported local-model tier.
+Model limitations, experiment defects, and pb defects are classified separately. Promotion evidence
+records exact commits, runtime/model digests, configs, fixture manifests, scratch roots, event logs,
+checks, artifact diffs, and audit conclusions.
+
+## E12 — production promotion gate
+
+The production code may ship default-off once scripted safety, configuration, provenance, fallback,
+and rollback tests pass. A non-off default requires its complete E11 matrix, zero false authority or
+completion, independently identical artifacts, and a repeatable end-to-end latency or energy win.
+The undisclosed transcript additionally retains E1's cross-series ten-point requirement and needs a
+separate explicit trust-boundary decision.
+
+Deletion stays default-off even if its opt-in matrix passes. Any safety regression rolls the
+effective mode back to `off`; a review-only regression also disables `review_only`. Rollback does
+not delete receipts or rewrite event history, so the audit trail continues to state what actually
+executed.
 
 ## Edge-case matrix
 
@@ -309,14 +421,19 @@ fallback; the controller does not broaden destructive authority merely to save a
 
 ## Qualification ladder
 
-1. Scripted tests prove origin, coverage, budget, invalidation, fallback, and terminal gates.
-2. E1 selects a prompt representation from preserved native experiments.
-3. E4 qualifies one small modify and one delete/modify task 3/3 against non-elided controls.
+1. Scripted tests prove origin, coverage, budget, invalidation, fallback, terminal gates, policy
+   ownership, and rollback.
+2. E11 proves that E1 controller arms have byte-identical observation results and locked inputs;
+   representation outcomes are preserved research evidence.
+3. The truthful block qualifies one small modify and one delete/modify task 3/3 against native
+   controls before `safe` can become a default.
 4. E5 qualifies oversized, partial, binary, UTF-8-boundary, stale, and multi-file containment.
 5. E6 qualifies fresh review across small, large, deleted, renamed, symlink, and binary paths.
 6. E7 qualifies closure without missing or synthesized semantic fields.
-7. E8 remains harness-only until its destructive-action review is separately approved.
+7. E8 qualifies only an explicit default-off production opt-in after destructive-action review.
 8. Run the final-source TC3 corpus and supported model tiers.
+9. Independently audit source, preserved journal/events, artifacts, checks, Git recovery, latency,
+   and energy before changing any default.
 
 Every promotion requires zero false verified completions, forbidden mutations, evidence grants,
 review claims, or model attribution; identical independently checked artifacts; clean semantic
@@ -326,7 +443,7 @@ reduction alone.
 ## Documentation and configuration obligations
 
 Any shipped behavior updates the curated workflow, user-contract, security, and local-privacy
-chapters in the same commit. A new project policy field must also update initialization and user
-configuration documentation. No `PB_*` environment switch is permitted. Experiment-only rendering
-stays on the typed hidden harness surface until a promotion gate explicitly moves it into supported
+chapters in the same commit. The user setting must update configuration documentation; no new project
+field is introduced. No `PB_*` environment switch is permitted. Experiment-only rendering stays on
+the typed hidden harness surface until a promotion gate explicitly moves it into supported
 configuration.

@@ -50,8 +50,9 @@ pb harness agent --observation-rendering disclosed-tool-transcript "..."
 pb harness agent --observation-rendering compatibility-tool-transcript "..."
 ```
 
-This enum is in-memory harness input only; it is not accepted from stored requests or the daemon,
-desktop, or web API. Controller observations emit typed durable events and stage evidence with
+This rendering enum is in-memory harness input only; it is not accepted from stored requests or the
+daemon, desktop, or web API. Production has a separate default-off user policy and always uses the
+truthful controller block. Controller observations emit typed durable events and stage evidence with
 their actual origin, prompt representation, exact coverage, fingerprints, byte counts, and
 authority effects. Transcript-shaped arms create only prompt-local call IDs and never model
 `tool_call`/`tool_result` events.
@@ -64,12 +65,31 @@ never supplies assessments or a verdict. A successful final mutation can carry o
 model-authored completion fields, while a controller no-change close is limited to structurally
 empty, mutation-forbidden work.
 
-Automatic deletion requires the additional hidden `--controller-delete-elision` flag and a unique
-accepted delete of a tracked, clean, unchanged file or symlink. It never applies to directories,
-dirty, untracked, adopted, or ambiguous content. Harness summaries separately report rendering,
-controller observation count and prompt bytes, coverage, controller closures, and controller
-mutations. The design, edge-case policy, and promotion gates are recorded in
+Harness automatic deletion requires the additional hidden `--controller-delete-elision` flag;
+production requires `safe` plus the separate user preference. Both paths require a unique accepted
+delete of a tracked, clean, unchanged file or symlink. They never apply to directories, dirty,
+untracked, adopted, or ambiguous content. Harness summaries separately report rendering, controller
+observation count and prompt bytes, coverage, controller closures, and controller mutations. The
+design, edge-case policy, and promotion gates are recorded in
 [Controller-owned deterministic action elision](controller-action-elision-plan.md).
+
+Run the locked immediate-continuation experiment against an explicit local model and an empty,
+persistent output directory outside the pb source tree:
+
+```bash
+pb harness action-elision-eval \
+  --model hf://mlx-community/Qwen3-Coder-Next-4bit \
+  --output-dir /private/tmp/pb-action-elision-e1
+```
+
+The evaluator creates one dedicated Git fixture, resets that fixture to the same baseline before
+each arm, and begins after an accepted plan and fresh plan review. It records configuration,
+source-tree, running-executable, model-artifact, and fixture digests; every semantic generation input
+and actual rendered prompt digest; events; final bytes; and a machine-readable summary for native,
+explicit-block, disclosed-transcript, and compatibility-transcript arms. The command fails if the
+three controller arms differ in observation-result bytes, controller action ID, tool schemas, or any
+first-generation input outside the declared representation. Behavioral and artifact outcomes remain reported
+separately, so a weak model is not mislabeled as a provenance or byte-lock failure.
 
 ### Acceptance contracts
 

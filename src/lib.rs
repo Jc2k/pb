@@ -430,6 +430,54 @@ pub enum HarnessCommand {
     Agent(HarnessAgentArgs),
     /// Run deterministic or explicitly selected local-model harness control evaluations
     Eval(HarnessEvalArgs),
+    /// Run the immutable four-arm controller-observation continuation experiment
+    #[command(hide = true)]
+    ActionElisionEval(HarnessActionElisionEvalArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HarnessActionElisionEvalArgs {
+    /// Persistent directory for configuration, prompts, events, artifacts, and the summary
+    #[arg(long, value_name = "PATH")]
+    pub output_dir: PathBuf,
+
+    /// Explicit local model identifier
+    #[arg(long)]
+    pub model: String,
+
+    /// Directory containing pulled model blobs; defaults to the configured model directory
+    #[arg(long)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Maximum new tokens per model turn
+    #[arg(long, default_value_t = 512)]
+    pub max_tokens: i32,
+
+    /// Maximum bounded workflow steps
+    #[arg(long, default_value_t = DEFAULT_AGENT_MAX_STEPS)]
+    pub max_steps: usize,
+
+    /// Context size for the experiment
+    #[arg(long, default_value_t = 32768)]
+    pub ctx_size: u32,
+
+    #[arg(long)]
+    pub threads: Option<i32>,
+
+    #[arg(long)]
+    pub threads_batch: Option<i32>,
+
+    #[arg(long, default_value_t = GPU_FULL_OFFLOAD)]
+    pub gpu_layers: u32,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+
+    #[arg(long, default_value_t = 1)]
+    pub top_k: i32,
+
+    #[arg(long, default_value_t = 0)]
+    pub seed: u32,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1103,8 +1151,17 @@ async fn run_serve() -> Result<()> {
         max_tokens: user_config.effective_max_tokens(),
         turn_max_tokens_cap: None,
         tool_allowlist: None,
-        observation_rendering: crate::workflow::ObservationRendering::Native,
-        controller_delete_elision: false,
+        action_elision: user_config.effective_action_elision(),
+        observation_rendering: match user_config.effective_action_elision() {
+            crate::workflow::ActionElisionMode::Off => {
+                crate::workflow::ObservationRendering::Native
+            }
+            crate::workflow::ActionElisionMode::ReviewOnly
+            | crate::workflow::ActionElisionMode::Safe => {
+                crate::workflow::ObservationRendering::ControllerBlock
+            }
+        },
+        controller_delete_elision: user_config.effective_controller_delete_elision(),
         accept_existing_workspace_changes: false,
         ctx_size: user_config.effective_ctx_size(),
         threads: user_config.effective_threads(),
@@ -2034,6 +2091,9 @@ fn run_harness_command(command: HarnessCommand) -> Result<()> {
         HarnessCommand::CacheClean(args) => run_flashmoe_cache_clean(args),
         HarnessCommand::Agent(args) => harness::run_agent_task(args),
         HarnessCommand::Eval(args) => harness_eval::run_eval_command(args),
+        HarnessCommand::ActionElisionEval(args) => {
+            harness_eval::run_action_elision_eval_command(args)
+        }
     }
 }
 
@@ -4650,6 +4710,32 @@ mod tests {
         assert_eq!(model.jsonl, Some(PathBuf::from("report.jsonl")));
         assert_eq!(model.max_tokens, 768);
         assert_eq!(model.seed, 42);
+    }
+
+    #[test]
+    fn action_elision_eval_requires_explicit_model_and_output_directory() {
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "action-elision-eval",
+            "--model",
+            "model.gguf",
+            "--output-dir",
+            "preserved-run",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::ActionElisionEval(args),
+        } = parsed.command
+        else {
+            panic!("expected harness action-elision-eval command");
+        };
+        assert_eq!(args.model, "model.gguf");
+        assert_eq!(args.output_dir, PathBuf::from("preserved-run"));
+        assert_eq!(args.seed, 7);
+        assert_eq!(args.max_steps, DEFAULT_AGENT_MAX_STEPS);
     }
 
     #[test]

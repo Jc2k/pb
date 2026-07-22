@@ -17,12 +17,22 @@ use crate::{
 pub struct UserConfig {
     pub web: WebConfig,
     pub model: ModelConfig,
+    pub agent: AgentConfig,
     pub mcp: McpConfig,
     pub lsp: LspConfig,
     pub memory: MemoryConfig,
     pub storage: StorageConfig,
     pub inference: InferenceConfig,
     pub flashmoe: FlashMoeConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    /// Controller-owned deterministic action elision. Default-off until qualification promotes it.
+    pub action_elision: Option<crate::workflow::ActionElisionMode>,
+    /// Separately opt in to the conservative tracked-clean deletion path.
+    pub controller_delete_elision: Option<bool>,
 }
 
 pub const DEFAULT_SESSION_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -144,6 +154,11 @@ impl UserConfig {
 
     pub fn get(&self, key: &str) -> Result<Option<String>> {
         Ok(match key {
+            "agent.action_elision" => self.agent.action_elision.map(|value| value.to_string()),
+            "agent.controller_delete_elision" => self
+                .agent
+                .controller_delete_elision
+                .map(|value| value.to_string()),
             "web.listen" => self.web.listen.clone(),
             "web.port" => self.web.port.map(|value| value.to_string()),
             "web.socket_path" => self.web.socket_path.as_ref().map(|path| display_path(path)),
@@ -208,6 +223,10 @@ impl UserConfig {
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
+            "agent.action_elision" => self.agent.action_elision = Some(parse_value(key, value)?),
+            "agent.controller_delete_elision" => {
+                self.agent.controller_delete_elision = Some(parse_value(key, value)?)
+            }
             "web.listen" => self.web.listen = Some(value.to_string()),
             "web.port" => self.web.port = Some(parse_value(key, value)?),
             "web.socket_path" => self.web.socket_path = Some(PathBuf::from(value)),
@@ -272,6 +291,15 @@ impl UserConfig {
             .listen
             .clone()
             .unwrap_or_else(|| "127.0.0.1".to_string())
+    }
+
+    pub fn effective_action_elision(&self) -> crate::workflow::ActionElisionMode {
+        self.agent.action_elision.unwrap_or_default()
+    }
+
+    pub fn effective_controller_delete_elision(&self) -> bool {
+        self.effective_action_elision() == crate::workflow::ActionElisionMode::Safe
+            && self.agent.controller_delete_elision.unwrap_or(false)
     }
 
     pub fn effective_web_port(&self) -> u16 {
@@ -483,7 +511,7 @@ where
 
 fn bail_unknown_key<T>(key: &str) -> Result<T> {
     bail!(
-        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, memory.personal_repo, storage.state_dir, storage.cache_dir, inference.llamacpp_session_cache_enabled, inference.llamacpp_session_cache_max_bytes, inference.flashmoe_session_cache_enabled, inference.flashmoe_session_cache_max_bytes, flashmoe.memory_sessions, flashmoe.resident_models, flashmoe.idle_seconds. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, capabilities, and disabled fields. MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, secret_env, and operator-audited read_only_tools. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
+        "unknown config key '{key}'; supported keys: agent.action_elision, agent.controller_delete_elision, web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, memory.personal_repo, storage.state_dir, storage.cache_dir, inference.llamacpp_session_cache_enabled, inference.llamacpp_session_cache_max_bytes, inference.flashmoe_session_cache_enabled, inference.flashmoe_session_cache_max_bytes, flashmoe.memory_sessions, flashmoe.resident_models, flashmoe.idle_seconds. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, capabilities, and disabled fields. MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, secret_env, and operator-audited read_only_tools. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
     )
 }
 
@@ -509,6 +537,10 @@ mod tests {
             .unwrap();
         config.set("model.temperature", "0.7").unwrap();
         config.set("model.profile", "review").unwrap();
+        config.set("agent.action_elision", "safe").unwrap();
+        config
+            .set("agent.controller_delete_elision", "true")
+            .unwrap();
         config.save_to_path(&path).unwrap();
 
         let loaded = UserConfig::load_from_path(&path).unwrap();
@@ -523,6 +555,11 @@ mod tests {
         );
         assert_eq!(loaded.model.temperature, Some(0.7));
         assert_eq!(loaded.model.profile, Some(AgentProfile::Review));
+        assert_eq!(
+            loaded.effective_action_elision(),
+            crate::workflow::ActionElisionMode::Safe
+        );
+        assert!(loaded.effective_controller_delete_elision());
     }
 
     #[test]
@@ -542,6 +579,31 @@ mod tests {
         assert_eq!(
             UserConfig::default().effective_max_steps(),
             DEFAULT_AGENT_MAX_STEPS
+        );
+        assert_eq!(
+            UserConfig::default().effective_action_elision(),
+            crate::workflow::ActionElisionMode::Off
+        );
+        assert!(!UserConfig::default().effective_controller_delete_elision());
+
+        config
+            .set("agent.controller_delete_elision", "true")
+            .unwrap();
+        assert!(!config.effective_controller_delete_elision());
+        config.set("agent.action_elision", "safe").unwrap();
+        assert!(config.effective_controller_delete_elision());
+    }
+
+    #[test]
+    fn action_elision_rejects_unknown_modes() {
+        let mut config = UserConfig::default();
+        let error = config
+            .set("agent.action_elision", "compatibility_tool_transcript")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected off, review_only, or safe")
         );
     }
 

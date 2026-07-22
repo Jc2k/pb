@@ -129,6 +129,15 @@ impl FlashMoeEngine {
         Ok((prompt, prompt_tokens))
     }
 
+    pub(crate) fn rendered_structured_prompt_identity(
+        &self,
+        request: &StructuredGenerationRequest,
+    ) -> Result<(String, usize)> {
+        let prompt = self.render_structured_prompt(request)?;
+        let bytes = prompt.as_bytes();
+        Ok((format!("{:x}", Sha256::digest(bytes)), bytes.len()))
+    }
+
     fn render_structured_prompt(&self, request: &StructuredGenerationRequest) -> Result<String> {
         if request.raw_prompt {
             if !request.tools.is_empty() {

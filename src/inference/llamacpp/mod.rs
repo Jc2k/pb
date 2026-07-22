@@ -797,6 +797,15 @@ impl LlamaCppChatSession<'_> {
 }
 
 impl LlamaCppBackend {
+    pub(crate) fn rendered_chat_prompt_identity(
+        &self,
+        request: &LlamaCppChatRequest,
+    ) -> Result<(String, usize)> {
+        let (prompt, _) = self.render_chat_prompt(&request.messages, &request.tools)?;
+        let bytes = prompt.as_bytes();
+        Ok((format!("{:x}", Sha256::digest(bytes)), bytes.len()))
+    }
+
     fn render_prompt(&self, prompt: &str) -> Result<(String, AddBos)> {
         if prompt.contains("<|im_start|>") {
             return Ok((prompt.to_string(), AddBos::Never));

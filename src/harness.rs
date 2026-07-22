@@ -804,6 +804,11 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
                 .map(|tool| (*tool).to_string())
                 .collect(),
         ),
+        action_elision: if args.observation_rendering.is_controller() {
+            crate::workflow::ActionElisionMode::Safe
+        } else {
+            crate::workflow::ActionElisionMode::Off
+        },
         observation_rendering: args.observation_rendering,
         controller_delete_elision: args.controller_delete_elision,
         accept_existing_workspace_changes: layout.resumed,
