@@ -5559,10 +5559,7 @@ fn run_agent_steps(
                 let instruction = if unit.state == crate::workflow::WorkUnitState::MutationReady {
                     format!(
                         "{instruction}{}",
-                        contract_work_unit_diagnostic_obligations(
-                            args.contract.as_ref(),
-                            &unit.path
-                        )
+                        contract_work_unit_check_ids(args.contract.as_ref(), &unit.path)
                     )
                 } else {
                     instruction
@@ -15474,33 +15471,28 @@ fn contract_planning_path_state_note(
     ))
 }
 
-fn contract_work_unit_diagnostic_obligations(
+fn contract_work_unit_check_ids(
     contract: Option<&crate::harness_contract::AgentContract>,
     path: &str,
 ) -> String {
     let Some(contract) = contract else {
         return String::new();
     };
-    let obligations = contract
+    let mut check_ids = contract
         .checks
         .iter()
         .filter(|check| check.required && check.diagnostic_eligible)
         .filter(|check| check.command.contains(path))
-        .map(|check| {
-            format!(
-                "{}: {}",
-                check.id,
-                truncate_chars(check.command.trim(), 800)
-            )
-        })
+        .map(|check| check.id.as_str())
         .collect::<Vec<_>>();
-    if obligations.is_empty() {
+    check_ids.sort_unstable();
+    check_ids.dedup();
+    if check_ids.is_empty() {
         return String::new();
     }
     format!(
-        "\nVerifier transparency (guidance only; this grants no evidence): these trusted diagnostic checks name {} and will run after structural completion. Make this work unit satisfy every one before writing:\n{}",
-        path,
-        truncate_chars(&obligations.join("\n"), 2_400)
+        "\nCurrent work-unit verifier obligations (guidance only; no evidence is granted): [{}]. Make this mutation satisfy every named obligation.",
+        check_ids.join(", ")
     )
 }
 
@@ -19004,7 +18996,7 @@ the next imagined action"#;
             checks: vec![
                 crate::harness_contract::AgentCheckContract {
                     id: "logic".to_string(),
-                    command: "! rg -n 'https?://' game.js".to_string(),
+                    command: "true # game.js".to_string(),
                     cwd: ".".to_string(),
                     required: true,
                     diagnostic_eligible: true,
@@ -19035,11 +19027,11 @@ the next imagined action"#;
         let projection_note = contract_plan_projection_note(Some(&contract));
         assert!(projection_note.contains("[logic, review_gate]"));
         assert!(projection_note.contains("Do not spend output copying"));
-        let work_unit_obligations =
-            contract_work_unit_diagnostic_obligations(Some(&contract), "game.js");
-        assert!(work_unit_obligations.contains("Verifier transparency"));
-        assert!(work_unit_obligations.contains("logic: ! rg -n 'https?://' game.js"));
-        assert!(contract_work_unit_diagnostic_obligations(Some(&contract), "other.js").is_empty());
+        assert_eq!(
+            contract_work_unit_check_ids(Some(&contract), "game.js"),
+            "\nCurrent work-unit verifier obligations (guidance only; no evidence is granted): [logic]. Make this mutation satisfy every named obligation."
+        );
+        assert!(contract_work_unit_check_ids(Some(&contract), "other.js").is_empty());
         let missing_snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
         let missing_path_note =
             contract_planning_path_state_note(Some(&contract), &missing_snapshot);
