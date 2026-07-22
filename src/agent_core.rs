@@ -19399,6 +19399,122 @@ the next imagined action"#;
     }
 
     #[test]
+    fn typed_delete_advances_to_the_next_bound_modify_unit() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("legacy.txt"), "obsolete\n").unwrap();
+        std::fs::write(repo.path().join("README.md"), "legacy workflow\n").unwrap();
+        git_run(&["add", "legacy.txt", "README.md"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "chore: seed workflow"], repo.path()).unwrap();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+
+        let mut artifact = delivery_plan(
+            Some(("legacy.txt", crate::workflow::PlannedChange::Delete)),
+            Vec::new(),
+        )
+        .artifact;
+        artifact.steps[0].paths.push(crate::workflow::PlanPath {
+            path: "README.md".to_string(),
+            change: crate::workflow::PlannedChange::Modify,
+        });
+        let plan = crate::workflow::ArtifactEnvelope::new("plan-delete-modify", artifact).unwrap();
+        let evidence_paths = BTreeSet::from(["legacy.txt".to_string(), "README.md".to_string()]);
+        let ledger = crate::workflow::WorkUnitLedger::from_plan(
+            &plan.id,
+            &plan.sha256,
+            &plan.artifact,
+            &repository.task_baseline.content,
+            &repository.invocation_baseline.content,
+            &current,
+            &evidence_paths,
+        )
+        .unwrap();
+        let stage_evidence = crate::workflow::StageEvidenceBundle {
+            entries: vec![
+                crate::workflow::StageEvidenceEntry::complete_file(
+                    "legacy.txt".to_string(),
+                    current.paths["legacy.txt"].fingerprint.clone(),
+                    current.fingerprint.clone(),
+                    crate::workflow::WorkflowStage::Planning,
+                    "read_file".to_string(),
+                    "legacy-args".to_string(),
+                    "obsolete\n".to_string(),
+                    1,
+                )
+                .unwrap(),
+                crate::workflow::StageEvidenceEntry::complete_file(
+                    "README.md".to_string(),
+                    current.paths["README.md"].fingerprint.clone(),
+                    current.fingerprint.clone(),
+                    crate::workflow::WorkflowStage::Planning,
+                    "read_file".to_string(),
+                    "readme-args".to_string(),
+                    "legacy workflow\n".to_string(),
+                    2,
+                )
+                .unwrap(),
+            ],
+            ..crate::workflow::StageEvidenceBundle::default()
+        };
+
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        request.workflow_work_units = Some(ledger);
+        request.workflow_stage_evidence = Some(stage_evidence);
+        request.repository_context = Some(repository);
+        request.max_steps = 2;
+
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("rm", json!({})),
+                tool_completion("replace_file", json!({"content": "current workflow\n"})),
+                tool_completion(
+                    "submit_implementation",
+                    json!({
+                        "id": "implementation-1",
+                        "steps": [{
+                            "step_id": "step-delivery",
+                            "status": "completed",
+                            "summary": "removed legacy marker and updated documentation"
+                        }],
+                        "summary": "completed the bounded delete and modify units",
+                        "semantic_commit_subject": "fix: remove legacy workflow marker"
+                    }),
+                ),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert!(!repo.path().join("legacy.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+            "current workflow\n"
+        );
+        assert!(outcome.generation_tool_names[0].contains(&"rm".to_string()));
+        assert!(!outcome.generation_tool_names[0].contains(&"replace_file".to_string()));
+        assert!(outcome.generation_tool_names[1].contains(&"replace_file".to_string()));
+        assert!(!outcome.generation_tool_names[1].contains(&"rm".to_string()));
+        let announced_paths = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Correction {
+                    summary, message, ..
+                } if summary == "Active accepted-plan work unit" => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(announced_paths.len(), 2);
+        assert!(announced_paths[0].contains("legacy.txt"));
+        assert!(announced_paths[1].contains("README.md"));
+    }
+
+    #[test]
     fn implementation_projection_accounts_for_adopted_and_current_stage_paths() {
         let repo = init_contract_test_repo();
         std::fs::write(

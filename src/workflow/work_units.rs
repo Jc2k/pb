@@ -4,10 +4,17 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{PlanArtifact, PlannedChange};
-use crate::workspace::ContentSnapshot;
+use crate::workspace::{ContentSnapshot, PathContent};
 
 pub const WORK_UNIT_LEDGER_VERSION: u32 = 2;
 pub const MAX_WORK_UNIT_PROGRESS_CREDITS: usize = 4;
+
+fn present_path<'a>(snapshot: &'a ContentSnapshot, path: &str) -> Option<&'a PathContent> {
+    snapshot
+        .paths
+        .get(path)
+        .filter(|content| content.kind != "missing")
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -111,22 +118,18 @@ impl WorkUnitLedger {
         let mut units = Vec::new();
         for step in &plan.steps {
             for (path_index, planned) in step.paths.iter().enumerate() {
+                let baseline_path = present_path(baseline, &planned.path);
+                let invocation_path = present_path(invocation, &planned.path);
                 units.push(WorkUnit {
                     id: format!("{}:{path_index}", step.id),
                     plan_step_id: step.id.clone(),
                     operation: planned.change,
                     path: planned.path.clone(),
-                    baseline_path_fingerprint: baseline
-                        .paths
-                        .get(&planned.path)
-                        .map(|entry| entry.fingerprint.clone()),
-                    invocation_path_fingerprint: invocation
-                        .paths
-                        .get(&planned.path)
+                    baseline_path_fingerprint: baseline_path.map(|entry| entry.fingerprint.clone()),
+                    invocation_path_fingerprint: invocation_path
                         .map(|entry| entry.fingerprint.clone()),
                     current_path_fingerprint: None,
-                    adopted: baseline.paths.get(&planned.path)
-                        != invocation.paths.get(&planned.path),
+                    adopted: baseline_path != invocation_path,
                     state: WorkUnitState::EvidenceNeeded,
                 });
             }
@@ -235,15 +238,13 @@ impl WorkUnitLedger {
         let before = self.clone();
         self.observed_fingerprint = current.fingerprint.clone();
         self.diagnostic_failures.retain(|path, fingerprint| {
-            current
-                .paths
-                .get(path)
+            present_path(current, path)
                 .map(|entry| entry.fingerprint.as_str())
                 .unwrap_or("<missing>")
                 == fingerprint.as_str()
         });
         for unit in &mut self.units {
-            let now = current.paths.get(&unit.path);
+            let now = present_path(current, &unit.path);
             unit.current_path_fingerprint = now.map(|entry| entry.fingerprint.clone());
             let task_transition_complete = match unit.operation {
                 PlannedChange::Create => unit.baseline_path_fingerprint.is_none() && now.is_some(),
@@ -346,9 +347,7 @@ impl WorkUnitLedger {
             if !known.contains(path.as_str()) {
                 continue;
             }
-            let fingerprint = current
-                .paths
-                .get(&path)
+            let fingerprint = present_path(current, &path)
                 .map(|entry| entry.fingerprint.clone())
                 .unwrap_or_else(|| "<missing>".to_string());
             self.diagnostic_failures.insert(path, fingerprint);
@@ -535,5 +534,38 @@ mod tests {
             ledger.active().unwrap().state,
             WorkUnitState::DiagnosticRepairReady
         );
+    }
+
+    #[test]
+    fn tracked_missing_delete_completes_and_advances_to_the_next_unit() {
+        let baseline = snapshot(
+            "base",
+            &[("delete.txt", "old-delete"), ("modify.txt", "old-modify")],
+        );
+        let artifact = plan(&[
+            ("delete.txt", PlannedChange::Delete),
+            ("modify.txt", PlannedChange::Modify),
+        ]);
+        let evidence = BTreeSet::from(["delete.txt".to_string(), "modify.txt".to_string()]);
+        let mut ledger = WorkUnitLedger::from_plan(
+            "plan", "digest", &artifact, &baseline, &baseline, &baseline, &evidence,
+        )
+        .unwrap();
+        assert_eq!(ledger.active().unwrap().path, "delete.txt");
+        assert_eq!(ledger.active().unwrap().state, WorkUnitState::MutationReady);
+
+        let mut deleted = snapshot("deleted", &[("modify.txt", "old-modify")]);
+        deleted.paths.insert(
+            "delete.txt".to_string(),
+            PathContent {
+                kind: "missing".to_string(),
+                fingerprint: "tracked-missing".to_string(),
+            },
+        );
+        ledger.reconcile(&deleted, &evidence).unwrap();
+
+        assert_eq!(ledger.units[0].state, WorkUnitState::StructurallyComplete);
+        assert_eq!(ledger.active().unwrap().path, "modify.txt");
+        assert_eq!(ledger.active().unwrap().state, WorkUnitState::MutationReady);
     }
 }
