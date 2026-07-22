@@ -10861,8 +10861,10 @@ fn delivery_stage_context(
             let (graph_sha256, repository_brief_json) = delivery_repository_brief(run, graph)?;
             let handoff = serde_json::to_string_pretty(&run.task)?;
             let acceptance_projection_note = contract_plan_projection_note(contract);
-            let contract_path_state_note =
-                contract_planning_path_state_note(contract, run.planning_content());
+            let contract_path_state_section =
+                contract_planning_path_state_note(contract, run.planning_content())
+                    .map(|note| format!("\n\n{note}"))
+                    .unwrap_or_default();
             let prior_challenges = run
                 .plan_review
                 .as_ref()
@@ -10872,7 +10874,7 @@ fn delivery_stage_context(
             Ok(StageContext {
                 system_prompt: "You are the planning stage of a harness-controlled delivery workflow. You have read-only repository tools. Produce a concrete, structurally complete plan tied to real workspace component/check ids and repository-relative paths. Resolve genuinely blocking human ambiguity with ask_user when that tool is exposed; otherwise record a truthful open question instead of inventing an answer. End only by calling submit_plan; prose final responses cannot advance the workflow.".to_string(),
                 user_prompt: format!(
-                    "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}\n\n{contract_path_state_note}\n\nBounded repository brief (full normalized graph SHA-256 {graph_sha256} remains the validation authority):\n{repository_brief_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{acceptance_projection_note}\n\n{evidence_note}\n\n{handoff_note}\n\n{PLAN_SUBMISSION_GUIDANCE}{correction}",
+                    "Task:\n{}\n\nTask JSON:\n{handoff}\n\nPlanning snapshot fingerprint: {}{contract_path_state_section}\n\nBounded repository brief (full normalized graph SHA-256 {graph_sha256} remains the validation authority):\n{repository_brief_json}\n\nBlocking challenges that a revision must account for:\n{prior_challenges}\n\n{acceptance_projection_note}\n\n{evidence_note}\n\n{handoff_note}\n\n{PLAN_SUBMISSION_GUIDANCE}{correction}",
                     run.task,
                     run.planning_content().fingerprint,
                 ),
@@ -15406,14 +15408,22 @@ fn contract_plan_projection_note(
 fn contract_planning_path_state_note(
     contract: Option<&crate::harness_contract::AgentContract>,
     snapshot: &crate::workspace::ContentSnapshot,
-) -> String {
+) -> Option<String> {
     let Some(contract) = contract else {
-        return "Contract planning path state: no harness contract paths were supplied."
-            .to_string();
+        return None;
     };
     if contract.mutation == crate::harness_contract::MutationRequirement::Forbidden {
-        return "Contract planning path state: mutation is forbidden; submit a truthful no-change plan with no path operations."
-            .to_string();
+        return Some(
+            "Contract planning path state: mutation is forbidden; submit a truthful no-change plan with no path operations."
+                .to_string(),
+        );
+    }
+    if contract
+        .allowed_paths
+        .iter()
+        .all(|path| !snapshot.paths.contains_key(path))
+    {
+        return None;
     }
     let states = contract
         .allowed_paths
@@ -15434,10 +15444,10 @@ fn contract_planning_path_state_note(
             }
         })
         .collect::<Vec<_>>();
-    format!(
+    Some(format!(
         "Contract planning path state at this exact snapshot (authoritative for each path's next change enum even when the task's historical wording says create): {}",
         Value::Array(states)
-    )
+    ))
 }
 
 fn project_contract_plan_checks(
@@ -18974,13 +18984,12 @@ the next imagined action"#;
         let missing_snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
         let missing_path_note =
             contract_planning_path_state_note(Some(&contract), &missing_snapshot);
-        assert!(missing_path_note.contains(r#""path":"game.js""#));
-        assert!(missing_path_note.contains(r#""state":"missing""#));
-        assert!(missing_path_note.contains(r#""valid_next_changes":["create"]"#));
+        assert!(missing_path_note.is_none());
         std::fs::write(repo.path().join("game.js"), "present\n").unwrap();
         let existing_snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
         let existing_path_note =
-            contract_planning_path_state_note(Some(&contract), &existing_snapshot);
+            contract_planning_path_state_note(Some(&contract), &existing_snapshot).unwrap();
+        assert!(existing_path_note.contains(r#""path":"game.js""#));
         assert!(existing_path_note.contains(r#""state":"exists""#));
         assert!(existing_path_note.contains(r#""valid_next_changes":["modify","delete"]"#));
         assert_eq!(
