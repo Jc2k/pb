@@ -1,11 +1,28 @@
 # Controller-owned deterministic action elision
 
-Status: **Design record; prompt-rendering experiment required before implementation**
+Status: **Configurable on the hidden harness; real-model prompt-rendering qualification required
+before production promotion**
 
 This follow-on explores whether pb can save local-model invocations by executing uniquely determined
 observations and bookkeeping in the controller. It extends the
 [verified task-completion reliability plan](task-completion-reliability-plan.md) and its typed
-work-unit controller. Nothing in this record is a shipped guarantee.
+work-unit controller. The experiment is implemented as an opt-in `pb harness agent` capability;
+normal daemon, desktop, and web requests retain native model tool calls. The qualification and
+production-promotion items in this record are not shipped guarantees.
+
+## Implementation status
+
+| Step | Current state |
+| --- | --- |
+| E0 | **Configurable:** hidden harness rendering enum, typed receipts, truthful durable provenance, and prompt-only compatibility call IDs. |
+| E1 | **Open qualification:** the four rendering arms and audit counters exist; the [initial preserved screen](benchmarks/controller-action-elision-e1.md) qualified safe review elision but did not satisfy the byte-locked read comparison required for representation selection. |
+| E2 | **Configurable:** controller observations carry validated operation, coverage, fingerprints, ranges, prompt bytes, and authority effects alongside ordinary stage evidence. |
+| E3 | **Configurable:** candidate prompts use the active model's renderer/tokenizer and admit observations only below 55% of usable prompt capacity without compacting their bytes. |
+| E4 | **Configurable:** exact active small UTF-8 files can be fully observed and seed read-before-write evidence; ineligible inputs fall back to native reads. |
+| E5 | **Configurable:** exact failed-diagnostic anchors can produce hash-bound ranges and range-confined edits; replacement and unobserved edits remain blocked. |
+| E6 | **Configurable:** fresh review may receive all required `inspect_change` results at once, without controller-authored assessments or verdicts. |
+| E7 | **Configurable:** a successful final mutation may carry model-authored completion fields; structurally empty mutation-forbidden work can close as controller-owned no-change. |
+| E8 | **Configurable only behind an additional hidden harness flag:** narrowly eligible tracked clean deletions retain controller origin and Git recovery; production promotion remains a separate decision. |
 
 ## Outcome
 

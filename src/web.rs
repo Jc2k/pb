@@ -4015,6 +4015,8 @@ mod workflow_tests {
             max_tokens: 1,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            observation_rendering: crate::workflow::ObservationRendering::Native,
+            controller_delete_elision: false,
             accept_existing_workspace_changes: false,
             ctx_size: 128,
             threads: None,

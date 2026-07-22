@@ -259,7 +259,16 @@ fn completed_tool_groups(messages: &[ChatMessage]) -> Vec<(usize, usize)> {
                 end += 1;
             }
             if end > index + 1 {
-                groups.push((index, end));
+                let controller_owned = messages[index + 1..end].iter().any(|message| {
+                    message
+                        .prompt_tool_result
+                        .as_ref()
+                        .and_then(|metadata| metadata.actual_origin.as_deref())
+                        == Some("controller")
+                });
+                if !controller_owned {
+                    groups.push((index, end));
+                }
                 index = end;
                 continue;
             }
@@ -325,6 +334,18 @@ fn compacted_tool_group_receipt(messages: &[ChatMessage]) -> (String, PromptTool
             if !metadata.evidence_effects.is_empty() && metadata.evidence_effects != "none" {
                 evidence_effects.push(metadata.evidence_effects.clone());
             }
+            if metadata.actual_origin.is_some() {
+                aggregate.actual_origin = metadata.actual_origin.clone();
+            }
+            if metadata.prompt_representation.is_some() {
+                aggregate.prompt_representation = metadata.prompt_representation.clone();
+            }
+            if metadata.observation_coverage.is_some() {
+                aggregate.observation_coverage = metadata.observation_coverage.clone();
+            }
+            if metadata.observation_action_id.is_some() {
+                aggregate.observation_action_id = metadata.observation_action_id.clone();
+            }
         }
     }
     evidence_effects.sort();
@@ -370,8 +391,20 @@ fn append_one_receipt(
         .map(|metadata| metadata.evidence_effects.as_str())
         .filter(|effects| !effects.is_empty())
         .unwrap_or("none");
+    let actual_origin = metadata
+        .and_then(|metadata| metadata.actual_origin.as_deref())
+        .unwrap_or("model");
+    let prompt_representation = metadata
+        .and_then(|metadata| metadata.prompt_representation.as_deref())
+        .unwrap_or("native");
+    let observation_coverage = metadata
+        .and_then(|metadata| metadata.observation_coverage.as_deref())
+        .unwrap_or("none");
+    let observation_action_id = metadata
+        .and_then(|metadata| metadata.observation_action_id.as_deref())
+        .unwrap_or("none");
     receipt.push_str(&format!(
-        "receipt[{index}]: tool={tool}; arguments_sha256={argument_hash}; outcome={}; omitted_bytes={omitted_bytes}; omitted_lines={omitted_lines}; workspace_fingerprint={workspace_fingerprint}; evidence_effects={evidence_effects}\nexcerpt:\n{excerpt}\n",
+        "receipt[{index}]: tool={tool}; arguments_sha256={argument_hash}; outcome={}; omitted_bytes={omitted_bytes}; omitted_lines={omitted_lines}; workspace_fingerprint={workspace_fingerprint}; evidence_effects={evidence_effects}; actual_origin={actual_origin}; prompt_representation={prompt_representation}; observation_coverage={observation_coverage}; observation_action_id={observation_action_id}\nexcerpt:\n{excerpt}\n",
         if success { "success" } else { "failure" }
     ));
 }
@@ -482,6 +515,7 @@ mod tests {
                     omitted_lines: 0,
                     workspace_fingerprint: Some("abc123".to_string()),
                     evidence_effects: format!("read_path:{id}.txt"),
+                    ..PromptToolResultMetadata::default()
                 },
             )
         };
@@ -506,6 +540,53 @@ mod tests {
         assert!(rendered.contains("arguments_sha256="));
         assert!(rendered.contains("workspace_fingerprint=abc123"));
         assert!(rendered.contains("evidence_effects=read_path:one.txt"));
+    }
+
+    #[test]
+    fn controller_tool_transcript_is_not_compacted_into_false_partial_coverage() {
+        let messages = vec![
+            ChatMessage::text("system", "SYSTEM"),
+            ChatMessage::text("user", "TASK"),
+            ChatMessage::assistant_with_tool_calls(
+                "",
+                vec![AgentToolCall {
+                    id: Some("controller-read".to_string()),
+                    tool: "read_file".to_string(),
+                    arguments: json!({"path":"small.txt"}),
+                }],
+            ),
+            ChatMessage::tool_result_with_metadata(
+                "read_file".to_string(),
+                Some("controller-read".to_string()),
+                "x".repeat(1_600),
+                PromptToolResultMetadata {
+                    arguments_sha256: normalized_arguments_sha256(&json!({"path":"small.txt"})),
+                    success: true,
+                    raw_bytes: 1_600,
+                    raw_lines: 1,
+                    workspace_fingerprint: Some("a".repeat(64)),
+                    evidence_effects: "read_before_write".to_string(),
+                    actual_origin: Some("controller".to_string()),
+                    prompt_representation: Some("disclosed_tool_transcript".to_string()),
+                    observation_coverage: Some("full".to_string()),
+                    observation_action_id: Some("controller-read".to_string()),
+                    ..PromptToolResultMetadata::default()
+                },
+            ),
+        ];
+        let prepared = prepare_prompt(&messages, 560, 100, 0, measured).unwrap();
+        assert_eq!(prepared.compacted_messages, 0);
+        assert_eq!(prepared.messages.len(), messages.len());
+        assert_eq!(prepared.messages[3].content, messages[3].content);
+        assert_eq!(
+            prepared.messages[3]
+                .prompt_tool_result
+                .as_ref()
+                .unwrap()
+                .actual_origin
+                .as_deref(),
+            Some("controller")
+        );
     }
 
     #[test]

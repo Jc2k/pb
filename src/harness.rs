@@ -121,6 +121,15 @@ struct WorkflowConfigMetadata {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct HarnessRunAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    observation_rendering: Option<crate::workflow::ObservationRendering>,
+    controller_delete_elision_enabled: bool,
+    controller_observations: usize,
+    controller_observation_prompt_bytes: usize,
+    #[serde(default)]
+    controller_observation_coverage: BTreeMap<String, usize>,
+    controller_mutations: usize,
+    controller_closures: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     goal_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     goal_stage: Option<crate::goal::GoalStage>,
@@ -316,6 +325,32 @@ impl EventSink for HarnessEventSink {
         match &event {
             AgentEvent::Started { branch, .. } => {
                 state.summary.branch = branch.clone();
+            }
+            AgentEvent::HarnessExperimentConfigured {
+                observation_rendering,
+                controller_delete_elision,
+                ..
+            } => {
+                state.audit.observation_rendering = Some(*observation_rendering);
+                state.audit.controller_delete_elision_enabled = *controller_delete_elision;
+            }
+            AgentEvent::ControllerObservation { receipt, .. } => {
+                state.audit.controller_observations += 1;
+                state.audit.controller_observation_prompt_bytes = state
+                    .audit
+                    .controller_observation_prompt_bytes
+                    .saturating_add(receipt.prompt_bytes);
+                *state
+                    .audit
+                    .controller_observation_coverage
+                    .entry(receipt.coverage.as_str().to_string())
+                    .or_default() += 1;
+            }
+            AgentEvent::ControllerMutation { .. } => {
+                state.audit.controller_mutations += 1;
+            }
+            AgentEvent::ControllerClosure { .. } => {
+                state.audit.controller_closures += 1;
             }
             AgentEvent::Error {
                 message, summary, ..
@@ -696,6 +731,14 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     println!("pb harness: run_events={}", layout.run_events.display());
     println!("pb harness: run_journal={}", layout.run_journal.display());
     println!("pb harness: resumed={}", layout.resumed);
+    println!(
+        "pb harness: observation_rendering={}",
+        args.observation_rendering.as_str()
+    );
+    println!(
+        "pb harness: controller_delete_elision={}",
+        args.controller_delete_elision
+    );
 
     let user_config = UserConfig::load()?;
     let model_dir = args
@@ -761,6 +804,8 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
                 .map(|tool| (*tool).to_string())
                 .collect(),
         ),
+        observation_rendering: args.observation_rendering,
+        controller_delete_elision: args.controller_delete_elision,
         accept_existing_workspace_changes: layout.resumed,
         ctx_size: args
             .ctx_size
@@ -804,11 +849,16 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         workspace_config_metadata.as_ref(),
         &workflow_config_metadata,
     )?;
-    let sink = HarnessEventSink::new(
+    let mut sink = HarnessEventSink::new(
         &layout.events,
         &layout.run_events,
         &layout.workflow_checkpoint,
     )?;
+    sink.emit(AgentEvent::HarnessExperimentConfigured {
+        observation_rendering: args.observation_rendering,
+        controller_delete_elision: args.controller_delete_elision,
+        timestamp_ms: Some(now_millis()),
+    });
     if let Some(goal) = goal_context.as_ref() {
         sink.configure_goal_context(goal)?;
     }
@@ -1659,6 +1709,21 @@ fn write_journal(
         audit.goal_amendment_requests,
         audit.goal_budget_requests,
     ));
+    journal.push_str("\n## Controller action-elision audit\n\n");
+    journal.push_str(&format!(
+        "- Observation rendering: `{}`\n- Controller deletion enabled: `{}`\n- Observations / prompt bytes: `{}` / `{}`\n- Observation coverage: `{}`\n- Controller mutations / closures: `{}` / `{}`\n",
+        audit
+            .observation_rendering
+            .map(crate::workflow::ObservationRendering::as_str)
+            .unwrap_or("none"),
+        audit.controller_delete_elision_enabled,
+        audit.controller_observations,
+        audit.controller_observation_prompt_bytes,
+        serde_json::to_string(&audit.controller_observation_coverage)
+            .context("failed to serialize controller observation coverage audit")?,
+        audit.controller_mutations,
+        audit.controller_closures,
+    ));
     journal.push_str("\n## Workflow audit\n\n");
     journal.push_str(&format!(
         "- Strict workflow enabled/satisfied: `{}` / `{}`\n- Workflow ID: `{}`\n- Outcome: `{}`\n- Stage sequence: `{}`\n- Plan / plan review / code review SHA-256: `{}` / `{}` / `{}`\n- Plan / repair cycles: `{}` / `{}`\n- Model invocations / generated tokens / advisory calls: `{}` / `{}` / `{}`\n- Stage steps: `{}`\n- Rejected workflow actions: `{}`\n- Evidence invalidations: `{}`\n- Checkpoint SHA-256: `{}`\n- Ready evidence SHA-256: `{}`\n- Repository remote: `{}`\n",
@@ -2340,6 +2405,42 @@ mod tests {
             &layout.workflow_checkpoint,
         )
         .unwrap();
+        sink.emit(AgentEvent::HarnessExperimentConfigured {
+            observation_rendering: crate::workflow::ObservationRendering::ControllerBlock,
+            controller_delete_elision: false,
+            timestamp_ms: None,
+        });
+        sink.emit(AgentEvent::ControllerObservation {
+            receipt: crate::workflow::ControllerObservationReceipt {
+                version: crate::workflow::CONTROLLER_OBSERVATION_SCHEMA_VERSION,
+                action_id: "controller-observation-audit".to_string(),
+                actual_origin: crate::workflow::ControllerObservationOrigin::Controller,
+                prompt_representation: crate::workflow::ObservationRendering::ControllerBlock,
+                stage: crate::workflow::WorkflowStage::CodeReview,
+                work_unit_id: None,
+                operation: crate::workflow::ControllerObservationOperation::InspectChange,
+                path: "average.mjs".to_string(),
+                workspace_fingerprint: "a".repeat(64),
+                path_fingerprint: "b".repeat(64),
+                content_sha256: "c".repeat(64),
+                coverage: crate::workflow::ObservationCoverage::Full,
+                observed_bytes: 40,
+                prompt_bytes: 64,
+                included_ranges: vec![crate::workflow::ObservationRange {
+                    start_byte: 0,
+                    end_byte: 40,
+                    sha256: "d".repeat(64),
+                }],
+                included_in_prompt: true,
+                authority_effects: vec![
+                    crate::workflow::ControllerObservationAuthority::PromptContext,
+                    crate::workflow::ControllerObservationAuthority::ReviewCoverage,
+                ],
+                fallback_reason: None,
+            },
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
         for stage in [
             crate::workflow::WorkflowStage::Planning,
             crate::workflow::WorkflowStage::PlanReview,
@@ -2416,6 +2517,12 @@ mod tests {
         assert_eq!(audit.workflow_stage_steps, run.counters.stage_steps);
         assert_eq!(audit.rejected_workflow_actions, 1);
         assert_eq!(audit.evidence_invalidations, 1);
+        assert_eq!(
+            audit.observation_rendering,
+            Some(crate::workflow::ObservationRendering::ControllerBlock)
+        );
+        assert_eq!(audit.controller_observations, 1);
+        assert_eq!(audit.controller_observation_prompt_bytes, 64);
 
         let result = Ok(AgentRunResult {
             branch: "main".to_string(),
@@ -2473,6 +2580,11 @@ mod tests {
         );
         assert!(journal.contains("Rejected workflow actions: `1`"));
         assert!(journal.contains("Evidence invalidations: `1`"));
+        assert!(journal.contains("## Controller action-elision audit"));
+        assert!(journal.contains("Observation rendering: `controller_block`"));
+        assert!(journal.contains("Observations / prompt bytes: `1` / `64`"));
+        assert!(journal.contains("Observation coverage: `{"));
+        assert!(journal.contains("Controller mutations / closures: `0` / `0`"));
         assert!(journal.contains("builtin:strict-default"));
         assert!(journal.contains(&metadata.policy_sha256));
     }

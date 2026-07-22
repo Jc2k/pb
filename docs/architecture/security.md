@@ -71,6 +71,13 @@ before execution and roll back earlier members after an execution failure. Diagn
 cannot mint selected-check evidence and are rejected if they alter repository or Git control state.
 Optional contract `work_unit_guidance` is size-bounded advisory prompt text for an exact allowed
 path; it grants no capability, scope, evidence, progress, or stage transition.
+Hidden controller action-elision experiments preserve the same boundary. Prompt-local synthetic
+tool calls never become durable model actions. Full controller reads may grant read-before-write
+only for the exact current fingerprint; diagnostic excerpts grant only range-confined edits; review
+observations grant inspection coverage but no verdict authority. Experimental automatic deletion
+requires an additional harness flag and rejects directories, dirty or untracked content, adopted
+work, stale fingerprints, and ambiguous targets; eligible tracked deletions remain recoverable from
+Git.
 
 Configured tasks run in an isolated snapshot. pb rejects Git-control changes, undeclared paths,
 unsafe symlinks, and boundedness violations before staging every output. Promotion is transactional:

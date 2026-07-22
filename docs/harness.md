@@ -38,6 +38,39 @@ contains no authority. It exposes only `goal_status`, `goal_pause`, `goal_reques
 of the journal. They cannot apply an amendment, increase a budget, resume, cancel, accept, publish,
 or rewrite a Goal. Without `--goal-context`, those active-Goal tools remain hidden.
 
+### Controller action-elision experiments
+
+The hidden harness can compare native model reads with three controller-owned prompt
+representations while keeping actual execution provenance explicit:
+
+```bash
+pb harness agent --observation-rendering native "..."
+pb harness agent --observation-rendering controller-block "..."
+pb harness agent --observation-rendering disclosed-tool-transcript "..."
+pb harness agent --observation-rendering compatibility-tool-transcript "..."
+```
+
+This enum is in-memory harness input only; it is not accepted from stored requests or the daemon,
+desktop, or web API. Controller observations emit typed durable events and stage evidence with
+their actual origin, prompt representation, exact coverage, fingerprints, byte counts, and
+authority effects. Transcript-shaped arms create only prompt-local call IDs and never model
+`tool_call`/`tool_result` events.
+
+Admission uses the active model's prompt renderer and tokenizer. A candidate observation must stay
+unchanged through compaction and keep the complete prompt at or below 55% of usable capacity. Full
+small-file observations may seed read-before-write evidence; failed-diagnostic ranges authorize
+only edits wholly inside the included byte windows. Fresh review inspection is all-or-none and
+never supplies assessments or a verdict. A successful final mutation can carry optional
+model-authored completion fields, while a controller no-change close is limited to structurally
+empty, mutation-forbidden work.
+
+Automatic deletion requires the additional hidden `--controller-delete-elision` flag and a unique
+accepted delete of a tracked, clean, unchanged file or symlink. It never applies to directories,
+dirty, untracked, adopted, or ambiguous content. Harness summaries separately report rendering,
+controller observation count and prompt bytes, coverage, controller closures, and controller
+mutations. The design, edge-case policy, and promotion gates are recorded in
+[Controller-owned deterministic action elision](controller-action-elision-plan.md).
+
 ### Acceptance contracts
 
 An optional trusted JSON contract makes completion externally verifiable:

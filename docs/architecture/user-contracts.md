@@ -137,6 +137,12 @@ identity: tracked-deletion sentinels are excluded, so a reviewed deletion keeps 
 through the managed commit while any actual worktree-byte change invalidates the receipt.
 
 File-read evidence binds the bytes actually returned, not merely a path observed at some point.
+Hidden harness action-elision experiments may create the same evidence from a controller-executed
+complete read, but its typed receipt records controller origin, prompt representation, coverage,
+and current fingerprints. Partial ranges never claim complete observation or grant whole-file
+replacement. Transcript-shaped prompt rendering does not turn a controller observation into a
+model action, and no controller observation can supply an approval, check result, review judgment,
+or semantic completion claim.
 In strict delivery and acceptance contracts, named check evidence comes only from `run_check(id)`;
 a similar `run_command` or `run_task` result is diagnostic evidence, not an acceptance receipt. A
 restored legacy/direct request may still route an exact configured guard command through the check

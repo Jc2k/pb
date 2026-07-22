@@ -1,5 +1,15 @@
 export type AgentEvent =
   | {
+    type: "harness_experiment_configured";
+    observation_rendering:
+      | "native"
+      | "controller_block"
+      | "disclosed_tool_transcript"
+      | "compatibility_tool_transcript";
+    controller_delete_elision: boolean;
+    timestamp_ms?: number;
+  }
+  | {
     type: "conversation_turn_started";
     turn_id: string;
     intent: TurnIntent;
@@ -205,6 +215,65 @@ export type AgentEvent =
     tool: string;
     arguments: unknown;
     nesting_depth?: number;
+    timestamp_ms?: number;
+  }
+  | {
+    type: "controller_observation";
+    receipt: {
+      version: number;
+      action_id: string;
+      actual_origin: "controller";
+      prompt_representation:
+        | "controller_block"
+        | "disclosed_tool_transcript"
+        | "compatibility_tool_transcript";
+      stage: WorkflowStage;
+      work_unit_id?: string;
+      operation: "read_file" | "inspect_change";
+      path: string;
+      workspace_fingerprint: string;
+      path_fingerprint: string;
+      content_sha256: string;
+      coverage: "full" | "ranges" | "metadata_only" | "none";
+      observed_bytes: number;
+      prompt_bytes: number;
+      included_ranges: Array<{
+        start_byte: number;
+        end_byte: number;
+        sha256: string;
+      }>;
+      included_in_prompt: boolean;
+      authority_effects: Array<"prompt_context" | "read_before_write" | "review_coverage">;
+      fallback_reason?: string;
+    };
+    nesting_depth?: number;
+    timestamp_ms?: number;
+  }
+  | {
+    type: "controller_closure";
+    workflow_id: string;
+    stage: WorkflowStage;
+    reason: string;
+    timestamp_ms?: number;
+  }
+  | {
+    type: "controller_mutation";
+    receipt: {
+      version: number;
+      action_id: string;
+      actual_origin: "controller";
+      stage: WorkflowStage;
+      work_unit_id: string;
+      operation: "delete";
+      path: string;
+      before_workspace_fingerprint: string;
+      before_path_fingerprint: string;
+      before_content_sha256: string;
+      after_workspace_fingerprint: string;
+      tracked: boolean;
+      adopted: boolean;
+      recovery: string;
+    };
     timestamp_ms?: number;
   }
   | {

@@ -318,6 +318,23 @@ pb similarly projects the checked fingerprint while the fresh reviewer owns asse
 and verdict. Existing artifact validators still reject missing steps, paths outside the plan, stale
 state, incomplete work, or unsupported review conclusions.
 
+### Experimental controller action elision
+
+**Configurable on the hidden harness only.** A typed observation-rendering argument can let pb
+execute a uniquely determined local observation before a model turn. Normal daemon, desktop, and
+web workflows continue to expose native model tools. The controller records its actual origin and
+exact full/range coverage even when the experimental prompt representation resembles an assistant
+tool transcript; prompt-only calls are not durable model actions and grant no progress or review
+authority.
+
+An exact active small-file observation may satisfy read-before-write only while its current
+fingerprint and complete prompt bytes remain valid. A failed-diagnostic range permits only an edit
+whose old text lies wholly inside an included byte window. Fresh review inspection is injected only
+when every required changed path fits, and the reviewer still authors assessments, findings, and
+verdict. Optional completion fields on a successful final mutation remain model-authored. The
+additional automatic-delete experiment is separately gated and limited to a unique tracked, clean,
+unchanged plan deletion with Git recovery.
+
 Content fingerprints identify present worktree entries and bytes, independently of Git index
 bookkeeping. In particular, the synthetic tracked-`missing` entry visible before staging a deletion
 is excluded. Staging and committing an already-reviewed deletion therefore preserve the checked

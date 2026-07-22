@@ -20,6 +20,17 @@ pub fn render_event(event: &AgentEvent) {
             }
             print_header("branch", branch);
         }
+        AgentEvent::HarnessExperimentConfigured {
+            observation_rendering,
+            controller_delete_elision,
+            ..
+        } => print_header(
+            "harness experiment",
+            &format!(
+                "observation_rendering={}; controller_delete_elision={controller_delete_elision}",
+                observation_rendering.as_str()
+            ),
+        ),
         AgentEvent::ConversationTurnStarted { intent, task, .. } => {
             print_header("turn", &format!("{intent:?}: {task}"));
         }
@@ -122,6 +133,21 @@ pub fn render_event(event: &AgentEvent) {
             ..
         } => print_header("reasoning", content),
         AgentEvent::ToolCall { tool, .. } => print_header("tool", tool),
+        AgentEvent::ControllerObservation { receipt, .. } => print_header(
+            "controller observation",
+            &format!(
+                "{} {} ({}, {})",
+                receipt.operation.as_str(),
+                receipt.path,
+                receipt.coverage.as_str(),
+                receipt.prompt_representation.as_str()
+            ),
+        ),
+        AgentEvent::ControllerClosure { reason, .. } => print_header("controller closure", reason),
+        AgentEvent::ControllerMutation { receipt, .. } => print_header(
+            "controller mutation",
+            &format!("delete {} ({})", receipt.path, receipt.action_id),
+        ),
         AgentEvent::ToolBatch {
             call_count,
             useful_count,

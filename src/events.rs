@@ -432,6 +432,12 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    HarnessExperimentConfigured {
+        observation_rendering: crate::workflow::ObservationRendering,
+        controller_delete_elision: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     ConversationTurnStarted {
         turn_id: String,
         intent: crate::workflow::TurnIntent,
@@ -646,6 +652,25 @@ pub enum AgentEvent {
         arguments: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    ControllerObservation {
+        receipt: crate::workflow::ControllerObservationReceipt,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    ControllerClosure {
+        workflow_id: String,
+        stage: crate::workflow::WorkflowStage,
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    ControllerMutation {
+        receipt: crate::workflow::ControllerMutationReceipt,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -983,6 +1008,18 @@ impl EventEnvelope {
                     focus_root,
                     branch,
                     attachments,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::HarnessExperimentConfigured {
+                observation_rendering,
+                controller_delete_elision,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::HarnessExperimentConfigured {
+                    observation_rendering,
+                    controller_delete_elision,
                     timestamp_ms: Some(now),
                 },
             },
@@ -1348,6 +1385,39 @@ impl EventEnvelope {
                     tool,
                     arguments,
                     nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::ControllerObservation {
+                receipt,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::ControllerObservation {
+                    receipt,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::ControllerClosure {
+                workflow_id,
+                stage,
+                reason,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::ControllerClosure {
+                    workflow_id,
+                    stage,
+                    reason,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::ControllerMutation { receipt, .. } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::ControllerMutation {
+                    receipt,
                     timestamp_ms: Some(now),
                 },
             },
