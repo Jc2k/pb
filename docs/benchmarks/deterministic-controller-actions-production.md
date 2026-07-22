@@ -18,7 +18,7 @@ freshness, fallback, checks, review, commit, reporting, and UI/terminal event co
 
 | Field | Value |
 | --- | --- |
-| Source base | `3d36d567f8b76118b61449014dce19138c539ff5` plus the pending deterministic-action implementation |
+| Source commit | `d24bde58d9087fe57615a2769367163226960d2d` |
 | Release binary SHA-256 | `b1ea715b5d6fbac26030f27cb74c0cacad650abd89b629095cfae1837e4c48aa` |
 | Model | `hf://mlx-community/Qwen3-Coder-Next-4bit` |
 | Backend | local FlashMoe `flashmoe-v2-mlxq4`, 48 layers, K=10 |
