@@ -38,6 +38,7 @@ impl WorkflowCounters {
         stage: WorkflowStage,
         usage: WorkflowUsage,
         limits: WorkflowLimits,
+        earned_work_unit_progress: usize,
     ) -> Option<WorkflowOutcome> {
         let stage_steps = self.stage_steps.entry(stage).or_default();
         *stage_steps = stage_steps.saturating_add(usage.stage_steps);
@@ -46,7 +47,17 @@ impl WorkflowCounters {
             .saturating_add(usage.model_invocations);
         self.generated_tokens = self.generated_tokens.saturating_add(usage.generated_tokens);
         self.advisory_calls = self.advisory_calls.saturating_add(usage.advisory_calls);
-        if *stage_steps > limits.stage_steps {
+        let stage_step_limit = limits.stage_steps.saturating_add(
+            if matches!(
+                stage,
+                WorkflowStage::Implementing | WorkflowStage::Repairing
+            ) {
+                earned_work_unit_progress.min(super::MAX_WORK_UNIT_PROGRESS_CREDITS)
+            } else {
+                0
+            },
+        );
+        if *stage_steps > stage_step_limit {
             Some(WorkflowOutcome::StepLimit)
         } else if self.model_invocations > limits.total_model_invocations {
             Some(WorkflowOutcome::InvocationLimit)
@@ -92,6 +103,8 @@ pub struct WorkflowRun {
     pub checks: CheckEvidenceLedger,
     #[serde(default)]
     pub stage_evidence: super::StageEvidenceBundle,
+    #[serde(default)]
+    pub work_units: super::WorkUnitLedger,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,6 +153,7 @@ impl WorkflowRun {
             selected_checks: Vec::new(),
             checks: CheckEvidenceLedger::default(),
             stage_evidence: super::StageEvidenceBundle::default(),
+            work_units: super::WorkUnitLedger::default(),
             content_fingerprint: None,
             code_review: None,
             counters: WorkflowCounters::default(),
@@ -234,7 +248,13 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
     }
     match event {
         WorkflowEvent::UsageRecorded { usage } => {
-            if let Some(outcome) = run.counters.record(run.stage, usage, run.policy.limits) {
+            let earned_work_unit_progress = run.work_units.progress_credited_units.len();
+            if let Some(outcome) = run.counters.record(
+                run.stage,
+                usage,
+                run.policy.limits,
+                earned_work_unit_progress,
+            ) {
                 run.stage = WorkflowStage::Failed;
                 run.outcome = Some(outcome);
                 run.blocked_reason = Some("workflow-wide budget exhausted".to_string());
@@ -276,6 +296,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             }
             run.plan = Some(plan);
             run.plan_review = None;
+            run.work_units = super::WorkUnitLedger::default();
             run.implementation = None;
             run.selected_checks.clear();
             run.checks = CheckEvidenceLedger::default();
@@ -324,6 +345,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             }
             run.plan = None;
             run.plan_review = None;
+            run.work_units = super::WorkUnitLedger::default();
             run.implementation = None;
             run.selected_checks.clear();
             run.checks = CheckEvidenceLedger::default();

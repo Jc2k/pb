@@ -472,6 +472,8 @@ fn validate_supported_schema(schema: &Value, location: &str) -> Result<()> {
                 | "enum"
                 | "maxLength"
                 | "minLength"
+                | "maxItems"
+                | "minItems"
                 | "minimum"
                 | "maximum"
         ) {
@@ -489,7 +491,7 @@ fn validate_supported_schema(schema: &Value, location: &str) -> Result<()> {
                 key.as_str(),
                 "properties" | "required" | "additionalProperties"
             ),
-            "array" => key == "items",
+            "array" => matches!(key.as_str(), "items" | "maxItems" | "minItems"),
             "string" => matches!(key.as_str(), "maxLength" | "minLength"),
             "integer" | "number" => matches!(key.as_str(), "minimum" | "maximum"),
             "boolean" => false,
@@ -566,6 +568,25 @@ fn validate_supported_schema(schema: &Value, location: &str) -> Result<()> {
             .is_some_and(|(minimum, maximum)| minimum > maximum)
         {
             bail!("{location} has minLength greater than maxLength");
+        }
+    }
+    if kind == "array" {
+        let minimum = object.get("minItems").map(|value| {
+            value
+                .as_u64()
+                .with_context(|| format!("{location}.minItems must be a non-negative integer"))
+        });
+        let maximum = object.get("maxItems").map(|value| {
+            value
+                .as_u64()
+                .with_context(|| format!("{location}.maxItems must be a non-negative integer"))
+        });
+        if minimum
+            .transpose()?
+            .zip(maximum.transpose()?)
+            .is_some_and(|(minimum, maximum)| minimum > maximum)
+        {
+            bail!("{location} has minItems greater than maxItems");
         }
     }
     if matches!(kind, "integer" | "number") {
@@ -792,12 +813,17 @@ impl<'a> JsonPrefixParser<'a> {
         let Some(items) = schema.get("items") else {
             return PrefixStatus::Invalid;
         };
+        let minimum = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0);
+        let maximum = schema.get("maxItems").and_then(Value::as_u64);
+        let mut item_count = 0u64;
         let mut can_close = true;
         loop {
             position = skip_ws(self.input, position);
             match self.input.as_bytes().get(position) {
                 None => return PrefixStatus::Incomplete,
-                Some(b']') if can_close => return PrefixStatus::Complete(position + 1),
+                Some(b']') if can_close && item_count >= minimum => {
+                    return PrefixStatus::Complete(position + 1);
+                }
                 Some(b']') => return PrefixStatus::Invalid,
                 _ => {}
             }
@@ -805,13 +831,23 @@ impl<'a> JsonPrefixParser<'a> {
                 PrefixStatus::Complete(position) => position,
                 status => return status,
             };
+            item_count = item_count.saturating_add(1);
+            if maximum.is_some_and(|maximum| item_count > maximum) {
+                return PrefixStatus::Invalid;
+            }
             position = skip_ws(self.input, position);
             match self.input.as_bytes().get(position) {
                 Some(b',') => {
+                    if maximum.is_some_and(|maximum| item_count >= maximum) {
+                        return PrefixStatus::Invalid;
+                    }
                     position += 1;
                     can_close = false;
                 }
-                Some(b']') => return PrefixStatus::Complete(position + 1),
+                Some(b']') if item_count >= minimum => {
+                    return PrefixStatus::Complete(position + 1);
+                }
+                Some(b']') => return PrefixStatus::Invalid,
                 None => return PrefixStatus::Incomplete,
                 _ => return PrefixStatus::Invalid,
             }
@@ -1077,6 +1113,31 @@ mod tests {
         let forbidden = repeated_ngram_forbidden_tokens(&tokens, 32);
         assert_eq!(forbidden, BTreeSet::from([39]));
         assert!(repeated_ngram_forbidden_tokens(&tokens, 1).is_empty());
+    }
+
+    #[test]
+    fn bounded_array_constraints_compile_and_enforce_item_counts() {
+        let schema = json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {"type": "string"}
+        });
+        validate_supported_schema(&schema, "files").unwrap();
+        let parser = |input| JsonPrefixParser::new(input).parse_array(0, &schema);
+        assert_eq!(parser("[]"), PrefixStatus::Invalid);
+        assert_eq!(parser("[\"one\"]"), PrefixStatus::Complete(7));
+        assert_eq!(parser("[\"one\",\"two\"]"), PrefixStatus::Complete(13));
+        assert_eq!(parser("[\"one\",\"two\","), PrefixStatus::Invalid);
+        assert_eq!(parser("[\"one\",\"two\",\"three\"]"), PrefixStatus::Invalid);
+
+        let invalid = json!({
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 2,
+            "items": {"type": "string"}
+        });
+        assert!(validate_supported_schema(&invalid, "files").is_err());
     }
 
     #[test]

@@ -64,6 +64,12 @@ Existing files can be changed only after a read of the exact current bytes, reco
 fingerprint. Writes use synced temporary files and atomic no-clobber or replace operations, with a
 final stale-content check immediately before replacement. Recursive deletion is not exposed.
 
+Strict implementation and repair additionally bind mutation to the active checkpointed work unit.
+The model does not need to supply its target path; pb resolves it from the accepted-plan ledger and
+records the resolved path in the tool event. Bounded multi-create batches validate every member
+before execution and roll back earlier members after an execution failure. Diagnostic previews
+cannot mint selected-check evidence and are rejected if they alter repository or Git control state.
+
 Configured tasks run in an isolated snapshot. pb rejects Git-control changes, undeclared paths,
 unsafe symlinks, and boundedness violations before staging every output. Promotion is transactional:
 if one destination fails, previously promoted paths are restored. Unexpected changes do not gain

@@ -66,6 +66,12 @@ surface; plans, checkpoints, and managed commit stages own those concerns. Dynam
 also fail-closed: only operator-declared read-only raw tool names are exposed, and server-provided
 effect annotations cannot authorize a call. External MCP mutation has no current workflow surface.
 
+Implementation mutation authority is narrower than the stage capability: a checkpointed work-unit
+ledger selects one operation and path at a time. pb inserts that path into a target-bound call, so a
+model-supplied alternate path cannot widen scope. Existing-path operations still require an exact,
+current complete-file read; adopted task-owned bytes retain separate provenance. A failed exact-path
+diagnostic invalidates older reads and grants repair authority only for that current path.
+
 ## Acceptance contract
 
 There are three distinct claims:
@@ -102,6 +108,11 @@ its submission: pb projects any missing IDs into the accepted plan, recomputes i
 that exact artifact to fresh plan review. Additional checks remain model-selected, while paths and
 implementation scope remain model-proposed and contract-validated; projection cannot turn an
 allowed path into a required mutation or add user intent.
+
+Checks may opt into `diagnostic_eligible`. Such a check can run early only after structural work-unit
+completion. Its result is repair feedback, not acceptance evidence: required checks rerun after the
+typed implementation artifact, and only that authoritative run can satisfy checking, review,
+commit, or verified completion.
 
 ## Evidence contract
 
@@ -158,7 +169,8 @@ completion.
 
 ## Persistence contract
 
-Workflow checkpoints preserve structured artifacts, counters, fingerprints, and terminal state.
+Workflow checkpoints preserve structured artifacts, counters, fingerprints, the typed work-unit
+ledger, adopted-work provenance, unique progress credits, diagnostic repair focus, and terminal state.
 After a service restart, unfinished daemon sessions restore as paused. The user chooses whether to
 resume them; pb does not continue mutation merely because a process came back.
 

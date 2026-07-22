@@ -736,6 +736,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         workflow_expected_content_fingerprint: None,
         workflow_action_first_turn: false,
         workflow_creation_path_order: Vec::new(),
+        workflow_work_units: None,
         workflow_stage_evidence: None,
         workflow_checkpoint: resumed_workflow,
         conversation_handoff: None,

@@ -43,6 +43,7 @@
 - [Verified task-completion reliability](task-completion-reliability-plan.md)
   - [TC1 · Verified completion](benchmarks/task-completion-tc1.md)
   - [TC2 · Useful coding](benchmarks/task-completion-tc2.md)
+  - [TC3 · Controller baseline](benchmarks/task-completion-tc3-baseline.md)
 - [Qwen3-Coder-Next native agent](qwen3-coder-next-agent-plan.md)
   - [Native agent evaluation](benchmarks/qwen3-coder-next-agent.md)
   - [Agent performance follow-on](qwen3-coder-next-agent-follow-on.md)

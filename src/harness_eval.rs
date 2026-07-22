@@ -462,6 +462,7 @@ pub fn run_control_fixture(fixture: &ControlFixture) -> Result<ControlFixtureRes
         workflow_expected_content_fingerprint: None,
         workflow_action_first_turn: false,
         workflow_creation_path_order: Vec::new(),
+        workflow_work_units: None,
         workflow_stage_evidence: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
@@ -530,6 +531,7 @@ fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
         workflow_expected_content_fingerprint: None,
         workflow_action_first_turn: false,
         workflow_creation_path_order: Vec::new(),
+        workflow_work_units: None,
         workflow_stage_evidence: None,
         workflow_checkpoint: None,
         conversation_handoff: None,
@@ -930,6 +932,7 @@ fn execute_workflow_assertion(
                     expected_content_fingerprint: None,
                     action_first_turn: false,
                     creation_path_order: Vec::new(),
+                    work_units: None,
                 },
                 vec![
                     ScriptedCompletion {
@@ -990,6 +993,7 @@ fn execute_workflow_assertion(
                     expected_content_fingerprint: None,
                     action_first_turn: false,
                     creation_path_order: Vec::new(),
+                    work_units: None,
                 },
                 vec![
                     ScriptedCompletion {
@@ -1144,6 +1148,7 @@ fn execute_workflow_assertion(
                     expected_content_fingerprint: None,
                     action_first_turn: false,
                     creation_path_order: Vec::new(),
+                    work_units: None,
                 },
                 vec![
                     ScriptedCompletion {
@@ -2394,6 +2399,7 @@ fn run_real_model_fixture(
         workflow_expected_content_fingerprint: None,
         workflow_action_first_turn: false,
         workflow_creation_path_order: Vec::new(),
+        workflow_work_units: None,
         workflow_stage_evidence: None,
         workflow_checkpoint: None,
         conversation_handoff: None,

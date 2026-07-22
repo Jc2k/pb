@@ -51,6 +51,15 @@ Version 1 can require a final mutation, restrict changed paths, define named che
 semantic commits, require a clean worktree, and state the exact paths/checks a review must inspect.
 See `docs/harness-contract-v1.example.json` for the complete shape.
 
+An individual check may set `"diagnostic_eligible": true`. After all typed work units are
+structurally complete, pb may run that check once as fingerprint-bound repair feedback. The preview
+cannot satisfy any required-check or review gate; authoritative checking reruns it after the model's
+typed implementation submission. A failing preview focuses repair only when its bounded output
+names an exact current task path. Previous reads of that path are invalidated before a bounded
+replace/edit repair, and the preview must not change repository or Git control state.
+Diagnostic-eligible checks have a 60-second timeout ceiling even though authoritative checks may use
+the general one-hour contract maximum.
+
 The agent receives `run_check(id)` only when the contract defines checks. The check command is
 trusted caller input; the model supplies only its ID. Each run records its exit status, bounded
 stdout/stderr, duration, timeout state, executor, command/input/output fingerprints, and evidence
@@ -121,6 +130,11 @@ independently reproduced check, the recorded commit at `HEAD`, and a clean workt
 containment, task completion, artifact quality, wall time, and energy are reported separately. The
 [reliability plan](task-completion-reliability-plan.md) defines the locked repeatability and corpus
 promotion gates.
+
+`scripts/summarize-harness-completion.ts` reports rendered prompt tokens, reused cached-prefix
+tokens, actual fresh-prefill tokens, cache-hit invocation count, and observed native tool-schema
+digests separately. These fields measure prefix reuse without treating cached tokens as work avoided
+by a weaker contract.
 
 The same directory contains a schema-validated 11-case TC3 candidate corpus spanning ordered
 creation, repair after a failed check, a one-file fix, regression tests, related multi-file work,
@@ -256,13 +270,22 @@ turn on a native edit action. Later implementation turns, every repair turn, pla
 fresh review stages retain normal reasoning. The decision is derived once from the validated plan
 and current workspace; it is not a model option or environment toggle.
 
-For an accepted plan containing only `create` paths, implementation and repair also select the
-first still-missing path in plan order as the current work unit. Until that file exists, the native
-schema binds `write_file.path` to the exact target, hides the other built-in mutation tools, and
-hides `submit_implementation`. The next turn advances only after an atomic complete write, so a
-small loadable scaffold can preserve progress without drifting to another planned file. Existing
-files are skipped after resume. Plans that mix create, modify, or delete operations retain the
-normal edit surface because their dependencies cannot be represented by a single creation order.
+After fresh plan review, implementation and repair persist a typed ledger for every planned create,
+modify, and delete. The ledger records plan step, operation, target, task/invocation/current
+fingerprints, adopted provenance, progress credit, diagnostic focus, and structural state. Only the
+active unit's read or mutation tool is exposed. Target-bound tools do not require the model to copy
+the path: pb inserts the ledger path into the durable call before validation and execution. Existing
+modify/delete targets require a current complete read; adopted task-owned deltas can already be
+structurally complete without false model authorship. Exact-path diagnostic failures invalidate
+older reads and reopen only that path as a repair; they do not repeat the original create operation.
+
+Consecutive independent creates may be sent through `write_files` as one ordered batch of at most
+four complete payloads. All payloads and destinations validate before execution; an execution
+failure removes members already created by that batch. One real content/evidence transition can
+earn one extra turn per unit, at most four per stage. No failed, rejected, cached, repeated, no-op,
+or bookkeeping action earns budget. When the ledger is complete, pb projects plan identity,
+fingerprint, touched paths, and no-change into implementation accounting; the model still supplies
+step status, summaries, and commit subject.
 
 Each run creates a persistent scratch root under the system temporary directory unless
 `--scratch-dir` selects a new path. The layout is:

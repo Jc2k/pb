@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 const HARNESS_CONTRACT_VERSION: u32 = 1;
 const DEFAULT_CHECK_TIMEOUT_SECONDS: u64 = 60;
 const MAX_CHECK_TIMEOUT_SECONDS: u64 = 3600;
+const MAX_DIAGNOSTIC_TIMEOUT_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +47,8 @@ pub struct HarnessCheckDocument {
     pub cwd: String,
     #[serde(default = "default_true")]
     pub required: bool,
+    #[serde(default)]
+    pub diagnostic_eligible: bool,
     #[serde(default = "default_check_timeout_seconds")]
     pub timeout_seconds: u64,
 }
@@ -74,6 +77,7 @@ pub struct AgentCheckContract {
     pub command: String,
     pub cwd: String,
     pub required: bool,
+    pub diagnostic_eligible: bool,
     pub timeout_seconds: u64,
 }
 
@@ -133,11 +137,17 @@ impl HarnessContractDocument {
                     "checks[{index}].timeout_seconds must be between 1 and {MAX_CHECK_TIMEOUT_SECONDS}"
                 );
             }
+            if check.diagnostic_eligible && check.timeout_seconds > MAX_DIAGNOSTIC_TIMEOUT_SECONDS {
+                bail!(
+                    "checks[{index}] diagnostic_eligible timeout must not exceed {MAX_DIAGNOSTIC_TIMEOUT_SECONDS} seconds"
+                );
+            }
             checks.push(AgentCheckContract {
                 id,
                 command,
                 cwd,
                 required: check.required,
+                diagnostic_eligible: check.diagnostic_eligible,
                 timeout_seconds: check.timeout_seconds,
             });
         }
@@ -389,6 +399,22 @@ mod tests {
         assert_eq!(contract.checks[0].cwd, ".");
         assert_eq!(contract.checks[0].timeout_seconds, 60);
         assert!(contract.checks[0].required);
+        assert!(!contract.checks[0].diagnostic_eligible);
+    }
+
+    #[test]
+    fn diagnostic_preview_requires_an_explicit_bounded_check() {
+        let document: HarnessContractDocument = serde_json::from_str(
+            r#"{"version":1,"checks":[{"id":"slow","command":"slow test","diagnostic_eligible":true,"timeout_seconds":61}]}"#,
+        )
+        .unwrap();
+        assert!(
+            document
+                .normalize()
+                .unwrap_err()
+                .to_string()
+                .contains("diagnostic_eligible timeout")
+        );
     }
 
     #[test]

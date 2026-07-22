@@ -39,9 +39,10 @@
         "checks": [
           {
             "id": "behavior",
-            "command": "deno eval 'import { slugify } from \"./slugify.mjs\"; if (slugify(\"Hello, World!\") !== \"hello-world\" || slugify(\"!!!\") !== \"\") throw new Error(\"bad slug\")'",
+            "command": "deno eval 'import { slugify } from \"./slugify.mjs\"; const cases = [[\"Hello, World!\", \"hello-world\"], [\"!!!\", \"\"], [\"hello_world\", \"hello-world\"], [\"naïve\", \"na-ve\"]]; for (const [input, expected] of cases) if (slugify(input) !== expected) throw new Error(`bad slug: ${input}`)'",
             "cwd": ".",
             "required": true,
+            "diagnostic_eligible": true,
             "timeout_seconds": 30
           },
           {
@@ -49,13 +50,15 @@
             "command": "! rg -n 'https?://|jsr:|npm:' slugify.mjs slugify.test.mjs README.md",
             "cwd": ".",
             "required": true,
+            "diagnostic_eligible": true,
             "timeout_seconds": 30
           },
           {
             "id": "model_tests",
-            "command": "deno test slugify.test.mjs",
+            "command": "rg -q 'Deno\\.test' slugify.test.mjs && deno test slugify.test.mjs",
             "cwd": ".",
             "required": true,
+            "diagnostic_eligible": true,
             "timeout_seconds": 30
           }
         ],

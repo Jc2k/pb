@@ -8,6 +8,7 @@
       "command": "deno eval 'import { slugify } from \"./slugify.mjs\"; const cases = [[\"Hello, World!\",\"hello-world\"],[\"  many   spaces  \",\"many-spaces\"],[\"a___b---c\",\"a-b-c\"],[\"Version 2.0\",\"version-2-0\"],[\"---Already-Slugged---\",\"already-slugged\"],[\"\",\"\"],[\"!!!\",\"\"]]; for (const [input, expected] of cases) { const actual = slugify(input); if (actual !== expected) throw new Error(`${input}: ${actual} !== ${expected}`); }'",
       "cwd": ".",
       "required": true,
+      "diagnostic_eligible": true,
       "timeout_seconds": 30
     },
     {
@@ -15,6 +16,7 @@
       "command": "! rg -n 'https?://|jsr:|npm:' slugify.mjs slugify.test.mjs README.md",
       "cwd": ".",
       "required": true,
+      "diagnostic_eligible": true,
       "timeout_seconds": 30
     },
     {
@@ -22,6 +24,7 @@
       "command": "deno test slugify.test.mjs",
       "cwd": ".",
       "required": true,
+      "diagnostic_eligible": true,
       "timeout_seconds": 30
     }
   ],

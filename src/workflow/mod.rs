@@ -5,6 +5,7 @@ mod engine;
 mod evidence;
 mod persistence;
 mod publication;
+mod work_units;
 
 pub use artifacts::*;
 pub use capabilities::*;
@@ -13,6 +14,7 @@ pub use engine::*;
 pub use evidence::*;
 pub use persistence::*;
 pub use publication::*;
+pub use work_units::*;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};

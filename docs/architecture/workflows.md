@@ -269,22 +269,47 @@ turn's generated-token cap after reserving native-envelope and closing overhead.
 enforced again by recursive executor-side schema validation and appears in the stage anchor and
 invocation telemetry. Larger files are built from complete, loadable, atomic work units rather than
 partial JSON or partial filesystem writes.
-When every accepted plan path is a `create`, implementation and repair advance through those paths
-in plan order. While a path is missing, `write_file` is the only exposed built-in mutation tool and
-its path schema is bound to that exact next target; the typed implementation terminal remains
-hidden. A successful complete write advances the next turn to the next missing path, including
-after checkpoint resume. Mixed create/modify/delete plans retain the ordinary mutation surface
-because a single create ordering would not represent their dependencies. The executor still
-validates every call and final delta, so this narrowing does not grant authority or weaken the
-accepted plan.
+After plan review, pb persists an ordered, typed work-unit ledger in the workflow checkpoint. Every
+planned create, modify, or delete records its plan step, operation, path, task/invocation/current
+fingerprints, adopted-work provenance, and structural state. Modify and delete units require a
+complete fingerprint-current read before mutation. A task-owned delta present at invocation can
+satisfy structural progress as adopted work without requiring the current model to claim that it
+authored those bytes. A forbidden-mutation contract has an initialized empty ledger.
+
+Implementation and repair expose only the active unit's operation. The target path is omitted from
+the model-required arguments and inserted by pb into the durable call immediately before schema,
+policy, scope, fingerprint, and executor validation. Tool schemas are therefore byte-stable across
+target paths. Consecutive independent create units may use `write_files`, a bounded one-to-four-file
+batch whose ordered paths come from the ledger. Every payload and destination validates before the
+first create; an execution failure rolls back already-created members. A complete transition
+advances the ledger after a normal turn or checkpoint resume, while an incomplete, stale, or
+out-of-order transition keeps the typed implementation terminal hidden.
 On the final ordinary implementation or repair turn, pb exposes only the typed implementation
 submission when its deterministic terminal preconditions are ready. This reserves closure capacity
 for small local models instead of letting a redundant diagnostic consume the stage budget. If a
 required creation path is still missing or another deterministic precondition is not ready, the
 ordinary authorized surface remains available; pb never synthesizes implementation accounting or
 waives its validation. Harness-owned checking still runs after the accepted submission.
-An edit tool receives mutation and progress credit only when repository bytes actually change.
-Identical replacements and edits fail without emitting a diff or invalidating existing evidence.
+An active unit may earn one additional stage turn after its first distinct content or exact-evidence
+transition, with four earned turns maximum. Failed, rejected, cached, repeated, no-op, and
+bookkeeping-only calls earn none; workflow-wide invocation and generated-token limits remain
+authoritative. Identical replacements and edits fail without emitting a diff or invalidating
+existing evidence.
+
+Contract checks marked `diagnostic_eligible` run automatically after the queue is structurally
+complete. Preview results are fingerprint-bound feedback only: they never enter selected-check
+evidence and all required checks run again in the authoritative checking stage. A failed preview
+can reopen only an exact current task path named as a complete diagnostic token. Earlier read
+evidence for that path is invalidated; after a fresh complete read, repair uses a bounded replace or
+edit even when the original plan operation created the file. A missing diagnostic target requires a
+replan. The preview command must preserve repository content and Git control state.
+
+At implementation submission, pb projects the accepted plan identity/digest, current content
+fingerprint, actual task-delta paths per named plan step, and no-change fact. The model still accounts
+for every step and owns status, summaries, and the proposed semantic commit subject. At code review,
+pb similarly projects the checked fingerprint while the fresh reviewer owns assessments, findings,
+and verdict. Existing artifact validators still reject missing steps, paths outside the plan, stale
+state, incomplete work, or unsupported review conclusions.
 
 Local and managed command failures retain their exit status and bounded stdout/stderr in structured
 tool feedback. Output redirected from stderr to stdout is still preserved. Timeout and user

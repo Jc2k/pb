@@ -66,11 +66,18 @@ impl StageContract {
                 self.stage
             );
         }
-        if self.max_steps == 0 || self.max_steps > limits.stage_steps {
-            bail!(
-                "stage max_steps must be between 1 and {}",
-                limits.stage_steps
-            );
+        let max_stage_steps = limits.stage_steps.saturating_add(
+            if matches!(
+                self.stage,
+                WorkflowStage::Implementing | WorkflowStage::Repairing
+            ) {
+                super::MAX_WORK_UNIT_PROGRESS_CREDITS
+            } else {
+                0
+            },
+        );
+        if self.max_steps == 0 || self.max_steps > max_stage_steps {
+            bail!("stage max_steps must be between 1 and {}", max_stage_steps);
         }
         if self.max_tokens_per_turn <= 0
             || self.max_tokens_per_turn as usize > limits.total_generated_tokens
@@ -202,9 +209,8 @@ impl StageCapabilities {
             // Strict delivery already has durable typed stage state. Exposing the legacy,
             // invocation-local todo protocol only adds another control loop for the model.
             "todo" => false,
-            "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm" => {
-                self.repository_mutation
-            }
+            "write_file" | "write_files" | "replace_file" | "edit_file" | "apply_patch" | "mv"
+            | "rm" => self.repository_mutation,
             "run_command" => self.run_command,
             "run_task" => self.run_task,
             "run_check" => self.run_check,
@@ -289,6 +295,12 @@ mod tests {
         assert!(contract.validate(limits).is_err());
 
         let mut contract = StageContract::strict(WorkflowStage::Implementing, limits, 512).unwrap();
+        contract.max_steps = limits.stage_steps + crate::workflow::MAX_WORK_UNIT_PROGRESS_CREDITS;
+        assert!(contract.validate(limits).is_ok());
+        contract.max_steps += 1;
+        assert!(contract.validate(limits).is_err());
+
+        let mut contract = StageContract::strict(WorkflowStage::Planning, limits, 512).unwrap();
         contract.max_steps = limits.stage_steps + 1;
         assert!(contract.validate(limits).is_err());
         assert!(StageContract::strict(WorkflowStage::Checking, limits, 512).is_err());

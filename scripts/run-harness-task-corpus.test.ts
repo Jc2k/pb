@@ -36,6 +36,42 @@ Deno.test("checked-in task corpus is valid and spans ten cases", async () => {
   );
 });
 
+Deno.test("slugify case independently covers the exact normalization rule and registered tests", async () => {
+  const parsed = JSON.parse(
+    await Deno.readTextFile("fixtures/harness-task-completion/corpus.json"),
+  );
+  const corpus = validateCorpus(parsed);
+  const slugify = corpus.cases.find((item) =>
+    item.id === "create_slugify_repair"
+  );
+  assert(slugify, "slugify case");
+
+  assert(Array.isArray(slugify.contract.checks), "slugify checks");
+  const checks = slugify.contract.checks as Array<{
+    id?: string;
+    command?: string;
+  }>;
+  const behavior = checks.find((check) =>
+    check.id === "behavior"
+  );
+  assert(behavior, "behavior check");
+  assert(
+    behavior.command?.includes("hello_world"),
+    "underscore coverage",
+  );
+  assert(behavior.command?.includes("naïve"), "non-ASCII coverage");
+
+  const modelTests = checks.find((check) =>
+    check.id === "model_tests"
+  );
+  assert(modelTests, "model-tests check");
+  assert(
+    modelTests.command?.includes("Deno\\.test"),
+    "registered-test gate",
+  );
+  assert(modelTests.command?.includes("deno test"), "test execution gate");
+});
+
 Deno.test("corpus paths fail closed on traversal", () => {
   let message = "";
   try {

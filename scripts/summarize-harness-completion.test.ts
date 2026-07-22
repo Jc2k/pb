@@ -58,6 +58,28 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
         JSON.stringify({ event: { type: "started", model: "local-model" } }),
         JSON.stringify({
           event: {
+            type: "llm_invocation",
+            prompt_tokens: 120,
+            prompt_cache: { cached_tokens: 80, prefilled_tokens: 40 },
+            native: {
+              fresh_prefill_tokens: 40,
+              tool_schema_sha256: "schema-a",
+            },
+          },
+        }),
+        JSON.stringify({
+          event: {
+            type: "llm_invocation",
+            prompt_tokens: 80,
+            prompt_cache: { cached_tokens: 0, prefilled_tokens: 80 },
+            native: {
+              fresh_prefill_tokens: 80,
+              tool_schema_sha256: "schema-b",
+            },
+          },
+        }),
+        JSON.stringify({
+          event: {
             type: "session_metrics",
             wall_runtime_ms: 1000,
             llm_invocations: 6,
@@ -80,6 +102,11 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
     assert(summary.total_energy_kwh === 0.002, JSON.stringify(summary));
     assert(summary.commit_oid === "abc123", JSON.stringify(summary));
     assert(summary.checks_passed === 1, JSON.stringify(summary));
+    assert(summary.rendered_prompt_tokens === 200, JSON.stringify(summary));
+    assert(summary.cached_prefix_tokens === 80, JSON.stringify(summary));
+    assert(summary.fresh_prefill_tokens === 120, JSON.stringify(summary));
+    assert(summary.prompt_cache_hit_invocations === 1, JSON.stringify(summary));
+    assert(summary.tool_schema_sha256s.length === 2, JSON.stringify(summary));
   } finally {
     await Deno.remove(root, { recursive: true });
   }

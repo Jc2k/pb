@@ -67,6 +67,12 @@ impl WorkflowCheckpoint {
             );
         }
         self.run.stage_evidence.validate()?;
+        self.run.work_units.validate()?;
+        if let Some(plan) = &self.run.plan {
+            self.run.work_units.validate_plan(&plan.id, &plan.sha256)?;
+        } else if self.run.work_units.is_initialized() {
+            bail!("workflow checkpoint has work units without an accepted plan");
+        }
         match &self.run.ready_evidence {
             Some(_) if self.run.ready_evidence_schema == 0 => {
                 bail!("legacy workflow checkpoint cannot contain current ready evidence");

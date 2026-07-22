@@ -1082,6 +1082,7 @@ async fn run_serve() -> Result<()> {
         workflow_expected_content_fingerprint: None,
         workflow_action_first_turn: false,
         workflow_creation_path_order: Vec::new(),
+        workflow_work_units: None,
         workflow_stage_evidence: None,
         workflow_checkpoint: None,
         conversation_handoff: None,

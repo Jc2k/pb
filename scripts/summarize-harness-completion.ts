@@ -25,6 +25,11 @@ export interface CompletionRunSummary {
   wall_runtime_ms?: number;
   llm_invocations?: number;
   prompt_tokens?: number;
+  rendered_prompt_tokens?: number;
+  cached_prefix_tokens?: number;
+  fresh_prefill_tokens?: number;
+  prompt_cache_hit_invocations?: number;
+  tool_schema_sha256s: string[];
   generated_tokens?: number;
   tool_calls?: number;
   total_energy_kwh?: number;
@@ -125,6 +130,15 @@ function eventOfType(
   );
 }
 
+function eventsOfType(
+  events: EventEnvelope[],
+  type: string,
+): Record<string, unknown>[] {
+  return events
+    .map((envelope) => envelope.event)
+    .filter((event): event is Record<string, unknown> => event?.type === type);
+}
+
 export async function summarizeScratch(
   scratchPath: string,
 ): Promise<CompletionRunSummary[]> {
@@ -164,6 +178,42 @@ export async function summarizeScratch(
     const events = parseJsonLines(eventText, runEvents) as EventEnvelope[];
     const startEvent = eventOfType(events, "started");
     const metrics = eventOfType(events, "session_metrics");
+    const invocations = eventsOfType(events, "llm_invocation");
+    const renderedPromptTokens = invocations.reduce(
+      (total, event) => total + numberOrZero(event.prompt_tokens),
+      0,
+    );
+    const cachedPrefixTokens = invocations.reduce((total, event) => {
+      const cache = event.prompt_cache;
+      return total + (cache !== null && typeof cache === "object"
+        ? numberOrZero((cache as Record<string, unknown>).cached_tokens)
+        : 0);
+    }, 0);
+    const freshPrefillTokens = invocations.reduce((total, event) => {
+      const native = event.native;
+      if (native !== null && typeof native === "object") {
+        return total + numberOrZero(
+          (native as Record<string, unknown>).fresh_prefill_tokens,
+        );
+      }
+      const cache = event.prompt_cache;
+      return total + (cache !== null && typeof cache === "object"
+        ? numberOrZero((cache as Record<string, unknown>).prefilled_tokens)
+        : numberOrZero(event.prompt_tokens));
+    }, 0);
+    const promptCacheHitInvocations = invocations.filter((event) => {
+      const cache = event.prompt_cache;
+      return cache !== null && typeof cache === "object" &&
+        numberOrZero((cache as Record<string, unknown>).cached_tokens) > 0;
+    }).length;
+    const toolSchemaSha256s = Array.from(new Set(invocations.flatMap((event) => {
+      const native = event.native;
+      if (native === null || typeof native !== "object") return [];
+      const digest = optionalString(
+        (native as Record<string, unknown>).tool_schema_sha256,
+      );
+      return digest ? [digest] : [];
+    })));
     const audit = finished.audit ?? {};
     const contractStatus = requiredString(
       finished.contract_status,
@@ -198,6 +248,19 @@ export async function summarizeScratch(
       wall_runtime_ms: optionalNumber(metrics?.wall_runtime_ms),
       llm_invocations: optionalNumber(metrics?.llm_invocations),
       prompt_tokens: optionalNumber(metrics?.prompt_tokens),
+      rendered_prompt_tokens: invocations.length > 0
+        ? renderedPromptTokens
+        : optionalNumber(metrics?.prompt_tokens),
+      cached_prefix_tokens: invocations.length > 0
+        ? cachedPrefixTokens
+        : undefined,
+      fresh_prefill_tokens: invocations.length > 0
+        ? freshPrefillTokens
+        : undefined,
+      prompt_cache_hit_invocations: invocations.length > 0
+        ? promptCacheHitInvocations
+        : undefined,
+      tool_schema_sha256s: toolSchemaSha256s,
       generated_tokens: optionalNumber(metrics?.generated_tokens),
       tool_calls: optionalNumber(metrics?.tool_calls),
       total_energy_kwh: optionalNumber(metrics?.total_energy_kwh),

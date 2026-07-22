@@ -1,6 +1,6 @@
 # Verified task-completion reliability
 
-Status: **Active; TC1 qualified 3/3, TC2 qualified, and the TC3 candidate corpus is checked in**
+Status: **Active; Work-Unit Controller v2 implemented, W6 native qualification pending**
 
 This record tracks pb's move from protocol-safe local agent runs to repeatable, externally verified
 coding-task completion. It complements the [small-model reliability plan](small-model-agent-reliability-plan.md),
@@ -85,7 +85,8 @@ The checked-in 11-case offline corpus covers ordered creation, repair after a fa
 fixes, regression tests, related multi-file changes, failed-check diagnosis, delete/modify work,
 resume adoption, mixed create/modify work, truthful no-change completion, and out-of-scope mutation
 resistance. Its manifest, safe scratch preparation, trusted contracts, and locked per-case bounds are
-deterministically validated. Aggregate native model execution remains pending.
+deterministically validated. The audited W0 native baseline is 7/11 verified with zero false
+completion or forbidden mutation; see the [TC3 baseline](benchmarks/task-completion-tc3-baseline.md).
 
 Initial promotion target:
 
@@ -121,6 +122,75 @@ Work is evidence-gated in this order:
 Larger context windows, higher unconditional output caps, acceptance-gate relaxation, checkpoint-
 specific runtime shortcuts, and silent hosted-model fallback are not promotion strategies.
 
+## Work-Unit Controller v2 milestones
+
+The existing small-model reliability plan already shipped bounded context, focused repository and
+review evidence, outcome-aware loop recovery, structured tool errors, deterministic closure, and
+authorized-subset tool exposure. This follow-on targets the remaining task-completion gap without
+reimplementing those controls.
+
+| ID | Priority | Status | Deliverable | Promotion proof |
+| --- | --- | --- | --- | --- |
+| W0 | P0 | complete | Execute and independently audit the locked 11-case TC3 native baseline | 7/11 verified; zero false completion/forbidden mutation; per-case audit plus aggregate invocation, token, cache, wall, and energy evidence published |
+| W1 | P0 | implemented | Persist a typed harness-owned work-unit ledger for create, modify, delete, adopted/resumed, and no-change work | Ordered-state, checkpoint round-trip, fingerprint, adopted-work, and target fixtures pass |
+| W2 | P0 | implemented | Expose stable target-bound workflow mutations and bounded atomic batches for independent creations | Harness-bound path insertion, operation-only tool exposure, batch validation/rollback, and malformed-batch fixtures pass |
+| W3 | P1 | implemented | Grant bounded work only after unique progress and run explicitly eligible cheap diagnostics without final evidence credit | Per-unit/max-four progress credit and diagnostic-preview isolation/focus fixtures pass |
+| W4 | P1 | implemented | Project trusted implementation and review skeleton fields while retaining model-authored completion and review judgments | Resume/adopted projection and existing artifact validators pass deterministic tests |
+| W5 | P2 | implemented; measurement pending | Make work-unit prompt and tool prefixes byte-stable and measure cacheable versus fresh prefill | Cross-target tool schema identity passes; summary reports rendered, cached-prefix, and fresh-prefill tokens separately |
+| W6 | P2 | pending | Qualify TC1, TC2, TC3, and supported local model tiers | TC1 3/3 at no more than 6 calls; TC2 3/3 at no more than 12 calls; TC3 at least 9/11; zero false completion or forbidden mutation |
+
+### W1 target state
+
+The accepted plan, task baseline, current content snapshot, and trusted diagnostics produce a
+checkpointed work-unit ledger. Each unit records its plan step, operation, path, baseline/current
+fingerprints, and one of `evidence_needed`, `mutation_ready`, `structurally_complete`,
+`diagnostic_failed`, `diagnostic_repair_ready`, or `blocked_for_replan`. Structural completion
+records only the required filesystem transition; it never substitutes for configured checks or
+fresh review. Diagnostic failure invalidates older reads of the exact named path before bounded
+replacement/edit repair; a missing target requires replanning.
+
+Modify and delete work requires exact fingerprint-bound target evidence. An adopted task-owned
+delta may satisfy structural progress without being rewritten. No-change tasks have an empty
+mutation ledger and retain their existing truthful no-change gates.
+
+### W2 target state
+
+Implementation and repair expose only the operation appropriate to the active unit. The model does
+not copy a repository path or expected fingerprint into a scoped mutation; pb resolves both from
+the checkpointed ledger and records them in the durable event. Independent creation units may be
+submitted as a bounded atomic batch after every member and the combined mutation payload validate.
+No member executes when any member is invalid or truncated.
+
+### W3 target state
+
+A distinct content/evidence transition may earn at most one additional implementation or repair
+turn for its work unit, with at most four earned turns for the stage. Failed, rejected, no-op,
+repeated, cached, and bookkeeping-only actions earn none. Existing global invocation and generated-
+token budgets remain authoritative.
+
+Only checks explicitly marked as diagnostic-eligible may run after the current work-unit queue is
+structurally complete. Their results are fingerprint-bound diagnostic feedback, not selected-check
+receipts. Passing checks run again through the authoritative checking stage; failing output may
+focus a repair unit only when it names an exact task path.
+
+### W4 target state
+
+For implementation submission, pb supplies trusted plan identity/digest, current fingerprint, and
+actual touched paths. The model still names the completed accepted steps, gives a semantic summary,
+and proposes the commit subject. For review, pb supplies the checked fingerprint and successful
+check identifiers while the fresh model remains responsible for substantive assessments, findings,
+and verdict. Projection never synthesizes a passing completion or review.
+
+### W5 and W6 measurement
+
+Work-unit targets and fingerprints belong in the dynamic prompt suffix, not rewritten tool schemas.
+Schema ordering, common guidance, and cache identities must be canonical and versioned. Report
+rendered, cacheable, and fresh-prefill tokens separately.
+
+The final locked comparison retains the current task contracts and independent audit procedure.
+TC2 must also improve wall time and energy by at least 25% from its qualified 1,167,352 ms and
+12.90 Wh run. Efficiency never compensates for a safety or functional regression.
+
 ## Evidence log
 
 | Date | Gate | Evidence | Result | Next action |
@@ -133,6 +203,8 @@ specific runtime shortcuts, and silent hosted-model fallback are not promotion s
 | 2026-07-21 | TC2 useful-coding qualification | scratch `/private/tmp/pb-tc2-slugify-3-20260721`, run `1784671564495-58382-0`, commit `7fd899ce771857bd39a3c6d0ec77e85e6b230607`; [TC2 report](benchmarks/task-completion-tc2.md) | Verified completion after one real repair; all three checks independently passed; clean three-path semantic commit; 16 calls, 1,167,352 ms, 12.90 Wh | Retain as a repair regression; expand TC3 and reduce model calls without weakening gates |
 | 2026-07-21 | Trusted acceptance projection | unit projection/digest test, scripted planning-stage test, exact-path repair-focus test, and complete Rust quality suite | Required contract check IDs are projected and rehashed before fresh review; bounded failed-check diagnostics focus repair without granting evidence or scope | Measure the native invocation and token effect in TC3 rather than claiming an efficiency win from deterministic tests |
 | 2026-07-21 | TC3 candidate corpus | `fixtures/harness-task-completion/corpus.json`, `scripts/run-harness-task-corpus.ts`, Deno preparation tests, Rust contract normalization test | 11 safe offline cases across 11 categories; reproducible seeded and resumed scratch preparation; aggregate native results not yet claimed | Execute preserved cases, audit every claimed success, and publish aggregate functional and efficiency results |
+| 2026-07-22 | W0 TC3 baseline | 11 corrected-contract preserved native runs; [aggregate report](benchmarks/task-completion-tc3-baseline.md) | 7/11 verified, zero false completion/forbidden mutation; median 10 calls, 400,020 ms, 4.62 Wh; one confirmed resumed-work accounting defect | Qualify Work-Unit Controller v2 against the same cases |
+| 2026-07-22 | W1–W5 deterministic implementation | typed checkpoint ledger, target-bound/batched creates, unique progress credits, diagnostic previews, trusted submission projection, stable-schema and reporting fixtures | Controller path implemented without weakening authoritative check/review/commit gates; full quality and native W6 qualification pending | Run full quality suite, rebuild release, then execute locked TC1/TC2/TC3 comparisons |
 
 ## Completion audit
 
@@ -145,6 +217,6 @@ specific runtime shortcuts, and silent hosted-model fallback are not promotion s
 - [x] TC1 repeats successfully 3/3 with locked settings.
 - [x] TC2 reaches one independently verified completion.
 - [x] TC3 candidate corpus and single-case runner exist.
-- [ ] TC3 aggregate native-model report exists.
+- [x] TC3 aggregate native-model report exists.
 - [x] Highest-value evidenced acceptance-projection gap is fixed and regression-tested.
 - [ ] External same-model comparison is recorded.

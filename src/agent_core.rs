@@ -215,6 +215,12 @@ pub trait EventSink {
         Ok(())
     }
 
+    /// Persist a work-unit progress credit before a later stage step can consume it. The default
+    /// remains a no-op for direct, non-workflow runs.
+    fn workflow_work_unit_progress_earned(&mut self, _unit_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     fn ask_user(&mut self, _question: &str) -> Result<String> {
         bail!("ask_user is not available in this execution context")
     }
@@ -501,6 +507,11 @@ pub struct AgentRequest {
     /// model mutation paths.
     #[serde(skip)]
     pub(crate) workflow_creation_path_order: Vec<String>,
+    /// Harness-owned typed work-unit authority for the active implementation or repair stage.
+    /// The ledger is derived from the accepted plan and durable workflow checkpoint; persisted
+    /// requests cannot manufacture target-bound mutation authority.
+    #[serde(skip)]
+    pub(crate) workflow_work_units: Option<crate::workflow::WorkUnitLedger>,
     /// Harness-owned complete-file evidence carried from the durable workflow checkpoint. It is
     /// validated against the active workspace before it seeds a fresh stage and cannot be supplied
     /// by persisted/API requests.
@@ -1202,6 +1213,7 @@ impl CommandBackend {
                 command: check.command.clone(),
                 cwd: check.cwd.clone(),
                 required: true,
+                diagnostic_eligible: false,
                 timeout_seconds: check.timeout_seconds,
             },
             workspace_root,
@@ -3461,7 +3473,8 @@ fn builtin_tool_semantics(name: &str) -> Option<BuiltInToolSemantics> {
             semantics.parallel_safe = true;
             semantics.useful_on_success = true;
         }
-        "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm" | "run_task" => {
+        "write_file" | "write_files" | "replace_file" | "edit_file" | "apply_patch" | "mv"
+        | "rm" | "run_task" => {
             semantics.mutates_workspace = true;
             semantics.useful_on_success = true;
         }
@@ -3686,6 +3699,7 @@ impl BuiltInToolSchema {
             "run_command" => "run_command(cmd,timeout_seconds)",
             "run_check" => "run_check(id)",
             "write_file" => "write_file(path,content)",
+            "write_files" => "write_files(files)",
             "replace_file" => "replace_file(path,content)",
             "edit_file" => "edit_file(path,old_text,new_text)",
             "apply_patch" => "apply_patch(patch)",
@@ -3936,6 +3950,30 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                 ],
                 ["path", "content"],
             ),
+        ),
+        builtin_tool(
+            "write_files",
+            "Create one to four consecutive independent harness-bound files atomically. Paths are supplied by pb in accepted-plan order; provide only complete contents in matching order.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "Complete contents for the corresponding harness-bound path."}
+                            },
+                            "required": ["content"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["files"],
+                "additionalProperties": false
+            }),
         ),
         builtin_tool(
             "replace_file",
@@ -4416,9 +4454,9 @@ fn implementation_submission_schema() -> Value {
         json!({
             "type": "object",
             "properties": {
-                "plan_id": {"type": "string"},
-                "plan_sha256": {"type": "string"},
-                "content_fingerprint": {"type": "string"},
+                "plan_id": {"type": "string", "description": "Optional compatibility field; pb projects the accepted plan id."},
+                "plan_sha256": {"type": "string", "description": "Optional compatibility field; pb projects the accepted plan digest."},
+                "content_fingerprint": {"type": "string", "description": "Optional compatibility field; pb projects the current fingerprint."},
                 "steps": {
                     "type": "array",
                     "items": {
@@ -4426,20 +4464,19 @@ fn implementation_submission_schema() -> Value {
                         "properties": {
                             "step_id": {"type": "string"},
                             "status": {"type": "string", "enum": ["completed", "no_change", "incomplete"]},
-                            "touched_paths": string_array_schema("Actual repository-relative paths touched by this step."),
+                            "touched_paths": string_array_schema("Optional compatibility field; pb projects trusted task-delta paths."),
                             "summary": {"type": "string"},
                         },
-                        "required": ["step_id", "status", "touched_paths", "summary"],
+                        "required": ["step_id", "status", "summary"],
                         "additionalProperties": false,
                     },
                 },
                 "summary": {"type": "string"},
-                "no_change": {"type": "boolean"},
+                "no_change": {"type": "boolean", "description": "Optional compatibility field; pb derives this from the task delta."},
                 "semantic_commit_subject": {"type": "string"},
             },
             "required": [
-                "plan_id", "plan_sha256", "content_fingerprint", "steps", "summary",
-                "no_change", "semantic_commit_subject"
+                "steps", "summary", "semantic_commit_subject"
             ],
             "additionalProperties": false,
         }),
@@ -4453,7 +4490,7 @@ fn code_review_submission_schema() -> Value {
         json!({
             "type": "object",
             "properties": {
-                "content_fingerprint": {"type": "string"},
+                "content_fingerprint": {"type": "string", "description": "Optional compatibility field; pb projects the checked fingerprint."},
                 "assessments": {
                     "type": "array",
                     "items": assessment_schema(&[
@@ -4484,7 +4521,7 @@ fn code_review_submission_schema() -> Value {
                 },
                 "verdict": {"type": "string", "enum": ["pass", "revise"]},
             },
-            "required": ["content_fingerprint", "assessments", "findings", "verdict"],
+            "required": ["assessments", "findings", "verdict"],
             "additionalProperties": false,
         }),
     )
@@ -4552,7 +4589,7 @@ fn apply_mutation_payload_limit(tools: &mut [BuiltInToolSchema], max_tokens: i32
     for tool in tools {
         if !matches!(
             tool.name.as_str(),
-            "write_file" | "replace_file" | "apply_patch" | "edit_file"
+            "write_file" | "write_files" | "replace_file" | "apply_patch" | "edit_file"
         ) {
             continue;
         }
@@ -4567,6 +4604,7 @@ fn set_mutation_payload_char_limit(tools: &mut [BuiltInToolSchema], limit: usize
     for tool in tools {
         let fields: &[&str] = match tool.name.as_str() {
             "write_file" | "replace_file" => &["content"],
+            "write_files" => &[],
             "apply_patch" => &["patch"],
             // Both strings share one serialized action, so give each half of the allowance.
             "edit_file" => &["old_text", "new_text"],
@@ -4585,6 +4623,13 @@ fn set_mutation_payload_char_limit(tools: &mut [BuiltInToolSchema], limit: usize
                 property["maxLength"] = json!(field_limit);
             }
         }
+        if tool.name == "write_files"
+            && let Some(property) = tool
+                .input_schema
+                .pointer_mut("/properties/files/items/properties/content")
+        {
+            property["maxLength"] = json!((limit / 2).max(64));
+        }
     }
 }
 
@@ -4599,6 +4644,70 @@ fn set_tool_target_path(tools: &mut [BuiltInToolSchema], tool_name: &str, target
     }
 }
 
+fn scope_tools_to_work_unit(tools: &mut Vec<BuiltInToolSchema>, unit: &crate::workflow::WorkUnit) {
+    use crate::workflow::{PlannedChange, WorkUnitState};
+
+    let allowed: &[&str] = match unit.state {
+        WorkUnitState::EvidenceNeeded | WorkUnitState::DiagnosticFailed => {
+            &["read_file", "request_replan"][..]
+        }
+        WorkUnitState::DiagnosticRepairReady => {
+            &["replace_file", "edit_file", "request_replan"][..]
+        }
+        WorkUnitState::MutationReady => match unit.operation {
+            PlannedChange::Create => &["write_file", "write_files", "request_replan"],
+            PlannedChange::Modify => &["replace_file", "edit_file", "request_replan"],
+            PlannedChange::Delete => &["rm", "request_replan"],
+        },
+        WorkUnitState::BlockedForReplan => &["request_replan"],
+        WorkUnitState::StructurallyComplete => &[],
+    };
+    tools.retain(|tool| allowed.contains(&tool.name.as_str()));
+    for tool_name in ["read_file", "write_file", "replace_file", "edit_file", "rm"] {
+        if let Some(tool) = tools.iter_mut().find(|tool| tool.name == tool_name)
+            && let Some(required) = tool
+                .input_schema
+                .get_mut("required")
+                .and_then(Value::as_array_mut)
+        {
+            required.retain(|field| field.as_str() != Some("path"));
+        }
+    }
+}
+
+fn bind_work_unit_target(
+    call: &mut AgentToolCall,
+    args: &AgentRequest,
+    gate_state: &GateState,
+    workspace_root: &Path,
+) -> Result<()> {
+    if !matches!(
+        call.tool.as_str(),
+        "read_file" | "write_file" | "replace_file" | "edit_file" | "rm"
+    ) {
+        return Ok(());
+    }
+    let Some(mut ledger) = args.workflow_work_units.clone() else {
+        return Ok(());
+    };
+    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let exact_evidence_paths = gate_state
+        .stage_evidence
+        .read_paths()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    ledger.reconcile(&current, &exact_evidence_paths)?;
+    let unit = ledger
+        .active()
+        .context("target-bound tool called with no active work unit")?;
+    let arguments = call
+        .arguments
+        .as_object_mut()
+        .context("target-bound tool arguments must be an object")?;
+    arguments.insert("path".to_string(), json!(unit.path));
+    Ok(())
+}
+
 fn set_mutation_target_path(tools: &mut [BuiltInToolSchema], target_path: &str) {
     for tool_name in ["write_file", "replace_file"] {
         set_tool_target_path(tools, tool_name, target_path);
@@ -4609,6 +4718,7 @@ fn exposed_mutation_payload_limit(tools: &[BuiltInToolSchema]) -> Option<usize> 
     tools.iter().find_map(|tool| {
         let field = match tool.name.as_str() {
             "write_file" | "replace_file" => "content",
+            "write_files" => "files/items/properties/content",
             "apply_patch" => "patch",
             "edit_file" => "old_text",
             _ => return None,
@@ -4704,7 +4814,8 @@ fn tool_allowed(
         "memory_propose" => matches!(profile, AgentProfile::Build | AgentProfile::Plan),
         "memory_supersede" => profile == AgentProfile::Build,
         "run_command" | "run_check" => command_backend_kind.is_some(),
-        "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm" => {
+        "write_file" | "write_files" | "replace_file" | "edit_file" | "apply_patch" | "mv"
+        | "rm" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
         }
         "sub_agent" => allow_sub_agents && profile != AgentProfile::Research,
@@ -4922,6 +5033,9 @@ struct GateState {
     legacy_review_command_required: bool,
     workflow_submission: Option<crate::workflow::StageSubmission>,
     workflow_control_violation: Option<String>,
+    earned_work_unit_ids: BTreeSet<String>,
+    diagnostic_preview_fingerprint: Option<String>,
+    diagnostic_failed_paths: BTreeSet<String>,
     delivery_proposal: Option<crate::workflow::DeliveryProposal>,
     requested_delivery: Option<crate::workflow::ConversationHandoff>,
     goal_proposal: Option<crate::goal::GoalProposal>,
@@ -5180,9 +5294,15 @@ fn initial_gate_state(
         .transpose()?
         .unwrap_or_default();
     let read_paths = stage_evidence.read_paths().map(str::to_string).collect();
+    let earned_work_unit_ids = args
+        .workflow_work_units
+        .as_ref()
+        .map(|ledger| ledger.progress_credited_units.clone())
+        .unwrap_or_default();
     Ok(GateState {
         read_paths,
         stage_evidence,
+        earned_work_unit_ids,
         wrote_file,
         legacy_review_read_evidence_gathered: args.repository_less,
         legacy_review_command_evidence_gathered: args.repository_less,
@@ -5221,7 +5341,8 @@ fn run_agent_steps(
     let mut progress_guard = ProgressGuard::default();
     let mut terminal_submission_only = false;
     let mut suppress_thinking = false;
-    let mut announced_creation_work_unit: Option<String> = None;
+    let mut work_units = args.workflow_work_units.clone();
+    let mut announced_work_unit: Option<(String, crate::workflow::WorkUnitState)> = None;
     let gate_state = RefCell::new(initial_gate_state(
         args,
         workspace_root,
@@ -5332,15 +5453,122 @@ fn run_agent_steps(
             timestamp_ms: Some(now_millis()),
         });
 
-        let creation_work_unit = args
-            .workflow_creation_path_order
-            .iter()
-            .find(|path| !workspace_root.join(path).exists())
+        if let Some(ledger) = work_units.as_mut() {
+            let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+            let exact_evidence_paths = gate_state
+                .borrow()
+                .stage_evidence
+                .read_paths()
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
+            ledger.reconcile(&current, &exact_evidence_paths)?;
+            if let Some(feedback) = run_work_unit_diagnostic_previews(
+                args,
+                command_backend,
+                ledger,
+                &gate_state,
+                workspace_root,
+                nesting_depth,
+                sink,
+            )? {
+                sink.emit(AgentEvent::Correction {
+                    message: feedback.clone(),
+                    summary: "Harness diagnostic preview".to_string(),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+                messages.push(correction_chat_message(
+                    "Harness diagnostic preview",
+                    &feedback,
+                ));
+            }
+        }
+        let active_work_unit = work_units
+            .as_ref()
+            .and_then(crate::workflow::WorkUnitLedger::active)
             .cloned();
-        if creation_work_unit != announced_creation_work_unit {
-            if let Some(path) = creation_work_unit.as_deref() {
+        let legacy_creation_work_unit = work_units
+            .is_none()
+            .then(|| {
+                args.workflow_creation_path_order
+                    .iter()
+                    .find(|path| !workspace_root.join(path).exists())
+                    .cloned()
+            })
+            .flatten();
+        let announced = active_work_unit
+            .as_ref()
+            .map(|unit| (unit.id.clone(), unit.state))
+            .or_else(|| {
+                legacy_creation_work_unit.as_ref().map(|path| {
+                    (
+                        format!("legacy-create:{path}"),
+                        crate::workflow::WorkUnitState::MutationReady,
+                    )
+                })
+            });
+        if announced != announced_work_unit {
+            if let Some(unit) = active_work_unit.as_ref() {
+                let instruction = match (unit.operation, unit.state) {
+                    (_, crate::workflow::WorkUnitState::EvidenceNeeded) => format!(
+                        "Harness work unit {}: observe the complete current bytes of {} with read_file before its {:?} mutation can become eligible.",
+                        unit.id, unit.path, unit.operation
+                    ),
+                    (_, crate::workflow::WorkUnitState::DiagnosticFailed) => format!(
+                        "Harness diagnostic repair unit {}: read the complete current bytes of {} again. Evidence collected before the failed diagnostic was invalidated.",
+                        unit.id, unit.path
+                    ),
+                    (_, crate::workflow::WorkUnitState::DiagnosticRepairReady) => format!(
+                        "Harness diagnostic repair unit {}: repair only {} with target-bound replace_file or edit_file. This repair authority does not reopen any other accepted-plan path.",
+                        unit.id, unit.path
+                    ),
+                    (
+                        crate::workflow::PlannedChange::Create,
+                        crate::workflow::WorkUnitState::MutationReady,
+                    ) => {
+                        let batch_paths = active_creation_batch_paths(
+                            args,
+                            &gate_state.borrow(),
+                            workspace_root,
+                        )?;
+                        if batch_paths.len() > 1 {
+                            format!(
+                                "Harness work unit {}: {} consecutive creates are eligible in this exact order: {}. Prefer one atomic write_files call with one complete content object per path in that order; pb binds the paths, so do not include path fields. Otherwise create {} now with write_file. If the full implementation will not fit, write the smallest syntactically loadable scaffold that preserves a later edit path.",
+                                unit.id,
+                                batch_paths.len(),
+                                batch_paths.join(", "),
+                                unit.path
+                            )
+                        } else {
+                            format!(
+                                "Harness work unit {}: create {} now with one complete atomic write_file payload. If the full implementation will not fit, write the smallest syntactically loadable scaffold that preserves a later edit path.",
+                                unit.id, unit.path
+                            )
+                        }
+                    }
+                    (operation, crate::workflow::WorkUnitState::MutationReady) => format!(
+                        "Harness work unit {}: perform only the target-bound {:?} mutation for {}. The observed target fingerprint remains the write authority.",
+                        unit.id, operation, unit.path
+                    ),
+                    (_, crate::workflow::WorkUnitState::BlockedForReplan) => format!(
+                        "Harness work unit {} is blocked because {} no longer has the filesystem state required for {:?}. Request replan instead of mutating another path.",
+                        unit.id, unit.path, unit.operation
+                    ),
+                    (_, crate::workflow::WorkUnitState::StructurallyComplete) => String::new(),
+                };
+                sink.emit(AgentEvent::Correction {
+                    message: instruction.clone(),
+                    summary: "Active accepted-plan work unit".to_string(),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+                messages.push(correction_chat_message(
+                    "Active accepted-plan work unit",
+                    &instruction,
+                ));
+            } else if let Some(path) = legacy_creation_work_unit.as_deref() {
                 let instruction = format!(
-                    "Harness creation work unit: the next missing accepted-plan path is {path}. Create that exact path now with one complete write_file payload within the current allowance. If the full implementation will not fit, write the smallest syntactically loadable scaffold that preserves a later edit path. Do not rewrite or delete an already-created plan path while this target is missing."
+                    "Harness creation work unit: the next missing accepted-plan path is {path}. Create that exact path now with one complete write_file payload within the current allowance."
                 );
                 sink.emit(AgentEvent::Correction {
                     message: instruction.clone(),
@@ -5353,7 +5581,7 @@ fn run_agent_steps(
                     &instruction,
                 ));
             }
-            announced_creation_work_unit = creation_work_unit.clone();
+            announced_work_unit = announced;
         }
 
         let terminal_tool = args.workflow_stage.and_then(workflow_terminal_tool_name);
@@ -5382,7 +5610,16 @@ fn run_agent_steps(
             terminal_precondition.is_none(),
         );
         scoped_tools.retain(|tool| exposure_state.allows(&tool.name));
-        if let Some(path) = creation_work_unit.as_deref() {
+        if let Some(unit) = active_work_unit.as_ref() {
+            scope_tools_to_work_unit(&mut scoped_tools, unit);
+        } else if work_units.is_some() {
+            scoped_tools.retain(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "submit_implementation" | "request_replan"
+                )
+            });
+        } else if let Some(path) = legacy_creation_work_unit.as_deref() {
             scoped_tools.retain(|tool| tool.name == "write_file" || !mutation_tool(&tool.name));
             set_tool_target_path(&mut scoped_tools, "write_file", path);
             if let Some(schema) = scoped_tools
@@ -5468,6 +5705,7 @@ fn run_agent_steps(
         let enable_thinking =
             workflow_completion_enable_thinking(args, step, suppress_thinking, terminal_only_turn)
                 && generator.supports_thinking()?;
+        let progress_before_action = progress_state(workspace_root, &gate_state)?;
         let generated = match generate_and_parse_action_with_retries(
             generator,
             args,
@@ -6074,6 +6312,17 @@ fn run_agent_steps(
                     workspace_root,
                     &gate_state,
                 )?;
+                let progress_after_action = progress_state(workspace_root, &gate_state)?;
+                grant_work_unit_progress_turn(
+                    active_work_unit.as_ref(),
+                    &progress_outcomes,
+                    &progress_before_action,
+                    &progress_after_action,
+                    &gate_state,
+                    &mut effective_max_steps,
+                    nesting_depth,
+                    sink,
+                )?;
                 let control_violation = gate_state.borrow().workflow_control_violation.clone();
                 if control_violation.is_some() {
                     return Ok(StepRunOutcome {
@@ -6226,6 +6475,17 @@ fn run_agent_steps(
                     &progress_outcomes,
                     workspace_root,
                     &gate_state,
+                )?;
+                let progress_after_action = progress_state(workspace_root, &gate_state)?;
+                grant_work_unit_progress_turn(
+                    active_work_unit.as_ref(),
+                    &progress_outcomes,
+                    &progress_before_action,
+                    &progress_after_action,
+                    &gate_state,
+                    &mut effective_max_steps,
+                    nesting_depth,
+                    sink,
                 )?;
                 let control_violation = gate_state.borrow().workflow_control_violation.clone();
                 if control_violation.is_some() {
@@ -7399,6 +7659,12 @@ fn execute_tool_calls(
     let mut runnable = Vec::new();
     let mut results = Vec::new();
     for mut call in calls {
+        bind_work_unit_target(
+            &mut call,
+            env.args,
+            &env.gate_state.borrow(),
+            env.workspace_root,
+        )?;
         sink.emit(AgentEvent::ToolCall {
             tool: call.tool.clone(),
             arguments: call.arguments.clone(),
@@ -7891,12 +8157,128 @@ fn tool_evidence_effects(tool: &str, arguments: &Value, result: &str) -> String 
             .get("id")
             .and_then(Value::as_str)
             .map(|id| format!("named_check:{id}")),
-        "write_file" | "replace_file" | "edit_file" | "apply_patch" | "rm" => {
+        "write_file" | "write_files" | "replace_file" | "edit_file" | "apply_patch" | "rm" => {
             Some("workspace_mutation".to_string())
         }
         _ => None,
     }
     .unwrap_or_else(|| "none".to_string())
+}
+
+fn project_implementation_submission(
+    arguments: &Value,
+    request: &AgentRequest,
+    workspace_root: &Path,
+) -> Result<Value> {
+    let Some(ledger) = request
+        .workflow_work_units
+        .as_ref()
+        .filter(|ledger| ledger.is_initialized())
+    else {
+        return Ok(arguments.clone());
+    };
+    ledger.validate()?;
+    let repository = request
+        .repository_context
+        .as_ref()
+        .context("implementation projection requires repository authority")?;
+    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let actual_paths = repository
+        .task_baseline
+        .content
+        .changed_paths(&current)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut projected = arguments.clone();
+    let object = projected
+        .as_object_mut()
+        .context("submit_implementation arguments must be an object")?;
+    object.insert("plan_id".to_string(), json!(ledger.plan_id));
+    object.insert("plan_sha256".to_string(), json!(ledger.plan_sha256));
+    object.insert(
+        "content_fingerprint".to_string(),
+        json!(current.fingerprint),
+    );
+    object.insert("no_change".to_string(), json!(actual_paths.is_empty()));
+    let steps = object
+        .get_mut("steps")
+        .and_then(Value::as_array_mut)
+        .context("submit_implementation requires steps")?;
+    for step in steps {
+        let step = step
+            .as_object_mut()
+            .context("implementation step must be an object")?;
+        let step_id = step
+            .get("step_id")
+            .and_then(Value::as_str)
+            .context("implementation step requires step_id")?;
+        let touched_paths = ledger
+            .units
+            .iter()
+            .filter(|unit| unit.plan_step_id == step_id && actual_paths.contains(&unit.path))
+            .map(|unit| unit.path.clone())
+            .collect::<BTreeSet<_>>();
+        step.insert(
+            "touched_paths".to_string(),
+            serde_json::to_value(touched_paths)?,
+        );
+    }
+    Ok(projected)
+}
+
+fn project_code_review_submission(arguments: &Value, request: &AgentRequest) -> Result<Value> {
+    let Some(fingerprint) = request
+        .workflow_expected_content_fingerprint
+        .as_ref()
+        .filter(|fingerprint| !fingerprint.is_empty())
+    else {
+        return Ok(arguments.clone());
+    };
+    let mut projected = arguments.clone();
+    projected
+        .as_object_mut()
+        .context("submit_code_review arguments must be an object")?
+        .insert("content_fingerprint".to_string(), json!(fingerprint));
+    Ok(projected)
+}
+
+fn active_creation_batch_paths(
+    request: &AgentRequest,
+    gate_state: &GateState,
+    workspace_root: &Path,
+) -> Result<Vec<String>> {
+    let mut ledger = request
+        .workflow_work_units
+        .clone()
+        .context("write_files requires work-unit authority")?;
+    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let evidence_paths = gate_state
+        .stage_evidence
+        .read_paths()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    ledger.reconcile(&current, &evidence_paths)?;
+    let Some(start) = ledger
+        .units
+        .iter()
+        .position(|unit| unit.state != crate::workflow::WorkUnitState::StructurallyComplete)
+    else {
+        bail!("write_files has no active creation work unit");
+    };
+    let mut seen = BTreeSet::new();
+    let paths = ledger.units[start..]
+        .iter()
+        .take_while(|unit| {
+            unit.operation == crate::workflow::PlannedChange::Create
+                && unit.state == crate::workflow::WorkUnitState::MutationReady
+        })
+        .filter_map(|unit| seen.insert(unit.path.clone()).then_some(unit.path.clone()))
+        .take(4)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        bail!("write_files is available only for consecutive mutation-ready creation units");
+    }
+    Ok(paths)
 }
 
 fn append_workflow_content_fingerprint(
@@ -8293,6 +8675,164 @@ fn record_tool_progress(
     Ok(decision)
 }
 
+fn grant_work_unit_progress_turn(
+    active_unit: Option<&crate::workflow::WorkUnit>,
+    outcomes: &[ToolOutcomeSummary],
+    before: &ProgressState,
+    after: &ProgressState,
+    gate_state: &RefCell<GateState>,
+    effective_max_steps: &mut usize,
+    nesting_depth: usize,
+    sink: &mut dyn EventSink,
+) -> Result<()> {
+    let Some(unit) = active_unit else {
+        return Ok(());
+    };
+    if before == after || !outcomes.iter().any(|outcome| outcome.success) {
+        return Ok(());
+    }
+    let mut gate = gate_state.borrow_mut();
+    if gate.earned_work_unit_ids.len() >= crate::workflow::MAX_WORK_UNIT_PROGRESS_CREDITS
+        || !gate.earned_work_unit_ids.insert(unit.id.clone())
+    {
+        return Ok(());
+    }
+    sink.workflow_work_unit_progress_earned(&unit.id)?;
+    *effective_max_steps = effective_max_steps.saturating_add(1);
+    sink.emit(AgentEvent::Correction {
+        message: format!(
+            "Harness progress credit: work unit {} produced a new content/evidence transition; one bounded stage turn was earned ({}/4). Failed, repeated, cached, no-op, and bookkeeping actions earn no credit.",
+            unit.id,
+            gate.earned_work_unit_ids.len()
+        ),
+        summary: "Work-unit progress earned one bounded turn".to_string(),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
+    Ok(())
+}
+
+fn run_work_unit_diagnostic_previews(
+    args: &AgentRequest,
+    command_backend: Option<&CommandBackend>,
+    ledger: &mut crate::workflow::WorkUnitLedger,
+    gate_state: &RefCell<GateState>,
+    workspace_root: &Path,
+    nesting_depth: usize,
+    sink: &mut dyn EventSink,
+) -> Result<Option<String>> {
+    let Some(contract) = args.contract.as_ref() else {
+        return Ok(None);
+    };
+    let checks = contract
+        .checks
+        .iter()
+        .filter(|check| check.diagnostic_eligible)
+        .collect::<Vec<_>>();
+    if checks.is_empty() || !ledger.structurally_complete() {
+        return Ok(None);
+    }
+    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    if gate_state
+        .borrow()
+        .diagnostic_preview_fingerprint
+        .as_deref()
+        == Some(current.fingerprint.as_str())
+    {
+        return Ok(None);
+    }
+    let backend = command_backend.context(
+        "diagnostic-eligible harness checks require a configured project command backend",
+    )?;
+    let control_before = git_control_state(workspace_root)?;
+    let mut failed = Vec::new();
+    let mut focused_paths = BTreeSet::new();
+    for check in checks {
+        let output = backend.exec_check(check, workspace_root)?;
+        let success = output.exit_status == 0 && !output.timed_out && !output.cancelled;
+        sink.emit(AgentEvent::CheckResult {
+            check_id: check.id.clone(),
+            exit_status: output.exit_status,
+            success,
+            timed_out: output.timed_out,
+            output: output.output.clone(),
+            truncated: output.truncated,
+            duration_ms: output.duration_ms,
+            fingerprint: current.fingerprint.clone(),
+            command: Some(check.command.clone()),
+            cwd: Some(check.cwd.clone()),
+            executor: Some("project".to_string()),
+            source: Some("diagnostic_preview".to_string()),
+            command_fingerprint: None,
+            dependency_outputs: BTreeMap::new(),
+            output_fingerprint: None,
+            reused: false,
+            skip_reason: None,
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+        if !success {
+            for unit in &ledger.units {
+                if diagnostic_output_mentions_path(&output.output, &unit.path) {
+                    focused_paths.insert(unit.path.clone());
+                }
+            }
+            failed.push(format!(
+                "{} (status {}): {}",
+                check.id,
+                output.exit_status,
+                output.output.trim()
+            ));
+        }
+    }
+    let after = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let control_after = git_control_state(workspace_root)?;
+    if after.fingerprint != current.fingerprint || control_after != control_before {
+        gate_state.borrow_mut().workflow_control_violation = Some(
+            "diagnostic preview changed repository content or Git control state; preview evidence was discarded"
+                .to_string(),
+        );
+        bail!("diagnostic preview mutated the controlled workspace");
+    }
+    if !focused_paths.is_empty() {
+        ledger.mark_diagnostic_failed(focused_paths.iter().cloned(), &current)?;
+        {
+            let mut gate = gate_state.borrow_mut();
+            gate.stage_evidence
+                .entries
+                .retain(|entry| !focused_paths.contains(&entry.path));
+            for path in &focused_paths {
+                gate.read_paths.remove(path);
+                gate.read_content_fingerprints.remove(path);
+                gate.contract_read_evidence.remove(path);
+            }
+        }
+        let exact_evidence_paths = gate_state
+            .borrow()
+            .stage_evidence
+            .read_paths()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        ledger.reconcile(&current, &exact_evidence_paths)?;
+    }
+    let mut gate = gate_state.borrow_mut();
+    gate.diagnostic_preview_fingerprint = Some(current.fingerprint);
+    gate.diagnostic_failed_paths = focused_paths.clone();
+    drop(gate);
+    if failed.is_empty() {
+        Ok(Some(
+            "Harness diagnostic preview passed. This grants no selected-check, review, commit, or completion evidence; every check will run again authoritatively after implementation submission."
+                .to_string(),
+        ))
+    } else {
+        Ok(Some(format!(
+            "Harness diagnostic preview failed and grants no final evidence. Exact focused task paths: [{}]. Repair before submission when a path is named.\n{}",
+            focused_paths.into_iter().collect::<Vec<_>>().join(", "),
+            failed.join("\n")
+        )))
+    }
+}
+
 fn record_progress_warning(
     feedback: &str,
     nesting_depth: usize,
@@ -8482,6 +9022,7 @@ pub(crate) struct StageContext {
     pub expected_content_fingerprint: Option<String>,
     pub action_first_turn: bool,
     pub creation_path_order: Vec<String>,
+    pub work_units: Option<crate::workflow::WorkUnitLedger>,
 }
 
 #[derive(Debug, Clone)]
@@ -8491,6 +9032,8 @@ pub(crate) struct StageRunOutcome {
     pub usage: crate::workflow::WorkflowUsage,
     pub read_paths: Vec<String>,
     pub stage_evidence: crate::workflow::StageEvidenceBundle,
+    pub earned_work_unit_ids: BTreeSet<String>,
+    pub diagnostic_failed_paths: BTreeSet<String>,
     pub control_violation: Option<String>,
     metrics: RunMetrics,
 }
@@ -8535,6 +9078,7 @@ fn run_stage(
     args.workflow_expected_content_fingerprint = context.expected_content_fingerprint.clone();
     args.workflow_action_first_turn = context.action_first_turn;
     args.workflow_creation_path_order = context.creation_path_order.clone();
+    args.workflow_work_units = context.work_units.clone();
     // StageCapabilities is the authoritative allowlist. A legacy/direct-run allowlist must not
     // accidentally remove the required typed terminal action or add authority to this stage.
     args.tool_allowlist = None;
@@ -8604,12 +9148,16 @@ fn run_stage(
     read_paths.sort();
     let metrics = outcome.metrics.clone();
     let stage_evidence = outcome.gate_state.stage_evidence.clone();
+    let earned_work_unit_ids = outcome.gate_state.earned_work_unit_ids.clone();
+    let diagnostic_failed_paths = outcome.gate_state.diagnostic_failed_paths.clone();
     Ok(StageRunOutcome {
         submission: outcome.gate_state.workflow_submission.take(),
         termination_reason: outcome.termination_reason,
         usage,
         read_paths,
         stage_evidence,
+        earned_work_unit_ids,
+        diagnostic_failed_paths,
         control_violation: outcome.gate_state.workflow_control_violation,
         metrics,
     })
@@ -8705,6 +9253,11 @@ impl EventSink for WorkflowCheckpointingSink<'_> {
             advisory_calls: 1,
             ..crate::workflow::WorkflowUsage::default()
         })
+    }
+
+    fn workflow_work_unit_progress_earned(&mut self, unit_id: &str) -> Result<()> {
+        self.run.work_units.credit_progress(unit_id)?;
+        checkpoint_delivery(self.run, self.sink)
     }
 
     fn ask_user(&mut self, question: &str) -> Result<String> {
@@ -8970,7 +9523,7 @@ fn run_delivery_workflow(
     let mut validation_signature: Option<u64> = None;
     let mut repeated_validation_failures = 0usize;
     let mut repair_context: Option<String> = None;
-    let stage_step_limit = args.max_steps.clamp(1, policy.limits.stage_steps);
+    let base_stage_step_limit = args.max_steps.clamp(1, policy.limits.stage_steps);
 
     loop {
         if sink.should_pause() && !run.stage.is_terminal() {
@@ -9039,7 +9592,26 @@ fn run_delivery_workflow(
         ) {
             bail!("delivery orchestrator cannot execute stage {stage:?}");
         }
+        if matches!(
+            stage,
+            crate::workflow::WorkflowStage::Implementing
+                | crate::workflow::WorkflowStage::Repairing
+        ) && reconcile_work_unit_ledger(&mut run, args.contract.as_ref(), workspace_root)?
+        {
+            checkpoint_delivery(&run, sink)?;
+        }
         let consumed_stage_steps = run.counters.stage_steps.get(&stage).copied().unwrap_or(0);
+        let stage_step_limit = base_stage_step_limit.saturating_add(
+            if matches!(
+                stage,
+                crate::workflow::WorkflowStage::Implementing
+                    | crate::workflow::WorkflowStage::Repairing
+            ) {
+                run.work_units.progress_credited_units.len()
+            } else {
+                0
+            },
+        );
         if consumed_stage_steps >= stage_step_limit {
             run.apply(crate::workflow::WorkflowEvent::Failed {
                 outcome: crate::workflow::WorkflowOutcome::StepLimit,
@@ -9170,6 +9742,25 @@ fn run_delivery_workflow(
         metrics.add(&stage_outcome.metrics);
         run.stage_evidence
             .merge(stage_outcome.stage_evidence.clone())?;
+        if run.work_units.is_initialized() {
+            for unit_id in &stage_outcome.earned_work_unit_ids {
+                run.work_units.credit_progress(unit_id)?;
+            }
+            if !stage_outcome.diagnostic_failed_paths.is_empty() {
+                let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+                run.work_units.mark_diagnostic_failed(
+                    stage_outcome.diagnostic_failed_paths.iter().cloned(),
+                    &current,
+                )?;
+            }
+        }
+        if matches!(
+            stage,
+            crate::workflow::WorkflowStage::Implementing
+                | crate::workflow::WorkflowStage::Repairing
+        ) {
+            reconcile_work_unit_ledger(&mut run, args.contract.as_ref(), workspace_root)?;
+        }
         if matches!(
             stage,
             crate::workflow::WorkflowStage::Planning
@@ -9329,6 +9920,24 @@ fn run_delivery_workflow(
                         )
                     })
                     .and_then(|_| {
+                        if run.work_units.is_initialized() {
+                            let blocking_paths = review
+                                .artifact
+                                .findings
+                                .iter()
+                                .filter(|finding| finding.severity.is_blocking())
+                                .filter_map(|finding| finding.path.clone())
+                                .collect::<BTreeSet<_>>();
+                            if !blocking_paths.is_empty() {
+                                let current =
+                                    crate::workspace::ContentSnapshot::capture(workspace_root)?;
+                                run.stage_evidence
+                                    .entries
+                                    .retain(|entry| !blocking_paths.contains(&entry.path));
+                                run.work_units
+                                    .mark_diagnostic_failed(blocking_paths, &current)?;
+                            }
+                        }
                         run.apply(crate::workflow::WorkflowEvent::CodeReviewSubmitted {
                             review: review.clone(),
                         })
@@ -9703,6 +10312,14 @@ fn run_delivery_checks(
         )
     };
     let feedback = format!("{failure_details}{diagnostic_focus}");
+    if run.work_units.is_initialized() && !diagnostic_paths.is_empty() {
+        let diagnostic_path_set = diagnostic_paths.iter().collect::<BTreeSet<_>>();
+        run.stage_evidence
+            .entries
+            .retain(|entry| !diagnostic_path_set.contains(&entry.path));
+        run.work_units
+            .mark_diagnostic_failed(diagnostic_paths.iter().cloned(), &content_after)?;
+    }
     run.apply(crate::workflow::WorkflowEvent::ChecksFailed {
         content_fingerprint: content_after.fingerprint,
         selected_checks: plan.checks,
@@ -10039,13 +10656,14 @@ Use the native function-call interface described by the system tool schema. If n
 const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
 When the plan creates a missing file, call write_file with arguments such as {"path":"path/to/file.ext","content":"exact contents"}. Never call write_file for a path that already exists. For an existing file, first call read_file as one turn with {"path":"path/to/file.ext"}; after pb returns the real contents, call replace_file in a later turn with {"path":"path/to/file.ext","content":"complete replacement contents"}, or use edit_file/apply_patch with their declared schemas. Paths are relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Use the native function-call interface described by the system tool schema. If native calls are unavailable, use exactly one compatibility action with no markdown or surrounding prose, for example {"type":"tool_call","tool":"write_file","arguments":{"path":"...","content":"..."}}, {"type":"tool_call","tool":"read_file","arguments":{"path":"..."}}, or {"type":"tool_call","tool":"replace_file","arguments":{"path":"...","content":"..."}}. Never return an argument object by itself. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
 One action ends the current turn. After closing a compatibility JSON object, stop generating immediately. Never imitate pb's transcript or invent later tool results: do not output `Tool calls:`, `[tool]`, or `[assistant]`, and do not act as though a file changed until pb returns the real tool result and content fingerprint.
-After the last build-stage tool result, copy its exact "Harness current content fingerprint" into content_fingerprint. Required terminal action: call the provided submit_implementation function exactly once with arguments shaped as:
-{"id":"implementation-1","plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","content_fingerprint":"<exact latest harness fingerprint>","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","touched_paths":["path/to/file.ext"],"summary":"..."}],"summary":"...","no_change":false,"semantic_commit_subject":"feat: concise semantic subject"}
-Call submit_implementation natively or use exactly {"type":"tool_call","tool":"submit_implementation","arguments":<the argument object above>} with no markdown or surrounding prose. For a genuine no-change result, use status no_change, empty touched_paths, no_change true, and an empty semantic_commit_subject. Do not return an argument object, prose, or a final action."#;
+After the last work unit is structurally complete, call the provided submit_implementation function exactly once with arguments shaped as:
+{"id":"implementation-1","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","summary":"..."}],"summary":"...","semantic_commit_subject":"feat: concise semantic subject"}
+pb supplies the accepted plan id and digest, exact current content fingerprint, actual task-delta paths for each named step, and no-change judgment. Do not copy or invent those harness-owned fields. Call submit_implementation natively or use exactly {"type":"tool_call","tool":"submit_implementation","arguments":<the argument object above>} with no markdown or surrounding prose. For a genuine no-change result, use status no_change and an empty semantic_commit_subject. Do not return an argument object, prose, or a final action."#;
 
 const CODE_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_code_review function exactly once with arguments shaped as:
-{"id":"code-review-1","content_fingerprint":"<exact checked fingerprint>","assessments":[{"kind":"correctness","status":"pass","evidence":[],"explanation":"..."},{"kind":"requirements","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"tests","status":"pass","evidence":[],"explanation":"..."},{"kind":"regressions","status":"pass","evidence":[],"explanation":"..."},{"kind":"maintainability","status":"pass","evidence":[],"explanation":"..."}],"findings":[],"verdict":"pass"}
+{"id":"code-review-1","assessments":[{"kind":"correctness","status":"pass","evidence":[],"explanation":"..."},{"kind":"requirements","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"tests","status":"pass","evidence":[],"explanation":"..."},{"kind":"regressions","status":"pass","evidence":[],"explanation":"..."},{"kind":"maintainability","status":"pass","evidence":[],"explanation":"..."}],"findings":[],"verdict":"pass"}
+pb supplies the exact checked content fingerprint and retains the successful selected-check identifiers as harness-owned evidence.
 Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_code_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a finding shaped exactly as {"id":"finding-1","severity":"p1","path":"path/to/file.ext","line":1,"requirement_ids":["r1"],"plan_step_ids":["s1"],"evidence":[{"path":"path/to/file.ext","line":1,"description":"..."}],"explanation":"..."} and set verdict to revise. The field is severity with lowercase p1, not kind. For pass, include no p0/p1 finding. Do not return prose or a final action."#;
 
 fn workflow_terminal_submission_guidance(stage: crate::workflow::WorkflowStage) -> &'static str {
@@ -10123,8 +10741,8 @@ fn workflow_terminal_readiness(
     ) {
         return Ok(None);
     }
-    let current_content_fingerprint =
-        crate::workspace::ContentSnapshot::capture(workspace_root)?.fingerprint;
+    let current_snapshot = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let current_content_fingerprint = current_snapshot.fingerprint.clone();
     let expected_content_fingerprint = args.workflow_expected_content_fingerprint.clone();
     let mut missing = Vec::new();
     let terminal_tool =
@@ -10148,14 +10766,40 @@ fn workflow_terminal_readiness(
     if matches!(
         stage,
         crate::workflow::WorkflowStage::Implementing | crate::workflow::WorkflowStage::Repairing
-    ) && let Some(path) = args
-        .workflow_creation_path_order
-        .iter()
-        .find(|path| !workspace_root.join(path).exists())
-    {
-        missing.push(format!(
-            "accepted-plan creation path '{path}' is still missing"
-        ));
+    ) {
+        if let Some(mut ledger) = args.workflow_work_units.clone() {
+            let exact_evidence_paths = gate_state
+                .stage_evidence
+                .read_paths()
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
+            ledger.reconcile(&current_snapshot, &exact_evidence_paths)?;
+            if let Some(unit) = ledger.active() {
+                missing.push(format!(
+                    "work unit '{}' for {:?} '{}' is {:?}",
+                    unit.id, unit.operation, unit.path, unit.state
+                ));
+            }
+            if !gate_state.diagnostic_failed_paths.is_empty() {
+                missing.push(format!(
+                    "diagnostic preview still fails exact task path(s): {}",
+                    gate_state
+                        .diagnostic_failed_paths
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        } else if let Some(path) = args
+            .workflow_creation_path_order
+            .iter()
+            .find(|path| !workspace_root.join(path).exists())
+        {
+            missing.push(format!(
+                "accepted-plan creation path '{path}' is still missing"
+            ));
+        }
     }
     if stage == crate::workflow::WorkflowStage::CodeReview {
         let repository = args
@@ -10247,6 +10891,7 @@ fn delivery_stage_context(
                 expected_content_fingerprint: Some(run.planning_content().fingerprint.clone()),
                 action_first_turn: false,
                 creation_path_order: Vec::new(),
+                work_units: None,
             })
         }
         crate::workflow::WorkflowStage::PlanReview => {
@@ -10266,6 +10911,7 @@ fn delivery_stage_context(
                 expected_content_fingerprint: Some(run.planning_content().fingerprint.clone()),
                 action_first_turn: false,
                 creation_path_order: Vec::new(),
+                work_units: None,
             })
         }
         crate::workflow::WorkflowStage::Implementing
@@ -10289,11 +10935,12 @@ fn delivery_stage_context(
             let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
             let planned_path_state =
                 implementation_planned_path_state_json(run, &plan.artifact, &current)?;
+            let work_unit_ledger = serde_json::to_string_pretty(&run.work_units)?;
             let creation_path_order = plan_creation_path_order(&plan.artifact);
             Ok(StageContext {
-                system_prompt: "You are the implementation or repair stage of a harness-controlled delivery workflow. Implement exactly the accepted plan. A submit_implementation call only reports work; it never performs edits. When the plan requires a delta, first call the available write/edit tools in earlier turns, observe their results, and only then submit accounting for actual touched paths. Never report a touched path that you did not mutate. If validation reports an empty actual delta for a required change, call an edit tool next instead of repeating the submission. Built-in edits, configured run_task/run_check, and run_command are available, but run_command is only a journaled escape hatch and cannot earn check, review, or commit credit. You cannot commit. If the accepted plan is materially wrong, call request_replan. Otherwise account for every plan step and end only with submit_implementation using the exact current content fingerprint and actual touched paths.".to_string(),
+                system_prompt: "You are the implementation or repair stage of a harness-controlled delivery workflow. Implement exactly the accepted plan through the single harness-selected work unit and target-bound tools exposed on each turn. A submit_implementation call only reports completed accepted steps; it never performs edits. pb projects plan identity, current content fingerprint, actual task-delta paths, and the no-change judgment. You remain responsible for truthful step status, summaries, and a semantic commit subject. You cannot commit. If the accepted plan is materially wrong, call request_replan; otherwise finish only with submit_implementation after every work unit is structurally complete.".to_string(),
                 user_prompt: format!(
-                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nPassing plan critique:\n{review_json}\n\nCurrent harness content fingerprint: {}\n\nCurrent planned-path state (authoritative for this invocation; do not call write_file for a path whose state says it already exists):\n{planned_path_state}\n\nBlocking code findings from the prior review:\n{findings}\n\n{evidence_note}\n\n{handoff_note}\n\n{IMPLEMENTATION_SUBMISSION_GUIDANCE}{repair_note}{correction}",
+                    "Task:\n{}\n\nAccepted plan:\n{plan_json}\n\nPassing plan critique:\n{review_json}\n\nCurrent harness content fingerprint: {}\n\nCheckpointed harness work-unit ledger (authoritative order, target, operation, fingerprints, adoption, and structural state):\n{work_unit_ledger}\n\nCurrent planned-path state:\n{planned_path_state}\n\nBlocking code findings from the prior review:\n{findings}\n\n{evidence_note}\n\n{handoff_note}\n\n{IMPLEMENTATION_SUBMISSION_GUIDANCE}{repair_note}{correction}",
                     run.task, current.fingerprint,
                 ),
                 expected_content_fingerprint: None,
@@ -10302,8 +10949,9 @@ fn delivery_stage_context(
                     && plan_is_unambiguous_missing_path_creation(
                         &plan.artifact,
                         workspace_root,
-                    ),
+                ),
                 creation_path_order,
+                work_units: Some(run.work_units.clone()),
             })
         }
         crate::workflow::WorkflowStage::CodeReview => {
@@ -10341,6 +10989,7 @@ fn delivery_stage_context(
                 expected_content_fingerprint: Some(checked_fingerprint.to_string()),
                 action_first_turn: false,
                 creation_path_order: Vec::new(),
+                work_units: None,
             })
         }
         stage => bail!("cannot build planning context for {stage:?}"),
@@ -10415,6 +11064,57 @@ fn plan_creation_path_order(plan: &crate::workflow::PlanArtifact) -> Vec<String>
         .flat_map(|step| step.paths.iter())
         .filter_map(|path| seen.insert(path.path.clone()).then_some(path.path.clone()))
         .collect()
+}
+
+fn current_stage_evidence_paths(
+    run: &crate::workflow::WorkflowRun,
+    workspace_root: &Path,
+) -> Result<BTreeSet<String>> {
+    Ok(run
+        .stage_evidence
+        .current(workspace_root)?
+        .read_paths()
+        .map(str::to_string)
+        .collect())
+}
+
+fn reconcile_work_unit_ledger(
+    run: &mut crate::workflow::WorkflowRun,
+    contract: Option<&crate::harness_contract::AgentContract>,
+    workspace_root: &Path,
+) -> Result<bool> {
+    let plan = run
+        .plan
+        .as_ref()
+        .context("work-unit ledger requires an accepted plan")?;
+    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let exact_evidence_paths = current_stage_evidence_paths(run, workspace_root)?;
+    if !run.work_units.is_initialized() {
+        run.work_units = if contract.is_some_and(|contract| {
+            contract.mutation == crate::harness_contract::MutationRequirement::Forbidden
+        }) {
+            crate::workflow::WorkUnitLedger::no_change(
+                &plan.id,
+                &plan.sha256,
+                &run.repository.task_baseline.content,
+                &run.repository.invocation_baseline.content,
+                &current,
+            )?
+        } else {
+            crate::workflow::WorkUnitLedger::from_plan(
+                &plan.id,
+                &plan.sha256,
+                &plan.artifact,
+                &run.repository.task_baseline.content,
+                &run.repository.invocation_baseline.content,
+                &current,
+                &exact_evidence_paths,
+            )?
+        };
+        return Ok(true);
+    }
+    run.work_units.validate_plan(&plan.id, &plan.sha256)?;
+    run.work_units.reconcile(&current, &exact_evidence_paths)
 }
 
 fn delivery_repository_brief(
@@ -13134,6 +13834,84 @@ fn run_tool(
             context.gate_state.borrow_mut().record_content_mutation();
             Ok(format!("created {}", resolved.display()))
         }
+        "write_files" => {
+            let files = arguments
+                .get("files")
+                .and_then(Value::as_array)
+                .context("write_files requires array argument: files")?;
+            if files.is_empty() || files.len() > 4 {
+                bail!("write_files requires one to four complete file payloads");
+            }
+            let authority_paths = active_creation_batch_paths(
+                context.request,
+                &context.gate_state.borrow(),
+                workspace_root,
+            )?;
+            if files.len() > authority_paths.len() {
+                bail!(
+                    "write_files supplied {} payloads but only {} consecutive creation units are eligible",
+                    files.len(),
+                    authority_paths.len()
+                );
+            }
+            let mut prepared = Vec::with_capacity(files.len());
+            let mut combined_content_chars = 0usize;
+            for (index, file) in files.iter().enumerate() {
+                let content = file
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .with_context(|| format!("write_files files[{index}] requires content"))?;
+                combined_content_chars =
+                    combined_content_chars.saturating_add(content.chars().count());
+                let path = &authority_paths[index];
+                ensure_contract_paths_allowed(context.request, [path.as_str()])?;
+                let resolved = resolve_workspace_path(workspace_root, path, false)?;
+                if resolved.exists() {
+                    bail!("write_files refuses to overwrite existing file {path}");
+                }
+                prepared.push((path.clone(), resolved, content));
+            }
+            let payload_limit = mutation_payload_char_limit(boosted_max_tokens(context.request));
+            if combined_content_chars > payload_limit {
+                bail!(
+                    "write_files combined content exceeds the {payload_limit}-character mutation payload bound"
+                );
+            }
+            let mut created = Vec::new();
+            for (path, resolved, content) in &prepared {
+                if let Some(parent) = resolved.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                if let Err(error) = atomic_create_file(resolved, content.as_bytes()) {
+                    for (_, created_path) in created.iter().rev() {
+                        let _ = std::fs::remove_file(created_path);
+                    }
+                    return Err(error).with_context(|| {
+                        format!("write_files rolled back after failing to create {path}")
+                    });
+                }
+                created.push((path.clone(), resolved.clone()));
+            }
+            for (path, _, content) in &prepared {
+                sink.emit(AgentEvent::Diff {
+                    path: path.clone(),
+                    diff: bounded_tool_diff(unified_diff("", content, path)),
+                    nesting_depth: (context.request.sub_agent_depth > 0)
+                        .then_some(context.request.sub_agent_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+            }
+            context.gate_state.borrow_mut().record_content_mutation();
+            Ok(format!(
+                "created harness-bound batch: {}",
+                created
+                    .iter()
+                    .map(|(path, _)| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
         "replace_file" => {
             let path = arguments
                 .get("path")
@@ -13614,8 +14392,10 @@ fn run_tool(
             )
         }
         "submit_implementation" => {
+            let projected =
+                project_implementation_submission(arguments, context.request, workspace_root)?;
             let (implementation, normalized_json_string) =
-                parse_submission_artifact(arguments, "implementation")?;
+                parse_submission_artifact(&projected, "implementation")?;
             accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::Implementation { implementation },
@@ -13640,7 +14420,8 @@ fn run_tool(
             )
         }
         "submit_code_review" => {
-            let (review, normalized_json_string) = parse_submission_artifact(arguments, "review")?;
+            let projected = project_code_review_submission(arguments, context.request)?;
+            let (review, normalized_json_string) = parse_submission_artifact(&projected, "review")?;
             accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::CodeReview { review },
@@ -15908,6 +16689,7 @@ fn run_workspace_task(id: &str, context: &ToolContext<'_>) -> Result<String> {
             command: task.command.clone(),
             cwd: task.cwd.clone(),
             required: true,
+            diagnostic_eligible: false,
             timeout_seconds: task.timeout_seconds,
         },
         &isolated.root,
@@ -17706,6 +18488,7 @@ mod tests {
             workflow_expected_content_fingerprint: None,
             workflow_action_first_turn: false,
             workflow_creation_path_order: Vec::new(),
+            workflow_work_units: None,
             workflow_stage_evidence: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
@@ -17784,6 +18567,7 @@ mod tests {
             expected_content_fingerprint: None,
             action_first_turn: false,
             creation_path_order: Vec::new(),
+            work_units: None,
         }
     }
 
@@ -17837,7 +18621,7 @@ mod tests {
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("\"check_ids\":[\"required-check-id\"]"));
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("never modify or delete it before that create"));
         assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("submit_plan_review"));
-        assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Harness current content fingerprint"));
+        assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("exact current content fingerprint"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Never imitate pb's transcript"));
         assert!(
             IMPLEMENTATION_SUBMISSION_GUIDANCE
@@ -17887,6 +18671,32 @@ mod tests {
         assert_eq!(
             schema("edit_file").pointer("/properties/old_text/maxLength"),
             Some(&json!(limit / 2))
+        );
+    }
+
+    #[test]
+    fn work_unit_tool_schema_is_byte_stable_across_target_paths() {
+        let unit = |id: &str, path: &str| crate::workflow::WorkUnit {
+            id: id.to_string(),
+            plan_step_id: "step-1".to_string(),
+            operation: crate::workflow::PlannedChange::Create,
+            path: path.to_string(),
+            baseline_path_fingerprint: None,
+            invocation_path_fingerprint: None,
+            current_path_fingerprint: None,
+            adopted: false,
+            state: crate::workflow::WorkUnitState::MutationReady,
+        };
+        let mut alpha = all_builtin_tool_specs();
+        let mut beta = all_builtin_tool_specs();
+        scope_tools_to_work_unit(&mut alpha, &unit("s1:0", "alpha.txt"));
+        scope_tools_to_work_unit(&mut beta, &unit("s2:0", "nested/beta.txt"));
+        assert_eq!(model_tools_value(&alpha), model_tools_value(&beta));
+        assert!(!model_tools_value(&alpha).to_string().contains("alpha.txt"));
+        assert!(
+            !model_tools_value(&beta)
+                .to_string()
+                .contains("nested/beta.txt")
         );
     }
 
@@ -18075,6 +18885,7 @@ the next imagined action"#;
                 command: "true".to_string(),
                 cwd: ".".to_string(),
                 required: true,
+                diagnostic_eligible: false,
                 timeout_seconds: 2,
             }],
             commit: crate::harness_contract::HarnessCommitContract::default(),
@@ -18107,6 +18918,7 @@ the next imagined action"#;
                     command: "true".to_string(),
                     cwd: ".".to_string(),
                     required: true,
+                    diagnostic_eligible: false,
                     timeout_seconds: 2,
                 },
                 crate::harness_contract::AgentCheckContract {
@@ -18114,6 +18926,7 @@ the next imagined action"#;
                     command: "true".to_string(),
                     cwd: ".".to_string(),
                     required: false,
+                    diagnostic_eligible: false,
                     timeout_seconds: 2,
                 },
             ],
@@ -18319,6 +19132,302 @@ the next imagined action"#;
         assert_eq!(announced_paths.len(), 2);
         assert!(announced_paths[0].contains("index.html"));
         assert!(announced_paths[1].contains("styles.css"));
+    }
+
+    #[test]
+    fn typed_creation_batch_binds_ordered_paths_and_earns_one_real_progress_turn() {
+        let repo = init_contract_test_repo();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let mut artifact = delivery_plan(
+            Some(("alpha.txt", crate::workflow::PlannedChange::Create)),
+            Vec::new(),
+        )
+        .artifact;
+        artifact.steps[0].paths.push(crate::workflow::PlanPath {
+            path: "beta.txt".to_string(),
+            change: crate::workflow::PlannedChange::Create,
+        });
+        let plan = crate::workflow::ArtifactEnvelope::new("plan-batch", artifact).unwrap();
+        let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let ledger = crate::workflow::WorkUnitLedger::from_plan(
+            &plan.id,
+            &plan.sha256,
+            &plan.artifact,
+            &repository.task_baseline.content,
+            &repository.invocation_baseline.content,
+            &current,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        request.workflow_work_units = Some(ledger);
+        request.repository_context = Some(repository);
+        request.max_steps = 1;
+
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion(
+                    "write_files",
+                    json!({"files": [{"content": "alpha\n"}, {"content": "beta\n"}]}),
+                ),
+                tool_completion(
+                    "submit_implementation",
+                    json!({
+                        "id": "implementation-1",
+                        "steps": [{
+                            "step_id": "step-delivery",
+                            "status": "completed",
+                            "summary": "created both files"
+                        }],
+                        "summary": "created exact pair",
+                        "semantic_commit_subject": "feat: create exact pair"
+                    }),
+                ),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::Final);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("alpha.txt")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("beta.txt")).unwrap(),
+            "beta\n"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { summary, .. }
+                if summary == "Work-unit progress earned one bounded turn"
+        )));
+
+        let invalid_repo = init_contract_test_repo();
+        let invalid_repository =
+            crate::workspace::RepositoryContext::capture(invalid_repo.path(), invalid_repo.path())
+                .unwrap();
+        let invalid_current =
+            crate::workspace::ContentSnapshot::capture(invalid_repo.path()).unwrap();
+        let invalid_ledger = crate::workflow::WorkUnitLedger::from_plan(
+            &plan.id,
+            &plan.sha256,
+            &plan.artifact,
+            &invalid_repository.task_baseline.content,
+            &invalid_repository.invocation_baseline.content,
+            &invalid_current,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let mut invalid_request = workflow_request(AgentProfile::Build, invalid_repo.path());
+        invalid_request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        invalid_request.workflow_work_units = Some(invalid_ledger);
+        invalid_request.repository_context = Some(invalid_repository);
+        invalid_request.max_steps = 1;
+        run_scripted_agent_steps(
+            &invalid_request,
+            vec![tool_completion(
+                "write_files",
+                json!({"files": [{"content": "alpha\n"}, {}]}),
+            )],
+            invalid_repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(!invalid_repo.path().join("alpha.txt").exists());
+        assert!(!invalid_repo.path().join("beta.txt").exists());
+
+        let oversized_repo = init_contract_test_repo();
+        let oversized_repository = crate::workspace::RepositoryContext::capture(
+            oversized_repo.path(),
+            oversized_repo.path(),
+        )
+        .unwrap();
+        let mut oversized_artifact = plan.artifact.clone();
+        oversized_artifact.steps[0]
+            .paths
+            .push(crate::workflow::PlanPath {
+                path: "gamma.txt".to_string(),
+                change: crate::workflow::PlannedChange::Create,
+            });
+        let oversized_plan =
+            crate::workflow::ArtifactEnvelope::new("plan-oversized-batch", oversized_artifact)
+                .unwrap();
+        let oversized_current =
+            crate::workspace::ContentSnapshot::capture(oversized_repo.path()).unwrap();
+        let oversized_ledger = crate::workflow::WorkUnitLedger::from_plan(
+            &oversized_plan.id,
+            &oversized_plan.sha256,
+            &oversized_plan.artifact,
+            &oversized_repository.task_baseline.content,
+            &oversized_repository.invocation_baseline.content,
+            &oversized_current,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let mut oversized_request = workflow_request(AgentProfile::Build, oversized_repo.path());
+        oversized_request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        oversized_request.workflow_work_units = Some(oversized_ledger);
+        oversized_request.repository_context = Some(oversized_repository);
+        oversized_request.max_steps = 1;
+        oversized_request.turn_max_tokens_cap = Some(512);
+        let payload = "x".repeat(250);
+        run_scripted_agent_steps(
+            &oversized_request,
+            vec![tool_completion(
+                "write_files",
+                json!({"files": [
+                    {"content": payload},
+                    {"content": payload},
+                    {"content": payload}
+                ]}),
+            )],
+            oversized_repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        for path in ["alpha.txt", "beta.txt", "gamma.txt"] {
+            assert!(!oversized_repo.path().join(path).exists());
+        }
+    }
+
+    #[test]
+    fn implementation_projection_accounts_for_adopted_and_current_stage_paths() {
+        let repo = init_contract_test_repo();
+        std::fs::write(
+            repo.path().join("formatter.mjs"),
+            "export const value = 1;\n",
+        )
+        .unwrap();
+        git_run(&["add", "formatter.mjs"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "chore: seed formatter"], repo.path()).unwrap();
+        let task_baseline = crate::workspace::WorkspaceBaseline::capture(repo.path()).unwrap();
+        std::fs::write(
+            repo.path().join("formatter.mjs"),
+            "export const value = 2;\n",
+        )
+        .unwrap();
+        let repository =
+            crate::workspace::RepositoryContext::resume(repo.path(), repo.path(), task_baseline)
+                .unwrap();
+        std::fs::write(repo.path().join("formatter.test.mjs"), "// tests\n").unwrap();
+
+        let mut artifact = delivery_plan(
+            Some(("formatter.mjs", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        )
+        .artifact;
+        artifact.steps[0].paths.push(crate::workflow::PlanPath {
+            path: "formatter.test.mjs".to_string(),
+            change: crate::workflow::PlannedChange::Create,
+        });
+        let plan = crate::workflow::ArtifactEnvelope::new("plan-resume", artifact).unwrap();
+        let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let ledger = crate::workflow::WorkUnitLedger::from_plan(
+            &plan.id,
+            &plan.sha256,
+            &plan.artifact,
+            &repository.task_baseline.content,
+            &repository.invocation_baseline.content,
+            &current,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.repository_context = Some(repository);
+        request.workflow_work_units = Some(ledger);
+        let projected = project_implementation_submission(
+            &json!({
+                "id": "implementation-1",
+                "steps": [{
+                    "step_id": "step-delivery",
+                    "status": "completed",
+                    "touched_paths": ["formatter.test.mjs"],
+                    "summary": "added tests"
+                }],
+                "summary": "completed formatter work",
+                "semantic_commit_subject": "feat: complete formatter helpers"
+            }),
+            &request,
+            repo.path(),
+        )
+        .unwrap();
+        assert_eq!(projected["plan_id"], plan.id);
+        assert_eq!(projected["plan_sha256"], plan.sha256);
+        assert_eq!(
+            projected["steps"][0]["touched_paths"],
+            json!(["formatter.mjs", "formatter.test.mjs"])
+        );
+    }
+
+    #[test]
+    fn diagnostic_preview_focuses_exact_path_without_granting_check_evidence() {
+        let repo = init_contract_test_repo();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let plan = delivery_plan(
+            Some(("alpha.txt", crate::workflow::PlannedChange::Create)),
+            Vec::new(),
+        );
+        std::fs::write(repo.path().join("alpha.txt"), "broken\n").unwrap();
+        let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let mut ledger = crate::workflow::WorkUnitLedger::from_plan(
+            &plan.id,
+            &plan.sha256,
+            &plan.artifact,
+            &repository.task_baseline.content,
+            &repository.invocation_baseline.content,
+            &current,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(ledger.structurally_complete());
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.contract = Some(crate::harness_contract::AgentContract {
+            version: 1,
+            mutation: crate::harness_contract::MutationRequirement::Required,
+            allowed_paths: vec!["alpha.txt".to_string()],
+            checks: vec![crate::harness_contract::AgentCheckContract {
+                id: "preview".to_string(),
+                command: "echo 'alpha.txt: broken'; exit 1".to_string(),
+                cwd: ".".to_string(),
+                required: true,
+                diagnostic_eligible: true,
+                timeout_seconds: 2,
+            }],
+            commit: crate::harness_contract::HarnessCommitContract::default(),
+            review: crate::harness_contract::HarnessReviewContract::default(),
+            workspace_clean: false,
+        });
+        let backend = CommandBackend::Local {
+            workspace_root: repo.path().to_path_buf(),
+        };
+        let gate = RefCell::new(GateState::default());
+        let mut events = Vec::new();
+        let feedback = run_work_unit_diagnostic_previews(
+            &request,
+            Some(&backend),
+            &mut ledger,
+            &gate,
+            repo.path(),
+            0,
+            &mut |event| events.push(event),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(feedback.contains("alpha.txt"));
+        assert_eq!(ledger.active().unwrap().path, "alpha.txt");
+        assert!(gate.borrow().named_check_evidence.is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult { source: Some(source), .. }
+                if source == "diagnostic_preview"
+        )));
     }
 
     #[test]
@@ -19315,6 +20424,7 @@ the next imagined action"#;
                 command: contract_check.command.clone(),
                 cwd: contract_check.cwd.clone(),
                 required: true,
+                diagnostic_eligible: false,
                 timeout_seconds: contract_check.timeout_seconds,
             }],
             commit: crate::harness_contract::HarnessCommitContract {
@@ -19656,7 +20766,7 @@ the next imagined action"#;
         let bad_fingerprint = fingerprint_with_file_content(repo.path(), "existing.txt", "bad\n");
         let good_fingerprint = fingerprint_with_file_content(repo.path(), "existing.txt", "good\n");
         let graph = crate::workspace::WorkspaceGraph::legacy(&[
-            "test \"$(cat existing.txt)\" = good".to_string(),
+            "test \"$(cat existing.txt)\" = good || { echo existing.txt >&2; exit 1; }".to_string(),
         ]);
         let check_id = graph.checks.keys().next().unwrap().clone();
         let plan = delivery_plan(
@@ -19708,7 +20818,14 @@ the next imagined action"#;
 
         assert_eq!(
             outcome.checkpoint.run.outcome,
-            Some(crate::workflow::WorkflowOutcome::Ready)
+            Some(crate::workflow::WorkflowOutcome::Ready),
+            "{}\nevents: {events:#?}",
+            outcome
+                .checkpoint
+                .run
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("no blocked reason")
         );
         assert_eq!(outcome.checkpoint.run.counters.repair_cycles, 1);
         assert!(events.iter().any(|event| matches!(
@@ -19792,7 +20909,14 @@ the next imagined action"#;
 
         assert_eq!(
             outcome.checkpoint.run.outcome,
-            Some(crate::workflow::WorkflowOutcome::Ready)
+            Some(crate::workflow::WorkflowOutcome::Ready),
+            "{}\nevents: {events:#?}",
+            outcome
+                .checkpoint
+                .run
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("no blocked reason")
         );
         assert_eq!(outcome.checkpoint.run.counters.repair_cycles, 1);
         let code_review_starts = events
@@ -19824,7 +20948,7 @@ the next imagined action"#;
     }
 
     #[test]
-    fn implementation_outside_the_accepted_plan_fails_closed_after_bounded_retries() {
+    fn implementation_outside_the_accepted_plan_is_rejected_at_the_tool_boundary() {
         let repo = init_contract_test_repo();
         std::fs::write(repo.path().join("existing.txt"), "baseline\n").unwrap();
         git_run(&["add", "existing.txt"], repo.path()).unwrap();
@@ -19864,25 +20988,21 @@ the next imagined action"#;
 
         assert_eq!(
             outcome.checkpoint.run.outcome,
-            Some(crate::workflow::WorkflowOutcome::EngineError)
+            Some(crate::workflow::WorkflowOutcome::StepLimit)
         );
         assert!(outcome.checkpoint.run.commit.is_none());
+        assert!(!repo.path().join("outside.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("existing.txt")).unwrap(),
+            "baseline\n"
+        );
         assert_eq!(
             git_run(&["rev-parse", "HEAD"], repo.path()).unwrap(),
             head_before
         );
-        let corrections = events
-            .iter()
-            .filter(|event| matches!(event, AgentEvent::Correction { .. }))
-            .count();
-        assert_eq!(corrections, MAX_IDENTICAL_WORKFLOW_VALIDATION_FAILURES);
         assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::WorkflowBlocked {
-                outcome: crate::workflow::WorkflowOutcome::EngineError,
-                reason,
-                ..
-            } if reason.contains("outside the accepted plan")
+            event, AgentEvent::ToolResult { tool, result, .. }
+                if tool == "write_file" && result.contains("not exposed")
         )));
     }
 
@@ -19893,12 +21013,10 @@ the next imagined action"#;
         git_run(&["add", "existing.txt"], repo.path()).unwrap();
         git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
         let baseline = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
-        let plan = delivery_plan(
-            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
-            Vec::new(),
-        );
+        let plan = delivery_plan(None, Vec::new());
         let invalid =
-            implementation_submission(&plan, &baseline.fingerprint, vec!["existing.txt"], false);
+            implementation_submission(&plan, &baseline.fingerprint, vec!["existing.txt"], false)
+                .replace("\"step-delivery\"", "\"unknown-step\"");
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         let mut document = crate::workflow::WorkflowConfigDocument::default();
         document.limits.stage_steps = 2;
@@ -19931,15 +21049,8 @@ the next imagined action"#;
                 .get(&crate::workflow::WorkflowStage::Implementing),
             Some(&2)
         );
-        assert!(
-            outcome
-                .checkpoint
-                .run
-                .blocked_reason
-                .as_deref()
-                .unwrap()
-                .contains("cumulative 2-step budget")
-        );
+        let reason = outcome.checkpoint.run.blocked_reason.as_deref().unwrap();
+        assert!(reason.contains("cumulative 2-step budget"), "{reason}");
         assert!(generator.completions.is_empty());
         assert_eq!(
             events
@@ -19963,12 +21074,10 @@ the next imagined action"#;
         git_run(&["add", "existing.txt"], repo.path()).unwrap();
         git_run(&["commit", "-m", "test: add baseline"], repo.path()).unwrap();
         let baseline = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
-        let plan = delivery_plan(
-            Some(("existing.txt", crate::workflow::PlannedChange::Modify)),
-            Vec::new(),
-        );
+        let plan = delivery_plan(None, Vec::new());
         let invalid =
-            implementation_submission(&plan, &baseline.fingerprint, vec!["existing.txt"], false);
+            implementation_submission(&plan, &baseline.fingerprint, vec!["existing.txt"], false)
+                .replace("\"step-delivery\"", "\"unknown-step\"");
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         request.max_steps = 1;
         request.repository_context =
@@ -19999,15 +21108,8 @@ the next imagined action"#;
                 .get(&crate::workflow::WorkflowStage::Implementing),
             Some(&1)
         );
-        assert!(
-            outcome
-                .checkpoint
-                .run
-                .blocked_reason
-                .as_deref()
-                .unwrap()
-                .contains("cumulative 1-step budget")
-        );
+        let reason = outcome.checkpoint.run.blocked_reason.as_deref().unwrap();
+        assert!(reason.contains("cumulative 1-step budget"), "{reason}");
         assert_eq!(generator.completions.len(), 1);
         assert!(events.iter().all(|event| !matches!(
             event,
@@ -21022,6 +22124,7 @@ the next imagined action"#;
                 command: command.to_string(),
                 cwd: ".".to_string(),
                 required: true,
+                diagnostic_eligible: false,
                 timeout_seconds: 2,
             }],
             commit: crate::harness_contract::HarnessCommitContract::default(),
@@ -21729,6 +22832,7 @@ the next imagined action"#;
                 command: "true".to_string(),
                 cwd: ".".to_string(),
                 required: true,
+                diagnostic_eligible: false,
                 timeout_seconds: 2,
             }],
             commit: crate::harness_contract::HarnessCommitContract {
@@ -25908,6 +27012,7 @@ the next imagined action"#;
             workflow_expected_content_fingerprint: None,
             workflow_action_first_turn: false,
             workflow_creation_path_order: Vec::new(),
+            workflow_work_units: None,
             workflow_stage_evidence: None,
             workflow_checkpoint: None,
             conversation_handoff: None,
@@ -25986,6 +27091,7 @@ the next imagined action"#;
             workflow_expected_content_fingerprint: None,
             workflow_action_first_turn: false,
             workflow_creation_path_order: Vec::new(),
+            workflow_work_units: None,
             workflow_stage_evidence: None,
             workflow_checkpoint: None,
             conversation_handoff: None,

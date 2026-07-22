@@ -8,6 +8,7 @@
       "command": "deno test game-logic.test.mjs",
       "cwd": ".",
       "required": true,
+      "diagnostic_eligible": true,
       "timeout_seconds": 60
     }
   ],
