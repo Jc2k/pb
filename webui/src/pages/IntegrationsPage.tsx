@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   InstalledIntegration,
   IntegrationConfigSchemaResponse,
@@ -34,6 +34,17 @@ export function IntegrationsPage() {
   const [submitError, setSubmitError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [pageError, setPageError] = useState("");
+  const schemaRequest = useRef<{
+    id: number;
+    controller?: AbortController;
+  }>({ id: 0 });
+
+  const invalidateSchemaRequest = () => {
+    schemaRequest.current.controller?.abort();
+    schemaRequest.current = { id: schemaRequest.current.id + 1 };
+  };
+
+  useEffect(() => () => invalidateSchemaRequest(), []);
 
   useEffect(() => {
     void fetch("/api/integrations/marketplace")
@@ -113,11 +124,16 @@ export function IntegrationsPage() {
     setSchemaError("");
     setSubmitError("");
     setSchemaLoading(true);
+    schemaRequest.current.controller?.abort();
+    const requestId = schemaRequest.current.id + 1;
+    const controller = new AbortController();
+    schemaRequest.current = { id: requestId, controller };
     try {
       const res = await fetch(
         `/api/integrations/config-schema?image=${
           encodeURIComponent(pending.containerImage)
         }`,
+        { signal: controller.signal },
       );
       if (!res.ok) {
         throw new Error(
@@ -127,11 +143,23 @@ export function IntegrationsPage() {
           ),
         );
       }
-      setConfigSchema((await res.json()) as IntegrationConfigSchemaResponse);
+      const metadata = (await res.json()) as IntegrationConfigSchemaResponse;
+      if (
+        schemaRequest.current.id === requestId && !controller.signal.aborted
+      ) {
+        setConfigSchema(metadata);
+      }
     } catch (err) {
-      setSchemaError(err instanceof Error ? err.message : "Unknown error");
+      if (
+        schemaRequest.current.id === requestId && !controller.signal.aborted
+      ) {
+        setSchemaError(err instanceof Error ? err.message : "Unknown error");
+      }
     } finally {
-      setSchemaLoading(false);
+      if (schemaRequest.current.id === requestId) {
+        schemaRequest.current = { id: requestId };
+        setSchemaLoading(false);
+      }
     }
   };
 
@@ -179,6 +207,7 @@ export function IntegrationsPage() {
           await integrationApiError(res, "Could not install the integration"),
         );
       }
+      invalidateSchemaRequest();
       setPendingInstall(null);
       setConfigSchema(null);
       setSchemaError("");
@@ -195,6 +224,7 @@ export function IntegrationsPage() {
   };
 
   const cancelIntegration = () => {
+    invalidateSchemaRequest();
     setPendingInstall(null);
     setConfigSchema(null);
     setSchemaError("");

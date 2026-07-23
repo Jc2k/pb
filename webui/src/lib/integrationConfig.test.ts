@@ -73,7 +73,7 @@ Deno.test("integrationInstallPayload carries typed LSP defaults without pinning 
   const payload = integrationInstallPayload(
     {
       kind: "lsp",
-      containerImage: metadata.container_image,
+      containerImage: metadata.source_container_image!,
       name: "rust-analyzer",
     },
     {},
@@ -90,6 +90,31 @@ Deno.test("integrationInstallPayload carries typed LSP defaults without pinning 
     "ghcr.io/crunchy-pb/lsp-rust-analyzer:latest",
   );
   ok(!("runtime" in payload));
+});
+
+Deno.test("integrationInstallPayload rejects metadata fetched for another image", () => {
+  let error: unknown;
+  try {
+    integrationInstallPayload(
+      {
+        kind: "mcp",
+        containerImage: "ghcr.io/crunchy-pb/mcp-current:latest",
+        name: "mcp-current",
+      },
+      {},
+      {
+        container_image: "ghcr.io/crunchy-pb/mcp-stale@sha256:abc",
+        source_container_image: "ghcr.io/crunchy-pb/mcp-stale:latest",
+        manifest_digest: "sha256:abc",
+        annotation: "schema",
+        lsp_manifest_annotation: "manifest",
+      },
+    );
+  } catch (caught) {
+    error = caught;
+  }
+  ok(error instanceof Error);
+  ok(error.message.includes("no longer matches"));
 });
 
 Deno.test("integrationInstallPayload keeps the saved source while configuring a pinned image", () => {

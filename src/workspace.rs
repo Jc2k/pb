@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::Read;
 use std::path::{Component as PathComponent, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use globset::Glob;
@@ -187,6 +189,67 @@ impl ContentSnapshot {
         })
     }
 
+    pub(crate) fn capture_until(
+        repo_root: &Path,
+        deadline: Instant,
+        max_total_file_bytes: u64,
+    ) -> Result<Self> {
+        ensure_snapshot_time(deadline, "listing workspace paths")?;
+        let output = git_bytes_until(
+            repo_root,
+            &[
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+            deadline,
+            16 * 1024 * 1024,
+        )?;
+        let mut raw_paths = output
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        if raw_paths.len() > 100_000 {
+            bail!("workspace snapshot exceeds the 100000-path proactive bound");
+        }
+        raw_paths.sort_unstable();
+
+        let mut remaining_bytes = max_total_file_bytes;
+        let mut fingerprint = Sha256::new();
+        let mut paths = BTreeMap::new();
+        for raw_path in raw_paths {
+            ensure_snapshot_time(deadline, "reading workspace content")?;
+            let relative = std::str::from_utf8(raw_path)
+                .context("workspace contains a non-UTF-8 tracked or untracked path")?;
+            let normalized = relative.replace('\\', "/");
+            let (kind, bytes) =
+                path_content_until(repo_root, relative, deadline, &mut remaining_bytes)?;
+            if kind == "missing" {
+                continue;
+            }
+            fingerprint.update((raw_path.len() as u64).to_le_bytes());
+            fingerprint.update(raw_path);
+            fingerprint.update(kind.as_bytes());
+            fingerprint.update(&bytes);
+            let mut path_digest = Sha256::new();
+            path_digest.update(kind.as_bytes());
+            path_digest.update(&bytes);
+            paths.insert(
+                normalized,
+                PathContent {
+                    kind,
+                    fingerprint: format!("{:x}", path_digest.finalize()),
+                },
+            );
+        }
+        Ok(Self {
+            fingerprint: format!("{:x}", fingerprint.finalize()),
+            paths,
+        })
+    }
+
     pub fn changed_paths(&self, current: &Self) -> Vec<String> {
         self.paths
             .keys()
@@ -230,6 +293,147 @@ fn path_content(repo_root: &Path, relative: &str) -> Result<(String, Vec<u8>)> {
             Err(error).with_context(|| format!("failed to inspect path {}", path.display()))
         }
     }
+}
+
+fn path_content_until(
+    repo_root: &Path,
+    relative: &str,
+    deadline: Instant,
+    remaining_bytes: &mut u64,
+) -> Result<(String, Vec<u8>)> {
+    ensure_snapshot_time(deadline, "inspecting workspace content")?;
+    let path = repo_root.join(relative);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let bytes = std::fs::read_link(&path)
+                .with_context(|| format!("failed to read symlink {}", path.display()))?
+                .to_string_lossy()
+                .as_bytes()
+                .to_vec();
+            consume_snapshot_bytes(remaining_bytes, bytes.len() as u64)?;
+            Ok(("symlink".to_string(), bytes))
+        }
+        Ok(metadata) if metadata.is_file() => {
+            consume_snapshot_bytes(remaining_bytes, metadata.len())?;
+            let mut file = std::fs::File::open(&path)
+                .with_context(|| format!("failed to open worktree file {}", path.display()))?;
+            let mut bytes = Vec::with_capacity(
+                usize::try_from(metadata.len())
+                    .unwrap_or(usize::MAX)
+                    .min(1024 * 1024),
+            );
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                ensure_snapshot_time(deadline, "reading workspace content")?;
+                let count = file
+                    .read(&mut buffer)
+                    .with_context(|| format!("failed to read worktree file {}", path.display()))?;
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if bytes.len() as u64 > metadata.len() {
+                    bail!(
+                        "worktree file {} grew during bounded snapshot",
+                        path.display()
+                    );
+                }
+            }
+            Ok(("file".to_string(), bytes))
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(("directory".to_string(), Vec::new())),
+        Ok(_) => Ok(("other".to_string(), Vec::new())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(("missing".to_string(), Vec::new()))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect path {}", path.display()))
+        }
+    }
+}
+
+fn consume_snapshot_bytes(remaining: &mut u64, bytes: u64) -> Result<()> {
+    if bytes > *remaining {
+        bail!("workspace content exceeds the proactive snapshot byte bound");
+    }
+    *remaining -= bytes;
+    Ok(())
+}
+
+fn ensure_snapshot_time(deadline: Instant, operation: &str) -> Result<()> {
+    if Instant::now() >= deadline {
+        bail!("proactive workspace snapshot time bound expired while {operation}");
+    }
+    Ok(())
+}
+
+fn git_bytes_until(
+    repo_root: &Path,
+    args: &[&str],
+    deadline: Instant,
+    max_output_bytes: usize,
+) -> Result<Vec<u8>> {
+    ensure_snapshot_time(deadline, "starting Git workspace discovery")?;
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture git stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture git stderr")?;
+    let stdout_thread = std::thread::spawn(move || read_bounded_stream(stdout, max_output_bytes));
+    let stderr_thread = std::thread::spawn(move || read_bounded_stream(stderr, 64 * 1024));
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            bail!("proactive workspace snapshot time bound expired while running git");
+        }
+        std::thread::sleep(
+            Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    };
+    let (stdout, stdout_truncated) = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stdout reader stopped unexpectedly"))??;
+    let (stderr, _) = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stderr reader stopped unexpectedly"))??;
+    if stdout_truncated {
+        bail!("git workspace path listing exceeds the proactive output bound");
+    }
+    if !status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    Ok(stdout)
+}
+
+fn read_bounded_stream(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    Ok((bytes, truncated))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -783,6 +987,31 @@ fn default_timeout_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proactive_snapshot_rejects_expired_deadlines() {
+        let repo = tempfile::tempdir().unwrap();
+        let error = ContentSnapshot::capture_until(repo.path(), Instant::now(), 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("time bound expired"), "{error}");
+    }
+
+    #[test]
+    fn proactive_snapshot_enforces_aggregate_file_byte_bound() {
+        let repo = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        std::fs::write(repo.path().join("large.txt"), "four").unwrap();
+        let error =
+            ContentSnapshot::capture_until(repo.path(), Instant::now() + Duration::from_secs(2), 3)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("byte bound"), "{error}");
+    }
 
     fn init_repo() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();

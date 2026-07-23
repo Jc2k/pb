@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import type {
   ComposerMode,
@@ -594,6 +594,15 @@ export function ProjectSettingsPage() {
   const [integrationCategory, setIntegrationCategory] = useState<
     IntegrationKind | "all"
   >("all");
+  const schemaRequest = useRef<{
+    id: number;
+    controller?: AbortController;
+  }>({ id: 0 });
+  const invalidateSchemaRequest = () => {
+    schemaRequest.current.controller?.abort();
+    schemaRequest.current = { id: schemaRequest.current.id + 1 };
+  };
+  useEffect(() => () => invalidateSchemaRequest(), []);
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
   const filteredMarketplace = marketplace.filter((item) => {
@@ -715,11 +724,16 @@ export function ProjectSettingsPage() {
     setSchemaError("");
     setSubmitError("");
     setSchemaLoading(true);
+    schemaRequest.current.controller?.abort();
+    const requestId = schemaRequest.current.id + 1;
+    const controller = new AbortController();
+    schemaRequest.current = { id: requestId, controller };
     try {
       const res = await fetch(
         `/api/integrations/config-schema?image=${
           encodeURIComponent(pending.containerImage)
         }`,
+        { signal: controller.signal },
       );
       if (!res.ok) {
         throw new Error(
@@ -729,11 +743,23 @@ export function ProjectSettingsPage() {
           ),
         );
       }
-      setConfigSchema((await res.json()) as IntegrationConfigSchemaResponse);
+      const metadata = (await res.json()) as IntegrationConfigSchemaResponse;
+      if (
+        schemaRequest.current.id === requestId && !controller.signal.aborted
+      ) {
+        setConfigSchema(metadata);
+      }
     } catch (err) {
-      setSchemaError(err instanceof Error ? err.message : "Unknown error");
+      if (
+        schemaRequest.current.id === requestId && !controller.signal.aborted
+      ) {
+        setSchemaError(err instanceof Error ? err.message : "Unknown error");
+      }
     } finally {
-      setSchemaLoading(false);
+      if (schemaRequest.current.id === requestId) {
+        schemaRequest.current = { id: requestId };
+        setSchemaLoading(false);
+      }
     }
   };
 
@@ -784,6 +810,7 @@ export function ProjectSettingsPage() {
           await integrationApiError(res, "Could not install the integration"),
         );
       }
+      invalidateSchemaRequest();
       setPendingInstall(null);
       setConfigSchema(null);
       setSchemaError("");
@@ -797,6 +824,14 @@ export function ProjectSettingsPage() {
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const cancelIntegration = () => {
+    invalidateSchemaRequest();
+    setPendingInstall(null);
+    setConfigSchema(null);
+    setSchemaError("");
+    setSubmitError("");
   };
 
   return (
@@ -923,12 +958,7 @@ export function ProjectSettingsPage() {
                 error={schemaError}
                 submitError={submitError}
                 submitting={submitting}
-                onCancel={() => {
-                  setPendingInstall(null);
-                  setConfigSchema(null);
-                  setSchemaError("");
-                  setSubmitError("");
-                }}
+                onCancel={cancelIntegration}
                 onInstall={(env) => void installIntegration(env)}
               />
             </div>

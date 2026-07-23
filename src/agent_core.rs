@@ -5171,25 +5171,25 @@ struct ProactiveLspState {
 }
 
 impl ProactiveLspState {
-    fn new(args: &AgentRequest, workspace_root: &Path) -> Result<Self> {
-        let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    fn new(args: &AgentRequest, _workspace_root: &Path) -> Result<Self> {
         let previous = args
             .repository_context
             .as_ref()
             .map(|repository| repository.task_baseline.content.clone())
-            .unwrap_or_else(|| current.clone());
-        let mut state = Self {
+            .unwrap_or_else(|| crate::workspace::ContentSnapshot {
+                fingerprint: String::new(),
+                paths: BTreeMap::new(),
+            });
+        Ok(Self {
             event_namespace: format!("{}\0{}", args.session_id, args.turn_id),
             workspace_epoch: 0,
             previous,
             paths: BTreeMap::new(),
-        };
-        state.observe_snapshot(current);
-        Ok(state)
+        })
     }
 
-    fn observe(&mut self, workspace_root: &Path) -> Result<()> {
-        let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    fn observe_until(&mut self, workspace_root: &Path, deadline: Instant) -> Result<()> {
+        let current = lsp::proactive_workspace_snapshot(workspace_root, deadline)?;
         self.observe_snapshot(current);
         Ok(())
     }
@@ -5267,16 +5267,48 @@ fn run_proactive_lsp_pass(
     lsp_registry: &LspToolRegistry,
     state: &RefCell<ProactiveLspState>,
     workspace_root: &Path,
-    scope: &BTreeSet<String>,
+    scope: Option<&BTreeSet<String>>,
     mode: lsp::ProactiveLspMode,
     nesting_depth: usize,
     sink: &mut dyn EventSink,
     metrics: &mut RunMetrics,
 ) -> Result<Option<ProactiveLspPass>> {
-    if lsp_registry.servers.is_empty() || scope.is_empty() {
+    if lsp_registry.servers.is_empty() || scope.is_some_and(BTreeSet::is_empty) {
         return Ok(None);
     }
-    state.borrow_mut().observe(workspace_root)?;
+    let pass_deadline = lsp::proactive_pass_deadline();
+    if let Err(error) = state
+        .borrow_mut()
+        .observe_until(workspace_root, pass_deadline)
+    {
+        sink.emit(AgentEvent::TeamMessage {
+            actor: crate::events::TeamActor::workflow_steward(),
+            tone: crate::events::TeamMessageTone::Warning,
+            message:
+                "Automatic language-server diagnostics were skipped within their safety bound."
+                    .to_string(),
+            detail: Some(truncate_chars(&format!("{error:#}"), 1_000)),
+            evidence_ids: Vec::new(),
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+        return Ok(None);
+    }
+    let inferred_scope;
+    let scope = if let Some(scope) = scope {
+        scope
+    } else {
+        inferred_scope = state
+            .borrow()
+            .paths
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        &inferred_scope
+    };
+    if scope.is_empty() {
+        return Ok(None);
+    }
     let candidates = state.borrow().candidates(scope, mode);
     let selection = lsp::proactive_supported_paths(lsp_registry, candidates);
     if selection.paths.is_empty() {
@@ -5316,12 +5348,14 @@ fn run_proactive_lsp_pass(
     });
     let energy_start = energy::sample();
     let started = Instant::now();
-    let mut report = lsp::proactive_diagnostics(
+    let mut report = lsp::proactive_diagnostics_until(
         lsp_registry,
         workspace_root,
         selection.paths,
         mode,
         workspace_epoch,
+        state.borrow().previous.clone(),
+        pass_deadline,
     )?;
     report.defer_omitted_paths(selection.omitted_paths);
     let duration_ms = duration_millis(started);
@@ -5855,9 +5889,6 @@ fn run_agent_steps(
             timestamp_ms: Some(now_millis()),
         });
 
-        if let Some(proactive_lsp) = proactive_lsp.as_ref() {
-            proactive_lsp.borrow_mut().observe(workspace_root)?;
-        }
         if let Some(ledger) = work_units.as_mut() {
             let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
             let exact_evidence_paths = gate_state
@@ -5878,7 +5909,7 @@ fn run_agent_steps(
                     lsp_registry,
                     proactive_lsp,
                     workspace_root,
-                    &proactive_scope,
+                    Some(&proactive_scope),
                     proactive_mode,
                     nesting_depth,
                     sink,
@@ -6503,29 +6534,12 @@ fn run_agent_steps(
                     step += 1;
                     continue;
                 }
-                let proactive_scope = args
-                    .repository_context
-                    .as_ref()
-                    .map(crate::workspace::RepositoryContext::task_changed_paths)
-                    .transpose()?
-                    .map(|paths| paths.into_iter().collect::<BTreeSet<_>>())
-                    .or_else(|| {
-                        proactive_lsp.as_ref().map(|state| {
-                            state
-                                .borrow()
-                                .paths
-                                .keys()
-                                .cloned()
-                                .collect::<BTreeSet<_>>()
-                        })
-                    })
-                    .unwrap_or_default();
                 if let Some(proactive_lsp) = proactive_lsp.as_ref()
                     && let Some(pass) = run_proactive_lsp_pass(
                         lsp_registry,
                         proactive_lsp,
                         workspace_root,
-                        &proactive_scope,
+                        None,
                         lsp::ProactiveLspMode::Settled,
                         nesting_depth,
                         sink,
@@ -7197,29 +7211,12 @@ fn run_agent_steps(
         }
 
         if step == original_max_steps && args.workflow_stage.is_none() {
-            let proactive_scope = args
-                .repository_context
-                .as_ref()
-                .map(crate::workspace::RepositoryContext::task_changed_paths)
-                .transpose()?
-                .map(|paths| paths.into_iter().collect::<BTreeSet<_>>())
-                .or_else(|| {
-                    proactive_lsp.as_ref().map(|state| {
-                        state
-                            .borrow()
-                            .paths
-                            .keys()
-                            .cloned()
-                            .collect::<BTreeSet<_>>()
-                    })
-                })
-                .unwrap_or_default();
             if let Some(proactive_lsp) = proactive_lsp.as_ref()
                 && let Some(pass) = run_proactive_lsp_pass(
                     lsp_registry,
                     proactive_lsp,
                     workspace_root,
-                    &proactive_scope,
+                    None,
                     lsp::ProactiveLspMode::Settled,
                     nesting_depth,
                     sink,
@@ -29901,7 +29898,7 @@ the next imagined action"#;
             &registry,
             &state,
             repo.path(),
-            &BTreeSet::from(["src/lib.rs".to_string()]),
+            None,
             lsp::ProactiveLspMode::Settled,
             0,
             &mut sink,

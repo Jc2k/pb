@@ -342,9 +342,13 @@ pub fn marketplace_container_image(repo_name: &str) -> String {
 }
 
 pub fn is_marketplace_container_image(image: &str) -> bool {
-    image
-        .trim()
-        .starts_with(&format!("ghcr.io/{MARKETPLACE_ORG}/"))
+    RegistryImage::parse(image).is_ok_and(|image| {
+        image.registry == "ghcr.io"
+            && image
+                .repository
+                .strip_prefix(MARKETPLACE_ORG)
+                .is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1)
+    })
 }
 
 pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSchema> {
@@ -445,8 +449,8 @@ impl RegistryImage {
             bail!("container image must include a registry and repository");
         }
         Ok(Self {
-            registry: registry.to_string(),
-            repository: repository.to_string(),
+            registry: registry.trim_end_matches('.').to_ascii_lowercase(),
+            repository: repository.to_ascii_lowercase(),
             reference: reference.to_string(),
         })
     }
@@ -525,7 +529,7 @@ fn fetch_registry_config(image: &RegistryImage, manifest: &Value) -> Result<Valu
     } else {
         let digest = select_runnable_manifest_digest(manifest)
             .context("image index does not contain a runnable manifest digest")?;
-        fetch_registry_json_document(
+        fetch_registry_json_document_with_digest(
             image,
             &image.manifest_digest_url(digest),
             &[
@@ -534,6 +538,7 @@ fn fetch_registry_config(image: &RegistryImage, manifest: &Value) -> Result<Valu
             ]
             .join(", "),
             "platform image manifest",
+            digest,
         )?
         .value
     };
@@ -542,7 +547,7 @@ fn fetch_registry_config(image: &RegistryImage, manifest: &Value) -> Result<Valu
         .and_then(|config| config.get("digest"))
         .and_then(Value::as_str)
         .context("image manifest does not contain a config digest")?;
-    Ok(fetch_registry_json_document(
+    Ok(fetch_registry_json_document_with_digest(
         image,
         &image.blob_url(digest),
         &[
@@ -552,8 +557,42 @@ fn fetch_registry_config(image: &RegistryImage, manifest: &Value) -> Result<Valu
         ]
         .join(", "),
         "image config",
+        digest,
     )?
     .value)
+}
+
+fn fetch_registry_json_document_with_digest(
+    image: &RegistryImage,
+    url: &str,
+    accept: &str,
+    context: &str,
+    expected_digest: &str,
+) -> Result<RegistryDocument> {
+    let document = fetch_registry_json_document(image, url, accept, context)?;
+    verify_registry_document_digest(document, expected_digest, context)
+}
+
+fn verify_registry_document_digest(
+    document: RegistryDocument,
+    expected_digest: &str,
+    context: &str,
+) -> Result<RegistryDocument> {
+    if !is_sha256_digest(expected_digest) {
+        bail!("{context} uses an invalid sha256 digest");
+    }
+    if document.digest != expected_digest {
+        bail!("{context} content does not match the digest selected by its parent manifest");
+    }
+    Ok(document)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn select_runnable_manifest_digest(manifest: &Value) -> Option<&str> {
@@ -642,13 +681,7 @@ fn read_bounded_registry_document(
         .headers()
         .get("docker-content-digest")
         .and_then(|value| value.to_str().ok())
-        .filter(|value| {
-            value.len() == 71
-                && value.starts_with("sha256:")
-                && value[7..]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
+        .filter(|value| is_sha256_digest(value))
         .map(str::to_string);
     if response
         .content_length()
@@ -935,6 +968,7 @@ pub fn install_project(
                 env: request.env.clone(),
                 ..Default::default()
             };
+            let verified_manifest_digest = server_config.verified_manifest_digest.clone();
             ProjectMcpConfig::mutate(workspace_root, |config| {
                 if request.no_overwrite && config.servers.contains_key(&name) {
                     bail!("MCP integration '{name}' is already installed");
@@ -948,7 +982,7 @@ pub fn install_project(
                     kind: IntegrationKind::Mcp,
                     container_image: request.container_image,
                     source_container_image: request.source_container_image,
-                    verified_manifest_digest: None,
+                    verified_manifest_digest,
                     env: request.env,
                     disabled: false,
                     status,
@@ -974,10 +1008,17 @@ pub fn remove_project(
         bail!("integration name cannot be empty or contain newlines");
     }
     let server = ProjectMcpConfig::mutate(workspace_root, |config| {
-        config
+        let server = config
+            .servers
+            .get(name)
+            .with_context(|| format!("MCP integration '{name}' is not installed"))?;
+        if server.container_image.is_none() {
+            bail!("configured MCP server is not a container integration");
+        }
+        Ok(config
             .servers
             .remove(name)
-            .with_context(|| format!("MCP integration '{name}' is not installed"))
+            .expect("server was checked above"))
     })?;
     let status = server.container_image.as_deref().map(|image| {
         container_installation_status(image, server.container_runtime.as_deref(), server.disabled)
@@ -1138,12 +1179,25 @@ pub fn remove_global_lsp(name: &str) -> Result<IntegrationRemoveResponse> {
     if name.trim().is_empty() || name.contains(['\n', '\r']) {
         bail!("integration name cannot be empty or contain newlines");
     }
-    let server = UserConfig::mutate(|user_config| {
-        user_config
+    let path = config::config_path()?;
+    remove_global_lsp_from_path(&path, name)
+}
+
+fn remove_global_lsp_from_path(path: &Path, name: &str) -> Result<IntegrationRemoveResponse> {
+    let server = UserConfig::mutate_path(path, |user_config| {
+        let server = user_config
+            .lsp
+            .servers
+            .get(name)
+            .with_context(|| format!("LSP integration '{name}' is not installed"))?;
+        if server.container_image.is_none() {
+            bail!("configured LSP server is not a container integration");
+        }
+        Ok(user_config
             .lsp
             .servers
             .remove(name)
-            .with_context(|| format!("LSP integration '{name}' is not installed"))
+            .expect("server was checked above"))
     })?;
     let status = lsp_installation_status(&server);
     let source_container_image = server.source_container_image.clone();
@@ -1162,7 +1216,7 @@ pub fn remove_global_lsp(name: &str) -> Result<IntegrationRemoveResponse> {
             disabled: server.disabled,
             status,
         },
-        config_path: config::config_path()?.display().to_string(),
+        config_path: path.display().to_string(),
     })
 }
 
@@ -1190,14 +1244,26 @@ mod tests {
         assert!(is_marketplace_container_image(
             "ghcr.io/crunchy-pb/lsp-rust-analyzer:latest"
         ));
+        assert!(is_marketplace_container_image(
+            "GHCR.IO/crunchy-pb/lsp-rust-analyzer:latest"
+        ));
+        assert!(is_marketplace_container_image(
+            "ghcr.io/CRUNCHY-PB/lsp-rust-analyzer:latest"
+        ));
+        assert!(is_marketplace_container_image(
+            "ghcr.io./crunchy-pb/lsp-rust-analyzer:latest"
+        ));
         assert!(!is_marketplace_container_image(
             "ghcr.io/example/lsp-rust-analyzer:latest"
+        ));
+        assert!(!is_marketplace_container_image(
+            "ghcr.io/crunchy-pb.evil/lsp-rust-analyzer:latest"
         ));
     }
 
     #[test]
     fn registry_image_parse_splits_registry_repository_and_tag() {
-        let image = RegistryImage::parse("ghcr.io/crunchy-pb/mcp-sentry:latest").unwrap();
+        let image = RegistryImage::parse("GHCR.IO./crunchy-pb/mcp-sentry:latest").unwrap();
         assert_eq!(image.registry, "ghcr.io");
         assert_eq!(image.repository, "crunchy-pb/mcp-sentry");
         assert_eq!(image.reference, "latest");
@@ -1205,6 +1271,39 @@ mod tests {
             image.manifest_url(),
             "https://ghcr.io/v2/crunchy-pb/mcp-sentry/manifests/latest"
         );
+    }
+
+    #[test]
+    fn digest_addressed_registry_documents_must_match_the_parent_digest() {
+        let bytes = br#"{"schemaVersion":2}"#;
+        let digest = format!("sha256:{}", crate::environment_lock::sha256(bytes));
+        let document = RegistryDocument {
+            value: serde_json::from_slice(bytes).unwrap(),
+            digest: digest.clone(),
+        };
+        assert!(verify_registry_document_digest(document, &digest, "image config").is_ok());
+
+        let mismatch = RegistryDocument {
+            value: serde_json::json!({"schemaVersion": 2}),
+            digest,
+        };
+        assert!(
+            verify_registry_document_digest(
+                mismatch,
+                &format!("sha256:{}", "0".repeat(64)),
+                "image config"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn digest_addressed_registry_documents_reject_malformed_parent_digests() {
+        let document = RegistryDocument {
+            value: serde_json::json!({}),
+            digest: format!("sha256:{}", "0".repeat(64)),
+        };
+        assert!(verify_registry_document_digest(document, "sha256:abc", "image config").is_err());
     }
 
     #[test]
@@ -1330,6 +1429,47 @@ mod tests {
     }
 
     #[test]
+    fn remove_project_preserves_non_container_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        ProjectMcpConfig::mutate(dir.path(), |config| {
+            config.servers.insert(
+                "local".to_string(),
+                McpServerConfig {
+                    command: Some("local-mcp".to_string()),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(remove_project(dir.path(), IntegrationKind::Mcp, "local").is_err());
+        let config = ProjectMcpConfig::load(dir.path()).unwrap().unwrap();
+        assert!(config.servers.contains_key("local"));
+    }
+
+    #[test]
+    fn remove_global_lsp_preserves_non_container_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        UserConfig::mutate_path(&path, |config| {
+            config.lsp.servers.insert(
+                "local".to_string(),
+                LspServerConfig {
+                    command: Some("local-lsp".to_string()),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(remove_global_lsp_from_path(&path, "local").is_err());
+        let config = UserConfig::load_from_path(&path).unwrap();
+        assert!(config.lsp.servers.contains_key("local"));
+    }
+
+    #[test]
     fn install_writes_project_scoped_mcp_config() {
         let dir = tempfile::tempdir().unwrap();
         let response = install_project(
@@ -1382,6 +1522,10 @@ mod tests {
         assert_eq!(
             response.installed.source_container_image.as_deref(),
             Some("ghcr.io/example/sentry-mcp:stable")
+        );
+        assert_eq!(
+            response.installed.verified_manifest_digest.as_deref(),
+            Some("sha256:abc")
         );
         let installed = list_project_installed(dir.path()).unwrap();
         assert_eq!(installed.len(), 1);

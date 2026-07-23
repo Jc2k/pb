@@ -163,7 +163,9 @@ evidence; deleting the containing finished session through the existing session-
 removes its pb session note and Goal state under the same cleanup contract.
 
 If verified container or network cleanup fails, pb keeps the local lease record in a failed state
-and retries it later. It does not erase the only inventory of resources that may still need removal.
+and retries it later together with the session workspace. It does not erase the only inventory of
+resources that may still need removal; a dirty or otherwise unremovable workspace keeps that
+recovery record intact.
 
 Likewise, a managed commit is local evidence. pb intentionally stops before remote publication. A
 future publication flow must have its own approval, idempotency, provider, and audit contracts.

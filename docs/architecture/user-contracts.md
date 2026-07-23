@@ -132,6 +132,9 @@ and staging evidence for only the exact reported paths and requires a fresh read
 Clean, failed, timed-out, or unavailable LSP evidence never satisfies a named check, review,
 commit, completion claim, or Goal criterion. The model may still call manual read-only LSP tools
 for targeted questions, but it is not responsible for triggering the proactive contract.
+The proactive budget begins before repository observation: an oversized workspace, blocked launch,
+blocked stdin, or revalidation timeout becomes visible incomplete advisory evidence and cannot delay
+the controller beyond the pass deadline or be mistaken for a clean result.
 
 ## Evidence contract
 

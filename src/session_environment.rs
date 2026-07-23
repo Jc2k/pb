@@ -1099,12 +1099,16 @@ impl EnvironmentSupervisor {
     }
 
     pub fn retry_failed_cleanup(&self) -> Result<Vec<String>> {
-        self.retry_failed_cleanup_with(|binary| container::runtime_for_binary(binary))
+        self.retry_failed_cleanup_with(
+            |binary| container::runtime_for_binary(binary),
+            cleanup_persistent_session_workspace,
+        )
     }
 
     fn retry_failed_cleanup_with(
         &self,
         mut runtime_for_binary: impl FnMut(&str) -> Result<Box<dyn ContainerRuntime>>,
+        mut cleanup_workspace: impl FnMut(&str) -> Result<()>,
     ) -> Result<Vec<String>> {
         let records_dir = self.records_dir();
         std::fs::create_dir_all(&records_dir)?;
@@ -1129,7 +1133,8 @@ impl EnvironmentSupervisor {
                 continue;
             }
             let result = runtime_for_binary(&record.runtime_binary)
-                .and_then(|runtime| cleanup_recorded_resources(&record, runtime.as_ref()));
+                .and_then(|runtime| cleanup_recorded_resources(&record, runtime.as_ref()))
+                .and_then(|()| cleanup_workspace(&record.session_id));
             match result {
                 Ok(()) => {
                     if entry.path().exists() {
@@ -1161,6 +1166,20 @@ impl EnvironmentSupervisor {
             crate::environment_lock::sha256(session_id.as_bytes())
         ))
     }
+}
+
+fn cleanup_persistent_session_workspace(session_id: &str) -> Result<()> {
+    let manager = crate::session_workspace::WorkspaceManager::persistent()?;
+    let Some(record) = manager.find_record_by_session(session_id)? else {
+        return Ok(());
+    };
+    if !manager.remove(&record, false)? {
+        bail!(
+            "session workspace {} contains uncommitted changes and was preserved",
+            record.worktree_root.display()
+        );
+    }
+    Ok(())
 }
 
 struct SessionOperationLock {
@@ -1979,15 +1998,89 @@ mod tests {
 
         state.fail_inventory.store(false, Ordering::Release);
         let cleaned = supervisor
-            .retry_failed_cleanup_with(|_| {
-                Ok(Box::new(FakeRuntime {
-                    state: Arc::clone(&state),
-                }))
-            })
+            .retry_failed_cleanup_with(
+                |_| {
+                    Ok(Box::new(FakeRuntime {
+                        state: Arc::clone(&state),
+                    }))
+                },
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(cleaned, vec!["s1".to_string()]);
         assert!(!record_path.exists());
         assert!(state.containers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_cleanup_keeps_lease_until_workspace_cleanup_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let supervisor = Box::leak(Box::new(EnvironmentSupervisor::new(
+            dir.path().to_path_buf(),
+        )));
+        let state = state();
+        let handle = supervisor
+            .acquire(
+                seed(dir.path()),
+                Box::new(FakeRuntime {
+                    state: Arc::clone(&state),
+                }),
+                Vec::new(),
+                true,
+                {
+                    let state = Arc::clone(&state);
+                    move |runtime| {
+                        state
+                            .containers
+                            .lock()
+                            .unwrap()
+                            .insert("pb-task-s1".to_string());
+                        Ok(ContainerHandle {
+                            runtime,
+                            container_id: "pb-task-s1".to_string(),
+                            network: None,
+                        })
+                    }
+                },
+            )
+            .unwrap();
+        drop(handle);
+        state.fail_inventory.store(true, Ordering::Release);
+        assert!(supervisor.terminate("s1").is_err());
+        state.fail_inventory.store(false, Ordering::Release);
+
+        let record_path = supervisor.record_path("s1");
+        let mut workspace_attempts = 0;
+        assert!(
+            supervisor
+                .retry_failed_cleanup_with(
+                    |_| {
+                        Ok(Box::new(FakeRuntime {
+                            state: Arc::clone(&state),
+                        }))
+                    },
+                    |_| {
+                        workspace_attempts += 1;
+                        bail!("workspace cleanup failed")
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(workspace_attempts, 1);
+        assert!(record_path.exists());
+
+        let cleaned = supervisor
+            .retry_failed_cleanup_with(
+                |_| {
+                    Ok(Box::new(FakeRuntime {
+                        state: Arc::clone(&state),
+                    }))
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(cleaned, vec!["s1".to_string()]);
+        assert!(!record_path.exists());
     }
 
     #[test]

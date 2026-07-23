@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -24,6 +26,7 @@ const MAX_PROACTIVE_LSP_PATHS: usize = 8;
 const MAX_PROACTIVE_LSP_CALLS: usize = 8;
 const MAX_PROACTIVE_LSP_DIAGNOSTICS: usize = 64;
 const MAX_PROACTIVE_LSP_MESSAGE_CHARS: usize = 500;
+const MAX_PROACTIVE_LSP_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 pub const PROACTIVE_LSP_TOOL_NAME: &str = "lsp_proactive_diagnostics";
 
@@ -303,6 +306,49 @@ fn read_bounded_utf8(path: &Path, max_bytes: u64, label: &str) -> Result<String>
             "{label} {} grew beyond the {max_bytes}-byte input bound",
             path.display()
         );
+    }
+    String::from_utf8(bytes).with_context(|| format!("{label} is not valid UTF-8"))
+}
+
+fn read_bounded_utf8_until(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+    deadline: Instant,
+) -> Result<String> {
+    if Instant::now() >= deadline {
+        bail!("timed out before reading {label} {}", path.display());
+    }
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat {label} {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        bail!(
+            "{label} {} exceeds the {max_bytes}-byte input bound",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if Instant::now() >= deadline {
+            bail!("timed out reading {label} {}", path.display());
+        }
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {label} {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes.len() as u64 > max_bytes {
+            bail!(
+                "{label} {} grew beyond the {max_bytes}-byte input bound",
+                path.display()
+            );
+        }
     }
     String::from_utf8(bytes).with_context(|| format!("{label} is not valid UTF-8"))
 }
@@ -620,7 +666,43 @@ pub fn proactive_diagnostics(
     mode: ProactiveLspMode,
     workspace_epoch: u64,
 ) -> Result<ProactiveLspReport> {
-    let before = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let pass_deadline = proactive_pass_deadline();
+    let before = proactive_workspace_snapshot(workspace_root, pass_deadline)?;
+    proactive_diagnostics_until(
+        registry,
+        workspace_root,
+        paths,
+        mode,
+        workspace_epoch,
+        before,
+        pass_deadline,
+    )
+}
+
+pub(crate) fn proactive_pass_deadline() -> Instant {
+    Instant::now() + PROACTIVE_LSP_PASS_TIMEOUT
+}
+
+pub(crate) fn proactive_workspace_snapshot(
+    workspace_root: &Path,
+    deadline: Instant,
+) -> Result<crate::workspace::ContentSnapshot> {
+    crate::workspace::ContentSnapshot::capture_until(
+        workspace_root,
+        deadline,
+        MAX_PROACTIVE_LSP_SNAPSHOT_BYTES,
+    )
+}
+
+pub(crate) fn proactive_diagnostics_until(
+    registry: &LspToolRegistry,
+    workspace_root: &Path,
+    paths: impl IntoIterator<Item = String>,
+    mode: ProactiveLspMode,
+    workspace_epoch: u64,
+    before: crate::workspace::ContentSnapshot,
+    pass_deadline: Instant,
+) -> Result<ProactiveLspReport> {
     let all_paths = paths
         .into_iter()
         .collect::<BTreeSet<_>>()
@@ -699,8 +781,6 @@ pub fn proactive_diagnostics(
                 message: "selected path is missing, not a regular file, or no longer supported by a configured server".to_string(),
             }));
     }
-    let started = Instant::now();
-    let pass_deadline = started + PROACTIVE_LSP_PASS_TIMEOUT;
     for (index, target) in requested_targets.iter().enumerate() {
         if index >= MAX_PROACTIVE_LSP_CALLS {
             report
@@ -711,7 +791,7 @@ pub fn proactive_diagnostics(
                 .insert(ProactiveLspIncompleteReason::CallBound);
             break;
         }
-        if started.elapsed() >= PROACTIVE_LSP_PASS_TIMEOUT {
+        if Instant::now() >= pass_deadline {
             report
                 .deferred_targets
                 .extend_from_slice(&requested_targets[index..]);
@@ -834,21 +914,38 @@ pub fn proactive_diagnostics(
         }
     }
 
-    let after = crate::workspace::ContentSnapshot::capture(workspace_root)?;
-    if after.fingerprint != before.fingerprint {
-        report.stale = true;
-        report.diagnostics.clear();
-        report.completed_targets.clear();
-        report
-            .incomplete_reasons
-            .insert(ProactiveLspIncompleteReason::StaleWorkspace);
-        report.failures.push(ProactiveLspFailure {
-            server: "pb".to_string(),
-            path: ".".to_string(),
-            message:
-                "workspace content changed during proactive LSP collection; all diagnostics were discarded"
-                    .to_string(),
-        });
+    match proactive_workspace_snapshot(workspace_root, pass_deadline) {
+        Ok(after) if after.fingerprint == before.fingerprint => {}
+        Ok(_) => {
+            report.stale = true;
+            report.diagnostics.clear();
+            report.completed_targets.clear();
+            report
+                .incomplete_reasons
+                .insert(ProactiveLspIncompleteReason::StaleWorkspace);
+            report.failures.push(ProactiveLspFailure {
+                server: "pb".to_string(),
+                path: ".".to_string(),
+                message:
+                    "workspace content changed during proactive LSP collection; all diagnostics were discarded"
+                        .to_string(),
+            });
+        }
+        Err(error) => {
+            report.stale = true;
+            report.diagnostics.clear();
+            report.completed_targets.clear();
+            report
+                .incomplete_reasons
+                .insert(ProactiveLspIncompleteReason::TimeBound);
+            report.failures.push(ProactiveLspFailure {
+                server: "pb".to_string(),
+                path: ".".to_string(),
+                message: bounded_proactive_text(&format!(
+                    "workspace could not be revalidated within the proactive bound: {error:#}"
+                )),
+            });
+        }
     }
     report.scanned_paths.sort();
     report.scanned_paths.dedup();
@@ -1021,7 +1118,7 @@ impl LspOperation {
 
 struct LspClient {
     process: LspProcess,
-    stdin: ChildStdin,
+    stdin_writer: LspStdinWriter,
     stdout_reader: crate::jsonrpc::FramedJsonReader,
     next_id: u64,
     diagnostic_serial: u64,
@@ -1035,6 +1132,85 @@ struct LspClient {
     stderr_thread: Option<std::thread::JoinHandle<()>>,
     shutdown_timeout: Duration,
     transport_shutdown: bool,
+    active_deadline: Option<Instant>,
+}
+
+struct LspWriteCommand {
+    frame: Vec<u8>,
+    completion: SyncSender<std::result::Result<(), String>>,
+}
+
+struct LspStdinWriter {
+    sender: Option<SyncSender<LspWriteCommand>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LspStdinWriter {
+    fn spawn(mut stdin: ChildStdin) -> Self {
+        let (sender, receiver) = sync_channel::<LspWriteCommand>(1);
+        let thread = std::thread::spawn(move || {
+            while let Ok(command) = receiver.recv() {
+                let result = stdin
+                    .write_all(&command.frame)
+                    .and_then(|()| stdin.flush())
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                let _ = command.completion.send(result);
+                if failed {
+                    break;
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        }
+    }
+
+    fn write_until(&self, message: &Value, deadline: Instant) -> Result<()> {
+        let body = serde_json::to_vec(message)?;
+        let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        frame.extend_from_slice(&body);
+        let (completion, completed) = sync_channel(1);
+        let mut command = LspWriteCommand { frame, completion };
+        let sender = self
+            .sender
+            .as_ref()
+            .context("LSP stdin writer is already shut down")?;
+        loop {
+            match sender.try_send(command) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    command = returned;
+                    if Instant::now() >= deadline {
+                        bail!("timed out queueing an LSP request");
+                    }
+                    std::thread::sleep(
+                        Duration::from_millis(2)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    bail!("LSP stdin writer stopped unexpectedly")
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out writing an LSP request");
+        }
+        completed
+            .recv_timeout(remaining)
+            .map_err(|_| anyhow!("timed out writing an LSP request"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn join(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 struct OpenDocument {
@@ -1057,6 +1233,13 @@ enum LspProcess {
     Host(Child),
     Exec(crate::container::ManagedProcess),
     Service(crate::container::ManagedServiceProcess),
+}
+
+struct LspTransport {
+    process: LspProcess,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    stderr: Option<ChildStderr>,
 }
 
 impl LspProcess {
@@ -1093,94 +1276,25 @@ impl LspClient {
         lease: Option<&Arc<crate::session_environment::SessionEnvironmentLease>>,
         initialize_timeout: Duration,
     ) -> Result<Self> {
+        let initialize_deadline = Instant::now() + initialize_timeout;
         validate_packaged_image_authority(config)?;
         let cwd = match config.working_directory.as_deref() {
             Some(path) => resolve_workspace_path(workspace_root, &path.to_string_lossy())?,
             None => workspace_root.to_path_buf(),
         };
-        let (process, stdin, stdout, stderr) = if let Some(lease) = lease {
-            if let Some(image) = config
-                .container_image
-                .as_deref()
-                .filter(|image| !image.trim().is_empty())
-            {
-                let actual_runtime = lease.record()?.runtime_binary;
-                crate::container::ensure_service_runtime_matches(
-                    config.container_runtime.as_deref(),
-                    &actual_runtime,
-                    &format!("LSP server {server_name}"),
-                )?;
-                let mut service =
-                    lease.spawn_service(crate::session_environment::SessionServiceSpec {
-                        service_name: server_name.to_string(),
-                        role: format!("lsp:{server_name}"),
-                        kind: crate::session_environment::LeaseResourceKind::LspProcess,
-                        image: image.trim().to_string(),
-                        args: config.args.clone(),
-                        env: config.env.clone(),
-                        working_directory: config.working_directory.clone(),
-                        cache_scope_sha256: crate::environment_lock::sha256(&serde_json::to_vec(
-                            config,
-                        )?),
-                        workspace_access: config.workspace_access,
-                        network_access: config.network_access,
-                        cache_ids: config.cache_ids.clone(),
-                    })?;
-                let stdin = service.take_stdin()?;
-                let stdout = service.take_stdout()?;
-                let stderr = service.take_stderr()?;
-                (LspProcess::Service(service), stdin, stdout, Some(stderr))
-            } else {
-                let command = config.command.as_deref().with_context(|| {
-                    format!("LSP server {server_name} has no command or container_image")
-                })?;
-                let mut argv = vec![
-                    "sh".to_string(),
-                    "-lc".to_string(),
-                    "cd \"$1\" && shift && exec \"$@\"".to_string(),
-                    "pb-lsp".to_string(),
-                    cwd.to_string_lossy().into_owned(),
-                    command.to_string(),
-                ];
-                argv.extend(config.args.clone());
-                let mut process = lease.spawn_exec_with_env(&argv, &config.env)?;
-                let stdin = process.take_stdin()?;
-                let stdout = process.take_stdout()?;
-                let stderr = process.take_stderr()?;
-                (LspProcess::Exec(process), stdin, stdout, Some(stderr))
-            }
-        } else {
-            let (command, args) = stdio_command(server_name, config, workspace_root)?;
-            let mut command_builder = Command::new(&command);
-            command_builder
-                .args(&args)
-                .current_dir(&cwd)
-                .envs(&config.env)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                command_builder.process_group(0);
-            }
-            let mut child = command_builder
-                .spawn()
-                .with_context(|| format!("failed to start LSP server {server_name}: {command}"))?;
-            let stdin = child
-                .stdin
-                .take()
-                .context("failed to open LSP server stdin")?;
-            let stdout = child
-                .stdout
-                .take()
-                .context("failed to open LSP server stdout")?;
-            let stderr = child
-                .stderr
-                .take()
-                .context("failed to open LSP server stderr")?;
-            (LspProcess::Host(child), stdin, stdout, Some(stderr))
-        };
+        let LspTransport {
+            process,
+            stdin,
+            stdout,
+            stderr,
+        } = spawn_lsp_transport_until(
+            server_name,
+            config,
+            workspace_root,
+            &cwd,
+            lease,
+            initialize_deadline,
+        )?;
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
         let stderr_thread = stderr.map(|stderr| drain_stderr(stderr, Arc::clone(&stderr_tail)));
         let stdout_reader =
@@ -1193,7 +1307,7 @@ impl LspClient {
             .to_string();
         let mut client = Self {
             process,
-            stdin,
+            stdin_writer: LspStdinWriter::spawn(stdin),
             stdout_reader,
             next_id: 1,
             diagnostic_serial: 0,
@@ -1207,6 +1321,7 @@ impl LspClient {
             stderr_thread,
             shutdown_timeout: Duration::ZERO,
             transport_shutdown: false,
+            active_deadline: Some(initialize_deadline),
         };
         let mut initialize_params = json!({"processId": std::process::id(), "rootUri": root_uri, "workspaceFolders": [{"uri": root_uri, "name": root_name}], "capabilities": {"textDocument":{"synchronization":{"didSave":true,"dynamicRegistration":false},"hover":{},"definition":{},"references":{},"documentSymbol":{},"publishDiagnostics":{},"diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false}},"workspace":{"symbol":{},"workspaceFolders":true,"configuration":true,"diagnostics":{"refreshSupport":false}}}});
         if let Some(options) = config.initialization_options.clone()
@@ -1218,11 +1333,27 @@ impl LspClient {
             client.request_with_timeout("initialize", initialize_params, initialize_timeout)?;
         client.supports_pull_diagnostics = server_supports_pull_diagnostics(&initialize_result);
         client.notify("initialized", json!({}))?;
+        client.active_deadline = None;
         client.shutdown_timeout = Duration::from_secs(2);
         Ok(client)
     }
 
     fn call_with_diagnostic_timeout(
+        &mut self,
+        op: LspOperation,
+        workspace_root: &Path,
+        args: &Value,
+        diagnostic_timeout: Duration,
+    ) -> Result<LspToolCallOutcome> {
+        let operation_deadline = Instant::now() + diagnostic_timeout;
+        let previous_deadline = self.active_deadline.replace(operation_deadline);
+        let result =
+            self.call_with_diagnostic_timeout_inner(op, workspace_root, args, diagnostic_timeout);
+        self.active_deadline = previous_deadline;
+        result
+    }
+
+    fn call_with_diagnostic_timeout_inner(
         &mut self,
         op: LspOperation,
         workspace_root: &Path,
@@ -1329,7 +1460,12 @@ impl LspClient {
     ) -> Result<OpenDocumentState> {
         let path = string_arg(args, "path")?;
         let full = resolve_workspace_path(workspace_root, path)?;
-        let text = read_bounded_utf8(&full, MAX_LSP_DOCUMENT_BYTES, "LSP document")?;
+        let text = read_bounded_utf8_until(
+            &full,
+            MAX_LSP_DOCUMENT_BYTES,
+            "LSP document",
+            self.effective_deadline(LSP_READ_TIMEOUT),
+        )?;
         let uri = path_to_uri(&full)?;
         let content_sha256 = crate::environment_lock::sha256(text.as_bytes());
         if let Some(document) = self.open_documents.get(&uri) {
@@ -1382,7 +1518,7 @@ impl LspClient {
         timeout: Duration,
         after_serial: u64,
     ) -> Result<Value> {
-        let deadline = Instant::now() + timeout;
+        let deadline = self.effective_deadline(timeout);
         loop {
             if let Some(mut observed_serial) = self
                 .diagnostics
@@ -1464,11 +1600,14 @@ impl LspClient {
     ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.write(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .map_err(|error| {
-                lsp_transport_failure(format!("failed to write LSP request {method}: {error:#}"))
-            })?;
-        let deadline = Instant::now() + timeout;
+        let deadline = self.effective_deadline(timeout);
+        self.write_until(
+            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            deadline,
+        )
+        .map_err(|error| {
+            lsp_transport_failure(format!("failed to write LSP request {method}: {error:#}"))
+        })?;
         loop {
             if Instant::now() > deadline {
                 return Err(lsp_transport_failure(format!(
@@ -1509,11 +1648,15 @@ impl LspClient {
             })
     }
     fn write(&mut self, message: &Value) -> Result<()> {
-        let body = serde_json::to_vec(message)?;
-        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())?;
-        self.stdin.write_all(&body)?;
-        self.stdin.flush()?;
-        Ok(())
+        self.write_until(message, self.effective_deadline(LSP_READ_TIMEOUT))
+    }
+    fn write_until(&mut self, message: &Value, deadline: Instant) -> Result<()> {
+        self.stdin_writer.write_until(message, deadline)
+    }
+    fn effective_deadline(&self, timeout: Duration) -> Instant {
+        let requested = Instant::now() + timeout;
+        self.active_deadline
+            .map_or(requested, |deadline| deadline.min(requested))
     }
     fn read_message(&mut self, deadline: Instant) -> Result<Value> {
         if let Some(status) = self.process.try_wait().map_err(|error| {
@@ -1583,6 +1726,156 @@ impl LspClient {
     }
 }
 
+fn spawn_lsp_transport_until(
+    server_name: &str,
+    config: &LspServerConfig,
+    workspace_root: &Path,
+    cwd: &Path,
+    lease: Option<&Arc<crate::session_environment::SessionEnvironmentLease>>,
+    deadline: Instant,
+) -> Result<LspTransport> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("proactive LSP time bound expired before starting the language server");
+    }
+    let server_name = server_name.to_string();
+    let config = config.clone();
+    let workspace_root = workspace_root.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let lease = lease.cloned();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let (sender, receiver) = sync_channel(0);
+    std::thread::spawn(move || {
+        let result =
+            spawn_lsp_transport(&server_name, &config, &workspace_root, &cwd, lease.as_ref());
+        if worker_cancelled.load(Ordering::Acquire) {
+            if let Ok(mut transport) = result {
+                transport.process.shutdown(Duration::from_secs(1));
+            }
+            return;
+        }
+        if let Err(error) = sender.send(result)
+            && let Ok(mut transport) = error.0
+        {
+            transport.process.shutdown(Duration::from_secs(1));
+        }
+    });
+    match receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(_) => {
+            cancelled.store(true, Ordering::Release);
+            bail!("timed out starting the language server")
+        }
+    }
+}
+
+fn spawn_lsp_transport(
+    server_name: &str,
+    config: &LspServerConfig,
+    workspace_root: &Path,
+    cwd: &Path,
+    lease: Option<&Arc<crate::session_environment::SessionEnvironmentLease>>,
+) -> Result<LspTransport> {
+    if let Some(lease) = lease {
+        if let Some(image) = config
+            .container_image
+            .as_deref()
+            .filter(|image| !image.trim().is_empty())
+        {
+            let actual_runtime = lease.record()?.runtime_binary;
+            crate::container::ensure_service_runtime_matches(
+                config.container_runtime.as_deref(),
+                &actual_runtime,
+                &format!("LSP server {server_name}"),
+            )?;
+            let mut service =
+                lease.spawn_service(crate::session_environment::SessionServiceSpec {
+                    service_name: server_name.to_string(),
+                    role: format!("lsp:{server_name}"),
+                    kind: crate::session_environment::LeaseResourceKind::LspProcess,
+                    image: image.trim().to_string(),
+                    args: config.args.clone(),
+                    env: config.env.clone(),
+                    working_directory: config.working_directory.clone(),
+                    cache_scope_sha256: crate::environment_lock::sha256(&serde_json::to_vec(
+                        config,
+                    )?),
+                    workspace_access: config.workspace_access,
+                    network_access: config.network_access,
+                    cache_ids: config.cache_ids.clone(),
+                })?;
+            let stdin = service.take_stdin()?;
+            let stdout = service.take_stdout()?;
+            let stderr = service.take_stderr()?;
+            return Ok(LspTransport {
+                process: LspProcess::Service(service),
+                stdin,
+                stdout,
+                stderr: Some(stderr),
+            });
+        }
+        let command = config.command.as_deref().with_context(|| {
+            format!("LSP server {server_name} has no command or container_image")
+        })?;
+        let mut argv = vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "cd \"$1\" && shift && exec \"$@\"".to_string(),
+            "pb-lsp".to_string(),
+            cwd.to_string_lossy().into_owned(),
+            command.to_string(),
+        ];
+        argv.extend(config.args.clone());
+        let mut process = lease.spawn_exec_with_env(&argv, &config.env)?;
+        let stdin = process.take_stdin()?;
+        let stdout = process.take_stdout()?;
+        let stderr = process.take_stderr()?;
+        return Ok(LspTransport {
+            process: LspProcess::Exec(process),
+            stdin,
+            stdout,
+            stderr: Some(stderr),
+        });
+    }
+
+    let (command, args) = stdio_command(server_name, config, workspace_root)?;
+    let mut command_builder = Command::new(&command);
+    command_builder
+        .args(&args)
+        .current_dir(cwd)
+        .envs(&config.env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command_builder.process_group(0);
+    }
+    let mut child = command_builder
+        .spawn()
+        .with_context(|| format!("failed to start LSP server {server_name}: {command}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("failed to open LSP server stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to open LSP server stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to open LSP server stderr")?;
+    Ok(LspTransport {
+        process: LspProcess::Host(child),
+        stdin,
+        stdout,
+        stderr: Some(stderr),
+    })
+}
+
 fn server_supports_pull_diagnostics(initialize_result: &Value) -> bool {
     initialize_result
         .pointer("/capabilities/diagnosticProvider")
@@ -1646,6 +1939,7 @@ impl LspClient {
             return;
         }
         self.process.shutdown(timeout);
+        self.stdin_writer.join();
         self.stdout_reader.join();
         if let Some(thread) = self.stderr_thread.take() {
             let _ = thread.join();
@@ -1995,6 +2289,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("time bound expired"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_stdin_writes_are_deadline_bounded() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut writer = LspStdinWriter::spawn(stdin);
+        let message = json!({"payload": "x".repeat(2 * 1024 * 1024)});
+        let started = Instant::now();
+        let error = writer
+            .write_until(&message, Instant::now() + Duration::from_millis(100))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed out writing"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = child.kill();
+        let _ = child.wait();
+        writer.join();
     }
 
     #[cfg(unix)]

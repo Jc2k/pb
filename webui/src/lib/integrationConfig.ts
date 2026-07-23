@@ -10,6 +10,13 @@ export function integrationInstallPayload(
   env: Record<string, string>,
   metadata?: IntegrationConfigSchemaResponse | null,
 ) {
+  if (
+    metadata && metadata.source_container_image !== pending.containerImage
+  ) {
+    throw new Error(
+      "Integration metadata no longer matches the selected container image. Inspect the image again before installing.",
+    );
+  }
   return {
     kind: pending.kind,
     container_image: metadata?.container_image ?? pending.containerImage,

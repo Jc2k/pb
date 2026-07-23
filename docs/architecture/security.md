@@ -127,8 +127,10 @@ call, time, result-count, and message-size ceilings. Every diagnostic records wo
 content identity. Every matching server/path target is retained as completed, advisory, failed, or
 deferred. Only a full pull-diagnostic report completes a target; a push-only server's fresh
 publication remains useful advisory evidence but cannot claim a clean result. The same 12-second
-proactive deadline bounds initialization, the diagnostic request, and a typed restart. A workspace
-change during collection discards the whole result. Server
+proactive deadline starts before workspace observation and bounds Git path discovery, path and
+aggregate file bytes, server launch, stdin writes, initialization, the diagnostic request, a typed
+restart, shutdown, and final workspace revalidation. A workspace change during collection discards
+the whole result. Server
 startup, transport, timeout, and response failures remain visible advisory failures and cannot
 mint check evidence or bypass configured checks. A blocking current result can grant only
 exact-path repair focus after older read/stage evidence is invalidated. pb never executes LSP
@@ -152,7 +154,10 @@ bearer token is forwarded only within the origin for which it was obtained.
 
 Marketplace metadata and executed code share one immutable OCI identity. Installation resolves the
 tag, records the registry manifest digest plus the original display tag, re-reads the typed manifest
-through that digest, and pulls that exact image when a runtime is available. Task startup never
+through that digest, and pulls that exact image when a runtime is available. Registry and repository
+identity are canonicalized before marketplace policy is selected. Every digest-addressed child
+manifest and image-config blob is hashed locally and must match the digest selected by its parent,
+even when the registry omits its optional digest header. Task startup never
 pulls a missing digest-pinned image. Tag-only legacy marketplace LSP entries are reported as
 `legacy_unverified` and fail closed until explicitly upgraded or reinstalled.
 
@@ -220,8 +225,9 @@ project configuration, arguments, and the session ledger.
 Images and approved caches may outlive a session. The primary container, services, networks, and
 ephemeral workspaces are session-owned. A cleanup failure changes the durable lease to `Failed` and
 retains its resource inventory instead of deleting recovery state. The supervisor retries those
-records under the per-session operation lock and removes a record only after verified cleanup
-succeeds.
+records under the per-session operation lock, includes the associated session workspace in the
+retry, and removes a record only after verified container, network, cache, and workspace cleanup
+succeeds. A dirty workspace is preserved and keeps the recovery record rather than being erased.
 
 ## Important limits
 

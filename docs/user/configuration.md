@@ -27,8 +27,10 @@ The user configuration file is `<config-dir>/pb/config.toml`. It covers:
 
 CLI, web, and marketplace mutations take a cross-process lock, re-read the latest configuration,
 and atomically replace the file. Concurrent changes to different settings or integrations therefore
-do not silently overwrite one another. Project MCP marketplace writes use the same pattern for
-`.pb/mcp.toml`.
+do not silently overwrite one another. Project MCP marketplace writes and the GitHub/Safari setup
+commands use the same pattern for `.pb/mcp.toml`. Integration removal validates that the selected
+entry is container-backed inside that transaction, so trying to remove a host-command server
+through the container-integration UI cannot delete it before returning an error.
 
 The web server binds to `127.0.0.1:8311` by default. Changing `web.listen` to `0.0.0.0` exposes the
 interface on available networks. pb does not add authentication or TLS merely because the address
@@ -408,6 +410,10 @@ the saved source tag. **Upgrade** is a separate action that re-resolves that sou
 new digest and package metadata, and then replaces the pinned identity. Project MCP marketplace
 entries preserve the same pinned/source distinction. Schema, install, list, and removal failures
 remain visible in the integration UI instead of closing the form or silently doing nothing.
+Registry/repository case and a trailing registry dot are canonicalized before marketplace policy is
+applied. Each selected platform manifest and image-config blob is hashed and matched to its parent
+digest rather than trusting an optional registry response header. The web UI cancels superseded
+schema lookups and refuses to install metadata that does not name the currently selected image.
 
 The rust-analyzer package is published by the `crunchy-pb/lsp-rust-analyzer` marketplace repository.
 Install it from the web integration store or from the CLI; pb reads and validates the embedded
@@ -433,8 +439,9 @@ An unavailable or timed-out server is reported and pb continues to the ordinary 
 applies language-server edits, commands, formatting, or code actions. A full pull-diagnostic
 response can complete a server/file target. A push-only server can still surface a fresh bounded
 snapshot, but even an empty snapshot remains explicitly incomplete and is never presented as proof
-that the target is clean. One 12-second proactive deadline covers server initialization, collection,
-and any typed restart.
+that the target is clean. One 12-second proactive deadline begins before bounded workspace
+observation and covers server launch, stdin delivery, initialization, collection, any typed restart,
+shutdown, and final workspace revalidation.
 
 Language servers start lazily on their first manual query or matching proactive pass. A project does
 not need a container-backed task environment: for local and otherwise unconfigured projects, pb

@@ -1408,19 +1408,12 @@ fn mcp_setup_safari(args: McpSetupSafariArgs) -> Result<()> {
             );
         }
 
-        let mut config = ProjectMcpConfig::load(&root)?.unwrap_or_default();
-        if args.no_overwrite && config.servers.contains_key(&args.server_name) {
-            bail!(
-                "MCP server '{}' already exists in {}; remove --no-overwrite to replace it",
-                args.server_name,
-                mcp::project_mcp_config_path(&root).display()
-            );
-        }
-        config.servers.insert(
-            args.server_name.clone(),
+        save_project_mcp_server(
+            &root,
+            &args.server_name,
+            args.no_overwrite,
             safari_mcp_server_config(&driver_path),
-        );
-        config.save(&root)?;
+        )?;
 
         println!(
             "Safari MCP server '{}' saved to {}.",
@@ -1494,20 +1487,12 @@ async fn mcp_setup_github(args: McpSetupGithubArgs) -> Result<()> {
     .await?;
     let token_path = github_oauth::write_token(&token)?;
 
-    let mut config = ProjectMcpConfig::load(&root)?.unwrap_or_default();
-    if args.no_overwrite && config.servers.contains_key(&args.server_name) {
-        bail!(
-            "MCP server '{}' already exists in {}; remove --no-overwrite to replace it",
-            args.server_name,
-            mcp::project_mcp_config_path(&root).display()
-        );
-    }
-
-    config.servers.insert(
-        args.server_name.clone(),
+    save_project_mcp_server(
+        &root,
+        &args.server_name,
+        args.no_overwrite,
         github_mcp_server_config(&runtime, &token_path),
-    );
-    config.save(&root)?;
+    )?;
 
     println!(
         "GitHub MCP server '{}' saved to {}.",
@@ -1525,6 +1510,25 @@ async fn mcp_setup_github(args: McpSetupGithubArgs) -> Result<()> {
 }
 
 const BAKED_GITHUB_CLIENT_ID: Option<&str> = option_env!("PB_GITHUB_CLIENT_ID");
+
+fn save_project_mcp_server(
+    root: &Path,
+    server_name: &str,
+    no_overwrite: bool,
+    server: McpServerConfig,
+) -> Result<()> {
+    ProjectMcpConfig::mutate(root, |config| {
+        if no_overwrite && config.servers.contains_key(server_name) {
+            bail!(
+                "MCP server '{}' already exists in {}; remove --no-overwrite to replace it",
+                server_name,
+                mcp::project_mcp_config_path(root).display()
+            );
+        }
+        config.servers.insert(server_name.to_string(), server);
+        Ok(())
+    })
+}
 
 fn github_mcp_server_config(runtime: &str, token_path: &Path) -> McpServerConfig {
     let runtime = shell_single_quote(runtime);
@@ -5170,6 +5174,35 @@ mod tests {
         assert!(config.env.is_empty());
         assert!(!config.disabled);
         assert!(config.capabilities.read_only_tools.is_empty());
+    }
+
+    #[test]
+    fn setup_server_writes_are_locked_and_no_overwrite_is_transactional() {
+        let dir = tempfile::tempdir().unwrap();
+        save_project_mcp_server(
+            dir.path(),
+            "local",
+            false,
+            McpServerConfig {
+                command: Some("first".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            save_project_mcp_server(
+                dir.path(),
+                "local",
+                true,
+                McpServerConfig {
+                    command: Some("second".to_string()),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+        let config = ProjectMcpConfig::load(dir.path()).unwrap().unwrap();
+        assert_eq!(config.servers["local"].command.as_deref(), Some("first"));
     }
 
     #[test]
