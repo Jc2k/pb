@@ -32,6 +32,8 @@ pub enum WorkUnitState {
 pub struct WorkUnit {
     pub id: String,
     pub plan_step_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributing_step_ids: Vec<String>,
     pub operation: PlannedChange,
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,6 +45,16 @@ pub struct WorkUnit {
     #[serde(default)]
     pub adopted: bool,
     pub state: WorkUnitState,
+}
+
+impl WorkUnit {
+    pub fn contributes_to(&self, step_id: &str) -> bool {
+        self.plan_step_id == step_id
+            || self
+                .contributing_step_ids
+                .iter()
+                .any(|candidate| candidate == step_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,24 +127,53 @@ impl WorkUnitLedger {
         current: &ContentSnapshot,
         exact_evidence_paths: &BTreeSet<String>,
     ) -> Result<Self> {
-        let mut units = Vec::new();
+        let mut compiled = BTreeMap::<String, (usize, String, Vec<String>)>::new();
+        let mut occurrence = 0_usize;
         for step in &plan.steps {
-            for (path_index, planned) in step.paths.iter().enumerate() {
-                let baseline_path = present_path(baseline, &planned.path);
-                let invocation_path = present_path(invocation, &planned.path);
-                units.push(WorkUnit {
-                    id: format!("{}:{path_index}", step.id),
-                    plan_step_id: step.id.clone(),
-                    operation: planned.change,
-                    path: planned.path.clone(),
-                    baseline_path_fingerprint: baseline_path.map(|entry| entry.fingerprint.clone()),
-                    invocation_path_fingerprint: invocation_path
-                        .map(|entry| entry.fingerprint.clone()),
-                    current_path_fingerprint: None,
-                    adopted: baseline_path != invocation_path,
-                    state: WorkUnitState::EvidenceNeeded,
+            for planned in &step.paths {
+                let entry = compiled.entry(planned.path.clone()).or_insert_with(|| {
+                    let first = occurrence;
+                    occurrence += 1;
+                    (first, step.id.clone(), Vec::new())
                 });
+                if !entry.2.contains(&step.id) {
+                    entry.2.push(step.id.clone());
+                }
             }
+        }
+        let mut compiled = compiled.into_iter().collect::<Vec<_>>();
+        compiled.sort_by_key(|(_, (first, _, _))| *first);
+        let mut units = Vec::with_capacity(compiled.len());
+        for (path, (first, primary_step_id, contributing_step_ids)) in compiled {
+            let baseline_path = present_path(baseline, &path);
+            let invocation_path = present_path(invocation, &path);
+            let final_present = plan
+                .steps
+                .iter()
+                .flat_map(|step| &step.paths)
+                .filter(|planned| planned.path == path)
+                .next_back()
+                .is_some_and(|planned| planned.change != PlannedChange::Delete);
+            let operation = match (baseline_path.is_some(), final_present) {
+                (false, true) => PlannedChange::Create,
+                (true, true) => PlannedChange::Modify,
+                (true, false) => PlannedChange::Delete,
+                (false, false) => {
+                    bail!("plan path '{path}' has no durable transition from the task baseline")
+                }
+            };
+            units.push(WorkUnit {
+                id: format!("path:{first}"),
+                plan_step_id: primary_step_id,
+                contributing_step_ids,
+                operation,
+                path,
+                baseline_path_fingerprint: baseline_path.map(|entry| entry.fingerprint.clone()),
+                invocation_path_fingerprint: invocation_path.map(|entry| entry.fingerprint.clone()),
+                current_path_fingerprint: None,
+                adopted: baseline_path != invocation_path,
+                state: WorkUnitState::EvidenceNeeded,
+            });
         }
         let mut ledger = Self {
             version: WORK_UNIT_LEDGER_VERSION,
@@ -183,6 +224,7 @@ impl WorkUnitLedger {
             bail!("initialized work-unit ledger has incomplete authority fingerprints");
         }
         let mut ids = BTreeSet::new();
+        let mut paths = BTreeSet::new();
         for unit in &self.units {
             if unit.id.trim().is_empty()
                 || unit.plan_step_id.trim().is_empty()
@@ -198,6 +240,18 @@ impl WorkUnitLedger {
             if !ids.insert(unit.id.as_str()) {
                 bail!("work-unit ledger repeats id {}", unit.id);
             }
+            if !paths.insert(unit.path.as_str()) {
+                bail!(
+                    "legacy work-unit ledger repeats path {}; the accepted plan must be replanned",
+                    unit.path
+                );
+            }
+            let mut step_ids = BTreeSet::new();
+            for step_id in &unit.contributing_step_ids {
+                if step_id.trim().is_empty() || !step_ids.insert(step_id) {
+                    bail!("work-unit ledger has invalid contributing plan step ids");
+                }
+            }
         }
         if self
             .progress_credited_units
@@ -206,11 +260,6 @@ impl WorkUnitLedger {
         {
             bail!("work-unit progress credit names an unknown unit");
         }
-        let paths = self
-            .units
-            .iter()
-            .map(|unit| unit.path.as_str())
-            .collect::<BTreeSet<_>>();
         if self
             .diagnostic_failures
             .keys()
@@ -499,6 +548,115 @@ mod tests {
         let restored: WorkUnitLedger = serde_json::from_slice(&encoded).unwrap();
         restored.validate_plan("plan-1", "sha").unwrap();
         assert_eq!(restored, ledger);
+    }
+
+    #[test]
+    fn legacy_unique_path_checkpoint_defaults_contributing_steps() {
+        let baseline = snapshot("base", &[("modify.txt", "old")]);
+        let ledger = WorkUnitLedger::from_plan(
+            "plan-1",
+            "sha",
+            &plan(&[("modify.txt", PlannedChange::Modify)]),
+            &baseline,
+            &baseline,
+            &baseline,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let mut encoded = serde_json::to_value(&ledger).unwrap();
+        encoded["units"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("contributing_step_ids");
+
+        let restored: WorkUnitLedger = serde_json::from_value(encoded).unwrap();
+
+        restored.validate_plan("plan-1", "sha").unwrap();
+        assert!(restored.units[0].contributes_to("s1"));
+        assert!(restored.units[0].contributing_step_ids.is_empty());
+    }
+
+    #[test]
+    fn repeated_path_steps_compile_to_one_verifiable_transition() {
+        let baseline = snapshot("base", &[]);
+        let artifact = plan(&[
+            ("new.txt", PlannedChange::Create),
+            ("new.txt", PlannedChange::Modify),
+        ]);
+        let mut ledger = WorkUnitLedger::from_plan(
+            "plan",
+            "digest",
+            &artifact,
+            &baseline,
+            &baseline,
+            &baseline,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(ledger.units.len(), 1);
+        assert_eq!(ledger.units[0].operation, PlannedChange::Create);
+        assert_eq!(ledger.units[0].plan_step_id, "s1");
+        assert_eq!(ledger.units[0].contributing_step_ids, ["s1", "s2"]);
+        assert!(ledger.units[0].contributes_to("s1"));
+        assert!(ledger.units[0].contributes_to("s2"));
+
+        ledger
+            .reconcile(
+                &snapshot("current", &[("new.txt", "new")]),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert!(ledger.structurally_complete());
+    }
+
+    #[test]
+    fn delete_then_create_compiles_to_modification_of_existing_path() {
+        let baseline = snapshot("base", &[("existing.txt", "old")]);
+        let artifact = plan(&[
+            ("existing.txt", PlannedChange::Delete),
+            ("existing.txt", PlannedChange::Create),
+        ]);
+        let ledger = WorkUnitLedger::from_plan(
+            "plan",
+            "digest",
+            &artifact,
+            &baseline,
+            &baseline,
+            &snapshot("current", &[("existing.txt", "replacement")]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(ledger.units.len(), 1);
+        assert_eq!(ledger.units[0].operation, PlannedChange::Modify);
+        assert!(ledger.structurally_complete());
+    }
+
+    #[test]
+    fn legacy_repeated_path_ledger_requires_replan() {
+        let baseline = snapshot("base", &[("same.txt", "old")]);
+        let mut ledger = WorkUnitLedger::from_plan(
+            "plan",
+            "digest",
+            &plan(&[("same.txt", PlannedChange::Modify)]),
+            &baseline,
+            &baseline,
+            &baseline,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let mut duplicate = ledger.units[0].clone();
+        duplicate.id = "legacy-second-occurrence".to_string();
+        ledger.units.push(duplicate);
+
+        assert!(
+            ledger
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("replanned")
+        );
     }
 
     #[test]

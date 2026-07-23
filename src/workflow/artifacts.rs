@@ -154,7 +154,14 @@ impl PlanArtifact {
         debug_assert_eq!(acceptance_ids.len(), self.acceptance.len());
 
         let mut requirements_with_steps = HashSet::new();
-        let mut planned_paths = snapshot.paths.keys().cloned().collect::<HashSet<_>>();
+        let initial_paths = snapshot
+            .paths
+            .iter()
+            .filter(|(_, content)| content.kind != "missing")
+            .map(|(path, _)| path.clone())
+            .collect::<HashSet<_>>();
+        let mut planned_paths = initial_paths.clone();
+        let mut touched_paths = HashSet::new();
         for step in &self.steps {
             non_empty("plan step description", &step.description)?;
             if step.requirement_ids.is_empty() {
@@ -178,6 +185,7 @@ impl PlanArtifact {
             }
             for planned in &step.paths {
                 validate_repository_path("plan path", &planned.path)?;
+                touched_paths.insert(planned.path.clone());
                 let exists = planned_paths.contains(&planned.path);
                 match planned.change {
                     PlannedChange::Create if exists => bail!(
@@ -203,6 +211,14 @@ impl PlanArtifact {
                     PlannedChange::Modify => {}
                 }
             }
+        }
+        if let Some(path) = touched_paths
+            .iter()
+            .find(|path| !initial_paths.contains(*path) && !planned_paths.contains(*path))
+        {
+            bail!(
+                "plan path '{path}' starts and ends missing, so it has no durable repository transition"
+            );
         }
 
         let mut requirements_with_acceptance = HashSet::new();
@@ -837,6 +853,15 @@ mod tests {
                 description: "remove the temporary module".to_string(),
             },
         ];
+        assert!(
+            ordered
+                .validate(&graph(), &snapshot())
+                .unwrap_err()
+                .to_string()
+                .contains("no durable repository transition")
+        );
+
+        ordered.steps.pop();
         ordered.validate(&graph(), &snapshot()).unwrap();
 
         let mut modify_before_create = ordered.clone();
@@ -850,6 +875,16 @@ mod tests {
         );
 
         let mut modify_after_delete = ordered;
+        modify_after_delete.steps.push(PlanStep {
+            id: "s3".to_string(),
+            requirement_ids: vec!["r1".to_string()],
+            component_ids: vec!["repository".to_string()],
+            paths: vec![PlanPath {
+                path: "new.js".to_string(),
+                change: PlannedChange::Delete,
+            }],
+            description: "remove the module".to_string(),
+        });
         modify_after_delete.steps.push(PlanStep {
             id: "s4".to_string(),
             requirement_ids: vec!["r1".to_string()],

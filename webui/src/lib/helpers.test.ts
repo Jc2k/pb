@@ -10,6 +10,7 @@ import {
   sessionPageDocumentTitle,
   sessionTitle,
   usageStatsForToday,
+  toolResultForCall,
 } from "./helpers.ts";
 
 Deno.test("sessionTitle prefers a trimmed title and falls back to the task", () => {
@@ -183,6 +184,41 @@ Deno.test("groupActionEvents presents proactive LSP work as Trinity's routine ac
   equal((grouped[0] as { actor: { id: string } }).actor.id, "trinity");
   equal((grouped[0] as { toolCalls: EventEnvelope[] }).toolCalls.length, 1);
   equal((grouped[0] as { toolResults: EventEnvelope[] }).toolResults.length, 1);
+});
+
+Deno.test("groupActionEvents correlates reordered identical tools across intervening messages", () => {
+  const actor = { kind: "agent" as const, id: "build" };
+  const callA: EventEnvelope = {
+    version: "1",
+    event: { type: "tool_call", tool: "read_file", arguments: { path: "a.rs" }, call_id: "a", batch_id: "batch", actor },
+  };
+  const callB: EventEnvelope = {
+    version: "1",
+    event: { type: "tool_call", tool: "read_file", arguments: { path: "b.rs" }, call_id: "b", batch_id: "batch", actor },
+  };
+  const correction: EventEnvelope = {
+    version: "1",
+    event: { type: "correction", message: "keep going", actor: { kind: "automation", id: "trinity" } },
+  };
+  const resultB: EventEnvelope = {
+    version: "1",
+    event: { type: "tool_result", tool: "read_file", result: "B", call_id: "b", batch_id: "batch", outcome: "succeeded", actor },
+  };
+  const resultA: EventEnvelope = {
+    version: "1",
+    event: { type: "tool_result", tool: "read_file", result: "A", call_id: "a", batch_id: "batch", outcome: "succeeded", actor },
+  };
+
+  const grouped = groupActionEvents([callA, callB, correction, resultB, resultA]);
+  const actions = grouped[0];
+  if (!("type" in actions) || actions.type !== "action_group") {
+    throw new Error("expected action group");
+  }
+  const matchedA = toolResultForCall(callA, actions.toolResults);
+  const matchedB = toolResultForCall(callB, actions.toolResults);
+  equal(matchedA?.event.type, "tool_result");
+  equal(matchedA?.event.type === "tool_result" ? matchedA.event.result : undefined, "A");
+  equal(matchedB?.event.type === "tool_result" ? matchedB.event.result : undefined, "B");
 });
 
 Deno.test("projectSettingsPath encodes project names under the project URL", () => {

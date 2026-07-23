@@ -124,7 +124,10 @@ task paths whose inferred language matches a configured server; the model cannot
 selection. Mid-implementation collection admits only error-severity diagnostics identified as
 syntax/parser failures, while settled collection admits error severity only. Passes have path,
 call, time, result-count, and message-size ceilings. Every diagnostic records workspace, path, and
-content identity, and a workspace change during collection discards the whole result. Server
+content identity. Every matching server/path target is retained as completed, failed, or deferred;
+an incomplete pass cannot claim a clean result. Settled collection establishes a publication
+barrier after opening the bounded workspace set, and a workspace change during collection discards
+the whole result. Server
 startup, transport, timeout, and response failures remain visible advisory failures and cannot
 mint check evidence or bypass configured checks. A blocking current result can grant only
 exact-path repair focus after older read/stage evidence is invalidated. pb never executes LSP
@@ -139,6 +142,12 @@ network access. A crunchy-pb marketplace LSP without this manifest cannot be ins
 constraints prevent package metadata from granting its own authority; they do not turn arbitrary
 language-server implementation code into trusted code, so the read-only, isolated sidecar remains
 the execution boundary.
+
+Marketplace metadata and executed code share one immutable OCI identity. Installation resolves the
+tag, records the registry manifest digest plus the original display tag, re-reads the typed manifest
+through that digest, and pulls that exact image when a runtime is available. Task startup never
+pulls a missing digest-pinned image. Tag-only legacy marketplace LSP entries are reported as
+`legacy_unverified` and fail closed until explicitly upgraded or reinstalled.
 
 Container-backed connector processes remain resources of the session environment. A retained
 per-integration `container_runtime` value must match the owning session runtime or startup fails;
@@ -191,6 +200,11 @@ Apple-container-backed sessions give pb ownership of the primary container, task
 services, network, and cache attachments. Lease records support startup reconciliation and terminal
 cleanup. Runtime and bootstrap phases are distinct, and service capabilities for workspace,
 network, caches, and secrets default to none.
+
+Projects using the local backend or no project environment may create a service-only lease for a
+packaged LSP. It has the same ownership labels, durable resource ledger, isolated network,
+read-only workspace policy, and terminal cleanup as a sidecar attached to a primary task container;
+it does not fabricate a primary environment or grant command execution to the task.
 
 Container-backed MCP/LSP services must declare read-only or read-write workspace access and none,
 session-only, or egress network access. Secret values are injected at launch and excluded from

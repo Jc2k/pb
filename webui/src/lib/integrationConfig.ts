@@ -12,7 +12,8 @@ export function integrationInstallPayload(
 ) {
   return {
     kind: pending.kind,
-    container_image: pending.containerImage,
+    container_image: metadata?.container_image ?? pending.containerImage,
+    source_container_image: metadata?.source_container_image,
     name: pending.name,
     env,
     lsp_manifest: pending.kind === "lsp"

@@ -205,6 +205,12 @@ impl SessionEnvironmentLease {
         let _image_operation =
             container::acquire_image_operation_lock(&snapshot.runtime_binary, &spec.image)?;
         if !runtime.image_exists(&spec.image)? {
+            if spec.image.contains("@sha256:") {
+                bail!(
+                    "pinned integration image {} is not present locally; reinstall or upgrade the integration while online before starting a task",
+                    spec.image
+                );
+            }
             runtime
                 .pull(&spec.image)
                 .with_context(|| format!("failed to bootstrap service image {}", spec.image))?;
@@ -554,6 +560,12 @@ impl SessionEnvironmentLease {
             // ContainerHandle::drop retries only failures for resources whose ownership was
             // verified above; foreign identifiers have already been cleared.
             drop(handle);
+        } else {
+            let record = self.record()?;
+            let runtime = container::runtime_for_binary(&record.runtime_binary)?;
+            if let Err(error) = cleanup_recorded_service_resources(&record, runtime.as_ref()) {
+                stop_error = Some(error);
+            }
         }
         self.cache_attachments
             .lock()
@@ -752,6 +764,117 @@ impl EnvironmentSupervisor {
         Ok(SessionLeaseHandle {
             supervisor: self,
             session_id: seed.session_id,
+            retain_after_turn,
+            lease,
+        })
+    }
+
+    pub fn acquire_service_only(
+        &'static self,
+        session_id: &str,
+        workspace_root: &Path,
+        repository_root: &Path,
+        runtime: Box<dyn ContainerRuntime>,
+        retain_after_turn: bool,
+    ) -> Result<SessionLeaseHandle> {
+        let _operation = SessionOperationLock::acquire(self.lock_path(session_id))?;
+        let runtime_info = runtime.info()?;
+        if let Some(lease) = self
+            .leases
+            .lock()
+            .map_err(|_| anyhow::anyhow!("environment supervisor lock is poisoned"))?
+            .get(session_id)
+            .cloned()
+        {
+            let record = lease.record()?;
+            let service_only = !record
+                .resources
+                .iter()
+                .any(|resource| resource.kind == LeaseResourceKind::Container);
+            if service_only
+                && record.workspace_root == workspace_root
+                && record.runtime_binary == runtime_info.binary
+            {
+                lease.transition(LeaseState::InUse, LeaseState::InUse)?;
+                lease.active_handles.fetch_add(1, Ordering::AcqRel);
+                return Ok(SessionLeaseHandle {
+                    supervisor: self,
+                    session_id: session_id.to_string(),
+                    retain_after_turn,
+                    lease,
+                });
+            }
+            bail!("session already owns an incompatible environment lease");
+        }
+
+        let record_path = self.record_path(session_id);
+        if let Some(record) = load_record(&record_path)? {
+            cleanup_recorded_resources(&record, runtime.as_ref())?;
+            std::fs::remove_file(&record_path).with_context(|| {
+                format!(
+                    "failed to remove stale lease record {}",
+                    record_path.display()
+                )
+            })?;
+        }
+        let canonical_repository = repository_root.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve repository root {}",
+                repository_root.display()
+            )
+        })?;
+        let project_id =
+            crate::environment_lock::sha256(canonical_repository.to_string_lossy().as_bytes())
+                [..12]
+                .to_string();
+        let authority = crate::environment_lock::sha256(
+            format!(
+                "service-only\0{}\0{}",
+                runtime_info.binary, runtime_info.version
+            )
+            .as_bytes(),
+        );
+        let now = now_millis();
+        let record = SessionLeaseRecord {
+            version: SESSION_LEASE_RECORD_VERSION,
+            lease_id: format!(
+                "pb-svc-lease-{}",
+                &crate::environment_lock::sha256(session_id.as_bytes())[..12]
+            ),
+            session_id: session_id.to_string(),
+            project_id,
+            environment_lock_sha256: authority,
+            workspace_root: workspace_root.to_path_buf(),
+            repository_root: canonical_repository,
+            runtime_binary: runtime_info.binary,
+            runtime_version: runtime_info.version,
+            desired_state: LeaseState::InUse,
+            observed_state: LeaseState::InUse,
+            resources: vec![LeaseResourceRecord {
+                kind: LeaseResourceKind::Workspace,
+                name: workspace_root.to_string_lossy().into_owned(),
+                role: "task-worktree".to_string(),
+                persistent: false,
+            }],
+            created_at_ms: now,
+            last_used_at_ms: now,
+            expires_at_ms: now.saturating_add(self.idle_ttl_ms),
+        };
+        save_record_atomic(&record_path, &record)?;
+        let lease = Arc::new(SessionEnvironmentLease {
+            record_path,
+            record: Mutex::new(record),
+            handle: Mutex::new(None),
+            cache_attachments: Mutex::new(Vec::new()),
+            active_handles: AtomicUsize::new(1),
+        });
+        self.leases
+            .lock()
+            .map_err(|_| anyhow::anyhow!("environment supervisor lock is poisoned"))?
+            .insert(session_id.to_string(), Arc::clone(&lease));
+        Ok(SessionLeaseHandle {
+            supervisor: self,
+            session_id: session_id.to_string(),
             retain_after_turn,
             lease,
         })

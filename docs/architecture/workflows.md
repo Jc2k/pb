@@ -71,6 +71,14 @@ direct handoff or final-grace path; unchanged versions are deduplicated. That pa
 error diagnostics. A blocking result reopens only its exact current task paths for repair. It does
 not replace the checking stage, including for supported paths beyond the bounded pass selection.
 
+Settled evidence is workspace-epoch scoped, not merely file-version scoped. Any content mutation
+invalidates settled evidence for every supported task path. Before accepting a settled result, pb
+opens the whole bounded server/path set, forces a document-version publication barrier for the
+target, and accepts only a newer publication after a short quiescence window. Coverage is tracked
+per server/path target. A path is settled only when every matching target completed for the same
+workspace epoch; path, call, time, startup, transport, and stale-workspace limits are explicit
+incomplete outcomes and can never be presented as clean.
+
 ### 4. Checks
 
 The harness selects affected configured checks and records their current results. Named acceptance
@@ -198,7 +206,7 @@ The runtime applies these boundaries before a result can become evidence:
 | Public research | Every URL and redirect is restricted to HTTP(S), resolved before connection, rejected if any answer is private/special-use, and pinned to the validated public address. Proxies are bypassed. Bodies are capped and oversized chunked responses fail instead of being returned as complete. |
 | Vision | A vision path must be inside the workspace or exactly match a session attachment. Inputs are regular files with byte and pixel ceilings. |
 | MCP | Only operator-declared `capabilities.read_only_tools` are exposed. Server annotations are untrusted hints. Unsupported schemas and normalized-name collisions become explicit status failures; `isError` is a failed call; only an operator-read-only, server-idempotent call is retried, and only after a typed transport failure. A configured service runtime must match the owning session runtime. |
-| LSP | Names cannot collide silently; documents/config/responses and the open-document set are bounded; language IDs follow file extensions; diagnostics wait for the current document version; only typed transport failures restart a server. Proactive passes are deterministic, read-only, content-fingerprinted, limited to 8 supported task paths/calls, report the count deferred by that ceiling, stop scheduling new calls after 12 seconds, wait at most 2 seconds per diagnostic publication, retain at most 64 diagnostics, and collapse each message to 500 characters. Any workspace mutation during collection discards the entire result. Marketplace packages require a bounded typed manifest that cannot request write or network authority. Sidecars follow the owning session runtime unless an explicit compatibility assertion matches it. |
+| LSP | Discovery is schema-only and server startup is lazy behind one per-session/per-server initialization lock; no registry lock is held while an image or server starts. Names cannot collide silently; documents/config/responses and the open-document set are bounded; language IDs follow file extensions; diagnostics require a post-barrier publication for the current document and workspace epoch; only typed transport failures restart a server. Proactive passes are deterministic, read-only, content-fingerprinted, limited to 8 supported task paths and 8 server/path calls, retain every unattempted target as deferred, stop scheduling new calls after 12 seconds, wait at most 2 seconds per diagnostic publication, retain at most 64 diagnostics, and collapse each message to 500 characters. Any workspace mutation during collection discards the entire result. Marketplace packages require a bounded typed manifest bound to an immutable OCI digest and cannot request write or network authority. Sidecars use the owning task runtime or a session-owned service-only lease for local/no-environment projects. |
 | Durable memory | Agent writes are byte/count bounded and evidence-backed. The agent can record only facts, gotchas, procedures, and debt. Decisions and preferences require a future controller-owned approval record and cannot be self-approved in tool arguments. Supersession requires active source and replacement entries. |
 
 Dynamic JSON schemas are admitted only when pb's recursive validator can enforce every supported
@@ -352,6 +360,12 @@ character. Controller actions and deterministic corrections record Trinity Walke
 steward plus the profile she is assisting when that context is available. Older tool events without
 an actor remain explicitly unattributed rather than inheriting a nearby profile.
 
+New tool calls and results also carry a stable call id, optional batch id, and a typed result outcome
+(`succeeded`, `failed`, `rejected`, `timed_out`, `cancelled`, or `cache_replay`). Consumers correlate
+by id even when parallel results arrive out of order or a correction occurs between call and result.
+Legacy events use a bounded tool/actor fallback only when both sides lack an id, and an absent legacy
+outcome remains unknown rather than being displayed as success.
+
 An exact active small-file observation may satisfy read-before-write only while its current
 fingerprint and complete prompt bytes remain valid. A failed-diagnostic range permits only an edit
 whose old text lies wholly inside an included byte window. Fresh review inspection is injected only
@@ -434,8 +448,16 @@ change that the correction requires.
 
 Plan paths are validated in step order. `create` makes a missing path available to later `modify`
 or `delete` steps, and `delete` removes it from the subsequent plan state. A modification before
-creation and a duplicate creation while the path exists remain invalid. This lets a plan express
-several conceptual phases on one new file without weakening filesystem-state checks.
+creation and a duplicate creation while the path exists remain invalid. A path that starts and ends
+missing is also rejected because no durable repository delta could prove the work happened.
+
+After acceptance, conceptual operations on the same path compile to one path-transition work unit.
+The unit retains every contributing plan step id but derives its authority from the task baseline and
+required final state: create for missing-to-present, delete for present-to-missing, and modify for
+present-to-present. Repository state can therefore complete only one unit for a path; an early create
+cannot accidentally complete a later conceptual modification, and a temporary delete cannot become
+an impossible outstanding unit. Legacy checkpoints containing repeated path units fail validation
+and require replanning instead of inheriting completion under the new meaning.
 
 When a trusted harness contract restricts paths, planning validates every proposed path against
 that allowlist before implementation. Prompt examples use workspace-relative paths and explicitly

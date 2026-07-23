@@ -101,6 +101,17 @@ impl FramedJsonReader {
         recv_until(&self.receiver, self.protocol, deadline)
     }
 
+    pub(crate) fn try_recv(&self) -> Result<Option<Value>> {
+        match self.receiver.try_recv() {
+            Ok(Ok(message)) => Ok(Some(message)),
+            Ok(Err(error)) => Err(anyhow!(error)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                bail!("{} response stream closed", self.protocol)
+            }
+        }
+    }
+
     /// Join only after the owning process has been stopped and its stdout pipe has closed.
     pub(crate) fn join(&mut self) {
         if let Some(thread) = self.thread.take() {

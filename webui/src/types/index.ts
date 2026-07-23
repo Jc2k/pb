@@ -209,6 +209,8 @@ export type AgentEvent =
     type: "tool_call";
     tool: string;
     arguments: unknown;
+    call_id?: string;
+    batch_id?: string;
     actor?: TeamActor;
     nesting_depth?: number;
     timestamp_ms?: number;
@@ -293,6 +295,9 @@ export type AgentEvent =
     type: "tool_result";
     tool: string;
     result: string;
+    call_id?: string;
+    batch_id?: string;
+    outcome?: "succeeded" | "failed" | "rejected" | "timed_out" | "cancelled" | "cache_replay";
     actor?: TeamActor;
     duration_ms?: number;
     energy_joules?: number;
@@ -922,8 +927,11 @@ export interface InstalledIntegration {
   name: string;
   kind: IntegrationKind;
   container_image: string;
+  source_container_image?: string;
+  verified_manifest_digest?: string;
   env?: Record<string, string>;
   disabled: boolean;
+  status?: "ready" | "disabled" | "unavailable" | "legacy_unverified";
 }
 
 export type JsonSchemaProperty = {
@@ -962,6 +970,8 @@ export interface LspPackageManifest {
 
 export interface IntegrationConfigSchemaResponse {
   container_image: string;
+  source_container_image?: string;
+  manifest_digest?: string;
   annotation: string;
   schema?: IntegrationJsonSchema | null;
   lsp_manifest_annotation: string;

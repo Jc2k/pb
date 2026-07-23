@@ -122,7 +122,10 @@ commit, or verified completion.
 Configured LSPs add an intrinsic diagnostic contract. pb automatically inspects supported changed
 task paths: syntax-classified errors during partial implementation and all error-severity
 diagnostics once work is settled or being handed off. Reports are bound to the current workspace
-and path fingerprints; concurrent mutation discards them. A blocking report invalidates older read
+epoch and path fingerprints; concurrent mutation discards them. Every matching server/path target
+is accounted as completed, failed, or deferred, and only complete coverage with no diagnostics is
+clean. Any content mutation invalidates settled evidence across the task path set, while syntax
+evidence is invalidated only for files whose bytes changed. A blocking report invalidates older read
 and staging evidence for only the exact reported paths and requires a fresh read before repair.
 Clean, failed, timed-out, or unavailable LSP evidence never satisfies a named check, review,
 commit, completion claim, or Goal criterion. The model may still call manual read-only LSP tools
@@ -171,6 +174,11 @@ Tool failures preserve the distinction too. Command timeout, user cancellation, 
 bounded output are structured results. MCP/LSP transport failures are distinct from remote
 application errors, so an application failure cannot cause an unsafe automatic replay. Oversized
 inputs and responses fail explicitly rather than being presented as complete evidence.
+
+Durable tool events preserve that distinction for presentation as well: call and batch identities
+survive result reordering, and typed outcomes distinguish success, execution failure, validation or
+policy rejection, timeout, cancellation, and deterministic cache replay. Older events without these
+additive fields stay readable and are shown as unknown rather than upgraded to success.
 
 Automatic LSP failures are fail-open only with respect to this advisory pre-check: Trinity records
 the incomplete evidence and the normal configured checks remain authoritative. Current blocking

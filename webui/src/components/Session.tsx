@@ -8,6 +8,7 @@ import {
   projectName,
   relativeTime,
   sessionTitle,
+  toolResultForCall,
 } from "../lib/helpers";
 import {
   errorSummary,
@@ -205,10 +206,13 @@ export function ActionGroupBubble({
       const friendlyName = TOOL_FRIENDLY_NAMES[toolName] || toolName;
       const iconClass = TOOL_ICONS[toolName] || "bi bi-file-earmark-text";
 
-      let statusClass = "success";
+      let statusClass = "pending";
       let detailText: string | null = null;
 
-      const result = i < toolResults.length ? toolResults[i] : undefined;
+      const result = toolResultForCall(e, toolResults);
+      if (result?.event.type === "tool_result") {
+        statusClass = result.event.outcome || "unknown";
+      }
       detailText = getToolDetail(e, result);
 
       return (

@@ -7,6 +7,17 @@ use crate::session_store::now_millis;
 
 pub const EVENT_SCHEMA_VERSION: &str = "v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutcome {
+    Succeeded,
+    Failed,
+    Rejected,
+    TimedOut,
+    Cancelled,
+    CacheReplay,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContractStatus {
@@ -676,6 +687,10 @@ pub enum AgentEvent {
         tool: String,
         arguments: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<TeamActor>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
@@ -731,6 +746,12 @@ pub enum AgentEvent {
     ToolResult {
         tool: String,
         result: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<ToolOutcome>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<TeamActor>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1424,6 +1445,8 @@ impl EventEnvelope {
             AgentEvent::ToolCall {
                 tool,
                 arguments,
+                call_id,
+                batch_id,
                 actor,
                 nesting_depth,
                 ..
@@ -1432,6 +1455,8 @@ impl EventEnvelope {
                 event: AgentEvent::ToolCall {
                     tool,
                     arguments,
+                    call_id,
+                    batch_id,
                     actor,
                     nesting_depth,
                     timestamp_ms: Some(now),
@@ -1512,6 +1537,9 @@ impl EventEnvelope {
             AgentEvent::ToolResult {
                 tool,
                 result,
+                call_id,
+                batch_id,
+                outcome,
                 actor,
                 duration_ms,
                 energy_joules,
@@ -1525,6 +1553,9 @@ impl EventEnvelope {
                 event: AgentEvent::ToolResult {
                     tool,
                     result,
+                    call_id,
+                    batch_id,
+                    outcome,
                     actor,
                     duration_ms,
                     energy_joules,
@@ -1965,6 +1996,8 @@ mod tests {
         let envelope = EventEnvelope::with_timestamp(AgentEvent::ToolCall {
             tool: "read_file".to_string(),
             arguments: serde_json::json!({"path": "src/lib.rs"}),
+            call_id: Some("call-1".to_string()),
+            batch_id: Some("batch-1".to_string()),
             actor: Some(TeamActor::agent(AgentProfile::Review)),
             nesting_depth: None,
             timestamp_ms: None,
@@ -1974,10 +2007,38 @@ mod tests {
         assert!(matches!(
             restored.event,
             AgentEvent::ToolCall {
+                call_id: Some(ref call_id),
+                batch_id: Some(ref batch_id),
                 actor: Some(TeamActor::Agent(AgentProfile::Review)),
                 timestamp_ms: Some(_),
                 ..
-            }
+            } if call_id == "call-1" && batch_id == "batch-1"
+        ));
+
+        let result = EventEnvelope::with_timestamp(AgentEvent::ToolResult {
+            tool: "read_file".to_string(),
+            result: "contents".to_string(),
+            call_id: Some("call-1".to_string()),
+            batch_id: Some("batch-1".to_string()),
+            outcome: Some(ToolOutcome::Succeeded),
+            actor: Some(TeamActor::agent(AgentProfile::Review)),
+            duration_ms: Some(1),
+            energy_joules: None,
+            energy_kwh: None,
+            average_power_watts: None,
+            energy_shared_calls: None,
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        let restored: EventEnvelope =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert!(matches!(
+            restored.event,
+            AgentEvent::ToolResult {
+                call_id: Some(ref call_id),
+                outcome: Some(ToolOutcome::Succeeded),
+                ..
+            } if call_id == "call-1"
         ));
 
         let envelope = EventEnvelope::with_timestamp(AgentEvent::ControllerClosure {
@@ -2012,7 +2073,27 @@ mod tests {
         let envelope: EventEnvelope = serde_json::from_str(legacy_tool).unwrap();
         assert!(matches!(
             envelope.event,
-            AgentEvent::ToolCall { actor: None, .. }
+            AgentEvent::ToolCall {
+                actor: None,
+                call_id: None,
+                batch_id: None,
+                ..
+            }
+        ));
+
+        let legacy_result = r#"{
+            "version":"v1",
+            "event":{"type":"tool_result","tool":"read_file","result":"contents"}
+        }"#;
+        let envelope: EventEnvelope = serde_json::from_str(legacy_result).unwrap();
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::ToolResult {
+                actor: None,
+                call_id: None,
+                outcome: None,
+                ..
+            }
         ));
 
         let legacy_controller = r#"{

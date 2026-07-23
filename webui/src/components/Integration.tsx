@@ -34,8 +34,18 @@ export function IntegrationList({
               <div className="mcp-store-icon"><i className={installedIcon}></i></div>
               <div className="mcp-store-copy">
                 <strong>{item.name}</strong>
-                <span>{item.container_image}</span>
-                <small>{item.disabled ? "Disabled for new sessions" : "Ready for new sessions"}</small>
+                <span>{item.source_container_image || item.container_image}</span>
+                <small>{
+                  item.status === "legacy_unverified"
+                    ? "Upgrade required · image identity is not pinned"
+                    : item.status === "unavailable"
+                    ? "Configured · pinned image or container runtime unavailable"
+                    : item.disabled || item.status === "disabled"
+                    ? "Disabled for new sessions"
+                    : item.verified_manifest_digest
+                    ? `Ready · pinned ${item.verified_manifest_digest.slice(0, 19)}…`
+                    : "Ready for new sessions"
+                }</small>
               </div>
               <div className="mcp-store-actions">
                 <button className="mcp-icon-btn" title={`Configure ${item.name}`} aria-label={`Configure ${item.name}`} onClick={() => onConfigure(item)}>

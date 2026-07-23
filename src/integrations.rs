@@ -64,15 +64,72 @@ pub struct InstalledIntegration {
     pub name: String,
     pub kind: IntegrationKind,
     pub container_image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_container_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_manifest_digest: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub disabled: bool,
+    #[serde(default)]
+    pub status: IntegrationStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationStatus {
+    #[default]
+    Ready,
+    Disabled,
+    Unavailable,
+    LegacyUnverified,
+}
+
+fn lsp_installation_status(config: &LspServerConfig) -> IntegrationStatus {
+    let Some(image) = config.container_image.as_deref() else {
+        return if config.disabled {
+            IntegrationStatus::Disabled
+        } else {
+            IntegrationStatus::Ready
+        };
+    };
+    container_installation_status(image, config.container_runtime.as_deref(), config.disabled)
+}
+
+fn container_installation_status(
+    image: &str,
+    configured_runtime: Option<&str>,
+    disabled: bool,
+) -> IntegrationStatus {
+    if disabled {
+        IntegrationStatus::Disabled
+    } else if is_marketplace_container_image(image) && !image.contains("@sha256:") {
+        IntegrationStatus::LegacyUnverified
+    } else {
+        let runtime = match configured_runtime {
+            Some(binary) => crate::container::runtime_for_binary(binary).ok(),
+            None => crate::container::detect_runtime(),
+        };
+        if runtime.is_some_and(|runtime| {
+            if image.contains("@sha256:") {
+                runtime.image_exists(image).unwrap_or(false)
+            } else {
+                runtime.info().is_ok()
+            }
+        }) {
+            IntegrationStatus::Ready
+        } else {
+            IntegrationStatus::Unavailable
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntegrationInstallRequest {
     pub kind: IntegrationKind,
     pub container_image: String,
+    #[serde(default)]
+    pub source_container_image: Option<String>,
     pub name: Option<String>,
     pub runtime: Option<String>,
     #[serde(default)]
@@ -209,6 +266,8 @@ pub struct IntegrationRemoveResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntegrationConfigSchema {
     pub container_image: String,
+    pub source_container_image: String,
+    pub manifest_digest: String,
     pub annotation: String,
     pub schema: Option<Value>,
     pub lsp_manifest_annotation: String,
@@ -293,10 +352,17 @@ pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSch
         .context("failed to build registry client")?;
     let manifest = fetch_registry_manifest(&client, &image)
         .with_context(|| format!("failed to inspect container image {container_image}"))?;
-    let config = fetch_registry_config(&client, &image, &manifest)
+    if image.reference.starts_with("sha256:") && image.reference != manifest.digest {
+        bail!(
+            "registry returned manifest digest {} for requested digest {}",
+            manifest.digest,
+            image.reference
+        );
+    }
+    let config = fetch_registry_config(&client, &image, &manifest.value)
         .with_context(|| format!("failed to fetch image config for {container_image}"))?;
     let schema_text = find_annotation(&config, CONFIG_SCHEMA_ANNOTATION)
-        .or_else(|| find_annotation(&manifest, CONFIG_SCHEMA_ANNOTATION));
+        .or_else(|| find_annotation(&manifest.value, CONFIG_SCHEMA_ANNOTATION));
     let schema = schema_text
         .map(|text| {
             serde_json::from_str(text)
@@ -304,12 +370,14 @@ pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSch
         })
         .transpose()?;
     let lsp_manifest_text = find_annotation(&config, LSP_MANIFEST_ANNOTATION)
-        .or_else(|| find_annotation(&manifest, LSP_MANIFEST_ANNOTATION));
+        .or_else(|| find_annotation(&manifest.value, LSP_MANIFEST_ANNOTATION));
     let lsp_manifest = lsp_manifest_text
         .map(parse_lsp_package_manifest)
         .transpose()?;
     Ok(IntegrationConfigSchema {
-        container_image: container_image.to_string(),
+        container_image: image.pinned_reference(&manifest.digest),
+        source_container_image: container_image.to_string(),
+        manifest_digest: manifest.digest,
         annotation: CONFIG_SCHEMA_ANNOTATION.to_string(),
         schema,
         lsp_manifest_annotation: LSP_MANIFEST_ANNOTATION.to_string(),
@@ -401,9 +469,16 @@ impl RegistryImage {
             self.registry, self.repository, digest
         )
     }
+
+    fn pinned_reference(&self, digest: &str) -> String {
+        format!("{}/{}@{digest}", self.registry, self.repository)
+    }
 }
 
 fn split_image_reference(image: &str) -> (&str, &str) {
+    if let Some((name, digest)) = image.rsplit_once('@') {
+        return (name, digest);
+    }
     let last_slash = image.rfind('/');
     let last_colon = image.rfind(':');
     if let Some(colon) = last_colon
@@ -414,7 +489,24 @@ fn split_image_reference(image: &str) -> (&str, &str) {
     (image, "latest")
 }
 
-fn fetch_registry_manifest(client: &Client, image: &RegistryImage) -> Result<Value> {
+fn validate_source_image_identity(request: &IntegrationInstallRequest) -> Result<()> {
+    let Some(source) = request.source_container_image.as_deref() else {
+        return Ok(());
+    };
+    let source = RegistryImage::parse(source)?;
+    let installed = RegistryImage::parse(&request.container_image)?;
+    if source.registry != installed.registry || source.repository != installed.repository {
+        bail!("source container image does not name the installed image repository");
+    }
+    Ok(())
+}
+
+struct RegistryDocument {
+    value: Value,
+    digest: String,
+}
+
+fn fetch_registry_manifest(client: &Client, image: &RegistryImage) -> Result<RegistryDocument> {
     let accept = [
         "application/vnd.oci.image.index.v1+json",
         "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -422,7 +514,7 @@ fn fetch_registry_manifest(client: &Client, image: &RegistryImage) -> Result<Val
         "application/vnd.docker.distribution.manifest.v2+json",
     ]
     .join(", ");
-    fetch_registry_json(
+    fetch_registry_json_document(
         client,
         image,
         &image.manifest_url(),
@@ -441,7 +533,7 @@ fn fetch_registry_config(
     } else {
         let digest = select_runnable_manifest_digest(manifest)
             .context("image index does not contain a runnable manifest digest")?;
-        fetch_registry_json(
+        fetch_registry_json_document(
             client,
             image,
             &image.manifest_digest_url(digest),
@@ -452,13 +544,14 @@ fn fetch_registry_config(
             .join(", "),
             "platform image manifest",
         )?
+        .value
     };
     let digest = image_manifest
         .get("config")
         .and_then(|config| config.get("digest"))
         .and_then(Value::as_str)
         .context("image manifest does not contain a config digest")?;
-    fetch_registry_json(
+    Ok(fetch_registry_json_document(
         client,
         image,
         &image.blob_url(digest),
@@ -469,7 +562,8 @@ fn fetch_registry_config(
         ]
         .join(", "),
         "image config",
-    )
+    )?
+    .value)
 }
 
 fn select_runnable_manifest_digest(manifest: &Value) -> Option<&str> {
@@ -477,6 +571,7 @@ fn select_runnable_manifest_digest(manifest: &Value) -> Option<&str> {
     manifests
         .iter()
         .filter(|item| is_runnable_manifest(item))
+        .filter(|item| manifest_platform_priority(item) > 0)
         .max_by_key(|item| manifest_platform_priority(item))
         .and_then(|item| item.get("digest"))
         .and_then(Value::as_str)
@@ -507,21 +602,27 @@ fn manifest_platform_priority(manifest: &Value) -> u8 {
         .and_then(|platform| platform.get("architecture"))
         .and_then(Value::as_str);
 
+    let host_architecture = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "amd64"
+    } else {
+        std::env::consts::ARCH
+    };
     match (os, architecture) {
-        (Some("linux"), Some("amd64")) => 3,
-        (Some("linux"), Some("arm64")) => 2,
-        (Some("linux"), _) => 1,
+        (Some("linux"), Some(candidate)) if candidate == host_architecture => 3,
+        (Some("linux"), None) => 1,
         _ => 0,
     }
 }
 
-fn fetch_registry_json(
+fn fetch_registry_json_document(
     client: &Client,
     image: &RegistryImage,
     url: &str,
     accept: &str,
     context: &str,
-) -> Result<Value> {
+) -> Result<RegistryDocument> {
     let mut response = client.get(url).header(ACCEPT, accept).send()?;
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         let challenge = response
@@ -539,11 +640,57 @@ fn fetch_registry_json(
                 .send()?;
         }
     }
-    read_bounded_registry_json(
+    read_bounded_registry_document(
         response.error_for_status()?,
         MAX_REGISTRY_DOCUMENT_BYTES,
         context,
     )
+}
+
+fn read_bounded_registry_document(
+    response: reqwest::blocking::Response,
+    max_bytes: u64,
+    context: &str,
+) -> Result<RegistryDocument> {
+    let declared_digest = response
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value.len() == 71
+                && value.starts_with("sha256:")
+                && value[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_string);
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes)
+    {
+        bail!("{context} exceeds the {max_bytes}-byte response bound");
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {context}"))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("{context} exceeds the {max_bytes}-byte response bound");
+    }
+    let value =
+        serde_json::from_slice(&bytes).with_context(|| format!("failed to decode {context}"))?;
+    let computed_digest = format!("sha256:{}", crate::environment_lock::sha256(&bytes));
+    if declared_digest
+        .as_deref()
+        .is_some_and(|declared| declared != computed_digest)
+    {
+        bail!("{context} content does not match its declared registry digest");
+    }
+    Ok(RegistryDocument {
+        value,
+        digest: computed_digest,
+    })
 }
 
 fn fetch_bearer_token(
@@ -640,14 +787,24 @@ pub fn list_project_installed(workspace_root: &Path) -> Result<Vec<InstalledInte
     let mut installed = Vec::new();
     if let Some(config) = ProjectMcpConfig::load(workspace_root)? {
         installed.extend(config.servers.into_iter().filter_map(|(name, server)| {
+            let status = server.container_image.as_deref().map(|image| {
+                container_installation_status(
+                    image,
+                    server.container_runtime.as_deref(),
+                    server.disabled,
+                )
+            });
             server
                 .container_image
                 .map(|container_image| InstalledIntegration {
                     name,
                     kind: IntegrationKind::Mcp,
                     container_image,
+                    source_container_image: None,
+                    verified_manifest_digest: None,
                     env: server.env,
                     disabled: server.disabled,
+                    status: status.unwrap_or(IntegrationStatus::Unavailable),
                 })
         }));
     }
@@ -664,6 +821,7 @@ pub fn install_project(
     workspace_root: &Path,
     request: IntegrationInstallRequest,
 ) -> Result<IntegrationInstallResponse> {
+    validate_source_image_identity(&request)?;
     let name = request
         .name
         .clone()
@@ -680,11 +838,43 @@ pub fn install_project(
             if request.no_overwrite && config.servers.contains_key(&name) {
                 bail!("MCP integration '{name}' is already installed");
             }
+            if is_marketplace_container_image(&request.container_image)
+                && !request.container_image.contains("@sha256:")
+            {
+                bail!("marketplace integrations must be installed by immutable OCI digest");
+            }
+            let container_runtime = requested_runtime(request.runtime.as_deref())?;
+            if is_marketplace_container_image(&request.container_image) {
+                let runtime = match container_runtime.as_deref() {
+                    Some(binary) => Some(crate::container::runtime_for_binary(binary)?),
+                    None => crate::container::detect_runtime(),
+                };
+                if let Some(runtime) = runtime {
+                    let runtime_info = runtime.info()?;
+                    let _image_operation = crate::container::acquire_image_operation_lock(
+                        &runtime_info.binary,
+                        &request.container_image,
+                    )?;
+                    if !runtime.image_exists(&request.container_image)? {
+                        runtime.pull(&request.container_image).with_context(|| {
+                            format!(
+                                "failed to install pinned MCP image {}",
+                                request.container_image
+                            )
+                        })?;
+                    }
+                }
+            }
+            let status = container_installation_status(
+                &request.container_image,
+                container_runtime.as_deref(),
+                false,
+            );
             config.servers.insert(
                 name.clone(),
                 McpServerConfig {
                     container_image: Some(request.container_image.clone()),
-                    container_runtime: requested_runtime(request.runtime.as_deref())?,
+                    container_runtime,
                     env: request.env.clone(),
                     ..Default::default()
                 },
@@ -695,8 +885,11 @@ pub fn install_project(
                     name,
                     kind: IntegrationKind::Mcp,
                     container_image: request.container_image,
+                    source_container_image: request.source_container_image,
+                    verified_manifest_digest: None,
                     env: request.env,
                     disabled: false,
+                    status,
                 },
                 config_path: crate::mcp::project_mcp_config_path(workspace_root)
                     .display()
@@ -723,6 +916,9 @@ pub fn remove_project(
         .servers
         .remove(name)
         .with_context(|| format!("MCP integration '{name}' is not installed"))?;
+    let status = server.container_image.as_deref().map(|image| {
+        container_installation_status(image, server.container_runtime.as_deref(), server.disabled)
+    });
     let container_image = server
         .container_image
         .context("configured MCP server is not a container integration")?;
@@ -732,8 +928,11 @@ pub fn remove_project(
             name: name.to_string(),
             kind,
             container_image,
+            source_container_image: None,
+            verified_manifest_digest: None,
             env: server.env,
             disabled: server.disabled,
+            status: status.unwrap_or(IntegrationStatus::Unavailable),
         },
         config_path: crate::mcp::project_mcp_config_path(workspace_root)
             .display()
@@ -748,14 +947,18 @@ pub fn list_global_lsp_installed() -> Result<Vec<InstalledIntegration>> {
         .servers
         .into_iter()
         .filter_map(|(name, server)| {
+            let status = lsp_installation_status(&server);
             server
                 .container_image
                 .map(|container_image| InstalledIntegration {
                     name,
                     kind: IntegrationKind::Lsp,
                     container_image,
+                    source_container_image: server.source_container_image,
+                    verified_manifest_digest: server.verified_manifest_digest,
                     env: server.env,
                     disabled: server.disabled,
+                    status,
                 })
         })
         .collect();
@@ -766,11 +969,9 @@ pub fn list_global_lsp_installed() -> Result<Vec<InstalledIntegration>> {
 pub fn install_global_lsp(
     request: IntegrationInstallRequest,
 ) -> Result<IntegrationInstallResponse> {
+    validate_source_image_identity(&request)?;
     if request.kind != IntegrationKind::Lsp {
         bail!("only LSP integrations can be installed globally");
-    }
-    if is_marketplace_container_image(&request.container_image) && request.lsp_manifest.is_none() {
-        bail!("marketplace LSP integrations must provide a typed package manifest");
     }
     let name = request
         .name
@@ -779,11 +980,46 @@ pub fn install_global_lsp(
     if name.trim().is_empty() || name.contains(['\n', '\r']) {
         bail!("integration name cannot be empty or contain newlines");
     }
-    let server_config = lsp_server_config_from_install(&request)?;
     let mut user_config = UserConfig::load()?;
     if request.no_overwrite && user_config.lsp.servers.contains_key(&name) {
         bail!("LSP integration '{name}' is already installed");
     }
+    if is_marketplace_container_image(&request.container_image) {
+        if !request.container_image.contains("@sha256:") {
+            bail!("marketplace LSP integrations must be installed by immutable OCI digest");
+        }
+        let verified = fetch_config_schema(&request.container_image)?;
+        let verified_manifest = verified
+            .lsp_manifest
+            .context("marketplace LSP image does not publish a typed package manifest")?;
+        if request.lsp_manifest.as_ref() != Some(&verified_manifest) {
+            bail!("marketplace LSP manifest does not match the pinned OCI image");
+        }
+    }
+    let server_config = lsp_server_config_from_install(&request)?;
+    if is_marketplace_container_image(&request.container_image) {
+        let runtime = match server_config.container_runtime.as_deref() {
+            Some(binary) => Some(crate::container::runtime_for_binary(binary)?),
+            None => crate::container::detect_runtime(),
+        };
+        if let Some(runtime) = runtime {
+            let runtime_info = runtime.info()?;
+            let _image_operation = crate::container::acquire_image_operation_lock(
+                &runtime_info.binary,
+                &request.container_image,
+            )?;
+            if !runtime.image_exists(&request.container_image)? {
+                runtime.pull(&request.container_image).with_context(|| {
+                    format!(
+                        "failed to install pinned LSP image {}",
+                        request.container_image
+                    )
+                })?;
+            }
+        }
+    }
+    let status = lsp_installation_status(&server_config);
+    let verified_manifest_digest = server_config.verified_manifest_digest.clone();
     user_config.lsp.servers.insert(name.clone(), server_config);
     user_config.save()?;
     Ok(IntegrationInstallResponse {
@@ -791,8 +1027,11 @@ pub fn install_global_lsp(
             name,
             kind: IntegrationKind::Lsp,
             container_image: request.container_image,
+            source_container_image: request.source_container_image,
+            verified_manifest_digest,
             env: request.env,
             disabled: false,
+            status,
         },
         config_path: config::config_path()?.display().to_string(),
     })
@@ -808,8 +1047,14 @@ fn requested_runtime(runtime: Option<&str>) -> Result<Option<String>> {
 }
 
 fn lsp_server_config_from_install(request: &IntegrationInstallRequest) -> Result<LspServerConfig> {
+    let manifest_digest = request
+        .container_image
+        .rsplit_once("@sha256:")
+        .map(|(_, digest)| format!("sha256:{digest}"));
     let mut config = LspServerConfig {
         container_image: Some(request.container_image.clone()),
+        source_container_image: request.source_container_image.clone(),
+        verified_manifest_digest: manifest_digest,
         container_runtime: requested_runtime(request.runtime.as_deref())?,
         env: request.env.clone(),
         ..Default::default()
@@ -836,6 +1081,9 @@ pub fn remove_global_lsp(name: &str) -> Result<IntegrationRemoveResponse> {
         .servers
         .remove(name)
         .with_context(|| format!("LSP integration '{name}' is not installed"))?;
+    let status = lsp_installation_status(&server);
+    let source_container_image = server.source_container_image.clone();
+    let verified_manifest_digest = server.verified_manifest_digest.clone();
     let container_image = server
         .container_image
         .context("configured LSP server is not a container integration")?;
@@ -845,21 +1093,24 @@ pub fn remove_global_lsp(name: &str) -> Result<IntegrationRemoveResponse> {
             name: name.to_string(),
             kind: IntegrationKind::Lsp,
             container_image,
+            source_container_image,
+            verified_manifest_digest,
             env: server.env,
             disabled: server.disabled,
+            status,
         },
         config_path: config::config_path()?.display().to_string(),
     })
 }
 
 fn name_from_image(image: &str) -> String {
-    image
-        .rsplit('/')
+    let leaf = image.rsplit('/').next().unwrap_or(image);
+    leaf.split('@')
         .next()
-        .unwrap_or(image)
+        .unwrap_or(leaf)
         .split(':')
         .next()
-        .unwrap_or(image)
+        .unwrap_or(leaf)
         .to_string()
 }
 
@@ -897,6 +1148,22 @@ mod tests {
     fn registry_image_parse_defaults_missing_tag_to_latest() {
         let image = RegistryImage::parse("ghcr.io/crunchy-pb/mcp-sentry").unwrap();
         assert_eq!(image.reference, "latest");
+    }
+
+    #[test]
+    fn registry_image_preserves_and_renders_immutable_digest_references() {
+        let image =
+            RegistryImage::parse("ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:0123456789abcdef")
+                .unwrap();
+        assert_eq!(image.reference, "sha256:0123456789abcdef");
+        assert_eq!(
+            image.pinned_reference("sha256:fedcba9876543210"),
+            "ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:fedcba9876543210"
+        );
+        assert_eq!(
+            name_from_image("ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:abc"),
+            "lsp-rust-analyzer"
+        );
     }
 
     #[test]
@@ -953,10 +1220,12 @@ mod tests {
             ]
         });
 
-        assert_eq!(
-            select_runnable_manifest_digest(&manifest),
-            Some("sha256:amd64")
-        );
+        let expected = if cfg!(target_arch = "aarch64") {
+            "sha256:arm64"
+        } else {
+            "sha256:amd64"
+        };
+        assert_eq!(select_runnable_manifest_digest(&manifest), Some(expected));
     }
 
     #[test]
@@ -966,7 +1235,8 @@ mod tests {
             dir.path(),
             IntegrationInstallRequest {
                 kind: IntegrationKind::Mcp,
-                container_image: "ghcr.io/crunchy-pb/sentry-mcp:latest".to_string(),
+                container_image: "ghcr.io/example/sentry-mcp:latest".to_string(),
+                source_container_image: None,
                 name: None,
                 runtime: Some("docker".to_string()),
                 env: BTreeMap::new(),
@@ -990,7 +1260,8 @@ mod tests {
             dir.path(),
             IntegrationInstallRequest {
                 kind: IntegrationKind::Mcp,
-                container_image: "ghcr.io/crunchy-pb/sentry-mcp:latest".to_string(),
+                container_image: "ghcr.io/example/sentry-mcp:latest".to_string(),
+                source_container_image: None,
                 name: None,
                 runtime: Some("docker".to_string()),
                 env: BTreeMap::from([("SENTRY_DSN".to_string(), "https://example".to_string())]),
@@ -1003,7 +1274,7 @@ mod tests {
         let config = ProjectMcpConfig::load(dir.path()).unwrap().unwrap();
         assert_eq!(
             config.servers["sentry-mcp"].container_image.as_deref(),
-            Some("ghcr.io/crunchy-pb/sentry-mcp:latest")
+            Some("ghcr.io/example/sentry-mcp:latest")
         );
         assert_eq!(
             config.servers["sentry-mcp"]
@@ -1035,6 +1306,7 @@ mod tests {
         let request = IntegrationInstallRequest {
             kind: IntegrationKind::Lsp,
             container_image: "ghcr.io/crunchy-pb/lsp-rust-analyzer:latest".to_string(),
+            source_container_image: None,
             name: Some("rust-analyzer".to_string()),
             runtime: None,
             env: BTreeMap::new(),

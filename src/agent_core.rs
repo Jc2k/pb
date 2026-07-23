@@ -858,7 +858,7 @@ fn correction_chat_message(summary: &str, message: &str) -> ChatMessage {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AgentToolCall {
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -2515,10 +2515,42 @@ fn run_agent_inner<S: EventSink>(
         lsp::ProjectLspConfig::load(&workspace_root).context("failed to load project LSP config")?
     };
     let lsp_servers = lsp::effective_servers(&user_config.lsp, project_lsp_config.as_ref());
+    let lsp_service_lease = if !args.repository_less
+        && session_lease.is_none()
+        && lsp_servers.values().any(|server| {
+            server
+                .container_image
+                .as_deref()
+                .is_some_and(|image| !image.trim().is_empty())
+        }) {
+        if let Some(runtime) = container::detect_runtime() {
+            let workspace_record = crate::session_workspace::WorkspaceManager::persistent()?
+                .find_record_by_session(&args.session_id)?;
+            let repository_root = workspace_record
+                .as_ref()
+                .map(|record| record.repository_root.as_path())
+                .unwrap_or(&workspace_root);
+            Some(
+                crate::session_environment::global_supervisor().acquire_service_only(
+                    &args.session_id,
+                    &workspace_root,
+                    repository_root,
+                    runtime,
+                    false,
+                )?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let lsp_registry = if args.repository_less {
         LspToolRegistry::default()
     } else if let Some(lease) = session_lease {
         lsp::discover_tools_for_session(&args.session_id, lsp_servers, &workspace_root, lease)
+    } else if let Some(handle) = lsp_service_lease.as_ref() {
+        lsp::discover_tools_with_lease(lsp_servers, &workspace_root, handle.lease())
     } else {
         lsp::discover_tools(lsp_servers, &workspace_root)
     };
@@ -5132,6 +5164,7 @@ struct ProactiveLspPathState {
 
 #[derive(Debug, Clone)]
 struct ProactiveLspState {
+    workspace_epoch: u64,
     previous: crate::workspace::ContentSnapshot,
     paths: BTreeMap<String, ProactiveLspPathState>,
 }
@@ -5145,6 +5178,7 @@ impl ProactiveLspState {
             .map(|repository| repository.task_baseline.content.clone())
             .unwrap_or_else(|| current.clone());
         let mut state = Self {
+            workspace_epoch: 0,
             previous,
             paths: BTreeMap::new(),
         };
@@ -5159,7 +5193,14 @@ impl ProactiveLspState {
     }
 
     fn observe_snapshot(&mut self, current: crate::workspace::ContentSnapshot) {
-        for path in self.previous.changed_paths(&current) {
+        let changed_paths = self.previous.changed_paths(&current);
+        if !changed_paths.is_empty() {
+            self.workspace_epoch = self.workspace_epoch.saturating_add(1);
+            for state in self.paths.values_mut() {
+                state.settled_checked = false;
+            }
+        }
+        for path in changed_paths {
             match current.paths.get(&path) {
                 Some(content) if content.kind == "file" => {
                     self.paths.insert(
@@ -5193,7 +5234,10 @@ impl ProactiveLspState {
     }
 
     fn record(&mut self, report: &lsp::ProactiveLspReport) {
-        if report.stale || self.previous.fingerprint != report.workspace_fingerprint {
+        if report.stale
+            || self.workspace_epoch != report.workspace_epoch
+            || self.previous.fingerprint != report.workspace_fingerprint
+        {
             return;
         }
         for path in report.completed_paths() {
@@ -5237,7 +5281,21 @@ fn run_proactive_lsp_pass(
         return Ok(None);
     }
     let workspace_fingerprint = state.borrow().previous.fingerprint.clone();
+    let workspace_epoch = state.borrow().workspace_epoch;
     let actor = crate::events::TeamActor::workflow_steward();
+    let call_id = format!(
+        "controller-{}",
+        &crate::environment_lock::sha256(
+            format!(
+                "{}\0{}\0{}\0{}",
+                mode.as_str(),
+                workspace_epoch,
+                workspace_fingerprint,
+                metrics.tool_calls
+            )
+            .as_bytes(),
+        )[..16]
+    );
     sink.emit(AgentEvent::ToolCall {
         tool: lsp::PROACTIVE_LSP_TOOL_NAME.to_string(),
         arguments: json!({
@@ -5245,16 +5303,24 @@ fn run_proactive_lsp_pass(
             "paths": selection.paths,
             "omitted_paths": selection.omitted_paths,
             "workspace_fingerprint": workspace_fingerprint,
+            "workspace_epoch": workspace_epoch,
         }),
+        call_id: Some(call_id.clone()),
+        batch_id: Some(call_id.clone()),
         actor: Some(actor),
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
     let energy_start = energy::sample();
     let started = Instant::now();
-    let mut report =
-        lsp::proactive_diagnostics(lsp_registry, workspace_root, selection.paths, mode)?;
-    report.omitted_paths = selection.omitted_paths;
+    let mut report = lsp::proactive_diagnostics(
+        lsp_registry,
+        workspace_root,
+        selection.paths,
+        mode,
+        workspace_epoch,
+    )?;
+    report.defer_omitted_paths(selection.omitted_paths);
     let duration_ms = duration_millis(started);
     let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
     metrics.tool_calls = metrics.tool_calls.saturating_add(1);
@@ -5268,6 +5334,13 @@ fn run_proactive_lsp_pass(
     sink.emit(AgentEvent::ToolResult {
         tool: lsp::PROACTIVE_LSP_TOOL_NAME.to_string(),
         result: serialized,
+        call_id: Some(call_id.clone()),
+        batch_id: Some(call_id),
+        outcome: Some(if report.complete {
+            crate::events::ToolOutcome::Succeeded
+        } else {
+            crate::events::ToolOutcome::Failed
+        }),
         actor: Some(actor),
         duration_ms: Some(duration_ms),
         energy_joules: energy.map(|estimate| estimate.joules),
@@ -5288,7 +5361,7 @@ fn run_proactive_lsp_pass(
     });
     state.borrow_mut().record(&report);
 
-    if !report.failures.is_empty() || report.omitted_paths > 0 {
+    if !report.complete {
         let mut details = report
             .failures
             .iter()
@@ -5298,6 +5371,18 @@ fn run_proactive_lsp_pass(
             details.push(format!(
                 "{} additional supported task path(s) were deferred by the per-pass bound",
                 report.omitted_paths
+            ));
+        }
+        if !report.deferred_targets.is_empty() {
+            details.push(format!(
+                "{} server/file diagnostic target(s) were deferred by the call or time bound",
+                report.deferred_targets.len()
+            ));
+        }
+        if details.is_empty() {
+            details.push(format!(
+                "diagnostic coverage was incomplete: {}",
+                serde_json::to_string(&report.incomplete_reasons)?
             ));
         }
         sink.emit(AgentEvent::TeamMessage {
@@ -7998,6 +8083,48 @@ fn tool_outcome_succeeded(tool: &str, transport_success: bool, result: &str) -> 
     !(tool == "read_file" && result.trim() == "(no content in requested range)")
 }
 
+fn durable_tool_outcome(
+    tool: &str,
+    transport_success: bool,
+    cache_hit: bool,
+    result: &str,
+) -> crate::events::ToolOutcome {
+    use crate::events::ToolOutcome;
+    if cache_hit {
+        return ToolOutcome::CacheReplay;
+    }
+    if let Ok(failure) = serde_json::from_str::<agent_tool_errors::ToolFailureEnvelope>(result) {
+        return match failure.reason_code {
+            ToolFailureReason::Timeout => ToolOutcome::TimedOut,
+            ToolFailureReason::Cancelled => ToolOutcome::Cancelled,
+            ToolFailureReason::ExecutionFailed => ToolOutcome::Failed,
+            _ => ToolOutcome::Rejected,
+        };
+    }
+    let payload = semantic_tool_result_payload(result);
+    if let Ok(value) = serde_json::from_str::<Value>(payload) {
+        if value
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return ToolOutcome::Cancelled;
+        }
+        if value
+            .get("timed_out")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return ToolOutcome::TimedOut;
+        }
+    }
+    if tool_outcome_succeeded(tool, transport_success, result) {
+        ToolOutcome::Succeeded
+    } else {
+        ToolOutcome::Failed
+    }
+}
+
 fn progress_call_fingerprint(
     tool: &str,
     arguments: &Value,
@@ -8172,6 +8299,18 @@ fn tool_outcome_is_useful(tool: &str, success: bool) -> bool {
     success && builtin_tool_semantics(tool).is_some_and(|semantics| semantics.useful_on_success)
 }
 
+fn durable_event_call_ids(batch_id: &str, calls: &[AgentToolCall]) -> BTreeMap<String, String> {
+    calls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            call.id
+                .as_ref()
+                .map(|id| (id.clone(), format!("{batch_id}-{index}")))
+        })
+        .collect()
+}
+
 fn execute_tool_calls(
     calls: Vec<AgentToolCall>,
     thinking: Option<String>,
@@ -8181,6 +8320,30 @@ fn execute_tool_calls(
     sink: &mut dyn EventSink,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<ToolOutcomeSummary>> {
+    let mut calls = calls;
+    let batch_material = serde_json::to_vec(&(
+        &env.args.session_id,
+        env.nesting_depth,
+        metrics.tool_calls,
+        &calls,
+    ))?;
+    let batch_id = format!(
+        "batch-{}",
+        &crate::environment_lock::sha256(&batch_material)[..16]
+    );
+    let mut call_ids = BTreeSet::new();
+    for (index, call) in calls.iter_mut().enumerate() {
+        if call.id.as_deref().is_none_or(str::is_empty)
+            || call
+                .id
+                .as_ref()
+                .is_some_and(|call_id| !call_ids.insert(call_id.clone()))
+        {
+            call.id = Some(format!("{batch_id}-{index}"));
+            call_ids.insert(call.id.clone().expect("generated above"));
+        }
+    }
+    let durable_call_ids = durable_event_call_ids(&batch_id, &calls);
     let call_count = calls.len();
     let parallel_safe_count = calls
         .iter()
@@ -8214,6 +8377,12 @@ fn execute_tool_calls(
             sink.emit(AgentEvent::ToolCall {
                 tool: call.tool.clone(),
                 arguments: call.arguments.clone(),
+                call_id: call
+                    .id
+                    .as_ref()
+                    .and_then(|id| durable_call_ids.get(id))
+                    .cloned(),
+                batch_id: Some(batch_id.clone()),
                 actor: Some(crate::events::TeamActor::agent(env.args.profile)),
                 nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
                 timestamp_ms: Some(now_millis()),
@@ -8221,6 +8390,13 @@ fn execute_tool_calls(
             sink.emit(AgentEvent::ToolResult {
                 tool: call.tool.clone(),
                 result: feedback.clone(),
+                call_id: call
+                    .id
+                    .as_ref()
+                    .and_then(|id| durable_call_ids.get(id))
+                    .cloned(),
+                batch_id: Some(batch_id.clone()),
+                outcome: Some(crate::events::ToolOutcome::Rejected),
                 actor: Some(crate::events::TeamActor::agent(env.args.profile)),
                 duration_ms: Some(0),
                 energy_joules: None,
@@ -8288,6 +8464,12 @@ fn execute_tool_calls(
         sink.emit(AgentEvent::ToolCall {
             tool: call.tool.clone(),
             arguments: call.arguments.clone(),
+            call_id: call
+                .id
+                .as_ref()
+                .and_then(|id| durable_call_ids.get(id))
+                .cloned(),
+            batch_id: Some(batch_id.clone()),
             actor: Some(crate::events::TeamActor::agent(env.args.profile)),
             nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
             timestamp_ms: Some(now_millis()),
@@ -8710,6 +8892,12 @@ fn execute_tool_calls(
         sink.emit(AgentEvent::ToolResult {
             tool: tool.clone(),
             result: result.clone(),
+            call_id: tool_call_id
+                .as_ref()
+                .and_then(|id| durable_call_ids.get(id))
+                .cloned(),
+            batch_id: Some(batch_id.clone()),
+            outcome: Some(durable_tool_outcome(&tool, success, cache_hit, &result)),
             actor: Some(crate::events::TeamActor::agent(env.args.profile)),
             duration_ms: Some(duration_ms),
             energy_joules: energy.map(|estimate| estimate.joules),
@@ -8840,7 +9028,7 @@ fn project_implementation_submission(
         let touched_paths = ledger
             .units
             .iter()
-            .filter(|unit| unit.plan_step_id == step_id && actual_paths.contains(&unit.path))
+            .filter(|unit| unit.contributes_to(step_id) && actual_paths.contains(&unit.path))
             .map(|unit| unit.path.clone())
             .collect::<BTreeSet<_>>();
         step.insert(
@@ -20749,6 +20937,7 @@ mod tests {
         let unit = |id: &str, path: &str| crate::workflow::WorkUnit {
             id: id.to_string(),
             plan_step_id: "step-1".to_string(),
+            contributing_step_ids: Vec::new(),
             operation: crate::workflow::PlannedChange::Create,
             path: path.to_string(),
             baseline_path_fingerprint: None,
@@ -20879,6 +21068,22 @@ mod tests {
     }
 
     #[test]
+    fn durable_event_call_ids_namespace_reused_model_ids_by_batch() {
+        let calls = vec![AgentToolCall {
+            id: Some("call-1".to_string()),
+            tool: "read_file".to_string(),
+            arguments: json!({"path":"src/lib.rs"}),
+        }];
+
+        let first = durable_event_call_ids("batch-first", &calls);
+        let second = durable_event_call_ids("batch-second", &calls);
+
+        assert_eq!(first["call-1"], "batch-first-0");
+        assert_eq!(second["call-1"], "batch-second-0");
+        assert_ne!(first["call-1"], second["call-1"]);
+    }
+
+    #[test]
     fn fabricated_tool_transcripts_are_not_replayed_into_model_context() {
         let fabricated = r#"```json
 {"type":"tool_call","tool":"write_file","arguments":{"path":"game.js","content":"ok"}}
@@ -20981,6 +21186,7 @@ the next imagined action"#;
         let mut unit = crate::workflow::WorkUnit {
             id: "step:0".to_string(),
             plan_step_id: "step".to_string(),
+            contributing_step_ids: Vec::new(),
             operation: crate::workflow::PlannedChange::Modify,
             path: "game.js".to_string(),
             baseline_path_fingerprint: Some(snapshot.paths["game.js"].fingerprint.clone()),
@@ -21086,6 +21292,7 @@ the next imagined action"#;
         let unit = crate::workflow::WorkUnit {
             id: "delete:0".to_string(),
             plan_step_id: "delete".to_string(),
+            contributing_step_ids: Vec::new(),
             operation: crate::workflow::PlannedChange::Delete,
             path: "game.js".to_string(),
             baseline_path_fingerprint: Some(fingerprint.clone()),
@@ -21147,6 +21354,7 @@ the next imagined action"#;
         let untracked_unit = crate::workflow::WorkUnit {
             id: "delete:untracked".to_string(),
             plan_step_id: "delete".to_string(),
+            contributing_step_ids: Vec::new(),
             operation: crate::workflow::PlannedChange::Delete,
             path: "untracked.js".to_string(),
             baseline_path_fingerprint: Some(untracked_fingerprint.clone()),
@@ -21259,6 +21467,7 @@ the next imagined action"#;
         let unit = crate::workflow::WorkUnit {
             id: "delete:large".to_string(),
             plan_step_id: "delete".to_string(),
+            contributing_step_ids: Vec::new(),
             operation: crate::workflow::PlannedChange::Delete,
             path: "game.js".to_string(),
             baseline_path_fingerprint: Some(fingerprint.clone()),
@@ -21308,6 +21517,7 @@ the next imagined action"#;
         let unit = crate::workflow::WorkUnit {
             id: "delete:symlink".to_string(),
             plan_step_id: "delete".to_string(),
+            contributing_step_ids: Vec::new(),
             operation: crate::workflow::PlannedChange::Delete,
             path: "game.js".to_string(),
             baseline_path_fingerprint: Some(fingerprint.clone()),
@@ -29519,6 +29729,7 @@ the next imagined action"#;
             )]),
         };
         let mut state = ProactiveLspState {
+            workspace_epoch: 0,
             previous: baseline,
             paths: BTreeMap::new(),
         };
@@ -29530,6 +29741,7 @@ the next imagined action"#;
         );
         state.record(&lsp::ProactiveLspReport {
             mode: lsp::ProactiveLspMode::Syntax,
+            workspace_epoch: state.workspace_epoch,
             workspace_fingerprint: current.fingerprint.clone(),
             requested_paths: vec!["src/lib.rs".to_string()],
             scanned_paths: vec!["src/lib.rs".to_string()],
@@ -29538,6 +29750,17 @@ the next imagined action"#;
             omitted_paths: 0,
             failures: Vec::new(),
             stale: false,
+            requested_targets: vec![lsp::ProactiveLspTarget {
+                server: "rust".to_string(),
+                path: "src/lib.rs".to_string(),
+            }],
+            completed_targets: vec![lsp::ProactiveLspTarget {
+                server: "rust".to_string(),
+                path: "src/lib.rs".to_string(),
+            }],
+            deferred_targets: Vec::new(),
+            incomplete_reasons: BTreeSet::new(),
+            complete: true,
         });
         assert!(
             state
@@ -29562,6 +29785,7 @@ the next imagined action"#;
         state.observe_snapshot(changed);
         state.record(&lsp::ProactiveLspReport {
             mode: lsp::ProactiveLspMode::Settled,
+            workspace_epoch: state.workspace_epoch,
             workspace_fingerprint: "workspace-v2".to_string(),
             requested_paths: vec!["src/lib.rs".to_string()],
             scanned_paths: vec!["src/lib.rs".to_string()],
@@ -29570,10 +29794,101 @@ the next imagined action"#;
             omitted_paths: 0,
             failures: Vec::new(),
             stale: true,
+            requested_targets: Vec::new(),
+            completed_targets: Vec::new(),
+            deferred_targets: Vec::new(),
+            incomplete_reasons: BTreeSet::from([lsp::ProactiveLspIncompleteReason::StaleWorkspace]),
+            complete: false,
         });
         assert_eq!(
             state.candidates(&scope, lsp::ProactiveLspMode::Syntax),
             vec!["src/lib.rs"]
+        );
+    }
+
+    #[test]
+    fn any_workspace_change_invalidates_settled_evidence_for_related_paths() {
+        let baseline = crate::workspace::ContentSnapshot {
+            fingerprint: "baseline".to_string(),
+            paths: BTreeMap::new(),
+        };
+        let first = crate::workspace::ContentSnapshot {
+            fingerprint: "workspace-v1".to_string(),
+            paths: BTreeMap::from([
+                (
+                    "src/a.rs".to_string(),
+                    crate::workspace::PathContent {
+                        kind: "file".to_string(),
+                        fingerprint: "a1".to_string(),
+                    },
+                ),
+                (
+                    "src/b.rs".to_string(),
+                    crate::workspace::PathContent {
+                        kind: "file".to_string(),
+                        fingerprint: "b1".to_string(),
+                    },
+                ),
+            ]),
+        };
+        let mut state = ProactiveLspState {
+            workspace_epoch: 0,
+            previous: baseline,
+            paths: BTreeMap::new(),
+        };
+        state.observe_snapshot(first.clone());
+        let targets = ["src/a.rs", "src/b.rs"]
+            .into_iter()
+            .map(|path| lsp::ProactiveLspTarget {
+                server: "rust".to_string(),
+                path: path.to_string(),
+            })
+            .collect::<Vec<_>>();
+        state.record(&lsp::ProactiveLspReport {
+            mode: lsp::ProactiveLspMode::Settled,
+            workspace_epoch: state.workspace_epoch,
+            workspace_fingerprint: first.fingerprint,
+            requested_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            scanned_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            diagnostics: Vec::new(),
+            suppressed_diagnostics: 0,
+            omitted_paths: 0,
+            failures: Vec::new(),
+            stale: false,
+            requested_targets: targets.clone(),
+            completed_targets: targets,
+            deferred_targets: Vec::new(),
+            incomplete_reasons: BTreeSet::new(),
+            complete: true,
+        });
+
+        state.observe_snapshot(crate::workspace::ContentSnapshot {
+            fingerprint: "workspace-v2".to_string(),
+            paths: BTreeMap::from([
+                (
+                    "src/a.rs".to_string(),
+                    crate::workspace::PathContent {
+                        kind: "file".to_string(),
+                        fingerprint: "a2".to_string(),
+                    },
+                ),
+                (
+                    "src/b.rs".to_string(),
+                    crate::workspace::PathContent {
+                        kind: "file".to_string(),
+                        fingerprint: "b1".to_string(),
+                    },
+                ),
+            ]),
+        });
+        let scope = BTreeSet::from(["src/a.rs".to_string(), "src/b.rs".to_string()]);
+        assert_eq!(
+            state.candidates(&scope, lsp::ProactiveLspMode::Settled),
+            vec!["src/a.rs", "src/b.rs"]
+        );
+        assert_eq!(
+            state.candidates(&scope, lsp::ProactiveLspMode::Syntax),
+            vec!["src/a.rs"]
         );
     }
 

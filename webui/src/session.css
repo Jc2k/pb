@@ -677,6 +677,22 @@ article.user div.message-container {
 .tool-item.success i {
     color: #16a34a;
 }
+.tool-item.succeeded i,
+.tool-item.cache_replay i {
+    color: #16a34a;
+}
+.tool-item.failed i,
+.tool-item.timed_out i,
+.tool-item.cancelled i {
+    color: #dc2626;
+}
+.tool-item.rejected i {
+    color: #d97706;
+}
+.tool-item.pending i,
+.tool-item.unknown i {
+    color: #64748b;
+}
 .tool-item.automatic-action i {
     color: #7c3aed;
 }

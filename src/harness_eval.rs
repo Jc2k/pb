@@ -4226,6 +4226,8 @@ mod tests {
         let trace = summarize_tool_trace(&[AgentEvent::ToolCall {
             tool: "write_file".repeat(20),
             arguments: arguments.clone(),
+            call_id: None,
+            batch_id: None,
             actor: Some(crate::events::TeamActor::agent(
                 crate::agent_core::AgentProfile::Build,
             )),

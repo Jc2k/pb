@@ -392,6 +392,13 @@ networking, or make the workspace writable. Marketplace LSP installation fails w
 is absent or invalid; the web UI reports the missing contract instead of offering an unconfigured
 install.
 
+Marketplace configuration resolves the displayed tag to an immutable OCI manifest digest. pb
+stores that digest as the executable image identity, keeps the original tag only as display/update
+metadata, verifies the typed manifest again through the digest, and downloads that exact image
+during installation when a container runtime is available. Task startup does not pull a missing
+pinned image. Existing tag-only marketplace LSP entries appear as **Upgrade required** and cannot
+run until they are explicitly reinstalled; no compatibility switch permits mutable execution.
+
 The rust-analyzer package is published by the `crunchy-pb/lsp-rust-analyzer` marketplace repository.
 Install it from the web integration store or from the CLI; pb reads and validates the embedded
 manifest, so no local manifest or package checkout is required:
@@ -414,6 +421,14 @@ language diagnostics, with the Actions drawer retaining the structured result. T
 bounded repair hints, not substitutes for configured checks, code review, or the managed commit.
 An unavailable or timed-out server is reported and pb continues to the ordinary checks. pb never
 applies language-server edits, commands, formatting, or code actions.
+
+Language servers start lazily on their first manual query or matching proactive pass. A project does
+not need a container-backed task environment: for local and otherwise unconfigured projects, pb
+creates a service-only lease using the detected local container runtime, mounts the workspace
+read-only, applies the package's network declaration, rejects cache IDs that are not backed by a
+declared task-environment cache, and removes the owned sidecar at the session boundary. The
+integration list distinguishes ready, unavailable, disabled, and legacy
+unverified installations instead of claiming every configured server is ready.
 
 The `--runtime` install argument is optional and normally should be omitted. An integration without
 that field follows the runtime that owns each task session. Supplying it retains an exact

@@ -1,7 +1,8 @@
 import type { AgentEvent, EventEnvelope, TeamActor } from "../types";
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "./constants";
 import { formatEnergy, formatPower } from "./energy";
-import { teamActorKey, workflowStewardActor } from "./team";
+import { toolEventsMatch } from "./helpers";
+import { workflowStewardActor } from "./team";
 
 export { profileJobTitle, profileName } from "./team";
 
@@ -87,17 +88,26 @@ export function getToolDetail(
           failures?: unknown[];
           omitted_paths?: number;
           stale?: boolean;
+          complete?: boolean;
+          requested_targets?: unknown[];
+          completed_targets?: unknown[];
+          incomplete_reasons?: string[];
         };
         const scanned = report.scanned_paths?.length || 0;
         const diagnostics = report.diagnostics?.length || 0;
         const failures = report.failures?.length || 0;
         const omitted = report.omitted_paths || 0;
+        const requestedTargets = report.requested_targets?.length || 0;
+        const completedTargets = report.completed_targets?.length || 0;
         if (report.stale) return `${mode} · stale evidence discarded`;
         if (diagnostics > 0) {
           return `${mode} · ${diagnostics} blocking ${diagnostics === 1 ? "diagnostic" : "diagnostics"} in ${scanned} ${scanned === 1 ? "file" : "files"}${omitted > 0 ? ` · ${omitted} deferred` : ""}`;
         }
         if (failures > 0) {
           return `${mode} · ${scanned}/${requested} files · ${failures} ${failures === 1 ? "server issue" : "server issues"}${omitted > 0 ? ` · ${omitted} deferred` : ""}`;
+        }
+        if (report.complete !== true) {
+          return `${mode} · incomplete evidence · ${completedTargets}/${requestedTargets} server/file targets${omitted > 0 ? ` · ${omitted} deferred` : ""}`;
         }
         if (omitted > 0) return `${mode} · ${scanned} files · ${omitted} deferred`;
         return `${mode} · ${scanned} ${scanned === 1 ? "file" : "files"} · clean`;
@@ -193,10 +203,8 @@ export function buildTodoTasks(events: EventEnvelope[]): TodoTask[] {
       return;
     }
     if (event.event.type !== "tool_result") return;
-    const resultTool = event.event.tool;
-    const callIndex = pendingCalls.findIndex(
-      (call) =>
-        call.event.type === "tool_call" && call.event.tool === resultTool,
+    const callIndex = pendingCalls.findIndex((call) =>
+      toolEventsMatch(call, event)
     );
     const call = callIndex >= 0
       ? pendingCalls.splice(callIndex, 1)[0]
@@ -230,7 +238,8 @@ export function buildToolSummaries(events: EventEnvelope[]): ToolSummary[] {
       return;
     }
     if (event.event.type === "tool_result" && pendingCalls.length > 0) {
-      const call = pendingCalls.shift();
+      const index = pendingCalls.findIndex((call) => toolEventsMatch(call, event));
+      const call = index >= 0 ? pendingCalls.splice(index, 1)[0] : undefined;
       if (!call || call.event.type !== "tool_call") return;
       addToolSummaryItem(summaries, call, event);
     }
@@ -255,9 +264,7 @@ export function buildActionTimeline(
     }
     if (event.type === "tool_result") {
       const index = pending.findIndex((item) =>
-        item.envelope.event.type === "tool_call" &&
-        item.envelope.event.tool === event.tool &&
-        teamActorKey(item.actor) === teamActorKey(event.actor)
+        toolEventsMatch(item.envelope, envelope)
       );
       const item = index >= 0 ? pending.splice(index, 1)[0] : undefined;
       if (item) item.result = envelope;

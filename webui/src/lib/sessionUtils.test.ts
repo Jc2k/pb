@@ -111,6 +111,34 @@ Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
   );
 });
 
+Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
+  const call: EventEnvelope = {
+    version: "1",
+    event: { type: "tool_call", tool: "lsp_proactive_diagnostics", arguments: { mode: "settled", paths: ["src/lib.rs"] }, call_id: "lsp-1" },
+  };
+  const result: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "tool_result",
+      tool: "lsp_proactive_diagnostics",
+      result: JSON.stringify({
+        scanned_paths: ["src/lib.rs"],
+        diagnostics: [],
+        failures: [],
+        omitted_paths: 0,
+        stale: false,
+        complete: false,
+        requested_targets: [{ server: "rust", path: "src/lib.rs" }, { server: "second", path: "src/lib.rs" }],
+        completed_targets: [{ server: "rust", path: "src/lib.rs" }],
+      }),
+      call_id: "lsp-1",
+      outcome: "failed",
+    },
+  };
+
+  equal(getToolDetail(call, result), "settled · incomplete evidence · 1/2 server/file targets");
+});
+
 Deno.test("buildToolSummaries includes session_title parameters in drawer details", () => {
   const events: EventEnvelope[] = [
     {

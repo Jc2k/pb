@@ -87,10 +87,13 @@ runtime artifacts remain local for reuse after the operation.
 
 Opening integration discovery queries the fixed public `crunchy-pb` GitHub organization;
 configuring a selected package reads its container metadata from the registry. Installing an LSP
-package pulls its published image. Those requests disclose the
+package resolves the selected tag to an immutable digest and pulls that exact image when a local
+runtime is available. Those requests disclose the
 requested public package name and the ordinary network metadata of a download, but no repository
 source or prompt content. Downloaded
-images remain local reusable artifacts. At task runtime, packaged LSP networking is independently
+images remain local reusable artifacts. A task never contacts the registry to fill in a missing
+digest-pinned package; it reports the integration unavailable and asks for an explicit online
+install or upgrade. At task runtime, packaged LSP networking is independently
 controlled by its validated service capability; the rust-analyzer package uses an internal network
 without egress and performs Cargo analysis offline.
 

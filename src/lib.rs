@@ -1314,17 +1314,20 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
                 .as_deref()
                 .map(integrations::load_lsp_package_manifest)
                 .transpose()?;
-            if kind == IntegrationKind::Lsp
-                && lsp_manifest.is_none()
-                && integrations::is_marketplace_container_image(&args.container_image)
-            {
-                lsp_manifest = fetch_integration_config_schema(args.container_image.clone())
-                    .await?
-                    .lsp_manifest;
+            let mut container_image = args.container_image;
+            let mut source_container_image = None;
+            if integrations::is_marketplace_container_image(&container_image) {
+                let metadata = fetch_integration_config_schema(container_image.clone()).await?;
+                source_container_image = Some(metadata.source_container_image);
+                container_image = metadata.container_image;
+                if kind == IntegrationKind::Lsp && lsp_manifest.is_none() {
+                    lsp_manifest = metadata.lsp_manifest;
+                }
             }
             let request = IntegrationInstallRequest {
                 kind,
-                container_image: args.container_image,
+                container_image,
+                source_container_image,
                 name: args.name,
                 runtime: args.runtime,
                 env: Default::default(),

@@ -70,6 +70,30 @@ export type ActionGroup = {
   controllerActions: EventEnvelope[];
 };
 
+export function toolEventsMatch(
+  call: EventEnvelope,
+  result: EventEnvelope,
+): boolean {
+  if (call.event.type !== "tool_call" || result.event.type !== "tool_result") {
+    return false;
+  }
+  if (call.event.call_id || result.event.call_id) {
+    return Boolean(
+      call.event.call_id && result.event.call_id &&
+        call.event.call_id === result.event.call_id,
+    );
+  }
+  return call.event.tool === result.event.tool &&
+    teamActorKey(call.event.actor) === teamActorKey(result.event.actor);
+}
+
+export function toolResultForCall(
+  call: EventEnvelope,
+  results: EventEnvelope[],
+): EventEnvelope | undefined {
+  return results.find((result) => toolEventsMatch(call, result));
+}
+
 export function isControllerActionEvent(event: EventEnvelope): boolean {
   return event.event.type === "controller_observation" ||
     event.event.type === "controller_closure" ||
@@ -132,12 +156,27 @@ export function groupActionEvents(
     if (event.event.type === "tool_call") {
       beginOrSwitchGroup(event.event.actor);
       currentToolCalls.push(event);
-    } else if (
-      event.event.type === "tool_result" &&
-      currentToolCalls.length > currentToolResults.length
-    ) {
-      beginOrSwitchGroup(event.event.actor);
-      currentToolResults.push(event);
+    } else if (event.event.type === "tool_result") {
+      const currentMatch = currentToolCalls.some((call) =>
+        toolEventsMatch(call, event) && !toolResultForCall(call, currentToolResults)
+      );
+      if (currentMatch) {
+        currentToolResults.push(event);
+        continue;
+      }
+      const prior = [...grouped].reverse().find((candidate) =>
+        "type" in candidate && candidate.type === "action_group" &&
+        candidate.toolCalls.some((call) =>
+          toolEventsMatch(call, event) &&
+          !toolResultForCall(call, candidate.toolResults)
+        )
+      );
+      if (prior && "type" in prior && prior.type === "action_group") {
+        prior.toolResults.push(event);
+        continue;
+      }
+      flush();
+      grouped.push(event);
     } else if (
       event.event.type === "controller_observation" ||
       event.event.type === "controller_closure" ||
