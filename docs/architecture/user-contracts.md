@@ -31,13 +31,19 @@ discussion model may propose a Goal. Only the user's Goal action, the Goal API/C
 Auto turn citing its exact current turn can create one, and creation still stops for exact plan
 approval. Project configuration cannot activate a Goal or choose automatic continuation.
 
-The shipped Task-plan foundation applies the same authority rule before future multi-Task dispatch.
+The shipped Task controller applies the same authority rule before high-level decomposition.
 `.pb/tasks.toml` can narrow budgets but cannot qualify a planner or authorize automatic Goal
-selection. An explicitly selected Goal may unwrap through one Goal Task; otherwise a Goal Task is
-valid only when controller-owned evidence qualifies the exact planner/model/template protocol. This
-foundation now also has a durable sequential reducer and restart checkpoint. The reducer cannot
-start work by itself, and no current Build or Goal entry point dispatches into it yet. Ordinary
-Build and Goal behavior therefore remains unchanged until queued dispatch ships.
+selection. Qualification is an embedded controller-owned record for the exact model bytes, backend,
+prompt template, and artifact protocol. An unqualified model stays on the ordinary Build path. A
+qualified one-Task result unwraps into the same Build or Goal experience; only two or more Tasks
+create a durable queue and Tasks UI.
+
+The accepted high-level plan is not mutation authority. It can only narrow the original objective,
+repository, workflow and Goal policies, request cap, aggregate allowance, and no-publication
+boundary. Each queued Task becomes a fresh Build or Goal request only when its dependencies are
+delivered and the repository matches the prior terminal checkpoint. Task-planning failure cannot
+silently reinterpret the broad original request as one Build: retry, edit, and an explicit
+run-as-one-Build decision are distinct user actions.
 
 When planning discovers a materially missing choice, it may ask the user. The answer becomes part of
 the task contract. Guessing would make progress faster at the cost of changing ownership of the
@@ -96,6 +102,17 @@ Goal mode adds two higher-level claims without weakening those three:
 | --- | --- |
 | Goal ready for review | Every current criterion has strict-workflow evidence, but at least one criterion is prose or explicitly user-owned. |
 | Goal complete | Every current criterion is machine-verified, or the user accepted the exact current Goal checkpoint. |
+
+A multi-Task run adds one orchestration claim:
+
+| Claim | Meaning |
+| --- | --- |
+| Tasks complete | Every required Task reached committed or verified-no-change delivery, every dependency and repository boundary reconciled, and no pending Task remains. |
+
+A child workflow Ready or Goal Complete is evidence only for its active Task. It cannot skip later
+Tasks or make the parent Ready. A Goal Task amendment cannot remove an accepted criterion or change
+the parent Task objective, authority, or budget; additions remain an explicit existing Goal user
+decision and are recorded in the parent checkpoint.
 
 A workflow Ready result is evidence for a criterion; it is not by itself permission to call a
 multi-milestone Goal complete. A reviewer model's prose never converts a subjective criterion into

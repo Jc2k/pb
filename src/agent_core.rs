@@ -178,6 +178,15 @@ pub trait EventSink {
         Ok(())
     }
 
+    /// Persist a complete multi-Task controller checkpoint before a child starts or the queue
+    /// advances. Sinks that do not own durable sessions retain the daemon-free no-op behavior.
+    fn checkpoint_multi_task(
+        &mut self,
+        _checkpoint: &crate::task_queue::MultiTaskCheckpoint,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn should_cancel(&self) -> bool {
         false
     }
@@ -485,6 +494,14 @@ pub struct AgentRequest {
     /// one preserves its old control path rather than silently changing its completion claims.
     #[serde(default)]
     pub intent: Option<crate::workflow::TurnIntent>,
+    /// Explicit user choice for the high-level Task preflight. `OneBuild` is set only by the
+    /// planning-recovery action and skips decomposition for this request without changing Build.
+    #[serde(default)]
+    pub task_planning: TaskPlanningPreference,
+    /// Last typed high-level planning failure, retained only so the session can present explicit
+    /// recovery actions after restart. It grants no authority and is cleared before another run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_plan_rejected: Option<crate::task_queue::TaskPlanRejected>,
     /// Optional trusted, already-normalized workflow policy supplied by daemon-free callers.
     /// Ordinary project sessions load and snapshot `.pb/workflow.toml` when delivery starts.
     #[serde(default)]
@@ -612,6 +629,16 @@ pub struct AgentRunResult {
     pub requested_delivery: Option<crate::workflow::ConversationHandoff>,
     pub goal_proposal: Option<crate::goal::GoalProposal>,
     pub requested_goal: Option<crate::goal::GoalProposal>,
+    pub task_goal: Option<crate::task_queue::GoalTaskProjection>,
+    pub task_plan_rejected: Option<crate::task_queue::TaskPlanRejected>,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPlanningPreference {
+    #[default]
+    Auto,
+    OneBuild,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2180,6 +2207,125 @@ pub(crate) fn run_agent_managed<S: EventSink>(
     run_agent_inner(args, models_root, sink, true)
 }
 
+fn task_planner_model_sha256(
+    args: &AgentRequest,
+    models_root: &Path,
+    text_backend: TextBackendKind,
+    flashmoe_plan: Option<&crate::inference::flashmoe::FlashMoePlan>,
+) -> Result<String> {
+    match text_backend {
+        TextBackendKind::LlamaCpp => {
+            let path = find_model_in_cache_in(models_root, &args.model)?;
+            sha256_file(&path)
+        }
+        TextBackendKind::FlashMoe => {
+            let _ = flashmoe_plan.context("qualified FlashMoe planner has no model plan")?;
+            bail!(
+                "automatic Task planning requires a portable full-model digest; FlashMoe qualification is not enabled"
+            )
+        }
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn task_planning_repository_context(graph: &crate::workspace::WorkspaceGraph) -> Result<String> {
+    let serialized = serde_json::to_string(graph)?;
+    const MAX_CONTEXT_CHARS: usize = 24_000;
+    if serialized.chars().count() <= MAX_CONTEXT_CHARS {
+        return Ok(serialized);
+    }
+    Ok(serialized.chars().take(MAX_CONTEXT_CHARS).collect())
+}
+
+fn single_task_request(
+    plan: &crate::task_queue::TaskPlanArtifact,
+    source_turn_id: &str,
+    workdir: &Path,
+    repository: crate::task_queue::TaskRepositoryState,
+) -> Result<crate::task_queue::TaskRequest> {
+    let task = plan.tasks.first().context("single-Task plan has no Task")?;
+    if plan.tasks.len() != 1 {
+        bail!("single Task projection requires exactly one Task");
+    }
+    let request_id = format!(
+        "single-task:{:016x}",
+        stable_hash(&format!("{}\0{}", source_turn_id, task.id))
+    );
+    Ok(crate::task_queue::TaskRequest {
+        id: format!("task-request:{request_id}"),
+        multi_task_id: request_id.clone(),
+        source_turn_id: source_turn_id.to_string(),
+        task_id: task.id.clone(),
+        child_id: request_id,
+        workdir: workdir.display().to_string(),
+        kind: task.kind,
+        title: task.title.clone(),
+        objective: task.description.clone(),
+        requirements: task
+            .requirement_ids
+            .iter()
+            .map(|id| {
+                plan.requirements
+                    .iter()
+                    .find(|requirement| requirement.id == *id)
+                    .cloned()
+                    .with_context(|| format!("single Task references missing requirement '{id}'"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        acceptance: task
+            .acceptance_ids
+            .iter()
+            .map(|id| {
+                plan.acceptance
+                    .iter()
+                    .find(|fact| fact.id == *id)
+                    .cloned()
+                    .with_context(|| format!("single Task references missing acceptance '{id}'"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        scope_hints: task.scope_hints.clone(),
+        goal_contract: task.goal_contract.clone(),
+        base_repository: repository,
+        budget: task.budget,
+        attempt: 1,
+    })
+}
+
+fn apply_build_task_projection(
+    args: &mut AgentRequest,
+    projection: crate::task_queue::BuildTaskProjection,
+    preserve_source_turn: bool,
+) {
+    args.task = projection.task;
+    if !preserve_source_turn {
+        args.turn_id = projection.turn_id;
+    }
+    args.intent = Some(crate::workflow::TurnIntent::Deliver);
+    args.workflow_policy = Some(projection.workflow_policy);
+    args.workflow_stage = None;
+    args.workflow_checkpoint = None;
+    args.conversation_handoff = Some(projection.handoff);
+    args.max_steps = args.max_steps.min(projection.max_steps).max(1);
+    args.profile = AgentProfile::Build;
+    args.infer_profile = false;
+}
+
 fn run_agent_inner<S: EventSink>(
     mut args: AgentRequest,
     models_root: &Path,
@@ -2642,13 +2788,253 @@ fn run_agent_inner<S: EventSink>(
         &mut llama_generator
     };
 
-    let (outcome, workflow_checkpoint) =
-        if args.intent == Some(crate::workflow::TurnIntent::Deliver) {
-            let delivery = run_delivery_workflow(
+    let mut task_planning_metrics = RunMetrics::default();
+    let mut task_plan_rejected = None;
+    let mut multi_task_created = false;
+    let mut single_task_goal = None;
+    let should_plan_tasks = args.intent == Some(crate::workflow::TurnIntent::Deliver)
+        && args.workflow_checkpoint.is_none()
+        && args.goal_context.is_none()
+        && args.task_planning == TaskPlanningPreference::Auto
+        && !args.turn_id.starts_with("task-request:")
+        && !args.repository_less;
+    if should_plan_tasks {
+        let catalog = crate::task_queue::TaskPlannerQualificationCatalog::embedded()?;
+        let backend = match text_backend {
+            TextBackendKind::LlamaCpp => "llama_cpp",
+            TextBackendKind::FlashMoe => "flashmoe",
+        };
+        if let Some(qualification) = catalog.candidate(&args.model, backend).cloned() {
+            let model_sha256 = task_planner_model_sha256(
+                &args,
+                models_root,
+                text_backend,
+                flashmoe_plan.as_ref(),
+            )?;
+            let policy = crate::task_queue::TaskConfigDocument::load_or_default(&workspace_root)?;
+            let repository = crate::task_queue::TaskRepositoryState::capture(&workspace_root)?;
+            let repository_context = task_planning_repository_context(
+                workspace_graph
+                    .as_ref()
+                    .context("Task planning requires a workspace graph")?,
+            )?;
+            let source_task = args.task.clone();
+            let source_turn_id = args.turn_id.clone();
+            let should_cancel = || sink.should_cancel();
+            let (planning, metrics) = {
+                let mut model = TaskPlanningCompletionModel {
+                    generator,
+                    args: &args,
+                    should_cancel: &should_cancel,
+                    metrics: RunMetrics::default(),
+                };
+                let planning = crate::task_queue::plan_tasks(
+                    &mut model,
+                    crate::task_queue::TaskPlanningInput {
+                        objective: &source_task,
+                        repository_context: &repository_context,
+                        source_intent: crate::task_queue::TaskSourceIntent::Build,
+                        model_sha256: &model_sha256,
+                        qualification: &qualification,
+                        policy: &policy,
+                    },
+                );
+                (planning, model.take_metrics())
+            };
+            task_planning_metrics.add(&metrics);
+            match planning {
+                crate::task_queue::TaskPlanningOutcome::Accepted(accepted) => {
+                    match accepted.plan.artifact.dispatch()? {
+                        crate::task_queue::TaskDispatch::Build { .. } => {
+                            let request = single_task_request(
+                                &accepted.plan.artifact,
+                                &source_turn_id,
+                                &workspace_root,
+                                repository,
+                            )?;
+                            let workflow_policy = args
+                                .workflow_policy
+                                .as_ref()
+                                .context("Build Task projection requires workflow policy")?;
+                            let projection =
+                                crate::task_queue::project_build_task(&request, workflow_policy)?;
+                            apply_build_task_projection(&mut args, projection, true);
+                        }
+                        crate::task_queue::TaskDispatch::MultiTask => {
+                            let run_id = format!(
+                                "multi-task-{:016x}",
+                                stable_hash(&format!(
+                                    "{}\0{}\0{}",
+                                    args.session_id, source_turn_id, accepted.plan.sha256
+                                ))
+                            );
+                            let run = crate::task_queue::MultiTaskRun::start(
+                                run_id,
+                                args.session_id.clone(),
+                                source_turn_id,
+                                accepted.plan,
+                                accepted.review,
+                                policy,
+                                args.workflow_policy
+                                    .clone()
+                                    .context("multi-Task run requires workflow policy")?,
+                                crate::goal::GoalConfigDocument::load_or_default(&workspace_root)?,
+                                args.max_steps,
+                                crate::task_queue::TaskSourceIntent::Build,
+                                qualification,
+                                workspace_root.display().to_string(),
+                                repository,
+                                accepted.counters,
+                                now_millis(),
+                            )?;
+                            let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(run)?;
+                            sink.checkpoint_multi_task(&checkpoint)?;
+                            sink.emit(AgentEvent::TaskPlanAccepted {
+                                multi_task_id: checkpoint.run.id.clone(),
+                                plan_sha256: checkpoint.run.plan.sha256.clone(),
+                                task_count: checkpoint.run.plan.artifact.tasks.len(),
+                                timestamp_ms: Some(now_millis()),
+                            });
+                            multi_task_created = true;
+                        }
+                        crate::task_queue::TaskDispatch::Goal { .. } => {
+                            let request = single_task_request(
+                                &accepted.plan.artifact,
+                                &source_turn_id,
+                                &workspace_root,
+                                repository,
+                            )?;
+                            let goal_policy =
+                                crate::goal::GoalConfigDocument::load_or_default(&workspace_root)?;
+                            single_task_goal = Some(crate::task_queue::project_goal_task(
+                                &request,
+                                &goal_policy,
+                            )?);
+                        }
+                    }
+                }
+                crate::task_queue::TaskPlanningOutcome::Rejected(rejected) => {
+                    sink.emit(AgentEvent::TaskPlanRejected {
+                        outcome: rejected.outcome,
+                        attempts: rejected.attempts,
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    task_plan_rejected = Some(rejected);
+                }
+            }
+        }
+    }
+
+    let task_plan_rejection_result = task_plan_rejected.clone();
+    let (mut outcome, workflow_checkpoint) = if let Some(goal) = single_task_goal.as_ref() {
+        let content = format!(
+            "Goal plan accepted for '{}'. Review and approve the existing Goal plan to begin delivery.",
+            goal.objective
+        );
+        sink.emit(AgentEvent::Final {
+            content: content.clone(),
+            profile: AgentProfile::Plan,
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        });
+        (
+            StepRunOutcome {
+                reached_final: true,
+                contract_status: ContractStatus::Unspecified,
+                verified_completed: false,
+                termination_reason: TerminationReason::Final,
+                final_content: Some(content),
+                metrics: RunMetrics::default(),
+                gate_state: GateState::default(),
+            },
+            None,
+        )
+    } else if multi_task_created {
+        let content =
+            "Task plan accepted. The first Task is queued for independent planning and delivery."
+                .to_string();
+        sink.emit(AgentEvent::Final {
+            content: content.clone(),
+            profile: AgentProfile::Plan,
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        });
+        (
+            StepRunOutcome {
+                reached_final: true,
+                contract_status: ContractStatus::Unspecified,
+                verified_completed: false,
+                termination_reason: TerminationReason::Final,
+                final_content: Some(content),
+                metrics: RunMetrics::default(),
+                gate_state: GateState::default(),
+            },
+            None,
+        )
+    } else if let Some(rejected) = task_plan_rejected {
+        let actions = rejected
+            .recovery_actions
+            .iter()
+            .map(|action| match action {
+                crate::task_queue::TaskPlanRecoveryAction::RetryPlanning => "Retry planning",
+                crate::task_queue::TaskPlanRecoveryAction::EditRequest => "Edit request",
+                crate::task_queue::TaskPlanRecoveryAction::RunAsOneBuild => "Run as one Build",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let detail = rejected
+            .failures
+            .last()
+            .map(|failure| failure.reason.as_str())
+            .unwrap_or("Task planning stopped before producing a valid artifact");
+        let content = format!(
+            "Task planning did not produce an executable plan ({:?}). {detail}\n\nAvailable actions: {actions}.",
+            rejected.outcome
+        );
+        sink.emit(AgentEvent::Final {
+            content: content.clone(),
+            profile: AgentProfile::Plan,
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        });
+        (
+            StepRunOutcome {
+                reached_final: false,
+                contract_status: incomplete_contract_status(&args),
+                verified_completed: false,
+                termination_reason: TerminationReason::EngineError,
+                final_content: Some(content),
+                metrics: RunMetrics::default(),
+                gate_state: GateState::default(),
+            },
+            None,
+        )
+    } else if args.intent == Some(crate::workflow::TurnIntent::Deliver) {
+        let delivery = run_delivery_workflow(
+            generator,
+            text_backend,
+            llamacpp_backend.as_ref(),
+            &args,
+            &workspace_root,
+            models_root,
+            command_backend.as_ref(),
+            env_config.as_ref(),
+            &mcp_registry,
+            &lsp_registry,
+            &policy_config,
+            user_config.effective_personal_memory_repo().as_deref(),
+            None,
+            &mut sink,
+        )?;
+        (delivery.step, Some(delivery.checkpoint))
+    } else {
+        (
+            run_agent_steps(
                 generator,
                 text_backend,
                 llamacpp_backend.as_ref(),
                 &args,
+                &mut messages,
                 &workspace_root,
                 models_root,
                 command_backend.as_ref(),
@@ -2657,33 +3043,14 @@ fn run_agent_inner<S: EventSink>(
                 &lsp_registry,
                 &policy_config,
                 user_config.effective_personal_memory_repo().as_deref(),
-                None,
+                &run_budget,
+                0,
                 &mut sink,
-            )?;
-            (delivery.step, Some(delivery.checkpoint))
-        } else {
-            (
-                run_agent_steps(
-                    generator,
-                    text_backend,
-                    llamacpp_backend.as_ref(),
-                    &args,
-                    &mut messages,
-                    &workspace_root,
-                    models_root,
-                    command_backend.as_ref(),
-                    env_config.as_ref(),
-                    &mcp_registry,
-                    &lsp_registry,
-                    &policy_config,
-                    user_config.effective_personal_memory_repo().as_deref(),
-                    &run_budget,
-                    0,
-                    &mut sink,
-                )?,
-                None,
-            )
-        };
+            )?,
+            None,
+        )
+    };
+    outcome.metrics.add(&task_planning_metrics);
     if let Err(error) = generator.persist_session_cache(&args.session_id) {
         tracing::warn!(
             session = %args.session_id,
@@ -2821,6 +3188,8 @@ fn run_agent_inner<S: EventSink>(
         requested_delivery,
         goal_proposal,
         requested_goal,
+        task_goal: single_task_goal,
+        task_plan_rejected: task_plan_rejection_result,
     })
 }
 
@@ -9934,6 +10303,74 @@ trait CompletionEngine {
     }
 }
 
+struct TaskPlanningCompletionModel<'a> {
+    generator: &'a mut dyn CompletionEngine,
+    args: &'a AgentRequest,
+    should_cancel: &'a dyn Fn() -> bool,
+    metrics: RunMetrics,
+}
+
+impl TaskPlanningCompletionModel<'_> {
+    fn take_metrics(&mut self) -> RunMetrics {
+        std::mem::take(&mut self.metrics)
+    }
+}
+
+impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
+    fn generate(
+        &mut self,
+        role: crate::task_queue::TaskPlanningRole,
+        prompt: &str,
+        max_tokens: usize,
+    ) -> Result<crate::task_queue::TaskModelOutput> {
+        let mut args = self.args.clone();
+        args.max_tokens = i32::try_from(max_tokens).unwrap_or(i32::MAX);
+        args.turn_max_tokens_cap = Some(args.max_tokens);
+        args.profile = match role {
+            crate::task_queue::TaskPlanningRole::Planner => AgentProfile::Plan,
+            crate::task_queue::TaskPlanningRole::Reviewer => AgentProfile::Review,
+        };
+        let messages = vec![
+            ChatMessage::text(
+                "system",
+                "Follow the supplied Task artifact protocol exactly. Return the requested JSON object only.",
+            ),
+            ChatMessage::text("user", prompt),
+        ];
+        let output = self.generator.generate(&args, &messages, &[], false)?;
+        if !output.tool_calls.is_empty() || output.tool_parse_error.is_some() {
+            bail!("Task planning completion attempted an unsupported tool call");
+        }
+        self.metrics.llm_invocations = self.metrics.llm_invocations.saturating_add(1);
+        self.metrics.llm_runtime_ms = self
+            .metrics
+            .llm_runtime_ms
+            .saturating_add(output.duration_ms);
+        self.metrics.prompt_tokens = self
+            .metrics
+            .prompt_tokens
+            .saturating_add(output.prompt_tokens);
+        self.metrics.generated_tokens = self
+            .metrics
+            .generated_tokens
+            .saturating_add(output.generated_tokens);
+        if let Some(energy) = output.energy {
+            self.metrics.llm_energy_joules += energy.joules;
+            self.metrics.llm_energy_kwh += energy.kwh;
+        }
+        Ok(crate::task_queue::TaskModelOutput {
+            text: output.content,
+            prompt_tokens: output.prompt_tokens,
+            generated_tokens: output.generated_tokens,
+            duration_ms: output.duration_ms,
+        })
+    }
+
+    fn should_cancel(&self) -> bool {
+        (self.should_cancel)()
+    }
+}
+
 fn prepare_generation_prompt(
     generator: &mut dyn CompletionEngine,
     args: &AgentRequest,
@@ -10399,13 +10836,20 @@ fn run_delivery_workflow(
         resumed = true;
         run
     } else {
-        let workflow_id = format!(
-            "workflow-{:016x}",
-            stable_hash(&format!(
-                "{}\0{}\0{}\0{}",
-                args.session_id, args.turn_id, repository.task_baseline.id, policy.sha256
-            ))
-        );
+        let workflow_id = args
+            .turn_id
+            .strip_prefix("task-request:")
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "workflow-{:016x}",
+                    stable_hash(&format!(
+                        "{}\0{}\0{}\0{}",
+                        args.session_id, args.turn_id, repository.task_baseline.id, policy.sha256
+                    ))
+                )
+            });
         let mut run = crate::workflow::WorkflowRun::start(
             workflow_id,
             args.turn_id.clone(),
@@ -20674,6 +21118,8 @@ mod tests {
             task: "test".to_string(),
             turn_id: "turn-test".to_string(),
             intent: None,
+            task_planning: TaskPlanningPreference::Auto,
+            task_plan_rejected: None,
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
@@ -30482,6 +30928,8 @@ the next imagined action"#;
             task: "Fix login bug".to_string(),
             turn_id: "turn-branch".to_string(),
             intent: Some(crate::workflow::TurnIntent::Discuss),
+            task_planning: TaskPlanningPreference::Auto,
+            task_plan_rejected: None,
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
@@ -30562,6 +31010,8 @@ the next imagined action"#;
             task: "Another task".to_string(),
             turn_id: "turn-another".to_string(),
             intent: Some(crate::workflow::TurnIntent::Discuss),
+            task_planning: TaskPlanningPreference::Auto,
+            task_plan_rejected: None,
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,

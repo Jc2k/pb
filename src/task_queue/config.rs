@@ -429,7 +429,7 @@ const fn default_large_budget() -> TaskBudget {
 
 const fn default_aggregate_budget() -> MultiTaskBudget {
     MultiTaskBudget {
-        max_tasks: 6,
+        max_tasks: 8,
         tasks: TaskBudget {
             max_workflows: 24,
             stage_steps: 768,

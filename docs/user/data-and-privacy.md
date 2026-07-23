@@ -14,7 +14,7 @@ updates, and provider publication are explicit paths across the machine boundary
 | llama.cpp session states | `<platform-cache>/pb/llamacpp-session-v1` or `<storage.cache_dir>/llamacpp-session-v1` | Owner-only, byte-budgeted restart states; may contain prompt tokens and derived attention state. |
 | FlashMoe session and shared-prefix states | `<platform-cache>/pb/flashmoe-session-v1` or `<storage.cache_dir>/flashmoe-session-v1` | Owner-only, content-addressed and byte-budgeted KV/MLA/recurrent checkpoints; contains token ids and prompt-derived state. |
 | Project configuration | `<repository>/.pb/` | Owned by the repository; may be committed intentionally. |
-| Session history and workflow checkpoints | Repository-local Git notes under `refs/notes/pb/sessions` | Kept locally until the session is deleted; may include bounded exact bytes from complete small-file reads for cross-stage evidence; Git notes are not pushed by ordinary branch pushes. |
+| Session history, workflow, Goal, and multi-Task checkpoints | Repository-local Git notes under `refs/notes/pb/sessions` | Kept locally until the session is deleted; may include accepted Task plans, budgets, local model qualification digests, active child state, and bounded exact bytes from complete small-file reads for cross-stage evidence; Git notes are not pushed by ordinary branch pushes. |
 | Durable project memory | Repository-local `refs/pb/memory` | Evidence-backed Markdown outside the working tree and ordinary branch pushes; bounded to 500 entries and 4 MiB until the ref is changed or removed. |
 | Session containers, networks, workspaces, and services | Runtime-managed, session-owned resources | Reconciled and removed at terminal cleanup or expiry. |
 | Declared images and caches | Container/model runtime storage | May persist for reuse and garbage collection. |
@@ -73,8 +73,9 @@ and [security model](../architecture/security.md).
 
 Delete a finished daemon session with `pb queue --delete-session SESSION_ID`. This removes its pb Git
 notes ref, including its active/completed Goal checkpoints, objectives, criteria, amendments, and
-evidence. Stopping a Goal does not delete or roll back that data; use session deletion when you want
-the persisted record removed. `pb self uninstall --delete-data` removes the installed application together with pb's
+evidence, plus any accepted Task plan, queue state, budgets, child checkpoints, and results. Stopping
+a Goal or Tasks run does not delete or roll back that data; use session deletion when you want the
+persisted record removed. `pb self uninstall --delete-data` removes the installed application together with pb's
 known data, cache, configuration, state, and logs after confirmation. Review project-owned `.pb/`
 files and container runtime storage separately when you need a full project-specific cleanup.
 Set `inference.llamacpp_session_cache_enabled` to `false` if prompt-derived llama.cpp state should

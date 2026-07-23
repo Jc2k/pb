@@ -1132,6 +1132,8 @@ async fn run_serve() -> Result<()> {
         task: String::new(),
         turn_id: String::new(),
         intent: Some(crate::workflow::TurnIntent::Discuss),
+        task_planning: agent_core::TaskPlanningPreference::Auto,
+        task_plan_rejected: None,
         workflow_policy: None,
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,

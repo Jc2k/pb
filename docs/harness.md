@@ -344,6 +344,7 @@ pb-harness-.../
 ├── workspace/       # isolated git repository used by the agent
 ├── task-baseline.json # immutable original task baseline
 ├── adoptions.jsonl  # explicit provenance for resumed external changes
+├── multi-task-checkpoint.json # latest durable parent checkpoint, when Task planning activates
 ├── events.jsonl     # cumulative compatibility AgentEvent stream
 ├── journal.md       # latest-run compatibility view
 ├── run-index.jsonl  # append-only started/finished run records
@@ -356,6 +357,12 @@ An explicitly supplied scratch directory may already exist when it is empty; the
 initializes it as a new scratch root. A non-empty existing directory is treated only as a resume
 candidate and is rejected unless it contains the expected Git workspace, so unrelated contents
 are never adopted or overwritten.
+
+The optional `multi-task-checkpoint.json` mirrors the latest accepted multi-Task parent checkpoint
+for qualification and recovery inspection. It contains the accepted plan, controller-owned
+budgets, active child checkpoint, usage watermarks, repository boundary, and terminal reason. It is
+written only when a qualified proposal creates a multi-Task run; a rejected proposal or one-Task
+unwrap does not fabricate it.
 
 The harness allocates the run ID and writes the per-run `running` journal plus a `started` index
 record before model loading. Events are flushed to both streams. Final journals are atomically

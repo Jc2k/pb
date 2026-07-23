@@ -496,6 +496,30 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    TaskPlanAccepted {
+        multi_task_id: String,
+        plan_sha256: String,
+        task_count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    TaskPlanRejected {
+        outcome: crate::task_queue::TaskPlanRejectionOutcome,
+        attempts: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    TasksChanged {
+        multi_task_id: String,
+        stage: crate::task_queue::MultiTaskStage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<crate::task_queue::MultiTaskOutcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_task_id: Option<String>,
+        checkpoint_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     GoalStarted {
         goal_id: String,
         objective: String,
@@ -1130,6 +1154,39 @@ impl EventEnvelope {
                 source_turn_id,
                 objective,
                 criteria,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::TaskPlanAccepted {
+                multi_task_id,
+                plan_sha256,
+                task_count,
+                ..
+            } => Self::new(AgentEvent::TaskPlanAccepted {
+                multi_task_id,
+                plan_sha256,
+                task_count,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::TaskPlanRejected {
+                outcome, attempts, ..
+            } => Self::new(AgentEvent::TaskPlanRejected {
+                outcome,
+                attempts,
+                timestamp_ms: Some(now),
+            }),
+            AgentEvent::TasksChanged {
+                multi_task_id,
+                stage,
+                outcome,
+                active_task_id,
+                checkpoint_sha256,
+                ..
+            } => Self::new(AgentEvent::TasksChanged {
+                multi_task_id,
+                stage,
+                outcome,
+                active_task_id,
+                checkpoint_sha256,
                 timestamp_ms: Some(now),
             }),
             AgentEvent::GoalStarted {

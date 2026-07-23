@@ -27,6 +27,28 @@ export type AgentEvent =
     timestamp_ms?: number;
   }
   | {
+    type: "task_plan_accepted";
+    multi_task_id: string;
+    plan_sha256: string;
+    task_count: number;
+    timestamp_ms?: number;
+  }
+  | {
+    type: "task_plan_rejected";
+    outcome: TaskPlanRejected["outcome"];
+    attempts: number;
+    timestamp_ms?: number;
+  }
+  | {
+    type: "tasks_changed";
+    multi_task_id: string;
+    stage: MultiTaskStage;
+    outcome?: MultiTaskOutcome;
+    active_task_id?: string;
+    checkpoint_sha256: string;
+    timestamp_ms?: number;
+  }
+  | {
     type: "goal_started";
     goal_id: string;
     objective: string;
@@ -799,6 +821,125 @@ export interface GoalSummary {
   active: boolean;
   plan_sha256: string;
 }
+
+export type TaskKind = "build" | "goal";
+export type TaskState =
+  | "queued"
+  | "running"
+  | "committed"
+  | "no_change"
+  | "blocked"
+  | "failed"
+  | "cancelled"
+  | "superseded";
+export type MultiTaskStage =
+  | "running_task"
+  | "evaluating"
+  | "paused"
+  | "blocked"
+  | "ready"
+  | "failed"
+  | "cancelled";
+export type MultiTaskOutcome =
+  | "ready"
+  | "task_blocked"
+  | "task_failed"
+  | "budget_exhausted"
+  | "cancelled";
+
+export interface TaskBudget {
+  max_workflows: number;
+  stage_steps: number;
+  total_model_invocations: number;
+  total_generated_tokens: number;
+  advisory_calls: number;
+  plan_cycles: number;
+  repair_cycles: number;
+  wall_time_minutes: number;
+}
+
+export interface TaskCounters {
+  workflows: number;
+  stage_steps: number;
+  model_invocations: number;
+  generated_tokens: number;
+  advisory_calls: number;
+  plan_cycles: number;
+  repair_cycles: number;
+  elapsed_ms: number;
+}
+
+export interface PlannedTask {
+  id: string;
+  title: string;
+  description: string;
+  requirement_ids: string[];
+  depends_on: string[];
+  acceptance_ids: string[];
+  scope_hints: string[];
+  effort: "small" | "medium" | "large";
+  kind: TaskKind;
+  budget: TaskBudget;
+}
+
+export interface TaskRun {
+  spec: PlannedTask;
+  revision: number;
+  state: TaskState;
+  attempts: number;
+  counters: TaskCounters;
+  blocked_reason?: string;
+  result?: {
+    commits: string[];
+    no_change: boolean;
+    summary: string;
+  };
+}
+
+export interface MultiTaskCheckpoint {
+  sha256: string;
+  run: {
+    id: string;
+    stage: MultiTaskStage;
+    active_task_id?: string;
+    tasks: TaskRun[];
+    plan: {
+      sha256: string;
+      artifact: {
+        objective: string;
+        tasks: PlannedTask[];
+      };
+    };
+    outcome?: MultiTaskOutcome;
+    reason?: string;
+  };
+}
+
+export interface MultiTaskSummary {
+  id: string;
+  stage: MultiTaskStage;
+  outcome?: MultiTaskOutcome;
+  completed_tasks: number;
+  total_tasks: number;
+  active_task_title?: string;
+}
+
+export interface TaskPlanRejected {
+  outcome:
+    | "attempts_exhausted"
+    | "budget_exhausted"
+    | "cancelled"
+    | "qualification_mismatch";
+  attempts: number;
+  failures: Array<{
+    attempt: number;
+    stage: "planner" | "reviewer";
+    reason: string;
+  }>;
+  recovery_actions: Array<
+    "retry_planning" | "edit_request" | "run_as_one_build"
+  >;
+}
 export type WorkflowStage =
   | "planning"
   | "plan_review"
@@ -875,6 +1016,8 @@ export interface SessionItem {
   strict_workflow?: boolean;
   goal?: GoalSummary;
   active_goal?: boolean;
+  multi_task?: MultiTaskSummary;
+  active_multi_task?: boolean;
 }
 
 export interface SessionDetails {
@@ -901,6 +1044,9 @@ export interface SessionDetails {
   strict_workflow?: boolean;
   goal?: GoalCheckpoint;
   active_goal?: boolean;
+  multi_task?: MultiTaskCheckpoint;
+  active_multi_task?: boolean;
+  task_plan_rejected?: TaskPlanRejected;
 }
 
 export interface ProjectEntry {

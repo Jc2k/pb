@@ -991,6 +991,9 @@ export function MessageBubble({
       );
 
     case "executor_started":
+    case "task_plan_accepted":
+    case "task_plan_rejected":
+    case "tasks_changed":
     case "workflow_started":
     case "workflow_resumed":
     case "workflow_stage_started":

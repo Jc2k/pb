@@ -68,10 +68,12 @@ with the local session. The responsive Goal UI calls the same loopback daemon AP
 controls. Goal mode adds no cloud scheduler, hosted inference fallback, analytics edge, or automatic
 publication path.
 
-The multi-Task controller foundation follows the same local path. Its accepted high-level plan,
-planner-qualification digests, exact budgets and consumption, Task requests/results, repository
-fingerprints, and native active Build or Goal checkpoint remain in the containing session Git note.
-It adds no hosted scheduler, model escalation, telemetry, remote persistence, or publication edge.
+High-level Task planning and the multi-Task controller follow the same local path. Planner and critic
+inference use the selected local model; there is no hosted fallback or automatic model escalation.
+The accepted plan, planner-qualification digests, exact budgets and consumption, Task requests and
+results, repository fingerprints, and native active Build or Goal checkpoint remain in the
+containing session Git note. The Tasks UI reads that state through the loopback daemon. The feature
+adds no hosted scheduler, telemetry, remote persistence, or publication edge.
 
 ## Explicit external edges
 

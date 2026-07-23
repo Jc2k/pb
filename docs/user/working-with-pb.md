@@ -67,6 +67,41 @@ pb does not pretend it was read. The normal model/tool path remains available. A
 has stricter gates and applies only to a unique accepted tracked-clean path that is unchanged and
 recoverable from Git.
 
+## Tasks
+
+**Shipped controller; no planner currently qualified.** For a larger explicit Build request, pb can
+first create a high-level plan of outcome-shaped **Tasks** once an exact qualification is shipped.
+Each Task is either **Build** or
+**Goal**, has its own read-only budget display, and runs in order. This is above ordinary Build
+planning: when a Build Task becomes active, its normal planner still inspects the current repository
+and proposes the actual changes, checks, and commit boundary for that Task.
+
+The selected local model must exactly match pb's embedded model/backend/template/protocol
+qualification record. The embedded catalog is empty in this release, and `.pb/tasks.toml` cannot
+turn the feature on. With an unqualified model, pb
+starts the current Build workflow directly, so existing projects do not pay an extra planning turn
+or see a new UI.
+
+The number of accepted Tasks determines the experience:
+
+- One Build Task looks and behaves like the existing Build workflow.
+- One Goal Task looks and behaves like the existing Goal workflow and still waits at its normal
+  Goal plan approval boundary.
+- Two or more Tasks show a **Tasks** panel with ordered state, Build/Goal kind, active Task, budget
+  use, commits, and any blocked reason. An active Goal's existing controls appear inside that Goal
+  Task.
+
+Only one Task runs at a time. pb plans a Task against the repository left by its predecessor,
+requires the predecessor's managed commit or verified no-change result, checks the exact repository
+state, and only then queues the next Task. Stopping or exhausting a Task preserves completed local
+commits and prevents dependent Tasks from starting. A restart restores the exact active request and
+remaining allowance, paused at a safe boundary.
+
+If high-level planning cannot produce a valid reviewed plan in two attempts, pb does not silently
+run the broad request. The session shows three choices: **Retry planning**, **Edit request**, or
+**Run as one Build**. The final choice is a new explicit decision and enters the unchanged Build
+workflow.
+
 ## Goal
 
 **Shipped.** Use **Goal** when one durable objective needs several sequential, bounded Build
@@ -112,6 +147,10 @@ or tool operation, persists the child workflow at the next safe boundary, and on
 editor. An accepted amendment creates a new plan version. Completed milestones, workflows, and
 criterion evidence remain in history, while unfinished milestones are marked superseded. Budget
 changes remain subject to `.pb/goal.toml` ceilings.
+
+Inside a Goal Task, the same amendment UI remains available, but the enclosing Task contract also
+applies: an amendment may add bounded criteria or change continuation, but cannot remove an accepted
+criterion, change the Task objective or repository authority, or exceed the Task budget.
 
 **Stop goal** preserves commits, uncommitted workspace content, events, and evidence. It does not
 roll back repository work. A daemon restart likewise never silently resumes Goal mutation: active

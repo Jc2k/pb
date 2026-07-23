@@ -419,6 +419,8 @@ mod tests {
             task: "test task".to_string(),
             turn_id: "turn-test".to_string(),
             intent: Some(crate::workflow::TurnIntent::Discuss),
+            task_planning: crate::agent_core::TaskPlanningPreference::Auto,
+            task_plan_rejected: None,
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
@@ -526,6 +528,13 @@ mod tests {
             plan,
             review,
             policy,
+            crate::workflow::WorkflowConfigDocument::default()
+                .compile()
+                .unwrap(),
+            crate::goal::GoalConfigDocument::default()
+                .compile()
+                .unwrap(),
+            32,
             crate::task_queue::TaskSourceIntent::Build,
             qualification,
             repo.to_string_lossy(),

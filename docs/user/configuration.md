@@ -319,17 +319,19 @@ strict-workflow, durable-Goal, and Task-decomposition foundations.
 
 ## Task decomposition policy
 
-**Shipped configuration foundation.** `.pb/tasks.toml` is a versioned, hashed ceiling document for
+**Shipped policy; automatic planning currently unavailable.** `.pb/tasks.toml` is a versioned, hashed ceiling document for
 high-level Task-plan validation and controller-owned budget projection. It defines `small`,
-`medium`, and `large` qualitative effort presets, a six-Task aggregate ceiling by default, and a
+`medium`, and `large` qualitative effort presets, an eight-Task aggregate ceiling by default, and a
 two-attempt coordination allowance. Models propose only qualitative effort; executable numeric
 budgets are compiled from this document and included in the accepted artifact digest.
 
 The file cannot enable Task planning, qualify a model, authorize automatic Goal selection, start a
 Goal, expand workflow authority, or allow publication. Planner qualification is controller-owned
-evidence for an exact model/template/protocol version. Existing `.pb/workflow.toml` and
-`.pb/goal.toml` formats and limits are unchanged. The multi-Task session controller and Tasks UI
-remain design-record behavior until their later delivery Tasks ship.
+evidence for an exact model/template/protocol version. This release's embedded qualification catalog
+is empty. Existing `.pb/workflow.toml` and
+`.pb/goal.toml` formats and limits are unchanged. Qualified multi-Task sessions use these ceilings
+for the durable controller and read-only Tasks UI; an unqualified model retains ordinary Build
+behavior.
 
 ## Goal policy
 

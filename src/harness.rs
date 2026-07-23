@@ -56,6 +56,7 @@ struct ScratchLayout {
     task_baseline: PathBuf,
     adoptions: PathBuf,
     workflow_checkpoint: PathBuf,
+    multi_task_checkpoint: PathBuf,
     resumed: bool,
 }
 
@@ -225,6 +226,7 @@ struct JournalState {
     audit: HarnessRunAudit,
     write_error: Option<String>,
     workflow_checkpoint: PathBuf,
+    multi_task_checkpoint: PathBuf,
 }
 
 #[derive(Clone)]
@@ -263,6 +265,8 @@ impl HarnessEventSink {
                 audit: HarnessRunAudit::default(),
                 write_error: None,
                 workflow_checkpoint: workflow_checkpoint.to_path_buf(),
+                multi_task_checkpoint: workflow_checkpoint
+                    .with_file_name("multi-task-checkpoint.json"),
             })),
         })
     }
@@ -619,6 +623,22 @@ impl EventSink for HarnessEventSink {
         atomic_write(&path, &bytes)
     }
 
+    fn checkpoint_multi_task(
+        &mut self,
+        checkpoint: &crate::task_queue::MultiTaskCheckpoint,
+    ) -> Result<()> {
+        checkpoint.validate()?;
+        let path = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("harness event journal lock was poisoned"))?
+            .multi_task_checkpoint
+            .clone();
+        let bytes = serde_json::to_vec_pretty(checkpoint)
+            .context("failed to serialize harness multi-Task checkpoint")?;
+        atomic_write(&path, &bytes)
+    }
+
     fn request_goal_pause(&mut self, reason: &str) -> Result<String> {
         let goal_id = self
             .state
@@ -727,6 +747,10 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     println!("pb harness: run_id={}", layout.run_id);
     println!("pb harness: run_events={}", layout.run_events.display());
     println!("pb harness: run_journal={}", layout.run_journal.display());
+    println!(
+        "pb harness: multi_task_checkpoint={}",
+        layout.multi_task_checkpoint.display()
+    );
     println!("pb harness: resumed={}", layout.resumed);
     println!("pb harness: deterministic_actions=controller_block");
 
@@ -764,6 +788,8 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
             .map(|checkpoint| checkpoint.run.source_turn_id.clone())
             .unwrap_or_else(|| format!("harness-turn-{}", layout.run_id)),
         intent: Some(args.intent),
+        task_planning: crate::agent_core::TaskPlanningPreference::Auto,
+        task_plan_rejected: None,
         workflow_policy: Some(workflow_policy),
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
@@ -1273,6 +1299,7 @@ fn prepare_scratch(requested: Option<&Path>) -> Result<ScratchLayout> {
         task_baseline: root.join("task-baseline.json"),
         adoptions: root.join("adoptions.jsonl"),
         workflow_checkpoint: root.join("workflow-checkpoint.json"),
+        multi_task_checkpoint: root.join("multi-task-checkpoint.json"),
         run_id,
         root,
         workspace,
@@ -1966,6 +1993,8 @@ mod tests {
                 requested_delivery: None,
                 goal_proposal: None,
                 requested_goal: None,
+                task_goal: None,
+                task_plan_rejected: None,
             }
         };
 
@@ -2530,6 +2559,8 @@ mod tests {
             requested_delivery: None,
             goal_proposal: None,
             requested_goal: None,
+            task_goal: None,
+            task_plan_rejected: None,
         });
         append_run_index_started(&layout, &run.task, None, &metadata).unwrap();
         append_run_index_finished(&layout, &result, &audit, None, &metadata).unwrap();
@@ -2600,6 +2631,8 @@ mod tests {
             requested_delivery: None,
             goal_proposal: None,
             requested_goal: None,
+            task_goal: None,
+            task_plan_rejected: None,
         });
         let summary = CapturedSummary {
             summary: "No changes were needed.".to_string(),
@@ -2637,6 +2670,8 @@ mod tests {
             requested_delivery: None,
             goal_proposal: None,
             requested_goal: None,
+            task_goal: None,
+            task_plan_rejected: None,
         });
         let summary = CapturedSummary {
             summary: "Discussion answer.".to_string(),
@@ -2674,6 +2709,8 @@ mod tests {
             requested_delivery: None,
             goal_proposal: None,
             requested_goal: None,
+            task_goal: None,
+            task_plan_rejected: None,
         });
         let summary = CapturedSummary {
             summary: "Model setup failed before delivery began.".to_string(),
@@ -2712,6 +2749,8 @@ mod tests {
             requested_delivery: None,
             goal_proposal: None,
             requested_goal: None,
+            task_goal: None,
+            task_plan_rejected: None,
         });
         let summary = CapturedSummary {
             summary: "Implementation stopped at its step limit.".to_string(),
@@ -2871,6 +2910,8 @@ mod tests {
                 objective: "Qualify Goal mode".to_string(),
                 criteria: Vec::new(),
             }),
+            task_goal: None,
+            task_plan_rejected: None,
         });
         let mut observations = Vec::new();
 
@@ -3074,6 +3115,8 @@ mod tests {
             requested_delivery: None,
             goal_proposal: None,
             requested_goal: None,
+            task_goal: None,
+            task_plan_rejected: None,
         });
         write_journal(
             layout,

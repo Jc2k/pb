@@ -41,6 +41,26 @@ pub fn render_event(event: &AgentEvent) {
             "goal proposed",
             &format!("{objective} ({} criteria)", criteria.len()),
         ),
+        AgentEvent::TaskPlanAccepted { task_count, .. } => {
+            print_header("Tasks", &format!("{task_count} accepted"));
+        }
+        AgentEvent::TaskPlanRejected {
+            outcome, attempts, ..
+        } => print_header(
+            "Task planning",
+            &format!("stopped after {attempts} attempt(s): {outcome:?}"),
+        ),
+        AgentEvent::TasksChanged {
+            stage,
+            active_task_id,
+            ..
+        } => print_header(
+            "Tasks",
+            &active_task_id.as_ref().map_or_else(
+                || format!("{stage:?}"),
+                |task_id| format!("{stage:?}: {task_id}"),
+            ),
+        ),
         AgentEvent::GoalStarted { objective, .. } => print_header("goal", objective),
         AgentEvent::GoalPlanAwaitingApproval { milestones, .. } => {
             print_header(

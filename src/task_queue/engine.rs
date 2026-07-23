@@ -74,8 +74,11 @@ impl TaskState {
 pub struct TaskAuthorityEnvelope {
     pub workdir: String,
     pub publication: bool,
+    pub request_max_steps: usize,
     pub plan: TaskPlanAuthority,
     pub qualification: TaskPlannerQualification,
+    pub workflow_policy: crate::workflow::CompiledWorkflowPolicy,
+    pub goal_policy: crate::goal::CompiledGoalPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -293,12 +296,15 @@ pub struct TaskRequest {
     pub source_turn_id: String,
     pub task_id: String,
     pub child_id: String,
+    pub workdir: String,
     pub kind: TaskKind,
     pub title: String,
     pub objective: String,
     pub requirements: Vec<TaskRequirement>,
     pub acceptance: Vec<TaskAcceptance>,
     pub scope_hints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_contract: Option<super::TaskGoalContract>,
     pub base_repository: TaskRepositoryState,
     pub budget: TaskBudget,
     pub attempt: usize,
@@ -346,6 +352,8 @@ pub struct TaskRun {
     pub workflow: Option<WorkflowCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<GoalCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_contract_revision: Option<super::TaskGoalContract>,
     #[serde(default)]
     pub direct_counters: TaskCounters,
     #[serde(default)]
@@ -370,6 +378,7 @@ impl TaskRun {
             request: None,
             workflow: None,
             goal: None,
+            goal_contract_revision: None,
             direct_counters: TaskCounters::default(),
             child_watermarks: BTreeMap::new(),
             counters: TaskCounters::default(),
@@ -387,6 +396,12 @@ impl TaskRun {
                 total.checked_add(watermark.usage)
             })?;
         Ok(())
+    }
+
+    fn effective_goal_contract(&self) -> Option<&super::TaskGoalContract> {
+        self.goal_contract_revision
+            .as_ref()
+            .or(self.spec.goal_contract.as_ref())
     }
 }
 
@@ -501,6 +516,12 @@ pub enum MultiTaskEvent {
         repository: TaskRepositoryState,
         now_ms: u64,
     },
+    GoalContractRevised {
+        task_id: String,
+        child: GoalCheckpoint,
+        repository: TaskRepositoryState,
+        now_ms: u64,
+    },
     TaskDelivered {
         task_id: String,
         result: TaskResult,
@@ -549,6 +570,7 @@ impl MultiTaskEvent {
             | Self::DirectUsageRecorded { now_ms, .. }
             | Self::ChildStarted { now_ms, .. }
             | Self::ChildCheckpointed { now_ms, .. }
+            | Self::GoalContractRevised { now_ms, .. }
             | Self::TaskDelivered { now_ms, .. }
             | Self::TaskStopped { now_ms, .. }
             | Self::EvaluationCompleted { now_ms, .. }
@@ -570,6 +592,9 @@ impl MultiTaskRun {
         plan: ArtifactEnvelope<TaskPlanArtifact>,
         plan_review: ArtifactEnvelope<TaskPlanReviewArtifact>,
         policy: CompiledTaskPolicy,
+        workflow_policy: crate::workflow::CompiledWorkflowPolicy,
+        goal_policy: crate::goal::CompiledGoalPolicy,
+        request_max_steps: usize,
         source_intent: TaskSourceIntent,
         qualification: TaskPlannerQualification,
         workdir: impl Into<String>,
@@ -584,6 +609,11 @@ impl MultiTaskRun {
         let workdir = required("multi-Task workdir", &workdir.into())?.to_string();
         repository.validate()?;
         policy.validate()?;
+        workflow_policy.validate()?;
+        goal_policy.validate()?;
+        if request_max_steps == 0 {
+            bail!("multi-Task source request must allow at least one model step");
+        }
         qualification.validate()?;
         let plan_authority = TaskPlanAuthority {
             source_intent,
@@ -621,8 +651,11 @@ impl MultiTaskRun {
             authority: TaskAuthorityEnvelope {
                 workdir,
                 publication: false,
+                request_max_steps,
                 plan: plan_authority,
                 qualification,
+                workflow_policy,
+                goal_policy,
             },
             budget: plan.artifact.allocated_budget,
             counters: MultiTaskCounters {
@@ -762,12 +795,14 @@ impl MultiTaskRun {
             source_turn_id: self.source_turn_id.clone(),
             task_id: task.spec.id.clone(),
             child_id,
+            workdir: self.authority.workdir.clone(),
             kind: task.spec.kind,
             title: task.spec.title.clone(),
             objective: task.spec.description.clone(),
             requirements,
             acceptance,
             scope_hints: task.spec.scope_hints.clone(),
+            goal_contract: task.effective_goal_contract().cloned(),
             base_repository: self.expected_repository.clone(),
             budget: task.spec.budget,
             attempt,
@@ -798,7 +833,12 @@ impl MultiTaskRun {
         if self.authority.publication {
             bail!("multi-Task runs cannot carry publication authority");
         }
+        if self.authority.request_max_steps == 0 {
+            bail!("multi-Task source request has no model-step allowance");
+        }
         self.authority.qualification.validate()?;
+        self.authority.workflow_policy.validate()?;
+        self.authority.goal_policy.validate()?;
         if self.authority.plan.task_planning_qualified != self.authority.qualification.task_planning
             || self.authority.plan.automatic_goal_selection_qualified
                 != self.authority.qualification.automatic_goal_selection
@@ -1077,12 +1117,19 @@ impl MultiTaskRun {
                 goal_usage(goal)?,
             )?;
         }
+        if task.goal_contract_revision.is_some() && task.spec.kind != TaskKind::Goal {
+            bail!(
+                "Build Task '{}' contains a Goal contract revision",
+                task.spec.id
+            );
+        }
         match task.state {
             TaskState::Queued | TaskState::Superseded => {
                 if task.attempts != 0
                     || task.request.is_some()
                     || task.workflow.is_some()
                     || task.goal.is_some()
+                    || task.goal_contract_revision.is_some()
                     || task.repository_checkpoint.is_some()
                     || task.result.is_some()
                     || task.counters != TaskCounters::default()
@@ -1121,6 +1168,7 @@ impl MultiTaskRun {
                 } else if task.attempts != 0
                     || task.workflow.is_some()
                     || task.goal.is_some()
+                    || task.goal_contract_revision.is_some()
                     || task.repository_checkpoint.is_some()
                     || task.counters != TaskCounters::default()
                 {
@@ -1220,6 +1268,41 @@ pub fn reduce(mut run: MultiTaskRun, event: MultiTaskEvent) -> Result<MultiTaskR
         } => {
             require_running_task(&run, &task_id)?;
             checkpoint_child(&mut run, &task_id, child, repository, now_ms, false)?;
+        }
+        MultiTaskEvent::GoalContractRevised {
+            task_id,
+            child,
+            repository,
+            now_ms,
+        } => {
+            require_running_task(&run, &task_id)?;
+            let task = run
+                .current_task(&task_id)
+                .context("active Goal Task disappeared")?;
+            if task.spec.kind != TaskKind::Goal || task.goal.is_none() {
+                bail!("only a started Goal Task contract can be revised");
+            }
+            let request = task
+                .request
+                .as_ref()
+                .context("active Goal Task has no request")?;
+            let contract = validate_goal_task_revision(request, &child)?;
+            let task = run
+                .current_task_mut(&task_id)
+                .context("active Goal Task disappeared")?;
+            task.goal_contract_revision = Some(contract.clone());
+            task.request
+                .as_mut()
+                .context("active Goal Task has no request")?
+                .goal_contract = Some(contract);
+            checkpoint_child(
+                &mut run,
+                &task_id,
+                TaskChildCheckpoint::Goal(child),
+                repository,
+                now_ms,
+                false,
+            )?;
         }
         MultiTaskEvent::TaskDelivered {
             task_id,
@@ -1400,7 +1483,14 @@ fn checkpoint_child(
                 bail!("Build Task checkpoint is not bound to its Task request");
             }
         }
-        (TaskChildCheckpoint::Goal(_), TaskKind::Goal) => {}
+        (TaskChildCheckpoint::Goal(checkpoint), TaskKind::Goal) => {
+            validate_goal_task_checkpoint(
+                request,
+                task.effective_goal_contract(),
+                task.goal_contract_revision.is_some(),
+                checkpoint,
+            )?;
+        }
         _ => bail!("Task child kind does not match its accepted Task kind"),
     }
     if !starting {
@@ -1711,15 +1801,21 @@ fn require_running_task(run: &MultiTaskRun, task_id: &str) -> Result<()> {
 fn validate_request(run: &MultiTaskRun, task: &TaskRun, request: &TaskRequest) -> Result<()> {
     required("Task request id", &request.id)?;
     required("Task request child id", &request.child_id)?;
+    required("Task request workdir", &request.workdir)?;
+    if !Path::new(&request.workdir).is_absolute() {
+        bail!("Task request workdir must be absolute");
+    }
     let expected_child_id = format!("{}:{}:{}", run.id, task.spec.id, task.attempts);
     let expected_request_id = format!("task-request:{expected_child_id}");
     if request.multi_task_id != run.id
         || request.source_turn_id != run.source_turn_id
         || request.task_id != task.spec.id
+        || request.workdir != run.authority.workdir
         || request.kind != task.spec.kind
         || request.title != task.spec.title
         || request.objective != task.spec.description
         || request.scope_hints != task.spec.scope_hints
+        || request.goal_contract.as_ref() != task.effective_goal_contract()
         || request.budget != task.spec.budget
         || request.attempt != task.attempts
         || request.child_id != expected_child_id
@@ -1740,11 +1836,103 @@ fn validate_request(run: &MultiTaskRun, task: &TaskRun, request: &TaskRequest) -
         bail!("Build checkpoint is not bound to its Task request");
     }
     if let Some(goal) = &task.goal
-        && goal.run.id != request.child_id
+        && (goal.run.id != request.child_id
+            || validate_goal_task_checkpoint(
+                request,
+                task.effective_goal_contract(),
+                task.goal_contract_revision.is_some(),
+                goal,
+            )
+            .is_err())
     {
         bail!("Goal checkpoint is not bound to its Task request");
     }
     Ok(())
+}
+
+fn validate_goal_task_checkpoint(
+    request: &TaskRequest,
+    contract: Option<&super::TaskGoalContract>,
+    contract_was_revised: bool,
+    checkpoint: &GoalCheckpoint,
+) -> Result<()> {
+    let contract = contract.context("Goal Task request has no Goal contract")?;
+    if checkpoint.run.id != request.child_id
+        || checkpoint.run.objective != contract.objective
+        || checkpoint.run.continuation != contract.continuation
+        || checkpoint.run.criteria.len() != contract.criteria.len()
+        || checkpoint
+            .run
+            .criteria
+            .iter()
+            .zip(&contract.criteria)
+            .any(|(actual, expected)| {
+                actual.text.trim() != expected.text.trim() || actual.verifier != expected.verifier
+            })
+        || (!contract_was_revised && !checkpoint.run.retired_criteria.is_empty())
+    {
+        bail!("Goal checkpoint changed the accepted Goal Task contract");
+    }
+    if checkpoint.run.authority.publication || checkpoint.run.authority.workdir != request.workdir {
+        bail!("Goal checkpoint changed the parent Task authority");
+    }
+    let budget = checkpoint.run.budget;
+    if budget.max_milestones > request.budget.max_workflows
+        || budget.max_workflows > request.budget.max_workflows
+        || budget.total_model_invocations > request.budget.total_model_invocations
+        || budget.total_generated_tokens > request.budget.total_generated_tokens
+        || budget.wall_time_minutes > request.budget.wall_time_minutes
+    {
+        bail!("Goal checkpoint exceeds its parent Task budget");
+    }
+    Ok(())
+}
+
+fn validate_goal_task_revision(
+    request: &TaskRequest,
+    checkpoint: &GoalCheckpoint,
+) -> Result<super::TaskGoalContract> {
+    checkpoint.validate()?;
+    let accepted = request
+        .goal_contract
+        .as_ref()
+        .context("Goal Task request has no accepted Goal contract")?;
+    if checkpoint.run.id != request.child_id
+        || checkpoint.run.objective != accepted.objective
+        || checkpoint.run.authority.publication
+        || checkpoint.run.authority.workdir != request.workdir
+    {
+        bail!("Goal Task revision changed objective, identity, or authority");
+    }
+    if accepted.criteria.iter().any(|expected| {
+        !checkpoint.run.criteria.iter().any(|actual| {
+            actual.text.trim() == expected.text.trim() && actual.verifier == expected.verifier
+        })
+    }) {
+        bail!("Goal Task revision removed an accepted criterion");
+    }
+    let budget = checkpoint.run.budget;
+    if budget.max_milestones > request.budget.max_workflows
+        || budget.max_workflows > request.budget.max_workflows
+        || budget.total_model_invocations > request.budget.total_model_invocations
+        || budget.total_generated_tokens > request.budget.total_generated_tokens
+        || budget.wall_time_minutes > request.budget.wall_time_minutes
+    {
+        bail!("Goal Task revision exceeds its parent Task budget");
+    }
+    Ok(super::TaskGoalContract {
+        objective: checkpoint.run.objective.clone(),
+        criteria: checkpoint
+            .run
+            .criteria
+            .iter()
+            .map(|criterion| super::TaskGoalCriterion {
+                text: criterion.text.clone(),
+                verifier: criterion.verifier,
+            })
+            .collect(),
+        continuation: checkpoint.run.continuation,
+    })
 }
 
 fn validate_current_watermark(
@@ -2040,6 +2228,13 @@ mod tests {
             plan,
             review,
             policy,
+            crate::workflow::WorkflowConfigDocument::default()
+                .compile()
+                .unwrap(),
+            crate::goal::GoalConfigDocument::default()
+                .compile()
+                .unwrap(),
+            32,
             TaskSourceIntent::Build,
             qualification(),
             "/workspace",
@@ -2109,6 +2304,73 @@ mod tests {
         run.active_task().unwrap().request.clone().unwrap()
     }
 
+    fn goal_task_request() -> TaskRequest {
+        TaskRequest {
+            id: "task-request:multi-goal:g1:1".to_string(),
+            multi_task_id: "multi-goal".to_string(),
+            source_turn_id: "turn-goal".to_string(),
+            task_id: "g1".to_string(),
+            child_id: "multi-goal:g1:1".to_string(),
+            workdir: "/workspace".to_string(),
+            kind: TaskKind::Goal,
+            title: "Prove recovery".to_string(),
+            objective: "Deliver recovery evidence".to_string(),
+            requirements: Vec::new(),
+            acceptance: Vec::new(),
+            scope_hints: Vec::new(),
+            goal_contract: Some(super::super::TaskGoalContract {
+                objective: "Prove restart recovery".to_string(),
+                criteria: vec![super::super::TaskGoalCriterion {
+                    text: "Recovery is machine verified".to_string(),
+                    verifier: crate::goal::GoalVerifier::WorkflowReady,
+                }],
+                continuation: crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
+            }),
+            base_repository: repository("goal-base"),
+            budget: TaskBudget {
+                max_workflows: 3,
+                stage_steps: 20,
+                total_model_invocations: 20,
+                total_generated_tokens: 10_000,
+                advisory_calls: 4,
+                plan_cycles: 2,
+                repair_cycles: 2,
+                wall_time_minutes: 30,
+            },
+            attempt: 1,
+        }
+    }
+
+    fn goal_checkpoint(request: &TaskRequest) -> GoalCheckpoint {
+        let contract = request.goal_contract.as_ref().unwrap();
+        let policy = crate::goal::GoalConfigDocument::default()
+            .compile()
+            .unwrap();
+        let run = crate::goal::GoalRun::start(
+            request.child_id.clone(),
+            "session-1",
+            contract.objective.clone(),
+            contract
+                .criteria
+                .iter()
+                .map(crate::goal::GoalCriterionInput::from)
+                .collect(),
+            contract.continuation,
+            Some(crate::goal::GoalBudget {
+                max_milestones: 2,
+                max_workflows: 3,
+                total_model_invocations: 20,
+                total_generated_tokens: 10_000,
+                wall_time_minutes: 30,
+            }),
+            policy,
+            request.workdir.clone(),
+            10,
+        )
+        .unwrap();
+        GoalCheckpoint::new(run).unwrap()
+    }
+
     fn start_child(run: &mut MultiTaskRun, counters: WorkflowCounters, now_ms: u64) {
         let request = active_request(run);
         run.apply(MultiTaskEvent::ChildStarted {
@@ -2166,6 +2428,57 @@ mod tests {
         assert_eq!(run.current_task("t2").unwrap().state, TaskState::Queued);
         assert!(run.current_task("t2").unwrap().request.is_none());
         assert!(run.current_task("t2").unwrap().workflow.is_none());
+    }
+
+    #[test]
+    fn explicit_goal_revision_may_add_bounded_criteria_but_cannot_weaken_contract() {
+        let request = goal_task_request();
+        let initial = goal_checkpoint(&request);
+        validate_goal_task_checkpoint(&request, request.goal_contract.as_ref(), false, &initial)
+            .unwrap();
+
+        let mut revised = initial.run.clone();
+        revised
+            .revise_initial_plan(
+                revised.objective.clone(),
+                vec![
+                    crate::goal::GoalCriterionInput {
+                        text: "Recovery is machine verified".to_string(),
+                        verifier: crate::goal::GoalVerifier::WorkflowReady,
+                    },
+                    crate::goal::GoalCriterionInput {
+                        text: "The restart record is reviewed".to_string(),
+                        verifier: crate::goal::GoalVerifier::ReviewRequired,
+                    },
+                ],
+                crate::goal::GoalContinuationPolicy::ManualMilestones,
+                Some(revised.budget),
+                20,
+            )
+            .unwrap();
+        let revised = GoalCheckpoint::new(revised).unwrap();
+        let contract = validate_goal_task_revision(&request, &revised).unwrap();
+        assert_eq!(contract.criteria.len(), 2);
+        assert_eq!(
+            contract.continuation,
+            crate::goal::GoalContinuationPolicy::ManualMilestones
+        );
+
+        let mut weakened = initial.run;
+        weakened
+            .revise_initial_plan(
+                weakened.objective.clone(),
+                vec![crate::goal::GoalCriterionInput {
+                    text: "A weaker replacement".to_string(),
+                    verifier: crate::goal::GoalVerifier::ReviewRequired,
+                }],
+                weakened.continuation,
+                Some(weakened.budget),
+                21,
+            )
+            .unwrap();
+        let weakened = GoalCheckpoint::new(weakened).unwrap();
+        assert!(validate_goal_task_revision(&request, &weakened).is_err());
     }
 
     #[test]

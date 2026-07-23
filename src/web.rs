@@ -199,6 +199,21 @@ pub struct SessionListItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::goal::GoalSummary>,
     pub active_goal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_task: Option<MultiTaskSummary>,
+    pub active_multi_task: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiTaskSummary {
+    pub id: String,
+    pub stage: crate::task_queue::MultiTaskStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<crate::task_queue::MultiTaskOutcome>,
+    pub completed_tasks: usize,
+    pub total_tasks: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -302,6 +317,11 @@ pub struct SessionDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::goal::GoalCheckpoint>,
     pub active_goal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
+    pub active_multi_task: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_plan_rejected: Option<crate::task_queue::TaskPlanRejected>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +424,8 @@ struct SessionState {
     completed_workflows: Vec<crate::workflow::WorkflowSummary>,
     goal: Option<crate::goal::GoalCheckpoint>,
     completed_goals: Vec<crate::goal::GoalCheckpoint>,
+    multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
+    completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
     pause_token: Arc<AtomicBool>,
     cancel_token: Arc<AtomicBool>,
     updated_at_ms: u64,
@@ -520,6 +542,14 @@ pub async fn run_server_with_ready(
         )
         .route("/api/sessions/{id}/continue", post(continue_session))
         .route("/api/sessions/{id}/resume", post(resume_session))
+        .route(
+            "/api/sessions/{id}/retry-task-planning",
+            post(retry_task_planning),
+        )
+        .route(
+            "/api/sessions/{id}/run-as-one-build",
+            post(run_as_one_build),
+        )
         .route("/api/sessions/{id}/cancel", post(cancel_session))
         .route("/api/sessions/{id}/answer", post(answer_question))
         .route("/api/sessions/{id}/events", get(session_events))
@@ -833,6 +863,8 @@ async fn start_session_inner(
     }
     let workflow_policy = workflow_policy_for_request(request.workdir.as_deref())?;
     request.intent = Some(req.intent.unwrap_or(workflow_policy.default_intent));
+    request.task_planning = crate::agent_core::TaskPlanningPreference::Auto;
+    request.task_plan_rejected = None;
     // A new user turn in a restored conversation always uses current workflow policy. The
     // compatibility marker applies only to resuming the exact pre-intent invocation.
     request.legacy_prompt_owned_delivery = false;
@@ -889,6 +921,8 @@ async fn start_session_inner(
         completed_workflows: Vec::new(),
         goal: None,
         completed_goals: Vec::new(),
+        multi_task: None,
+        completed_multi_tasks: Vec::new(),
         pause_token: Arc::new(AtomicBool::new(false)),
         cancel_token: Arc::new(AtomicBool::new(false)),
         updated_at_ms: now,
@@ -908,6 +942,8 @@ async fn start_session_inner(
         SessionStatus::Queued,
         &empty_history,
         &usage_records,
+        None,
+        Vec::new(),
         None,
         Vec::new(),
         None,
@@ -1055,6 +1091,8 @@ async fn start_goal_inner(
         completed_workflows: Vec::new(),
         goal: Some(checkpoint.clone()),
         completed_goals: Vec::new(),
+        multi_task: None,
+        completed_multi_tasks: Vec::new(),
         pause_token: Arc::new(AtomicBool::new(false)),
         cancel_token: Arc::new(AtomicBool::new(false)),
         updated_at_ms: now,
@@ -1179,6 +1217,7 @@ async fn revise_goal_draft(
     Json(req): Json<GoalAmendmentRequest>,
 ) -> Result<Json<GoalResponse>, StatusCode> {
     mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+        validate_goal_task_amendment(session, &req.objective, &req.criteria, req.budget)?;
         run.revise_initial_plan(
             req.objective.clone(),
             req.criteria.clone(),
@@ -1299,7 +1338,7 @@ async fn cancel_goal(
         },
     );
     session.completed_goals.push(checkpoint.clone());
-    session.status = SessionStatus::Completed;
+    session.status = fold_terminal_goal_task(session, &checkpoint).map_err(internal_status)?;
     session.paused = false;
     session.updated_at_ms = now_millis();
     persist_live_session(&session_id, session);
@@ -1339,14 +1378,20 @@ async fn accept_goal(
         },
     );
     session.completed_goals.push(checkpoint.clone());
-    session.status = SessionStatus::Completed;
+    session.status = fold_terminal_goal_task(session, &checkpoint).map_err(internal_status)?;
     session.paused = false;
+    let dispatch = session.status == SessionStatus::Queued;
     persist_live_session(&session_id, session);
-    Ok(Json(GoalResponse {
+    let response = Json(GoalResponse {
         session_id,
         goal_id: id,
         goal_sha256: checkpoint.sha256,
-    }))
+    });
+    drop(sessions);
+    if dispatch {
+        dispatch_next_session(state);
+    }
+    Ok(response)
 }
 
 async fn amend_goal(
@@ -1355,6 +1400,7 @@ async fn amend_goal(
     Json(req): Json<GoalAmendmentRequest>,
 ) -> Result<Json<GoalResponse>, StatusCode> {
     mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+        validate_goal_task_amendment(session, &req.objective, &req.criteria, req.budget)?;
         let amendment_id = format!("amendment-{}", now_millis());
         run.propose_amendment(
             amendment_id.clone(),
@@ -1401,6 +1447,12 @@ async fn approve_goal_amendment(
         if pending.id != amendment_id {
             bail!("amendment id is stale");
         }
+        validate_goal_task_amendment(
+            session,
+            &pending.objective,
+            &pending.criteria,
+            Some(pending.budget),
+        )?;
         let plan_sha256 = req
             .plan_sha256
             .as_deref()
@@ -1480,12 +1532,211 @@ async fn mutate_active_goal(
     checkpoint = crate::goal::GoalCheckpoint::new(checkpoint.run).map_err(internal_status)?;
     session.updated_at_ms = now_millis();
     session.goal = Some(checkpoint.clone());
+    sync_multi_task_goal_checkpoint(session).map_err(internal_status)?;
     persist_live_session(&session_id, session);
     Ok(GoalResponse {
         session_id,
         goal_id: goal_id.to_string(),
         goal_sha256: checkpoint.sha256,
     })
+}
+
+fn sync_multi_task_goal_checkpoint(session: &mut SessionState) -> Result<()> {
+    let (Some(parent), Some(goal)) = (session.multi_task.clone(), session.goal.clone()) else {
+        return Ok(());
+    };
+    if parent.run.stage != crate::task_queue::MultiTaskStage::RunningTask {
+        return Ok(());
+    }
+    let mut run = parent.run;
+    let task_id = run
+        .active_task_id
+        .clone()
+        .context("Goal Task parent has no active Task")?;
+    let repository = crate::task_queue::TaskRepositoryState::capture(std::path::Path::new(
+        &run.authority.workdir,
+    ))?;
+    let now = now_millis().max(run.updated_at_ms);
+    let contract_matches = run
+        .active_task()
+        .and_then(|task| task.request.as_ref())
+        .and_then(|request| request.goal_contract.as_ref())
+        .is_some_and(|contract| goal_matches_task_contract(&goal, contract));
+    let event = if contract_matches {
+        crate::task_queue::MultiTaskEvent::ChildCheckpointed {
+            task_id,
+            child: crate::task_queue::TaskChildCheckpoint::Goal(goal),
+            repository,
+            now_ms: now,
+        }
+    } else {
+        crate::task_queue::MultiTaskEvent::GoalContractRevised {
+            task_id,
+            child: goal,
+            repository,
+            now_ms: now,
+        }
+    };
+    run.apply(event)?;
+    let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(run)?;
+    session.multi_task = Some(checkpoint.clone());
+    publish_multi_task_changed(session, &checkpoint);
+    Ok(())
+}
+
+fn goal_matches_task_contract(
+    goal: &crate::goal::GoalCheckpoint,
+    contract: &crate::task_queue::TaskGoalContract,
+) -> bool {
+    goal.run.objective == contract.objective
+        && goal.run.continuation == contract.continuation
+        && goal.run.criteria.len() == contract.criteria.len()
+        && goal
+            .run
+            .criteria
+            .iter()
+            .zip(&contract.criteria)
+            .all(|(actual, expected)| {
+                actual.text.trim() == expected.text.trim() && actual.verifier == expected.verifier
+            })
+}
+
+fn validate_goal_task_amendment(
+    session: &SessionState,
+    objective: &str,
+    criteria: &[crate::goal::GoalCriterionInput],
+    budget: Option<crate::goal::GoalBudget>,
+) -> Result<()> {
+    let Some(request) = session
+        .multi_task
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.run.active_task())
+        .and_then(|task| task.request.as_ref())
+    else {
+        return Ok(());
+    };
+    if request.kind != crate::task_queue::TaskKind::Goal {
+        bail!("active Task is not a Goal Task");
+    }
+    let accepted = request
+        .goal_contract
+        .as_ref()
+        .context("Goal Task request has no accepted contract")?;
+    if objective.trim() != accepted.objective {
+        bail!("Goal Task amendments cannot change the accepted Task objective");
+    }
+    if accepted.criteria.iter().any(|expected| {
+        !criteria.iter().any(|actual| {
+            actual.text.trim() == expected.text.trim() && actual.verifier == expected.verifier
+        })
+    }) {
+        bail!("Goal Task amendments cannot remove an accepted criterion");
+    }
+    if criteria.len() > request.budget.max_workflows {
+        bail!("Goal Task amendment exceeds its milestone allowance");
+    }
+    if let Some(budget) = budget
+        && (budget.max_milestones > request.budget.max_workflows
+            || budget.max_workflows > request.budget.max_workflows
+            || budget.total_model_invocations > request.budget.total_model_invocations
+            || budget.total_generated_tokens > request.budget.total_generated_tokens
+            || budget.wall_time_minutes > request.budget.wall_time_minutes)
+    {
+        bail!("Goal Task amendment exceeds its parent Task budget");
+    }
+    Ok(())
+}
+
+fn fold_terminal_goal_task(
+    session: &mut SessionState,
+    goal: &crate::goal::GoalCheckpoint,
+) -> Result<SessionStatus> {
+    let Some(checkpoint) = session.multi_task.clone() else {
+        return match goal.run.stage {
+            crate::goal::GoalStage::Completed | crate::goal::GoalStage::Cancelled => {
+                Ok(SessionStatus::Completed)
+            }
+            crate::goal::GoalStage::Failed => Ok(SessionStatus::Failed),
+            stage => bail!("non-terminal standalone Goal reached terminal folding at {stage:?}"),
+        };
+    };
+    let mut parent = checkpoint.run;
+    let task_id = parent
+        .active_task_id
+        .clone()
+        .context("terminal Goal Task parent has no active Task")?;
+    let repository = crate::task_queue::TaskRepositoryState::capture(std::path::Path::new(
+        &parent.authority.workdir,
+    ))?;
+    let mut now = now_millis().max(parent.updated_at_ms);
+    parent.apply(crate::task_queue::MultiTaskEvent::ChildCheckpointed {
+        task_id: task_id.clone(),
+        child: crate::task_queue::TaskChildCheckpoint::Goal(goal.clone()),
+        repository: repository.clone(),
+        now_ms: now,
+    })?;
+    match goal.run.stage {
+        crate::goal::GoalStage::Completed => {
+            let request = parent
+                .active_task()
+                .and_then(|task| task.request.as_ref())
+                .context("terminal Goal Task lost its request")?;
+            let result = crate::task_queue::goal_task_result(request, goal, repository.clone())?;
+            now = now_millis().max(parent.updated_at_ms);
+            parent.apply(crate::task_queue::MultiTaskEvent::TaskDelivered {
+                task_id,
+                result,
+                repository: repository.clone(),
+                now_ms: now,
+            })?;
+            now = now_millis().max(parent.updated_at_ms);
+            parent.apply(crate::task_queue::MultiTaskEvent::EvaluationCompleted {
+                repository,
+                now_ms: now,
+            })?;
+            let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(parent)?;
+            match checkpoint.run.stage {
+                crate::task_queue::MultiTaskStage::Ready => {
+                    archive_multi_task(session, checkpoint);
+                    Ok(SessionStatus::Completed)
+                }
+                crate::task_queue::MultiTaskStage::RunningTask => {
+                    dispatch_multi_task_active(session, &checkpoint)
+                }
+                stage => bail!("terminal Goal Task evaluation reached unexpected stage {stage:?}"),
+            }
+        }
+        crate::goal::GoalStage::Cancelled => {
+            now = now_millis().max(parent.updated_at_ms);
+            parent.apply(crate::task_queue::MultiTaskEvent::Cancelled {
+                reason: "Goal Task was cancelled; completed Task commits were preserved"
+                    .to_string(),
+                now_ms: now,
+            })?;
+            archive_multi_task(
+                session,
+                crate::task_queue::MultiTaskCheckpoint::new(parent)?,
+            );
+            Ok(SessionStatus::Completed)
+        }
+        crate::goal::GoalStage::Failed => {
+            let (_, reason) = crate::task_queue::goal_task_stop(goal)?
+                .context("failed Goal Task has no stop disposition")?;
+            now = now_millis().max(parent.updated_at_ms);
+            parent.apply(crate::task_queue::MultiTaskEvent::TaskStopped {
+                task_id,
+                disposition: crate::task_queue::TaskStopDisposition::Failed,
+                reason,
+                now_ms: now,
+            })?;
+            archive_multi_task(
+                session,
+                crate::task_queue::MultiTaskCheckpoint::new(parent)?,
+            );
+            Ok(SessionStatus::Failed)
+        }
+        stage => bail!("Goal Task checkpoint is not terminal: {stage:?}"),
+    }
 }
 
 fn find_active_goal_session_mut<'a>(
@@ -1520,7 +1771,14 @@ fn configure_goal_milestone_request(
     request.workflow_policy = Some(if let Some(checkpoint) = milestone.workflow.as_ref() {
         checkpoint.run.policy.clone()
     } else {
-        let base = workflow_policy_for_request(session.workdir.as_deref())?;
+        let base = session
+            .multi_task
+            .as_ref()
+            .map(|checkpoint| checkpoint.run.authority.workflow_policy.clone())
+            .map_or_else(
+                || workflow_policy_for_request(session.workdir.as_deref()),
+                Ok,
+            )?;
         let mut limits = base.limits;
         limits.total_model_invocations = limits.total_model_invocations.min(
             run.budget
@@ -1534,6 +1792,48 @@ fn configure_goal_milestone_request(
                 .saturating_sub(run.counters.generated_tokens)
                 .max(1),
         );
+        if let Some(task) = session
+            .multi_task
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.run.active_task())
+        {
+            limits.stage_steps = limits.stage_steps.min(task.spec.budget.stage_steps);
+            limits.total_model_invocations = limits.total_model_invocations.min(
+                task.spec
+                    .budget
+                    .total_model_invocations
+                    .saturating_sub(task.counters.model_invocations)
+                    .max(1),
+            );
+            limits.total_generated_tokens = limits.total_generated_tokens.min(
+                task.spec
+                    .budget
+                    .total_generated_tokens
+                    .saturating_sub(task.counters.generated_tokens)
+                    .max(1),
+            );
+            limits.advisory_calls = limits.advisory_calls.min(
+                task.spec
+                    .budget
+                    .advisory_calls
+                    .saturating_sub(task.counters.advisory_calls)
+                    .max(1),
+            );
+            limits.plan_cycles = limits.plan_cycles.min(
+                task.spec
+                    .budget
+                    .plan_cycles
+                    .saturating_sub(task.counters.plan_cycles)
+                    .max(1),
+            );
+            limits.repair_cycles = limits.repair_cycles.min(
+                task.spec
+                    .budget
+                    .repair_cycles
+                    .saturating_sub(task.counters.repair_cycles)
+                    .max(1),
+            );
+        }
         crate::workflow::WorkflowConfigDocument {
             version: base.version,
             delivery: base.delivery,
@@ -1545,6 +1845,12 @@ fn configure_goal_milestone_request(
     request.workflow_stage = None;
     request.workflow_checkpoint = milestone.workflow.clone();
     request.goal_context = Some(run.model_brief());
+    if let Some(parent) = session.multi_task.as_ref() {
+        request.max_steps = request
+            .max_steps
+            .min(parent.run.authority.request_max_steps)
+            .max(1);
+    }
     request.turn_id = milestone
         .workflow
         .as_ref()
@@ -1771,6 +2077,15 @@ async fn continue_session(
     session.status = SessionStatus::Queued;
     session.pending_question = None;
     session.workflow = None;
+    if let Some(multi_task) = session.multi_task.take() {
+        if session
+            .completed_multi_tasks
+            .last()
+            .is_none_or(|existing| existing.run.id != multi_task.run.id)
+        {
+            session.completed_multi_tasks.push(multi_task);
+        }
+    }
     session.cancel_token.store(false, Ordering::SeqCst);
     session.updated_at_ms = now_millis();
 
@@ -1781,6 +2096,8 @@ async fn continue_session(
     let completed_workflows = session.completed_workflows.clone();
     let goal = session.goal.clone();
     let completed_goals = session.completed_goals.clone();
+    let multi_task = session.multi_task.clone();
+    let completed_multi_tasks = session.completed_multi_tasks.clone();
     drop(sessions);
     persist_session_snapshot(
         &id,
@@ -1794,6 +2111,8 @@ async fn continue_session(
         completed_workflows,
         goal,
         completed_goals,
+        multi_task,
+        completed_multi_tasks,
     );
     dispatch_next_session(state.clone());
 
@@ -1837,19 +2156,91 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
         .workflow
         .as_ref()
         .is_some_and(|checkpoint| checkpoint.run.stage == crate::workflow::WorkflowStage::Blocked);
+    let resumable_multi_task = session.multi_task.as_ref().is_some_and(|checkpoint| {
+        matches!(
+            checkpoint.run.stage,
+            crate::task_queue::MultiTaskStage::Paused | crate::task_queue::MultiTaskStage::Blocked
+        )
+    });
     if (!matches!(session.status, SessionStatus::Paused)
-        && !(session.status == SessionStatus::Failed && blocked_workflow))
+        && !(session.status == SessionStatus::Failed && (blocked_workflow || resumable_multi_task)))
         || session.pending_question.is_some()
     {
         anyhow::bail!(ResumeSessionError::Conflict);
+    }
+    let mut request = session.request_template.clone();
+    if let Some(checkpoint) = session.multi_task.clone() {
+        let mut run = checkpoint.run;
+        let repository = crate::task_queue::TaskRepositoryState::capture(std::path::Path::new(
+            &run.authority.workdir,
+        ))?;
+        let now = now_millis().max(run.updated_at_ms);
+        run.apply(crate::task_queue::MultiTaskEvent::ResumeRequested {
+            repository: repository.clone(),
+            now_ms: now,
+        })?;
+        let is_goal_task = run
+            .active_task()
+            .is_some_and(|task| task.spec.kind == crate::task_queue::TaskKind::Goal);
+        if is_goal_task {
+            let mut goal = session
+                .goal
+                .clone()
+                .context("resumable Goal Task lost its Goal checkpoint")?
+                .run;
+            goal.resume(now)?;
+            let goal = crate::goal::GoalCheckpoint::new(goal)?;
+            let task_id = run
+                .active_task_id
+                .clone()
+                .context("resumable Goal Task has no active Task")?;
+            run.apply(crate::task_queue::MultiTaskEvent::ChildCheckpointed {
+                task_id,
+                child: crate::task_queue::TaskChildCheckpoint::Goal(goal.clone()),
+                repository,
+                now_ms: now_millis().max(run.updated_at_ms),
+            })?;
+            let parent = crate::task_queue::MultiTaskCheckpoint::new(run)?;
+            let previous_goal = session.goal.clone();
+            let previous_parent = session.multi_task.clone();
+            let previous_request = session.request_template.clone();
+            let previous_task = session.task.clone();
+            let previous_workflow = session.workflow.clone();
+            session.goal = Some(goal.clone());
+            session.multi_task = Some(parent);
+            if let Err(error) = configure_goal_milestone_request(session, &goal.run) {
+                session.goal = previous_goal;
+                session.multi_task = previous_parent;
+                session.request_template = previous_request;
+                session.task = previous_task;
+                session.workflow = previous_workflow;
+                return Err(error);
+            }
+            publish_event(
+                &session.sender,
+                &session.history,
+                AgentEvent::GoalResumed {
+                    goal_id: goal.run.id.clone(),
+                    timestamp_ms: Some(now_millis()),
+                },
+            );
+            publish_current_goal_milestone(session, &goal.run);
+        } else {
+            let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(run)?;
+            let status = dispatch_multi_task_active(session, &checkpoint)?;
+            if status != SessionStatus::Queued {
+                anyhow::bail!(ResumeSessionError::Conflict);
+            }
+        }
+        request = session.request_template.clone();
+    } else {
+        request.workflow_checkpoint = session.workflow.clone();
     }
     session.running = false;
     session.paused = false;
     session.status = SessionStatus::Queued;
     session.updated_at_ms = now_millis();
     session.cancel_token.store(false, Ordering::SeqCst);
-    let mut request = session.request_template.clone();
-    request.workflow_checkpoint = session.workflow.clone();
     session.request_template = request.clone();
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
@@ -1859,6 +2250,8 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
     let completed_workflows = session.completed_workflows.clone();
     let goal = session.goal.clone();
     let completed_goals = session.completed_goals.clone();
+    let multi_task = session.multi_task.clone();
+    let completed_multi_tasks = session.completed_multi_tasks.clone();
     drop(sessions);
     persist_session_snapshot(
         &id,
@@ -1872,8 +2265,93 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
         completed_workflows,
         goal,
         completed_goals,
+        multi_task,
+        completed_multi_tasks,
     );
     dispatch_next_session(state.clone());
+    Ok(SessionResponse { session_id: id })
+}
+
+async fn retry_task_planning(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<SessionResponse>, StatusCode> {
+    recover_task_plan(state, id, crate::agent_core::TaskPlanningPreference::Auto)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::CONFLICT)
+}
+
+async fn run_as_one_build(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<SessionResponse>, StatusCode> {
+    recover_task_plan(
+        state,
+        id,
+        crate::agent_core::TaskPlanningPreference::OneBuild,
+    )
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::CONFLICT)
+}
+
+async fn recover_task_plan(
+    state: AppState,
+    id: String,
+    preference: crate::agent_core::TaskPlanningPreference,
+) -> Result<SessionResponse> {
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions
+        .get_mut(&id)
+        .with_context(|| format!("session not found: {id}"))?;
+    if session.status != SessionStatus::Failed
+        || session.request_template.task_plan_rejected.is_none()
+        || session.running
+        || session.multi_task.is_some()
+        || session.goal.is_some()
+    {
+        bail!("session has no recoverable Task-planning failure");
+    }
+    let action = match preference {
+        crate::agent_core::TaskPlanningPreference::Auto => "Retrying Task planning",
+        crate::agent_core::TaskPlanningPreference::OneBuild => "Running as one Build",
+    };
+    session.request_template.task_planning = preference;
+    session.request_template.task_plan_rejected = None;
+    session.request_template.turn_id = new_turn_id(&id);
+    session.request_template.workflow_stage = None;
+    session.request_template.workflow_checkpoint = None;
+    session.request_template.repository_context = None;
+    session.request_template.intent = Some(crate::workflow::TurnIntent::Deliver);
+    session.request_template.conversation_handoff = delivery_handoff_for_turn(
+        session.request_template.intent,
+        &session.request_template.turn_id,
+        &session.request_template.task,
+        None,
+    );
+    session.running = false;
+    session.paused = false;
+    session.status = SessionStatus::Queued;
+    session.cancel_token.store(false, Ordering::SeqCst);
+    session.updated_at_ms = now_millis();
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::Correction {
+            message: format!(
+                "{action}. Repository state and existing commits remain unchanged until the selected workflow delivers."
+            ),
+            summary: action.to_string(),
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(crate::agent_core::AgentProfile::Plan),
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+    persist_live_session(&id, session);
+    drop(sessions);
+    dispatch_next_session(state);
     Ok(SessionResponse { session_id: id })
 }
 
@@ -1892,8 +2370,12 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
     let session = sessions
         .get_mut(&id)
         .with_context(|| format!("session not found: {id}"))?;
+    let blocked_multi_task = session.multi_task.as_ref().is_some_and(|checkpoint| {
+        checkpoint.run.stage == crate::task_queue::MultiTaskStage::Blocked
+    });
     if matches!(session.status, SessionStatus::Completed)
         || (session.status == SessionStatus::Failed
+            && !blocked_multi_task
             && session.workflow.as_ref().is_none_or(|checkpoint| {
                 checkpoint.run.stage != crate::workflow::WorkflowStage::Blocked
             }))
@@ -1918,6 +2400,17 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
 
     let terminate_environment = !session.running;
     if terminate_environment {
+        if let Some(checkpoint) = session.multi_task.take() {
+            let mut run = checkpoint.run;
+            if !run.stage.is_terminal() {
+                let now = now_millis().max(run.updated_at_ms);
+                run.apply(crate::task_queue::MultiTaskEvent::Cancelled {
+                    reason: "cancelled by user; completed Task commits were preserved".to_string(),
+                    now_ms: now,
+                })?;
+            }
+            archive_multi_task(session, crate::task_queue::MultiTaskCheckpoint::new(run)?);
+        }
         if let Some(checkpoint) = session.workflow.take() {
             let mut run = checkpoint.run;
             if run.stage == crate::workflow::WorkflowStage::Blocked {
@@ -1965,6 +2458,8 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
     let completed_workflows = session.completed_workflows.clone();
     let goal = session.goal.clone();
     let completed_goals = session.completed_goals.clone();
+    let multi_task = session.multi_task.clone();
+    let completed_multi_tasks = session.completed_multi_tasks.clone();
     let status = session.status;
     drop(sessions);
     persist_session_snapshot(
@@ -1979,6 +2474,8 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         completed_workflows,
         goal,
         completed_goals,
+        multi_task,
+        completed_multi_tasks,
     );
     if terminate_environment {
         crate::session_environment::terminate_global_session(&id)?;
@@ -2055,6 +2552,8 @@ async fn answer_question_inner(
         let completed_workflows = session.completed_workflows.clone();
         let goal = session.goal.clone();
         let completed_goals = session.completed_goals.clone();
+        let multi_task = session.multi_task.clone();
+        let completed_multi_tasks = session.completed_multi_tasks.clone();
         let question_id = req.question_id.clone();
         pending
             .responder
@@ -2085,6 +2584,8 @@ async fn answer_question_inner(
             completed_workflows,
             goal,
             completed_goals,
+            multi_task,
+            completed_multi_tasks,
         );
     }
     state.update_sleep_prevention_working(true);
@@ -2151,6 +2652,41 @@ fn latest_goal_checkpoint(session: &SessionState) -> Option<&crate::goal::GoalCh
         .or_else(|| session.completed_goals.last())
 }
 
+fn latest_multi_task_checkpoint(
+    session: &SessionState,
+) -> Option<&crate::task_queue::MultiTaskCheckpoint> {
+    session
+        .multi_task
+        .as_ref()
+        .or_else(|| session.completed_multi_tasks.last())
+}
+
+fn multi_task_summary(checkpoint: &crate::task_queue::MultiTaskCheckpoint) -> MultiTaskSummary {
+    MultiTaskSummary {
+        id: checkpoint.run.id.clone(),
+        stage: checkpoint.run.stage,
+        outcome: checkpoint.run.outcome,
+        completed_tasks: checkpoint
+            .run
+            .tasks
+            .iter()
+            .filter(|task| task.state.is_success())
+            .count(),
+        total_tasks: checkpoint.run.plan.artifact.tasks.len(),
+        active_task_title: checkpoint
+            .run
+            .active_task()
+            .map(|task| task.spec.title.clone()),
+    }
+}
+
+fn task_deadline_ms(checkpoint: &crate::task_queue::MultiTaskCheckpoint) -> Option<u64> {
+    let task = checkpoint.run.active_task()?;
+    let allowance = task.spec.budget.wall_time_minutes.saturating_mul(60_000);
+    let remaining = allowance.saturating_sub(task.counters.elapsed_ms);
+    Some(now_millis().saturating_add(remaining))
+}
+
 async fn list_sessions(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<Vec<SessionListItem>> {
@@ -2183,6 +2719,8 @@ async fn list_sessions(
                 strict_workflow: strict_workflow_enabled(session),
                 goal: goal.map(|checkpoint| crate::goal::GoalSummary::from(&checkpoint.run)),
                 active_goal: session.goal.is_some(),
+                multi_task: latest_multi_task_checkpoint(session).map(multi_task_summary),
+                active_multi_task: session.multi_task.is_some(),
             }
         })
         .collect::<Vec<_>>();
@@ -2229,6 +2767,9 @@ async fn get_session(
         strict_workflow: strict_workflow_enabled(session),
         goal,
         active_goal: session.goal.is_some(),
+        multi_task: latest_multi_task_checkpoint(session).cloned(),
+        active_multi_task: session.multi_task.is_some(),
+        task_plan_rejected: session.request_template.task_plan_rejected.clone(),
     }))
 }
 
@@ -2406,8 +2947,11 @@ struct WebEventSink {
     workflow: Option<crate::workflow::WorkflowCheckpoint>,
     completed_workflows: Vec<crate::workflow::WorkflowSummary>,
     goal_deadline_ms: Option<u64>,
+    task_deadline_ms: Option<u64>,
     goal: Option<crate::goal::GoalCheckpoint>,
     completed_goals: Vec<crate::goal::GoalCheckpoint>,
+    multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
+    completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
     pause_token: Arc<AtomicBool>,
     cancel_token: Arc<AtomicBool>,
 }
@@ -2480,6 +3024,14 @@ impl EventSink for WebEventSink {
                     .and_then(|session| session.goal.clone())
             });
         }
+        if self.multi_task.is_some() {
+            self.multi_task = tokio::runtime::Handle::current().block_on(async {
+                let sessions = self.state.sessions.lock().await;
+                sessions
+                    .get(&self.session_id)
+                    .and_then(|session| session.multi_task.clone())
+            });
+        }
         persist_session_snapshot(
             &self.session_id,
             &self.request_template,
@@ -2492,6 +3044,8 @@ impl EventSink for WebEventSink {
             self.completed_workflows.clone(),
             self.goal.clone(),
             self.completed_goals.clone(),
+            self.multi_task.clone(),
+            self.completed_multi_tasks.clone(),
         );
     }
 
@@ -2500,6 +3054,137 @@ impl EventSink for WebEventSink {
         checkpoint: &crate::workflow::WorkflowCheckpoint,
     ) -> Result<()> {
         checkpoint.validate()?;
+        if self.multi_task.is_some() && self.goal.is_some() {
+            let (latest_parent, latest_goal) = tokio::runtime::Handle::current().block_on(async {
+                let sessions = self.state.sessions.lock().await;
+                let session = sessions.get(&self.session_id);
+                (
+                    session.and_then(|session| session.multi_task.clone()),
+                    session.and_then(|session| session.goal.clone()),
+                )
+            });
+            let mut goal = latest_goal
+                .or_else(|| self.goal.take())
+                .context("Goal Task workflow lost its Goal checkpoint")?
+                .run;
+            goal.checkpoint_active_workflow(checkpoint.clone(), now_millis())?;
+            let goal = crate::goal::GoalCheckpoint::new(goal)?;
+            let mut parent = latest_parent
+                .or_else(|| self.multi_task.take())
+                .context("Goal Task workflow lost its parent checkpoint")?
+                .run;
+            let task_id = parent
+                .active_task_id
+                .clone()
+                .context("Goal Task parent has no active Task")?;
+            let repository = crate::task_queue::TaskRepositoryState::capture(
+                &checkpoint.run.repository.repo_root,
+            )?;
+            parent.apply(crate::task_queue::MultiTaskEvent::ChildCheckpointed {
+                task_id,
+                child: crate::task_queue::TaskChildCheckpoint::Goal(goal.clone()),
+                repository,
+                now_ms: now_millis().max(parent.updated_at_ms),
+            })?;
+            let parent = crate::task_queue::MultiTaskCheckpoint::new(parent)?;
+            self.goal = Some(goal.clone());
+            self.multi_task = Some(parent.clone());
+            self.workflow = None;
+            tokio::runtime::Handle::current().block_on(async {
+                let mut sessions = self.state.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&self.session_id)
+                    .with_context(|| format!("session not found: {}", self.session_id))?;
+                session.goal = Some(goal);
+                session.multi_task = Some(parent);
+                session.workflow = None;
+                session.request_template.workflow_checkpoint = None;
+                session.updated_at_ms = now_millis();
+                Ok::<(), anyhow::Error>(())
+            })?;
+            persist_session_snapshot(
+                &self.session_id,
+                &self.request_template,
+                self.persisted_branch.clone(),
+                self.persisted_workdir.clone(),
+                SessionStatus::Running,
+                &self.history,
+                &self.usage_records,
+                None,
+                self.completed_workflows.clone(),
+                self.goal.clone(),
+                self.completed_goals.clone(),
+                self.multi_task.clone(),
+                self.completed_multi_tasks.clone(),
+            );
+            return Ok(());
+        }
+        if let Some(parent) = self.multi_task.take() {
+            let latest = tokio::runtime::Handle::current().block_on(async {
+                let sessions = self.state.sessions.lock().await;
+                sessions
+                    .get(&self.session_id)
+                    .and_then(|session| session.multi_task.clone())
+            });
+            let mut run = latest.unwrap_or(parent).run;
+            let task_id = run
+                .active_task_id
+                .clone()
+                .context("multi-Task workflow checkpoint has no active Task")?;
+            let repository = crate::task_queue::TaskRepositoryState::capture(
+                &checkpoint.run.repository.repo_root,
+            )?;
+            let child = crate::task_queue::TaskChildCheckpoint::Build(checkpoint.clone());
+            let event = if run
+                .active_task()
+                .is_some_and(|task| task.workflow.is_none())
+            {
+                crate::task_queue::MultiTaskEvent::ChildStarted {
+                    task_id,
+                    child,
+                    repository,
+                    now_ms: now_millis(),
+                }
+            } else {
+                crate::task_queue::MultiTaskEvent::ChildCheckpointed {
+                    task_id,
+                    child,
+                    repository,
+                    now_ms: now_millis(),
+                }
+            };
+            run.apply(event)?;
+            let parent = crate::task_queue::MultiTaskCheckpoint::new(run)?;
+            self.multi_task = Some(parent.clone());
+            self.workflow = None;
+            tokio::runtime::Handle::current().block_on(async {
+                let mut sessions = self.state.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&self.session_id)
+                    .with_context(|| format!("session not found: {}", self.session_id))?;
+                session.multi_task = Some(parent);
+                session.workflow = None;
+                session.request_template.workflow_checkpoint = None;
+                session.updated_at_ms = now_millis();
+                Ok::<(), anyhow::Error>(())
+            })?;
+            persist_session_snapshot(
+                &self.session_id,
+                &self.request_template,
+                self.persisted_branch.clone(),
+                self.persisted_workdir.clone(),
+                SessionStatus::Running,
+                &self.history,
+                &self.usage_records,
+                None,
+                self.completed_workflows.clone(),
+                self.goal.clone(),
+                self.completed_goals.clone(),
+                self.multi_task.clone(),
+                self.completed_multi_tasks.clone(),
+            );
+            return Ok(());
+        }
         if let Some(goal) = self.goal.take() {
             let latest = tokio::runtime::Handle::current().block_on(async {
                 let sessions = self.state.sessions.lock().await;
@@ -2557,6 +3242,44 @@ impl EventSink for WebEventSink {
             self.completed_workflows.clone(),
             self.goal.clone(),
             self.completed_goals.clone(),
+            self.multi_task.clone(),
+            self.completed_multi_tasks.clone(),
+        );
+        Ok(())
+    }
+
+    fn checkpoint_multi_task(
+        &mut self,
+        checkpoint: &crate::task_queue::MultiTaskCheckpoint,
+    ) -> Result<()> {
+        checkpoint.validate()?;
+        self.multi_task = Some(checkpoint.clone());
+        self.workflow = None;
+        tokio::runtime::Handle::current().block_on(async {
+            let mut sessions = self.state.sessions.lock().await;
+            let session = sessions
+                .get_mut(&self.session_id)
+                .with_context(|| format!("session not found: {}", self.session_id))?;
+            session.multi_task = Some(checkpoint.clone());
+            session.workflow = None;
+            session.request_template.workflow_checkpoint = None;
+            session.updated_at_ms = now_millis();
+            Ok::<(), anyhow::Error>(())
+        })?;
+        persist_session_snapshot(
+            &self.session_id,
+            &self.request_template,
+            self.persisted_branch.clone(),
+            self.persisted_workdir.clone(),
+            SessionStatus::Running,
+            &self.history,
+            &self.usage_records,
+            None,
+            self.completed_workflows.clone(),
+            self.goal.clone(),
+            self.completed_goals.clone(),
+            self.multi_task.clone(),
+            self.completed_multi_tasks.clone(),
         );
         Ok(())
     }
@@ -2569,6 +3292,9 @@ impl EventSink for WebEventSink {
         self.pause_token.load(Ordering::SeqCst)
             || self
                 .goal_deadline_ms
+                .is_some_and(|deadline| now_millis() >= deadline)
+            || self
+                .task_deadline_ms
                 .is_some_and(|deadline| now_millis() >= deadline)
     }
 
@@ -2697,6 +3423,8 @@ impl EventSink for WebEventSink {
                     session.completed_workflows.clone(),
                     session.goal.clone(),
                     session.completed_goals.clone(),
+                    session.multi_task.clone(),
+                    session.completed_multi_tasks.clone(),
                 );
             }
             self.state.update_sleep_prevention_working(false);
@@ -2751,6 +3479,8 @@ fn dispatch_next_session(state: AppState) {
                         session.completed_workflows.clone(),
                         session.goal.clone(),
                         session.completed_goals.clone(),
+                        session.multi_task.clone(),
+                        session.completed_multi_tasks.clone(),
                     )),
                     true,
                 )
@@ -2775,6 +3505,8 @@ fn dispatch_next_session(state: AppState) {
             completed_workflows,
             goal,
             completed_goals,
+            multi_task,
+            completed_multi_tasks,
         ) = next;
         persist_session_snapshot(
             &session_id,
@@ -2788,6 +3520,8 @@ fn dispatch_next_session(state: AppState) {
             completed_workflows,
             goal,
             completed_goals,
+            multi_task,
+            completed_multi_tasks,
         );
         spawn_agent_run(state, session_id, request);
     });
@@ -2804,6 +3538,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             completed_workflows,
             goal,
             completed_goals,
+            multi_task,
+            completed_multi_tasks,
             pause_token,
             cancel_token,
         ) = {
@@ -2823,6 +3559,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 session.completed_workflows.clone(),
                 session.goal.clone(),
                 session.completed_goals.clone(),
+                session.multi_task.clone(),
+                session.completed_multi_tasks.clone(),
                 Arc::clone(&session.pause_token),
                 Arc::clone(&session.cancel_token),
             )
@@ -2852,8 +3590,11 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                             .saturating_mul(60_000),
                     )
                 }),
+                task_deadline_ms: multi_task.as_ref().and_then(task_deadline_ms),
                 goal,
                 completed_goals,
+                multi_task,
+                completed_multi_tasks,
                 pause_token,
                 cancel_token,
             };
@@ -2879,12 +3620,34 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             let mut final_status = SessionStatus::Completed;
             match result {
                 Ok(Ok(run_result)) => {
+                    session.request_template.task_plan_rejected =
+                        run_result.task_plan_rejected.clone();
                     session.request_template.repository_context =
                         run_result.repository_context.clone();
                     session.request_template.workspace_graph = run_result.workspace_graph.clone();
                     session.branch = Some(run_result.branch.clone());
                     session.workdir = Some(run_result.focus_root.clone());
-                    if session.goal.is_some() {
+                    if session.multi_task.is_some() {
+                        match apply_multi_task_run_result(session, &run_result) {
+                            Ok((status, terminate)) => {
+                                final_status = status;
+                                terminate_environment = terminate;
+                            }
+                            Err(error) => {
+                                final_status = SessionStatus::Failed;
+                                publish_event(
+                                    &session.sender,
+                                    &session.history,
+                                    AgentEvent::Error {
+                                        summary: "Task controller failed".to_string(),
+                                        message: format!("{error:#}"),
+                                        nesting_depth: None,
+                                        timestamp_ms: Some(now_millis()),
+                                    },
+                                );
+                            }
+                        }
+                    } else if session.goal.is_some() {
                         match apply_goal_run_result(session, &run_result) {
                             Ok((status, terminate)) => {
                                 final_status = status;
@@ -2925,6 +3688,26 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                             session.workflow = None;
                             session.request_template.workflow_checkpoint = None;
                         }
+                    } else if let Some(task_goal) = run_result.task_goal {
+                        match activate_single_task_goal(session, &session_id, task_goal) {
+                            Ok(()) => {
+                                final_status = SessionStatus::Paused;
+                                session.paused = true;
+                            }
+                            Err(error) => {
+                                final_status = SessionStatus::Failed;
+                                publish_event(
+                                    &session.sender,
+                                    &session.history,
+                                    AgentEvent::Error {
+                                        summary: "Goal Task activation failed".to_string(),
+                                        message: format!("{error:#}"),
+                                        nesting_depth: None,
+                                        timestamp_ms: Some(now_millis()),
+                                    },
+                                );
+                            }
+                        }
                     } else if let Some(proposal) = run_result.requested_goal {
                         match activate_requested_goal(
                             session,
@@ -2960,12 +3743,14 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         final_status = SessionStatus::Queued;
                     }
                     if session.goal.is_none()
+                        && session.multi_task.is_none()
                         && run_result.termination_reason
                             == crate::events::TerminationReason::Cancelled
                     {
                         final_status = SessionStatus::Completed;
                         terminate_environment = true;
                     } else if session.goal.is_none()
+                        && session.multi_task.is_none()
                         && (!run_result.reached_final
                             || run_result.termination_reason
                                 != crate::events::TerminationReason::Final)
@@ -3020,6 +3805,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 session.completed_workflows.clone(),
                 session.goal.clone(),
                 session.completed_goals.clone(),
+                session.multi_task.clone(),
+                session.completed_multi_tasks.clone(),
             );
         }
         drop(sessions);
@@ -3030,6 +3817,508 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
         }
         dispatch_next_session(state.clone());
     });
+}
+
+fn activate_single_task_goal(
+    session: &mut SessionState,
+    session_id: &str,
+    projection: crate::task_queue::GoalTaskProjection,
+) -> Result<()> {
+    let workdir = session
+        .workdir
+        .clone()
+        .context("Goal Task activation requires a repository-backed session")?;
+    let root = crate::agent_core::find_git_root(&workdir).unwrap_or(workdir);
+    let now = now_millis();
+    let run = crate::goal::GoalRun::start(
+        projection.goal_id,
+        session_id.to_string(),
+        projection.objective,
+        projection.criteria,
+        projection.continuation,
+        Some(projection.budget),
+        projection.policy,
+        root.to_string_lossy(),
+        now,
+    )?;
+    let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
+    session.goal = Some(checkpoint.clone());
+    session.workflow = None;
+    session.request_template.workflow_checkpoint = None;
+    session.pause_token.store(false, Ordering::SeqCst);
+    publish_goal_started(session, &checkpoint);
+    Ok(())
+}
+
+fn configure_multi_task_build_request(
+    session: &mut SessionState,
+    checkpoint: &crate::task_queue::MultiTaskCheckpoint,
+) -> Result<()> {
+    checkpoint.validate()?;
+    let task = checkpoint
+        .run
+        .active_task()
+        .context("multi-Task run has no active Task to dispatch")?;
+    let request = task
+        .request
+        .as_ref()
+        .context("active Task has no controller request")?;
+    if request.kind != crate::task_queue::TaskKind::Build {
+        bail!("active Task requires Goal dispatch");
+    }
+    let projection =
+        crate::task_queue::project_build_task(request, &checkpoint.run.authority.workflow_policy)?;
+    let mut next = session.request_template.clone();
+    next.task = projection.task;
+    next.turn_id = projection.turn_id;
+    next.intent = Some(crate::workflow::TurnIntent::Deliver);
+    next.workflow_policy = Some(projection.workflow_policy);
+    next.workflow_stage = None;
+    next.workflow_checkpoint = task.workflow.clone();
+    next.conversation_handoff = Some(projection.handoff);
+    next.max_steps = checkpoint
+        .run
+        .authority
+        .request_max_steps
+        .min(projection.max_steps)
+        .max(1);
+    next.profile = crate::agent_core::AgentProfile::Build;
+    next.infer_profile = false;
+    next.repository_context = None;
+    next.prior_check_evidence = crate::checks::CheckEvidenceLedger::default();
+    next.goal_context = None;
+    next.branch = session.branch.clone();
+    next.workdir = session.workdir.clone();
+    session.request_template = next;
+    session.workflow = None;
+    Ok(())
+}
+
+fn activate_multi_task_goal(
+    session: &mut SessionState,
+    checkpoint: &crate::task_queue::MultiTaskCheckpoint,
+) -> Result<crate::task_queue::MultiTaskCheckpoint> {
+    checkpoint.validate()?;
+    let mut parent = checkpoint.run.clone();
+    let task = parent
+        .active_task()
+        .context("multi-Task run has no active Goal Task")?;
+    let request = task
+        .request
+        .as_ref()
+        .context("active Goal Task has no controller request")?;
+    let projection = crate::task_queue::project_goal_task(request, &parent.authority.goal_policy)?;
+    let now = now_millis().max(parent.updated_at_ms);
+    let goal = crate::goal::GoalRun::start(
+        projection.goal_id,
+        parent.session_id.clone(),
+        projection.objective,
+        projection.criteria,
+        projection.continuation,
+        Some(projection.budget),
+        projection.policy,
+        parent.authority.workdir.clone(),
+        now,
+    )?;
+    let goal = crate::goal::GoalCheckpoint::new(goal)?;
+    let repository = crate::task_queue::TaskRepositoryState::capture(std::path::Path::new(
+        &parent.authority.workdir,
+    ))?;
+    parent.apply(crate::task_queue::MultiTaskEvent::ChildStarted {
+        task_id: request.task_id.clone(),
+        child: crate::task_queue::TaskChildCheckpoint::Goal(goal.clone()),
+        repository,
+        now_ms: now,
+    })?;
+    let parent = crate::task_queue::MultiTaskCheckpoint::new(parent)?;
+    session.goal = Some(goal.clone());
+    session.workflow = None;
+    session.request_template.workflow_checkpoint = None;
+    session.pause_token.store(false, Ordering::SeqCst);
+    publish_goal_started(session, &goal);
+    Ok(parent)
+}
+
+fn dispatch_multi_task_active(
+    session: &mut SessionState,
+    checkpoint: &crate::task_queue::MultiTaskCheckpoint,
+) -> Result<SessionStatus> {
+    let kind = checkpoint
+        .run
+        .active_task()
+        .and_then(|task| task.request.as_ref())
+        .map(|request| request.kind)
+        .context("multi-Task run has no active request")?;
+    match kind {
+        crate::task_queue::TaskKind::Build => {
+            configure_multi_task_build_request(session, checkpoint)?;
+            session.multi_task = Some(checkpoint.clone());
+            publish_multi_task_changed(session, checkpoint);
+            Ok(SessionStatus::Queued)
+        }
+        crate::task_queue::TaskKind::Goal => {
+            let checkpoint = activate_multi_task_goal(session, checkpoint)?;
+            session.multi_task = Some(checkpoint.clone());
+            publish_multi_task_changed(session, &checkpoint);
+            session.paused = true;
+            Ok(SessionStatus::Paused)
+        }
+    }
+}
+
+fn archive_multi_task(
+    session: &mut SessionState,
+    checkpoint: crate::task_queue::MultiTaskCheckpoint,
+) {
+    publish_multi_task_changed(session, &checkpoint);
+    if session
+        .completed_multi_tasks
+        .last()
+        .is_none_or(|existing| existing.run.id != checkpoint.run.id)
+    {
+        session.completed_multi_tasks.push(checkpoint);
+    }
+    session.multi_task = None;
+    session.workflow = None;
+    session.request_template.workflow_checkpoint = None;
+}
+
+fn publish_multi_task_changed(
+    session: &SessionState,
+    checkpoint: &crate::task_queue::MultiTaskCheckpoint,
+) {
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::TasksChanged {
+            multi_task_id: checkpoint.run.id.clone(),
+            stage: checkpoint.run.stage,
+            outcome: checkpoint.run.outcome,
+            active_task_id: checkpoint.run.active_task_id.clone(),
+            checkpoint_sha256: checkpoint.sha256.clone(),
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+}
+
+fn apply_multi_task_run_result(
+    session: &mut SessionState,
+    run_result: &crate::agent_core::AgentRunResult,
+) -> Result<(SessionStatus, bool)> {
+    if session.goal.is_some() {
+        return apply_multi_task_goal_run_result(session, run_result);
+    }
+    let checkpoint = session
+        .multi_task
+        .clone()
+        .context("session lost its active multi-Task checkpoint")?;
+    checkpoint.validate()?;
+    let mut run = checkpoint.run;
+    let now = now_millis().max(run.updated_at_ms);
+
+    if run.stage.is_terminal() {
+        let status = if run.stage == crate::task_queue::MultiTaskStage::Ready
+            || run.stage == crate::task_queue::MultiTaskStage::Cancelled
+        {
+            SessionStatus::Completed
+        } else {
+            SessionStatus::Failed
+        };
+        archive_multi_task(session, crate::task_queue::MultiTaskCheckpoint::new(run)?);
+        return Ok((status, status == SessionStatus::Completed));
+    }
+
+    let active = run
+        .active_task()
+        .context("running multi-Task checkpoint has no active Task")?;
+    if active.workflow.is_none() && active.goal.is_none() && run_result.workflow.is_none() {
+        let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(run)?;
+        let status = dispatch_multi_task_active(session, &checkpoint)?;
+        return Ok((status, false));
+    }
+
+    let task_id = active.spec.id.clone();
+    if session.cancel_token.load(Ordering::SeqCst)
+        || run_result.termination_reason == crate::events::TerminationReason::Cancelled
+    {
+        run.apply(crate::task_queue::MultiTaskEvent::Cancelled {
+            reason: "cancelled by user; completed Task commits were preserved".to_string(),
+            now_ms: now,
+        })?;
+        archive_multi_task(session, crate::task_queue::MultiTaskCheckpoint::new(run)?);
+        return Ok((SessionStatus::Completed, true));
+    }
+
+    let child_wall_ms = session
+        .usage_records
+        .lock()
+        .ok()
+        .and_then(|records| records.last().map(|metrics| metrics.wall_runtime_ms))
+        .unwrap_or_default();
+    if child_wall_ms > 0 {
+        run.apply(crate::task_queue::MultiTaskEvent::DirectUsageRecorded {
+            task_id: task_id.clone(),
+            usage: crate::task_queue::TaskDirectUsage {
+                elapsed_ms: child_wall_ms,
+                ..crate::task_queue::TaskDirectUsage::default()
+            },
+            now_ms: now,
+        })?;
+    }
+    if run.stage.is_terminal() {
+        archive_multi_task(session, crate::task_queue::MultiTaskCheckpoint::new(run)?);
+        return Ok((SessionStatus::Failed, false));
+    }
+
+    let workflow = run_result
+        .workflow
+        .clone()
+        .or_else(|| run.active_task().and_then(|task| task.workflow.clone()))
+        .context("Build Task ended without a workflow checkpoint")?;
+    let summary = crate::workflow::WorkflowSummary::from(&workflow.run);
+    if session
+        .completed_workflows
+        .last()
+        .is_none_or(|existing| existing.id != summary.id)
+        && workflow.run.stage.is_terminal()
+    {
+        session.completed_workflows.push(summary);
+    }
+
+    if workflow.run.stage == crate::workflow::WorkflowStage::Ready {
+        let repository =
+            crate::task_queue::TaskRepositoryState::capture(&workflow.run.repository.repo_root)?;
+        let request = run
+            .active_task()
+            .and_then(|task| task.request.as_ref())
+            .context("delivered Build Task lost its request")?;
+        let result = crate::task_queue::build_task_result(request, &workflow, repository.clone())?;
+        run.apply(crate::task_queue::MultiTaskEvent::TaskDelivered {
+            task_id,
+            result,
+            repository: repository.clone(),
+            now_ms: now,
+        })?;
+        run.apply(crate::task_queue::MultiTaskEvent::EvaluationCompleted {
+            repository,
+            now_ms: now,
+        })?;
+        let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(run)?;
+        match checkpoint.run.stage {
+            crate::task_queue::MultiTaskStage::Ready => {
+                archive_multi_task(session, checkpoint);
+                Ok((SessionStatus::Completed, true))
+            }
+            crate::task_queue::MultiTaskStage::RunningTask => {
+                let status = dispatch_multi_task_active(session, &checkpoint)?;
+                Ok((status, false))
+            }
+            crate::task_queue::MultiTaskStage::Blocked => {
+                session.multi_task = Some(checkpoint.clone());
+                publish_multi_task_changed(session, &checkpoint);
+                Ok((SessionStatus::Failed, false))
+            }
+            stage => bail!("Task evaluation reached unexpected stage {stage:?}"),
+        }
+    } else if let Some((disposition, reason)) = crate::task_queue::build_task_stop(&workflow)? {
+        run.apply(crate::task_queue::MultiTaskEvent::TaskStopped {
+            task_id,
+            disposition,
+            reason,
+            now_ms: now,
+        })?;
+        let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(run)?;
+        session.multi_task = Some(checkpoint.clone());
+        publish_multi_task_changed(session, &checkpoint);
+        session.workflow = None;
+        session.request_template.workflow_checkpoint = None;
+        Ok((SessionStatus::Failed, false))
+    } else {
+        run.apply(crate::task_queue::MultiTaskEvent::TaskStopped {
+            task_id,
+            disposition: crate::task_queue::TaskStopDisposition::Failed,
+            reason: format!(
+                "Build Task stopped at {:?}: {}",
+                workflow.run.stage, run_result.termination_reason
+            ),
+            now_ms: now,
+        })?;
+        let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(run)?;
+        archive_multi_task(session, checkpoint);
+        Ok((SessionStatus::Failed, false))
+    }
+}
+
+fn apply_multi_task_goal_run_result(
+    session: &mut SessionState,
+    run_result: &crate::agent_core::AgentRunResult,
+) -> Result<(SessionStatus, bool)> {
+    let parent_checkpoint = session
+        .multi_task
+        .clone()
+        .context("Goal Task session lost its parent checkpoint")?;
+    let task_id = parent_checkpoint
+        .run
+        .active_task_id
+        .clone()
+        .context("Goal Task parent has no active Task")?;
+    let child_id = parent_checkpoint
+        .run
+        .active_task()
+        .and_then(|task| task.request.as_ref())
+        .map(|request| request.child_id.clone())
+        .context("Goal Task parent has no active request")?;
+
+    let (goal_status, _) = apply_goal_run_result(session, run_result)?;
+    let goal = session
+        .goal
+        .clone()
+        .or_else(|| {
+            session
+                .completed_goals
+                .iter()
+                .rev()
+                .find(|checkpoint| checkpoint.run.id == child_id)
+                .cloned()
+        })
+        .context("Goal Task controller did not preserve its Goal checkpoint")?;
+    let mut parent = session.multi_task.clone().unwrap_or(parent_checkpoint).run;
+    if parent.stage.is_terminal() {
+        if let Some(active_goal) = session.goal.take() {
+            let mut goal_run = active_goal.run;
+            if !goal_run.stage.is_terminal() {
+                goal_run.cancel(now_millis().max(goal_run.updated_at_ms));
+            }
+            session
+                .completed_goals
+                .push(crate::goal::GoalCheckpoint::new(goal_run)?);
+        }
+        archive_multi_task(
+            session,
+            crate::task_queue::MultiTaskCheckpoint::new(parent)?,
+        );
+        return Ok((SessionStatus::Failed, false));
+    }
+
+    let repository = crate::task_queue::TaskRepositoryState::capture(std::path::Path::new(
+        &parent.authority.workdir,
+    ))?;
+    let mut now = now_millis().max(parent.updated_at_ms);
+    parent.apply(crate::task_queue::MultiTaskEvent::ChildCheckpointed {
+        task_id: task_id.clone(),
+        child: crate::task_queue::TaskChildCheckpoint::Goal(goal.clone()),
+        repository: repository.clone(),
+        now_ms: now,
+    })?;
+    let child_wall_ms = session
+        .usage_records
+        .lock()
+        .ok()
+        .and_then(|records| records.last().map(|metrics| metrics.wall_runtime_ms))
+        .unwrap_or_default();
+    if child_wall_ms > 0 && !parent.stage.is_terminal() {
+        now = now_millis().max(parent.updated_at_ms);
+        parent.apply(crate::task_queue::MultiTaskEvent::DirectUsageRecorded {
+            task_id: task_id.clone(),
+            usage: crate::task_queue::TaskDirectUsage {
+                elapsed_ms: child_wall_ms,
+                ..crate::task_queue::TaskDirectUsage::default()
+            },
+            now_ms: now,
+        })?;
+    }
+    if parent.stage.is_terminal() {
+        archive_multi_task(
+            session,
+            crate::task_queue::MultiTaskCheckpoint::new(parent)?,
+        );
+        return Ok((SessionStatus::Failed, false));
+    }
+
+    match goal.run.stage {
+        crate::goal::GoalStage::Completed => {
+            let request = parent
+                .active_task()
+                .and_then(|task| task.request.as_ref())
+                .context("completed Goal Task lost its request")?;
+            let result = crate::task_queue::goal_task_result(request, &goal, repository.clone())?;
+            now = now_millis().max(parent.updated_at_ms);
+            parent.apply(crate::task_queue::MultiTaskEvent::TaskDelivered {
+                task_id,
+                result,
+                repository: repository.clone(),
+                now_ms: now,
+            })?;
+            now = now_millis().max(parent.updated_at_ms);
+            parent.apply(crate::task_queue::MultiTaskEvent::EvaluationCompleted {
+                repository,
+                now_ms: now,
+            })?;
+            let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(parent)?;
+            match checkpoint.run.stage {
+                crate::task_queue::MultiTaskStage::Ready => {
+                    archive_multi_task(session, checkpoint);
+                    Ok((SessionStatus::Completed, true))
+                }
+                crate::task_queue::MultiTaskStage::RunningTask => {
+                    let status = dispatch_multi_task_active(session, &checkpoint)?;
+                    Ok((status, false))
+                }
+                stage => bail!("Goal Task evaluation reached unexpected stage {stage:?}"),
+            }
+        }
+        crate::goal::GoalStage::Blocked => {
+            let (_, reason) = crate::task_queue::goal_task_stop(&goal)?
+                .context("blocked Goal Task has no stop disposition")?;
+            now = now_millis().max(parent.updated_at_ms);
+            parent.apply(crate::task_queue::MultiTaskEvent::TaskStopped {
+                task_id,
+                disposition: crate::task_queue::TaskStopDisposition::Blocked,
+                reason,
+                now_ms: now,
+            })?;
+            let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(parent)?;
+            session.multi_task = Some(checkpoint.clone());
+            publish_multi_task_changed(session, &checkpoint);
+            session.paused = true;
+            Ok((SessionStatus::Paused, false))
+        }
+        crate::goal::GoalStage::Failed => {
+            let (_, reason) = crate::task_queue::goal_task_stop(&goal)?
+                .context("failed Goal Task has no stop disposition")?;
+            now = now_millis().max(parent.updated_at_ms);
+            parent.apply(crate::task_queue::MultiTaskEvent::TaskStopped {
+                task_id,
+                disposition: crate::task_queue::TaskStopDisposition::Failed,
+                reason,
+                now_ms: now,
+            })?;
+            archive_multi_task(
+                session,
+                crate::task_queue::MultiTaskCheckpoint::new(parent)?,
+            );
+            Ok((SessionStatus::Failed, false))
+        }
+        crate::goal::GoalStage::Cancelled => {
+            now = now_millis().max(parent.updated_at_ms);
+            parent.apply(crate::task_queue::MultiTaskEvent::Cancelled {
+                reason: "Goal Task was cancelled; completed Task commits were preserved"
+                    .to_string(),
+                now_ms: now,
+            })?;
+            archive_multi_task(
+                session,
+                crate::task_queue::MultiTaskCheckpoint::new(parent)?,
+            );
+            Ok((SessionStatus::Completed, true))
+        }
+        _ => {
+            let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(parent)?;
+            session.multi_task = Some(checkpoint.clone());
+            publish_multi_task_changed(session, &checkpoint);
+            Ok((goal_status, false))
+        }
+    }
 }
 
 fn activate_requested_goal(
@@ -3731,6 +5020,8 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
             completed_workflows: persisted.completed_workflows,
             goal: persisted.goal,
             completed_goals: persisted.completed_goals,
+            multi_task: persisted.multi_task,
+            completed_multi_tasks: persisted.completed_multi_tasks,
             pause_token: Arc::new(AtomicBool::new(false)),
             cancel_token: Arc::new(AtomicBool::new(false)),
             updated_at_ms: persisted.updated_at_ms,
@@ -3758,6 +5049,8 @@ fn persist_session_snapshot(
     completed_workflows: Vec<crate::workflow::WorkflowSummary>,
     goal: Option<crate::goal::GoalCheckpoint>,
     completed_goals: Vec<crate::goal::GoalCheckpoint>,
+    multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
+    completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
 ) {
     let events = history
         .lock()
@@ -3784,6 +5077,8 @@ fn persist_session_snapshot(
     persisted.completed_workflows = completed_workflows;
     persisted.goal = goal;
     persisted.completed_goals = completed_goals;
+    persisted.multi_task = multi_task;
+    persisted.completed_multi_tasks = completed_multi_tasks;
     if let Err(err) = session_store::save_session(&persisted) {
         eprintln!("failed to persist pb session {session_id}: {err:#}");
     }
@@ -3802,6 +5097,8 @@ fn persist_live_session(session_id: &str, session: &SessionState) {
         session.completed_workflows.clone(),
         session.goal.clone(),
         session.completed_goals.clone(),
+        session.multi_task.clone(),
+        session.completed_multi_tasks.clone(),
     );
 }
 
@@ -3847,6 +5144,8 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
                 strict_workflow: strict_workflow_enabled(session),
                 goal: goal.map(|checkpoint| crate::goal::GoalSummary::from(&checkpoint.run)),
                 active_goal: session.goal.is_some(),
+                multi_task: latest_multi_task_checkpoint(session).map(multi_task_summary),
+                active_multi_task: session.multi_task.is_some(),
             }
         })
         .collect::<Vec<_>>();
@@ -3901,6 +5200,9 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         strict_workflow: strict_workflow_enabled(session),
         goal,
         active_goal: session.goal.is_some(),
+        multi_task: latest_multi_task_checkpoint(session).cloned(),
+        active_multi_task: session.multi_task.is_some(),
+        task_plan_rejected: session.request_template.task_plan_rejected.clone(),
     })
 }
 
@@ -4072,6 +5374,8 @@ mod workflow_tests {
             task: "deliver safely".to_string(),
             turn_id: "turn-web-workflow".to_string(),
             intent: Some(crate::workflow::TurnIntent::Deliver),
+            task_planning: crate::agent_core::TaskPlanningPreference::Auto,
+            task_plan_rejected: None,
             workflow_policy: Some(
                 crate::workflow::WorkflowConfigDocument::default()
                     .compile()

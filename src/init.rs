@@ -2037,7 +2037,7 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap();
-        assert_eq!(task_policy.aggregate.max_tasks, 6);
+        assert_eq!(task_policy.aggregate.max_tasks, 8);
     }
 
     #[test]

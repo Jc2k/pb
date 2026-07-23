@@ -38,6 +38,26 @@ A model advances a model-driven stage only with the expected structured submissi
 reviews, implementation artifacts, checks, and commits are tied to current repository or evidence
 fingerprints. Later mutations invalidate stale approvals.
 
+### Task decomposition cannot amplify authority
+
+High-level Task planning is enabled only by an embedded qualification bound to exact model bytes,
+backend, prompt-template version, and artifact protocol. Repository configuration cannot qualify a
+model. The model proposes qualitative effort; Rust owns every executable budget, validates complete
+requirement and acceptance coverage, rejects invalid dependencies and Goal contracts, and persists
+the accepted plan and fresh review before dispatch.
+
+The multi-Task controller carries the source repository, workflow and Goal policies, request cap,
+no-publication boundary, and aggregate allowance as immutable authority. A child receives only its
+own projection and current repository baseline. One child runs at a time, and the controller checks
+the exact Git/content state before starting the next. Child counters are monotonic watermarks;
+retry, resume, restart, or Goal milestones cannot reset or double-spend them. Task runtime deadlines
+stop at the existing safe workflow boundary before the over-budget parent fails closed.
+
+A user can use the existing Goal amendment flow inside a Goal Task, but the parent admits only a
+bounded revision that preserves the accepted objective and criteria, stays in the same workdir,
+keeps publication disabled, and fits the Task budget. Planning failure does not silently fall back
+to a larger Build; running as one Build is a separate explicit user decision.
+
 ### Delegation cannot amplify authority
 
 Advisory work runs with bounded fresh context against an isolated workspace snapshot. Advisors are
@@ -214,8 +234,10 @@ repository control/content fingerprints, child checkpoint, and monotonic usage w
 rejects a second active child, backwards counters, replayed usage inflation, stale restart state,
 unreconciled delivery commits, and automatic pending-Task expansion. A changed Build must preserve
 its managed commit; a Goal Task must preserve its ordered child commits without a synthetic squash.
-Cancellation retains completed history. This controller is not connected to a user/session dispatch
-entry point yet, so it cannot currently start multi-Task work.
+Cancellation retains completed history. The controller is connected to the normal user/session
+dispatch path, but the embedded qualification catalog is empty in this release. Therefore no
+installed model can currently enter automatic Task planning; ordinary Build/Goal dispatch remains
+unchanged until exact qualification evidence is promoted in a future release.
 
 ### Bounded model-source resolution
 

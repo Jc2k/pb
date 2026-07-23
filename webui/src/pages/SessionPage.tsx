@@ -5,6 +5,7 @@ import type { ComposerMode, EventEnvelope, SessionDetails } from "../types";
 import { IntentControl } from "../components/IntentControl";
 import { GoalAmendmentSheet } from "../components/GoalAmendmentSheet";
 import { GoalDrawer } from "../components/GoalDrawer";
+import { TaskPlanningRecovery, TaskProgress } from "../components/TaskProgress";
 import { GoalModeBanner } from "../components/GoalModeBanner";
 import { GoalPlanReview } from "../components/GoalPlanReview";
 import { GoalStartSheet } from "../components/GoalStartSheet";
@@ -48,6 +49,7 @@ export function SessionPage() {
   const [goalBusy, setGoalBusy] = useState(false);
   const [answer, setAnswer] = useState("");
   const [shareMessage, setShareMessage] = useState("");
+  const [taskRecoveryBusy, setTaskRecoveryBusy] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
@@ -64,7 +66,14 @@ export function SessionPage() {
           const title = parsed.event.title;
           setSession((current) => current ? { ...current, title } : current);
         }
-        if (parsed.event.type.startsWith("goal_")) {
+        if (
+          parsed.event.type.startsWith("goal_") ||
+          parsed.event.type.startsWith("workflow_") ||
+          parsed.event.type === "task_plan_accepted" ||
+          parsed.event.type === "task_plan_rejected" ||
+          parsed.event.type === "tasks_changed" ||
+          parsed.event.type === "session_summary"
+        ) {
           void fetchSession();
         }
         if (parsed.event.type === "user_question") {
@@ -188,6 +197,18 @@ export function SessionPage() {
     await fetchSession();
   };
 
+  const recoverTaskPlanning = async (
+    action: "retry-task-planning" | "run-as-one-build",
+  ) => {
+    setTaskRecoveryBusy(true);
+    try {
+      await fetch(`/api/sessions/${sessionId}/${action}`, { method: "POST" });
+      await fetchSession();
+    } finally {
+      setTaskRecoveryBusy(false);
+    }
+  };
+
   const shareSession = async () => {
     if (!session) return;
     const shareUrl = new URL(
@@ -275,6 +296,20 @@ export function SessionPage() {
 
   const isRunning = session?.status === "running" || false;
   const activeGoal = session?.active_goal ? session.goal : undefined;
+  const activeGoalBanner = activeGoal
+    ? (
+      <GoalModeBanner
+        goal={activeGoal}
+        busy={goalBusy}
+        onDetails={() => setGoalDetailsOpen(true)}
+        onPause={() => void pauseGoal()}
+        onResume={() => void resumeGoal()}
+        onAccept={() => void acceptGoal()}
+        onEdit={() => void editGoal()}
+        onStop={() => void stopGoal()}
+      />
+    )
+    : null;
   const deliveryProposal = latestPendingDeliveryProposal(events);
   const goalProposal = latestPendingGoalProposal(events);
   const goalChangeRequest = latestGoalChangeRequest(events);
@@ -387,17 +422,26 @@ export function SessionPage() {
           </button>
         </header>
 
-        {activeGoal
+        {session.multi_task
           ? (
-            <GoalModeBanner
-              goal={activeGoal}
-              busy={goalBusy}
-              onDetails={() => setGoalDetailsOpen(true)}
-              onPause={() => void pauseGoal()}
-              onResume={() => void resumeGoal()}
-              onAccept={() => void acceptGoal()}
-              onEdit={() => void editGoal()}
-              onStop={() => void stopGoal()}
+            <TaskProgress
+              checkpoint={session.multi_task}
+              activeTaskDetail={activeGoalBanner}
+            />
+          )
+          : activeGoalBanner}
+
+        {session.task_plan_rejected
+          ? (
+            <TaskPlanningRecovery
+              rejection={session.task_plan_rejected}
+              busy={taskRecoveryBusy}
+              onRetry={() => void recoverTaskPlanning("retry-task-planning")}
+              onRunAsBuild={() => void recoverTaskPlanning("run-as-one-build")}
+              onEdit={() => {
+                setIntent("deliver");
+                setFollowUp(session.task);
+              }}
             />
           )
           : null}

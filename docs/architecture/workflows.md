@@ -31,30 +31,49 @@ Planning ──→ Plan review ──→ Implementing ──→ Checking ──�
 Each model-driven stage has one permitted structured terminal action. Checking and committing are
 deterministic harness stages and do not run a model.
 
-### Task-plan control foundation
+### High-level Tasks
 
-**Shipped foundation; multi-Task execution is not yet surfaced.** `TaskPlanProposal` is a separate
-high-level schema from the existing Build `PlanArtifact`. It contains outcome-shaped Tasks of kind
-Build or Goal, qualitative effort, dependencies, requirement mappings, and acceptance mappings; it
-cannot contain executable numeric budgets. Rust rejects unknown references, missing coverage,
-cycles, invalid Goal contracts, unqualified automatic Goal selection, and aggregate-policy overflow,
-then projects exact per-Task budgets into a digest-bound `TaskPlanArtifact`.
+**Shipped controller; no planner currently qualified.** Before a new explicit Build starts, pb can
+ask an exactly qualified local model for a high-level `TaskPlanProposal`. This is separate from the existing Build
+`PlanArtifact`: it contains outcome-shaped Tasks of kind Build or Goal, qualitative effort,
+dependencies, requirement mappings, and acceptance mappings. It cannot contain executable numeric
+budgets. A fresh critic reviews the proposal, while Rust rejects unknown references, missing
+coverage, cycles, invalid Goal contracts, unqualified automatic Goal selection, and aggregate
+overflow before any child starts. Planning has two attempts and its own invocation, token, advisory,
+and wall-time allowance.
 
-The pure dispatch boundary unwraps one Build or Goal Task into that existing engine. Two or more
-Tasks now compile into a digest-validated `MultiTaskRun` reducer, although session dispatch and the
-Tasks UI are not connected yet. The reducer creates a request only for the dependency-ready active
-Task, binds it to the reconciled repository state, accepts native workflow or Goal checkpoints,
-rolls monotonic child-counter watermarks up exactly once, and stops at a separate evaluation
-boundary before creating the next request. Completed commits and no-change evidence remain
-immutable when pending Tasks are revised.
+One accepted Task is unwrapped. A Build Task enters the ordinary Build workflow, whose planner still
+decides the actual changes against current repository state. A Goal Task enters the existing Goal
+approval and milestone UI. No `MultiTaskRun` or Tasks panel is created for either one-Task case.
 
-The checkpoint persists the accepted plan/review and exact model/template/protocol qualification,
-policy, budgets, queue revision, active request, native child checkpoint, repository fingerprints,
-usage watermarks, results, and terminal reason in the existing repository-local session Git note.
-Restore pauses an active multi-Task controller without changing its Task request or allowance.
-`.pb/tasks.toml` still supplies only versioned effort presets and ceilings; it cannot grant planner
-qualification. Existing Build and Goal serialized models are unchanged, and no current entry point
-starts this controller yet.
+Two or more accepted Tasks create a digest-bound `MultiTaskRun` and an ordered Tasks panel. The
+controller activates only one dependency-ready Task. A Build Task is projected into the existing
+strict workflow; a Goal Task is projected into the existing `GoalRun`, including its approval,
+pause, amendment, evidence, and completion boundaries. The next Task receives a fresh request and
+plans only after its predecessor reaches committed or verified-no-change delivery and pb reconciles
+the exact repository state. A Goal Task preserves its child commit range rather than adding a
+synthetic Task commit.
+
+Every Task has controller-compiled ceilings for child workflows, stage actions, model invocations,
+generated tokens, advisory calls, plan/repair cycles, and active runtime. Child checkpoints carry
+monotonic usage watermarks, so retry, resume, Goal milestones, and restart cannot reset or
+double-charge allowance. User-approved Goal amendments may add bounded criteria or change
+continuation, but cannot remove an accepted Task criterion, change the Task objective or authority,
+or exceed the parent Task budget.
+
+The parent checkpoint persists the accepted plan and review, exact model/template/protocol
+qualification, policy, budgets, queue revision, active request, native child checkpoint, repository
+fingerprints, usage, results, and terminal reason in the existing repository-local session Git
+note. Restore pauses active work at a safe boundary. Structured Task events and the session API use
+the same checkpoint digest. A planning failure exposes exactly three decisions: retry planning,
+edit the request, or explicitly run the original request as one Build; there is no silent fallback.
+
+Automatic Task planning is fail-closed, and this release's embedded qualification catalog is empty.
+The selected model file, backend, prompt-template version,
+and artifact protocol must match the embedded controller-owned qualification catalog. Project
+configuration cannot add an entry. An unqualified model follows the pre-existing Build path without
+the extra planning call or Tasks UI. `.pb/tasks.toml` supplies only versioned effort presets and
+ceilings and cannot grant qualification, automatic Goal selection, authority, or publication.
 
 ### 1. Planning
 
