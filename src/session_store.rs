@@ -49,6 +49,10 @@ pub struct PersistedSession {
     pub goal: Option<crate::goal::GoalCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_goals: Vec<crate::goal::GoalCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
     pub events: Vec<EventEnvelope>,
 }
 
@@ -82,6 +86,8 @@ impl PersistedSession {
             completed_workflows: Vec::new(),
             goal: None,
             completed_goals: Vec::new(),
+            multi_task: None,
+            completed_multi_tasks: Vec::new(),
             events: trim_events(events),
         }
     }
@@ -172,6 +178,22 @@ pub fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSe
                     }
                     session.goal = crate::goal::GoalCheckpoint::new(run).ok();
                 }
+                if let Some(checkpoint) = session.multi_task.take() {
+                    let mut run = checkpoint.run;
+                    if run.stage == crate::task_queue::MultiTaskStage::RunningTask {
+                        if let Err(error) =
+                            run.apply(crate::task_queue::MultiTaskEvent::PauseRequested {
+                                now_ms: now_millis(),
+                            })
+                        {
+                            eprintln!(
+                                "failed to pause restored multi-Task run '{}' from {note_ref}: {error:#}",
+                                run.id
+                            );
+                        }
+                    }
+                    session.multi_task = crate::task_queue::MultiTaskCheckpoint::new(run).ok();
+                }
                 session.status = Some(
                     match session.status.unwrap_or({
                         if session.running {
@@ -232,6 +254,16 @@ fn parse_session(payload: &str) -> Result<PersistedSession> {
     for goal in &session.completed_goals {
         goal.validate()
             .context("completed goal checkpoint is invalid")?;
+    }
+    if let Some(multi_task) = session.multi_task.as_ref() {
+        multi_task
+            .validate()
+            .context("active multi-Task checkpoint is invalid")?;
+    }
+    for multi_task in &session.completed_multi_tasks {
+        multi_task
+            .validate()
+            .context("completed multi-Task checkpoint is invalid")?;
     }
     session.request_template.legacy_prompt_owned_delivery = legacy_prompt_owned_delivery;
     Ok(session)
@@ -436,6 +468,81 @@ mod tests {
         dir
     }
 
+    fn multi_task_checkpoint(repo: &Path) -> crate::task_queue::MultiTaskCheckpoint {
+        let policy = crate::task_queue::TaskConfigDocument::default()
+            .compile()
+            .unwrap();
+        let authority = crate::task_queue::TaskPlanAuthority {
+            source_intent: crate::task_queue::TaskSourceIntent::Build,
+            task_planning_qualified: true,
+            automatic_goal_selection_qualified: false,
+        };
+        let proposal: crate::task_queue::TaskPlanProposal = serde_json::from_value(
+            serde_json::json!({
+                "objective": "Deliver two changes",
+                "requirements": [
+                    {"id": "r1", "description": "First"},
+                    {"id": "r2", "description": "Second"}
+                ],
+                "tasks": [
+                    {"id": "t1", "title": "First", "description": "First", "requirement_ids": ["r1"], "acceptance_ids": ["a1"], "effort": "small", "kind": "build"},
+                    {"id": "t2", "title": "Second", "description": "Second", "requirement_ids": ["r2"], "depends_on": ["t1"], "acceptance_ids": ["a2"], "effort": "small", "kind": "build"}
+                ],
+                "acceptance": [
+                    {"id": "a1", "description": "First is current"},
+                    {"id": "a2", "description": "Second is current"}
+                ]
+            }),
+        )
+        .unwrap();
+        let plan = crate::workflow::ArtifactEnvelope::new(
+            "persisted-task-plan",
+            proposal.validate_and_compile(authority, &policy).unwrap(),
+        )
+        .unwrap();
+        let review = crate::workflow::ArtifactEnvelope::new(
+            "persisted-task-plan-review",
+            crate::task_queue::TaskPlanReviewArtifact {
+                task_plan_sha256: plan.sha256.clone(),
+                verdict: crate::task_queue::TaskPlanReviewVerdict::Pass,
+                challenges: Vec::new(),
+            },
+        )
+        .unwrap();
+        let qualification_digest = "a".repeat(64);
+        let qualification = crate::task_queue::TaskPlannerQualification::new(
+            qualification_digest.clone(),
+            qualification_digest.clone(),
+            qualification_digest.clone(),
+            qualification_digest,
+            true,
+            false,
+        )
+        .unwrap();
+        let run = crate::task_queue::MultiTaskRun::start(
+            "persisted-multi-task",
+            "session-multi-task",
+            "turn-multi-task",
+            plan,
+            review,
+            policy,
+            crate::task_queue::TaskSourceIntent::Build,
+            qualification,
+            repo.to_string_lossy(),
+            crate::task_queue::TaskRepositoryState::capture(repo).unwrap(),
+            crate::task_queue::TaskCoordinationCounters {
+                planning_attempts: 1,
+                model_invocations: 1,
+                generated_tokens: 100,
+                advisory_calls: 0,
+                elapsed_ms: 10,
+            },
+            10,
+        )
+        .unwrap();
+        crate::task_queue::MultiTaskCheckpoint::new(run).unwrap()
+    }
+
     fn metrics_event(tokens: usize, joules: f64, started_at_ms: u64) -> EventEnvelope {
         EventEnvelope::new(AgentEvent::SessionMetrics {
             llm_invocations: 1,
@@ -472,6 +579,53 @@ mod tests {
     fn session_note_ref_rejects_path_separators() {
         assert!(session_note_ref("session-123").is_ok());
         assert!(session_note_ref("../bad").is_err());
+    }
+
+    #[test]
+    fn restore_preserves_and_pauses_active_multi_task_checkpoint() {
+        let repo = init_repo();
+        let mut persisted = PersistedSession::from_parts(
+            "session-multi-task".to_string(),
+            request(repo.path()),
+            Some("pb/test".to_string()),
+            Some(repo.path().to_path_buf()),
+            true,
+            SessionStatus::Running,
+            Vec::new(),
+        );
+        let original = multi_task_checkpoint(repo.path());
+        let request_id = original
+            .run
+            .active_task()
+            .unwrap()
+            .request
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        persisted.multi_task = Some(original);
+        save_session(&persisted).unwrap();
+
+        let restored = restore_project_sessions(repo.path()).unwrap();
+        assert_eq!(restored.len(), 1);
+        let checkpoint = restored[0].multi_task.as_ref().unwrap();
+        assert_eq!(
+            checkpoint.run.stage,
+            crate::task_queue::MultiTaskStage::Paused
+        );
+        assert_eq!(
+            checkpoint
+                .run
+                .active_task()
+                .unwrap()
+                .request
+                .as_ref()
+                .unwrap()
+                .id,
+            request_id
+        );
+        assert_eq!(checkpoint.run.counters.coordination.planning_attempts, 1);
+        checkpoint.validate().unwrap();
     }
 
     #[test]

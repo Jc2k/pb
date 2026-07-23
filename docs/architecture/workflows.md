@@ -40,11 +40,21 @@ cannot contain executable numeric budgets. Rust rejects unknown references, miss
 cycles, invalid Goal contracts, unqualified automatic Goal selection, and aggregate-policy overflow,
 then projects exact per-Task budgets into a digest-bound `TaskPlanArtifact`.
 
-The pure dispatch boundary unwraps one Build or Goal Task into that existing engine and identifies
-two or more Tasks as a future `MultiTaskRun`; it does not yet start a child or alter session state.
-`.pb/tasks.toml` supplies only versioned effort presets and ceilings. Model/template/protocol
-qualification is separate controller-owned evidence, and project configuration cannot grant it.
-The existing Build and Goal serialized models are unchanged.
+The pure dispatch boundary unwraps one Build or Goal Task into that existing engine. Two or more
+Tasks now compile into a digest-validated `MultiTaskRun` reducer, although session dispatch and the
+Tasks UI are not connected yet. The reducer creates a request only for the dependency-ready active
+Task, binds it to the reconciled repository state, accepts native workflow or Goal checkpoints,
+rolls monotonic child-counter watermarks up exactly once, and stops at a separate evaluation
+boundary before creating the next request. Completed commits and no-change evidence remain
+immutable when pending Tasks are revised.
+
+The checkpoint persists the accepted plan/review and exact model/template/protocol qualification,
+policy, budgets, queue revision, active request, native child checkpoint, repository fingerprints,
+usage watermarks, results, and terminal reason in the existing repository-local session Git note.
+Restore pauses an active multi-Task controller without changing its Task request or allowance.
+`.pb/tasks.toml` still supplies only versioned effort presets and ceilings; it cannot grant planner
+qualification. Existing Build and Goal serialized models are unchanged, and no current entry point
+starts this controller yet.
 
 ### 1. Planning
 

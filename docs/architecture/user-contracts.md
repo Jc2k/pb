@@ -35,8 +35,9 @@ The shipped Task-plan foundation applies the same authority rule before future m
 `.pb/tasks.toml` can narrow budgets but cannot qualify a planner or authorize automatic Goal
 selection. An explicitly selected Goal may unwrap through one Goal Task; otherwise a Goal Task is
 valid only when controller-owned evidence qualifies the exact planner/model/template protocol. This
-foundation currently validates and projects artifacts only; ordinary Build and Goal entry points
-remain unchanged until the multi-Task controller ships.
+foundation now also has a durable sequential reducer and restart checkpoint. The reducer cannot
+start work by itself, and no current Build or Goal entry point dispatches into it yet. Ordinary
+Build and Goal behavior therefore remains unchanged until queued dispatch ships.
 
 When planning discovers a materially missing choice, it may ask the user. The answer becomes part of
 the task contract. Guessing would make progress faster at the cost of changing ownership of the

@@ -16,8 +16,8 @@ local config + Git notes ───┘
 ```
 
 Normal prompts are generated inside the pb process and sent to the selected local inference
-backend. Session events, workflow checkpoints, and durable Goal checkpoints are persisted into
-repository-local Git notes.
+backend. Session events, workflow checkpoints, durable Goal checkpoints, and supported multi-Task
+controller checkpoints are persisted into repository-local Git notes.
 Workflow checkpoints may include a bounded bundle of exact bytes from complete small-file reads,
 together with their local path/content hashes and provenance. The bundle remains local session
 evidence, is revalidated before reuse, and follows the same session-deletion lifecycle; it is not
@@ -67,6 +67,11 @@ plan versions, milestone evidence, budgets, model-requested changes, and user ac
 with the local session. The responsive Goal UI calls the same loopback daemon API as other session
 controls. Goal mode adds no cloud scheduler, hosted inference fallback, analytics edge, or automatic
 publication path.
+
+The multi-Task controller foundation follows the same local path. Its accepted high-level plan,
+planner-qualification digests, exact budgets and consumption, Task requests/results, repository
+fingerprints, and native active Build or Goal checkpoint remain in the containing session Git note.
+It adds no hosted scheduler, model escalation, telemetry, remote persistence, or publication edge.
 
 ## Explicit external edges
 
@@ -146,7 +151,7 @@ explicit local backend inherits host connectivity.
 | --- | --- | --- |
 | User-global | Model preferences, project registry, OAuth token | Stored below the user's config/data roots; not checked into a project. |
 | Repository-owned | `.pb/` configuration, source, acceptance facts | Visible to project collaborators if committed; secret values should not appear here. |
-| Session-owned | Task workspace, container, services, network, event stream, active/completed Goal checkpoints | Reconciled or removed when terminal/expired, except persisted history. |
+| Session-owned | Task workspace, container, services, network, event stream, active/completed Goal and multi-Task checkpoints | Reconciled or removed when terminal/expired, except persisted history. |
 | Durable project memory | Evidence-backed Markdown entries under local `refs/pb/memory` | Outside the working tree and ordinary branch pushes; bounded and retained until that ref is changed or removed. |
 | Reusable local artifact | Model weights, images, declared caches, llama.cpp and FlashMoe session state | May survive sessions; managed separately from task cleanup. |
 | External disclosure | Search query, remote tool arguments, provider mutation | Occurs only through an enabled edge; governed by its provider and local policy. |
@@ -161,6 +166,10 @@ Goal restart safety is local persistence behavior: interrupted active work resto
 requires an explicit Resume. Stopping a Goal preserves local commits, workspace content, and
 evidence; deleting the containing finished session through the existing session-delete operation
 removes its pb session note and Goal state under the same cleanup contract.
+
+An interrupted active multi-Task controller is likewise restored paused with the exact active Task
+request and counters. Its completed local commits are preserved; deleting the containing session
+removes the Task plan and queue checkpoint with the same Git-note cleanup.
 
 If verified container or network cleanup fails, pb keeps the local lease record in a failed state
 and retries it later together with the session workspace. It does not erase the only inventory of

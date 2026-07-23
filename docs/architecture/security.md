@@ -207,8 +207,15 @@ artifact. Numeric budgets in model proposals are rejected rather than treated as
 qualify a model, select Goal automatically, change stage capabilities, or grant network,
 credential, mutation, or publication authority. Automatic Goal selection requires a separate
 controller-owned qualification record bound to exact model, template, protocol, and evidence
-digests; explicit Goal intent still enters the existing approval-gated Goal controller. The current
-foundation does not yet start multi-Task work.
+digests; explicit Goal intent still enters the existing approval-gated Goal controller.
+
+The durable multi-Task reducer persists that qualification record with the accepted plan, policy,
+repository control/content fingerprints, child checkpoint, and monotonic usage watermarks. It
+rejects a second active child, backwards counters, replayed usage inflation, stale restart state,
+unreconciled delivery commits, and automatic pending-Task expansion. A changed Build must preserve
+its managed commit; a Goal Task must preserve its ordered child commits without a synthetic squash.
+Cancellation retains completed history. This controller is not connected to a user/session dispatch
+entry point yet, so it cannot currently start multi-Task work.
 
 ### Bounded model-source resolution
 
