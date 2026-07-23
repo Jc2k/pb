@@ -36,7 +36,7 @@ you want to manage their location yourself.
 ## Prepare a project
 
 From a Git repository, let pb inspect the project and write its per-project environment, workspace,
-strict-workflow, and durable-Goal policy configuration:
+strict-workflow, durable-Goal, and Task-decomposition policy configuration:
 
 ```bash
 cd /path/to/project
@@ -58,8 +58,9 @@ pb env start
 ```
 
 `pb init` preserves existing project configuration rather than silently replacing it. In
-particular, `.pb/goal.toml` sets only Goal ceilings; it cannot start a Goal or grant automatic or
-publishing authority.
+particular, `.pb/goal.toml` sets only Goal ceilings, while `.pb/tasks.toml` sets only Task effort and
+aggregate ceilings. Neither can start a Goal, qualify a planner, or grant automatic or publishing
+authority.
 
 ## Start pb
 

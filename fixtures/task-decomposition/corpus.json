@@ -77,12 +77,11 @@
               "objective": "Make import recovery restart-safe.",
               "criteria": [
                 {
-                  "id": "c1",
-                  "description": "Interrupted imports resume without duplicate rows.",
-                  "verifier": "machine"
+                  "text": "Interrupted imports resume without duplicate rows.",
+                  "verifier": "workflow_ready"
                 }
               ],
-              "continuation": "bounded"
+              "continuation": "review_plan_then_automatic"
             }
           }
         ],
@@ -152,12 +151,11 @@
               "objective": "Make import execution restart-safe and idempotent.",
               "criteria": [
                 {
-                  "id": "c1",
-                  "description": "Interrupted imports resume without duplicate rows.",
-                  "verifier": "machine"
+                  "text": "Interrupted imports resume without duplicate rows.",
+                  "verifier": "workflow_ready"
                 }
               ],
-              "continuation": "bounded"
+              "continuation": "review_plan_then_automatic"
             }
           },
           {
@@ -404,12 +402,11 @@
               "objective": "Improve recovery.",
               "criteria": [
                 {
-                  "id": "c1",
-                  "description": "Recovery tests pass.",
-                  "verifier": "machine"
+                  "text": "Recovery tests pass.",
+                  "verifier": "workflow_ready"
                 }
               ],
-              "continuation": "bounded"
+              "continuation": "review_plan_then_automatic"
             }
           }
         ],

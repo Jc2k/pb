@@ -310,11 +310,26 @@ Project-specific files live below `.pb/` in the repository:
 | `.pb/workspace.toml` | Workspace components, executors, tasks, and affected checks. |
 | `.pb/workflow.toml` | Workflow limits and configured task/check policy. |
 | `.pb/goal.toml` | Durable Goal ceilings; cannot enable Auto, automatic continuation, or publication. |
+| `.pb/tasks.toml` | Task decomposition effort presets, aggregate ceilings, and coordination limits. |
 | `.pb/policy.toml` | User/tool policy rules evaluated for this project. |
 | `.pb/mcp.toml` | Project MCP servers and their declared capabilities. |
 
 Not every project needs every file. `pb init` creates or preserves the environment, workspace,
-strict-workflow, and durable-Goal foundations.
+strict-workflow, durable-Goal, and Task-decomposition foundations.
+
+## Task decomposition policy
+
+**Shipped configuration foundation.** `.pb/tasks.toml` is a versioned, hashed ceiling document for
+high-level Task-plan validation and controller-owned budget projection. It defines `small`,
+`medium`, and `large` qualitative effort presets, a six-Task aggregate ceiling by default, and a
+two-attempt coordination allowance. Models propose only qualitative effort; executable numeric
+budgets are compiled from this document and included in the accepted artifact digest.
+
+The file cannot enable Task planning, qualify a model, authorize automatic Goal selection, start a
+Goal, expand workflow authority, or allow publication. Planner qualification is controller-owned
+evidence for an exact model/template/protocol version. Existing `.pb/workflow.toml` and
+`.pb/goal.toml` formats and limits are unchanged. The multi-Task session controller and Tasks UI
+remain design-record behavior until their later delivery Tasks ship.
 
 ## Goal policy
 

@@ -31,6 +31,21 @@ Planning ──→ Plan review ──→ Implementing ──→ Checking ──�
 Each model-driven stage has one permitted structured terminal action. Checking and committing are
 deterministic harness stages and do not run a model.
 
+### Task-plan control foundation
+
+**Shipped foundation; multi-Task execution is not yet surfaced.** `TaskPlanProposal` is a separate
+high-level schema from the existing Build `PlanArtifact`. It contains outcome-shaped Tasks of kind
+Build or Goal, qualitative effort, dependencies, requirement mappings, and acceptance mappings; it
+cannot contain executable numeric budgets. Rust rejects unknown references, missing coverage,
+cycles, invalid Goal contracts, unqualified automatic Goal selection, and aggregate-policy overflow,
+then projects exact per-Task budgets into a digest-bound `TaskPlanArtifact`.
+
+The pure dispatch boundary unwraps one Build or Goal Task into that existing engine and identifies
+two or more Tasks as a future `MultiTaskRun`; it does not yet start a child or alter session state.
+`.pb/tasks.toml` supplies only versioned effort presets and ceilings. Model/template/protocol
+qualification is separate controller-owned evidence, and project configuration cannot grant it.
+The existing Build and Goal serialized models are unchanged.
+
 ### 1. Planning
 
 The planning profile reads the repository and submits a structured plan with scope, implementation

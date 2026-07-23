@@ -60,6 +60,7 @@ pub mod session_store;
 pub mod session_workspace;
 pub mod sleep_prevention;
 mod state_lock;
+pub mod task_queue;
 pub mod tray;
 pub mod user;
 pub mod web;

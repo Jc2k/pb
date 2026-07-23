@@ -6,7 +6,7 @@
 //! - Existing agent / coding-assistant documentation
 //!
 //! Based on the detections it writes (or confirms) the project environment,
-//! workspace, strict workflow, and durable goal policy under `.pb/`, then
+//! workspace, strict workflow, durable goal policy, and Task policy under `.pb/`, then
 //! prints a summary of what it found and what it configured.
 //! MCP tool-effect declarations such as `capabilities.read_only_tools` remain explicit operator
 //! configuration: `pb init` never infers that an external operation is read-only.
@@ -54,6 +54,7 @@ pub struct ProjectInspection {
     pub has_pb_workspace: bool,
     pub has_pb_workflow: bool,
     pub has_pb_goal: bool,
+    pub has_pb_tasks: bool,
 
     // Vision / image assets
     /// Project contains image files (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`).
@@ -181,6 +182,7 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     info.has_pb_workspace = root.join(".pb").join("workspace.toml").exists();
     info.has_pb_workflow = root.join(".pb").join("workflow.toml").exists();
     info.has_pb_goal = root.join(".pb").join("goal.toml").exists();
+    info.has_pb_tasks = root.join(".pb").join("tasks.toml").exists();
 
     info.environment_evidence.sort_by(|left, right| {
         left.component
@@ -1120,6 +1122,24 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
         );
     }
 
+    println!();
+    if info.has_pb_tasks {
+        let policy = crate::task_queue::TaskConfigDocument::load(&root)?
+            .expect("Task config exists after inspection")
+            .compile()?;
+        println!(
+            "Existing Task decomposition policy found at {} (policy {}).",
+            root.join(".pb").join("tasks.toml").display(),
+            &policy.sha256[..12]
+        );
+    } else {
+        crate::task_queue::TaskConfigDocument::default().save(&root)?;
+        println!(
+            "Task decomposition policy written to {}.",
+            root.join(".pb").join("tasks.toml").display()
+        );
+    }
+
     Ok(())
 }
 
@@ -1978,6 +1998,14 @@ mod tests {
     }
 
     #[test]
+    fn inspect_existing_pb_tasks() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".pb/tasks.toml", "version = 1\n");
+        let info = inspect(dir.path()).unwrap();
+        assert!(info.has_pb_tasks);
+    }
+
+    #[test]
     fn init_writes_normalized_workspace_graph_without_overwriting_environment_schema() {
         let dir = TempDir::new().unwrap();
         run_init(
@@ -1990,6 +2018,7 @@ mod tests {
         assert!(dir.path().join(".pb/workspace.toml").is_file());
         assert!(dir.path().join(".pb/workflow.toml").is_file());
         assert!(dir.path().join(".pb/goal.toml").is_file());
+        assert!(dir.path().join(".pb/tasks.toml").is_file());
         let graph = crate::workspace::WorkspaceConfigDocument::load(dir.path())
             .unwrap()
             .unwrap()
@@ -2003,6 +2032,12 @@ mod tests {
             .compile()
             .unwrap();
         assert_eq!(policy.delivery, crate::workflow::DeliveryPolicy::Strict);
+        let task_policy = crate::task_queue::TaskConfigDocument::load(dir.path())
+            .unwrap()
+            .unwrap()
+            .compile()
+            .unwrap();
+        assert_eq!(task_policy.aggregate.max_tasks, 6);
     }
 
     #[test]

@@ -197,6 +197,19 @@ plan approval also names the exact plan digest. Child workflows retain the ordin
 capability matrix, managed commit boundary, fingerprints, and policy checks. Total invocation,
 token, workflow, milestone, and wall-time limits bind continuation across child workflows.
 
+### Task-plan policy cannot qualify itself
+
+The shipped Task-plan foundation accepts model output only as a proposal. Rust validates its graph,
+coverage, Build/Goal contracts, and controller-projected budgets before producing a digest-bound
+artifact. Numeric budgets in model proposals are rejected rather than treated as limits.
+
+`.pb/tasks.toml` contains effort presets and aggregate ceilings only. It cannot enable planning,
+qualify a model, select Goal automatically, change stage capabilities, or grant network,
+credential, mutation, or publication authority. Automatic Goal selection requires a separate
+controller-owned qualification record bound to exact model, template, protocol, and evidence
+digests; explicit Goal intent still enters the existing approval-gated Goal controller. The current
+foundation does not yet start multi-Task work.
+
 ### Bounded model-source resolution
 
 FlashMoe does not let a model filename select arbitrary tensor behavior during inference. The
