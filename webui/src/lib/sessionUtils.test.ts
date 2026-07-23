@@ -79,6 +79,38 @@ Deno.test("getToolDetail shows session_title call title", () => {
   equal(getToolDetail(call), "Wire title tool");
 });
 
+Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
+  const call: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "tool_call",
+      tool: "lsp_proactive_diagnostics",
+      arguments: { mode: "settled", paths: ["src/lib.rs", "src/main.rs"] },
+      actor: { kind: "automation", id: "trinity" },
+    },
+  };
+  const result: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "tool_result",
+      tool: "lsp_proactive_diagnostics",
+      result: JSON.stringify({
+        scanned_paths: ["src/lib.rs", "src/main.rs"],
+        diagnostics: [{ path: "src/lib.rs" }],
+        failures: [],
+        omitted_paths: 3,
+        stale: false,
+      }),
+      actor: { kind: "automation", id: "trinity" },
+    },
+  };
+
+  equal(
+    getToolDetail(call, result),
+    "settled · 1 blocking diagnostic in 2 files · 3 deferred",
+  );
+});
+
 Deno.test("buildToolSummaries includes session_title parameters in drawer details", () => {
   const events: EventEnvelope[] = [
     {

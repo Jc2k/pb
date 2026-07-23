@@ -874,10 +874,10 @@ mod tests {
             "ghcr.io/crunchy-pb/sentry-mcp:latest"
         );
         assert!(is_marketplace_container_image(
-            "ghcr.io/crunchy-pb/rust-analyzer-lsp:latest"
+            "ghcr.io/crunchy-pb/lsp-rust-analyzer:latest"
         ));
         assert!(!is_marketplace_container_image(
-            "ghcr.io/example/rust-analyzer-lsp:latest"
+            "ghcr.io/example/lsp-rust-analyzer:latest"
         ));
     }
 
@@ -1034,7 +1034,7 @@ mod tests {
     fn packaged_lsp_manifest_applies_safe_server_defaults_without_pinning_runtime() {
         let request = IntegrationInstallRequest {
             kind: IntegrationKind::Lsp,
-            container_image: "pb/rust-analyzer-lsp:dev".to_string(),
+            container_image: "ghcr.io/crunchy-pb/lsp-rust-analyzer:latest".to_string(),
             name: Some("rust-analyzer".to_string()),
             runtime: None,
             env: BTreeMap::new(),
@@ -1082,38 +1082,5 @@ mod tests {
         let parsed = parse_lsp_package_manifest(&text).unwrap();
         assert_eq!(parsed.kind, IntegrationKind::Lsp);
         assert_eq!(parsed.server.language_ids, vec!["rust"]);
-    }
-
-    #[test]
-    fn packaged_rust_analyzer_source_manifest_matches_the_typed_contract() {
-        let parsed =
-            parse_lsp_package_manifest(include_str!("../packages/rust-analyzer-lsp/pb-lsp.json"))
-                .unwrap();
-
-        assert_eq!(parsed, rust_analyzer_manifest_with_full_safe_defaults());
-    }
-
-    fn rust_analyzer_manifest_with_full_safe_defaults() -> LspPackageManifest {
-        LspPackageManifest {
-            version: 1,
-            kind: IntegrationKind::Lsp,
-            server: LspPackageServerConfig {
-                args: Vec::new(),
-                language_ids: vec!["rust".to_string()],
-                initialization_options: Some(serde_json::json!({
-                    "cachePriming": {"enable": false},
-                    "cargo": {
-                        "autoreload": false,
-                        "buildScripts": {"enable": false},
-                        "noDeps": true
-                    },
-                    "checkOnSave": false,
-                    "procMacro": {"enable": false}
-                })),
-                workspace_access: crate::session_environment::ServiceWorkspaceAccess::ReadOnly,
-                network_access: crate::session_environment::ServiceNetworkAccess::None,
-                cache_ids: Vec::new(),
-            },
-        }
     }
 }

@@ -29,7 +29,7 @@ Deno.test("validateIntegrationConfig reports required and string constraint erro
 
 Deno.test("integrationInstallPayload carries typed LSP defaults without pinning a runtime", () => {
   const metadata: IntegrationConfigSchemaResponse = {
-    container_image: "ghcr.io/crunchy-pb/rust-analyzer-lsp:latest",
+    container_image: "ghcr.io/crunchy-pb/lsp-rust-analyzer:latest",
     annotation: "uk.unrtd.pb.integration.config-schema",
     lsp_manifest_annotation: "uk.unrtd.pb.integration.lsp-manifest",
     lsp_manifest: {

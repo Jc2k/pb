@@ -3192,7 +3192,7 @@ fn build_agent_instructions_with_tool_allowlist(
     }
     if !lsp_registry.is_empty() {
         instructions.push_str(
-            "Configured LSP tools are exposed with lsp_<server>_<operation> names for hover, definition, references, document symbols, workspace symbols, and diagnostics. Use them for code intelligence when they are more precise than text search. Containerized LSPs see the project at the same absolute path as the coding agent.\n",
+            "Configured LSP tools are exposed with lsp_<server>_<operation> names for hover, definition, references, document symbols, workspace symbols, and diagnostics. Use them for targeted code-intelligence questions when they are more precise than text search. pb automatically runs separate, bounded diagnostics over changed accepted task paths at safe syntax and settled-work boundaries; do not call a manual LSP tool merely to satisfy a gate. Automatic LSP evidence can request a repair but never grants check, review, commit, or completion credit. Containerized LSPs see the project at the same absolute path as the coding agent.\n",
         );
     }
     instructions.push_str(
@@ -5124,6 +5124,231 @@ impl GateState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ProactiveLspPathState {
+    syntax_checked: bool,
+    settled_checked: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProactiveLspState {
+    previous: crate::workspace::ContentSnapshot,
+    paths: BTreeMap<String, ProactiveLspPathState>,
+}
+
+impl ProactiveLspState {
+    fn new(args: &AgentRequest, workspace_root: &Path) -> Result<Self> {
+        let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+        let previous = args
+            .repository_context
+            .as_ref()
+            .map(|repository| repository.task_baseline.content.clone())
+            .unwrap_or_else(|| current.clone());
+        let mut state = Self {
+            previous,
+            paths: BTreeMap::new(),
+        };
+        state.observe_snapshot(current);
+        Ok(state)
+    }
+
+    fn observe(&mut self, workspace_root: &Path) -> Result<()> {
+        let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+        self.observe_snapshot(current);
+        Ok(())
+    }
+
+    fn observe_snapshot(&mut self, current: crate::workspace::ContentSnapshot) {
+        for path in self.previous.changed_paths(&current) {
+            match current.paths.get(&path) {
+                Some(content) if content.kind == "file" => {
+                    self.paths.insert(
+                        path,
+                        ProactiveLspPathState {
+                            syntax_checked: false,
+                            settled_checked: false,
+                        },
+                    );
+                }
+                _ => {
+                    self.paths.remove(&path);
+                }
+            }
+        }
+        self.previous = current;
+    }
+
+    fn candidates(&self, scope: &BTreeSet<String>, mode: lsp::ProactiveLspMode) -> Vec<String> {
+        self.paths
+            .iter()
+            .filter(|(path, state)| {
+                scope.contains(*path)
+                    && match mode {
+                        lsp::ProactiveLspMode::Syntax => !state.syntax_checked,
+                        lsp::ProactiveLspMode::Settled => !state.settled_checked,
+                    }
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    fn record(&mut self, report: &lsp::ProactiveLspReport) {
+        if report.stale || self.previous.fingerprint != report.workspace_fingerprint {
+            return;
+        }
+        for path in report.completed_paths() {
+            let Some(state) = self.paths.get_mut(&path) else {
+                continue;
+            };
+            match report.mode {
+                lsp::ProactiveLspMode::Syntax => state.syntax_checked = true,
+                lsp::ProactiveLspMode::Settled => {
+                    state.syntax_checked = true;
+                    state.settled_checked = true;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProactiveLspPass {
+    blocking_paths: BTreeSet<String>,
+    feedback: Option<String>,
+}
+
+fn run_proactive_lsp_pass(
+    lsp_registry: &LspToolRegistry,
+    state: &RefCell<ProactiveLspState>,
+    workspace_root: &Path,
+    scope: &BTreeSet<String>,
+    mode: lsp::ProactiveLspMode,
+    nesting_depth: usize,
+    sink: &mut dyn EventSink,
+    metrics: &mut RunMetrics,
+) -> Result<Option<ProactiveLspPass>> {
+    if lsp_registry.servers.is_empty() || scope.is_empty() {
+        return Ok(None);
+    }
+    state.borrow_mut().observe(workspace_root)?;
+    let candidates = state.borrow().candidates(scope, mode);
+    let selection = lsp::proactive_supported_paths(lsp_registry, candidates);
+    if selection.paths.is_empty() {
+        return Ok(None);
+    }
+    let workspace_fingerprint = state.borrow().previous.fingerprint.clone();
+    let actor = crate::events::TeamActor::workflow_steward();
+    sink.emit(AgentEvent::ToolCall {
+        tool: lsp::PROACTIVE_LSP_TOOL_NAME.to_string(),
+        arguments: json!({
+            "mode": mode.as_str(),
+            "paths": selection.paths,
+            "omitted_paths": selection.omitted_paths,
+            "workspace_fingerprint": workspace_fingerprint,
+        }),
+        actor: Some(actor),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
+    let energy_start = energy::sample();
+    let started = Instant::now();
+    let mut report =
+        lsp::proactive_diagnostics(lsp_registry, workspace_root, selection.paths, mode)?;
+    report.omitted_paths = selection.omitted_paths;
+    let duration_ms = duration_millis(started);
+    let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
+    metrics.tool_calls = metrics.tool_calls.saturating_add(1);
+    metrics.tool_runtime_ms = metrics.tool_runtime_ms.saturating_add(duration_ms);
+    add_energy(
+        &mut metrics.tool_energy_joules,
+        &mut metrics.tool_energy_kwh,
+        energy,
+    );
+    let serialized = serde_json::to_string(&report)?;
+    sink.emit(AgentEvent::ToolResult {
+        tool: lsp::PROACTIVE_LSP_TOOL_NAME.to_string(),
+        result: serialized,
+        actor: Some(actor),
+        duration_ms: Some(duration_ms),
+        energy_joules: energy.map(|estimate| estimate.joules),
+        energy_kwh: energy.map(|estimate| estimate.kwh),
+        average_power_watts: energy.map(|estimate| estimate.average_watts),
+        energy_shared_calls: None,
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
+    sink.emit(AgentEvent::ToolBatch {
+        call_count: 1,
+        parallel_safe_count: 1,
+        useful_count: if report.diagnostics.is_empty() { 0 } else { 1 },
+        bookkeeping_only_count: if report.diagnostics.is_empty() { 1 } else { 0 },
+        rejected_as_dependent: false,
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
+    state.borrow_mut().record(&report);
+
+    if !report.failures.is_empty() || report.omitted_paths > 0 {
+        let mut details = report
+            .failures
+            .iter()
+            .map(|failure| format!("{} {}: {}", failure.server, failure.path, failure.message))
+            .collect::<Vec<_>>();
+        if report.omitted_paths > 0 {
+            details.push(format!(
+                "{} additional supported task path(s) were deferred by the per-pass bound",
+                report.omitted_paths
+            ));
+        }
+        sink.emit(AgentEvent::TeamMessage {
+            actor,
+            tone: crate::events::TeamMessageTone::Warning,
+            message: "Automatic language-server evidence was incomplete; ordinary checks remain authoritative."
+                .to_string(),
+            detail: Some(truncate_chars(&details.join("\n"), 4_000)),
+            evidence_ids: Vec::new(),
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+    }
+
+    let blocking_paths = report.blocking_paths();
+    let feedback = (!blocking_paths.is_empty()).then(|| {
+        let diagnostics = report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let code = diagnostic
+                    .code
+                    .as_deref()
+                    .map(|code| format!(" {code}"))
+                    .unwrap_or_default();
+                format!(
+                    "{}:{}:{} [{}{}] {}",
+                    diagnostic.path,
+                    diagnostic.line,
+                    diagnostic.character,
+                    diagnostic.server,
+                    code,
+                    diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Trinity's automatic {} LSP pass found current error diagnostics before configured checks. The evidence is bound to workspace fingerprint {} and grants no check, review, commit, or completion credit. Repair the exact paths [{}], then let pb rerun the pass.\n{}",
+            mode.as_str(),
+            report.workspace_fingerprint,
+            blocking_paths.iter().cloned().collect::<Vec<_>>().join(", "),
+            truncate_chars(&diagnostics, 8_000),
+        )
+    });
+    Ok(Some(ProactiveLspPass {
+        blocking_paths,
+        feedback,
+    }))
+}
+
 fn gate_evidence_fingerprint(state: &GateState) -> Result<String> {
     let mut read_paths = state.read_paths.iter().cloned().collect::<Vec<_>>();
     read_paths.sort();
@@ -5429,6 +5654,11 @@ fn run_agent_steps(
         command_backend.is_some(),
     )?);
     let read_cache = RefCell::new(DeterministicReadCache::default());
+    let proactive_lsp = if args.repository_less || lsp_registry.servers.is_empty() {
+        None
+    } else {
+        Some(RefCell::new(ProactiveLspState::new(args, workspace_root)?))
+    };
     let workspace_checks = args.workspace_graph.as_ref().map(|graph| {
         RefCell::new(WorkspaceCheckRuntime::new(
             workspace_root,
@@ -5537,6 +5767,9 @@ fn run_agent_steps(
             timestamp_ms: Some(now_millis()),
         });
 
+        if let Some(proactive_lsp) = proactive_lsp.as_ref() {
+            proactive_lsp.borrow_mut().observe(workspace_root)?;
+        }
         if let Some(ledger) = work_units.as_mut() {
             let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
             let exact_evidence_paths = gate_state
@@ -5546,6 +5779,55 @@ fn run_agent_steps(
                 .map(str::to_string)
                 .collect::<BTreeSet<_>>();
             ledger.reconcile(&current, &exact_evidence_paths)?;
+            let proactive_mode = if ledger.structurally_complete() {
+                lsp::ProactiveLspMode::Settled
+            } else {
+                lsp::ProactiveLspMode::Syntax
+            };
+            let proactive_scope = ledger.actual_task_paths();
+            if let Some(proactive_lsp) = proactive_lsp.as_ref()
+                && let Some(pass) = run_proactive_lsp_pass(
+                    lsp_registry,
+                    proactive_lsp,
+                    workspace_root,
+                    &proactive_scope,
+                    proactive_mode,
+                    nesting_depth,
+                    sink,
+                    &mut metrics,
+                )?
+            {
+                if let Some(feedback) = pass.feedback {
+                    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+                    mark_work_unit_diagnostic_failed(
+                        ledger,
+                        &gate_state,
+                        &current,
+                        &pass.blocking_paths,
+                    )?;
+                    {
+                        let mut gate = gate_state.borrow_mut();
+                        gate.diagnostic_failed_paths = pass.blocking_paths.clone();
+                        gate.diagnostic_failure_feedback = Some(truncate_chars(&feedback, 8_000));
+                    }
+                    sink.emit(AgentEvent::Correction {
+                        message: feedback.clone(),
+                        summary: "Automatic language-server diagnostics need repair".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    messages.push(correction_chat_message(
+                        "Automatic language-server diagnostics need repair",
+                        &feedback,
+                    ));
+                } else if proactive_mode == lsp::ProactiveLspMode::Settled {
+                    let mut gate = gate_state.borrow_mut();
+                    gate.diagnostic_failed_paths.clear();
+                    gate.diagnostic_failure_feedback = None;
+                }
+            }
             if let Some(feedback) = run_work_unit_diagnostic_previews(
                 args,
                 command_backend,
@@ -6132,6 +6414,72 @@ fn run_agent_steps(
                     .is_none();
                     step += 1;
                     continue;
+                }
+                let proactive_scope = args
+                    .repository_context
+                    .as_ref()
+                    .map(crate::workspace::RepositoryContext::task_changed_paths)
+                    .transpose()?
+                    .map(|paths| paths.into_iter().collect::<BTreeSet<_>>())
+                    .or_else(|| {
+                        proactive_lsp.as_ref().map(|state| {
+                            state
+                                .borrow()
+                                .paths
+                                .keys()
+                                .cloned()
+                                .collect::<BTreeSet<_>>()
+                        })
+                    })
+                    .unwrap_or_default();
+                if let Some(proactive_lsp) = proactive_lsp.as_ref()
+                    && let Some(pass) = run_proactive_lsp_pass(
+                        lsp_registry,
+                        proactive_lsp,
+                        workspace_root,
+                        &proactive_scope,
+                        lsp::ProactiveLspMode::Settled,
+                        nesting_depth,
+                        sink,
+                        &mut metrics,
+                    )?
+                {
+                    if let Some(feedback) = pass.feedback {
+                        let mut gate = gate_state.borrow_mut();
+                        gate.diagnostic_failed_paths = pass.blocking_paths;
+                        gate.diagnostic_failure_feedback = Some(truncate_chars(&feedback, 8_000));
+                        drop(gate);
+                        sink.emit(AgentEvent::Correction {
+                            message: feedback.clone(),
+                            summary: "Automatic language-server diagnostics blocked handoff"
+                                .to_string(),
+                            actor: crate::events::TeamActor::workflow_steward(),
+                            assisting_profile: Some(args.profile),
+                            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                            timestamp_ms: Some(now_millis()),
+                        });
+                        if step >= effective_max_steps {
+                            return Ok(StepRunOutcome {
+                                reached_final: false,
+                                contract_status: incomplete_contract_status(args),
+                                verified_completed: false,
+                                termination_reason: TerminationReason::StepLimit,
+                                final_content: Some(content),
+                                metrics,
+                                gate_state: gate_state.into_inner(),
+                            });
+                        }
+                        messages.push(ChatMessage::text("assistant", output.clone()));
+                        messages.push(correction_chat_message(
+                            "Automatic language-server diagnostics blocked handoff",
+                            &feedback,
+                        ));
+                        step += 1;
+                        continue;
+                    }
+                    let mut gate = gate_state.borrow_mut();
+                    gate.diagnostic_failed_paths.clear();
+                    gate.diagnostic_failure_feedback = None;
                 }
                 let gate_feedback =
                     request_completion_gate_feedback(args, &gate_state.borrow(), workspace_root)?;
@@ -6761,6 +7109,63 @@ fn run_agent_steps(
         }
 
         if step == original_max_steps && args.workflow_stage.is_none() {
+            let proactive_scope = args
+                .repository_context
+                .as_ref()
+                .map(crate::workspace::RepositoryContext::task_changed_paths)
+                .transpose()?
+                .map(|paths| paths.into_iter().collect::<BTreeSet<_>>())
+                .or_else(|| {
+                    proactive_lsp.as_ref().map(|state| {
+                        state
+                            .borrow()
+                            .paths
+                            .keys()
+                            .cloned()
+                            .collect::<BTreeSet<_>>()
+                    })
+                })
+                .unwrap_or_default();
+            if let Some(proactive_lsp) = proactive_lsp.as_ref()
+                && let Some(pass) = run_proactive_lsp_pass(
+                    lsp_registry,
+                    proactive_lsp,
+                    workspace_root,
+                    &proactive_scope,
+                    lsp::ProactiveLspMode::Settled,
+                    nesting_depth,
+                    sink,
+                    &mut metrics,
+                )?
+            {
+                if let Some(feedback) = pass.feedback {
+                    let mut gate = gate_state.borrow_mut();
+                    gate.diagnostic_failed_paths = pass.blocking_paths;
+                    gate.diagnostic_failure_feedback = Some(truncate_chars(&feedback, 8_000));
+                    drop(gate);
+                    sink.emit(AgentEvent::Correction {
+                        message: feedback.clone(),
+                        summary: "Automatic language-server diagnostics blocked final grace"
+                            .to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    return Ok(StepRunOutcome {
+                        reached_final: false,
+                        contract_status: incomplete_contract_status(args),
+                        verified_completed: false,
+                        termination_reason: TerminationReason::StepLimit,
+                        final_content: Some(feedback),
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
+                let mut gate = gate_state.borrow_mut();
+                gate.diagnostic_failed_paths.clear();
+                gate.diagnostic_failure_feedback = None;
+            }
             let gate_feedback =
                 request_completion_gate_feedback(args, &gate_state.borrow(), workspace_root)?;
             if gate_feedback.is_none() {
@@ -9002,6 +9407,40 @@ fn grant_work_unit_progress_turn(
     Ok(())
 }
 
+fn mark_work_unit_diagnostic_failed(
+    ledger: &mut crate::workflow::WorkUnitLedger,
+    gate_state: &RefCell<GateState>,
+    current: &crate::workspace::ContentSnapshot,
+    focused_paths: &BTreeSet<String>,
+) -> Result<()> {
+    if focused_paths.is_empty() {
+        return Ok(());
+    }
+    ledger.mark_diagnostic_failed(focused_paths.iter().cloned(), current)?;
+    {
+        let mut gate = gate_state.borrow_mut();
+        gate.stage_evidence
+            .entries
+            .retain(|entry| !focused_paths.contains(&entry.path));
+        gate.stage_evidence
+            .controller_observations
+            .retain(|receipt| !focused_paths.contains(&receipt.path));
+        for path in focused_paths {
+            gate.read_paths.remove(path);
+            gate.read_content_fingerprints.remove(path);
+            gate.contract_read_evidence.remove(path);
+        }
+    }
+    let exact_evidence_paths = gate_state
+        .borrow()
+        .stage_evidence
+        .mutation_evidence_paths()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    ledger.reconcile(current, &exact_evidence_paths)?;
+    Ok(())
+}
+
 fn run_work_unit_diagnostic_previews(
     args: &AgentRequest,
     command_backend: Option<&CommandBackend>,
@@ -9085,28 +9524,7 @@ fn run_work_unit_diagnostic_previews(
         bail!("diagnostic preview mutated the controlled workspace");
     }
     if !focused_paths.is_empty() {
-        ledger.mark_diagnostic_failed(focused_paths.iter().cloned(), &current)?;
-        {
-            let mut gate = gate_state.borrow_mut();
-            gate.stage_evidence
-                .entries
-                .retain(|entry| !focused_paths.contains(&entry.path));
-            gate.stage_evidence
-                .controller_observations
-                .retain(|receipt| !focused_paths.contains(&receipt.path));
-            for path in &focused_paths {
-                gate.read_paths.remove(path);
-                gate.read_content_fingerprints.remove(path);
-                gate.contract_read_evidence.remove(path);
-            }
-        }
-        let exact_evidence_paths = gate_state
-            .borrow()
-            .stage_evidence
-            .mutation_evidence_paths()
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>();
-        ledger.reconcile(&current, &exact_evidence_paths)?;
+        mark_work_unit_diagnostic_failed(ledger, gate_state, &current, &focused_paths)?;
     }
     let mut gate = gate_state.borrow_mut();
     gate.diagnostic_preview_fingerprint = Some(current.fingerprint);
@@ -29082,6 +29500,158 @@ the next imagined action"#;
                 .unwrap()
                 .contains("review")
         );
+    }
+
+    #[test]
+    fn proactive_lsp_state_checks_each_content_version_at_syntax_and_settled_boundaries() {
+        let baseline = crate::workspace::ContentSnapshot {
+            fingerprint: "baseline".to_string(),
+            paths: BTreeMap::new(),
+        };
+        let current = crate::workspace::ContentSnapshot {
+            fingerprint: "workspace-v1".to_string(),
+            paths: BTreeMap::from([(
+                "src/lib.rs".to_string(),
+                crate::workspace::PathContent {
+                    kind: "file".to_string(),
+                    fingerprint: "path-v1".to_string(),
+                },
+            )]),
+        };
+        let mut state = ProactiveLspState {
+            previous: baseline,
+            paths: BTreeMap::new(),
+        };
+        state.observe_snapshot(current.clone());
+        let scope = BTreeSet::from(["src/lib.rs".to_string()]);
+        assert_eq!(
+            state.candidates(&scope, lsp::ProactiveLspMode::Syntax),
+            vec!["src/lib.rs"]
+        );
+        state.record(&lsp::ProactiveLspReport {
+            mode: lsp::ProactiveLspMode::Syntax,
+            workspace_fingerprint: current.fingerprint.clone(),
+            requested_paths: vec!["src/lib.rs".to_string()],
+            scanned_paths: vec!["src/lib.rs".to_string()],
+            diagnostics: Vec::new(),
+            suppressed_diagnostics: 0,
+            omitted_paths: 0,
+            failures: Vec::new(),
+            stale: false,
+        });
+        assert!(
+            state
+                .candidates(&scope, lsp::ProactiveLspMode::Syntax)
+                .is_empty()
+        );
+        assert_eq!(
+            state.candidates(&scope, lsp::ProactiveLspMode::Settled),
+            vec!["src/lib.rs"]
+        );
+
+        let changed = crate::workspace::ContentSnapshot {
+            fingerprint: "workspace-v2".to_string(),
+            paths: BTreeMap::from([(
+                "src/lib.rs".to_string(),
+                crate::workspace::PathContent {
+                    kind: "file".to_string(),
+                    fingerprint: "path-v2".to_string(),
+                },
+            )]),
+        };
+        state.observe_snapshot(changed);
+        state.record(&lsp::ProactiveLspReport {
+            mode: lsp::ProactiveLspMode::Settled,
+            workspace_fingerprint: "workspace-v2".to_string(),
+            requested_paths: vec!["src/lib.rs".to_string()],
+            scanned_paths: vec!["src/lib.rs".to_string()],
+            diagnostics: Vec::new(),
+            suppressed_diagnostics: 0,
+            omitted_paths: 0,
+            failures: Vec::new(),
+            stale: true,
+        });
+        assert_eq!(
+            state.candidates(&scope, lsp::ProactiveLspMode::Syntax),
+            vec!["src/lib.rs"]
+        );
+    }
+
+    #[test]
+    fn unavailable_proactive_lsp_is_visible_trinity_evidence_and_does_not_block() {
+        let repo = init_contract_test_repo();
+        let request = test_agent_request(AgentProfile::Build, 256);
+        let state = RefCell::new(ProactiveLspState::new(&request, repo.path()).unwrap());
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n",
+        )
+        .unwrap();
+        let registry = lsp::discover_tools(
+            BTreeMap::from([(
+                "rust-analyzer".to_string(),
+                crate::lsp::LspServerConfig {
+                    command: Some("/definitely/missing/pb-test-rust-analyzer".to_string()),
+                    language_ids: vec!["rust".to_string()],
+                    ..crate::lsp::LspServerConfig::default()
+                },
+            )]),
+            repo.path(),
+        );
+        let mut sink = CapturingWorkflowSink::default();
+        let mut metrics = RunMetrics::default();
+
+        let pass = run_proactive_lsp_pass(
+            &registry,
+            &state,
+            repo.path(),
+            &BTreeSet::from(["src/lib.rs".to_string()]),
+            lsp::ProactiveLspMode::Settled,
+            0,
+            &mut sink,
+            &mut metrics,
+        )
+        .unwrap()
+        .expect("the supported changed path should produce a pass");
+
+        assert!(pass.feedback.is_none());
+        assert!(pass.blocking_paths.is_empty());
+        assert_eq!(metrics.tool_calls, 1);
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCall {
+                tool,
+                actor: Some(crate::events::TeamActor::Automation(
+                    crate::events::AutomationActor::Trinity
+                )),
+                ..
+            } if tool == lsp::PROACTIVE_LSP_TOOL_NAME
+        )));
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TeamMessage {
+                actor: crate::events::TeamActor::Automation(
+                    crate::events::AutomationActor::Trinity
+                ),
+                tone: crate::events::TeamMessageTone::Warning,
+                ..
+            }
+        )));
+        let report = sink
+            .events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { tool, result, .. }
+                    if tool == lsp::PROACTIVE_LSP_TOOL_NAME =>
+                {
+                    Some(serde_json::from_str::<lsp::ProactiveLspReport>(result).unwrap())
+                }
+                _ => None,
+            })
+            .expect("the automatic pass should retain its structured result");
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.failures.len(), 1);
     }
 
     #[test]

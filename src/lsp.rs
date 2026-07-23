@@ -17,6 +17,14 @@ const MAX_LSP_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LSP_OPEN_DOCUMENTS: usize = 256;
 const LSP_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const LSP_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
+const PROACTIVE_LSP_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
+const PROACTIVE_LSP_PASS_TIMEOUT: Duration = Duration::from_secs(12);
+const MAX_PROACTIVE_LSP_PATHS: usize = 8;
+const MAX_PROACTIVE_LSP_CALLS: usize = 8;
+const MAX_PROACTIVE_LSP_DIAGNOSTICS: usize = 64;
+const MAX_PROACTIVE_LSP_MESSAGE_CHARS: usize = 500;
+
+pub const PROACTIVE_LSP_TOOL_NAME: &str = "lsp_proactive_diagnostics";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -90,6 +98,84 @@ pub enum LspOperation {
     DocumentSymbols,
     WorkspaceSymbols,
     Diagnostics,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ProactiveLspMode {
+    Syntax,
+    Settled,
+}
+
+impl ProactiveLspMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Syntax => "syntax",
+            Self::Settled => "settled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProactiveLspDiagnostic {
+    pub server: String,
+    pub path: String,
+    pub path_fingerprint: String,
+    pub line: u64,
+    pub character: u64,
+    pub severity: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProactiveLspFailure {
+    pub server: String,
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProactiveLspReport {
+    pub mode: ProactiveLspMode,
+    pub workspace_fingerprint: String,
+    pub requested_paths: Vec<String>,
+    pub scanned_paths: Vec<String>,
+    pub diagnostics: Vec<ProactiveLspDiagnostic>,
+    pub suppressed_diagnostics: usize,
+    #[serde(default)]
+    pub omitted_paths: usize,
+    pub failures: Vec<ProactiveLspFailure>,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProactiveLspPathSelection {
+    pub paths: Vec<String>,
+    pub omitted_paths: usize,
+}
+
+impl ProactiveLspReport {
+    pub fn blocking_paths(&self) -> BTreeSet<String> {
+        self.diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.path.clone())
+            .collect()
+    }
+
+    pub fn completed_paths(&self) -> BTreeSet<String> {
+        self.scanned_paths
+            .iter()
+            .cloned()
+            .chain(
+                self.failures
+                    .iter()
+                    .filter(|failure| failure.path != ".")
+                    .map(|failure| failure.path.clone()),
+            )
+            .collect()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -333,6 +419,22 @@ pub fn call_tool(
     tool_name: &str,
     arguments: &Value,
 ) -> Result<String> {
+    call_tool_with_diagnostic_timeout(
+        registry,
+        workspace_root,
+        tool_name,
+        arguments,
+        LSP_DIAGNOSTIC_TIMEOUT,
+    )
+}
+
+fn call_tool_with_diagnostic_timeout(
+    registry: &LspToolRegistry,
+    workspace_root: &Path,
+    tool_name: &str,
+    arguments: &Value,
+    diagnostic_timeout: Duration,
+) -> Result<String> {
     let spec = registry
         .tool(tool_name)
         .with_context(|| format!("unknown LSP tool: {tool_name}"))?;
@@ -346,7 +448,12 @@ pub fn call_tool(
     let mut client = session
         .lock()
         .map_err(|_| anyhow!("LSP session for {} is poisoned", spec.server_name))?;
-    match client.call(spec.operation, workspace_root, arguments) {
+    match client.call_with_diagnostic_timeout(
+        spec.operation,
+        workspace_root,
+        arguments,
+        diagnostic_timeout,
+    ) {
         Ok(result) => Ok(result),
         Err(first_error) => {
             if !recoverable_transport_error(&first_error) {
@@ -366,8 +473,266 @@ pub fn call_tool(
             .with_context(|| {
                 format!("LSP request failed ({first_error:#}) and the bounded restart also failed")
             })?;
-            client.call(spec.operation, workspace_root, arguments)
+            client.call_with_diagnostic_timeout(
+                spec.operation,
+                workspace_root,
+                arguments,
+                diagnostic_timeout,
+            )
         }
+    }
+}
+
+pub fn proactive_diagnostics(
+    registry: &LspToolRegistry,
+    workspace_root: &Path,
+    paths: impl IntoIterator<Item = String>,
+    mode: ProactiveLspMode,
+) -> Result<ProactiveLspReport> {
+    let before = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let requested_paths = paths
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(MAX_PROACTIVE_LSP_PATHS)
+        .collect::<Vec<_>>();
+    let mut report = ProactiveLspReport {
+        mode,
+        workspace_fingerprint: before.fingerprint.clone(),
+        requested_paths: requested_paths.clone(),
+        scanned_paths: Vec::new(),
+        diagnostics: Vec::new(),
+        suppressed_diagnostics: 0,
+        omitted_paths: 0,
+        failures: Vec::new(),
+        stale: false,
+    };
+    let started = Instant::now();
+    let mut calls = 0usize;
+
+    'paths: for path in requested_paths {
+        let Some(path_state) = before.paths.get(&path) else {
+            continue;
+        };
+        if path_state.kind != "file" {
+            continue;
+        }
+        let Some(language_id) = inferred_language_id(Path::new(&path)) else {
+            continue;
+        };
+        let matching_servers = registry
+            .servers
+            .iter()
+            .filter(|(_, config)| {
+                config
+                    .language_ids
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(language_id))
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for server in matching_servers {
+            if calls >= MAX_PROACTIVE_LSP_CALLS || started.elapsed() >= PROACTIVE_LSP_PASS_TIMEOUT {
+                break 'paths;
+            }
+            calls = calls.saturating_add(1);
+            let Some(spec) = registry.tools.values().find(|spec| {
+                spec.server_name == server && spec.operation == LspOperation::Diagnostics
+            }) else {
+                report.failures.push(ProactiveLspFailure {
+                    server: server.clone(),
+                    path: path.clone(),
+                    message: "diagnostics operation is unavailable".to_string(),
+                });
+                continue;
+            };
+            if let Some(error) = spec.status_error.as_deref() {
+                report.failures.push(ProactiveLspFailure {
+                    server: server.clone(),
+                    path: path.clone(),
+                    message: bounded_proactive_text(error),
+                });
+                continue;
+            }
+            let result = call_tool_with_diagnostic_timeout(
+                registry,
+                workspace_root,
+                &spec.tool_name,
+                &json!({"path": path.clone()}),
+                PROACTIVE_LSP_DIAGNOSTIC_TIMEOUT,
+            );
+            match result {
+                Ok(result) => {
+                    if !report.scanned_paths.contains(&path) {
+                        report.scanned_paths.push(path.clone());
+                    }
+                    let decoded: Value = match serde_json::from_str(&result) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            report.failures.push(ProactiveLspFailure {
+                                server: server.clone(),
+                                path: path.clone(),
+                                message: format!("invalid diagnostics response: {error}"),
+                            });
+                            continue;
+                        }
+                    };
+                    let Some(diagnostics) = decoded.as_array() else {
+                        report.failures.push(ProactiveLspFailure {
+                            server: server.clone(),
+                            path: path.clone(),
+                            message: "diagnostics response was not an array".to_string(),
+                        });
+                        continue;
+                    };
+                    for diagnostic in diagnostics {
+                        let Some(normalized) = normalize_proactive_diagnostic(
+                            &server,
+                            &path,
+                            &path_state.fingerprint,
+                            diagnostic,
+                        ) else {
+                            report.suppressed_diagnostics =
+                                report.suppressed_diagnostics.saturating_add(1);
+                            continue;
+                        };
+                        let admitted = match mode {
+                            ProactiveLspMode::Syntax => {
+                                proactive_diagnostic_is_syntax(diagnostic, &normalized)
+                            }
+                            ProactiveLspMode::Settled => normalized.severity == 1,
+                        };
+                        if !admitted || report.diagnostics.len() >= MAX_PROACTIVE_LSP_DIAGNOSTICS {
+                            report.suppressed_diagnostics =
+                                report.suppressed_diagnostics.saturating_add(1);
+                            continue;
+                        }
+                        report.diagnostics.push(normalized);
+                    }
+                }
+                Err(error) => report.failures.push(ProactiveLspFailure {
+                    server: server.clone(),
+                    path: path.clone(),
+                    message: bounded_proactive_text(&format!("{error:#}")),
+                }),
+            }
+        }
+    }
+
+    let after = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    if after.fingerprint != before.fingerprint {
+        report.stale = true;
+        report.diagnostics.clear();
+        report.failures.push(ProactiveLspFailure {
+            server: "pb".to_string(),
+            path: ".".to_string(),
+            message:
+                "workspace content changed during proactive LSP collection; all diagnostics were discarded"
+                    .to_string(),
+        });
+    }
+    report.scanned_paths.sort();
+    report.scanned_paths.dedup();
+    report.diagnostics.sort();
+    report.diagnostics.dedup();
+    report.failures.sort();
+    report.failures.dedup();
+    Ok(report)
+}
+
+pub fn proactive_supported_paths(
+    registry: &LspToolRegistry,
+    paths: impl IntoIterator<Item = String>,
+) -> ProactiveLspPathSelection {
+    let supported = paths
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| {
+            inferred_language_id(Path::new(path)).is_some_and(|language_id| {
+                registry.servers.values().any(|config| {
+                    config
+                        .language_ids
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(language_id))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    ProactiveLspPathSelection {
+        omitted_paths: supported.len().saturating_sub(MAX_PROACTIVE_LSP_PATHS),
+        paths: supported
+            .into_iter()
+            .take(MAX_PROACTIVE_LSP_PATHS)
+            .collect(),
+    }
+}
+
+fn normalize_proactive_diagnostic(
+    server: &str,
+    path: &str,
+    path_fingerprint: &str,
+    diagnostic: &Value,
+) -> Option<ProactiveLspDiagnostic> {
+    let message = diagnostic.get("message")?.as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let severity = diagnostic.get("severity").and_then(Value::as_u64)?;
+    let start = diagnostic.pointer("/range/start")?;
+    let line = start.get("line").and_then(Value::as_u64)?.saturating_add(1);
+    let character = start.get("character").and_then(Value::as_u64).unwrap_or(0);
+    let code = diagnostic.get("code").and_then(|value| match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    });
+    Some(ProactiveLspDiagnostic {
+        server: server.to_string(),
+        path: path.to_string(),
+        path_fingerprint: path_fingerprint.to_string(),
+        line,
+        character,
+        severity,
+        code,
+        message: bounded_proactive_text(message),
+    })
+}
+
+fn proactive_diagnostic_is_syntax(raw: &Value, diagnostic: &ProactiveLspDiagnostic) -> bool {
+    if diagnostic.severity != 1 {
+        return false;
+    }
+    let code = diagnostic
+        .code
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let source = raw
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    code.contains("syntax")
+        || code.contains("parse")
+        || source.contains("parser")
+        || diagnostic
+            .message
+            .to_ascii_lowercase()
+            .contains("syntax error")
+}
+
+fn bounded_proactive_text(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_PROACTIVE_LSP_MESSAGE_CHARS {
+        normalized
+    } else {
+        let mut bounded = normalized
+            .chars()
+            .take(MAX_PROACTIVE_LSP_MESSAGE_CHARS.saturating_sub(1))
+            .collect::<String>();
+        bounded.push('…');
+        bounded
     }
 }
 
@@ -613,7 +978,13 @@ impl LspClient {
         Ok(client)
     }
 
-    fn call(&mut self, op: LspOperation, workspace_root: &Path, args: &Value) -> Result<String> {
+    fn call_with_diagnostic_timeout(
+        &mut self,
+        op: LspOperation,
+        workspace_root: &Path,
+        args: &Value,
+        diagnostic_timeout: Duration,
+    ) -> Result<String> {
         match op {
             LspOperation::WorkspaceSymbols => self.request_text(
                 "workspace/symbol",
@@ -628,7 +999,9 @@ impl LspClient {
             }
             LspOperation::Diagnostics => {
                 let document = self.open_document(workspace_root, args)?;
-                Ok(self.wait_for_diagnostics(&document)?.to_string())
+                Ok(self
+                    .wait_for_diagnostics(&document, diagnostic_timeout)?
+                    .to_string())
             }
             LspOperation::Hover => {
                 self.position_request(workspace_root, args, "textDocument/hover")
@@ -721,8 +1094,12 @@ impl LspClient {
         Ok(OpenDocumentState { uri, version })
     }
 
-    fn wait_for_diagnostics(&mut self, document: &OpenDocumentState) -> Result<Value> {
-        let deadline = Instant::now() + LSP_DIAGNOSTIC_TIMEOUT;
+    fn wait_for_diagnostics(
+        &mut self,
+        document: &OpenDocumentState,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(snapshot) = self.diagnostics.get(&document.uri)
                 && diagnostic_snapshot_is_fresh(snapshot, document.version)
@@ -998,7 +1375,20 @@ fn language_id_for_path(path: &Path, configured: &[String]) -> String {
     if configured.len() == 1 {
         return configured[0].clone();
     }
-    let inferred = match path.extension().and_then(|extension| extension.to_str()) {
+    let inferred = inferred_language_id(path);
+    inferred
+        .and_then(|inferred| {
+            configured
+                .iter()
+                .find(|candidate| candidate.eq_ignore_ascii_case(inferred))
+                .cloned()
+        })
+        .or_else(|| configured.first().cloned())
+        .unwrap_or_else(|| inferred.unwrap_or("plaintext").to_string())
+}
+
+fn inferred_language_id(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|extension| extension.to_str()) {
         Some("rs") => Some("rust"),
         Some("ts") => Some("typescript"),
         Some("tsx") => Some("typescriptreact"),
@@ -1016,16 +1406,7 @@ fn language_id_for_path(path: &Path, configured: &[String]) -> String {
         Some("html") => Some("html"),
         Some("css") => Some("css"),
         _ => None,
-    };
-    inferred
-        .and_then(|inferred| {
-            configured
-                .iter()
-                .find(|candidate| candidate.eq_ignore_ascii_case(inferred))
-                .cloned()
-        })
-        .or_else(|| configured.first().cloned())
-        .unwrap_or_else(|| inferred.unwrap_or("plaintext").to_string())
+    }
 }
 
 fn unique_tool_name(server: &str, op: &str) -> String {
@@ -1139,6 +1520,91 @@ mod tests {
         };
         assert!(!diagnostic_snapshot_is_fresh(&stale, 2));
         assert!(diagnostic_snapshot_is_fresh(&current, 2));
+    }
+
+    #[test]
+    fn proactive_syntax_mode_admits_only_error_parse_diagnostics() {
+        let syntax = json!({
+            "range": {"start": {"line": 3, "character": 7}, "end": {"line": 3, "character": 8}},
+            "severity": 1,
+            "code": "syntax-error",
+            "source": "rust-analyzer",
+            "message": "expected expression"
+        });
+        let semantic = json!({
+            "range": {"start": {"line": 4, "character": 0}, "end": {"line": 4, "character": 3}},
+            "severity": 1,
+            "code": "unresolved-ident",
+            "source": "rust-analyzer",
+            "message": "unresolved identifier"
+        });
+        let warning = json!({
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 3}},
+            "severity": 2,
+            "code": "syntax-warning",
+            "source": "rust-analyzer",
+            "message": "warning"
+        });
+
+        let normalized = normalize_proactive_diagnostic(
+            "rust-analyzer",
+            "src/lib.rs",
+            "path-fingerprint",
+            &syntax,
+        )
+        .unwrap();
+        assert_eq!(normalized.line, 4);
+        assert!(proactive_diagnostic_is_syntax(&syntax, &normalized));
+        let normalized = normalize_proactive_diagnostic(
+            "rust-analyzer",
+            "src/lib.rs",
+            "path-fingerprint",
+            &semantic,
+        )
+        .unwrap();
+        assert!(!proactive_diagnostic_is_syntax(&semantic, &normalized));
+        let normalized = normalize_proactive_diagnostic(
+            "rust-analyzer",
+            "src/lib.rs",
+            "path-fingerprint",
+            &warning,
+        )
+        .unwrap();
+        assert!(!proactive_diagnostic_is_syntax(&warning, &normalized));
+    }
+
+    #[test]
+    fn proactive_path_selection_is_language_bound_and_bounded() {
+        let registry = LspToolRegistry {
+            servers: BTreeMap::from([(
+                "rust-analyzer".to_string(),
+                LspServerConfig {
+                    language_ids: vec!["rust".to_string()],
+                    command: Some("rust-analyzer".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let mut paths = (0..12)
+            .map(|index| format!("src/module_{index}.rs"))
+            .collect::<Vec<_>>();
+        paths.push("README.md".to_string());
+
+        let selected = proactive_supported_paths(&registry, paths);
+
+        assert_eq!(selected.paths.len(), MAX_PROACTIVE_LSP_PATHS);
+        assert_eq!(selected.omitted_paths, 4);
+        assert!(selected.paths.iter().all(|path| path.ends_with(".rs")));
+        assert!(!selected.paths.contains(&"README.md".to_string()));
+    }
+
+    #[test]
+    fn proactive_text_is_single_line_and_bounded() {
+        let bounded = bounded_proactive_text(&format!("first\n{}", "x".repeat(800)));
+        assert!(!bounded.contains('\n'));
+        assert_eq!(bounded.chars().count(), MAX_PROACTIVE_LSP_MESSAGE_CHARS);
+        assert!(bounded.ends_with('…'));
     }
 
     #[test]

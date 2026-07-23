@@ -86,13 +86,19 @@ Model pulls and application updates are user-invoked network operations. Downloa
 runtime artifacts remain local for reuse after the operation.
 
 Opening integration discovery queries the fixed public `crunchy-pb` GitHub organization;
-configuring a selected package reads its container metadata from the registry. Installing or
-locally building an LSP package pulls its image or pinned base layers. Those requests disclose the
+configuring a selected package reads its container metadata from the registry. Installing an LSP
+package pulls its published image. Those requests disclose the
 requested public package name and the ordinary network metadata of a download, but no repository
 source or prompt content. Downloaded
 images remain local reusable artifacts. At task runtime, packaged LSP networking is independently
 controlled by its validated service capability; the rust-analyzer package uses an internal network
 without egress and performs Cargo analysis offline.
+
+Once configured, proactive diagnostics stay on the same local path: pb sends bounded current file
+content to the session-owned LSP over stdio and records a bounded local report in the normal task
+event stream. No prompt, source, or diagnostic is sent to the package registry or an external LSP
+service. The read-only workspace mount, offline Cargo configuration, and no-egress service network
+remain in force; pb does not apply server-proposed edits or commands.
 
 ### Public research
 

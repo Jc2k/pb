@@ -1264,9 +1264,16 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
                 .as_deref()
                 .map(IntegrationKind::parse)
                 .transpose()?;
-            let installed = integrations::list_project_installed(&root)?;
+            let mut installed = integrations::list_project_installed(&root)?;
+            installed.extend(integrations::list_global_lsp_installed()?);
+            installed.sort_by(|left, right| {
+                left.kind
+                    .as_str()
+                    .cmp(right.kind.as_str())
+                    .then(left.name.cmp(&right.name))
+            });
             if installed.is_empty() {
-                println!("no project integrations installed");
+                println!("no integrations installed");
             } else {
                 for item in installed
                     .iter()
@@ -1311,8 +1318,9 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
                 && lsp_manifest.is_none()
                 && integrations::is_marketplace_container_image(&args.container_image)
             {
-                lsp_manifest =
-                    integrations::fetch_config_schema(&args.container_image)?.lsp_manifest;
+                lsp_manifest = fetch_integration_config_schema(args.container_image.clone())
+                    .await?
+                    .lsp_manifest;
             }
             let request = IntegrationInstallRequest {
                 kind,
@@ -1353,6 +1361,14 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn fetch_integration_config_schema(
+    container_image: String,
+) -> Result<integrations::IntegrationConfigSchema> {
+    tokio::task::spawn_blocking(move || integrations::fetch_config_schema(&container_image))
+        .await
+        .context("integration metadata worker stopped unexpectedly")?
 }
 
 async fn run_mcp_command(command: McpCommand) -> Result<()> {
@@ -4305,17 +4321,15 @@ mod tests {
     }
 
     #[test]
-    fn integrations_add_accepts_a_local_lsp_package_manifest() {
+    fn integrations_add_accepts_the_marketplace_lsp_without_local_scaffolding() {
         let parsed = Cli::try_parse_from([
             "pb",
             "integrations",
             "add",
             "lsp",
-            "pb/rust-analyzer-lsp:dev",
+            "ghcr.io/crunchy-pb/lsp-rust-analyzer:latest",
             "--name",
             "rust-analyzer",
-            "--manifest",
-            "packages/rust-analyzer-lsp/pb-lsp.json",
         ])
         .unwrap();
 
@@ -4326,11 +4340,18 @@ mod tests {
             panic!("expected integrations add command");
         };
         assert_eq!(args.kind, "lsp");
-        assert_eq!(
-            args.manifest,
-            Some(PathBuf::from("packages/rust-analyzer-lsp/pb-lsp.json"))
-        );
+        assert_eq!(args.manifest, None);
         assert_eq!(args.runtime, None);
+    }
+
+    #[tokio::test]
+    async fn integration_metadata_fetch_isolated_from_the_async_runtime() {
+        let error = fetch_integration_config_schema(String::new())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("container image cannot be empty"), "{error}");
     }
 
     #[test]

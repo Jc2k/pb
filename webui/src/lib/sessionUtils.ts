@@ -74,6 +74,37 @@ export function getToolDetail(
       return (args.url as string) || "(no url)";
     case "run_command":
       return (args.cmd as string) || "(no cmd)";
+    case "lsp_proactive_diagnostics": {
+      const mode = typeof args.mode === "string" ? args.mode : "automatic";
+      const requested = Array.isArray(args.paths) ? args.paths.length : 0;
+      if (!toolResult || toolResult.event.type !== "tool_result") {
+        return `${mode} · ${requested} ${requested === 1 ? "file" : "files"} (pending)`;
+      }
+      try {
+        const report = JSON.parse(toolResult.event.result) as {
+          scanned_paths?: unknown[];
+          diagnostics?: unknown[];
+          failures?: unknown[];
+          omitted_paths?: number;
+          stale?: boolean;
+        };
+        const scanned = report.scanned_paths?.length || 0;
+        const diagnostics = report.diagnostics?.length || 0;
+        const failures = report.failures?.length || 0;
+        const omitted = report.omitted_paths || 0;
+        if (report.stale) return `${mode} · stale evidence discarded`;
+        if (diagnostics > 0) {
+          return `${mode} · ${diagnostics} blocking ${diagnostics === 1 ? "diagnostic" : "diagnostics"} in ${scanned} ${scanned === 1 ? "file" : "files"}${omitted > 0 ? ` · ${omitted} deferred` : ""}`;
+        }
+        if (failures > 0) {
+          return `${mode} · ${scanned}/${requested} files · ${failures} ${failures === 1 ? "server issue" : "server issues"}${omitted > 0 ? ` · ${omitted} deferred` : ""}`;
+        }
+        if (omitted > 0) return `${mode} · ${scanned} files · ${omitted} deferred`;
+        return `${mode} · ${scanned} ${scanned === 1 ? "file" : "files"} · clean`;
+      } catch {
+        return `${mode} · ${requested} ${requested === 1 ? "file" : "files"}`;
+      }
+    }
     case "skill_search": {
       const query = args.query as string;
       if (!query) return "";

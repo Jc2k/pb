@@ -119,6 +119,17 @@ Only an operator-declared read-only tool that the server also marks idempotent c
 only after a typed transport failure. LSP restarts follow the same typed transport boundary;
 protocol/application errors do not trigger blind replay.
 
+Configured LSP diagnostics are also proactive controller inputs. pb selects only changed accepted
+task paths whose inferred language matches a configured server; the model cannot expand that
+selection. Mid-implementation collection admits only error-severity diagnostics identified as
+syntax/parser failures, while settled collection admits error severity only. Passes have path,
+call, time, result-count, and message-size ceilings. Every diagnostic records workspace, path, and
+content identity, and a workspace change during collection discards the whole result. Server
+startup, transport, timeout, and response failures remain visible advisory failures and cannot
+mint check evidence or bypass configured checks. A blocking current result can grant only
+exact-path repair focus after older read/stage evidence is invalidated. pb never executes LSP
+workspace edits, commands, formatting, or code actions.
+
 Marketplace LSP metadata is also untrusted input. Registry manifests, image configurations, and
 authentication responses have byte ceilings; the typed LSP package annotation has its own 64 KiB
 ceiling and rejects unknown fields, unsupported versions, invalid identifiers, and excessive list

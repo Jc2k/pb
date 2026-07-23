@@ -119,6 +119,15 @@ completion. Its result is repair feedback, not acceptance evidence: required che
 typed implementation artifact, and only that authoritative run can satisfy checking, review,
 commit, or verified completion.
 
+Configured LSPs add an intrinsic diagnostic contract. pb automatically inspects supported changed
+task paths: syntax-classified errors during partial implementation and all error-severity
+diagnostics once work is settled or being handed off. Reports are bound to the current workspace
+and path fingerprints; concurrent mutation discards them. A blocking report invalidates older read
+and staging evidence for only the exact reported paths and requires a fresh read before repair.
+Clean, failed, timed-out, or unavailable LSP evidence never satisfies a named check, review,
+commit, completion claim, or Goal criterion. The model may still call manual read-only LSP tools
+for targeted questions, but it is not responsible for triggering the proactive contract.
+
 ## Evidence contract
 
 A change-bearing Ready build carries evidence that is current for the managed commit:
@@ -162,6 +171,11 @@ Tool failures preserve the distinction too. Command timeout, user cancellation, 
 bounded output are structured results. MCP/LSP transport failures are distinct from remote
 application errors, so an application failure cannot cause an unsafe automatic replay. Oversized
 inputs and responses fail explicitly rather than being presented as complete evidence.
+
+Automatic LSP failures are fail-open only with respect to this advisory pre-check: Trinity records
+the incomplete evidence and the normal configured checks remain authoritative. Current blocking
+diagnostics are fail-closed for handoff until repaired or the bounded workflow stops. pb does not
+apply a language server's edits, commands, formatting, or code actions.
 
 Budgets apply across retries and advisors. Recovery can help express an allowed action, but it does
 not erase usage, broaden authority, or turn a partial result into success.

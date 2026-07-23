@@ -392,23 +392,28 @@ networking, or make the workspace writable. Marketplace LSP installation fails w
 is absent or invalid; the web UI reports the missing contract instead of offering an unconfigured
 install.
 
-The first package is provided as a repo-shaped local scaffold at
-`packages/rust-analyzer-lsp/`. It is not a marketplace entry until that directory is published as
-the `crunchy-pb/rust-analyzer-lsp` repository with the `lsp` topic. Build and install it locally with:
+The rust-analyzer package is published by the `crunchy-pb/lsp-rust-analyzer` marketplace repository.
+Install it from the web integration store or from the CLI; pb reads and validates the embedded
+manifest, so no local manifest or package checkout is required:
 
 ```bash
-packages/rust-analyzer-lsp/scripts/build-local.sh
-pb integrations add lsp pb/rust-analyzer-lsp:dev \
-  --name rust-analyzer \
-  --manifest packages/rust-analyzer-lsp/pb-lsp.json
+pb integrations add lsp ghcr.io/crunchy-pb/lsp-rust-analyzer:latest \
+  --name rust-analyzer
 ```
 
-The local manifest and the manifest embedded by the publishing workflow are the same file. The
-rust-analyzer profile mounts the workspace read-only, runs without egress, disables dependency
+The rust-analyzer profile mounts the workspace read-only, runs without egress, disables dependency
 fetching, check-on-save, build scripts, procedural macros, cache priming, and automatic Cargo
 reload, and leaves settled-state compilation and tests to pb's checks. Its packaged Rust toolchain
 is a stable baseline, not a promise that projects pinned to another compiler receive exact semantic
 parity.
+
+After configuration, pb uses the server automatically for changed Rust task paths. During partial
+implementation it surfaces only syntax/parser errors; at a settled work boundary and before
+handoff it surfaces current error diagnostics. The web transcript shows this as Trinity inspecting
+language diagnostics, with the Actions drawer retaining the structured result. These passes are
+bounded repair hints, not substitutes for configured checks, code review, or the managed commit.
+An unavailable or timed-out server is reported and pb continues to the ordinary checks. pb never
+applies language-server edits, commands, formatting, or code actions.
 
 The `--runtime` install argument is optional and normally should be omitted. An integration without
 that field follows the runtime that owns each task session. Supplying it retains an exact

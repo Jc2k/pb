@@ -156,6 +156,35 @@ Deno.test("groupActionEvents separates profile and steward actions", () => {
   equal((grouped[2] as { assistingProfile: string }).assistingProfile, "build");
 });
 
+Deno.test("groupActionEvents presents proactive LSP work as Trinity's routine action", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "1",
+      event: {
+        type: "tool_call",
+        tool: "lsp_proactive_diagnostics",
+        arguments: { mode: "syntax", paths: ["src/lib.rs"] },
+        actor: { kind: "automation", id: "trinity" },
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "tool_result",
+        tool: "lsp_proactive_diagnostics",
+        result: JSON.stringify({ diagnostics: [] }),
+        actor: { kind: "automation", id: "trinity" },
+      },
+    },
+  ];
+
+  const grouped = groupActionEvents(events);
+  equal(grouped.length, 1);
+  equal((grouped[0] as { actor: { id: string } }).actor.id, "trinity");
+  equal((grouped[0] as { toolCalls: EventEnvelope[] }).toolCalls.length, 1);
+  equal((grouped[0] as { toolResults: EventEnvelope[] }).toolResults.length, 1);
+});
+
 Deno.test("projectSettingsPath encodes project names under the project URL", () => {
   equal(projectSettingsPath("my project"), "/projects/my%20project/settings");
   equal(projectSettingsPath("owner/repo"), "/projects/owner%2Frepo/settings");

@@ -62,6 +62,15 @@ The build profile receives the accepted plan and mutation capabilities. It can u
 configured tasks and checks, or a journaled command escape hatch. It submits an implementation
 artifact that identifies what changed and the evidence it produced. It never receives `git_commit`.
 
+When a configured language server supports a changed accepted task path, pb proactively requests
+diagnostics without waiting for the model to choose an LSP tool. While implementation is still in
+progress, the syntax pass admits only error-severity diagnostics identified as parser or syntax
+failures, avoiding expected semantic noise from half-finished code. Once the work-unit ledger is
+structurally complete, pb ensures the current content version has received a settled pass before a
+direct handoff or final-grace path; unchanged versions are deduplicated. That pass admits current
+error diagnostics. A blocking result reopens only its exact current task paths for repair. It does
+not replace the checking stage, including for supported paths beyond the bounded pass selection.
+
 ### 4. Checks
 
 The harness selects affected configured checks and records their current results. Named acceptance
@@ -189,7 +198,7 @@ The runtime applies these boundaries before a result can become evidence:
 | Public research | Every URL and redirect is restricted to HTTP(S), resolved before connection, rejected if any answer is private/special-use, and pinned to the validated public address. Proxies are bypassed. Bodies are capped and oversized chunked responses fail instead of being returned as complete. |
 | Vision | A vision path must be inside the workspace or exactly match a session attachment. Inputs are regular files with byte and pixel ceilings. |
 | MCP | Only operator-declared `capabilities.read_only_tools` are exposed. Server annotations are untrusted hints. Unsupported schemas and normalized-name collisions become explicit status failures; `isError` is a failed call; only an operator-read-only, server-idempotent call is retried, and only after a typed transport failure. A configured service runtime must match the owning session runtime. |
-| LSP | Names cannot collide silently; documents/config/responses and the open-document set are bounded; language IDs follow file extensions; diagnostics wait for the current document version; only typed transport failures restart a server. Marketplace packages require a bounded typed manifest that cannot request write or network authority. Sidecars follow the owning session runtime unless an explicit compatibility assertion matches it. |
+| LSP | Names cannot collide silently; documents/config/responses and the open-document set are bounded; language IDs follow file extensions; diagnostics wait for the current document version; only typed transport failures restart a server. Proactive passes are deterministic, read-only, content-fingerprinted, limited to 8 supported task paths/calls, report the count deferred by that ceiling, stop scheduling new calls after 12 seconds, wait at most 2 seconds per diagnostic publication, retain at most 64 diagnostics, and collapse each message to 500 characters. Any workspace mutation during collection discards the entire result. Marketplace packages require a bounded typed manifest that cannot request write or network authority. Sidecars follow the owning session runtime unless an explicit compatibility assertion matches it. |
 | Durable memory | Agent writes are byte/count bounded and evidence-backed. The agent can record only facts, gotchas, procedures, and debt. Decisions and preferences require a future controller-owned approval record and cannot be self-approved in tool arguments. Supersession requires active source and replacement entries. |
 
 Dynamic JSON schemas are admitted only when pb's recursive validator can enforce every supported
@@ -311,6 +320,15 @@ evidence for that path is invalidated; after a fresh complete read, repair uses 
 edit even when the original plan operation created the file. A missing diagnostic target requires a
 replan. The preview command must preserve repository content and Git control state.
 
+Proactive LSP diagnostics run immediately before these configured diagnostic previews. A syntax
+pass is intentionally narrow during partial implementation; a settled pass includes every
+error-severity diagnostic returned for the bounded path set. Results bind both the workspace and
+each reported path's content fingerprint. A mutation during collection makes the pass stale and
+discards its diagnostics. Transport, startup, timeout, and malformed-response failures are visible
+Trinity warnings and cannot satisfy or bypass an ordinary check. A successful pass likewise grants
+no selected-check, review, commit, progress, or completion evidence. pb never requests or applies
+LSP edits, formatting, commands, or code actions automatically.
+
 At implementation submission, pb projects the accepted plan identity/digest, current content
 fingerprint, actual task-delta paths per named plan step, and no-change fact. The model still accounts
 for every step and owns status, summaries, and the proposed semantic commit subject. At code review,
@@ -349,6 +367,11 @@ mutation, correction, and handoff work. `Model-requested` and `Automatic` remain
 provenance labels, and the **Actions** drawer preserves event chronology. Character attribution is
 presentation over typed events; it never changes a controller event into a model tool call or
 claims that a model requested an automatic action.
+
+Proactive LSP collection uses the same typed action stream. The transcript shows Trinity inspecting
+language diagnostics and summarizes clean, blocking, stale, or incomplete results; the durable
+tool result retains the bounded structured report. This is truthful controller attribution, not a
+fabricated model request or a synthetic assistant/tool-call exchange.
 
 Content fingerprints identify present worktree entries and bytes, independently of Git index
 bookkeeping. In particular, the synthetic tracked-`missing` entry visible before staging a deletion

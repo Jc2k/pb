@@ -1,7 +1,0 @@
-{
-  "type": "object",
-  "title": "rust-analyzer",
-  "description": "This package runs offline and does not require credentials or environment configuration.",
-  "properties": {},
-  "additionalProperties": false
-}
