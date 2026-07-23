@@ -1,6 +1,6 @@
 # Task decomposition workflow plan
 
-Status: design record; not shipped
+Status: design record; controller, recovery, and UI shipped; automatic planning unqualified
 
 Assessment: [2026-07-23 decomposition feasibility probe](benchmarks/multi-task-decomposition.md)
 
@@ -53,10 +53,13 @@ User prompt → high-level TaskPlanArtifact
 No Task can publish, push, open a pull request, increase authority, allocate more budget, or mark a
 Goal complete.
 
-## Existing baseline
+## Shipped implementation
 
-The shipped implementation has the Build and Goal engines needed to execute Tasks, but not the
-high-level decomposition and multi-Task queue:
+The controller, dispatch paths, persistence, recovery controls, events, and Tasks UI described by
+this record are shipped. The embedded qualification catalog is intentionally empty after the
+initial model trials failed the promotion contract. Consequently automatic high-level planning is
+not currently selected and ordinary Build/Goal behavior remains the visible default. The following
+existing engines execute a Task once a future exact model/template/protocol tuple is promoted:
 
 - `PlanArtifact.steps` are ordered plan facts inside one `WorkflowRun`.
 - `WorkUnitLedger` compiles those plan steps into one active path-bound mutation unit at a time.
@@ -64,9 +67,9 @@ high-level decomposition and multi-Task queue:
   step.
 - `GoalRun` already supplies the complete Goal engine, including milestones, child workflows,
   approval, persistence, evidence, budgets, and completion.
-- Build and Goal already share strict workflow authority, evidence freshness, managed commits, and
-  the local Ready boundary. Multi-Task orchestration must dispatch into these controls rather than
-  duplicate or alter them.
+- Build and Goal share strict workflow authority, evidence freshness, managed commits, and the local
+  Ready boundary. Multi-Task orchestration dispatches into these controls rather than duplicating or
+  altering them.
 
 ## Product contract
 

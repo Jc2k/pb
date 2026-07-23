@@ -77,6 +77,29 @@ Removing arithmetic reduced output cost but did not fix semantic ordering, cover
 behavior. The product should therefore remove numeric allocation from the model contract without
 mistaking that simplification for sufficient plan quality.
 
+## Implementation qualification attempts
+
+After implementing the typed proposal/review protocol, deterministic compiler, two-attempt limit,
+and fail-closed recovery result, five additional live runs exercised the actual production entry
+point. These are diagnostic attempts, not a completed qualification matrix. Each rejection happened
+before a child Build or Goal began, and every workspace retained only its harness initialization
+commit.
+
+| Model / request | Template / policy | Calls / wall time | Terminal controller result |
+| --- | --- | --- | --- |
+| Qwen2.5-Coder 7B, cross-stack | v1 / 6 Tasks | 2 / 231 s | rejected: second proposal contained 9 Tasks (first contained 7) |
+| Qwen2.5-Coder 7B, cross-stack | v2 / 8 Tasks | 2 / 216 s | rejected: requirement `req6` remained uncovered |
+| Qwen2.5-Coder 14B, storage/API | v2 / 6 Tasks | 3 / 422 s | reviewer requested revision; replacement contained 8 Tasks |
+| Qwen2.5-Coder 14B, storage/API | v2 / 8 Tasks | 3 / 416 s | reviewer requested revision; replacement exceeded aggregate controller budget |
+| Qwen3 8B, storage/API | v2 / 8 Tasks | 2 / 298 s | rejected: replacement used unknown field `scope_hits` instead of `scope_hints` |
+
+The v2 template asks for one to the policy maximum Tasks and explicitly permits combining closely
+coupled behavior. Raising the default count ceiling from six to eight removed an artificial barrier
+for smaller-model-sized cross-stack work, but did not cure coverage, aggregate sizing, or schema
+conformance. The reviewer path also increased latency substantially for the 14B runs. None of these
+models is promoted: the embedded qualification catalog remains empty, so ordinary Build dispatch is
+unchanged in this release.
+
 ## Classification
 
 ### P2 — Exact budget arithmetic is not a model-owned control boundary
@@ -130,19 +153,26 @@ workspaces:
 - `/private/tmp/pb-decomposition-20260723/7b/`
 - `/private/tmp/pb-decomposition-20260723/14b/`
 - `/private/tmp/pb-decomposition-20260723/7b-controller-owned-budget/`
+- `/private/tmp/pb-task-qualification-7b-cross-1/`
+- `/private/tmp/pb-task-qualification-7b-cross-v2-1/`
+- `/private/tmp/pb-task-qualification-14b-storage-v2-1/`
+- `/private/tmp/pb-task-qualification-14b-storage-v2-2/`
+- `/private/tmp/pb-task-qualification-qwen3-8b-storage-v2-1/`
 
 The first 4B scratch run also records an experiment-environment lock failure before the bounded
 host-authorized rerun. That setup failure is separate from the completed model result.
 
 ## Qualification gap
 
-Before rollout, replace this prose-final probe with a typed Task-plan fixture and repeat at least
-three request shapes: a cross-stack feature, a storage/API migration with rollback, and a scoped
-multi-component refactor. Run three trials per supported model/template. Promotion requires zero
-accepted invalid graphs or budget overflows, zero false multi-Task completion, and bounded convergence
-to an accepted or truthfully rejected plan within two revision cycles.
+The typed runtime controls are shipped and the checked-in
+`fixtures/task-decomposition/corpus.json` locks the deterministic, semantic-review, qualification,
+and attempt-limit cases. `deno task test:task-decomposition` validates its schema and required
+coverage.
 
-The checked-in `fixtures/task-decomposition/corpus.json` now locks the first 12 deterministic,
-semantic-review, qualification, and attempt-limit cases. `deno task test:task-decomposition`
-validates its schema and required coverage. The corpus becomes production-validator input in the
-next delivery Task; it does not claim those runtime controls are shipped yet.
+Automatic rollout still requires a complete repeatable qualification run across at least three
+request shapes: a cross-stack feature, a storage/API migration with rollback, and a scoped
+multi-component refactor, with enough independent trials to establish the plan's 95% useful-boundary
+target. Promotion requires zero accepted invalid graphs or budget overflows, zero false multi-Task
+completion, and bounded convergence to an accepted or truthfully rejected plan within two attempts.
+The exact model bytes, backend, planner template, protocol, and evidence digest must then be added to
+the embedded catalog in source control; repository configuration cannot supply or override it.
