@@ -6,6 +6,8 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use crate::config::{self, UserConfig};
@@ -14,6 +16,14 @@ use crate::mcp::{McpServerConfig, ProjectMcpConfig};
 
 const MARKETPLACE_ORG: &str = "crunchy-pb";
 pub const CONFIG_SCHEMA_ANNOTATION: &str = "uk.unrtd.pb.integration.config-schema";
+pub const LSP_MANIFEST_ANNOTATION: &str = "uk.unrtd.pb.integration.lsp-manifest";
+const LSP_PACKAGE_MANIFEST_VERSION: u32 = 1;
+const MAX_LSP_PACKAGE_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_LSP_PACKAGE_ARGS: usize = 32;
+const MAX_LSP_PACKAGE_LANGUAGE_IDS: usize = 32;
+const MAX_LSP_PACKAGE_CACHE_IDS: usize = 16;
+const MAX_REGISTRY_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_REGISTRY_TOKEN_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -59,7 +69,7 @@ pub struct InstalledIntegration {
     pub disabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntegrationInstallRequest {
     pub kind: IntegrationKind,
     pub container_image: String,
@@ -68,7 +78,120 @@ pub struct IntegrationInstallRequest {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
+    pub lsp_manifest: Option<LspPackageManifest>,
+    #[serde(default)]
     pub no_overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LspPackageManifest {
+    pub version: u32,
+    pub kind: IntegrationKind,
+    pub server: LspPackageServerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LspPackageServerConfig {
+    pub args: Vec<String>,
+    pub language_ids: Vec<String>,
+    pub initialization_options: Option<Value>,
+    #[serde(default = "default_lsp_package_workspace_access")]
+    pub workspace_access: crate::session_environment::ServiceWorkspaceAccess,
+    pub network_access: crate::session_environment::ServiceNetworkAccess,
+    pub cache_ids: Vec<String>,
+}
+
+impl Default for LspPackageServerConfig {
+    fn default() -> Self {
+        Self {
+            args: Vec::new(),
+            language_ids: Vec::new(),
+            initialization_options: None,
+            workspace_access: default_lsp_package_workspace_access(),
+            network_access: crate::session_environment::ServiceNetworkAccess::None,
+            cache_ids: Vec::new(),
+        }
+    }
+}
+
+fn default_lsp_package_workspace_access() -> crate::session_environment::ServiceWorkspaceAccess {
+    crate::session_environment::ServiceWorkspaceAccess::ReadOnly
+}
+
+impl LspPackageManifest {
+    fn validate(&self) -> Result<()> {
+        if self.version != LSP_PACKAGE_MANIFEST_VERSION {
+            bail!(
+                "unsupported LSP package manifest version {}; expected {}",
+                self.version,
+                LSP_PACKAGE_MANIFEST_VERSION
+            );
+        }
+        if self.kind != IntegrationKind::Lsp {
+            bail!("LSP package manifest kind must be 'lsp'");
+        }
+        if self.server.workspace_access
+            != crate::session_environment::ServiceWorkspaceAccess::ReadOnly
+        {
+            bail!("packaged LSPs must use read_only workspace access");
+        }
+        if self.server.network_access != crate::session_environment::ServiceNetworkAccess::None {
+            bail!("packaged LSPs must use network access 'none'");
+        }
+        validate_bounded_strings(
+            "LSP package argument",
+            &self.server.args,
+            MAX_LSP_PACKAGE_ARGS,
+            false,
+        )?;
+        validate_bounded_strings(
+            "LSP package language id",
+            &self.server.language_ids,
+            MAX_LSP_PACKAGE_LANGUAGE_IDS,
+            true,
+        )?;
+        validate_bounded_strings(
+            "LSP package cache id",
+            &self.server.cache_ids,
+            MAX_LSP_PACKAGE_CACHE_IDS,
+            true,
+        )?;
+        if self.server.language_ids.is_empty() {
+            bail!("LSP package manifest must declare at least one language id");
+        }
+        if let Some(options) = &self.server.initialization_options
+            && serde_json::to_vec(options)?.len() as u64 > MAX_LSP_PACKAGE_MANIFEST_BYTES
+        {
+            bail!("LSP package initialization options exceed the 65536-byte bound");
+        }
+        Ok(())
+    }
+}
+
+fn validate_bounded_strings(
+    label: &str,
+    values: &[String],
+    max_count: usize,
+    identifier: bool,
+) -> Result<()> {
+    if values.len() > max_count {
+        bail!("{label} list exceeds the {max_count}-entry bound");
+    }
+    for value in values {
+        if value.is_empty()
+            || value.len() > 4096
+            || value.contains(['\0', '\n', '\r'])
+            || (identifier
+                && !value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "-_.".contains(character)
+                }))
+        {
+            bail!("invalid {label}: {value:?}");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,6 +211,8 @@ pub struct IntegrationConfigSchema {
     pub container_image: String,
     pub annotation: String,
     pub schema: Option<Value>,
+    pub lsp_manifest_annotation: String,
+    pub lsp_manifest: Option<LspPackageManifest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +276,12 @@ pub fn marketplace_container_image(repo_name: &str) -> String {
     format!("ghcr.io/{MARKETPLACE_ORG}/{repo_name}:latest")
 }
 
+pub fn is_marketplace_container_image(image: &str) -> bool {
+    image
+        .trim()
+        .starts_with(&format!("ghcr.io/{MARKETPLACE_ORG}/"))
+}
+
 pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSchema> {
     if container_image.trim().is_empty() {
         bail!("container image cannot be empty");
@@ -172,11 +303,55 @@ pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSch
                 .context("failed to parse integration config schema annotation")
         })
         .transpose()?;
+    let lsp_manifest_text = find_annotation(&config, LSP_MANIFEST_ANNOTATION)
+        .or_else(|| find_annotation(&manifest, LSP_MANIFEST_ANNOTATION));
+    let lsp_manifest = lsp_manifest_text
+        .map(parse_lsp_package_manifest)
+        .transpose()?;
     Ok(IntegrationConfigSchema {
         container_image: container_image.to_string(),
         annotation: CONFIG_SCHEMA_ANNOTATION.to_string(),
         schema,
+        lsp_manifest_annotation: LSP_MANIFEST_ANNOTATION.to_string(),
+        lsp_manifest,
     })
+}
+
+fn parse_lsp_package_manifest(text: &str) -> Result<LspPackageManifest> {
+    if text.len() as u64 > MAX_LSP_PACKAGE_MANIFEST_BYTES {
+        bail!("LSP package manifest exceeds the 65536-byte bound");
+    }
+    let manifest: LspPackageManifest =
+        serde_json::from_str(text).context("failed to parse LSP package manifest annotation")?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+pub fn load_lsp_package_manifest(path: &Path) -> Result<LspPackageManifest> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open LSP package manifest {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat LSP package manifest {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > MAX_LSP_PACKAGE_MANIFEST_BYTES {
+        bail!(
+            "LSP package manifest {} exceeds the {}-byte input bound",
+            path.display(),
+            MAX_LSP_PACKAGE_MANIFEST_BYTES
+        );
+    }
+    let mut text = String::new();
+    file.take(MAX_LSP_PACKAGE_MANIFEST_BYTES.saturating_add(1))
+        .read_to_string(&mut text)
+        .with_context(|| format!("failed to read LSP package manifest {}", path.display()))?;
+    if text.len() as u64 > MAX_LSP_PACKAGE_MANIFEST_BYTES {
+        bail!(
+            "LSP package manifest {} grew beyond the {}-byte input bound",
+            path.display(),
+            MAX_LSP_PACKAGE_MANIFEST_BYTES
+        );
+    }
+    parse_lsp_package_manifest(&text)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,10 +539,11 @@ fn fetch_registry_json(
                 .send()?;
         }
     }
-    let response = response.error_for_status()?;
-    response
-        .json::<Value>()
-        .with_context(|| format!("failed to decode {context}"))
+    read_bounded_registry_json(
+        response.error_for_status()?,
+        MAX_REGISTRY_DOCUMENT_BYTES,
+        context,
+    )
 }
 
 fn fetch_bearer_token(
@@ -400,16 +576,38 @@ fn fetch_bearer_token(
     if let Some(service) = service {
         request = request.query(&[("service", service)]);
     }
-    let token: Value = request
-        .send()?
-        .error_for_status()?
-        .json()
-        .context("failed to decode registry auth token")?;
+    let token = read_bounded_registry_json(
+        request.send()?.error_for_status()?,
+        MAX_REGISTRY_TOKEN_BYTES,
+        "registry auth token",
+    )?;
     Ok(token
         .get("token")
         .or_else(|| token.get("access_token"))
         .and_then(Value::as_str)
         .map(str::to_string))
+}
+
+fn read_bounded_registry_json(
+    response: reqwest::blocking::Response,
+    max_bytes: u64,
+    context: &str,
+) -> Result<Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes)
+    {
+        bail!("{context} exceeds the {max_bytes}-byte response bound");
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {context}"))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("{context} exceeds the {max_bytes}-byte response bound");
+    }
+    serde_json::from_slice(&bytes).with_context(|| format!("failed to decode {context}"))
 }
 
 fn find_annotation<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -468,13 +666,16 @@ pub fn install_project(
 ) -> Result<IntegrationInstallResponse> {
     let name = request
         .name
+        .clone()
         .unwrap_or_else(|| name_from_image(&request.container_image));
     if name.trim().is_empty() || name.contains(['\n', '\r']) {
         bail!("integration name cannot be empty or contain newlines");
     }
-    let runtime = crate::container::resolve_runtime_binary(request.runtime.as_deref())?;
     match request.kind {
         IntegrationKind::Mcp => {
+            if request.lsp_manifest.is_some() {
+                bail!("an LSP package manifest cannot configure an MCP integration");
+            }
             let mut config = ProjectMcpConfig::load(workspace_root)?.unwrap_or_default();
             if request.no_overwrite && config.servers.contains_key(&name) {
                 bail!("MCP integration '{name}' is already installed");
@@ -483,7 +684,7 @@ pub fn install_project(
                 name.clone(),
                 McpServerConfig {
                     container_image: Some(request.container_image.clone()),
-                    container_runtime: Some(runtime),
+                    container_runtime: requested_runtime(request.runtime.as_deref())?,
                     env: request.env.clone(),
                     ..Default::default()
                 },
@@ -568,26 +769,22 @@ pub fn install_global_lsp(
     if request.kind != IntegrationKind::Lsp {
         bail!("only LSP integrations can be installed globally");
     }
+    if is_marketplace_container_image(&request.container_image) && request.lsp_manifest.is_none() {
+        bail!("marketplace LSP integrations must provide a typed package manifest");
+    }
     let name = request
         .name
+        .clone()
         .unwrap_or_else(|| name_from_image(&request.container_image));
     if name.trim().is_empty() || name.contains(['\n', '\r']) {
         bail!("integration name cannot be empty or contain newlines");
     }
-    let runtime = crate::container::resolve_runtime_binary(request.runtime.as_deref())?;
+    let server_config = lsp_server_config_from_install(&request)?;
     let mut user_config = UserConfig::load()?;
     if request.no_overwrite && user_config.lsp.servers.contains_key(&name) {
         bail!("LSP integration '{name}' is already installed");
     }
-    user_config.lsp.servers.insert(
-        name.clone(),
-        LspServerConfig {
-            container_image: Some(request.container_image.clone()),
-            container_runtime: Some(runtime),
-            env: request.env.clone(),
-            ..Default::default()
-        },
-    );
+    user_config.lsp.servers.insert(name.clone(), server_config);
     user_config.save()?;
     Ok(IntegrationInstallResponse {
         installed: InstalledIntegration {
@@ -599,6 +796,34 @@ pub fn install_global_lsp(
         },
         config_path: config::config_path()?.display().to_string(),
     })
+}
+
+fn requested_runtime(runtime: Option<&str>) -> Result<Option<String>> {
+    runtime
+        .map(str::trim)
+        .filter(|runtime| !runtime.is_empty())
+        .map(|runtime| crate::container::resolve_runtime_binary(Some(runtime)).map(Some))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn lsp_server_config_from_install(request: &IntegrationInstallRequest) -> Result<LspServerConfig> {
+    let mut config = LspServerConfig {
+        container_image: Some(request.container_image.clone()),
+        container_runtime: requested_runtime(request.runtime.as_deref())?,
+        env: request.env.clone(),
+        ..Default::default()
+    };
+    if let Some(manifest) = &request.lsp_manifest {
+        manifest.validate()?;
+        config.args = manifest.server.args.clone();
+        config.language_ids = manifest.server.language_ids.clone();
+        config.initialization_options = manifest.server.initialization_options.clone();
+        config.workspace_access = manifest.server.workspace_access;
+        config.network_access = manifest.server.network_access;
+        config.cache_ids = manifest.server.cache_ids.clone();
+    }
+    Ok(config)
 }
 
 pub fn remove_global_lsp(name: &str) -> Result<IntegrationRemoveResponse> {
@@ -648,6 +873,12 @@ mod tests {
             marketplace_container_image("sentry-mcp"),
             "ghcr.io/crunchy-pb/sentry-mcp:latest"
         );
+        assert!(is_marketplace_container_image(
+            "ghcr.io/crunchy-pb/rust-analyzer-lsp:latest"
+        ));
+        assert!(!is_marketplace_container_image(
+            "ghcr.io/example/rust-analyzer-lsp:latest"
+        ));
     }
 
     #[test]
@@ -739,6 +970,7 @@ mod tests {
                 name: None,
                 runtime: Some("docker".to_string()),
                 env: BTreeMap::new(),
+                lsp_manifest: None,
                 no_overwrite: false,
             },
         )
@@ -762,6 +994,7 @@ mod tests {
                 name: None,
                 runtime: Some("docker".to_string()),
                 env: BTreeMap::from([("SENTRY_DSN".to_string(), "https://example".to_string())]),
+                lsp_manifest: None,
                 no_overwrite: false,
             },
         )
@@ -779,5 +1012,108 @@ mod tests {
                 .map(String::as_str),
             Some("https://example")
         );
+    }
+
+    fn rust_analyzer_manifest() -> LspPackageManifest {
+        LspPackageManifest {
+            version: 1,
+            kind: IntegrationKind::Lsp,
+            server: LspPackageServerConfig {
+                language_ids: vec!["rust".to_string()],
+                initialization_options: Some(serde_json::json!({
+                    "checkOnSave": false,
+                    "cargo": {"buildScripts": {"enable": false}, "noDeps": true},
+                    "procMacro": {"enable": false}
+                })),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn packaged_lsp_manifest_applies_safe_server_defaults_without_pinning_runtime() {
+        let request = IntegrationInstallRequest {
+            kind: IntegrationKind::Lsp,
+            container_image: "pb/rust-analyzer-lsp:dev".to_string(),
+            name: Some("rust-analyzer".to_string()),
+            runtime: None,
+            env: BTreeMap::new(),
+            lsp_manifest: Some(rust_analyzer_manifest()),
+            no_overwrite: false,
+        };
+
+        let config = lsp_server_config_from_install(&request).unwrap();
+
+        assert_eq!(config.container_runtime, None);
+        assert_eq!(config.language_ids, vec!["rust"]);
+        assert_eq!(
+            config.workspace_access,
+            crate::session_environment::ServiceWorkspaceAccess::ReadOnly
+        );
+        assert_eq!(
+            config.network_access,
+            crate::session_environment::ServiceNetworkAccess::None
+        );
+        assert_eq!(
+            config
+                .initialization_options
+                .as_ref()
+                .and_then(|options| options.get("checkOnSave"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn packaged_lsp_manifest_cannot_grant_itself_network_or_write_access() {
+        let mut manifest = rust_analyzer_manifest();
+        manifest.server.network_access = crate::session_environment::ServiceNetworkAccess::Egress;
+        assert!(manifest.validate().is_err());
+
+        manifest.server.network_access = crate::session_environment::ServiceNetworkAccess::None;
+        manifest.server.workspace_access =
+            crate::session_environment::ServiceWorkspaceAccess::ReadWrite;
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn lsp_manifest_annotation_is_parsed_and_validated() {
+        let text = serde_json::to_string(&rust_analyzer_manifest()).unwrap();
+        let parsed = parse_lsp_package_manifest(&text).unwrap();
+        assert_eq!(parsed.kind, IntegrationKind::Lsp);
+        assert_eq!(parsed.server.language_ids, vec!["rust"]);
+    }
+
+    #[test]
+    fn packaged_rust_analyzer_source_manifest_matches_the_typed_contract() {
+        let parsed =
+            parse_lsp_package_manifest(include_str!("../packages/rust-analyzer-lsp/pb-lsp.json"))
+                .unwrap();
+
+        assert_eq!(parsed, rust_analyzer_manifest_with_full_safe_defaults());
+    }
+
+    fn rust_analyzer_manifest_with_full_safe_defaults() -> LspPackageManifest {
+        LspPackageManifest {
+            version: 1,
+            kind: IntegrationKind::Lsp,
+            server: LspPackageServerConfig {
+                args: Vec::new(),
+                language_ids: vec!["rust".to_string()],
+                initialization_options: Some(serde_json::json!({
+                    "cachePriming": {"enable": false},
+                    "cargo": {
+                        "autoreload": false,
+                        "buildScripts": {"enable": false},
+                        "noDeps": true
+                    },
+                    "checkOnSave": false,
+                    "procMacro": {"enable": false}
+                })),
+                workspace_access: crate::session_environment::ServiceWorkspaceAccess::ReadOnly,
+                network_access: crate::session_environment::ServiceNetworkAccess::None,
+                cache_ids: Vec::new(),
+            },
+        }
     }
 }

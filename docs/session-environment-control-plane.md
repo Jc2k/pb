@@ -292,6 +292,12 @@ environment lease. Sidecar index-cache volumes include the inspected server imag
 server configuration in their provenance, while command LSPs use the primary environment's locked
 cache identity.
 
+Marketplace sidecars add a typed OCI manifest before this launch boundary. pb bounds and validates
+the manifest, admits only read-only workspace and no-network packages, and copies only the package's
+bounded arguments, language IDs, initialization options, and cache IDs into the ordinary
+`LspServerConfig`. The manifest cannot choose its runtime; absent a retained compatibility
+assertion, the owning session runtime launches and cleans up the service.
+
 ## MCP service capabilities
 
 Container MCP configuration declares:

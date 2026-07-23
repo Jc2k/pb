@@ -85,6 +85,15 @@ Each edge exists for a distinct reason and should carry the minimum data it need
 Model pulls and application updates are user-invoked network operations. Downloaded model and
 runtime artifacts remain local for reuse after the operation.
 
+Opening integration discovery queries the fixed public `crunchy-pb` GitHub organization;
+configuring a selected package reads its container metadata from the registry. Installing or
+locally building an LSP package pulls its image or pinned base layers. Those requests disclose the
+requested public package name and the ordinary network metadata of a download, but no repository
+source or prompt content. Downloaded
+images remain local reusable artifacts. At task runtime, packaged LSP networking is independently
+controlled by its validated service capability; the rust-analyzer package uses an internal network
+without egress and performs Cargo analysis offline.
+
 ### Public research
 
 Planning, review, discussion, implementation, and repair may expose public research tools. A query

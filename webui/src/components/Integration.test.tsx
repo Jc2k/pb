@@ -1,6 +1,6 @@
 import { ok } from "node:assert/strict";
 import { renderToString } from "react-dom/server";
-import { IntegrationList } from "./Integration.tsx";
+import { IntegrationConfigForm, IntegrationList } from "./Integration.tsx";
 import type { InstalledIntegration, MarketplaceIntegration } from "../types/index.ts";
 
 Deno.test("IntegrationList renders mockup-style MCP store actions", () => {
@@ -36,4 +36,26 @@ Deno.test("IntegrationList renders mockup-style MCP store actions", () => {
   ok(html.includes("aria-label=\"Configure mcp-sentry\""));
   ok(html.includes("aria-label=\"Remove mcp-sentry\""));
   ok(html.includes("aria-label=\"Install figma-assets\""));
+});
+
+Deno.test("IntegrationConfigForm blocks an LSP image without a typed package manifest", () => {
+  const html = renderToString(
+    <IntegrationConfigForm
+      pending={{
+        kind: "lsp",
+        containerImage: "ghcr.io/crunchy-pb/legacy-lsp:latest",
+      }}
+      schemaResponse={{
+        container_image: "ghcr.io/crunchy-pb/legacy-lsp:latest",
+        annotation: "uk.unrtd.pb.integration.config-schema",
+        lsp_manifest_annotation: "uk.unrtd.pb.integration.lsp-manifest",
+      }}
+      loading={false}
+      onCancel={() => {}}
+      onInstall={() => {}}
+    />,
+  );
+
+  ok(html.includes("typed LSP manifest required"));
+  ok(html.includes("disabled"));
 });

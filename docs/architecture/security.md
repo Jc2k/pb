@@ -119,9 +119,20 @@ Only an operator-declared read-only tool that the server also marks idempotent c
 only after a typed transport failure. LSP restarts follow the same typed transport boundary;
 protocol/application errors do not trigger blind replay.
 
+Marketplace LSP metadata is also untrusted input. Registry manifests, image configurations, and
+authentication responses have byte ceilings; the typed LSP package annotation has its own 64 KiB
+ceiling and rejects unknown fields, unsupported versions, invalid identifiers, and excessive list
+counts. Package fields may supply bounded process arguments, language IDs, initialization options,
+and cache requests, but cannot select a host command, environment, runtime, writable workspace, or
+network access. A crunchy-pb marketplace LSP without this manifest cannot be installed. These
+constraints prevent package metadata from granting its own authority; they do not turn arbitrary
+language-server implementation code into trusted code, so the read-only, isolated sidecar remains
+the execution boundary.
+
 Container-backed connector processes remain resources of the session environment. A retained
 per-integration `container_runtime` value must match the owning session runtime or startup fails;
-it cannot silently select a second cleanup domain.
+it cannot silently select a second cleanup domain. New UI installs omit this assertion and follow
+the runtime that owns each task session.
 
 ### Network and media inputs are validated
 

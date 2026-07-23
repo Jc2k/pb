@@ -945,10 +945,27 @@ export type IntegrationJsonSchema = {
   properties?: Record<string, JsonSchemaProperty>;
 };
 
+export interface LspPackageServerConfig {
+  args: string[];
+  language_ids: string[];
+  initialization_options?: unknown;
+  workspace_access: "read_only";
+  network_access: "none";
+  cache_ids: string[];
+}
+
+export interface LspPackageManifest {
+  version: number;
+  kind: "lsp";
+  server: LspPackageServerConfig;
+}
+
 export interface IntegrationConfigSchemaResponse {
   container_image: string;
   annotation: string;
   schema?: IntegrationJsonSchema | null;
+  lsp_manifest_annotation: string;
+  lsp_manifest?: LspPackageManifest | null;
 }
 
 export interface PendingIntegrationInstall {

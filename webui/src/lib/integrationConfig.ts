@@ -1,4 +1,25 @@
-import type { IntegrationJsonSchema, JsonSchemaProperty } from "../types/index";
+import type {
+  IntegrationConfigSchemaResponse,
+  IntegrationJsonSchema,
+  JsonSchemaProperty,
+  PendingIntegrationInstall,
+} from "../types/index";
+
+export function integrationInstallPayload(
+  pending: PendingIntegrationInstall,
+  env: Record<string, string>,
+  metadata?: IntegrationConfigSchemaResponse | null,
+) {
+  return {
+    kind: pending.kind,
+    container_image: pending.containerImage,
+    name: pending.name,
+    env,
+    lsp_manifest: pending.kind === "lsp"
+      ? metadata?.lsp_manifest ?? undefined
+      : undefined,
+  };
+}
 
 export function schemaPropertyType(property: JsonSchemaProperty): string {
   return Array.isArray(property.type) ? property.type.find((item) => item !== "null") || "string" : property.type || "string";

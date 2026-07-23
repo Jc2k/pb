@@ -277,9 +277,13 @@ pub struct IntegrationsAddArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Container runtime command; defaults to Apple container, Docker, or Podman in that order
+    /// Optional compatibility assertion for the session's container runtime
     #[arg(long)]
     pub runtime: Option<String>,
+
+    /// Local typed package manifest to apply to an LSP image
+    #[arg(long, value_name = "PATH")]
+    pub manifest: Option<PathBuf>,
 
     /// Do not overwrite an existing integration with the same name
     #[arg(long)]
@@ -1295,12 +1299,28 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
         IntegrationsCommand::Add(args) => {
             let root = resolve_env_root(args.workdir)?;
             let kind = IntegrationKind::parse(&args.kind)?;
+            if kind != IntegrationKind::Lsp && args.manifest.is_some() {
+                bail!("--manifest is available only for LSP integrations");
+            }
+            let mut lsp_manifest = args
+                .manifest
+                .as_deref()
+                .map(integrations::load_lsp_package_manifest)
+                .transpose()?;
+            if kind == IntegrationKind::Lsp
+                && lsp_manifest.is_none()
+                && integrations::is_marketplace_container_image(&args.container_image)
+            {
+                lsp_manifest =
+                    integrations::fetch_config_schema(&args.container_image)?.lsp_manifest;
+            }
             let request = IntegrationInstallRequest {
                 kind,
                 container_image: args.container_image,
                 name: args.name,
                 runtime: args.runtime,
                 env: Default::default(),
+                lsp_manifest,
                 no_overwrite: args.no_overwrite,
             };
             let response = match kind {
@@ -4282,6 +4302,35 @@ mod tests {
     #[test]
     fn default_parallelism_is_non_zero() {
         assert!(default_parallelism() > 0);
+    }
+
+    #[test]
+    fn integrations_add_accepts_a_local_lsp_package_manifest() {
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "integrations",
+            "add",
+            "lsp",
+            "pb/rust-analyzer-lsp:dev",
+            "--name",
+            "rust-analyzer",
+            "--manifest",
+            "packages/rust-analyzer-lsp/pb-lsp.json",
+        ])
+        .unwrap();
+
+        let Commands::Integrations {
+            command: IntegrationsCommand::Add(args),
+        } = parsed.command
+        else {
+            panic!("expected integrations add command");
+        };
+        assert_eq!(args.kind, "lsp");
+        assert_eq!(
+            args.manifest,
+            Some(PathBuf::from("packages/rust-analyzer-lsp/pb-lsp.json"))
+        );
+        assert_eq!(args.runtime, None);
     }
 
     #[test]

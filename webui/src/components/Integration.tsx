@@ -98,7 +98,8 @@ export function IntegrationConfigForm({
 
   const validationErrors = validateIntegrationConfig(schema, values);
   const fields = Object.entries(schema?.properties ?? {});
-  const canSubmit = !loading && Object.keys(validationErrors).length === 0;
+  const missingLspManifest = pending.kind === "lsp" && !schemaResponse?.lsp_manifest;
+  const canSubmit = !loading && !missingLspManifest && Object.keys(validationErrors).length === 0;
 
   return (
     <form className="integration-config-sheet" onSubmit={(event) => {
@@ -115,8 +116,10 @@ export function IntegrationConfigForm({
         <button type="button" className="mcp-modal-close" aria-label="Close configuration" onClick={onCancel}><i className="bi bi-x-lg"></i></button>
       </div>
       {loading && <div className="alert alert-info py-2 small"><span className="spinner-border spinner-border-sm me-2" />Fetching container schema annotation…</div>}
-      {error && <div className="alert alert-warning py-2 small">Could not fetch the schema annotation, so this integration can be installed without extra fields. {error}</div>}
-      {!loading && !error && fields.length === 0 && <div className="alert alert-secondary py-2 small">This container does not publish a configuration schema annotation, so it will be installed without extra environment values.</div>}
+      {error && pending.kind !== "lsp" && <div className="alert alert-warning py-2 small">Could not fetch the schema annotation, so this integration can be installed without extra fields. {error}</div>}
+      {error && pending.kind === "lsp" && <div className="alert alert-danger py-2 small">Could not verify the package's typed LSP manifest, so installation is blocked. {error}</div>}
+      {!loading && !error && missingLspManifest && <div className="alert alert-danger py-2 small">This image does not publish the typed LSP manifest required for marketplace installation.</div>}
+      {!loading && !error && !missingLspManifest && fields.length === 0 && <div className="alert alert-secondary py-2 small">This container does not publish a configuration schema annotation, so it will be installed without extra environment values.</div>}
       {schema?.description && <p className="small text-secondary">{schema.description}</p>}
       <div className="integration-config-grid">
         {fields.map(([key, property]) => {

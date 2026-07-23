@@ -28,6 +28,7 @@ import {
 import { PageShell } from "../components/PageShell";
 import { IntentControl } from "../components/IntentControl";
 import { GoalStartSheet } from "../components/GoalStartSheet";
+import { integrationInstallPayload } from "../lib/integrationConfig";
 import {
   ensureNotificationPermission,
   projectName,
@@ -705,13 +706,7 @@ export function ProjectSettingsPage() {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          kind: pendingInstall.kind,
-          container_image: pendingInstall.containerImage,
-          name: pendingInstall.name,
-          runtime: "docker",
-          env,
-        }),
+        body: JSON.stringify(integrationInstallPayload(pendingInstall, env, configSchema)),
       },
     );
     if (res.ok) {

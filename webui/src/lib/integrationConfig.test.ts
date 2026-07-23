@@ -1,7 +1,7 @@
 /// <reference lib="deno.ns" />
-import { deepEqual, equal } from "node:assert/strict";
-import type { IntegrationJsonSchema } from "../types/index";
-import { schemaPropertyType, validateIntegrationConfig } from "./integrationConfig.ts";
+import { deepEqual, equal, ok } from "node:assert/strict";
+import type { IntegrationConfigSchemaResponse, IntegrationJsonSchema } from "../types/index";
+import { integrationInstallPayload, schemaPropertyType, validateIntegrationConfig } from "./integrationConfig.ts";
 
 Deno.test("schemaPropertyType chooses a non-null type from nullable schemas", () => {
   equal(schemaPropertyType({ type: ["null", "string"] }), "string");
@@ -25,4 +25,33 @@ Deno.test("validateIntegrationConfig reports required and string constraint erro
   });
 
   deepEqual(validateIntegrationConfig(schema, { token: "abcd", mode: "read", slug: "pb-web" }), {});
+});
+
+Deno.test("integrationInstallPayload carries typed LSP defaults without pinning a runtime", () => {
+  const metadata: IntegrationConfigSchemaResponse = {
+    container_image: "ghcr.io/crunchy-pb/rust-analyzer-lsp:latest",
+    annotation: "uk.unrtd.pb.integration.config-schema",
+    lsp_manifest_annotation: "uk.unrtd.pb.integration.lsp-manifest",
+    lsp_manifest: {
+      version: 1,
+      kind: "lsp",
+      server: {
+        args: [],
+        language_ids: ["rust"],
+        initialization_options: { checkOnSave: false },
+        workspace_access: "read_only",
+        network_access: "none",
+        cache_ids: [],
+      },
+    },
+  };
+
+  const payload = integrationInstallPayload({
+    kind: "lsp",
+    containerImage: metadata.container_image,
+    name: "rust-analyzer",
+  }, {}, metadata);
+
+  equal(payload.lsp_manifest?.server.language_ids[0], "rust");
+  ok(!("runtime" in payload));
 });

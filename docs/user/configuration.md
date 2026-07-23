@@ -384,6 +384,37 @@ pb integrations list
 pb integrations list --marketplace
 ```
 
+**Shipped package contract.** Marketplace LSP images publish a versioned typed manifest in the
+`uk.unrtd.pb.integration.lsp-manifest` OCI annotation. pb validates its size, shape, language IDs,
+arguments, initialization options, and cache IDs before writing global configuration. A package
+manifest cannot select a host command, inject environment values, pin a container runtime, request
+networking, or make the workspace writable. Marketplace LSP installation fails when that manifest
+is absent or invalid; the web UI reports the missing contract instead of offering an unconfigured
+install.
+
+The first package is provided as a repo-shaped local scaffold at
+`packages/rust-analyzer-lsp/`. It is not a marketplace entry until that directory is published as
+the `crunchy-pb/rust-analyzer-lsp` repository with the `lsp` topic. Build and install it locally with:
+
+```bash
+packages/rust-analyzer-lsp/scripts/build-local.sh
+pb integrations add lsp pb/rust-analyzer-lsp:dev \
+  --name rust-analyzer \
+  --manifest packages/rust-analyzer-lsp/pb-lsp.json
+```
+
+The local manifest and the manifest embedded by the publishing workflow are the same file. The
+rust-analyzer profile mounts the workspace read-only, runs without egress, disables dependency
+fetching, check-on-save, build scripts, procedural macros, cache priming, and automatic Cargo
+reload, and leaves settled-state compilation and tests to pb's checks. Its packaged Rust toolchain
+is a stable baseline, not a promise that projects pinned to another compiler receive exact semantic
+parity.
+
+The `--runtime` install argument is optional and normally should be omitted. An integration without
+that field follows the runtime that owns each task session. Supplying it retains an exact
+compatibility assertion; a task using another runtime will reject the service rather than create a
+second cleanup domain.
+
 Project MCP entries override global entries with the same name. A project entry with
 `disabled = true` removes the corresponding global server for that repository.
 
@@ -417,7 +448,7 @@ also produce a status failure instead of silently broadening or pretending to ex
 
 Host-command MCP servers are less isolated. Container-backed sessions require such integrations to
 use a container image so pb can enforce workspace, cache, and network capabilities.
-When a container integration retains the older `container_runtime` field, pb treats it as an exact
+When a container integration retains an explicit `container_runtime` field, pb treats it as an exact
 compatibility assertion against the runtime that owns the session. A mismatch fails startup rather
 than silently launching with a different runtime; the field does not create an independent runtime
 or cleanup domain for that one service.

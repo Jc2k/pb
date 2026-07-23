@@ -3,6 +3,7 @@ import type { InstalledIntegration, IntegrationConfigSchemaResponse, Integration
 import { IntegrationConfigForm, IntegrationList } from "../components/Integration";
 import { PageShell } from "../components/PageShell";
 import { uniqueInstalledIntegrations, uniqueIntegrations } from "../lib/helpers";
+import { integrationInstallPayload } from "../lib/integrationConfig";
 
 export function IntegrationsPage() {
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
@@ -55,13 +56,7 @@ export function IntegrationsPage() {
     const res = await fetch("/api/integrations/lsp", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        kind: "lsp",
-        container_image: pendingInstall.containerImage,
-        name: pendingInstall.name,
-        runtime: "docker",
-        env,
-      }),
+      body: JSON.stringify(integrationInstallPayload(pendingInstall, env, configSchema)),
     });
     if (res.ok) {
       setPendingInstall(null);
