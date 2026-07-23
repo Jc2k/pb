@@ -123,8 +123,10 @@ Configured LSPs add an intrinsic diagnostic contract. pb automatically inspects 
 task paths: syntax-classified errors during partial implementation and all error-severity
 diagnostics once work is settled or being handed off. Reports are bound to the current workspace
 epoch and path fingerprints; concurrent mutation discards them. Every matching server/path target
-is accounted as completed, failed, or deferred, and only complete coverage with no diagnostics is
-clean. Any content mutation invalidates settled evidence across the task path set, while syntax
+is accounted as completed, advisory, failed, or deferred. Only an explicit full pull-diagnostic
+report completes a target; a fresh push-only publication can report useful errors but cannot prove
+an empty target clean. Only complete coverage with no diagnostics is clean. Any content mutation
+invalidates settled evidence across the task path set, while syntax
 evidence is invalidated only for files whose bytes changed. A blocking report invalidates older read
 and staging evidence for only the exact reported paths and requires a fresh read before repair.
 Clean, failed, timed-out, or unavailable LSP evidence never satisfies a named check, review,
@@ -176,7 +178,8 @@ application errors, so an application failure cannot cause an unsafe automatic r
 inputs and responses fail explicitly rather than being presented as complete evidence.
 
 Durable tool events preserve that distinction for presentation as well: call and batch identities
-survive result reordering, and typed outcomes distinguish success, execution failure, validation or
+include the session turn, survive result reordering and worker failure without losing the original
+tool identity, and typed outcomes distinguish success, execution failure, validation or
 policy rejection, timeout, cancellation, and deterministic cache replay. Older events without these
 additive fields stay readable and are shown as unknown rather than upgraded to success.
 

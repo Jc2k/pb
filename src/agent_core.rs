@@ -25,7 +25,7 @@ use std::fs::File;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -5164,6 +5164,7 @@ struct ProactiveLspPathState {
 
 #[derive(Debug, Clone)]
 struct ProactiveLspState {
+    event_namespace: String,
     workspace_epoch: u64,
     previous: crate::workspace::ContentSnapshot,
     paths: BTreeMap<String, ProactiveLspPathState>,
@@ -5178,6 +5179,7 @@ impl ProactiveLspState {
             .map(|repository| repository.task_baseline.content.clone())
             .unwrap_or_else(|| current.clone());
         let mut state = Self {
+            event_namespace: format!("{}\0{}", args.session_id, args.turn_id),
             workspace_epoch: 0,
             previous,
             paths: BTreeMap::new(),
@@ -5240,7 +5242,7 @@ impl ProactiveLspState {
         {
             return;
         }
-        for path in report.completed_paths() {
+        for path in report.attempted_paths() {
             let Some(state) = self.paths.get_mut(&path) else {
                 continue;
             };
@@ -5287,7 +5289,8 @@ fn run_proactive_lsp_pass(
         "controller-{}",
         &crate::environment_lock::sha256(
             format!(
-                "{}\0{}\0{}\0{}",
+                "{}\0{}\0{}\0{}\0{}",
+                state.borrow().event_namespace,
                 mode.as_str(),
                 workspace_epoch,
                 workspace_fingerprint,
@@ -8311,6 +8314,40 @@ fn durable_event_call_ids(batch_id: &str, calls: &[AgentToolCall]) -> BTreeMap<S
         .collect()
 }
 
+fn durable_event_batch_id(
+    session_id: &str,
+    turn_id: &str,
+    nesting_depth: usize,
+    prior_tool_calls: usize,
+    calls: &[AgentToolCall],
+) -> Result<String> {
+    let material =
+        serde_json::to_vec(&(session_id, turn_id, nesting_depth, prior_tool_calls, calls))?;
+    Ok(format!(
+        "batch-{}",
+        &crate::environment_lock::sha256(&material)[..16]
+    ))
+}
+
+type ParallelToolFallback = (Option<String>, String, Value);
+
+fn join_parallel_tool_thread(
+    fallback: ParallelToolFallback,
+    handle: std::thread::JoinHandle<ExecutedToolResult>,
+) -> ExecutedToolResult {
+    let (tool_call_id, tool, arguments) = fallback;
+    handle.join().unwrap_or_else(|_| ExecutedToolResult {
+        tool_call_id,
+        tool,
+        arguments,
+        result: "tool thread panicked".to_string(),
+        success: false,
+        cache_hit: false,
+        duration_ms: 0,
+        energy: None,
+    })
+}
+
 fn execute_tool_calls(
     calls: Vec<AgentToolCall>,
     thinking: Option<String>,
@@ -8321,16 +8358,13 @@ fn execute_tool_calls(
     metrics: &mut RunMetrics,
 ) -> Result<Vec<ToolOutcomeSummary>> {
     let mut calls = calls;
-    let batch_material = serde_json::to_vec(&(
+    let batch_id = durable_event_batch_id(
         &env.args.session_id,
+        &env.args.turn_id,
         env.nesting_depth,
         metrics.tool_calls,
         &calls,
-    ))?;
-    let batch_id = format!(
-        "batch-{}",
-        &crate::environment_lock::sha256(&batch_material)[..16]
-    );
+    )?;
     let mut call_ids = BTreeSet::new();
     for (index, call) in calls.iter_mut().enumerate() {
         if call.id.as_deref().is_none_or(str::is_empty)
@@ -8704,7 +8738,8 @@ fn execute_tool_calls(
             .into_iter()
             .map(|call| {
                 let registry = registry.clone();
-                std::thread::spawn(move || {
+                let fallback = (call.id.clone(), call.tool.clone(), call.arguments.clone());
+                let handle = std::thread::spawn(move || {
                     let started = Instant::now();
                     let (result, success) =
                         match mcp::call_tool(&registry, &call.tool, &call.arguments) {
@@ -8722,21 +8757,13 @@ fn execute_tool_calls(
                         duration_ms,
                         energy: None,
                     }
-                })
+                });
+                (fallback, handle)
             })
             .collect::<Vec<_>>();
         let mut batch_results = Vec::with_capacity(parallel_batch_calls);
-        for handle in handles {
-            batch_results.push(handle.join().unwrap_or_else(|_| ExecutedToolResult {
-                tool_call_id: None,
-                tool: "unknown".to_string(),
-                arguments: Value::Null,
-                result: "tool thread panicked".to_string(),
-                success: false,
-                cache_hit: false,
-                duration_ms: 0,
-                energy: None,
-            }));
+        for (fallback, handle) in handles {
+            batch_results.push(join_parallel_tool_thread(fallback, handle));
         }
         let batch_energy = batch_energy_start
             .and_then(|sample| sample.estimate_since(energy::sample(), batch_started));
@@ -20084,16 +20111,7 @@ async fn resolve_public_web_target(url: &Url) -> Result<(String, SocketAddr)> {
 }
 
 fn validate_resolved_public_addresses(host: &str, addresses: &[SocketAddr]) -> Result<SocketAddr> {
-    if addresses.is_empty() {
-        bail!("public web host '{host}' resolved to no addresses");
-    }
-    if let Some(address) = addresses.iter().find(|address| is_private_ip(address.ip())) {
-        bail!(
-            "public web host '{host}' resolved to private or special-use address {}",
-            address.ip()
-        );
-    }
-    Ok(addresses[0])
+    crate::public_network::validate_resolved_public_addresses(host, addresses)
 }
 
 async fn read_response_text(response: reqwest::Response) -> Result<String> {
@@ -20128,77 +20146,7 @@ fn parse_public_web_url(input: &str) -> Result<Url> {
 }
 
 fn validate_public_web_url(url: &Url) -> Result<()> {
-    if !matches!(url.scheme(), "http" | "https") {
-        bail!("only http and https URLs are supported");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!("URLs with embedded credentials are not allowed");
-    }
-    let host = url.host_str().context("URL is missing a host")?;
-    let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
-    if normalized_host == "localhost"
-        || normalized_host.ends_with(".localhost")
-        || normalized_host == "local"
-        || normalized_host.ends_with(".local")
-    {
-        bail!("local network URLs are not allowed");
-    }
-    if let Ok(ip) = normalized_host.parse::<IpAddr>()
-        && is_private_ip(ip)
-    {
-        bail!("private or loopback IP URLs are not allowed");
-    }
-    Ok(())
-}
-
-fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_unspecified()
-                || is_shared_v4(ip)
-                || ip.is_multicast()
-                || is_benchmark_v4(ip)
-                || is_protocol_assignment_v4(ip)
-                || ip.octets()[0] >= 240
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || is_documentation_v6(ip)
-                || ip.is_multicast()
-                || is_site_local_v6(ip)
-                || ip
-                    .to_ipv4_mapped()
-                    .is_some_and(|mapped| is_private_ip(IpAddr::V4(mapped)))
-        }
-    }
-}
-
-fn is_benchmark_v4(ip: Ipv4Addr) -> bool {
-    matches!(ip.octets(), [198, second, ..] if matches!(second, 18 | 19))
-}
-
-fn is_protocol_assignment_v4(ip: Ipv4Addr) -> bool {
-    matches!(ip.octets(), [192, 0, 0, _])
-}
-
-fn is_shared_v4(ip: Ipv4Addr) -> bool {
-    matches!(ip.octets(), [100, second_octet, ..] if (64..=127).contains(&second_octet))
-}
-
-fn is_documentation_v6(ip: Ipv6Addr) -> bool {
-    matches!(ip.segments(), [0x2001, 0x0db8, ..])
-}
-
-fn is_site_local_v6(ip: Ipv6Addr) -> bool {
-    ip.segments()[0] & 0xffc0 == 0xfec0
+    crate::public_network::validate_public_http_url(url)
 }
 
 fn normalize_web_content(body: &str, content_type: &str) -> String {
@@ -21081,6 +21029,33 @@ mod tests {
         assert_eq!(first["call-1"], "batch-first-0");
         assert_eq!(second["call-1"], "batch-second-0");
         assert_ne!(first["call-1"], second["call-1"]);
+    }
+
+    #[test]
+    fn durable_batch_ids_are_unique_across_turns() {
+        let calls = vec![AgentToolCall {
+            id: Some("call-1".to_string()),
+            tool: "read_file".to_string(),
+            arguments: json!({"path":"src/lib.rs"}),
+        }];
+        let first = durable_event_batch_id("session", "turn-a", 0, 0, &calls).unwrap();
+        let second = durable_event_batch_id("session", "turn-b", 0, 0, &calls).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn panicked_parallel_tool_retains_its_durable_identity() {
+        let fallback = (
+            Some("batch-call-0".to_string()),
+            "mcp_search".to_string(),
+            json!({"query":"needle"}),
+        );
+        let handle = std::thread::spawn(|| -> ExecutedToolResult { panic!("injected tool panic") });
+        let result = join_parallel_tool_thread(fallback, handle);
+        assert_eq!(result.tool_call_id.as_deref(), Some("batch-call-0"));
+        assert_eq!(result.tool, "mcp_search");
+        assert_eq!(result.arguments, json!({"query":"needle"}));
+        assert!(!result.success);
     }
 
     #[test]
@@ -29729,6 +29704,7 @@ the next imagined action"#;
             )]),
         };
         let mut state = ProactiveLspState {
+            event_namespace: "session\0turn".to_string(),
             workspace_epoch: 0,
             previous: baseline,
             paths: BTreeMap::new(),
@@ -29758,6 +29734,7 @@ the next imagined action"#;
                 server: "rust".to_string(),
                 path: "src/lib.rs".to_string(),
             }],
+            advisory_targets: Vec::new(),
             deferred_targets: Vec::new(),
             incomplete_reasons: BTreeSet::new(),
             complete: true,
@@ -29796,6 +29773,7 @@ the next imagined action"#;
             stale: true,
             requested_targets: Vec::new(),
             completed_targets: Vec::new(),
+            advisory_targets: Vec::new(),
             deferred_targets: Vec::new(),
             incomplete_reasons: BTreeSet::from([lsp::ProactiveLspIncompleteReason::StaleWorkspace]),
             complete: false,
@@ -29832,6 +29810,7 @@ the next imagined action"#;
             ]),
         };
         let mut state = ProactiveLspState {
+            event_namespace: "session\0turn".to_string(),
             workspace_epoch: 0,
             previous: baseline,
             paths: BTreeMap::new(),
@@ -29857,6 +29836,7 @@ the next imagined action"#;
             stale: false,
             requested_targets: targets.clone(),
             completed_targets: targets,
+            advisory_targets: Vec::new(),
             deferred_targets: Vec::new(),
             incomplete_reasons: BTreeSet::new(),
             complete: true,

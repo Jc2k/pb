@@ -147,12 +147,27 @@ impl UserConfig {
 
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
         self.validate()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
         let text = toml::to_string_pretty(self).context("failed to serialize user config")?;
-        std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+        crate::atomic_file::write(path, text.as_bytes())
+    }
+
+    pub fn mutate<R>(mutation: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
+        let path = config_path()?;
+        Self::mutate_path(&path, mutation)
+    }
+
+    pub(crate) fn mutate_path<R>(
+        path: &Path,
+        mutation: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let _lock = crate::state_lock::StateFileLock::acquire(
+            config_lock_path(path),
+            std::time::Duration::from_secs(10),
+        )?;
+        let mut config = Self::load_from_path(path)?;
+        let result = mutation(&mut config)?;
+        config.save_to_path(path)?;
+        Ok(result)
     }
 
     pub fn get(&self, key: &str) -> Result<Option<String>> {
@@ -438,6 +453,12 @@ impl UserConfig {
     }
 }
 
+fn config_lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
+
 pub fn config_path() -> Result<PathBuf> {
     let config_dir = dirs::config_dir().context("cannot determine config directory")?;
     Ok(config_dir.join("pb").join("config.toml"))
@@ -496,7 +517,7 @@ where
 
 fn bail_unknown_key<T>(key: &str) -> Result<T> {
     bail!(
-        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, memory.personal_repo, storage.state_dir, storage.cache_dir, inference.llamacpp_session_cache_enabled, inference.llamacpp_session_cache_max_bytes, inference.flashmoe_session_cache_enabled, inference.flashmoe_session_cache_max_bytes, flashmoe.memory_sessions, flashmoe.resident_models, flashmoe.idle_seconds. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, container_runtime, args, env, working_directory, capabilities, and disabled fields. MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, secret_env, and operator-audited read_only_tools. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
+        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, memory.personal_repo, storage.state_dir, storage.cache_dir, inference.llamacpp_session_cache_enabled, inference.llamacpp_session_cache_max_bytes, inference.flashmoe_session_cache_enabled, inference.flashmoe_session_cache_max_bytes, flashmoe.memory_sessions, flashmoe.resident_models, flashmoe.idle_seconds. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, source_container_image, verified_manifest_digest, container_runtime, args, env, working_directory, capabilities, and disabled fields. MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, secret_env, and operator-audited read_only_tools. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
     )
 }
 
@@ -508,6 +529,7 @@ struct ProfileWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
 
     #[test]
@@ -536,6 +558,46 @@ mod tests {
         );
         assert_eq!(loaded.model.temperature, Some(0.7));
         assert_eq!(loaded.model.profile, Some(AgentProfile::Review));
+    }
+
+    #[test]
+    fn serialized_mutations_preserve_concurrent_config_fields() {
+        let dir = tempdir().unwrap();
+        let path = Arc::new(dir.path().join("config.toml"));
+        UserConfig::default().save_to_path(&path).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let first = {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                UserConfig::mutate_path(&path, |config| {
+                    config.web.port = Some(9001);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        let second = {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                UserConfig::mutate_path(&path, |config| {
+                    config.model.max_steps = Some(7);
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        barrier.wait();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let config = UserConfig::load_from_path(&path).unwrap();
+        assert_eq!(config.web.port, Some(9001));
+        assert_eq!(config.model.max_steps, Some(7));
     }
 
     #[test]

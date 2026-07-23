@@ -28,7 +28,10 @@ import {
 import { PageShell } from "../components/PageShell";
 import { IntentControl } from "../components/IntentControl";
 import { GoalStartSheet } from "../components/GoalStartSheet";
-import { integrationInstallPayload } from "../lib/integrationConfig";
+import {
+  integrationApiError,
+  integrationInstallPayload,
+} from "../lib/integrationConfig";
 import {
   ensureNotificationPermission,
   projectName,
@@ -584,6 +587,9 @@ export function ProjectSettingsPage() {
   >(null);
   const [schemaLoading, setSchemaLoading] = useState(false);
   const [schemaError, setSchemaError] = useState("");
+  const [submitError, setSubmitError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [integrationError, setIntegrationError] = useState("");
   const [integrationSearch, setIntegrationSearch] = useState("");
   const [integrationCategory, setIntegrationCategory] = useState<
     IntegrationKind | "all"
@@ -608,10 +614,18 @@ export function ProjectSettingsPage() {
 
   const fetchInstalledIntegrations = async () => {
     if (!name) return;
-    const res = await fetch(
-      `/api/projects/${encodeURIComponent(name)}/integrations`,
-    );
-    if (res.ok) {
+    try {
+      const res = await fetch(
+        `/api/projects/${encodeURIComponent(name)}/integrations`,
+      );
+      if (!res.ok) {
+        throw new Error(
+          await integrationApiError(
+            res,
+            "Could not load installed integrations",
+          ),
+        );
+      }
       setInstalled(
         uniqueInstalledIntegrations(
           ((await res.json()) as InstalledIntegration[]).filter((entry) =>
@@ -619,16 +633,39 @@ export function ProjectSettingsPage() {
           ),
         ),
       );
+    } catch (error) {
+      setIntegrationError(
+        error instanceof Error
+          ? error.message
+          : "Could not load installed integrations",
+      );
     }
   };
 
   useEffect(() => {
     void fetchProjects();
     void fetch("/api/integrations/marketplace")
-      .then((res) => (res.ok ? res.json() : []))
+      .then(async (res) => {
+        if (!res.ok) {
+          throw new Error(
+            await integrationApiError(
+              res,
+              "Could not load the integration marketplace",
+            ),
+          );
+        }
+        return res.json();
+      })
       .then((entries: MarketplaceIntegration[]) =>
         setMarketplace(
           uniqueIntegrations(entries.filter((entry) => entry.kind === "mcp")),
+        )
+      )
+      .catch((error) =>
+        setIntegrationError(
+          error instanceof Error
+            ? error.message
+            : "Could not load the integration marketplace",
         )
       );
   }, []);
@@ -658,6 +695,10 @@ export function ProjectSettingsPage() {
     integrationName?: string,
     installed = false,
     env?: Record<string, string>,
+    sourceContainerImage?: string,
+    operation: "install" | "configure" | "upgrade" = installed
+      ? "configure"
+      : "install",
   ) => {
     if (!project || !containerImage.trim()) return;
     const pending = {
@@ -665,11 +706,14 @@ export function ProjectSettingsPage() {
       containerImage: containerImage.trim(),
       name: integrationName,
       installed,
+      sourceContainerImage,
+      operation,
       env,
     };
     setPendingInstall(pending);
     setConfigSchema(null);
     setSchemaError("");
+    setSubmitError("");
     setSchemaLoading(true);
     try {
       const res = await fetch(
@@ -677,7 +721,14 @@ export function ProjectSettingsPage() {
           encodeURIComponent(pending.containerImage)
         }`,
       );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        throw new Error(
+          await integrationApiError(
+            res,
+            "Could not inspect the integration image",
+          ),
+        );
+      }
       setConfigSchema((await res.json()) as IntegrationConfigSchemaResponse);
     } catch (err) {
       setSchemaError(err instanceof Error ? err.message : "Unknown error");
@@ -690,30 +741,61 @@ export function ProjectSettingsPage() {
     if (!project || !window.confirm(`Remove ${item.name} from this project?`)) {
       return;
     }
-    const res = await fetch(
-      `/api/projects/${encodeURIComponent(project.name)}/integrations/${
-        encodeURIComponent(item.name)
-      }`,
-      { method: "DELETE" },
-    );
-    if (res.ok) void fetchInstalledIntegrations();
+    setIntegrationError("");
+    try {
+      const res = await fetch(
+        `/api/projects/${encodeURIComponent(project.name)}/integrations/${
+          encodeURIComponent(item.name)
+        }`,
+        { method: "DELETE" },
+      );
+      if (!res.ok) {
+        throw new Error(
+          await integrationApiError(res, "Could not remove the integration"),
+        );
+      }
+      void fetchInstalledIntegrations();
+    } catch (error) {
+      setIntegrationError(
+        error instanceof Error
+          ? error.message
+          : "Could not remove the integration",
+      );
+    }
   };
 
   const installIntegration = async (env: Record<string, string> = {}) => {
     if (!project || !pendingInstall) return;
-    const res = await fetch(
-      `/api/projects/${encodeURIComponent(project.name)}/integrations`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(integrationInstallPayload(pendingInstall, env, configSchema)),
-      },
-    );
-    if (res.ok) {
+    setSubmitting(true);
+    setSubmitError("");
+    try {
+      const res = await fetch(
+        `/api/projects/${encodeURIComponent(project.name)}/integrations`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            integrationInstallPayload(pendingInstall, env, configSchema),
+          ),
+        },
+      );
+      if (!res.ok) {
+        throw new Error(
+          await integrationApiError(res, "Could not install the integration"),
+        );
+      }
       setPendingInstall(null);
       setConfigSchema(null);
       setSchemaError("");
       void fetchInstalledIntegrations();
+    } catch (error) {
+      setSubmitError(
+        error instanceof Error
+          ? error.message
+          : "Could not install the integration",
+      );
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -810,9 +892,27 @@ export function ProjectSettingsPage() {
                   item.name,
                   "disabled" in item,
                   "disabled" in item ? item.env : undefined,
+                  "source_container_image" in item
+                    ? item.source_container_image
+                    : undefined,
+                )}
+              onUpgrade={(item) =>
+                void prepareIntegrationInstall(
+                  item.kind,
+                  item.source_container_image || item.container_image,
+                  item.name,
+                  true,
+                  item.env,
+                  item.source_container_image || item.container_image,
+                  "upgrade",
                 )}
               onRemove={(item) => void removeIntegration(item)}
             />
+            {integrationError && (
+              <div className="alert alert-danger mt-3 mb-0">
+                {integrationError}
+              </div>
+            )}
           </section>
           {pendingInstall && (
             <div className="integration-modal-backdrop">
@@ -821,10 +921,13 @@ export function ProjectSettingsPage() {
                 schemaResponse={configSchema}
                 loading={schemaLoading}
                 error={schemaError}
+                submitError={submitError}
+                submitting={submitting}
                 onCancel={() => {
                   setPendingInstall(null);
                   setConfigSchema(null);
                   setSchemaError("");
+                  setSubmitError("");
                 }}
                 onInstall={(env) => void installIntegration(env)}
               />

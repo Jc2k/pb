@@ -155,6 +155,7 @@ pub enum ProactiveLspIncompleteReason {
     TimeBound,
     PathUnavailable,
     ServerFailure,
+    PushOnlySnapshot,
     StaleWorkspace,
 }
 
@@ -176,6 +177,8 @@ pub struct ProactiveLspReport {
     pub requested_targets: Vec<ProactiveLspTarget>,
     #[serde(default)]
     pub completed_targets: Vec<ProactiveLspTarget>,
+    #[serde(default)]
+    pub advisory_targets: Vec<ProactiveLspTarget>,
     #[serde(default)]
     pub deferred_targets: Vec<ProactiveLspTarget>,
     #[serde(default)]
@@ -199,6 +202,16 @@ impl ProactiveLspReport {
     }
 
     pub fn completed_paths(&self) -> BTreeSet<String> {
+        self.paths_accounted_by(&self.completed_targets)
+    }
+
+    pub fn attempted_paths(&self) -> BTreeSet<String> {
+        let mut targets = self.completed_targets.clone();
+        targets.extend(self.advisory_targets.iter().cloned());
+        self.paths_accounted_by(&targets)
+    }
+
+    fn paths_accounted_by(&self, targets: &[ProactiveLspTarget]) -> BTreeSet<String> {
         let requested = self.requested_targets.iter().fold(
             BTreeMap::<&str, usize>::new(),
             |mut counts, target| {
@@ -206,13 +219,13 @@ impl ProactiveLspReport {
                 counts
             },
         );
-        let completed = self.completed_targets.iter().fold(
-            BTreeMap::<&str, usize>::new(),
-            |mut counts, target| {
-                *counts.entry(&target.path).or_default() += 1;
-                counts
-            },
-        );
+        let completed =
+            targets
+                .iter()
+                .fold(BTreeMap::<&str, usize>::new(), |mut counts, target| {
+                    *counts.entry(&target.path).or_default() += 1;
+                    counts
+                });
         requested
             .into_iter()
             .filter(|(path, count)| completed.get(path).copied() == Some(*count))
@@ -259,13 +272,9 @@ impl ProjectLspConfig {
 
     pub fn save(&self, workspace_root: &Path) -> Result<()> {
         let path = project_lsp_config_path(workspace_root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
         let text =
             toml::to_string_pretty(self).context("failed to serialize project LSP config")?;
-        std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))
+        crate::atomic_file::write(&path, text.as_bytes())
     }
 }
 
@@ -474,7 +483,22 @@ pub fn call_tool(
         tool_name,
         arguments,
         LSP_DIAGNOSTIC_TIMEOUT,
+        None,
     )
+    .map(|outcome| outcome.result)
+}
+
+#[derive(Debug)]
+struct LspToolCallOutcome {
+    result: String,
+    diagnostic_complete: bool,
+}
+
+fn complete_tool_outcome(result: String) -> LspToolCallOutcome {
+    LspToolCallOutcome {
+        result,
+        diagnostic_complete: true,
+    }
 }
 
 fn call_tool_with_diagnostic_timeout(
@@ -483,7 +507,8 @@ fn call_tool_with_diagnostic_timeout(
     tool_name: &str,
     arguments: &Value,
     diagnostic_timeout: Duration,
-) -> Result<String> {
+    overall_deadline: Option<Instant>,
+) -> Result<LspToolCallOutcome> {
     let spec = registry
         .tool(tool_name)
         .with_context(|| format!("unknown LSP tool: {tool_name}"))?;
@@ -502,16 +527,27 @@ fn call_tool_with_diagnostic_timeout(
             .servers
             .get(&spec.server_name)
             .context("LSP server configuration disappeared during lazy startup")?;
+        let initialize_timeout = remaining_timeout(
+            overall_deadline,
+            LSP_READ_TIMEOUT,
+            "starting the language server",
+        )?;
         *slot = Some(LspClient::connect(
             &spec.server_name,
             config,
             workspace_root,
             registry.lease.as_ref(),
+            initialize_timeout,
         )?);
     }
     let client = slot
         .as_mut()
         .context("LSP server disappeared after lazy startup")?;
+    let diagnostic_timeout = remaining_timeout(
+        overall_deadline,
+        diagnostic_timeout,
+        "collecting language-server diagnostics",
+    )?;
     match client.call_with_diagnostic_timeout(
         spec.operation,
         workspace_root,
@@ -527,16 +563,31 @@ fn call_tool_with_diagnostic_timeout(
                 .servers
                 .get(&spec.server_name)
                 .context("LSP server configuration disappeared during restart")?;
-            client.shutdown_transport();
+            let shutdown_timeout = overall_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_secs(2))
+                .min(Duration::from_secs(2));
+            client.shutdown_transport(shutdown_timeout);
+            let initialize_timeout = remaining_timeout(
+                overall_deadline,
+                LSP_READ_TIMEOUT,
+                "restarting the language server",
+            )?;
             *client = LspClient::connect(
                 &spec.server_name,
                 config,
                 workspace_root,
                 registry.lease.as_ref(),
+                initialize_timeout,
             )
             .with_context(|| {
                 format!("LSP request failed ({first_error:#}) and the bounded restart also failed")
             })?;
+            let diagnostic_timeout = remaining_timeout(
+                overall_deadline,
+                diagnostic_timeout,
+                "collecting diagnostics after language-server restart",
+            )?;
             client.call_with_diagnostic_timeout(
                 spec.operation,
                 workspace_root,
@@ -545,6 +596,21 @@ fn call_tool_with_diagnostic_timeout(
             )
         }
     }
+}
+
+fn remaining_timeout(
+    overall_deadline: Option<Instant>,
+    requested: Duration,
+    operation: &str,
+) -> Result<Duration> {
+    let Some(deadline) = overall_deadline else {
+        return Ok(requested);
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("proactive LSP time bound expired before {operation}");
+    }
+    Ok(requested.min(remaining))
 }
 
 pub fn proactive_diagnostics(
@@ -612,6 +678,7 @@ pub fn proactive_diagnostics(
         stale: false,
         requested_targets: requested_targets.clone(),
         completed_targets: Vec::new(),
+        advisory_targets: Vec::new(),
         deferred_targets: Vec::new(),
         incomplete_reasons: if omitted_paths > 0 {
             BTreeSet::from([ProactiveLspIncompleteReason::PathBound])
@@ -633,6 +700,7 @@ pub fn proactive_diagnostics(
             }));
     }
     let started = Instant::now();
+    let pass_deadline = started + PROACTIVE_LSP_PASS_TIMEOUT;
     for (index, target) in requested_targets.iter().enumerate() {
         if index >= MAX_PROACTIVE_LSP_CALLS {
             report
@@ -688,13 +756,14 @@ pub fn proactive_diagnostics(
                 "_pb_workspace_paths": server_paths.get(server).cloned().unwrap_or_default(),
             }),
             PROACTIVE_LSP_DIAGNOSTIC_TIMEOUT,
+            Some(pass_deadline),
         );
         match result {
-            Ok(result) => {
+            Ok(outcome) => {
                 if !report.scanned_paths.contains(&path) {
                     report.scanned_paths.push(path.clone());
                 }
-                let decoded: Value = match serde_json::from_str(&result) {
+                let decoded: Value = match serde_json::from_str(&outcome.result) {
                     Ok(decoded) => decoded,
                     Err(error) => {
                         report.failures.push(ProactiveLspFailure {
@@ -719,7 +788,14 @@ pub fn proactive_diagnostics(
                         .insert(ProactiveLspIncompleteReason::ServerFailure);
                     continue;
                 };
-                report.completed_targets.push(target.clone());
+                if outcome.diagnostic_complete {
+                    report.completed_targets.push(target.clone());
+                } else {
+                    report.advisory_targets.push(target.clone());
+                    report
+                        .incomplete_reasons
+                        .insert(ProactiveLspIncompleteReason::PushOnlySnapshot);
+                }
                 for diagnostic in diagnostics {
                     let Some(normalized) = normalize_proactive_diagnostic(
                         &server,
@@ -782,6 +858,8 @@ pub fn proactive_diagnostics(
     report.failures.dedup();
     report.completed_targets.sort();
     report.completed_targets.dedup();
+    report.advisory_targets.sort();
+    report.advisory_targets.dedup();
     report.deferred_targets.sort();
     report.deferred_targets.dedup();
     report.complete = report.omitted_paths == 0
@@ -948,12 +1026,15 @@ struct LspClient {
     next_id: u64,
     diagnostic_serial: u64,
     diagnostics: BTreeMap<String, DiagnosticSnapshot>,
+    supports_pull_diagnostics: bool,
     language_ids: Vec<String>,
     root_uri: String,
     root_name: String,
     open_documents: BTreeMap<String, OpenDocument>,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
+    shutdown_timeout: Duration,
+    transport_shutdown: bool,
 }
 
 struct OpenDocument {
@@ -987,7 +1068,7 @@ impl LspProcess {
         }
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self, timeout: Duration) {
         match self {
             Self::Host(child) => {
                 terminate_host_process_group(child.id());
@@ -995,10 +1076,10 @@ impl LspProcess {
                 let _ = child.wait();
             }
             Self::Exec(process) => {
-                let _ = process.shutdown(Duration::from_secs(2));
+                let _ = process.shutdown(timeout);
             }
             Self::Service(process) => {
-                let _ = process.shutdown(Duration::from_secs(2));
+                let _ = process.shutdown(timeout);
             }
         }
     }
@@ -1010,6 +1091,7 @@ impl LspClient {
         config: &LspServerConfig,
         workspace_root: &Path,
         lease: Option<&Arc<crate::session_environment::SessionEnvironmentLease>>,
+        initialize_timeout: Duration,
     ) -> Result<Self> {
         validate_packaged_image_authority(config)?;
         let cwd = match config.working_directory.as_deref() {
@@ -1116,21 +1198,27 @@ impl LspClient {
             next_id: 1,
             diagnostic_serial: 0,
             diagnostics: BTreeMap::new(),
+            supports_pull_diagnostics: false,
             language_ids: config.language_ids.clone(),
             root_uri: root_uri.clone(),
             root_name: root_name.clone(),
             open_documents: BTreeMap::new(),
             stderr_tail,
             stderr_thread,
+            shutdown_timeout: Duration::ZERO,
+            transport_shutdown: false,
         };
-        let mut initialize_params = json!({"processId": std::process::id(), "rootUri": root_uri, "workspaceFolders": [{"uri": root_uri, "name": root_name}], "capabilities": {"textDocument":{"synchronization":{"didSave":true,"dynamicRegistration":false},"hover":{},"definition":{},"references":{},"documentSymbol":{},"publishDiagnostics":{}},"workspace":{"symbol":{},"workspaceFolders":true,"configuration":true}}});
+        let mut initialize_params = json!({"processId": std::process::id(), "rootUri": root_uri, "workspaceFolders": [{"uri": root_uri, "name": root_name}], "capabilities": {"textDocument":{"synchronization":{"didSave":true,"dynamicRegistration":false},"hover":{},"definition":{},"references":{},"documentSymbol":{},"publishDiagnostics":{},"diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false}},"workspace":{"symbol":{},"workspaceFolders":true,"configuration":true,"diagnostics":{"refreshSupport":false}}}});
         if let Some(options) = config.initialization_options.clone()
             && let Some(params) = initialize_params.as_object_mut()
         {
             params.insert("initializationOptions".to_string(), options);
         }
-        client.request("initialize", initialize_params)?;
+        let initialize_result =
+            client.request_with_timeout("initialize", initialize_params, initialize_timeout)?;
+        client.supports_pull_diagnostics = server_supports_pull_diagnostics(&initialize_result);
         client.notify("initialized", json!({}))?;
+        client.shutdown_timeout = Duration::from_secs(2);
         Ok(client)
     }
 
@@ -1140,18 +1228,21 @@ impl LspClient {
         workspace_root: &Path,
         args: &Value,
         diagnostic_timeout: Duration,
-    ) -> Result<String> {
+    ) -> Result<LspToolCallOutcome> {
         match op {
-            LspOperation::WorkspaceSymbols => self.request_text(
-                "workspace/symbol",
-                json!({"query": string_arg(args, "query")?}),
-            ),
+            LspOperation::WorkspaceSymbols => self
+                .request_text(
+                    "workspace/symbol",
+                    json!({"query": string_arg(args, "query")?}),
+                )
+                .map(complete_tool_outcome),
             LspOperation::DocumentSymbols => {
                 let document = self.open_document(workspace_root, args, false)?;
                 self.request_text(
                     "textDocument/documentSymbol",
                     json!({"textDocument":{"uri":document.uri}}),
                 )
+                .map(complete_tool_outcome)
             }
             LspOperation::Diagnostics => {
                 if let Some(paths) = args.get("_pb_workspace_paths").and_then(Value::as_array) {
@@ -1161,21 +1252,45 @@ impl LspClient {
                 }
                 let after_serial = self.diagnostic_serial;
                 let document = self.open_document(workspace_root, args, true)?;
-                Ok(self
-                    .wait_for_diagnostics(&document, diagnostic_timeout, after_serial)?
-                    .to_string())
+                if self.supports_pull_diagnostics {
+                    let diagnostics = self.pull_diagnostics(&document, diagnostic_timeout)?;
+                    Ok(LspToolCallOutcome {
+                        result: diagnostics.to_string(),
+                        diagnostic_complete: true,
+                    })
+                } else {
+                    Ok(LspToolCallOutcome {
+                        result: self
+                            .wait_for_diagnostics(&document, diagnostic_timeout, after_serial)?
+                            .to_string(),
+                        diagnostic_complete: false,
+                    })
+                }
             }
-            LspOperation::Hover => {
-                self.position_request(workspace_root, args, "textDocument/hover")
-            }
-            LspOperation::Definition => {
-                self.position_request(workspace_root, args, "textDocument/definition")
-            }
+            LspOperation::Hover => self
+                .position_request(workspace_root, args, "textDocument/hover")
+                .map(complete_tool_outcome),
+            LspOperation::Definition => self
+                .position_request(workspace_root, args, "textDocument/definition")
+                .map(complete_tool_outcome),
             LspOperation::References => {
                 let (uri, pos) = self.document_position(workspace_root, args)?;
-                self.request_text("textDocument/references", json!({"textDocument":{"uri":uri},"position":pos,"context":{"includeDeclaration":true}}))
+                self.request_text("textDocument/references", json!({"textDocument":{"uri":uri},"position":pos,"context":{"includeDeclaration":true}})).map(complete_tool_outcome)
             }
         }
+    }
+
+    fn pull_diagnostics(
+        &mut self,
+        document: &OpenDocumentState,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let report = self.request_with_timeout(
+            "textDocument/diagnostic",
+            json!({"textDocument":{"uri":document.uri}}),
+            timeout,
+        )?;
+        diagnostic_items_from_pull_report(&report)
     }
 
     fn position_request(
@@ -1468,6 +1583,26 @@ impl LspClient {
     }
 }
 
+fn server_supports_pull_diagnostics(initialize_result: &Value) -> bool {
+    initialize_result
+        .pointer("/capabilities/diagnosticProvider")
+        .is_some_and(|capability| !capability.is_null() && capability != &Value::Bool(false))
+}
+
+fn diagnostic_items_from_pull_report(report: &Value) -> Result<Value> {
+    match report.get("kind").and_then(Value::as_str) {
+        Some("full") => report
+            .get("items")
+            .filter(|items| items.is_array())
+            .cloned()
+            .context("full diagnostic pull response omitted its items array"),
+        Some("unchanged") => {
+            bail!("diagnostic pull returned unchanged without a previous result identifier")
+        }
+        _ => bail!("diagnostic pull returned an unsupported report"),
+    }
+}
+
 fn validate_packaged_image_authority(config: &LspServerConfig) -> Result<()> {
     let Some(image) = config.container_image.as_deref() else {
         return Ok(());
@@ -1493,22 +1628,29 @@ fn diagnostic_snapshot_is_fresh(snapshot: &DiagnosticSnapshot, version: u64) -> 
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        if self.transport_shutdown {
+            return;
+        }
         for uri in self.open_documents.keys().cloned().collect::<Vec<_>>() {
             let _ = self.notify("textDocument/didClose", json!({"textDocument":{"uri":uri}}));
         }
-        let _ = self.request_with_timeout("shutdown", Value::Null, Duration::from_secs(2));
+        let _ = self.request_with_timeout("shutdown", Value::Null, self.shutdown_timeout);
         let _ = self.notify("exit", json!(null));
-        self.shutdown_transport();
+        self.shutdown_transport(self.shutdown_timeout);
     }
 }
 
 impl LspClient {
-    fn shutdown_transport(&mut self) {
-        self.process.shutdown();
+    fn shutdown_transport(&mut self, timeout: Duration) {
+        if self.transport_shutdown {
+            return;
+        }
+        self.process.shutdown(timeout);
         self.stdout_reader.join();
         if let Some(thread) = self.stderr_thread.take() {
             let _ = thread.join();
         }
+        self.transport_shutdown = true;
     }
 }
 
@@ -1773,6 +1915,7 @@ mod tests {
                 server: "a".to_string(),
                 path: "src/lib.rs".to_string(),
             }],
+            advisory_targets: Vec::new(),
             deferred_targets: Vec::new(),
             incomplete_reasons: BTreeSet::new(),
             complete: false,
@@ -1786,6 +1929,106 @@ mod tests {
             report.completed_paths(),
             BTreeSet::from(["src/lib.rs".to_string()])
         );
+    }
+
+    #[test]
+    fn push_only_targets_are_attempted_but_never_complete() {
+        let target = ProactiveLspTarget {
+            server: "legacy".to_string(),
+            path: "src/lib.rs".to_string(),
+        };
+        let report = ProactiveLspReport {
+            mode: ProactiveLspMode::Settled,
+            workspace_epoch: 1,
+            workspace_fingerprint: "workspace".to_string(),
+            requested_paths: vec![target.path.clone()],
+            scanned_paths: vec![target.path.clone()],
+            diagnostics: Vec::new(),
+            suppressed_diagnostics: 0,
+            omitted_paths: 0,
+            failures: Vec::new(),
+            stale: false,
+            requested_targets: vec![target.clone()],
+            completed_targets: Vec::new(),
+            advisory_targets: vec![target],
+            deferred_targets: Vec::new(),
+            incomplete_reasons: BTreeSet::from([ProactiveLspIncompleteReason::PushOnlySnapshot]),
+            complete: false,
+        };
+        assert!(report.completed_paths().is_empty());
+        assert_eq!(
+            report.attempted_paths(),
+            BTreeSet::from(["src/lib.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn diagnostic_pull_requires_an_explicit_full_report() {
+        let diagnostics = diagnostic_items_from_pull_report(&json!({
+            "kind": "full",
+            "items": [{"message":"error"}]
+        }))
+        .unwrap();
+        assert_eq!(diagnostics.as_array().unwrap().len(), 1);
+        assert!(
+            diagnostic_items_from_pull_report(&json!({
+                "kind": "unchanged",
+                "resultId": "old"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn initialize_capability_controls_diagnostic_pull() {
+        assert!(server_supports_pull_diagnostics(&json!({
+            "capabilities": {"diagnosticProvider": {"interFileDependencies": true}}
+        })));
+        assert!(!server_supports_pull_diagnostics(&json!({
+            "capabilities": {}
+        })));
+    }
+
+    #[test]
+    fn expired_proactive_deadline_fails_before_startup() {
+        let error = remaining_timeout(Some(Instant::now()), Duration::from_secs(30), "starting")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("time bound expired"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proactive_deadline_bounds_an_unresponsive_initializer_and_its_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        std::fs::write(directory.path().join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        let registry = discover_tools(
+            BTreeMap::from([(
+                "rust".to_string(),
+                LspServerConfig {
+                    command: Some("sh".to_string()),
+                    args: vec!["-c".to_string(), "sleep 5".to_string()],
+                    language_ids: vec!["rust".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            directory.path(),
+        );
+        let started = Instant::now();
+        let error = call_tool_with_diagnostic_timeout(
+            &registry,
+            directory.path(),
+            "lsp_rust_diagnostics",
+            &json!({"path":"src/lib.rs"}),
+            Duration::from_secs(2),
+            Some(Instant::now() + Duration::from_millis(100)),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("LSP response failed"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -1927,14 +2170,21 @@ mod tests {
             handle.lease(),
         );
 
-        let result = call_tool(
+        let outcome = call_tool_with_diagnostic_timeout(
             &registry,
             directory.path(),
             "lsp_rust_analyzer_diagnostics",
             &json!({"path":"src/lib.rs"}),
+            LSP_DIAGNOSTIC_TIMEOUT,
+            None,
         )
         .unwrap();
-        assert!(serde_json::from_str::<Value>(&result).unwrap().is_array());
+        assert!(outcome.diagnostic_complete);
+        assert!(
+            serde_json::from_str::<Value>(&outcome.result)
+                .unwrap()
+                .is_array()
+        );
         drop(registry);
         drop(handle);
     }

@@ -482,6 +482,7 @@ pub async fn run_server_with_ready(
             interval.tick().await;
             let cleanup = tokio::task::spawn_blocking(|| -> Result<()> {
                 crate::session_environment::global_supervisor().reap_expired()?;
+                crate::session_environment::global_supervisor().retry_failed_cleanup()?;
                 crate::inference::flashmoe::reap_idle_shared_runtimes()?;
                 if let Some(runtime) = crate::container::detect_runtime() {
                     crate::cache_manager::global_cache_manager().gc(
@@ -627,11 +628,12 @@ fn notify_ready(
     }
 }
 
-async fn list_marketplace_integrations() -> Result<Json<Vec<MarketplaceIntegration>>, StatusCode> {
+async fn list_marketplace_integrations()
+-> Result<Json<Vec<MarketplaceIntegration>>, IntegrationApiError> {
     integrations::list_marketplace()
         .await
         .map(Json)
-        .map_err(|_| StatusCode::BAD_GATEWAY)
+        .map_err(|error| IntegrationApiError::new(StatusCode::BAD_GATEWAY, format!("{error:#}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -639,83 +641,150 @@ struct IntegrationSchemaQuery {
     image: String,
 }
 
+#[derive(Debug, Serialize)]
+struct IntegrationApiErrorBody {
+    error: String,
+}
+
+struct IntegrationApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl IntegrationApiError {
+    fn new(status: StatusCode, error: impl std::fmt::Display) -> Self {
+        Self {
+            status,
+            message: error.to_string().chars().take(2_000).collect(),
+        }
+    }
+}
+
+impl IntoResponse for IntegrationApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(IntegrationApiErrorBody {
+                error: self.message,
+            }),
+        )
+            .into_response()
+    }
+}
+
 async fn get_integration_config_schema(
     Query(query): Query<IntegrationSchemaQuery>,
-) -> Result<Json<IntegrationConfigSchema>, StatusCode> {
+) -> Result<Json<IntegrationConfigSchema>, IntegrationApiError> {
     tokio::task::spawn_blocking(move || integrations::fetch_config_schema(&query.image))
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .map(Json)
-        .map_err(|_| StatusCode::BAD_GATEWAY)
+        .map_err(|error| IntegrationApiError::new(StatusCode::BAD_GATEWAY, format!("{error:#}")))
 }
 
 async fn list_project_integrations(
     Path(name): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<Vec<InstalledIntegration>>, StatusCode> {
-    let projects = state.projects.lock().await;
-    let project = projects
-        .iter()
-        .find(|project| project.name == name)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    integrations::list_project_installed(&PathBuf::from(&project.path))
+) -> Result<Json<Vec<InstalledIntegration>>, IntegrationApiError> {
+    let project_path = {
+        let projects = state.projects.lock().await;
+        projects
+            .iter()
+            .find(|project| project.name == name)
+            .map(|project| PathBuf::from(&project.path))
+            .ok_or_else(|| IntegrationApiError::new(StatusCode::NOT_FOUND, "project not found"))?
+    };
+    tokio::task::spawn_blocking(move || integrations::list_project_installed(&project_path))
+        .await
+        .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| {
+            IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        })
 }
 
 async fn install_project_integration(
     Path(name): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<IntegrationInstallRequest>,
-) -> Result<Json<InstalledIntegration>, StatusCode> {
-    let projects = state.projects.lock().await;
-    let project = projects
-        .iter()
-        .find(|project| project.name == name)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    integrations::install_project(&PathBuf::from(&project.path), req)
+) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
+    let project_path = {
+        let projects = state.projects.lock().await;
+        projects
+            .iter()
+            .find(|project| project.name == name)
+            .map(|project| PathBuf::from(&project.path))
+            .ok_or_else(|| IntegrationApiError::new(StatusCode::NOT_FOUND, "project not found"))?
+    };
+    tokio::task::spawn_blocking(move || integrations::install_project(&project_path, req))
+        .await
+        .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .map(|response| Json(response.installed))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| {
+            IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        })
 }
 
 async fn remove_project_integration(
     Path((name, integration_name)): Path<(String, String)>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<InstalledIntegration>, StatusCode> {
-    let projects = state.projects.lock().await;
-    let project = projects
-        .iter()
-        .find(|project| project.name == name)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    integrations::remove_project(
-        &PathBuf::from(&project.path),
-        crate::integrations::IntegrationKind::Mcp,
-        &integration_name,
-    )
+) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
+    let project_path = {
+        let projects = state.projects.lock().await;
+        projects
+            .iter()
+            .find(|project| project.name == name)
+            .map(|project| PathBuf::from(&project.path))
+            .ok_or_else(|| IntegrationApiError::new(StatusCode::NOT_FOUND, "project not found"))?
+    };
+    tokio::task::spawn_blocking(move || {
+        integrations::remove_project(
+            &project_path,
+            crate::integrations::IntegrationKind::Mcp,
+            &integration_name,
+        )
+    })
+    .await
+    .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
     .map(|response| Json(response.removed))
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    .map_err(|error| {
+        IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    })
 }
 
-async fn list_global_lsp_integrations() -> Result<Json<Vec<InstalledIntegration>>, StatusCode> {
-    integrations::list_global_lsp_installed()
+async fn list_global_lsp_integrations()
+-> Result<Json<Vec<InstalledIntegration>>, IntegrationApiError> {
+    tokio::task::spawn_blocking(integrations::list_global_lsp_installed)
+        .await
+        .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| {
+            IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        })
 }
 
 async fn install_global_lsp_integration(
     Json(req): Json<IntegrationInstallRequest>,
-) -> Result<Json<InstalledIntegration>, StatusCode> {
-    integrations::install_global_lsp(req)
+) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
+    tokio::task::spawn_blocking(move || integrations::install_global_lsp(req))
+        .await
+        .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .map(|response| Json(response.installed))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| {
+            IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        })
 }
 
 async fn remove_global_lsp_integration(
     Path(integration_name): Path<String>,
-) -> Result<Json<InstalledIntegration>, StatusCode> {
-    integrations::remove_global_lsp(&integration_name)
+) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
+    tokio::task::spawn_blocking(move || integrations::remove_global_lsp(&integration_name))
+        .await
+        .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .map(|response| Json(response.removed))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| {
+            IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        })
 }
 
 async fn start_session(
@@ -2300,9 +2369,10 @@ async fn update_settings(
 
     let enabled = req.prevent_sleep_while_working;
     let persisted = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut config = crate::config::UserConfig::load()?;
-        config.web.prevent_sleep_while_working = Some(enabled);
-        config.save()
+        crate::config::UserConfig::mutate(|config| {
+            config.web.prevent_sleep_while_working = Some(enabled);
+            Ok(())
+        })
     })
     .await;
 

@@ -72,12 +72,14 @@ error diagnostics. A blocking result reopens only its exact current task paths f
 not replace the checking stage, including for supported paths beyond the bounded pass selection.
 
 Settled evidence is workspace-epoch scoped, not merely file-version scoped. Any content mutation
-invalidates settled evidence for every supported task path. Before accepting a settled result, pb
-opens the whole bounded server/path set, forces a document-version publication barrier for the
-target, and accepts only a newer publication after a short quiescence window. Coverage is tracked
-per server/path target. A path is settled only when every matching target completed for the same
-workspace epoch; path, call, time, startup, transport, and stale-workspace limits are explicit
-incomplete outcomes and can never be presented as clean.
+invalidates settled evidence for every supported task path. pb opens the whole bounded server/path
+set before requesting each target. A server that implements LSP pull diagnostics completes a target
+only with an explicit full diagnostic report. A push-only server can still provide a fresh
+post-open publication after the document-version barrier, but that bounded snapshot is advisory:
+even an empty snapshot cannot complete coverage or be presented as clean. Coverage is tracked per
+server/path target. A path is settled only when every matching target completed for the same
+workspace epoch; path, call, end-to-end pass time, startup, transport, push-only, and
+stale-workspace limits are explicit incomplete outcomes.
 
 ### 4. Checks
 
@@ -206,7 +208,7 @@ The runtime applies these boundaries before a result can become evidence:
 | Public research | Every URL and redirect is restricted to HTTP(S), resolved before connection, rejected if any answer is private/special-use, and pinned to the validated public address. Proxies are bypassed. Bodies are capped and oversized chunked responses fail instead of being returned as complete. |
 | Vision | A vision path must be inside the workspace or exactly match a session attachment. Inputs are regular files with byte and pixel ceilings. |
 | MCP | Only operator-declared `capabilities.read_only_tools` are exposed. Server annotations are untrusted hints. Unsupported schemas and normalized-name collisions become explicit status failures; `isError` is a failed call; only an operator-read-only, server-idempotent call is retried, and only after a typed transport failure. A configured service runtime must match the owning session runtime. |
-| LSP | Discovery is schema-only and server startup is lazy behind one per-session/per-server initialization lock; no registry lock is held while an image or server starts. Names cannot collide silently; documents/config/responses and the open-document set are bounded; language IDs follow file extensions; diagnostics require a post-barrier publication for the current document and workspace epoch; only typed transport failures restart a server. Proactive passes are deterministic, read-only, content-fingerprinted, limited to 8 supported task paths and 8 server/path calls, retain every unattempted target as deferred, stop scheduling new calls after 12 seconds, wait at most 2 seconds per diagnostic publication, retain at most 64 diagnostics, and collapse each message to 500 characters. Any workspace mutation during collection discards the entire result. Marketplace packages require a bounded typed manifest bound to an immutable OCI digest and cannot request write or network authority. Sidecars use the owning task runtime or a session-owned service-only lease for local/no-environment projects. |
+| LSP | Discovery is schema-only and server startup is lazy behind one per-session/per-server initialization lock; no registry lock is held while an image or server starts. Names cannot collide silently; documents/config/responses and the open-document set are bounded; language IDs follow file extensions; pull diagnostics require an explicit full report, while fresh push publications remain advisory and cannot establish clean coverage; only typed transport failures restart a server. Proactive passes are deterministic, read-only, content-fingerprinted, limited to 8 supported task paths and 8 server/path calls, retain every unattempted target as deferred, pass one 12-second deadline through initialization, diagnostics, and a bounded restart, wait at most 2 seconds for a push publication, retain at most 64 diagnostics, and collapse each message to 500 characters. Any workspace mutation during collection discards the entire result. Marketplace packages require a bounded typed manifest bound to an immutable OCI digest and cannot request write or network authority. Sidecars use the owning task runtime or a session-owned service-only lease for local/no-environment projects. |
 | Durable memory | Agent writes are byte/count bounded and evidence-backed. The agent can record only facts, gotchas, procedures, and debt. Decisions and preferences require a future controller-owned approval record and cannot be self-approved in tool arguments. Supersession requires active source and replacement entries. |
 
 Dynamic JSON schemas are admitted only when pb's recursive validator can enforce every supported
@@ -335,7 +337,9 @@ each reported path's content fingerprint. A mutation during collection makes the
 discards its diagnostics. Transport, startup, timeout, and malformed-response failures are visible
 Trinity warnings and cannot satisfy or bypass an ordinary check. A successful pass likewise grants
 no selected-check, review, commit, progress, or completion evidence. pb never requests or applies
-LSP edits, formatting, commands, or code actions automatically.
+LSP edits, formatting, commands, or code actions automatically. Empty push-only publications are
+shown as incomplete advisory evidence; only an explicit full pull-diagnostic response completes a
+server/path target.
 
 At implementation submission, pb projects the accepted plan identity/digest, current content
 fingerprint, actual task-delta paths per named plan step, and no-change fact. The model still accounts

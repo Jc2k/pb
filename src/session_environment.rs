@@ -571,6 +571,11 @@ impl SessionEnvironmentLease {
             .lock()
             .map_err(|_| anyhow::anyhow!("session cache attachment lock is poisoned"))?
             .clear();
+        if let Some(error) = stop_error {
+            self.transition(LeaseState::Stopped, LeaseState::Failed)?;
+            return Err(error)
+                .context("session container shutdown failed; recovery state was retained");
+        }
         self.transition(LeaseState::Stopped, LeaseState::Stopped)?;
         if self.record_path.exists() {
             std::fs::remove_file(&self.record_path).with_context(|| {
@@ -579,10 +584,6 @@ impl SessionEnvironmentLease {
                     self.record_path.display()
                 )
             })?;
-        }
-        if let Some(error) = stop_error {
-            return Err(error)
-                .context("session container shutdown failed; forced cleanup was attempted");
         }
         Ok(())
     }
@@ -911,7 +912,9 @@ impl EnvironmentSupervisor {
         if retain_after_turn {
             let _ = self.mark_idle(session_id);
         } else {
-            let _ = self.terminate(session_id);
+            if let Err(error) = self.terminate(session_id) {
+                eprintln!("failed to terminate session environment {session_id}: {error:#}");
+            }
             if let Ok(manager) = crate::session_workspace::WorkspaceManager::persistent()
                 && let Ok(Some(record)) = manager.find_record_by_session(session_id)
             {
@@ -1093,6 +1096,52 @@ impl EnvironmentSupervisor {
             }
         }
         Ok(expired)
+    }
+
+    pub fn retry_failed_cleanup(&self) -> Result<Vec<String>> {
+        self.retry_failed_cleanup_with(|binary| container::runtime_for_binary(binary))
+    }
+
+    fn retry_failed_cleanup_with(
+        &self,
+        mut runtime_for_binary: impl FnMut(&str) -> Result<Box<dyn ContainerRuntime>>,
+    ) -> Result<Vec<String>> {
+        let records_dir = self.records_dir();
+        std::fs::create_dir_all(&records_dir)?;
+        let mut cleaned = Vec::new();
+        let mut first_error = None;
+        for entry in std::fs::read_dir(&records_dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(discovered) = load_record(&entry.path())? else {
+                continue;
+            };
+            if discovered.observed_state != LeaseState::Failed {
+                continue;
+            }
+            let _operation = SessionOperationLock::acquire(self.lock_path(&discovered.session_id))?;
+            let Some(record) = load_record(&entry.path())? else {
+                continue;
+            };
+            if record.observed_state != LeaseState::Failed {
+                continue;
+            }
+            let result = runtime_for_binary(&record.runtime_binary)
+                .and_then(|runtime| cleanup_recorded_resources(&record, runtime.as_ref()));
+            match result {
+                Ok(()) => {
+                    if entry.path().exists() {
+                        std::fs::remove_file(entry.path())?;
+                    }
+                    cleaned.push(record.session_id);
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        first_error.map_or(Ok(cleaned), Err)
     }
 
     fn records_dir(&self) -> PathBuf {
@@ -1884,6 +1933,61 @@ mod tests {
                 "network remove pb-net-s1",
             ]
         );
+    }
+
+    #[test]
+    fn failed_cleanup_retains_a_retryable_lease_record() {
+        let dir = TempDir::new().unwrap();
+        let supervisor = Box::leak(Box::new(EnvironmentSupervisor::new(
+            dir.path().to_path_buf(),
+        )));
+        let state = state();
+        let handle = supervisor
+            .acquire(
+                seed(dir.path()),
+                Box::new(FakeRuntime {
+                    state: Arc::clone(&state),
+                }),
+                Vec::new(),
+                true,
+                {
+                    let state = Arc::clone(&state);
+                    move |runtime| {
+                        state
+                            .containers
+                            .lock()
+                            .unwrap()
+                            .insert("pb-task-s1".to_string());
+                        Ok(ContainerHandle {
+                            runtime,
+                            container_id: "pb-task-s1".to_string(),
+                            network: None,
+                        })
+                    }
+                },
+            )
+            .unwrap();
+        drop(handle);
+        state.fail_inventory.store(true, Ordering::Release);
+
+        assert!(supervisor.terminate("s1").is_err());
+        let record_path = supervisor.record_path("s1");
+        let record = load_record(&record_path).unwrap().expect("retained record");
+        assert_eq!(record.desired_state, LeaseState::Stopped);
+        assert_eq!(record.observed_state, LeaseState::Failed);
+        assert!(record_path.exists());
+
+        state.fail_inventory.store(false, Ordering::Release);
+        let cleaned = supervisor
+            .retry_failed_cleanup_with(|_| {
+                Ok(Box::new(FakeRuntime {
+                    state: Arc::clone(&state),
+                }))
+            })
+            .unwrap();
+        assert_eq!(cleaned, vec!["s1".to_string()]);
+        assert!(!record_path.exists());
+        assert!(state.containers.lock().unwrap().is_empty());
     }
 
     #[test]

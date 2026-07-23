@@ -24,6 +24,7 @@ pub mod agent_core;
 mod agent_progress;
 mod agent_repository;
 mod agent_tool_errors;
+mod atomic_file;
 pub mod cache_manager;
 pub mod checks;
 pub mod cli_ui;
@@ -51,6 +52,7 @@ pub mod mcp;
 pub mod memory;
 pub mod policy;
 pub mod projects;
+mod public_network;
 pub mod service;
 pub mod session_environment;
 pub mod session_power;
@@ -1231,14 +1233,11 @@ async fn run_serve_platform(
 fn run_config_command(command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Set(args) => {
-            let mut config = UserConfig::load()?;
-            config.set(&args.key, &args.value)?;
-            config.save()?;
-            println!(
-                "{} = {}",
-                args.key,
-                config.get(&args.key)?.unwrap_or_default()
-            );
+            let value = UserConfig::mutate(|config| {
+                config.set(&args.key, &args.value)?;
+                config.get(&args.key)
+            })?;
+            println!("{} = {}", args.key, value.unwrap_or_default());
         }
         ConfigCommand::Get(args) => {
             let config = UserConfig::load()?;

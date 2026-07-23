@@ -2,13 +2,15 @@
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
+use reqwest::header::{ACCEPT, AUTHORIZATION, LOCATION, WWW_AUTHENTICATE};
+use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::config::{self, UserConfig};
 use crate::lsp::LspServerConfig;
@@ -24,6 +26,10 @@ const MAX_LSP_PACKAGE_LANGUAGE_IDS: usize = 32;
 const MAX_LSP_PACKAGE_CACHE_IDS: usize = 16;
 const MAX_REGISTRY_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_REGISTRY_TOKEN_BYTES: u64 = 64 * 1024;
+const MAX_REGISTRY_REDIRECTS: usize = 5;
+const MAX_REGISTRY_URL_CHARS: usize = 8_192;
+const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -346,11 +352,7 @@ pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSch
         bail!("container image cannot be empty");
     }
     let image = RegistryImage::parse(container_image)?;
-    let client = Client::builder()
-        .user_agent("pb-integration-config-schema")
-        .build()
-        .context("failed to build registry client")?;
-    let manifest = fetch_registry_manifest(&client, &image)
+    let manifest = fetch_registry_manifest(&image)
         .with_context(|| format!("failed to inspect container image {container_image}"))?;
     if image.reference.starts_with("sha256:") && image.reference != manifest.digest {
         bail!(
@@ -359,7 +361,7 @@ pub fn fetch_config_schema(container_image: &str) -> Result<IntegrationConfigSch
             image.reference
         );
     }
-    let config = fetch_registry_config(&client, &image, &manifest.value)
+    let config = fetch_registry_config(&image, &manifest.value)
         .with_context(|| format!("failed to fetch image config for {container_image}"))?;
     let schema_text = find_annotation(&config, CONFIG_SCHEMA_ANNOTATION)
         .or_else(|| find_annotation(&manifest.value, CONFIG_SCHEMA_ANNOTATION));
@@ -506,7 +508,7 @@ struct RegistryDocument {
     digest: String,
 }
 
-fn fetch_registry_manifest(client: &Client, image: &RegistryImage) -> Result<RegistryDocument> {
+fn fetch_registry_manifest(image: &RegistryImage) -> Result<RegistryDocument> {
     let accept = [
         "application/vnd.oci.image.index.v1+json",
         "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -514,27 +516,16 @@ fn fetch_registry_manifest(client: &Client, image: &RegistryImage) -> Result<Reg
         "application/vnd.docker.distribution.manifest.v2+json",
     ]
     .join(", ");
-    fetch_registry_json_document(
-        client,
-        image,
-        &image.manifest_url(),
-        &accept,
-        "image manifest",
-    )
+    fetch_registry_json_document(image, &image.manifest_url(), &accept, "image manifest")
 }
 
-fn fetch_registry_config(
-    client: &Client,
-    image: &RegistryImage,
-    manifest: &Value,
-) -> Result<Value> {
+fn fetch_registry_config(image: &RegistryImage, manifest: &Value) -> Result<Value> {
     let image_manifest = if manifest.get("config").is_some() {
         manifest.clone()
     } else {
         let digest = select_runnable_manifest_digest(manifest)
             .context("image index does not contain a runnable manifest digest")?;
         fetch_registry_json_document(
-            client,
             image,
             &image.manifest_digest_url(digest),
             &[
@@ -552,7 +543,6 @@ fn fetch_registry_config(
         .and_then(Value::as_str)
         .context("image manifest does not contain a config digest")?;
     Ok(fetch_registry_json_document(
-        client,
         image,
         &image.blob_url(digest),
         &[
@@ -617,27 +607,23 @@ fn manifest_platform_priority(manifest: &Value) -> u8 {
 }
 
 fn fetch_registry_json_document(
-    client: &Client,
     image: &RegistryImage,
     url: &str,
     accept: &str,
     context: &str,
 ) -> Result<RegistryDocument> {
-    let mut response = client.get(url).header(ACCEPT, accept).send()?;
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+    let url = parse_registry_url(url)?;
+    let mut response = send_public_registry_get(url.clone(), Some(accept), None)?;
+    if response.status() == StatusCode::UNAUTHORIZED {
         let challenge = response
             .headers()
             .get(WWW_AUTHENTICATE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         if let Some(challenge) = challenge
-            && let Some(token) = fetch_bearer_token(client, &challenge, image)?
+            && let Some(token) = fetch_bearer_token(&challenge, image)?
         {
-            response = client
-                .get(url)
-                .header(ACCEPT, accept)
-                .header(AUTHORIZATION, format!("Bearer {token}"))
-                .send()?;
+            response = send_public_registry_get(url, Some(accept), Some(&token))?;
         }
     }
     read_bounded_registry_document(
@@ -693,11 +679,7 @@ fn read_bounded_registry_document(
     })
 }
 
-fn fetch_bearer_token(
-    client: &Client,
-    challenge: &str,
-    image: &RegistryImage,
-) -> Result<Option<String>> {
+fn fetch_bearer_token(challenge: &str, image: &RegistryImage) -> Result<Option<String>> {
     let Some(params) = challenge.strip_prefix("Bearer ") else {
         return Ok(None);
     };
@@ -717,14 +699,15 @@ fn fetch_bearer_token(
     let Some(realm) = realm else {
         return Ok(None);
     };
-    let mut request = client
-        .get(realm)
-        .query(&[("scope", format!("repository:{}:pull", image.repository))]);
+    let mut realm = parse_registry_url(&realm).context("registry auth realm is not safe")?;
+    realm
+        .query_pairs_mut()
+        .append_pair("scope", &format!("repository:{}:pull", image.repository));
     if let Some(service) = service {
-        request = request.query(&[("service", service)]);
+        realm.query_pairs_mut().append_pair("service", &service);
     }
     let token = read_bounded_registry_json(
-        request.send()?.error_for_status()?,
+        send_public_registry_get(realm, None, None)?.error_for_status()?,
         MAX_REGISTRY_TOKEN_BYTES,
         "registry auth token",
     )?;
@@ -733,6 +716,81 @@ fn fetch_bearer_token(
         .or_else(|| token.get("access_token"))
         .and_then(Value::as_str)
         .map(str::to_string))
+}
+
+fn parse_registry_url(value: &str) -> Result<Url> {
+    let url = Url::parse(value).with_context(|| format!("invalid registry URL: {value}"))?;
+    validate_registry_url(&url)?;
+    Ok(url)
+}
+
+fn validate_registry_url(url: &Url) -> Result<()> {
+    if url.as_str().chars().count() > MAX_REGISTRY_URL_CHARS {
+        bail!("registry URL exceeds {MAX_REGISTRY_URL_CHARS} characters");
+    }
+    crate::public_network::validate_public_http_url(url)?;
+    if url.scheme() != "https" {
+        bail!("registry and authentication URLs must use https");
+    }
+    Ok(())
+}
+
+fn registry_origin(url: &Url) -> Option<(String, String, u16)> {
+    Some((
+        url.scheme().to_string(),
+        url.host_str()?.to_ascii_lowercase(),
+        url.port_or_known_default()?,
+    ))
+}
+
+fn send_public_registry_get(
+    mut url: Url,
+    accept: Option<&str>,
+    bearer_token: Option<&str>,
+) -> Result<reqwest::blocking::Response> {
+    let authenticated_origin = bearer_token.and_then(|_| registry_origin(&url));
+    for redirect_count in 0..=MAX_REGISTRY_REDIRECTS {
+        validate_registry_url(&url)?;
+        let (host, address) = crate::public_network::resolve_public_target_blocking(&url)?;
+        let client = Client::builder()
+            .user_agent("pb-integration-config-schema")
+            .connect_timeout(REGISTRY_CONNECT_TIMEOUT)
+            .timeout(REGISTRY_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve(&host, address)
+            .build()
+            .context("failed to build pinned registry client")?;
+        let mut request = client.get(url.clone());
+        if let Some(accept) = accept {
+            request = request.header(ACCEPT, accept);
+        }
+        if let (Some(token), Some(origin)) = (bearer_token, authenticated_origin.as_ref())
+            && registry_origin(&url).as_ref() == Some(origin)
+        {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = request
+            .send()
+            .with_context(|| format!("failed to fetch registry URL {url}"))?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        if redirect_count == MAX_REGISTRY_REDIRECTS {
+            bail!("registry request exceeded {MAX_REGISTRY_REDIRECTS} redirects");
+        }
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .context("registry redirect omitted Location header")?
+            .to_str()
+            .context("registry redirect Location was not valid UTF-8")?;
+        url = url
+            .join(location)
+            .with_context(|| format!("invalid registry redirect target: {location}"))?;
+        validate_registry_url(&url).context("registry redirect target is not safe")?;
+    }
+    unreachable!("bounded registry redirect loop always returns or fails")
 }
 
 fn read_bounded_registry_json(
@@ -800,8 +858,8 @@ pub fn list_project_installed(workspace_root: &Path) -> Result<Vec<InstalledInte
                     name,
                     kind: IntegrationKind::Mcp,
                     container_image,
-                    source_container_image: None,
-                    verified_manifest_digest: None,
+                    source_container_image: server.source_container_image,
+                    verified_manifest_digest: server.verified_manifest_digest,
                     env: server.env,
                     disabled: server.disabled,
                     status: status.unwrap_or(IntegrationStatus::Unavailable),
@@ -833,10 +891,6 @@ pub fn install_project(
         IntegrationKind::Mcp => {
             if request.lsp_manifest.is_some() {
                 bail!("an LSP package manifest cannot configure an MCP integration");
-            }
-            let mut config = ProjectMcpConfig::load(workspace_root)?.unwrap_or_default();
-            if request.no_overwrite && config.servers.contains_key(&name) {
-                bail!("MCP integration '{name}' is already installed");
             }
             if is_marketplace_container_image(&request.container_image)
                 && !request.container_image.contains("@sha256:")
@@ -870,16 +924,24 @@ pub fn install_project(
                 container_runtime.as_deref(),
                 false,
             );
-            config.servers.insert(
-                name.clone(),
-                McpServerConfig {
-                    container_image: Some(request.container_image.clone()),
-                    container_runtime,
-                    env: request.env.clone(),
-                    ..Default::default()
-                },
-            );
-            config.save(workspace_root)?;
+            let server_config = McpServerConfig {
+                container_image: Some(request.container_image.clone()),
+                source_container_image: request.source_container_image.clone(),
+                verified_manifest_digest: request
+                    .container_image
+                    .rsplit_once("@sha256:")
+                    .map(|(_, digest)| format!("sha256:{digest}")),
+                container_runtime,
+                env: request.env.clone(),
+                ..Default::default()
+            };
+            ProjectMcpConfig::mutate(workspace_root, |config| {
+                if request.no_overwrite && config.servers.contains_key(&name) {
+                    bail!("MCP integration '{name}' is already installed");
+                }
+                config.servers.insert(name.clone(), server_config);
+                Ok(())
+            })?;
             Ok(IntegrationInstallResponse {
                 installed: InstalledIntegration {
                     name,
@@ -911,25 +973,25 @@ pub fn remove_project(
     if name.trim().is_empty() || name.contains(['\n', '\r']) {
         bail!("integration name cannot be empty or contain newlines");
     }
-    let mut config = ProjectMcpConfig::load(workspace_root)?.unwrap_or_default();
-    let server = config
-        .servers
-        .remove(name)
-        .with_context(|| format!("MCP integration '{name}' is not installed"))?;
+    let server = ProjectMcpConfig::mutate(workspace_root, |config| {
+        config
+            .servers
+            .remove(name)
+            .with_context(|| format!("MCP integration '{name}' is not installed"))
+    })?;
     let status = server.container_image.as_deref().map(|image| {
         container_installation_status(image, server.container_runtime.as_deref(), server.disabled)
     });
     let container_image = server
         .container_image
         .context("configured MCP server is not a container integration")?;
-    config.save(workspace_root)?;
     Ok(IntegrationRemoveResponse {
         removed: InstalledIntegration {
             name: name.to_string(),
             kind,
             container_image,
-            source_container_image: None,
-            verified_manifest_digest: None,
+            source_container_image: server.source_container_image,
+            verified_manifest_digest: server.verified_manifest_digest,
             env: server.env,
             disabled: server.disabled,
             status: status.unwrap_or(IntegrationStatus::Unavailable),
@@ -980,10 +1042,6 @@ pub fn install_global_lsp(
     if name.trim().is_empty() || name.contains(['\n', '\r']) {
         bail!("integration name cannot be empty or contain newlines");
     }
-    let mut user_config = UserConfig::load()?;
-    if request.no_overwrite && user_config.lsp.servers.contains_key(&name) {
-        bail!("LSP integration '{name}' is already installed");
-    }
     if is_marketplace_container_image(&request.container_image) {
         if !request.container_image.contains("@sha256:") {
             bail!("marketplace LSP integrations must be installed by immutable OCI digest");
@@ -1020,8 +1078,13 @@ pub fn install_global_lsp(
     }
     let status = lsp_installation_status(&server_config);
     let verified_manifest_digest = server_config.verified_manifest_digest.clone();
-    user_config.lsp.servers.insert(name.clone(), server_config);
-    user_config.save()?;
+    UserConfig::mutate(|user_config| {
+        if request.no_overwrite && user_config.lsp.servers.contains_key(&name) {
+            bail!("LSP integration '{name}' is already installed");
+        }
+        user_config.lsp.servers.insert(name.clone(), server_config);
+        Ok(())
+    })?;
     Ok(IntegrationInstallResponse {
         installed: InstalledIntegration {
             name,
@@ -1075,19 +1138,19 @@ pub fn remove_global_lsp(name: &str) -> Result<IntegrationRemoveResponse> {
     if name.trim().is_empty() || name.contains(['\n', '\r']) {
         bail!("integration name cannot be empty or contain newlines");
     }
-    let mut user_config = UserConfig::load()?;
-    let server = user_config
-        .lsp
-        .servers
-        .remove(name)
-        .with_context(|| format!("LSP integration '{name}' is not installed"))?;
+    let server = UserConfig::mutate(|user_config| {
+        user_config
+            .lsp
+            .servers
+            .remove(name)
+            .with_context(|| format!("LSP integration '{name}' is not installed"))
+    })?;
     let status = lsp_installation_status(&server);
     let source_container_image = server.source_container_image.clone();
     let verified_manifest_digest = server.verified_manifest_digest.clone();
     let container_image = server
         .container_image
         .context("configured LSP server is not a container integration")?;
-    user_config.save()?;
     Ok(IntegrationRemoveResponse {
         removed: InstalledIntegration {
             name: name.to_string(),
@@ -1164,6 +1227,19 @@ mod tests {
             name_from_image("ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:abc"),
             "lsp-rust-analyzer"
         );
+    }
+
+    #[test]
+    fn registry_transport_rejects_local_insecure_and_credentialed_urls() {
+        for value in [
+            "https://127.0.0.1/v2/image/manifests/latest",
+            "https://registry.local/v2/image/manifests/latest",
+            "http://example.com/v2/image/manifests/latest",
+            "https://token@example.com/v2/image/manifests/latest",
+        ] {
+            assert!(parse_registry_url(value).is_err(), "accepted {value}");
+        }
+        parse_registry_url("https://ghcr.io/v2/crunchy-pb/example/manifests/latest").unwrap();
     }
 
     #[test]
@@ -1282,6 +1358,40 @@ mod tests {
                 .get("SENTRY_DSN")
                 .map(String::as_str),
             Some("https://example")
+        );
+    }
+
+    #[test]
+    fn project_mcp_install_preserves_the_upgrade_source_and_verified_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = install_project(
+            dir.path(),
+            IntegrationInstallRequest {
+                kind: IntegrationKind::Mcp,
+                container_image: "ghcr.io/example/sentry-mcp@sha256:abc".to_string(),
+                source_container_image: Some("ghcr.io/example/sentry-mcp:stable".to_string()),
+                name: Some("sentry-mcp".to_string()),
+                runtime: Some("docker".to_string()),
+                env: BTreeMap::new(),
+                lsp_manifest: None,
+                no_overwrite: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.installed.source_container_image.as_deref(),
+            Some("ghcr.io/example/sentry-mcp:stable")
+        );
+        let installed = list_project_installed(dir.path()).unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].source_container_image.as_deref(),
+            Some("ghcr.io/example/sentry-mcp:stable")
+        );
+        assert_eq!(
+            installed[0].verified_manifest_digest.as_deref(),
+            Some("sha256:abc")
         );
     }
 

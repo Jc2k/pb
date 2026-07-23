@@ -38,6 +38,12 @@ pub struct McpServerConfig {
     pub command: Option<String>,
     pub url: Option<String>,
     pub container_image: Option<String>,
+    /// Mutable source reference used only for an explicit container upgrade.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_container_image: Option<String>,
+    /// Digest recorded when that source was resolved to an immutable image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_manifest_digest: Option<String>,
     pub container_runtime: Option<String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -122,13 +128,26 @@ impl ProjectMcpConfig {
 
     pub fn save(&self, workspace_root: &Path) -> Result<()> {
         let path = project_mcp_config_path(workspace_root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
         let text =
             toml::to_string_pretty(self).context("failed to serialize project MCP config")?;
-        std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))
+        crate::atomic_file::write(&path, text.as_bytes())
+    }
+
+    pub(crate) fn mutate<R>(
+        workspace_root: &Path,
+        mutation: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let path = project_mcp_config_path(workspace_root);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _lock = crate::state_lock::StateFileLock::acquire(
+            PathBuf::from(lock_path),
+            Duration::from_secs(10),
+        )?;
+        let mut config = Self::load(workspace_root)?.unwrap_or_default();
+        let result = mutation(&mut config)?;
+        config.save(workspace_root)?;
+        Ok(result)
     }
 }
 
@@ -1057,6 +1076,7 @@ fn format_tool_content(result: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn project_config_round_trips() {
@@ -1076,6 +1096,65 @@ mod tests {
         config.save(dir.path()).unwrap();
         let loaded = ProjectMcpConfig::load(dir.path()).unwrap().unwrap();
         assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn absent_upgrade_metadata_does_not_change_legacy_service_identity() {
+        let value = serde_json::to_value(McpServerConfig::default()).unwrap();
+        assert!(value.get("source_container_image").is_none());
+        assert!(value.get("verified_manifest_digest").is_none());
+    }
+
+    #[test]
+    fn project_config_mutations_preserve_concurrent_integrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(dir.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(3));
+        let first = {
+            let root = Arc::clone(&root);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                ProjectMcpConfig::mutate(&root, |config| {
+                    config.servers.insert(
+                        "docs".to_string(),
+                        McpServerConfig {
+                            command: Some("docs".to_string()),
+                            ..Default::default()
+                        },
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        let second = {
+            let root = Arc::clone(&root);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                ProjectMcpConfig::mutate(&root, |config| {
+                    config.servers.insert(
+                        "search".to_string(),
+                        McpServerConfig {
+                            command: Some("search".to_string()),
+                            ..Default::default()
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        barrier.wait();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let config = ProjectMcpConfig::load(&root).unwrap().unwrap();
+        assert_eq!(config.servers.len(), 2);
+        assert!(config.servers.contains_key("docs"));
+        assert!(config.servers.contains_key("search"));
     }
 
     #[test]

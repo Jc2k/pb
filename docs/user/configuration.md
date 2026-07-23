@@ -25,6 +25,11 @@ The user configuration file is `<config-dir>/pb/config.toml`. It covers:
 - global MCP and LSP server definitions;
 - an optional separate personal-memory repository.
 
+CLI, web, and marketplace mutations take a cross-process lock, re-read the latest configuration,
+and atomically replace the file. Concurrent changes to different settings or integrations therefore
+do not silently overwrite one another. Project MCP marketplace writes use the same pattern for
+`.pb/mcp.toml`.
+
 The web server binds to `127.0.0.1:8311` by default. Changing `web.listen` to `0.0.0.0` exposes the
 interface on available networks. pb does not add authentication or TLS merely because the address
 changed, so treat non-loopback binding as an explicit trust decision.
@@ -397,7 +402,12 @@ stores that digest as the executable image identity, keeps the original tag only
 metadata, verifies the typed manifest again through the digest, and downloads that exact image
 during installation when a container runtime is available. Task startup does not pull a missing
 pinned image. Existing tag-only marketplace LSP entries appear as **Upgrade required** and cannot
-run until they are explicitly reinstalled; no compatibility switch permits mutable execution.
+run until they are explicitly upgraded or reinstalled; no compatibility switch permits mutable
+execution. **Configure** always edits environment values against the installed digest and preserves
+the saved source tag. **Upgrade** is a separate action that re-resolves that source, verifies the
+new digest and package metadata, and then replaces the pinned identity. Project MCP marketplace
+entries preserve the same pinned/source distinction. Schema, install, list, and removal failures
+remain visible in the integration UI instead of closing the form or silently doing nothing.
 
 The rust-analyzer package is published by the `crunchy-pb/lsp-rust-analyzer` marketplace repository.
 Install it from the web integration store or from the CLI; pb reads and validates the embedded
@@ -420,7 +430,11 @@ handoff it surfaces current error diagnostics. The web transcript shows this as 
 language diagnostics, with the Actions drawer retaining the structured result. These passes are
 bounded repair hints, not substitutes for configured checks, code review, or the managed commit.
 An unavailable or timed-out server is reported and pb continues to the ordinary checks. pb never
-applies language-server edits, commands, formatting, or code actions.
+applies language-server edits, commands, formatting, or code actions. A full pull-diagnostic
+response can complete a server/file target. A push-only server can still surface a fresh bounded
+snapshot, but even an empty snapshot remains explicitly incomplete and is never presented as proof
+that the target is clean. One 12-second proactive deadline covers server initialization, collection,
+and any typed restart.
 
 Language servers start lazily on their first manual query or matching proactive pass. A project does
 not need a container-backed task environment: for local and otherwise unconfigured projects, pb

@@ -88,7 +88,10 @@ runtime artifacts remain local for reuse after the operation.
 Opening integration discovery queries the fixed public `crunchy-pb` GitHub organization;
 configuring a selected package reads its container metadata from the registry. Installing an LSP
 package resolves the selected tag to an immutable digest and pulls that exact image when a local
-runtime is available. Those requests disclose the
+runtime is available. Registry metadata, redirects, and authentication realms must all be public
+HTTPS targets: pb rejects local names, credentials, and any DNS set containing a private or
+special-use address, pins each request to a validated answer, and bypasses ambient proxies. Those
+requests disclose the
 requested public package name and the ordinary network metadata of a download, but no repository
 source or prompt content. Downloaded
 images remain local reusable artifacts. A task never contacts the registry to fill in a missing
@@ -158,6 +161,9 @@ Goal restart safety is local persistence behavior: interrupted active work resto
 requires an explicit Resume. Stopping a Goal preserves local commits, workspace content, and
 evidence; deleting the containing finished session through the existing session-delete operation
 removes its pb session note and Goal state under the same cleanup contract.
+
+If verified container or network cleanup fails, pb keeps the local lease record in a failed state
+and retries it later. It does not erase the only inventory of resources that may still need removal.
 
 Likewise, a managed commit is local evidence. pb intentionally stops before remote publication. A
 future publication flow must have its own approval, idempotency, provider, and audit contracts.

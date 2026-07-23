@@ -297,7 +297,13 @@ export type AgentEvent =
     result: string;
     call_id?: string;
     batch_id?: string;
-    outcome?: "succeeded" | "failed" | "rejected" | "timed_out" | "cancelled" | "cache_replay";
+    outcome?:
+      | "succeeded"
+      | "failed"
+      | "rejected"
+      | "timed_out"
+      | "cancelled"
+      | "cache_replay";
     actor?: TeamActor;
     duration_ms?: number;
     energy_joules?: number;
@@ -981,7 +987,9 @@ export interface IntegrationConfigSchemaResponse {
 export interface PendingIntegrationInstall {
   kind: IntegrationKind;
   containerImage: string;
+  sourceContainerImage?: string;
   name?: string;
   installed?: boolean;
+  operation?: "install" | "configure" | "upgrade";
   env?: Record<string, string>;
 }
