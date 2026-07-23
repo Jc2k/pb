@@ -1,0 +1,148 @@
+# Task decomposition feasibility probe
+
+Captured: 2026-07-23
+
+Plan: [Task decomposition workflow](../multi-task-workflow-plan.md)
+
+The resulting design calls each high-level queue entry a Task. Child implementation planning is
+reserved until each Task activates.
+
+## Decision
+
+Model-assisted Task decomposition is viable only as a proposal-and-review stage. It is not
+reliable enough to let a model define executable task budgets or start child workflows directly.
+
+The 7B and 14B models produced useful six-Task dependency graphs from one request brief, but neither
+produced truthful aggregate budgets. The 7B plan also violated the per-task ceilings and introduced
+vague testing/refinement catch-alls. The 14B plan kept every task below its individual ceiling, but
+misordered storage migration after the service that needed it and misstated all three aggregate
+budget dimensions. Qwen3 4B spent both bounded generations reasoning about the constraints and never
+returned a final plan.
+
+The implementation consequence is narrow:
+
+- models may propose task boundaries, dependencies, acceptance facts, and qualitative effort;
+- Rust validates the graph and requirement coverage;
+- Rust compiles exact task budgets from policy presets and remaining parent budget;
+- fresh plan review must challenge task size, ordering, and acceptance quality; and
+- no task starts until the accepted, controller-projected artifact passes deterministic validation.
+
+This is a model limitation and product-design constraint, not evidence of a pb safety defect. The
+harness bounded the failed 4B run, preserved all outputs, made no workspace mutation, and reported
+the step-limit outcome truthfully.
+
+## Experiment contract
+
+The self-contained fixture asked a planning profile to decompose a durable CSV-import request for an
+existing Rust service and React UI. The request required persisted queued/running/completed/failed/
+cancelled state, restart-safe idempotent resume, compatible start/status/cancel APIs, progress/error/
+cancel/retry UI, schema migration, Rust and web tests, architecture and user documentation, and no
+deployment work.
+
+The numeric arm required three to six ordered tasks. Every task needed an ID, dependencies,
+objective, deliverables, observable acceptance checks, and exact invocation/token/wall-time budgets.
+Individual ceilings were 7 invocations, 6,000 generated tokens, and 35 minutes. Aggregate ceilings
+were 30 invocations, 24,000 generated tokens, and 150 minutes. Declared totals had to equal the task
+sums, and vague final integration/testing catch-alls were forbidden.
+
+A follow-up 7B arm removed numeric arithmetic. It requested `small` or `medium` effort while saying
+that the controller would assign exact budgets. It also required behavior-owning tasks to carry their
+tests and documentation instead of adding final testing, integration, review, or documentation
+catch-alls.
+
+Every run used:
+
+| Field | Value |
+| --- | --- |
+| Profile / intent | `plan` / `discuss` |
+| Context | 8,192 tokens |
+| Generation | 1,536 maximum new tokens |
+| Visible steps | 1, with ordinary bounded truncation recovery |
+| Sampling | temperature 0, top-k 1, seed 0 |
+| Backend | llama.cpp CPU, `--gpu-layers 0` |
+| Workspace | empty isolated harness repository; no mutation requested or observed |
+
+This was one feasibility trial per arm, not a stability qualification.
+
+## Results
+
+| Arm | Terminal result | Structure | Task-size result | Budget result | Planning defects |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3 4B, numeric | step limit after two 1,536-token generations | no final artifact | not scorable | not scorable | repeated constraint analysis never converged to output |
+| Qwen2.5-Coder 7B, numeric | final in one call, 834 generated tokens | six-node acyclic graph | failed: one task requested 15,000 tokens and 60 minutes | failed: task sums were 20 invocations / 36,000 tokens / 150 minutes, declared as 21 / 45,000 / 150 | separate test catch-all, vague review/refine task, weak observable checks |
+| Qwen2.5-Coder 14B, numeric | final in one call, 961 generated tokens | six-node acyclic graph | all declared task caps fit, though the core service task remained broad | failed: task sums were 34 invocations / 20,000 tokens / 140 minutes, declared as 30 / 24,000 / 150 | migration depended on the service instead of preceding it; several checks were subjective |
+| Qwen2.5-Coder 7B, qualitative | final in one call, 563 generated tokens | six-node acyclic graph | plausible small/medium labels | numeric allocation correctly omitted | ignored the colocated-test instruction, repeated the migration ordering error, omitted restart and user-documentation coverage |
+
+Removing arithmetic reduced output cost but did not fix semantic ordering, coverage, or catch-all
+behavior. The product should therefore remove numeric allocation from the model contract without
+mistaking that simplification for sufficient plan quality.
+
+## Classification
+
+### P2 — Exact budget arithmetic is not a model-owned control boundary
+
+- Classification: model limitation.
+- Evidence: both completed numeric arms declared totals different from the sums; the 7B arm also
+  exceeded individual and aggregate ceilings.
+- Impact: accepting model-authored limits could overspend the request or strand later Tasks.
+- Disposition: planned controller-owned budget compilation and exact aggregate validation.
+- Recommendation: accept only qualitative effort hints; persist exact controller-projected budgets
+  in the reviewed plan digest.
+
+### P2 — Plausible task lists still contain unsafe execution order and oversized scopes
+
+- Classification: model limitation.
+- Evidence: both 14B and qualitative 7B placed migration after dependent service work; 7B created
+  forbidden catch-all tasks; core service tasks combined persistence, lifecycle, restart, and
+  idempotency.
+- Impact: a smaller executor could receive a task that is blocked by a missing predecessor or too
+  broad to finish inside its allowance.
+- Disposition: planned deterministic DAG checks plus fresh Task-plan review and bounded revision.
+- Recommendation: require explicit requirement/acceptance traceability and scope hints, then reject
+  or revise tasks that do not leave a buildable checkpoint.
+
+### P2 — Qwen3 4B does not reliably close the planning artifact
+
+- Classification: model limitation.
+- Evidence: the initial generation and thinking-off recovery each reached 1,536 tokens without a
+  valid final artifact.
+- Impact: 4B cannot be the unattended default for this planning stage on current evidence.
+- Disposition: keep explicit-only until the typed Task corpus passes; do not add a hidden stronger
+  model escalation.
+- Recommendation: expose one compact terminal schema, retain bounded truncation recovery, and stop
+  truthfully when the artifact is absent.
+
+### Positive evidence — Failed planning remained bounded and non-mutating
+
+- Classification: positive evidence.
+- Evidence: all four scratch repositories retained only the harness initialization commit; the 4B
+  arm terminated at the visible step cap and every completed arm remained an unverified discussion
+  final.
+- Impact: weak planning did not become mutation, workflow progress, or a completion claim.
+- Disposition: preserve the same authority boundary in the Task-planning stage.
+
+## Preserved evidence
+
+The scratch roots contain cumulative and immutable per-run events, journals, run indexes, and Git
+workspaces:
+
+- `/private/tmp/pb-decomposition-20260723/4b/`
+- `/private/tmp/pb-decomposition-20260723/7b/`
+- `/private/tmp/pb-decomposition-20260723/14b/`
+- `/private/tmp/pb-decomposition-20260723/7b-controller-owned-budget/`
+
+The first 4B scratch run also records an experiment-environment lock failure before the bounded
+host-authorized rerun. That setup failure is separate from the completed model result.
+
+## Qualification gap
+
+Before rollout, replace this prose-final probe with a typed Task-plan fixture and repeat at least
+three request shapes: a cross-stack feature, a storage/API migration with rollback, and a scoped
+multi-component refactor. Run three trials per supported model/template. Promotion requires zero
+accepted invalid graphs or budget overflows, zero false multi-Task completion, and bounded convergence
+to an accepted or truthfully rejected plan within two revision cycles.
+
+The checked-in `fixtures/task-decomposition/corpus.json` now locks the first 12 deterministic,
+semantic-review, qualification, and attempt-limit cases. `deno task test:task-decomposition`
+validates its schema and required coverage. The corpus becomes production-validator input in the
+next delivery Task; it does not claim those runtime controls are shipped yet.

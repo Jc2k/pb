@@ -28,6 +28,8 @@
 - [Conversational delivery workflow](conversational-delivery-workflow-plan.md)
 - [Durable goal mode](goal-mode-plan.md)
   - [G8 · Goal control qualification](benchmarks/goal-mode-g8.md)
+- [Task decomposition workflow](multi-task-workflow-plan.md)
+  - [Decomposition feasibility probe](benchmarks/multi-task-decomposition.md)
 - [Agent handoff and workspaces](agent-handoff-workspace-plan.md)
 - [Session environment control plane](session-environment-control-plane.md)
   - [Apple container foundation](apple-container-environment-architecture.md)

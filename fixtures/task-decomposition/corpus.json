@@ -1,0 +1,587 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "valid_single_build",
+      "hypothesis": "One bounded Build Task dispatches directly without a multi-Task run.",
+      "category": "deterministic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Fix the average divisor and add a regression test.",
+        "requirements": [
+          {
+            "id": "r1",
+            "description": "Correct the divisor and cover the defect."
+          }
+        ],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Correct average calculation",
+            "description": "Fix the bounded calculation defect and add its regression test.",
+            "requirement_ids": ["r1"],
+            "depends_on": [],
+            "acceptance_ids": ["a1"],
+            "scope_hints": ["calculation implementation and tests"],
+            "effort": "small",
+            "kind": "build"
+          }
+        ],
+        "acceptance": [
+          {
+            "id": "a1",
+            "description": "The regression test fails before the fix and passes after it."
+          }
+        ],
+        "risks": []
+      }],
+      "expected": {
+        "outcome": "accepted",
+        "reason": "valid_single_build",
+        "dispatch": "build"
+      }
+    },
+    {
+      "id": "valid_single_goal_explicit",
+      "hypothesis": "Explicit Goal intent may dispatch one Goal Task through the existing Goal flow even when automatic Goal selection is not qualified.",
+      "category": "deterministic",
+      "context": {
+        "intent": "goal",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Make import recovery demonstrably restart-safe.",
+        "requirements": [
+          {
+            "id": "r1",
+            "description": "Prove restart-safe, idempotent recovery."
+          }
+        ],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Prove restart-safe recovery",
+            "description": "Use bounded Goal execution to satisfy and verify the recovery criteria.",
+            "requirement_ids": ["r1"],
+            "depends_on": [],
+            "acceptance_ids": ["a1"],
+            "scope_hints": ["import recovery"],
+            "effort": "large",
+            "kind": "goal",
+            "goal_contract": {
+              "objective": "Make import recovery restart-safe.",
+              "criteria": [
+                {
+                  "id": "c1",
+                  "description": "Interrupted imports resume without duplicate rows.",
+                  "verifier": "machine"
+                }
+              ],
+              "continuation": "bounded"
+            }
+          }
+        ],
+        "acceptance": [
+          {
+            "id": "a1",
+            "description": "The existing Goal verifier accepts current restart and idempotency evidence."
+          }
+        ],
+        "risks": [
+          {
+            "description": "Crash timing may expose more than one required child Build."
+          }
+        ]
+      }],
+      "expected": {
+        "outcome": "accepted",
+        "reason": "explicit_goal_intent",
+        "dispatch": "goal"
+      }
+    },
+    {
+      "id": "valid_multi_task",
+      "hypothesis": "A qualified acyclic Build/Goal plan with full coverage creates a multi-Task run.",
+      "category": "deterministic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": true,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Add durable restart-safe CSV imports and user-visible progress.",
+        "requirements": [
+          { "id": "r1", "description": "Persist import lifecycle state." },
+          {
+            "id": "r2",
+            "description": "Prove restart-safe idempotent execution."
+          },
+          {
+            "id": "r3",
+            "description": "Expose compatible APIs and UI progress."
+          }
+        ],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Persist import lifecycle",
+            "description": "Add the durable schema and lifecycle transitions with colocated tests.",
+            "requirement_ids": ["r1"],
+            "depends_on": [],
+            "acceptance_ids": ["a1"],
+            "scope_hints": ["storage and migration"],
+            "effort": "medium",
+            "kind": "build"
+          },
+          {
+            "id": "t2",
+            "title": "Prove restart-safe execution",
+            "description": "Use the existing Goal engine to establish recovery and idempotency guarantees.",
+            "requirement_ids": ["r2"],
+            "depends_on": ["t1"],
+            "acceptance_ids": ["a2"],
+            "scope_hints": ["import worker and recovery tests"],
+            "effort": "large",
+            "kind": "goal",
+            "goal_contract": {
+              "objective": "Make import execution restart-safe and idempotent.",
+              "criteria": [
+                {
+                  "id": "c1",
+                  "description": "Interrupted imports resume without duplicate rows.",
+                  "verifier": "machine"
+                }
+              ],
+              "continuation": "bounded"
+            }
+          },
+          {
+            "id": "t3",
+            "title": "Expose APIs and progress UI",
+            "description": "Add compatible status/cancel APIs and tested progress UI.",
+            "requirement_ids": ["r3"],
+            "depends_on": ["t2"],
+            "acceptance_ids": ["a3"],
+            "scope_hints": ["API and web UI"],
+            "effort": "medium",
+            "kind": "build"
+          }
+        ],
+        "acceptance": [
+          { "id": "a1", "description": "Lifecycle state survives restart." },
+          {
+            "id": "a2",
+            "description": "Recovery evidence satisfies the Goal criteria."
+          },
+          {
+            "id": "a3",
+            "description": "API and web tests cover progress, cancel, error, and retry."
+          }
+        ],
+        "risks": [
+          { "description": "Migration ordering must precede worker changes." }
+        ]
+      }],
+      "expected": {
+        "outcome": "accepted",
+        "reason": "valid_multi_task",
+        "dispatch": "multi_task"
+      }
+    },
+    {
+      "id": "dependency_cycle",
+      "hypothesis": "A dependency cycle is rejected before dispatch.",
+      "category": "deterministic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Refactor storage and API.",
+        "requirements": [
+          { "id": "r1", "description": "Refactor both components." }
+        ],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Storage",
+            "description": "Refactor storage.",
+            "requirement_ids": ["r1"],
+            "depends_on": ["t2"],
+            "acceptance_ids": ["a1"],
+            "scope_hints": [],
+            "effort": "small",
+            "kind": "build"
+          },
+          {
+            "id": "t2",
+            "title": "API",
+            "description": "Refactor API.",
+            "requirement_ids": ["r1"],
+            "depends_on": ["t1"],
+            "acceptance_ids": ["a1"],
+            "scope_hints": [],
+            "effort": "small",
+            "kind": "build"
+          }
+        ],
+        "acceptance": [
+          { "id": "a1", "description": "Both components pass tests." }
+        ],
+        "risks": []
+      }],
+      "expected": {
+        "outcome": "validation_rejected",
+        "reason": "dependency_cycle"
+      }
+    },
+    {
+      "id": "unknown_dependency",
+      "hypothesis": "A dependency on an unknown Task is rejected before dispatch.",
+      "category": "deterministic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Add an API endpoint.",
+        "requirements": [{ "id": "r1", "description": "Add the endpoint." }],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Add endpoint",
+            "description": "Add and test the endpoint.",
+            "requirement_ids": ["r1"],
+            "depends_on": ["missing"],
+            "acceptance_ids": ["a1"],
+            "scope_hints": [],
+            "effort": "small",
+            "kind": "build"
+          }
+        ],
+        "acceptance": [{ "id": "a1", "description": "Endpoint tests pass." }],
+        "risks": []
+      }],
+      "expected": {
+        "outcome": "validation_rejected",
+        "reason": "unknown_dependency"
+      }
+    },
+    {
+      "id": "missing_requirement_coverage",
+      "hypothesis": "Every source requirement must map to at least one Task.",
+      "category": "deterministic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Add persistence and UI.",
+        "requirements": [
+          { "id": "r1", "description": "Persist state." },
+          { "id": "r2", "description": "Show state in the UI." }
+        ],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Persist state",
+            "description": "Add storage.",
+            "requirement_ids": ["r1"],
+            "depends_on": [],
+            "acceptance_ids": ["a1"],
+            "scope_hints": [],
+            "effort": "small",
+            "kind": "build"
+          }
+        ],
+        "acceptance": [{ "id": "a1", "description": "Storage tests pass." }],
+        "risks": []
+      }],
+      "expected": {
+        "outcome": "validation_rejected",
+        "reason": "uncovered_requirement"
+      }
+    },
+    {
+      "id": "unknown_acceptance_reference",
+      "hypothesis": "A Task cannot reference an unknown acceptance fact.",
+      "category": "deterministic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Add persistence.",
+        "requirements": [{ "id": "r1", "description": "Persist state." }],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Persist state",
+            "description": "Add storage.",
+            "requirement_ids": ["r1"],
+            "depends_on": [],
+            "acceptance_ids": ["missing"],
+            "scope_hints": [],
+            "effort": "small",
+            "kind": "build"
+          }
+        ],
+        "acceptance": [{ "id": "a1", "description": "Storage tests pass." }],
+        "risks": []
+      }],
+      "expected": {
+        "outcome": "validation_rejected",
+        "reason": "unknown_acceptance"
+      }
+    },
+    {
+      "id": "model_authored_numeric_budget",
+      "hypothesis": "Executable numeric budgets are forbidden in model proposals.",
+      "category": "deterministic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Add persistence.",
+        "requirements": [{ "id": "r1", "description": "Persist state." }],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Persist state",
+            "description": "Add storage.",
+            "requirement_ids": ["r1"],
+            "depends_on": [],
+            "acceptance_ids": ["a1"],
+            "scope_hints": [],
+            "effort": "small",
+            "kind": "build",
+            "budget": { "model_invocations": 99, "generated_tokens": 99999 }
+          }
+        ],
+        "acceptance": [{ "id": "a1", "description": "Storage tests pass." }],
+        "risks": []
+      }],
+      "expected": {
+        "outcome": "validation_rejected",
+        "reason": "model_authored_budget"
+      }
+    },
+    {
+      "id": "unqualified_goal_selection",
+      "hypothesis": "A planner that is not Goal-qualified cannot automatically select a Goal Task.",
+      "category": "deterministic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Improve recovery.",
+        "requirements": [{ "id": "r1", "description": "Improve recovery." }],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Improve recovery",
+            "description": "Coordinate recovery improvements.",
+            "requirement_ids": ["r1"],
+            "depends_on": [],
+            "acceptance_ids": ["a1"],
+            "scope_hints": [],
+            "effort": "large",
+            "kind": "goal",
+            "goal_contract": {
+              "objective": "Improve recovery.",
+              "criteria": [
+                {
+                  "id": "c1",
+                  "description": "Recovery tests pass.",
+                  "verifier": "machine"
+                }
+              ],
+              "continuation": "bounded"
+            }
+          }
+        ],
+        "acceptance": [
+          { "id": "a1", "description": "Recovery evidence is current." }
+        ],
+        "risks": []
+      }],
+      "expected": {
+        "outcome": "validation_rejected",
+        "reason": "goal_selection_unqualified"
+      }
+    },
+    {
+      "id": "migration_order_requires_review",
+      "hypothesis": "A structurally valid plan that migrates storage after dependent service work requires semantic revision.",
+      "category": "semantic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Add a persisted import service.",
+        "requirements": [
+          { "id": "r1", "description": "Add schema and service." }
+        ],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Implement service",
+            "description": "Implement the service against the new schema.",
+            "requirement_ids": ["r1"],
+            "depends_on": [],
+            "acceptance_ids": ["a1"],
+            "scope_hints": ["service"],
+            "effort": "medium",
+            "kind": "build"
+          },
+          {
+            "id": "t2",
+            "title": "Add migration",
+            "description": "Create the schema required by the service.",
+            "requirement_ids": ["r1"],
+            "depends_on": ["t1"],
+            "acceptance_ids": ["a1"],
+            "scope_hints": ["migration"],
+            "effort": "small",
+            "kind": "build"
+          }
+        ],
+        "acceptance": [
+          { "id": "a1", "description": "Migration and service tests pass." }
+        ],
+        "risks": []
+      }],
+      "expected": {
+        "outcome": "review_rejected",
+        "reason": "migration_dependency_order"
+      }
+    },
+    {
+      "id": "catch_all_requires_review",
+      "hypothesis": "A vague final integration/testing catch-all requires semantic revision.",
+      "category": "semantic",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [{
+        "objective": "Add persisted imports and UI.",
+        "requirements": [{ "id": "r1", "description": "Add imports." }],
+        "tasks": [
+          {
+            "id": "t1",
+            "title": "Implement imports",
+            "description": "Implement persisted imports with colocated tests.",
+            "requirement_ids": ["r1"],
+            "depends_on": [],
+            "acceptance_ids": ["a1"],
+            "scope_hints": [],
+            "effort": "medium",
+            "kind": "build"
+          },
+          {
+            "id": "t2",
+            "title": "Integrate, test, and refine everything",
+            "description": "Review all work, add missing tests and documentation, and fix anything remaining.",
+            "requirement_ids": ["r1"],
+            "depends_on": ["t1"],
+            "acceptance_ids": ["a1"],
+            "scope_hints": [],
+            "effort": "medium",
+            "kind": "build"
+          }
+        ],
+        "acceptance": [
+          { "id": "a1", "description": "Import behavior passes its tests." }
+        ],
+        "risks": []
+      }],
+      "expected": { "outcome": "review_rejected", "reason": "catch_all_task" }
+    },
+    {
+      "id": "two_invalid_attempts",
+      "hypothesis": "Two invalid proposals terminate as TaskPlanRejected without dispatch.",
+      "category": "attempt_limit",
+      "context": {
+        "intent": "build",
+        "goal_selection_qualified": false,
+        "max_tasks": 6
+      },
+      "attempts": [
+        {
+          "objective": "Add persistence and UI.",
+          "requirements": [
+            { "id": "r1", "description": "Add both components." }
+          ],
+          "tasks": [
+            {
+              "id": "t1",
+              "title": "Persistence",
+              "description": "Add persistence.",
+              "requirement_ids": ["r1"],
+              "depends_on": ["t2"],
+              "acceptance_ids": ["a1"],
+              "scope_hints": [],
+              "effort": "small",
+              "kind": "build"
+            },
+            {
+              "id": "t2",
+              "title": "UI",
+              "description": "Add UI.",
+              "requirement_ids": ["r1"],
+              "depends_on": ["t1"],
+              "acceptance_ids": ["a1"],
+              "scope_hints": [],
+              "effort": "small",
+              "kind": "build"
+            }
+          ],
+          "acceptance": [{ "id": "a1", "description": "Both pass tests." }],
+          "risks": []
+        },
+        {
+          "objective": "Add persistence and UI.",
+          "requirements": [
+            { "id": "r1", "description": "Add persistence." },
+            { "id": "r2", "description": "Add UI." }
+          ],
+          "tasks": [
+            {
+              "id": "t1",
+              "title": "Persistence",
+              "description": "Add persistence.",
+              "requirement_ids": ["r1"],
+              "depends_on": [],
+              "acceptance_ids": ["a1"],
+              "scope_hints": [],
+              "effort": "small",
+              "kind": "build"
+            }
+          ],
+          "acceptance": [
+            { "id": "a1", "description": "Persistence tests pass." }
+          ],
+          "risks": []
+        }
+      ],
+      "expected": { "outcome": "task_plan_rejected", "reason": "attempt_limit" }
+    }
+  ]
+}
