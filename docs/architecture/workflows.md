@@ -80,8 +80,10 @@ the same checkpoint digest. A planning failure exposes exactly three decisions: 
 edit the request, or explicitly run the original request as one Build; there is no silent fallback.
 
 Automatic Task planning is fail-closed, and this release's embedded qualification catalog is empty.
-The selected model file, backend, prompt-template version, artifact protocol, and structured-output
-contract must match the embedded controller-owned qualification catalog. Project
+The full selected model artifact, backend, prompt-template version, artifact protocol, and
+structured-output contract must match the embedded controller-owned qualification catalog. A
+single-file GGUF retains its file SHA-256 identity; a split GGUF uses a domain-separated digest over
+the ordered names, lengths, and bytes of every shard, and an incomplete shard set is rejected. Project
 configuration cannot add an entry. An unqualified model follows the pre-existing Build path without
 the extra planning call or Tasks UI. `.pb/tasks.toml` supplies only versioned effort presets and
 ceilings and cannot grant qualification, automatic Goal selection, authority, or publication.

@@ -2216,7 +2216,7 @@ fn task_planner_model_sha256(
     match text_backend {
         TextBackendKind::LlamaCpp => {
             let path = find_model_in_cache_in(models_root, &args.model)?;
-            sha256_file(&path)
+            gguf_artifact_sha256(&path)
         }
         TextBackendKind::FlashMoe => {
             let _ = flashmoe_plan.context("qualified FlashMoe planner has no model plan")?;
@@ -2242,6 +2242,90 @@ fn sha256_file(path: &Path) -> Result<String> {
         digest.update(&buffer[..read]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn gguf_artifact_sha256(path: &Path) -> Result<String> {
+    let Some(shards) = split_gguf_shards(path)? else {
+        return sha256_file(path);
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"pb-gguf-split-artifact-v1\0");
+    for shard in shards {
+        let name = shard
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("GGUF shard has a non-UTF-8 name: {}", shard.display()))?;
+        let metadata = std::fs::metadata(&shard)
+            .with_context(|| format!("failed to inspect GGUF shard {}", shard.display()))?;
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(metadata.len().to_le_bytes());
+        update_sha256_from_file(&mut digest, &shard)?;
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn split_gguf_shards(path: &Path) -> Result<Option<Vec<PathBuf>>> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let Some(stem) = name.strip_suffix(".gguf") else {
+        return Ok(None);
+    };
+    let Some((indexed_prefix, total_text)) = stem.rsplit_once("-of-") else {
+        return Ok(None);
+    };
+    let Some((prefix, index_text)) = indexed_prefix.rsplit_once('-') else {
+        return Ok(None);
+    };
+    if index_text.len() != 5
+        || total_text.len() != 5
+        || !index_text.bytes().all(|byte| byte.is_ascii_digit())
+        || !total_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Ok(None);
+    }
+    let index = index_text
+        .parse::<usize>()
+        .context("invalid GGUF shard index")?;
+    let total = total_text
+        .parse::<usize>()
+        .context("invalid GGUF shard count")?;
+    if total == 0 || index == 0 || index > total {
+        bail!("invalid GGUF split name '{}'", path.display());
+    }
+    let parent = path
+        .parent()
+        .context("split GGUF path has no parent directory")?;
+    let mut shards = Vec::with_capacity(total);
+    for shard_index in 1..=total {
+        let shard = parent.join(format!("{prefix}-{shard_index:05}-of-{total:05}.gguf"));
+        if !shard.is_file() {
+            bail!(
+                "split GGUF artifact is incomplete: missing shard {} of {} at {}",
+                shard_index,
+                total,
+                shard.display()
+            );
+        }
+        shards.push(shard);
+    }
+    Ok(Some(shards))
+}
+
+fn update_sha256_from_file(digest: &mut Sha256, path: &Path) -> Result<()> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash {}", path.display()))?;
+        if read == 0 {
+            return Ok(());
+        }
+        digest.update(&buffer[..read]);
+    }
 }
 
 fn task_planning_repository_context(graph: &crate::workspace::WorkspaceGraph) -> Result<String> {
@@ -31110,6 +31194,45 @@ the next imagined action"#;
 
         let path = find_model_in_cache_in(tmp.path(), "mymodel").expect("should find split GGUF");
         assert_eq!(path.file_name().unwrap(), "model-00001-of-00002.gguf");
+    }
+
+    #[test]
+    fn task_planner_digest_preserves_single_file_sha256() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("model.gguf");
+        let bytes = b"GGUFsingle-file-model";
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            gguf_artifact_sha256(&path).unwrap(),
+            format!("{:x}", Sha256::digest(bytes))
+        );
+    }
+
+    #[test]
+    fn task_planner_digest_binds_every_split_gguf_shard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = tmp.path().join("model-00001-of-00002.gguf");
+        let second = tmp.path().join("model-00002-of-00002.gguf");
+        std::fs::write(&first, b"GGUFfirst").unwrap();
+        std::fs::write(&second, b"GGUFsecond").unwrap();
+
+        let before = gguf_artifact_sha256(&first).unwrap();
+        std::fs::write(&second, b"GGUFchanged").unwrap();
+        let after = gguf_artifact_sha256(&first).unwrap();
+
+        assert_ne!(before, after);
+        assert_eq!(after, gguf_artifact_sha256(&second).unwrap());
+    }
+
+    #[test]
+    fn task_planner_digest_rejects_incomplete_split_gguf() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = tmp.path().join("model-00001-of-00002.gguf");
+        std::fs::write(&first, b"GGUFfirst").unwrap();
+
+        let error = gguf_artifact_sha256(&first).unwrap_err().to_string();
+        assert!(error.contains("missing shard 2 of 2"), "error was: {error}");
     }
 
     #[test]

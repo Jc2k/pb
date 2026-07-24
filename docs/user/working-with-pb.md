@@ -76,8 +76,9 @@ Each Task is either **Build** or
 planning: when a Build Task becomes active, its normal planner still inspects the current repository
 and proposes the actual changes, checks, and commit boundary for that Task.
 
-The selected local model must exactly match pb's embedded model/backend/template/protocol
-qualification record. pb constrains both the proposed plan and its fresh review to exact JSON
+The full selected local model artifact must exactly match pb's embedded
+model/backend/template/protocol qualification record; split GGUF qualifications bind every shard.
+pb constrains both the proposed plan and its fresh review to exact JSON
 schemas while each token is selected; deterministic validation and review still decide whether the
 result is complete and useful. The embedded catalog is empty in this release, and `.pb/tasks.toml`
 cannot turn the feature on. With an unqualified model, pb
