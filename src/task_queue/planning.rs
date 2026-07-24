@@ -26,7 +26,9 @@ const MAX_GOAL_CRITERIA: usize = 16;
 const MAX_REVIEW_CHALLENGES: usize = 16;
 const MAX_ID_CHARS: usize = 128;
 const MAX_TITLE_CHARS: usize = 256;
-const MAX_DESCRIPTION_CHARS: usize = 2_048;
+// llama.cpp's grammar parser rejects bounded repetitions above 2,000. Keep the shared schema
+// comfortably below that backend limit so the same contract compiles in llama.cpp and FlashMoe.
+const MAX_DESCRIPTION_CHARS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -974,6 +976,7 @@ mod tests {
             let schema = serde_json::to_string(&schema).unwrap();
             let grammar = llama_cpp_2::json_schema_to_grammar(&schema).unwrap();
             assert!(grammar.contains("root"));
+            assert!(!grammar.contains("{1,2048}"));
         }
     }
 

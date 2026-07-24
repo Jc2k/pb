@@ -287,6 +287,7 @@ impl LlamaCppBackend {
     ) -> Result<Output> {
         let energy_start = energy::sample();
         let started = std::time::Instant::now();
+        let mut sampler = self.sampler(top_k, temperature, seed, json_schema)?;
         let settings = LlamaSessionSettings {
             ctx_size,
             threads,
@@ -323,8 +324,6 @@ impl LlamaCppBackend {
                 )
             })?;
         }
-
-        let mut sampler = self.sampler(top_k, temperature, seed, json_schema)?;
 
         let mut decoder = UTF_8.new_decoder();
         let mut output = String::new();
@@ -558,6 +557,14 @@ impl LlamaCppChatSession<'_> {
             threads: request.threads,
             threads_batch: request.threads_batch,
         };
+        // Compile the constraint before changing a reusable KV cache. A schema/grammar error must
+        // leave the session prefix untouched so a bounded retry cannot double-prefill the context.
+        let mut sampler = self.backend.sampler(
+            request.top_k,
+            request.temperature,
+            request.seed,
+            request.json_schema.as_ref(),
+        )?;
 
         let needs_context = self
             .cached
@@ -652,12 +659,6 @@ impl LlamaCppChatSession<'_> {
         }
 
         let mut evaluated_tokens = tokens;
-        let mut sampler = self.backend.sampler(
-            request.top_k,
-            request.temperature,
-            request.seed,
-            request.json_schema.as_ref(),
-        )?;
         let mut decoder = UTF_8.new_decoder();
         let mut output = String::new();
         let mut n_cur =
