@@ -332,6 +332,56 @@ pub enum TaskPlanChallengeSeverity {
     Advisory,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPlanAuditCategory {
+    RequestCoverage,
+    TaskBoundaries,
+    DependencyOrder,
+    AcceptanceObservability,
+    TestDocumentationOwnership,
+    EffortGoalAuthority,
+}
+
+pub const REQUIRED_TASK_PLAN_AUDIT_CATEGORIES: [TaskPlanAuditCategory; 6] = [
+    TaskPlanAuditCategory::RequestCoverage,
+    TaskPlanAuditCategory::TaskBoundaries,
+    TaskPlanAuditCategory::DependencyOrder,
+    TaskPlanAuditCategory::AcceptanceObservability,
+    TaskPlanAuditCategory::TestDocumentationOwnership,
+    TaskPlanAuditCategory::EffortGoalAuthority,
+];
+
+#[cfg(test)]
+pub(crate) fn passing_task_plan_audits() -> Vec<TaskPlanAudit> {
+    REQUIRED_TASK_PLAN_AUDIT_CATEGORIES
+        .into_iter()
+        .map(|category| TaskPlanAudit {
+            category,
+            verdict: TaskPlanAuditVerdict::Pass,
+            detail: format!("{category:?} passed"),
+            task_ids: Vec::new(),
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPlanAuditVerdict {
+    Pass,
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskPlanAudit {
+    pub category: TaskPlanAuditCategory,
+    pub verdict: TaskPlanAuditVerdict,
+    pub detail: String,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskPlanChallenge {
@@ -348,6 +398,8 @@ pub struct TaskPlanChallenge {
 pub struct TaskPlanReviewArtifact {
     pub task_plan_sha256: String,
     pub verdict: TaskPlanReviewVerdict,
+    #[serde(default)]
+    pub audits: Vec<TaskPlanAudit>,
     #[serde(default)]
     pub challenges: Vec<TaskPlanChallenge>,
 }
@@ -372,6 +424,36 @@ impl TaskPlanReviewArtifact {
             .iter()
             .map(|task| task.id.as_str())
             .collect::<HashSet<_>>();
+        let required_audits = REQUIRED_TASK_PLAN_AUDIT_CATEGORIES
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut audit_categories = HashSet::new();
+        for audit in &self.audits {
+            required("Task-plan audit detail", &audit.detail)?;
+            if !audit_categories.insert(audit.category) {
+                return Err(TaskPlanError::new(
+                    TaskPlanErrorCode::ReviewInvalid,
+                    format!(
+                        "Task-plan review repeats audit category {:?}",
+                        audit.category
+                    ),
+                ));
+            }
+            for task_id in &audit.task_ids {
+                if !task_ids.contains(task_id.as_str()) {
+                    return Err(TaskPlanError::new(
+                        TaskPlanErrorCode::UnknownTask,
+                        format!("Task-plan audit references unknown Task '{task_id}'"),
+                    ));
+                }
+            }
+        }
+        if audit_categories != required_audits {
+            return Err(TaskPlanError::new(
+                TaskPlanErrorCode::ReviewInvalid,
+                "Task-plan review must contain every required audit category exactly once",
+            ));
+        }
         let mut challenge_ids = HashSet::new();
         for challenge in &self.challenges {
             required("Task-plan challenge id", &challenge.id)?;
@@ -396,16 +478,20 @@ impl TaskPlanReviewArtifact {
             .challenges
             .iter()
             .any(|challenge| challenge.severity == TaskPlanChallengeSeverity::Blocking);
-        if self.verdict == TaskPlanReviewVerdict::Pass && blocking {
+        let failed_audit = self
+            .audits
+            .iter()
+            .any(|audit| audit.verdict == TaskPlanAuditVerdict::Fail);
+        if self.verdict == TaskPlanReviewVerdict::Pass && (blocking || failed_audit) {
             return Err(TaskPlanError::new(
                 TaskPlanErrorCode::ReviewInvalid,
-                "Task-plan review cannot pass with blocking challenges",
+                "Task-plan review cannot pass with a failed audit or blocking challenge",
             ));
         }
-        if self.verdict == TaskPlanReviewVerdict::Revise && !blocking {
+        if self.verdict == TaskPlanReviewVerdict::Revise && (!blocking || !failed_audit) {
             return Err(TaskPlanError::new(
                 TaskPlanErrorCode::ReviewInvalid,
-                "Task-plan revision requires at least one blocking challenge",
+                "Task-plan revision requires a failed audit and at least one blocking challenge",
             ));
         }
         Ok(())
@@ -948,6 +1034,7 @@ mod tests {
         let review = TaskPlanReviewArtifact {
             task_plan_sha256: plan.sha256.clone(),
             verdict: TaskPlanReviewVerdict::Pass,
+            audits: passing_task_plan_audits(),
             challenges: vec![TaskPlanChallenge {
                 id: "c1".to_string(),
                 code: "catch_all_task".to_string(),
@@ -960,5 +1047,18 @@ mod tests {
             review.validate(&plan).unwrap_err().code,
             TaskPlanErrorCode::ReviewInvalid
         );
+
+        let mut missing_audit = review.clone();
+        missing_audit.challenges.clear();
+        missing_audit.audits.pop();
+        assert_eq!(
+            missing_audit.validate(&plan).unwrap_err().code,
+            TaskPlanErrorCode::ReviewInvalid
+        );
+
+        let mut revised = review;
+        revised.verdict = TaskPlanReviewVerdict::Revise;
+        revised.audits[0].verdict = TaskPlanAuditVerdict::Fail;
+        revised.validate(&plan).unwrap();
     }
 }

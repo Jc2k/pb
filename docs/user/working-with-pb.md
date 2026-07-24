@@ -84,6 +84,10 @@ cannot turn the feature on. With an unqualified model, pb
 starts the current Build workflow directly, so existing projects do not pay an extra planning turn
 or see a new UI.
 
+The fresh critic must separately audit request coverage, Task boundaries, dependency order,
+observable acceptance, test/documentation ownership, and effort/Goal authority. pb accepts a pass
+only when all six audits pass; a revision must identify a failed audit and a blocking correction.
+
 The number of accepted Tasks determines the experience:
 
 - One Build Task looks and behaves like the existing Build workflow.

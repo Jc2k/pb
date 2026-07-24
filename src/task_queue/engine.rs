@@ -2211,6 +2211,7 @@ mod tests {
             TaskPlanReviewArtifact {
                 task_plan_sha256: plan.sha256.clone(),
                 verdict: TaskPlanReviewVerdict::Pass,
+                audits: crate::task_queue::passing_task_plan_audits(),
                 challenges: Vec::new(),
             },
         )

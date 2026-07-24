@@ -47,6 +47,12 @@ coverage, cycles, invalid Goal contracts, unqualified automatic Goal selection, 
 overflow before any child starts. Planning has two attempts and its own invocation, token, advisory,
 and wall-time allowance.
 
+The critic must return six controller-validated audit records exactly once: request coverage, Task
+boundaries, dependency order, acceptance observability, test/documentation ownership, and
+effort/Goal authority. A passing review requires every audit to pass. Revision requires both a
+failed audit and a blocking challenge, so a bare `pass` or generic criticism cannot cross the
+review boundary.
+
 One accepted Task is unwrapped. A Build Task enters the ordinary Build workflow, whose planner still
 decides the actual changes against current repository state. A Goal Task enters the existing Goal
 approval and milestone UI. No `MultiTaskRun` or Tasks panel is created for either one-Task case.

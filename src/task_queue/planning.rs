@@ -13,8 +13,8 @@ use super::{
     TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v3";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v2";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v4";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v3";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
 const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
@@ -398,7 +398,7 @@ fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str)
         format!("\nThe previous attempt was rejected. Correct these facts:\n{feedback}\n")
     };
     format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Put tests and documentation in the Task that owns the behavior; never invent a final testing or documentation catch-all. Never include numeric budgets. Prefer effort small; use medium only for a cohesive cross-component outcome and large only when it cannot safely be divided.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Dependencies must point only to earlier prerequisites and remain acyclic.\n\nBefore responding, silently audit the artifact: extract every distinct user requirement; give it exactly one stable id; map every requirement and every observable acceptance fact to at least one Task; check each Task can be independently delivered and committed; check the complete queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Put tests and documentation in the Task that owns the behavior; never invent a final testing or documentation catch-all. Never include numeric budgets. Prefer effort small; use medium only for a cohesive cross-component outcome and large only when it cannot safely be divided.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Dependencies must point only to earlier prerequisites and remain acyclic.\n\nBefore responding, silently audit the artifact: treat every clause of the request as a requirement, including compatibility, tests, documentation, ordering, rollback, and explicit non-goals; do not discard them as meta-instructions. Give every distinct requirement exactly one stable id. Map every requirement and every observable acceptance fact to at least one Task. When the request assigns tests or documentation to behavior-owning Tasks, state that ownership in each applicable Task and acceptance fact. Check each Task can be independently delivered and committed, and that the complete queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
         input.policy.aggregate.max_tasks, input.objective, input.repository_context
     )
 }
@@ -408,7 +408,7 @@ fn reviewer_prompt(
     plan: &ArtifactEnvelope<TaskPlanArtifact>,
 ) -> Result<String> {
     Ok(format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Independently compare the original request with the proposed queue. Check every explicit and implied requirement for coverage, each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. A pass means the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Independently compare every clause of the original request with the proposed queue. Complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, and explicit non-goals even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. A pass means every audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
         input.objective,
         plan.sha256,
         serde_json::to_string_pretty(&plan.artifact)?
@@ -537,6 +537,37 @@ fn reviewer_schema(plan: &ArtifactEnvelope<TaskPlanArtifact>) -> Value {
         "properties": {
             "task_plan_sha256": {"type": "string", "enum": [plan.sha256.clone()]},
             "verdict": {"type": "string", "enum": ["pass", "revise"]},
+            "audits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "enum": [
+                                "request_coverage",
+                                "task_boundaries",
+                                "dependency_order",
+                                "acceptance_observability",
+                                "test_documentation_ownership",
+                                "effort_goal_authority"
+                            ]
+                        },
+                        "verdict": {"type": "string", "enum": ["pass", "fail"]},
+                        "detail": bounded_string(MAX_DESCRIPTION_CHARS),
+                        "task_ids": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": task_ids.clone()},
+                            "minItems": 0,
+                            "maxItems": plan.artifact.tasks.len()
+                        }
+                    },
+                    "required": ["category", "verdict", "detail", "task_ids"]
+                },
+                "minItems": 6,
+                "maxItems": 6
+            },
             "challenges": {
                 "type": "array",
                 "items": {
@@ -560,7 +591,7 @@ fn reviewer_schema(plan: &ArtifactEnvelope<TaskPlanArtifact>) -> Value {
                 "maxItems": MAX_REVIEW_CHALLENGES
             }
         },
-        "required": ["task_plan_sha256", "verdict", "challenges"]
+        "required": ["task_plan_sha256", "verdict", "audits", "challenges"]
     })
 }
 
@@ -778,9 +809,32 @@ mod tests {
 
     fn review(plan: &TaskPlanArtifact, attempt: usize, verdict: &str) -> String {
         let envelope = ArtifactEnvelope::new(format!("task-plan-{attempt}"), plan.clone()).unwrap();
+        let audits = [
+            "request_coverage",
+            "task_boundaries",
+            "dependency_order",
+            "acceptance_observability",
+            "test_documentation_ownership",
+            "effort_goal_authority",
+        ]
+        .into_iter()
+        .map(|category| {
+            serde_json::json!({
+                "category": category,
+                "verdict": if verdict == "revise" && category == "task_boundaries" {
+                    "fail"
+                } else {
+                    "pass"
+                },
+                "detail": format!("{category} was checked"),
+                "task_ids": []
+            })
+        })
+        .collect::<Vec<_>>();
         serde_json::json!({
             "task_plan_sha256": envelope.sha256,
             "verdict": verdict,
+            "audits": audits,
             "challenges": if verdict == "pass" { serde_json::json!([]) } else { serde_json::json!([{
                 "id": "c1",
                 "code": "task_too_broad",
