@@ -54,6 +54,8 @@ pub struct LlamaCppRequest {
 pub struct LlamaCppChatRequest {
     pub messages: Value,
     pub tools: Value,
+    /// Optional JSON schema enforced token-by-token during generation.
+    pub json_schema: Option<Value>,
     pub ctx_size: u32,
     pub threads: Option<i32>,
     pub threads_batch: Option<i32>,
@@ -230,6 +232,7 @@ impl LlamaCppBackend {
             request.top_k,
             request.temperature,
             request.seed,
+            None,
         )
     }
 
@@ -246,6 +249,7 @@ impl LlamaCppBackend {
             request.top_k,
             request.temperature,
             request.seed,
+            request.json_schema.as_ref(),
         )
     }
 
@@ -279,6 +283,7 @@ impl LlamaCppBackend {
         top_k: i32,
         temperature: f32,
         seed: u32,
+        json_schema: Option<&Value>,
     ) -> Result<Output> {
         let energy_start = energy::sample();
         let started = std::time::Instant::now();
@@ -319,11 +324,7 @@ impl LlamaCppBackend {
             })?;
         }
 
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::top_k(top_k),
-            LlamaSampler::temp(temperature),
-            LlamaSampler::dist(seed),
-        ]);
+        let mut sampler = self.sampler(top_k, temperature, seed, json_schema)?;
 
         let mut decoder = UTF_8.new_decoder();
         let mut output = String::new();
@@ -391,6 +392,32 @@ impl LlamaCppBackend {
                     )
                 }),
         }
+    }
+
+    fn sampler(
+        &self,
+        top_k: i32,
+        temperature: f32,
+        seed: u32,
+        json_schema: Option<&Value>,
+    ) -> Result<LlamaSampler> {
+        let mut samplers = Vec::with_capacity(if json_schema.is_some() { 4 } else { 3 });
+        if let Some(schema) = json_schema {
+            let schema = serde_json::to_string(schema)
+                .context("failed to serialize constrained-output JSON schema")?;
+            let grammar = llama_cpp_2::json_schema_to_grammar(&schema)
+                .context("failed to compile constrained-output JSON schema")?;
+            samplers.push(
+                LlamaSampler::grammar(&self.model, &grammar, "root")
+                    .context("failed to initialize constrained-output grammar")?,
+            );
+        }
+        samplers.extend([
+            LlamaSampler::top_k(top_k),
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(seed),
+        ]);
+        Ok(LlamaSampler::chain_simple(samplers))
     }
 
     /// Run vision (multimodal) generation for the given request and image path.
@@ -625,11 +652,12 @@ impl LlamaCppChatSession<'_> {
         }
 
         let mut evaluated_tokens = tokens;
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::top_k(request.top_k),
-            LlamaSampler::temp(request.temperature),
-            LlamaSampler::dist(request.seed),
-        ]);
+        let mut sampler = self.backend.sampler(
+            request.top_k,
+            request.temperature,
+            request.seed,
+            request.json_schema.as_ref(),
+        )?;
         let mut decoder = UTF_8.new_decoder();
         let mut output = String::new();
         let mut n_cur =

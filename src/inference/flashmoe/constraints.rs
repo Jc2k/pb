@@ -456,6 +456,11 @@ pub(crate) fn terminal_tool_output_is_complete(
     Ok(constraint.output_has_complete_terminal_call(output))
 }
 
+#[cfg(test)]
+pub(crate) fn validate_native_tool_schema(schema: &Value) -> Result<()> {
+    validate_supported_schema(schema, "test_tool")
+}
+
 fn validate_supported_schema(schema: &Value, location: &str) -> Result<()> {
     let object = schema
         .as_object()

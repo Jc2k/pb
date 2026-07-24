@@ -77,8 +77,10 @@ planning: when a Build Task becomes active, its normal planner still inspects th
 and proposes the actual changes, checks, and commit boundary for that Task.
 
 The selected local model must exactly match pb's embedded model/backend/template/protocol
-qualification record. The embedded catalog is empty in this release, and `.pb/tasks.toml` cannot
-turn the feature on. With an unqualified model, pb
+qualification record. pb constrains both the proposed plan and its fresh review to exact JSON
+schemas while each token is selected; deterministic validation and review still decide whether the
+result is complete and useful. The embedded catalog is empty in this release, and `.pb/tasks.toml`
+cannot turn the feature on. With an unqualified model, pb
 starts the current Build workflow directly, so existing projects do not pay an extra planning turn
 or see a new UI.
 

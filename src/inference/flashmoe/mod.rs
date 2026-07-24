@@ -8,7 +8,7 @@ mod cache;
 mod capabilities;
 mod constraints;
 #[cfg(test)]
-pub(crate) use constraints::terminal_tool_output_is_complete;
+pub(crate) use constraints::{terminal_tool_output_is_complete, validate_native_tool_schema};
 mod deepseek;
 mod deepseek_metal;
 mod deepseek_session;

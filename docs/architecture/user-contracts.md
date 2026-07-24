@@ -34,7 +34,10 @@ approval. Project configuration cannot activate a Goal or choose automatic conti
 The shipped Task controller applies the same authority rule before high-level decomposition.
 `.pb/tasks.toml` can narrow budgets but cannot qualify a planner or authorize automatic Goal
 selection. Qualification is an embedded controller-owned record for the exact model bytes, backend,
-prompt template, and artifact protocol. An unqualified model stays on the ordinary Build path. A
+prompt template, artifact protocol, and structured-output contract. The planner and critic are
+token-constrained to exact controller schemas in both supported inference engines; schema validity
+does not replace deterministic coverage, graph, authority, or budget validation, nor the fresh
+semantic critique. An unqualified model stays on the ordinary Build path. A
 qualified one-Task result unwraps into the same Build or Goal experience; only two or more Tasks
 create a durable queue and Tasks UI.
 

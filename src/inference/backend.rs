@@ -98,6 +98,7 @@ impl InferenceBackend for crate::inference::llamacpp::LlamaCppBackend {
         let llama_request = crate::inference::llamacpp::LlamaCppChatRequest {
             messages: serde_json::to_value(&request.messages)?,
             tools: serde_json::to_value(&request.tools)?,
+            json_schema: None,
             ctx_size: llama_ctx_size(&request.options)?,
             threads: request.options.threads,
             threads_batch: request.options.threads_batch,

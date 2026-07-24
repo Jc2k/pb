@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::workflow::ArtifactEnvelope;
@@ -12,12 +13,20 @@ use super::{
     TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v2";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v1";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v3";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v2";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
 const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
 const MAX_RETRY_FEEDBACK_CHARS: usize = 4_000;
+const MAX_PLANNING_FACTS: usize = 32;
+const MAX_SCOPE_HINTS: usize = 16;
+const MAX_RISKS: usize = 16;
+const MAX_GOAL_CRITERIA: usize = 16;
+const MAX_REVIEW_CHALLENGES: usize = 16;
+const MAX_ID_CHARS: usize = 128;
+const MAX_TITLE_CHARS: usize = 256;
+const MAX_DESCRIPTION_CHARS: usize = 2_048;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +50,7 @@ pub trait TaskPlanningModel {
         role: TaskPlanningRole,
         prompt: &str,
         max_tokens: usize,
+        schema: &Value,
     ) -> Result<TaskModelOutput>;
 
     fn should_cancel(&self) -> bool {
@@ -161,6 +171,7 @@ fn plan_tasks_inner(
         }
         counters.planning_attempts = counters.planning_attempts.saturating_add(1);
         let prompt = planner_prompt(input, attempt, &feedback);
+        let schema = planner_schema(input);
         let remaining_tokens = budget
             .generated_tokens
             .saturating_sub(counters.generated_tokens);
@@ -174,7 +185,7 @@ fn plan_tasks_inner(
             ));
         }
         let started = Instant::now();
-        let output = match model.generate(TaskPlanningRole::Planner, &prompt, max_tokens) {
+        let output = match model.generate(TaskPlanningRole::Planner, &prompt, max_tokens, &schema) {
             Ok(output) => output,
             Err(error) => {
                 counters.model_invocations = counters.model_invocations.saturating_add(1);
@@ -253,8 +264,14 @@ fn plan_tasks_inner(
             ));
         }
         let review_prompt = reviewer_prompt(input, &plan)?;
+        let review_schema = reviewer_schema(&plan);
         let started = Instant::now();
-        let output = match model.generate(TaskPlanningRole::Reviewer, &review_prompt, max_tokens) {
+        let output = match model.generate(
+            TaskPlanningRole::Reviewer,
+            &review_prompt,
+            max_tokens,
+            &review_schema,
+        ) {
             Ok(output) => output,
             Err(error) => {
                 counters.model_invocations = counters.model_invocations.saturating_add(1);
@@ -379,7 +396,7 @@ fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str)
         format!("\nThe previous attempt was rejected. Correct these facts:\n{feedback}\n")
     };
     format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks; combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not Build plan steps: do not name exact edits or invent a final testing/documentation catch-all. Tests and docs belong with the behavior they verify. Return exactly one JSON object and no prose. Never include numeric budgets; use effort small, medium, or large.\n\n{kind_rule}\nEach requirement and acceptance id must be mapped by at least one Task. Dependencies must be acyclic and point to earlier prerequisites. A build Task has no goal_contract. A goal Task has goal_contract {{\"objective\":string,\"criteria\":[{{\"text\":string,\"verifier\":\"workflow_ready\"|\"review_required\"|\"user_confirmation\"}}],\"continuation\":\"review_plan_then_automatic\"|\"manual_milestones\"|\"automatic_within_limits\"}}.\n\nSchema: {{\"objective\":string,\"requirements\":[{{\"id\":string,\"description\":string}}],\"tasks\":[{{\"id\":string,\"title\":string,\"description\":string,\"requirement_ids\":[string],\"depends_on\":[string],\"acceptance_ids\":[string],\"scope_hints\":[string],\"effort\":\"small\"|\"medium\"|\"large\",\"kind\":\"build\"|\"goal\",\"goal_contract\":object|null}}],\"acceptance\":[{{\"id\":string,\"description\":string}}],\"risks\":[{{\"description\":string}}]}}\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Put tests and documentation in the Task that owns the behavior; never invent a final testing or documentation catch-all. Never include numeric budgets. Prefer effort small; use medium only for a cohesive cross-component outcome and large only when it cannot safely be divided.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Dependencies must point only to earlier prerequisites and remain acyclic.\n\nBefore responding, silently audit the artifact: extract every distinct user requirement; give it exactly one stable id; map every requirement and every observable acceptance fact to at least one Task; check each Task can be independently delivered and committed; check the complete queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
         input.policy.aggregate.max_tasks, input.objective, input.repository_context
     )
 }
@@ -389,11 +406,218 @@ fn reviewer_prompt(
     plan: &ArtifactEnvelope<TaskPlanArtifact>,
 ) -> Result<String> {
     Ok(format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic. Assess requirement coverage, Task size for a smaller model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. Return exactly one JSON object and no prose. verdict pass cannot contain blocking challenges; verdict revise must contain at least one blocking challenge.\n\nSchema: {{\"task_plan_sha256\":\"{}\",\"verdict\":\"pass\"|\"revise\",\"challenges\":[{{\"id\":string,\"code\":string,\"description\":string,\"severity\":\"blocking\"|\"advisory\",\"task_ids\":[string]}}]}}\n\nOriginal request:\n{}\n\nTask plan:\n{}",
-        plan.sha256,
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Independently compare the original request with the proposed queue. Check every explicit and implied requirement for coverage, each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. A pass means the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
         input.objective,
+        plan.sha256,
         serde_json::to_string_pretty(&plan.artifact)?
     ))
+}
+
+fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
+    let explicit_goal = input.source_intent == TaskSourceIntent::Goal;
+    let goal_allowed = explicit_goal || input.qualification.automatic_goal_selection;
+    let task_kinds = if explicit_goal {
+        json!(["goal"])
+    } else if goal_allowed {
+        json!(["build", "goal"])
+    } else {
+        json!(["build"])
+    };
+    let mut task_properties = serde_json::Map::from_iter([
+        ("id".to_string(), bounded_string(MAX_ID_CHARS)),
+        ("title".to_string(), bounded_string(MAX_TITLE_CHARS)),
+        (
+            "description".to_string(),
+            bounded_string(MAX_DESCRIPTION_CHARS),
+        ),
+        (
+            "requirement_ids".to_string(),
+            bounded_string_array(MAX_PLANNING_FACTS, MAX_ID_CHARS),
+        ),
+        (
+            "depends_on".to_string(),
+            bounded_string_array(input.policy.aggregate.max_tasks, MAX_ID_CHARS),
+        ),
+        (
+            "acceptance_ids".to_string(),
+            bounded_string_array(MAX_PLANNING_FACTS, MAX_ID_CHARS),
+        ),
+        (
+            "scope_hints".to_string(),
+            bounded_string_array(MAX_SCOPE_HINTS, MAX_DESCRIPTION_CHARS),
+        ),
+        (
+            "effort".to_string(),
+            json!({"type": "string", "enum": ["small", "medium", "large"]}),
+        ),
+        (
+            "kind".to_string(),
+            json!({"type": "string", "enum": task_kinds}),
+        ),
+    ]);
+    if goal_allowed {
+        task_properties.insert("goal_contract".to_string(), goal_contract_schema());
+    }
+    let mut required = vec![
+        "id",
+        "title",
+        "description",
+        "requirement_ids",
+        "depends_on",
+        "acceptance_ids",
+        "scope_hints",
+        "effort",
+        "kind",
+    ];
+    if explicit_goal {
+        required.push("goal_contract");
+    }
+    let max_tasks = if explicit_goal {
+        1
+    } else {
+        input.policy.aggregate.max_tasks
+    };
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "objective": bounded_string(MAX_DESCRIPTION_CHARS),
+            "requirements": object_array(
+                json!({
+                    "id": bounded_string(MAX_ID_CHARS),
+                    "description": bounded_string(MAX_DESCRIPTION_CHARS)
+                }),
+                &["id", "description"],
+                1,
+                MAX_PLANNING_FACTS
+            ),
+            "tasks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": task_properties,
+                    "required": required
+                },
+                "minItems": 1,
+                "maxItems": max_tasks
+            },
+            "acceptance": object_array(
+                json!({
+                    "id": bounded_string(MAX_ID_CHARS),
+                    "description": bounded_string(MAX_DESCRIPTION_CHARS)
+                }),
+                &["id", "description"],
+                1,
+                MAX_PLANNING_FACTS
+            ),
+            "risks": object_array(
+                json!({"description": bounded_string(MAX_DESCRIPTION_CHARS)}),
+                &["description"],
+                0,
+                MAX_RISKS
+            )
+        },
+        "required": ["objective", "requirements", "tasks", "acceptance", "risks"]
+    })
+}
+
+fn reviewer_schema(plan: &ArtifactEnvelope<TaskPlanArtifact>) -> Value {
+    let task_ids = plan
+        .artifact
+        .tasks
+        .iter()
+        .map(|task| Value::String(task.id.clone()))
+        .collect::<Vec<_>>();
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "task_plan_sha256": {"type": "string", "enum": [plan.sha256.clone()]},
+            "verdict": {"type": "string", "enum": ["pass", "revise"]},
+            "challenges": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "id": bounded_string(MAX_ID_CHARS),
+                        "code": bounded_string(MAX_ID_CHARS),
+                        "description": bounded_string(MAX_DESCRIPTION_CHARS),
+                        "severity": {"type": "string", "enum": ["blocking", "advisory"]},
+                        "task_ids": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": task_ids},
+                            "minItems": 0,
+                            "maxItems": plan.artifact.tasks.len()
+                        }
+                    },
+                    "required": ["id", "code", "description", "severity", "task_ids"]
+                },
+                "minItems": 0,
+                "maxItems": MAX_REVIEW_CHALLENGES
+            }
+        },
+        "required": ["task_plan_sha256", "verdict", "challenges"]
+    })
+}
+
+fn goal_contract_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "objective": bounded_string(MAX_DESCRIPTION_CHARS),
+            "criteria": object_array(
+                json!({
+                    "text": bounded_string(MAX_DESCRIPTION_CHARS),
+                    "verifier": {
+                        "type": "string",
+                        "enum": ["workflow_ready", "review_required", "user_confirmation"]
+                    }
+                }),
+                &["text", "verifier"],
+                1,
+                MAX_GOAL_CRITERIA
+            ),
+            "continuation": {
+                "type": "string",
+                "enum": [
+                    "review_plan_then_automatic",
+                    "manual_milestones",
+                    "automatic_within_limits"
+                ]
+            }
+        },
+        "required": ["objective", "criteria", "continuation"]
+    })
+}
+
+fn bounded_string(max_chars: usize) -> Value {
+    json!({"type": "string", "minLength": 1, "maxLength": max_chars})
+}
+
+fn bounded_string_array(max_items: usize, max_chars: usize) -> Value {
+    json!({
+        "type": "array",
+        "items": bounded_string(max_chars),
+        "minItems": 0,
+        "maxItems": max_items
+    })
+}
+
+fn object_array(properties: Value, required: &[&str], min_items: usize, max_items: usize) -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": properties,
+            "required": required
+        },
+        "minItems": min_items,
+        "maxItems": max_items
+    })
 }
 
 fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T> {
@@ -487,6 +711,7 @@ mod tests {
             role: TaskPlanningRole,
             _prompt: &str,
             max_tokens: usize,
+            _schema: &Value,
         ) -> Result<TaskModelOutput> {
             self.calls.push((role, max_tokens));
             self.outputs
@@ -699,6 +924,57 @@ mod tests {
             TaskPlanRejectionOutcome::QualificationMismatch
         );
         assert!(model.calls.is_empty());
+    }
+
+    #[test]
+    fn constrained_output_schemas_compile_for_both_inference_engines() {
+        let policy = TaskConfigDocument::default().compile().unwrap();
+        let qualification = qualification(false);
+        let build_input = input(&policy, &qualification);
+        let build_schema = planner_schema(&build_input);
+        assert_eq!(
+            build_schema.pointer("/properties/tasks/maxItems"),
+            Some(&json!(policy.aggregate.max_tasks))
+        );
+        assert_eq!(
+            build_schema.pointer("/properties/tasks/items/properties/kind/enum"),
+            Some(&json!(["build"]))
+        );
+        assert!(
+            build_schema
+                .pointer("/properties/tasks/items/properties/goal_contract")
+                .is_none()
+        );
+
+        let mut goal_input = input(&policy, &qualification);
+        goal_input.source_intent = TaskSourceIntent::Goal;
+        let goal_schema = planner_schema(&goal_input);
+        assert_eq!(
+            goal_schema.pointer("/properties/tasks/maxItems"),
+            Some(&json!(1))
+        );
+        assert!(
+            goal_schema
+                .pointer("/properties/tasks/items/required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.contains(&json!("goal_contract")))
+        );
+
+        let value = proposal("t1");
+        let plan = compiled(&value, &policy);
+        let envelope = ArtifactEnvelope::new("task-plan-schema-test", plan).unwrap();
+        let review_schema = reviewer_schema(&envelope);
+        assert_eq!(
+            review_schema.pointer("/properties/task_plan_sha256/enum/0"),
+            Some(&json!(envelope.sha256))
+        );
+
+        for schema in [build_schema, goal_schema, review_schema] {
+            crate::inference::flashmoe::validate_native_tool_schema(&schema).unwrap();
+            let schema = serde_json::to_string(&schema).unwrap();
+            let grammar = llama_cpp_2::json_schema_to_grammar(&schema).unwrap();
+            assert!(grammar.contains("root"));
+        }
     }
 
     #[test]

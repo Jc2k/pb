@@ -34,10 +34,15 @@ deterministic harness stages and do not run a model.
 ### High-level Tasks
 
 **Shipped controller; no planner currently qualified.** Before a new explicit Build starts, pb can
-ask an exactly qualified local model for a high-level `TaskPlanProposal`. This is separate from the existing Build
-`PlanArtifact`: it contains outcome-shaped Tasks of kind Build or Goal, qualitative effort,
-dependencies, requirement mappings, and acceptance mappings. It cannot contain executable numeric
-budgets. A fresh critic reviews the proposal, while Rust rejects unknown references, missing
+ask an exactly qualified local model for a high-level `TaskPlanProposal`. This is separate from the
+existing Build `PlanArtifact`: it contains outcome-shaped Tasks of kind Build or Goal, qualitative
+effort, dependencies, requirement mappings, and acceptance mappings. It cannot contain executable
+numeric budgets. Proposal and review generation are token-constrained to controller-owned JSON schemas:
+llama.cpp compiles the schema to a grammar sampler, while FlashMoe exposes one required terminal
+schema call through its native constraint parser. Unknown fields, missing required fields, invalid
+enums, and structural array overflows are therefore masked during sampling rather than left to
+prompt compliance. This structural guarantee does not judge whether a decomposition is useful. A
+fresh critic reviews the proposal, while Rust rejects unknown references, missing
 coverage, cycles, invalid Goal contracts, unqualified automatic Goal selection, and aggregate
 overflow before any child starts. Planning has two attempts and its own invocation, token, advisory,
 and wall-time allowance.
@@ -69,8 +74,8 @@ the same checkpoint digest. A planning failure exposes exactly three decisions: 
 edit the request, or explicitly run the original request as one Build; there is no silent fallback.
 
 Automatic Task planning is fail-closed, and this release's embedded qualification catalog is empty.
-The selected model file, backend, prompt-template version,
-and artifact protocol must match the embedded controller-owned qualification catalog. Project
+The selected model file, backend, prompt-template version, artifact protocol, and structured-output
+contract must match the embedded controller-owned qualification catalog. Project
 configuration cannot add an entry. An unqualified model follows the pre-existing Build path without
 the extra planning call or Tasks UI. `.pb/tasks.toml` supplies only versioned effort presets and
 ceilings and cannot grant qualification, automatic Goal selection, authority, or publication.

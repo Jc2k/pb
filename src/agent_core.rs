@@ -10298,6 +10298,16 @@ trait CompletionEngine {
         enable_thinking: bool,
     ) -> Result<CompletionOutput>;
 
+    fn generate_json(
+        &mut self,
+        _args: &AgentRequest,
+        _messages: &[ChatMessage],
+        _schema: &BuiltInToolSchema,
+        _enable_thinking: bool,
+    ) -> Result<CompletionOutput> {
+        bail!("completion engine does not support schema-constrained JSON")
+    }
+
     fn persist_session_cache(&mut self, _session_id: &str) -> Result<()> {
         Ok(())
     }
@@ -10322,6 +10332,7 @@ impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
         role: crate::task_queue::TaskPlanningRole,
         prompt: &str,
         max_tokens: usize,
+        schema: &Value,
     ) -> Result<crate::task_queue::TaskModelOutput> {
         let mut args = self.args.clone();
         args.max_tokens = i32::try_from(max_tokens).unwrap_or(i32::MAX);
@@ -10333,14 +10344,39 @@ impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
         let messages = vec![
             ChatMessage::text(
                 "system",
-                "Follow the supplied Task artifact protocol exactly. Return the requested JSON object only.",
+                "Produce only the requested Task artifact. The runtime constrains the exact JSON schema; choose accurate content for every required field.",
             ),
             ChatMessage::text("user", prompt),
         ];
-        let output = self.generator.generate(&args, &messages, &[], false)?;
-        if !output.tool_calls.is_empty() || output.tool_parse_error.is_some() {
-            bail!("Task planning completion attempted an unsupported tool call");
+        let output_schema = BuiltInToolSchema {
+            name: match role {
+                crate::task_queue::TaskPlanningRole::Planner => "emit_task_plan",
+                crate::task_queue::TaskPlanningRole::Reviewer => "emit_task_plan_review",
+            }
+            .to_string(),
+            description: "Return the complete Task artifact using exactly this schema.".to_string(),
+            input_schema: schema.clone(),
+        };
+        let output = self
+            .generator
+            .generate_json(&args, &messages, &output_schema, false)?;
+        if let Some(error) = output.tool_parse_error.as_deref() {
+            bail!("Task planning structured output could not be parsed: {error}");
         }
+        let text = match output.tool_calls.as_slice() {
+            [] => output.content.clone(),
+            [call] if call.tool == output_schema.name && output.content.trim().is_empty() => {
+                serde_json::to_string(&call.arguments)
+                    .context("failed to serialize constrained Task artifact")?
+            }
+            [call] if call.tool != output_schema.name => bail!(
+                "Task planning returned tool '{}' instead of required structured output '{}'",
+                call.tool,
+                output_schema.name
+            ),
+            [_] => bail!("Task planning structured output also contained unsupported prose"),
+            _ => bail!("Task planning returned more than one structured output"),
+        };
         self.metrics.llm_invocations = self.metrics.llm_invocations.saturating_add(1);
         self.metrics.llm_runtime_ms = self
             .metrics
@@ -10359,7 +10395,7 @@ impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
             self.metrics.llm_energy_kwh += energy.kwh;
         }
         Ok(crate::task_queue::TaskModelOutput {
-            text: output.content,
+            text,
             prompt_tokens: output.prompt_tokens,
             generated_tokens: output.generated_tokens,
             duration_ms: output.duration_ms,
@@ -13592,33 +13628,63 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         _enable_thinking: bool,
     ) -> Result<CompletionOutput> {
         let request = llama_chat_request(args, messages, tools)?;
-        let mut output = self.session.generate_chat(&request)?;
-        let parsed_tool_calls = parse_model_tool_call_output(&mut output.content);
-        let (tool_calls, tool_parse_error) = match parsed_tool_calls {
-            Ok(tool_calls) => (tool_calls, None),
-            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
-        };
-        Ok(CompletionOutput {
-            content: output.content,
-            tool_calls,
-            tool_parse_error,
-            finish_reason: match output.finish_reason {
-                llamacpp::FinishReason::EndOfGeneration => CompletionFinishReason::EndOfGeneration,
-                llamacpp::FinishReason::MaxTokens => CompletionFinishReason::MaxTokens,
-            },
-            prompt_tokens: output.prompt_tokens,
-            generated_tokens: output.generated_tokens,
-            prompt_cache: output.prompt_cache_source.map(|source| PromptCacheUsage {
-                source,
-                cached_tokens: output.cached_prompt_tokens,
-                prefilled_tokens: output.prefilled_prompt_tokens,
-                restore_ms: output.prompt_cache_restore_ms,
-            }),
-            native: None,
-            duration_ms: output.duration_ms,
-            energy: output.energy,
-        })
+        llama_completion_output(self.session.generate_chat(&request)?)
     }
+
+    fn generate_json(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        schema: &BuiltInToolSchema,
+        _enable_thinking: bool,
+    ) -> Result<CompletionOutput> {
+        let schema_text = serde_json::to_string(&schema.input_schema)
+            .context("failed to serialize Task artifact schema for llama.cpp prompt")?;
+        let mut constrained_messages = messages.to_vec();
+        let schema_position = constrained_messages.len().saturating_sub(1);
+        constrained_messages.insert(
+            schema_position,
+            ChatMessage::text(
+                "system",
+                format!(
+                    "Required output JSON Schema (the sampler enforces it token by token):\n{schema_text}"
+                ),
+            ),
+        );
+        let mut request = llama_chat_request(args, &constrained_messages, &[])?;
+        request.json_schema = Some(schema.input_schema.clone());
+        llama_completion_output(self.session.generate_chat(&request)?)
+    }
+}
+
+fn llama_completion_output(
+    mut output: crate::inference::llamacpp::Output,
+) -> Result<CompletionOutput> {
+    let parsed_tool_calls = parse_model_tool_call_output(&mut output.content);
+    let (tool_calls, tool_parse_error) = match parsed_tool_calls {
+        Ok(tool_calls) => (tool_calls, None),
+        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+    };
+    Ok(CompletionOutput {
+        content: output.content,
+        tool_calls,
+        tool_parse_error,
+        finish_reason: match output.finish_reason {
+            llamacpp::FinishReason::EndOfGeneration => CompletionFinishReason::EndOfGeneration,
+            llamacpp::FinishReason::MaxTokens => CompletionFinishReason::MaxTokens,
+        },
+        prompt_tokens: output.prompt_tokens,
+        generated_tokens: output.generated_tokens,
+        prompt_cache: output.prompt_cache_source.map(|source| PromptCacheUsage {
+            source,
+            cached_tokens: output.cached_prompt_tokens,
+            prefilled_tokens: output.prefilled_prompt_tokens,
+            restore_ms: output.prompt_cache_restore_ms,
+        }),
+        native: None,
+        duration_ms: output.duration_ms,
+        energy: output.energy,
+    })
 }
 
 fn llama_chat_request(
@@ -13629,6 +13695,7 @@ fn llama_chat_request(
     Ok(LlamaCppChatRequest {
         messages: model_messages_value(messages)?,
         tools: model_tools_value(tools),
+        json_schema: None,
         ctx_size: args.ctx_size,
         threads: args.threads,
         threads_batch: args.threads_batch,
@@ -13685,6 +13752,24 @@ impl CompletionEngine for FlashMoeCompletionEngine {
         generate_flashmoe_completion(&mut engine, args, messages, tools, enable_thinking)
     }
 
+    fn generate_json(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        schema: &BuiltInToolSchema,
+        enable_thinking: bool,
+    ) -> Result<CompletionOutput> {
+        let mut engine = self.runtime.lock()?;
+        generate_flashmoe_completion_with_required_tool(
+            &mut engine,
+            args,
+            messages,
+            std::slice::from_ref(schema),
+            enable_thinking,
+            Some(&schema.name),
+        )
+    }
+
     fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
         let mut engine = self.runtime.lock()?;
         if engine.supports_session_snapshots() {
@@ -13737,6 +13822,23 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
         generate_flashmoe_completion(self.engine, args, messages, tools, enable_thinking)
     }
 
+    fn generate_json(
+        &mut self,
+        args: &AgentRequest,
+        messages: &[ChatMessage],
+        schema: &BuiltInToolSchema,
+        enable_thinking: bool,
+    ) -> Result<CompletionOutput> {
+        generate_flashmoe_completion_with_required_tool(
+            self.engine,
+            args,
+            messages,
+            std::slice::from_ref(schema),
+            enable_thinking,
+            Some(&schema.name),
+        )
+    }
+
     fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
         if self.engine.supports_session_snapshots() {
             self.engine.persist_session_cache(session_id)
@@ -13753,9 +13855,33 @@ fn generate_flashmoe_completion(
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
 ) -> Result<CompletionOutput> {
+    generate_flashmoe_completion_with_required_tool(
+        engine,
+        args,
+        messages,
+        tools,
+        enable_thinking,
+        None,
+    )
+}
+
+fn generate_flashmoe_completion_with_required_tool(
+    engine: &mut crate::inference::flashmoe::FlashMoeEngine,
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
+    required_tool_name: Option<&str>,
+) -> Result<CompletionOutput> {
     let energy_start = energy::sample();
     let started = Instant::now();
-    let request = flashmoe_structured_request(args, messages, tools, enable_thinking)?;
+    let request = flashmoe_structured_request_with_required_tool(
+        args,
+        messages,
+        tools,
+        enable_thinking,
+        required_tool_name,
+    )?;
     let output = if engine.supports_session_snapshots() {
         let session_id = flashmoe_generation_session_id(
             &args.session_id,
@@ -13866,10 +13992,27 @@ fn flashmoe_structured_request(
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
 ) -> Result<StructuredGenerationRequest> {
-    let terminal_tool_names = args
+    flashmoe_structured_request_with_required_tool(args, messages, tools, enable_thinking, None)
+}
+
+fn flashmoe_structured_request_with_required_tool(
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    tools: &[BuiltInToolSchema],
+    enable_thinking: bool,
+    required_tool_name: Option<&str>,
+) -> Result<StructuredGenerationRequest> {
+    if let Some(required) = required_tool_name
+        && (tools.len() != 1 || tools[0].name != required)
+    {
+        bail!("required structured output '{required}' must be the only exposed schema");
+    }
+    let workflow_terminal = args
         .workflow_stage
         .and_then(workflow_terminal_tool_name)
-        .filter(|terminal| tools.iter().any(|tool| tool.name == *terminal))
+        .filter(|terminal| tools.iter().any(|tool| tool.name == *terminal));
+    let terminal_tool_names = required_tool_name
+        .or(workflow_terminal)
         .map(|terminal| vec![terminal.to_string()])
         .unwrap_or_default();
     Ok(StructuredGenerationRequest {
@@ -13879,12 +14022,13 @@ fn flashmoe_structured_request(
         enable_thinking,
         raw_prompt: false,
         trace_candidates: false,
-        tool_constraint_mode: if args.workflow_stage.is_some()
-            && tools.len() == 1
-            && args
-                .workflow_stage
-                .and_then(workflow_terminal_tool_name)
-                .is_some_and(|terminal| tools[0].name == terminal)
+        tool_constraint_mode: if required_tool_name.is_some()
+            || (args.workflow_stage.is_some()
+                && tools.len() == 1
+                && args
+                    .workflow_stage
+                    .and_then(workflow_terminal_tool_name)
+                    .is_some_and(|terminal| tools[0].name == terminal))
         {
             crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
         } else if args.workflow_stage.is_some() && !tools.is_empty() {
@@ -21113,6 +21257,59 @@ pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> 
 mod tests {
     use super::*;
 
+    struct RequiredJsonEngine {
+        content: String,
+        calls: Vec<AgentToolCall>,
+        requested_schema: Option<BuiltInToolSchema>,
+    }
+
+    impl CompletionEngine for RequiredJsonEngine {
+        fn measure_prompt(
+            &mut self,
+            _args: &AgentRequest,
+            _messages: &[ChatMessage],
+            _tools: &[BuiltInToolSchema],
+            _enable_thinking: bool,
+        ) -> Result<PromptMeasurement> {
+            Ok(PromptMeasurement {
+                prompt_tokens: 1,
+                tool_schema_tokens: 0,
+            })
+        }
+
+        fn generate(
+            &mut self,
+            _args: &AgentRequest,
+            _messages: &[ChatMessage],
+            _tools: &[BuiltInToolSchema],
+            _enable_thinking: bool,
+        ) -> Result<CompletionOutput> {
+            bail!("unconstrained generation must not serve Task artifacts")
+        }
+
+        fn generate_json(
+            &mut self,
+            _args: &AgentRequest,
+            _messages: &[ChatMessage],
+            schema: &BuiltInToolSchema,
+            _enable_thinking: bool,
+        ) -> Result<CompletionOutput> {
+            self.requested_schema = Some(schema.clone());
+            Ok(CompletionOutput {
+                content: self.content.clone(),
+                tool_calls: self.calls.clone(),
+                tool_parse_error: None,
+                finish_reason: CompletionFinishReason::EndOfGeneration,
+                prompt_tokens: 10,
+                generated_tokens: 20,
+                prompt_cache: None,
+                native: None,
+                duration_ms: 30,
+                energy: None,
+            })
+        }
+    }
+
     fn test_agent_request(profile: AgentProfile, max_tokens: i32) -> AgentRequest {
         AgentRequest {
             task: "test".to_string(),
@@ -21161,6 +21358,51 @@ mod tests {
             goal_context: None,
             contract: None,
         }
+    }
+
+    #[test]
+    fn task_planning_requires_and_extracts_one_schema_constrained_artifact() {
+        let artifact = json!({"objective": "bounded result"});
+        let mut engine = RequiredJsonEngine {
+            content: String::new(),
+            calls: vec![AgentToolCall {
+                id: None,
+                tool: "emit_task_plan".to_string(),
+                arguments: artifact.clone(),
+            }],
+            requested_schema: None,
+        };
+        let request = test_agent_request(AgentProfile::Build, 512);
+        let should_cancel = || false;
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"objective": {"type": "string"}},
+            "required": ["objective"]
+        });
+        let output = {
+            let mut model = TaskPlanningCompletionModel {
+                generator: &mut engine,
+                args: &request,
+                should_cancel: &should_cancel,
+                metrics: RunMetrics::default(),
+            };
+            crate::task_queue::TaskPlanningModel::generate(
+                &mut model,
+                crate::task_queue::TaskPlanningRole::Planner,
+                "return the artifact",
+                128,
+                &schema,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.text).unwrap(),
+            artifact
+        );
+        let requested = engine.requested_schema.unwrap();
+        assert_eq!(requested.name, "emit_task_plan");
+        assert_eq!(requested.input_schema, schema);
     }
 
     fn init_contract_test_repo() -> tempfile::TempDir {

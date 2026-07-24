@@ -327,8 +327,8 @@ budgets are compiled from this document and included in the accepted artifact di
 
 The file cannot enable Task planning, qualify a model, authorize automatic Goal selection, start a
 Goal, expand workflow authority, or allow publication. Planner qualification is controller-owned
-evidence for an exact model/template/protocol version. This release's embedded qualification catalog
-is empty. Existing `.pb/workflow.toml` and
+evidence for an exact model/backend/template/protocol and structured-output contract. This
+release's embedded qualification catalog is empty. Existing `.pb/workflow.toml` and
 `.pb/goal.toml` formats and limits are unchanged. Qualified multi-Task sessions use these ceilings
 for the durable controller and read-only Tasks UI; an unqualified model retains ordinary Build
 behavior.
