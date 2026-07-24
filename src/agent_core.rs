@@ -97,6 +97,7 @@ const MONITOR_TURN_MAX_TOKENS: i32 = 512;
 const MONITOR_TRANSCRIPT_MESSAGES: usize = 8;
 const MONITOR_TRANSCRIPT_MESSAGE_CHARS: usize = 1_200;
 const MAX_CONSECUTIVE_PARSE_FAILURES: usize = 3;
+const MAX_REPEATED_PAYLOAD_LIMIT_FAILURES: usize = 2;
 const MAX_IDENTICAL_GATE_FAILURES: usize = 2;
 const FINAL_GRACE_MAX_TOKENS: i32 = 256;
 const MAX_CHECK_OUTPUT_BYTES: usize = 16 * 1024;
@@ -4088,8 +4089,7 @@ fn builtin_tool_semantics(name: &str) -> Option<BuiltInToolSemantics> {
             semantics.parallel_safe = true;
             semantics.useful_on_success = true;
         }
-        "write_file" | "write_files" | "replace_file" | "edit_file" | "apply_patch" | "mv"
-        | "rm" | "run_task" => {
+        "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm" | "run_task" => {
             semantics.mutates_workspace = true;
             semantics.useful_on_success = true;
         }
@@ -4314,7 +4314,6 @@ impl BuiltInToolSchema {
             "run_command" => "run_command(cmd,timeout_seconds)",
             "run_check" => "run_check(id)",
             "write_file" => "write_file(path,content)",
-            "write_files" => "write_files(files)",
             "replace_file" => "replace_file(path,content)",
             "edit_file" => "edit_file(path,old_text,new_text)",
             "apply_patch" => "apply_patch(patch)",
@@ -4565,31 +4564,6 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
                 ],
                 ["path", "content"],
             )),
-        ),
-        builtin_tool(
-            "write_files",
-            "Create one to four consecutive independent harness-bound files atomically. Paths are supplied by pb in accepted-plan order; provide only complete contents in matching order.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "files": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 4,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": {"type": "string", "description": "Complete contents for the corresponding harness-bound path."}
-                            },
-                            "required": ["content"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "completion": inline_implementation_completion_schema()
-                },
-                "required": ["files"],
-                "additionalProperties": false
-            }),
         ),
         builtin_tool(
             "replace_file",
@@ -5192,7 +5166,7 @@ fn string_property(name: &'static str, description: &'static str) -> (&'static s
 }
 
 const NATIVE_ACTION_RESERVE_TOKENS: i32 = 192;
-const CONSERVATIVE_MUTATION_CHARS_PER_TOKEN: usize = 2;
+const MUTATION_PAYLOAD_CHARS_PER_TOKEN: usize = 4;
 
 fn mutation_payload_char_limit(max_tokens: i32) -> usize {
     usize::try_from(
@@ -5201,11 +5175,11 @@ fn mutation_payload_char_limit(max_tokens: i32) -> usize {
             .max(64),
     )
     .unwrap_or(64)
-    .saturating_mul(CONSERVATIVE_MUTATION_CHARS_PER_TOKEN)
+    .saturating_mul(MUTATION_PAYLOAD_CHARS_PER_TOKEN)
 }
 
 fn compact_mutation_retry_max_tokens(current_max_tokens: i32, payload_chars: usize) -> i32 {
-    let payload_tokens = payload_chars.div_ceil(CONSERVATIVE_MUTATION_CHARS_PER_TOKEN);
+    let payload_tokens = payload_chars.div_ceil(MUTATION_PAYLOAD_CHARS_PER_TOKEN);
     let payload_tokens = i32::try_from(payload_tokens).unwrap_or(i32::MAX);
     NATIVE_ACTION_RESERVE_TOKENS
         .saturating_add(payload_tokens)
@@ -5218,7 +5192,7 @@ fn apply_mutation_payload_limit(tools: &mut [BuiltInToolSchema], max_tokens: i32
     for tool in tools {
         if !matches!(
             tool.name.as_str(),
-            "write_file" | "write_files" | "replace_file" | "apply_patch" | "edit_file"
+            "write_file" | "replace_file" | "apply_patch" | "edit_file"
         ) {
             continue;
         }
@@ -5233,7 +5207,6 @@ fn set_mutation_payload_char_limit(tools: &mut [BuiltInToolSchema], limit: usize
     for tool in tools {
         let fields: &[&str] = match tool.name.as_str() {
             "write_file" | "replace_file" => &["content"],
-            "write_files" => &[],
             "apply_patch" => &["patch"],
             // Both strings share one serialized action, so give each half of the allowance.
             "edit_file" => &["old_text", "new_text"],
@@ -5251,13 +5224,6 @@ fn set_mutation_payload_char_limit(tools: &mut [BuiltInToolSchema], limit: usize
             {
                 property["maxLength"] = json!(field_limit);
             }
-        }
-        if tool.name == "write_files"
-            && let Some(property) = tool
-                .input_schema
-                .pointer_mut("/properties/files/items/properties/content")
-        {
-            property["maxLength"] = json!((limit / 2).max(64));
         }
     }
 }
@@ -5284,7 +5250,7 @@ fn scope_tools_to_work_unit(tools: &mut Vec<BuiltInToolSchema>, unit: &crate::wo
             &["replace_file", "edit_file", "request_replan"][..]
         }
         WorkUnitState::MutationReady => match unit.operation {
-            PlannedChange::Create => &["write_file", "write_files", "request_replan"],
+            PlannedChange::Create => &["write_file", "request_replan"],
             PlannedChange::Modify => &["replace_file", "edit_file", "request_replan"],
             PlannedChange::Delete => &["rm", "request_replan"],
         },
@@ -5313,15 +5279,10 @@ fn active_unit_can_inline_completion(
         .iter()
         .filter(|candidate| candidate.state != crate::workflow::WorkUnitState::StructurallyComplete)
         .collect::<Vec<_>>();
-    remaining
-        .first()
-        .is_some_and(|candidate| candidate.id == unit.id)
-        && (remaining.len() == 1
-            || (remaining.len() <= 4
-                && remaining.iter().all(|candidate| {
-                    candidate.operation == crate::workflow::PlannedChange::Create
-                        && candidate.state == crate::workflow::WorkUnitState::MutationReady
-                })))
+    remaining.len() == 1
+        && remaining
+            .first()
+            .is_some_and(|candidate| candidate.id == unit.id)
 }
 
 fn configure_inline_completion_schema(
@@ -5373,7 +5334,6 @@ fn exposed_mutation_payload_limit(tools: &[BuiltInToolSchema]) -> Option<usize> 
     tools.iter().find_map(|tool| {
         let field = match tool.name.as_str() {
             "write_file" | "replace_file" => "content",
-            "write_files" => "files/items/properties/content",
             "apply_patch" => "patch",
             "edit_file" => "old_text",
             _ => return None,
@@ -5469,8 +5429,7 @@ fn tool_allowed(
         "memory_propose" => matches!(profile, AgentProfile::Build | AgentProfile::Plan),
         "memory_supersede" => profile == AgentProfile::Build,
         "run_command" | "run_check" => command_backend_kind.is_some(),
-        "write_file" | "write_files" | "replace_file" | "edit_file" | "apply_patch" | "mv"
-        | "rm" => {
+        "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm" => {
             matches!(profile, AgentProfile::Build | AgentProfile::Scout)
         }
         "sub_agent" => allow_sub_agents && profile != AgentProfile::Research,
@@ -6659,27 +6618,10 @@ fn run_agent_steps(
                     (
                         crate::workflow::PlannedChange::Create,
                         crate::workflow::WorkUnitState::MutationReady,
-                    ) => {
-                        let batch_paths = active_creation_batch_paths(
-                            args,
-                            &gate_state.borrow(),
-                            workspace_root,
-                        )?;
-                        if batch_paths.len() > 1 {
-                            format!(
-                                "Harness work unit {}: {} consecutive creates are eligible in this exact order: {}. Prefer one atomic write_files call with one complete content object per path in that order; pb binds the paths, so do not include path fields. Otherwise create {} now with write_file. If the full implementation will not fit, write the smallest syntactically loadable scaffold that preserves a later edit path.",
-                                unit.id,
-                                batch_paths.len(),
-                                batch_paths.join(", "),
-                                unit.path
-                            )
-                        } else {
-                            format!(
-                                "Harness work unit {}: create {} now with one complete atomic write_file payload. If the full implementation will not fit, write the smallest syntactically loadable scaffold that preserves a later edit path.",
-                                unit.id, unit.path
-                            )
-                        }
-                    }
+                    ) => format!(
+                        "Harness work unit {}: create {} now with one complete atomic write_file payload. pb binds this exact target, so do not include a path. If the full implementation will not fit, write the smallest syntactically loadable scaffold that preserves a later edit path.",
+                        unit.id, unit.path
+                    ),
                     (operation, crate::workflow::WorkUnitState::MutationReady) => format!(
                         "Harness work unit {}: perform only the target-bound {:?} mutation for {}. The observed target fingerprint remains the write authority.",
                         unit.id, operation, unit.path
@@ -6911,11 +6853,14 @@ fn run_agent_steps(
         };
         let (output, action) = match generated {
             Ok(parsed) => parsed,
-            Err(ParseFailure {
-                output,
-                error,
-                finish_reason,
-            }) => {
+            Err(failure) => {
+                let payload_limited = failure.hit_mutation_payload_limit(generation_tools);
+                let ParseFailure {
+                    output,
+                    error,
+                    finish_reason,
+                    ..
+                } = failure;
                 suppress_thinking |= finish_reason == CompletionFinishReason::MaxTokens;
                 let attempted_terminal_submission =
                     attempted_workflow_terminal_submission(args, &output, finish_reason);
@@ -6929,6 +6874,11 @@ fn run_agent_steps(
                 );
                 let repeated_parse_failures =
                     deterministic_failures.record(DeterministicFailureKind::Parse, signature);
+                let repeated_failure_limit = if payload_limited {
+                    MAX_REPEATED_PAYLOAD_LIMIT_FAILURES
+                } else {
+                    MAX_CONSECUTIVE_PARSE_FAILURES
+                };
 
                 let parse_summary = format!(
                     "{} on step {step}/{max_steps}",
@@ -6958,7 +6908,7 @@ fn run_agent_steps(
                         &error.to_string(),
                         consecutive_parse_failures,
                         repeated_parse_failures,
-                        MAX_CONSECUTIVE_PARSE_FAILURES,
+                        repeated_failure_limit,
                         required,
                     )
                 } else {
@@ -6966,7 +6916,7 @@ fn run_agent_steps(
                         &error.to_string(),
                         consecutive_parse_failures,
                         repeated_parse_failures,
-                        MAX_CONSECUTIVE_PARSE_FAILURES,
+                        repeated_failure_limit,
                     )
                 };
                 if finish_reason == CompletionFinishReason::MaxTokens
@@ -7001,10 +6951,9 @@ fn run_agent_steps(
                 messages.push(correction_chat_message(&parse_summary, &error_msg));
 
                 if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
-                    || repeated_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
+                    || repeated_parse_failures >= repeated_failure_limit
                 {
-                    let retry_limit_message = if repeated_parse_failures
-                        >= MAX_CONSECUTIVE_PARSE_FAILURES
+                    let retry_limit_message = if repeated_parse_failures >= repeated_failure_limit
                         && consecutive_parse_failures < MAX_CONSECUTIVE_PARSE_FAILURES
                     {
                         format!(
@@ -9565,7 +9514,7 @@ fn tool_evidence_effects(tool: &str, arguments: &Value, result: &str) -> String 
             .get("id")
             .and_then(Value::as_str)
             .map(|id| format!("named_check:{id}")),
-        "write_file" | "write_files" | "replace_file" | "edit_file" | "apply_patch" | "rm" => {
+        "write_file" | "replace_file" | "edit_file" | "apply_patch" | "rm" => {
             Some("workspace_mutation".to_string())
         }
         _ => None,
@@ -9718,45 +9667,6 @@ fn project_code_review_submission(arguments: &Value, request: &AgentRequest) -> 
     Ok(projected)
 }
 
-fn active_creation_batch_paths(
-    request: &AgentRequest,
-    gate_state: &GateState,
-    workspace_root: &Path,
-) -> Result<Vec<String>> {
-    let mut ledger = request
-        .workflow_work_units
-        .clone()
-        .context("write_files requires work-unit authority")?;
-    let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
-    let evidence_paths = gate_state
-        .stage_evidence
-        .mutation_evidence_paths()
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    ledger.reconcile(&current, &evidence_paths)?;
-    let Some(start) = ledger
-        .units
-        .iter()
-        .position(|unit| unit.state != crate::workflow::WorkUnitState::StructurallyComplete)
-    else {
-        bail!("write_files has no active creation work unit");
-    };
-    let mut seen = BTreeSet::new();
-    let paths = ledger.units[start..]
-        .iter()
-        .take_while(|unit| {
-            unit.operation == crate::workflow::PlannedChange::Create
-                && unit.state == crate::workflow::WorkUnitState::MutationReady
-        })
-        .filter_map(|unit| seen.insert(unit.path.clone()).then_some(unit.path.clone()))
-        .take(4)
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        bail!("write_files is available only for consecutive mutation-ready creation units");
-    }
-    Ok(paths)
-}
-
 fn append_workflow_content_fingerprint(
     args: &AgentRequest,
     tool: &str,
@@ -9820,6 +9730,63 @@ struct ParseFailure {
     output: String,
     error: anyhow::Error,
     finish_reason: CompletionFinishReason,
+    generated_tokens: usize,
+    generation_max_tokens: i32,
+    constraint_terminal_state: Option<String>,
+}
+
+impl ParseFailure {
+    fn new(
+        output: String,
+        error: anyhow::Error,
+        finish_reason: CompletionFinishReason,
+        generated_tokens: usize,
+        generation_max_tokens: i32,
+        constraint_terminal_state: Option<String>,
+    ) -> Self {
+        Self {
+            output,
+            error,
+            finish_reason,
+            generated_tokens,
+            generation_max_tokens,
+            constraint_terminal_state,
+        }
+    }
+
+    fn from_completion(
+        completion: CompletionOutput,
+        error: anyhow::Error,
+        generation_max_tokens: i32,
+    ) -> Self {
+        let constraint_terminal_state = completion
+            .native
+            .as_ref()
+            .and_then(|native| native.constraint_terminal_state.clone());
+        Self::new(
+            completion.content,
+            error,
+            completion.finish_reason,
+            completion.generated_tokens,
+            generation_max_tokens,
+            constraint_terminal_state,
+        )
+    }
+
+    fn hit_mutation_payload_limit(&self, tools: &[BuiltInToolSchema]) -> bool {
+        if self.constraint_terminal_state.as_deref() == Some("mutation_payload_limit") {
+            return true;
+        }
+        let Ok(generation_max_tokens) = usize::try_from(self.generation_max_tokens) else {
+            return false;
+        };
+        self.finish_reason == CompletionFinishReason::MaxTokens
+            && truncated_native_tool_name(&self.output)
+                .is_some_and(|tool| matches!(tool, "write_file" | "replace_file"))
+            && self.generated_tokens.saturating_mul(4) < generation_max_tokens.saturating_mul(3)
+            && exposed_mutation_payload_limit(tools)
+                .is_some_and(|limit| self.output.chars().count() >= limit)
+    }
 }
 
 fn parse_failure_signature(
@@ -9881,7 +9848,17 @@ fn truncated_native_mutation_path(output: &str) -> Option<String> {
     }
     for marker in ["<parameter=path>", "<｜DSML｜parameter name=\"path\">"] {
         if let Some((_, value)) = tail.rsplit_once(marker) {
-            let path = value.split(['\n', '<']).next().unwrap_or_default().trim();
+            let path = value
+                .split(['\n', '\r', '<'])
+                .next()
+                .unwrap_or_default()
+                .split("\\n")
+                .next()
+                .unwrap_or_default()
+                .split("\\r")
+                .next()
+                .unwrap_or_default()
+                .trim();
             if !path.is_empty() {
                 return Some(path.to_string());
             }
@@ -9911,7 +9888,7 @@ fn json_string_field(input: &str, field: &str) -> Option<String> {
     None
 }
 
-fn compact_mutation_action_error(
+fn bounded_mutation_retry_action_error(
     action: &AgentAction,
     expected_tool: &str,
     expected_path: Option<&str>,
@@ -9925,26 +9902,26 @@ fn compact_mutation_action_error(
         }
         AgentAction::ToolCalls { calls, .. } => {
             return Some(anyhow::anyhow!(
-                "compact mutation recovery requires exactly one {expected_tool} call, but the model returned {} calls",
+                "bounded mutation recovery requires exactly one {expected_tool} call, but the model returned {} calls",
                 calls.len()
             ));
         }
         AgentAction::Final { .. } => {
             return Some(anyhow::anyhow!(
-                "compact mutation recovery requires one {expected_tool} call"
+                "bounded mutation recovery requires one {expected_tool} call"
             ));
         }
     };
     if tool != expected_tool {
         return Some(anyhow::anyhow!(
-            "compact mutation recovery was restricted to {expected_tool}, but the model called {tool}"
+            "bounded mutation recovery was restricted to {expected_tool}, but the model called {tool}"
         ));
     }
     if let Some(expected_path) = expected_path {
         let actual_path = arguments.get("path").and_then(Value::as_str);
         if actual_path != Some(expected_path) {
             return Some(anyhow::anyhow!(
-                "compact mutation recovery was restricted to path {expected_path:?}, but the model returned path {:?}",
+                "bounded mutation recovery was restricted to path {expected_path:?}, but the model returned path {:?}",
                 actual_path.unwrap_or("<missing>")
             ));
         }
@@ -11794,6 +11771,7 @@ fn accepted_plan_check_ids(run: &crate::workflow::WorkflowRun) -> Vec<String> {
 }
 
 fn diagnostic_output_mentions_path(output: &str, path: &str) -> bool {
+    let path = path.replace('\\', "/");
     output
         .replace('\\', "/")
         .split(|character: char| {
@@ -11804,7 +11782,12 @@ fn diagnostic_output_mentions_path(output: &str, path: &str) -> bool {
                 )
         })
         .map(|token| token.strip_prefix("./").unwrap_or(token))
-        .any(|token| token == path)
+        .any(|token| {
+            token == path
+                || token
+                    .strip_suffix(path.as_str())
+                    .is_some_and(|prefix| prefix.ends_with('/'))
+        })
 }
 
 fn failed_check_diagnostic_paths(
@@ -13007,6 +12990,9 @@ pub(crate) struct ScriptedCompletion {
     pub truncated: bool,
 }
 
+#[cfg(test)]
+const SCRIPTED_PAYLOAD_LIMIT_PREFIX: &str = "<pb-scripted-payload-limit>";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScriptedAgentOutcome {
     pub reached_final: bool,
@@ -13069,8 +13055,26 @@ impl CompletionEngine for ScriptedCompletionEngine {
             .completions
             .pop_front()
             .context("scripted harness fixture exhausted its completion transcript")?;
+        #[cfg(test)]
+        let (content, native) = completion
+            .content
+            .strip_prefix(SCRIPTED_PAYLOAD_LIMIT_PREFIX)
+            .map_or_else(
+                || (completion.content.clone(), None),
+                |content| {
+                    (
+                        content.to_string(),
+                        Some(crate::events::NativeGenerationUsage {
+                            constraint_terminal_state: Some("mutation_payload_limit".to_string()),
+                            ..crate::events::NativeGenerationUsage::default()
+                        }),
+                    )
+                },
+            );
+        #[cfg(not(test))]
+        let (content, native) = (completion.content, None);
         Ok(CompletionOutput {
-            content: completion.content,
+            content,
             tool_calls: Vec::new(),
             tool_parse_error: None,
             finish_reason: if completion.truncated {
@@ -13082,7 +13086,7 @@ impl CompletionEngine for ScriptedCompletionEngine {
                 .prompt_tokens,
             generated_tokens: 1,
             prompt_cache: None,
-            native: None,
+            native,
             duration_ms: 0,
             energy: None,
         })
@@ -14309,8 +14313,8 @@ fn generate_and_parse_action_with_retries(
     let mut retry_messages = None;
     let mut retry_tools: Option<Vec<BuiltInToolSchema>> = None;
     let mut cap_growth_used = false;
-    let mut compact_mutation_retry_used = false;
-    let mut compact_mutation_constraint: Option<(String, Option<String>)> = None;
+    let mut mutation_retry_used = false;
+    let mut mutation_retry_constraint: Option<(String, Option<String>)> = None;
 
     loop {
         let mut request = args.clone();
@@ -14390,58 +14394,79 @@ fn generate_and_parse_action_with_retries(
                 completion.prompt_tokens
             );
         }
-        if let Some(error) = completion.tool_parse_error {
-            return Ok(Err(ParseFailure {
-                output: completion.content,
-                error: anyhow::anyhow!(error),
-                finish_reason: completion.finish_reason,
-            }));
+        if let Some(error) = completion.tool_parse_error.clone() {
+            return Ok(Err(ParseFailure::from_completion(
+                completion,
+                anyhow::anyhow!(error),
+                request.max_tokens,
+            )));
         }
         if completion.finish_reason == CompletionFinishReason::MaxTokens
             && !completion.tool_calls.is_empty()
             && let Some(tool) = truncated_native_tool_name(&completion.content)
         {
-            return Ok(Err(ParseFailure {
-                error: anyhow::anyhow!(
+            let tool = tool.to_string();
+            let complete_calls = completion.tool_calls.len();
+            return Ok(Err(ParseFailure::from_completion(
+                completion,
+                anyhow::anyhow!(
                     "native {tool} call was cut off after {} complete call(s); no call from the incomplete batch was executed",
-                    completion.tool_calls.len()
+                    complete_calls
                 ),
-                output: completion.content,
-                finish_reason: completion.finish_reason,
-            }));
+                request.max_tokens,
+            )));
         }
         if !completion.tool_calls.is_empty() {
+            let finish_reason = completion.finish_reason;
+            let generated_tokens = completion.generated_tokens;
+            let constraint_terminal_state = completion
+                .native
+                .as_ref()
+                .and_then(|native| native.constraint_terminal_state.clone());
             let output = completion.content.clone();
             let action = AgentAction::ToolCalls {
                 calls: completion.tool_calls,
                 thinking: non_empty_string(completion.content),
             };
-            if let Some((expected_tool, expected_path)) = compact_mutation_constraint.as_ref()
-                && let Some(error) =
-                    compact_mutation_action_error(&action, expected_tool, expected_path.as_deref())
+            if let Some((expected_tool, expected_path)) = mutation_retry_constraint.as_ref()
+                && let Some(error) = bounded_mutation_retry_action_error(
+                    &action,
+                    expected_tool,
+                    expected_path.as_deref(),
+                )
             {
-                return Ok(Err(ParseFailure {
+                return Ok(Err(ParseFailure::new(
                     output,
                     error,
-                    finish_reason: completion.finish_reason,
-                }));
+                    finish_reason,
+                    generated_tokens,
+                    request.max_tokens,
+                    constraint_terminal_state,
+                )));
             }
             return Ok(Ok((output, action)));
         }
         match parse_action(&completion.content) {
             Ok(action) => {
-                if let Some((expected_tool, expected_path)) = compact_mutation_constraint.as_ref()
-                    && let Some(error) = compact_mutation_action_error(
+                if let Some((expected_tool, expected_path)) = mutation_retry_constraint.as_ref()
+                    && let Some(error) = bounded_mutation_retry_action_error(
                         &action,
                         expected_tool,
                         expected_path.as_deref(),
                     )
                 {
-                    return Ok(Err(ParseFailure {
-                        output: completion.content,
+                    let constraint_terminal_state = completion
+                        .native
+                        .as_ref()
+                        .and_then(|native| native.constraint_terminal_state.clone());
+                    return Ok(Err(ParseFailure::new(
+                        completion.content,
                         error,
-                        finish_reason: completion.finish_reason,
-                    }));
+                        completion.finish_reason,
+                        completion.generated_tokens,
+                        request.max_tokens,
+                        constraint_terminal_state,
+                    )));
                 }
                 return Ok(Ok((completion.content, action)));
             }
@@ -14464,11 +14489,7 @@ fn generate_and_parse_action_with_retries(
                         },
                     )));
                 }
-                let failure = ParseFailure {
-                    output: completion.content,
-                    error,
-                    finish_reason: completion.finish_reason,
-                };
+                let failure = ParseFailure::from_completion(completion, error, request.max_tokens);
 
                 if attempt_enable_thinking {
                     tracing::warn!(
@@ -14513,33 +14534,53 @@ fn generate_and_parse_action_with_retries(
                 let truncated_mutation = truncated_native_tool_name(&failure.output)
                     .filter(|tool| matches!(*tool, "write_file" | "replace_file"))
                     .filter(|tool| tools.iter().any(|schema| schema.name.as_str() == *tool));
-                if !compact_mutation_retry_used && let Some(tool) = truncated_mutation {
-                    compact_mutation_retry_used = true;
-                    retry_reason = Some(AgentRetryReason::CompactMutationAfterTruncation);
+                if !mutation_retry_used && let Some(tool) = truncated_mutation {
+                    mutation_retry_used = true;
+                    let payload_limited = failure.hit_mutation_payload_limit(tools);
+                    retry_reason = Some(if payload_limited {
+                        AgentRetryReason::ExpandedMutationAfterPayloadLimit
+                    } else {
+                        AgentRetryReason::CompactMutationAfterTruncation
+                    });
                     let target_path = truncated_native_mutation_path(&failure.output);
-                    compact_mutation_constraint = Some((tool.to_string(), target_path.clone()));
-                    let mut compact_tools = tools
+                    mutation_retry_constraint = Some((tool.to_string(), target_path.clone()));
+                    let mut constrained_tools = tools
                         .iter()
                         .filter(|schema| schema.name == tool)
                         .cloned()
                         .collect::<Vec<_>>();
-                    let target_chars = mutation_payload_char_limit(max_tokens) / 2;
-                    set_mutation_payload_char_limit(&mut compact_tools, target_chars);
+                    let ordinary_chars = exposed_mutation_payload_limit(tools)
+                        .unwrap_or_else(|| mutation_payload_char_limit(max_tokens));
+                    let target_chars = if payload_limited {
+                        ordinary_chars.saturating_mul(2)
+                    } else {
+                        (ordinary_chars / 2).max(64)
+                    };
+                    set_mutation_payload_char_limit(&mut constrained_tools, target_chars);
                     if let Some(target_path) = target_path.as_deref() {
-                        set_mutation_target_path(&mut compact_tools, target_path);
+                        set_mutation_target_path(&mut constrained_tools, target_path);
                     }
-                    if let Some(schema) = compact_tools.first_mut() {
-                        schema.description.push_str(&format!(
-                            " Compact recovery permits at most {target_chars} content characters."
-                        ));
+                    if let Some(schema) = constrained_tools.first_mut() {
+                        let recovery_description = if payload_limited {
+                            format!(
+                                " Payload-bound recovery permits at most {target_chars} content characters at the same generated-token ceiling."
+                            )
+                        } else {
+                            format!(
+                                " Compact recovery permits at most {target_chars} content characters."
+                            )
+                        };
+                        schema.description.push_str(&recovery_description);
                         if let Some(target_path) = target_path.as_deref() {
                             schema.description.push_str(&format!(
                                 " This retry is restricted to the original target {target_path}."
                             ));
                         }
                     }
-                    retry_tools = Some(compact_tools);
-                    max_tokens = compact_mutation_retry_max_tokens(max_tokens, target_chars);
+                    retry_tools = Some(constrained_tools);
+                    if !payload_limited {
+                        max_tokens = compact_mutation_retry_max_tokens(max_tokens, target_chars);
+                    }
                     cap_growth_used = true;
                     let target_instruction = target_path.as_deref().map_or_else(
                         String::new,
@@ -14549,23 +14590,35 @@ fn generate_and_parse_action_with_retries(
                             )
                         },
                     );
-                    let instruction = format!(
-                        "The capped {tool} call was not executed. Retry {tool} now with one complete, syntactically loadable payload under {target_chars} characters and within {max_tokens} generated tokens.{target_instruction} Keep only the smallest functional core; omit decoration, commentary, optional helpers, and repeated material. Do not include the rejected payload or read the missing target."
-                    );
+                    let (summary, heading, instruction) = if payload_limited {
+                        (
+                            "Retrying a payload-bound atomic mutation",
+                            "Payload-bound atomic mutation recovery",
+                            format!(
+                                "The constrained {tool} call reached its {ordinary_chars}-character schema boundary after {} of {} available generated tokens and was not executed. Retry {tool} now with one complete, syntactically loadable payload under {target_chars} characters while retaining the same {max_tokens}-token ceiling.{target_instruction} Use the available output capacity, but still omit decoration and commentary. Do not include the rejected payload or read the missing target.",
+                                failure.generated_tokens, failure.generation_max_tokens
+                            ),
+                        )
+                    } else {
+                        (
+                            "Retrying a compact atomic mutation",
+                            "Compact atomic mutation recovery",
+                            format!(
+                                "The capped {tool} call exhausted its token allowance and was not executed. Retry {tool} now with one complete, syntactically loadable payload under {target_chars} characters and within {max_tokens} generated tokens.{target_instruction} Keep only the smallest functional core; omit decoration, commentary, optional helpers, and repeated material. Do not include the rejected payload or read the missing target."
+                            ),
+                        )
+                    };
                     sink.emit(AgentEvent::Correction {
                         message: instruction.clone(),
-                        summary: "Retrying a compact atomic mutation".to_string(),
+                        summary: summary.to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
                         assisting_profile: Some(args.profile),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
-                    let mut compact_messages = messages.to_vec();
-                    compact_messages.push(correction_chat_message(
-                        "Compact atomic mutation recovery",
-                        &instruction,
-                    ));
-                    retry_messages = Some(compact_messages);
+                    let mut mutation_retry_messages = messages.to_vec();
+                    mutation_retry_messages.push(correction_chat_message(heading, &instruction));
+                    retry_messages = Some(mutation_retry_messages);
                     continue;
                 }
 
@@ -16106,16 +16159,21 @@ fn build_controller_read_observation(
         WorkUnitState,
     };
 
-    if !args.observation_rendering.is_controller()
-        || !matches!(
-            unit.state,
-            WorkUnitState::EvidenceNeeded | WorkUnitState::DiagnosticFailed
-        )
-        || !matches!(
-            unit.operation,
-            PlannedChange::Modify | PlannedChange::Delete
-        )
-    {
+    let controller_read_is_applicable = match unit.state {
+        WorkUnitState::EvidenceNeeded => {
+            matches!(
+                unit.operation,
+                PlannedChange::Modify | PlannedChange::Delete
+            )
+        }
+        // A planned create becomes an existing, fingerprinted repair target after its first
+        // successful write. Let the controller provide the same truthful current-byte
+        // observation used for planned modifications instead of spending an LLM turn on a
+        // deterministic read.
+        WorkUnitState::DiagnosticFailed => !matches!(unit.operation, PlannedChange::Delete),
+        _ => false,
+    };
+    if !args.observation_rendering.is_controller() || !controller_read_is_applicable {
         return Ok(None);
     }
     let Ok(resolved) = resolve_workspace_entry_path(workspace_root, &unit.path, true) else {
@@ -16806,88 +16864,6 @@ fn run_tool(
             context.gate_state.borrow_mut().record_content_mutation();
             Ok(mutation_result_with_inline_completion(
                 format!("created {}", resolved.display()),
-                arguments,
-                context,
-            ))
-        }
-        "write_files" => {
-            let files = arguments
-                .get("files")
-                .and_then(Value::as_array)
-                .context("write_files requires array argument: files")?;
-            if files.is_empty() || files.len() > 4 {
-                bail!("write_files requires one to four complete file payloads");
-            }
-            let authority_paths = active_creation_batch_paths(
-                context.request,
-                &context.gate_state.borrow(),
-                workspace_root,
-            )?;
-            if files.len() > authority_paths.len() {
-                bail!(
-                    "write_files supplied {} payloads but only {} consecutive creation units are eligible",
-                    files.len(),
-                    authority_paths.len()
-                );
-            }
-            let mut prepared = Vec::with_capacity(files.len());
-            let mut combined_content_chars = 0usize;
-            for (index, file) in files.iter().enumerate() {
-                let content = file
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .with_context(|| format!("write_files files[{index}] requires content"))?;
-                combined_content_chars =
-                    combined_content_chars.saturating_add(content.chars().count());
-                let path = &authority_paths[index];
-                ensure_contract_paths_allowed(context.request, [path.as_str()])?;
-                let resolved = resolve_workspace_path(workspace_root, path, false)?;
-                if resolved.exists() {
-                    bail!("write_files refuses to overwrite existing file {path}");
-                }
-                prepared.push((path.clone(), resolved, content));
-            }
-            let payload_limit = mutation_payload_char_limit(boosted_max_tokens(context.request));
-            if combined_content_chars > payload_limit {
-                bail!(
-                    "write_files combined content exceeds the {payload_limit}-character mutation payload bound"
-                );
-            }
-            let mut created = Vec::new();
-            for (path, resolved, content) in &prepared {
-                if let Some(parent) = resolved.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("failed to create {}", parent.display()))?;
-                }
-                if let Err(error) = atomic_create_file(resolved, content.as_bytes()) {
-                    for (_, created_path) in created.iter().rev() {
-                        let _ = std::fs::remove_file(created_path);
-                    }
-                    return Err(error).with_context(|| {
-                        format!("write_files rolled back after failing to create {path}")
-                    });
-                }
-                created.push((path.clone(), resolved.clone()));
-            }
-            for (path, _, content) in &prepared {
-                sink.emit(AgentEvent::Diff {
-                    path: path.clone(),
-                    diff: bounded_tool_diff(unified_diff("", content, path)),
-                    nesting_depth: (context.request.sub_agent_depth > 0)
-                        .then_some(context.request.sub_agent_depth),
-                    timestamp_ms: Some(now_millis()),
-                });
-            }
-            context.gate_state.borrow_mut().record_content_mutation();
-            Ok(mutation_result_with_inline_completion(
-                format!(
-                    "created harness-bound batch: {}",
-                    created
-                        .iter()
-                        .map(|(path, _)| path.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
                 arguments,
                 context,
             ))
@@ -21785,7 +21761,7 @@ mod tests {
         let mut tools = all_builtin_tool_specs();
         let limit = apply_mutation_payload_limit(&mut tools, 1_024);
         set_mutation_target_path(&mut tools, "game.js");
-        assert_eq!(limit, 1_664);
+        assert_eq!(limit, 3_328);
         assert_eq!(compact_mutation_retry_max_tokens(1_024, limit / 2), 608);
         let schema = |name: &str| {
             &tools
@@ -22166,6 +22142,24 @@ the next imagined action"#;
                 .ends_with(&expected_native_result)
         );
 
+        unit.operation = crate::workflow::PlannedChange::Create;
+        unit.baseline_path_fingerprint = None;
+        unit.invocation_path_fingerprint = None;
+        unit.state = crate::workflow::WorkUnitState::DiagnosticFailed;
+        let created_repair = build_controller_read_observation(
+            &request,
+            &unit,
+            repo.path(),
+            Some("error at game.js:1:1"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            created_repair.receipt.coverage,
+            crate::workflow::ObservationCoverage::Full
+        );
+        assert!(created_repair.stage_entry.is_some());
+
         let large = (1..=2_000)
             .map(|line| format!("const value_{line} = {line};"))
             .collect::<Vec<_>>()
@@ -22174,6 +22168,7 @@ the next imagined action"#;
         let snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
         let current = snapshot.paths["game.js"].fingerprint.clone();
         unit.current_path_fingerprint = Some(current);
+        unit.operation = crate::workflow::PlannedChange::Modify;
         unit.state = crate::workflow::WorkUnitState::DiagnosticFailed;
         let ranged = build_controller_read_observation(
             &request,
@@ -22823,6 +22818,14 @@ the next imagined action"#;
             "slugify.test.mjs.backup:1",
             "slugify.test.mjs"
         ));
+        assert!(diagnostic_output_mentions_path(
+            "error: Expected unicode escape at file:///private/tmp/run/workspace/app.js:128:9",
+            "app.js"
+        ));
+        assert!(!diagnostic_output_mentions_path(
+            "error at file:///private/tmp/run/workspace/app.js.backup:128:9",
+            "app.js"
+        ));
     }
 
     #[test]
@@ -22938,7 +22941,7 @@ the next imagined action"#;
     }
 
     #[test]
-    fn typed_creation_batch_binds_ordered_paths_and_earns_one_real_progress_turn() {
+    fn typed_creation_units_expose_one_controller_bound_path_at_a_time() {
         let repo = init_contract_test_repo();
         let repository =
             crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
@@ -22951,7 +22954,7 @@ the next imagined action"#;
             path: "beta.txt".to_string(),
             change: crate::workflow::PlannedChange::Create,
         });
-        let plan = crate::workflow::ArtifactEnvelope::new("plan-batch", artifact).unwrap();
+        let plan = crate::workflow::ArtifactEnvelope::new("plan-sequential", artifact).unwrap();
         let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
         let ledger = crate::workflow::WorkUnitLedger::from_plan(
             &plan.id,
@@ -22973,10 +22976,8 @@ the next imagined action"#;
         let outcome = run_scripted_agent_steps(
             &request,
             vec![
-                tool_completion(
-                    "write_files",
-                    json!({"files": [{"content": "alpha\n"}, {"content": "beta\n"}]}),
-                ),
+                tool_completion("write_file", json!({"content": "alpha\n"})),
+                tool_completion("write_file", json!({"content": "beta\n"})),
                 tool_completion(
                     "submit_implementation",
                     json!({
@@ -23005,98 +23006,27 @@ the next imagined action"#;
             std::fs::read_to_string(repo.path().join("beta.txt")).unwrap(),
             "beta\n"
         );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::Correction { summary, .. }
-                if summary == "Work-unit progress earned one bounded turn"
-        )));
-
-        let invalid_repo = init_contract_test_repo();
-        let invalid_repository =
-            crate::workspace::RepositoryContext::capture(invalid_repo.path(), invalid_repo.path())
-                .unwrap();
-        let invalid_current =
-            crate::workspace::ContentSnapshot::capture(invalid_repo.path()).unwrap();
-        let invalid_ledger = crate::workflow::WorkUnitLedger::from_plan(
-            &plan.id,
-            &plan.sha256,
-            &plan.artifact,
-            &invalid_repository.task_baseline.content,
-            &invalid_repository.invocation_baseline.content,
-            &invalid_current,
-            &BTreeSet::new(),
-        )
-        .unwrap();
-        let mut invalid_request = workflow_request(AgentProfile::Build, invalid_repo.path());
-        invalid_request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
-        invalid_request.workflow_work_units = Some(invalid_ledger);
-        invalid_request.repository_context = Some(invalid_repository);
-        invalid_request.max_steps = 1;
-        run_scripted_agent_steps(
-            &invalid_request,
-            vec![tool_completion(
-                "write_files",
-                json!({"files": [{"content": "alpha\n"}, {}]}),
-            )],
-            invalid_repo.path(),
-            &mut |_| {},
-        )
-        .unwrap();
-        assert!(!invalid_repo.path().join("alpha.txt").exists());
-        assert!(!invalid_repo.path().join("beta.txt").exists());
-
-        let oversized_repo = init_contract_test_repo();
-        let oversized_repository = crate::workspace::RepositoryContext::capture(
-            oversized_repo.path(),
-            oversized_repo.path(),
-        )
-        .unwrap();
-        let mut oversized_artifact = plan.artifact.clone();
-        oversized_artifact.steps[0]
-            .paths
-            .push(crate::workflow::PlanPath {
-                path: "gamma.txt".to_string(),
-                change: crate::workflow::PlannedChange::Create,
-            });
-        let oversized_plan =
-            crate::workflow::ArtifactEnvelope::new("plan-oversized-batch", oversized_artifact)
-                .unwrap();
-        let oversized_current =
-            crate::workspace::ContentSnapshot::capture(oversized_repo.path()).unwrap();
-        let oversized_ledger = crate::workflow::WorkUnitLedger::from_plan(
-            &oversized_plan.id,
-            &oversized_plan.sha256,
-            &oversized_plan.artifact,
-            &oversized_repository.task_baseline.content,
-            &oversized_repository.invocation_baseline.content,
-            &oversized_current,
-            &BTreeSet::new(),
-        )
-        .unwrap();
-        let mut oversized_request = workflow_request(AgentProfile::Build, oversized_repo.path());
-        oversized_request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
-        oversized_request.workflow_work_units = Some(oversized_ledger);
-        oversized_request.repository_context = Some(oversized_repository);
-        oversized_request.max_steps = 1;
-        oversized_request.turn_max_tokens_cap = Some(512);
-        let payload = "x".repeat(250);
-        run_scripted_agent_steps(
-            &oversized_request,
-            vec![tool_completion(
-                "write_files",
-                json!({"files": [
-                    {"content": payload},
-                    {"content": payload},
-                    {"content": payload}
-                ]}),
-            )],
-            oversized_repo.path(),
-            &mut |_| {},
-        )
-        .unwrap();
-        for path in ["alpha.txt", "beta.txt", "gamma.txt"] {
-            assert!(!oversized_repo.path().join(path).exists());
-        }
+        assert_eq!(outcome.llm_invocations, 3);
+        assert!(outcome.generation_tool_names[..2].iter().all(|names| {
+            names.contains(&"write_file".to_string()) && !names.contains(&"write_files".to_string())
+        }));
+        let announcements = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Correction {
+                    summary, message, ..
+                } if summary == "Active accepted-plan work unit" => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(announcements.len(), 2);
+        assert!(announcements[0].contains("create alpha.txt now"));
+        assert!(announcements[1].contains("create beta.txt now"));
+        assert!(
+            announcements
+                .iter()
+                .all(|message| !message.contains("consecutive creates"))
+        );
     }
 
     #[test]
@@ -23314,7 +23244,7 @@ the next imagined action"#;
             work_unit_guidance: BTreeMap::new(),
             checks: vec![crate::harness_contract::AgentCheckContract {
                 id: "preview".to_string(),
-                command: "echo 'alpha.txt: broken'; exit 1".to_string(),
+                command: "echo \"error at file://$PWD/alpha.txt:1:1\"; exit 1".to_string(),
                 cwd: ".".to_string(),
                 required: true,
                 diagnostic_eligible: true,
@@ -27619,14 +27549,149 @@ the next imagined action"#;
             contexts[1].retry_reason,
             Some(AgentRetryReason::CompactMutationAfterTruncation)
         );
-        assert_eq!(contexts[1].mutation_payload_char_limit, Some(64));
+        assert_eq!(contexts[1].mutation_payload_char_limit, Some(128));
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::Correction { summary, message, .. }
                 if summary == "Retrying a compact atomic mutation"
-                    && message.contains("under 64 characters")
+                    && message.contains("under 128 characters")
                     && message.contains("within 224 generated tokens")
                     && message.contains("exact original target compact.txt")
+        )));
+    }
+
+    #[test]
+    fn payload_bound_mutation_gets_one_larger_retry_at_the_same_token_ceiling() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 2;
+        request.turn_max_tokens_cap = Some(256);
+        request.workflow_action_first_turn = true;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                ScriptedCompletion {
+                    content: format!(
+                        "{SCRIPTED_PAYLOAD_LIMIT_PREFIX}<tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"expanded.txt\",\"content\":\"unfinished"
+                    ),
+                    truncated: true,
+                },
+                tool_completion(
+                    "write_file",
+                    json!({"path": "expanded.txt", "content": "complete\n"}),
+                ),
+                scripted_final("completed after payload-bound recovery"),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(!outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert_eq!(outcome.llm_invocations, 3);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(outcome.generation_max_tokens, vec![256, 256, 256]);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("expanded.txt")).unwrap(),
+            "complete\n"
+        );
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["write_file".to_string()]
+        );
+        let retry_context = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::LlmInvocation {
+                    context: Some(context),
+                    ..
+                } => Some(context),
+                _ => None,
+            })
+            .nth(1)
+            .unwrap();
+        assert_eq!(
+            retry_context.retry_reason,
+            Some(AgentRetryReason::ExpandedMutationAfterPayloadLimit)
+        );
+        assert_eq!(retry_context.mutation_payload_char_limit, Some(512));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { summary, message, .. }
+                if summary == "Retrying a payload-bound atomic mutation"
+                    && message.contains("under 512 characters")
+                    && message.contains("same 256-token ceiling")
+                    && message.contains("exact original target expanded.txt")
+        )));
+    }
+
+    #[test]
+    fn portable_payload_limit_inference_requires_unused_tokens_and_schema_sized_output() {
+        let mut tools = all_builtin_tool_specs();
+        let limit = apply_mutation_payload_limit(&mut tools, 2_048);
+        let output = format!(
+            "<tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"content\":\"{}",
+            "x".repeat(limit)
+        );
+        let inferred = ParseFailure::new(
+            output.clone(),
+            anyhow::anyhow!("truncated"),
+            CompletionFinishReason::MaxTokens,
+            1_000,
+            2_048,
+            None,
+        );
+        assert!(inferred.hit_mutation_payload_limit(&tools));
+
+        let token_exhausted = ParseFailure::new(
+            output,
+            anyhow::anyhow!("truncated"),
+            CompletionFinishReason::MaxTokens,
+            2_048,
+            2_048,
+            None,
+        );
+        assert!(!token_exhausted.hit_mutation_payload_limit(&tools));
+    }
+
+    #[test]
+    fn repeated_payload_bound_mutation_stops_after_two_failed_recovery_cycles() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 5;
+        request.turn_max_tokens_cap = Some(256);
+        request.workflow_action_first_turn = true;
+        let truncated = || ScriptedCompletion {
+            content: format!(
+                "{SCRIPTED_PAYLOAD_LIMIT_PREFIX}<tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"repeat.txt\",\"content\":\"unfinished"
+            ),
+            truncated: true,
+        };
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                truncated(),
+                truncated(),
+                truncated(),
+                truncated(),
+                scripted_final("must not run"),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::ParseLoop);
+        assert_eq!(outcome.llm_invocations, 4);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(!tmp.path().join("repeat.txt").exists());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { message, .. }
+                if message.contains("equivalent unparsable structured action 2 times")
         )));
     }
 
@@ -29302,6 +29367,14 @@ the next imagined action"#;
         assert_eq!(
             truncated_native_mutation_path(qwen).as_deref(),
             Some("src/game.js")
+        );
+        let escaped_parameter = concat!(
+            "<tool_call><function=write_file><parameter=content>partial",
+            "<parameter=path>app.test.mjs\\n  }\\n}"
+        );
+        assert_eq!(
+            truncated_native_mutation_path(escaped_parameter).as_deref(),
+            Some("app.test.mjs")
         );
     }
 

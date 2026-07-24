@@ -209,8 +209,9 @@ impl StageCapabilities {
             // Strict delivery already has durable typed stage state. Exposing the legacy,
             // invocation-local todo protocol only adds another control loop for the model.
             "todo" => false,
-            "write_file" | "write_files" | "replace_file" | "edit_file" | "apply_patch" | "mv"
-            | "rm" => self.repository_mutation,
+            "write_file" | "replace_file" | "edit_file" | "apply_patch" | "mv" | "rm" => {
+                self.repository_mutation
+            }
             "run_command" => self.run_command,
             "run_task" => self.run_task,
             "run_check" => self.run_check,

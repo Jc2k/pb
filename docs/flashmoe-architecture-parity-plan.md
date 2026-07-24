@@ -274,11 +274,16 @@ DSML parser for ordinary tool actions; strict JSON artifacts use the shared LLGu
 llama.cpp keeps its existing LLGuidance sampler integration.
 Constraint-valid non-EOS candidates must increase the visible decoded prefix. When an open
 `write_file` or `replace_file` string reaches its schema limit, generation stops before a synthetic
-close can turn a cut-off payload into an executable mutation. The agent controller sees the named,
-truncated action and may spend its single same-step compact retry; that retry halves the payload
-allowance in the actual narrowed tool schema. Complete terminal-tool JSON may end semantically
-without spending tokens on the closing Qwen envelope, while ordinary tool-call batches retain the
-shared executor path. These controls change neither graph preparation nor expert scheduling.
+close can turn a cut-off payload into an executable mutation. Structural whitespace outside JSON
+strings is capped at 32 bytes at each position, including before a required tool marker, so a model
+cannot consume its generation allowance by emitting whitespace after entering the constrained tool
+envelope; valid lower-ranked structural tokens remain reachable through the existing vocabulary
+widening. The agent controller sees a named truncated mutation and chooses a same-token larger-schema
+retry for an early payload stop or a smaller retry for real token exhaustion. Complete terminal-tool
+JSON may end semantically without spending tokens on the closing Qwen envelope, while ordinary
+tool-call batches retain the shared executor path. The constraint sampler sits after the shared
+output head, so these rules apply identically to resident and streamed experts and change neither
+graph preparation nor expert scheduling.
 Persistent stage evidence is workflow-checkpoint data keyed by content fingerprints and path hashes,
 not model memory or expert state. None of these follow-ons changes the resident/streamed decision,
 adds a hidden environment toggle, enables unsupported thinking, or permits native load failure to

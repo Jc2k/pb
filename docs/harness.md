@@ -54,6 +54,11 @@ never supplies assessments or a verdict. A successful final mutation can carry o
 model-authored completion fields, while a controller no-change close is limited to structurally
 empty, mutation-forbidden work.
 
+After a planned create succeeds, an exact-path diagnostic failure makes that file an existing repair
+target. The controller can inject its current bounded bytes and read-before-write receipt directly,
+avoiding a model-authored read turn before the target-bound repair. It cannot do this before the
+create exists or for a different path.
+
 Automatic deletion requires a unique accepted delete of a tracked, clean, unchanged file or
 symlink. It never applies to directories, dirty, untracked, adopted, stale, oversized, forbidden,
 or ambiguous content. Harness summaries separately report controller observation count and prompt
@@ -328,11 +333,10 @@ modify/delete targets require a current complete read; adopted task-owned deltas
 structurally complete without false model authorship. Exact-path diagnostic failures invalidate
 older reads and reopen only that path as a repair; they do not repeat the original create operation.
 
-Consecutive independent creates may be sent through `write_files` as one ordered batch of at most
-four complete payloads. All payloads and destinations validate before execution; an execution
-failure removes members already created by that batch. One real content/evidence transition can
-earn one extra turn per unit, at most four per stage. No failed, rejected, cached, repeated, no-op,
-or bookkeeping action earns budget. When the ledger is complete, pb projects plan identity,
+Creation units execute one controller-bound path per model action, so an unknown multi-file payload
+cannot consume the turn before the first accepted-plan path is complete. One real content/evidence
+transition can earn one extra turn per unit, at most four per stage. No failed, rejected, cached,
+repeated, no-op, or bookkeeping action earns budget. When the ledger is complete, pb projects plan identity,
 fingerprint, touched paths, and no-change into implementation accounting; the model still supplies
 step status, summaries, and commit subject.
 
@@ -543,7 +547,8 @@ includes an optional backward-compatible context snapshot covering capacity, gen
 prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,
 thinking mode, retry reason, and the compaction/cache/closure counters introduced by later
 milestones. Evaluation summaries count `thinking_off_truncation_retries`,
-`compact_mutation_truncation_retries`, and `larger_cap_truncation_retries` separately. Runtime
+`expanded_mutation_payload_retries`, `compact_mutation_truncation_retries`, and
+`larger_cap_truncation_retries` separately. Runtime
 setup failures are reported separately from artifact quality so a backend experiment error is not
 scored as model reasoning.
 

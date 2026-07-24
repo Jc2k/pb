@@ -490,6 +490,7 @@ export type AgentEvent =
       thinking_enabled?: boolean;
       retry_reason?:
         | "thinking_off_after_truncation"
+        | "expanded_mutation_after_payload_limit"
         | "compact_mutation_after_truncation"
         | "larger_token_cap_after_truncation";
       compacted_messages: number;

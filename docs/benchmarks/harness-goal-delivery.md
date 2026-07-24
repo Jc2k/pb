@@ -79,6 +79,48 @@ request.
   completion qualification should use a separately budgeted/model-qualified corpus rather than
   weakening mutation or completion gates.
 
-No unresolved P0-P2 pb defect remained in the final delivery path. The next useful work is broader
-corpus coverage for dotted paths and code-like punctuation; another identical live slug run would
-mostly remeasure the same model and is not required for this audit.
+## Output-budget and controller follow-up
+
+A later follow-up reran the original three-file grocery contract with an explicit 2,048-token cap
+per model turn. It compared preserved transcripts rather than treating every failed artifact as a
+pb defect.
+
+| Run | Outcome | Finding |
+| --- | --- | --- |
+| `/private/tmp/pb-grocery-default2048-20260724-38eSOE/` | interrupted after the hypothesis was answered | A suggested three-file `write_files` action genuinely exhausted all 2,048 tokens. The later single-file `app.js` call then hit the 3,712-character schema boundary after only 1,025 tokens, and the compact retry halved the payload room and repeated the same early stop. No rejected action mutated the workspace. |
+| `/private/tmp/pb-grocery-budget-fix-20260724-ye4bK0/` | interrupted on a new constrained-decoding defect | One-file control and the 7,424-character allowance worked for `index.html`, but FlashMoe spent a complete 2,048-token turn after the tool marker while decoding only structural whitespace. |
+| `/private/tmp/pb-grocery-constraint-fix-20260724-BKEk3Q/` | interrupted after repair routing evidence | Structural-whitespace progress worked; `app.js` completed in 1,220 tokens and a genuinely exhausted test-file action received the compact retry. A check then exposed a model-authored syntax error, but absolute `file://` diagnostics did not reopen the relative plan path and an escaped newline polluted the recovered retry target. |
+| `/private/tmp/pb-grocery-final-qual-20260724-v2/` | `Ready`, contract satisfied, verified completed | Every creation and repair was independently controller-bound. The largest action used 1,142 of 2,048 tokens, so no truncation retry was needed. Two model-authored test defects were caught and repaired, the authoritative Deno check passed 13 tests, fresh review accepted full controller observations, pb created commit `d507c86`, and an independent post-run test plus clean Git audit agreed with the journal. |
+
+The follow-up fixed four clear pb defects:
+
+- **P2 — false mutation-budget exhaustion.** Creation now advances one controller-bound path at a
+  time; the multi-file mutation route is gone. The portable payload estimate uses four characters
+  per remaining token. An exact or conservatively inferred early schema stop gets one larger-payload
+  retry at the same token ceiling, while real token exhaustion gets the smaller compact retry.
+- **P1 — constrained structural no-progress.** FlashMoe now caps consecutive structural whitespace
+  outside JSON strings and widens candidate sampling until a lower-ranked schema-progress token is
+  available. The rule is after the shared output head, so resident and streamed expert modes use the
+  same behavior.
+- **P2 — repair target recovery.** Literal escaped line endings no longer contaminate a truncated
+  native target. Diagnostic routing recognizes exact relative paths inside absolute paths and
+  `file://` URIs without accepting suffixes such as backup filenames.
+- **P2 — redundant post-create repair reads.** A successfully created file that later fails an
+  exact-path diagnostic now receives a controller-owned current-byte observation and goes directly
+  to target-bound repair. In the qualification binary, the two model-authored reads generated only
+  18 tokens each but consumed 1,399.8 seconds and 16.72 Wh of prefill, and the second was falsely
+  described as a repeated model call. The deterministic controller path removes both costs and the
+  misleading loop warning.
+
+The final workflow used 11 workflow model calls, 96,322 prompt tokens, 6,173 generated tokens, and
+101.34 Wh; the enclosing session reported 13 calls and 103,951 total tokens. Total wall time was
+9,167 seconds. This is strong positive evidence for the output-budget change but a separate FlashMoe
+performance limitation: cold resident prefill reached 16,582 tokens on a 177-token closure action,
+and valid control turns dominated latency and energy. Future performance work should budget and
+compact control-turn input independently of generated-token limits; it should not weaken mutation,
+check, review, or commit gates.
+
+No unresolved P0-P2 pb correctness defect remained in the qualified delivery path. The next useful
+work is broader corpus coverage for dotted paths and code-like punctuation plus a separately scoped
+resident-prefill optimization; another identical live grocery run would mostly remeasure the same
+model and is not required to validate the deterministic controller-read fix.

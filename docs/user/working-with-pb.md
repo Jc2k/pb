@@ -41,6 +41,12 @@ Build stages use the accepted plan and checkpoint for progress instead of exposi
 protocol. Independent tool calls can share one model response, while dependent same-path or
 mutation/check batches are rejected before any call runs.
 
+During implementation, pb exposes one accepted-plan file operation at a time and inserts that
+controller-owned target into the action before validation. Consecutive new files do not share one
+model output budget. If constrained generation reaches a file-payload boundary well before its token
+ceiling, pb retries once with more string room at the same token limit; real token exhaustion instead
+gets one smaller complete-file retry. Neither case writes a partial file.
+
 You may see pb pause for a planning question when a missing choice would materially change the
 work. Answering that question updates the user-owned contract; it does not hand the model a general
 permission to improvise.

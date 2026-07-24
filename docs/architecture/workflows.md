@@ -297,15 +297,20 @@ lower of that ceiling and the compiled workflow policy is cumulative across vali
 
 When a model response is truncated before producing a valid action, pb can retry with thinking
 disabled and, within the same global budget, use a larger output cap. A capped native `write_file`
-or `replace_file` also receives at most one compact atomic retry inside that same stage step. That
-retry exposes only the attempted mutation tool, starts from the original authoritative messages
-rather than carrying the rejected oversized payload, and requests a complete loadable payload
-below half of the ordinary mutation allowance. When the truncated call exposed its path, the retry
-schema binds that exact original target, and its generation-token ceiling is reduced to the smaller
-serialized payload allowance. The retry schema enforces those constraints rather than relying on
-the correction text alone; pb also rejects a parsed retry that changes the bound tool or path. A
-failed compact retry does not grow back to the original cap. These recovery mechanics help the
-model express an allowed action; they never expose a new capability or waive a transition gate.
+or `replace_file` also receives at most one target-bound atomic retry inside that same stage step.
+pb distinguishes a mutation-schema boundary from real output-token exhaustion: FlashMoe reports the
+exact constrained-decoding terminal state, while other backends may use the published schema size,
+serialized output, and unused token allowance as a conservative inference. A payload-bound retry
+doubles the string allowance while retaining the same token ceiling; a genuinely token-bound retry
+requests a complete payload below half of the ordinary allowance and reduces its token ceiling to
+match. Both expose only the attempted tool, start from the original authoritative messages rather
+than carrying the rejected payload, and bind any recovered target path. The retry schema enforces
+those constraints rather than relying on correction text, and pb rejects a parsed retry that changes
+the bound tool or path. These mechanics help the model express an allowed action; they never expose
+a new capability or waive a transition gate.
+FlashMoe also bounds structural whitespace after entering a native tool envelope. Its sampler widens
+past rejected whitespace candidates until it finds a schema-valid structural token, so a resident or
+streamed model cannot spend the whole output allowance without advancing the call.
 Retries consume model-invocation and generated-token budgets, but remain part of the same visible
 stage step. Stage-step accounting is checkpointed at the `StepStarted` boundary, so an action-only
 retry cannot prematurely terminalize a workflow while its result is still being recorded.
@@ -313,8 +318,8 @@ Equivalent max-token native actions are correlated by attempted tool name and th
 and evidence fingerprints. A merely parsed action does not erase that history before its outcome is
 known; a successful executed action clears it, while a real workspace or evidence transition also
 changes the signature. For a capped file write, the correction explicitly says that no partial file
-exists and requires materially shorter complete content. The third equivalent failure at unchanged
-state terminates without another model turn.
+exists and requires complete content. Two repeated payload-bound recovery failures at unchanged
+state terminate; other equivalent parse failures retain the general three-failure bound.
 
 Compatibility edit actions are model-turn boundaries. Implementation prompts tell the model to
 stop after the action and never imitate pb's transcript or invent later results. If a local model
@@ -345,11 +350,13 @@ Implementation guidance gives symmetric concrete actions for missing and existin
 paths use `write_file`; existing paths use a separate `read_file` turn followed by
 `replace_file`, `edit_file`, or `apply_patch`. An attempted overwrite keeps failing closed but now
 returns that exact recovery sequence instead of a generic suggestion.
-Strict implementation schemas also derive a conservative mutation-string `maxLength` from the
-turn's generated-token cap after reserving native-envelope and closing overhead. The same bound is
-enforced again by recursive executor-side schema validation and appears in the stage anchor and
-invocation telemetry. Larger files are built from complete, loadable, atomic work units rather than
-partial JSON or partial filesystem writes.
+Strict implementation schemas derive mutation-string `maxLength` from the turn's generated-token
+cap after reserving native-envelope and closing overhead. The portable estimate budgets four payload
+characters per remaining token, matching the observed constrained Qwen action ratio while the hard
+token ceiling remains the final bound for other tokenizers. The same string bound is enforced again
+by recursive executor-side schema validation and appears in the stage anchor and invocation
+telemetry. Larger files are built from complete, loadable, atomic work units rather than partial JSON
+or partial filesystem writes.
 After plan review, pb persists an ordered, typed work-unit ledger in the workflow checkpoint. Every
 planned create, modify, or delete records its plan step, operation, path, task/invocation/current
 fingerprints, adopted-work provenance, and structural state. Modify and delete units require a
@@ -362,11 +369,10 @@ forbidden-mutation contract has an initialized empty ledger.
 Implementation and repair expose only the active unit's operation. The target path is omitted from
 the model-required arguments and inserted by pb into the durable call immediately before schema,
 policy, scope, fingerprint, and executor validation. Tool schemas are therefore byte-stable across
-target paths. Consecutive independent create units may use `write_files`, a bounded one-to-four-file
-batch whose ordered paths come from the ledger. Every payload and destination validates before the
-first create; an execution failure rolls back already-created members. A complete transition
-advances the ledger after a normal turn or checkpoint resume, while an incomplete, stale, or
-out-of-order transition keeps the typed implementation terminal hidden.
+target paths. Creation also advances one controller-bound path at a time; it does not expose a
+multi-file mutation that could make unknown file sizes compete for one model-turn budget. A complete
+transition advances the ledger after a normal turn or checkpoint resume, while an incomplete, stale,
+or out-of-order transition keeps the typed implementation terminal hidden.
 An acceptance contract may attach a bounded advisory hint to an exact allowed path. pb repeats only
 the active mutation-ready unit's hint in the dynamic prompt suffix; the canonical tool schema stays
 unchanged. The hint cannot select or advance a unit, grant authority or evidence, or satisfy any
@@ -440,6 +446,12 @@ verdict. Optional completion fields on a successful final mutation remain model-
 deletion is intrinsic but limited to a unique tracked, clean, unchanged, bounded plan deletion with
 Git recovery. The accepted plan, active work unit, allowed path, current identity, and Git state are
 all revalidated first; an attached contract must explicitly require mutation.
+
+A successful planned create that later fails an exact-path diagnostic is now an existing repair
+target. For a bounded text file, the controller injects its current fingerprinted bytes and advances
+directly to target-bound repair instead of asking the model to repeat a deterministic `read_file`
+turn. The observation carries the same read-before-write evidence as a planned modification; it
+cannot reopen another path or observe a create before the file exists.
 
 Terminal output and the web transcript present actions as work by teammates: the active profile
 character owns a model-requested tool action, while Trinity owns automatic observation, closure,

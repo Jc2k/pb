@@ -228,6 +228,8 @@ pub struct ContextEvalMetrics {
     #[serde(default)]
     pub thinking_off_truncation_retries: usize,
     #[serde(default)]
+    pub expanded_mutation_payload_retries: usize,
+    #[serde(default)]
     pub compact_mutation_truncation_retries: usize,
     #[serde(default)]
     pub larger_cap_truncation_retries: usize,
@@ -3749,6 +3751,10 @@ fn summarize_context_metrics(events: &[AgentEvent]) -> ContextEvalMetrics {
             Some(crate::events::AgentRetryReason::ThinkingOffAfterTruncation) => {
                 summary.thinking_off_truncation_retries =
                     summary.thinking_off_truncation_retries.saturating_add(1);
+            }
+            Some(crate::events::AgentRetryReason::ExpandedMutationAfterPayloadLimit) => {
+                summary.expanded_mutation_payload_retries =
+                    summary.expanded_mutation_payload_retries.saturating_add(1);
             }
             Some(crate::events::AgentRetryReason::CompactMutationAfterTruncation) => {
                 summary.compact_mutation_truncation_retries = summary

@@ -10,6 +10,7 @@ use super::types::{ChatTool, NativeToolConstraintMode};
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 const CONSTRAINED_NO_REPEAT_NGRAM: usize = 32;
+const MAX_STRUCTURAL_WHITESPACE_BYTES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub(super) struct NativeToolConstraint {
@@ -319,11 +320,18 @@ impl NativeToolConstraint {
             }
             (NativeToolConstraintMode::ToolRequired, None) => {
                 let prefix = decoded.trim_start();
-                return !at_eos && TOOL_CALL_OPEN.starts_with(prefix);
+                return !at_eos
+                    && decoded.len().saturating_sub(prefix.len())
+                        <= MAX_STRUCTURAL_WHITESPACE_BYTES
+                    && TOOL_CALL_OPEN.starts_with(prefix);
             }
             (_, None) => return true,
             (_, Some(start)) => start,
         };
+
+        if !structural_whitespace_is_bounded(&decoded[start..]) {
+            return false;
+        }
 
         let mut remaining = &decoded[start..];
         loop {
@@ -425,6 +433,36 @@ impl NativeToolConstraint {
 
 fn candidate_advances_visible_output(prefix: &str, candidate: &str, is_eos: bool) -> bool {
     is_eos || candidate.len() > prefix.len()
+}
+
+fn structural_whitespace_is_bounded(input: &str) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut whitespace_bytes = 0usize;
+    for byte in input.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            whitespace_bytes = 0;
+        } else if byte.is_ascii_whitespace() {
+            whitespace_bytes = whitespace_bytes.saturating_add(1);
+            if whitespace_bytes > MAX_STRUCTURAL_WHITESPACE_BYTES {
+                return false;
+            }
+        } else {
+            whitespace_bytes = 0;
+        }
+    }
+    true
 }
 
 fn repeated_ngram_forbidden_tokens(tokens: &[u32], width: usize) -> BTreeSet<u32> {
@@ -1109,6 +1147,28 @@ mod tests {
         assert!(!candidate_advances_visible_output("call", "wall", false));
         assert!(candidate_advances_visible_output("call", "call>", false));
         assert!(candidate_advances_visible_output("call", "call", true));
+    }
+
+    #[test]
+    fn constrained_tool_structure_bounds_whitespace_without_limiting_string_payloads() {
+        let constraint =
+            NativeToolConstraint::compile(NativeToolConstraintMode::ToolRequired, &tools())
+                .unwrap()
+                .unwrap();
+        let allowed = "\n".repeat(MAX_STRUCTURAL_WHITESPACE_BYTES);
+        let rejected = "\n".repeat(MAX_STRUCTURAL_WHITESPACE_BYTES + 1);
+        assert!(constraint.output_prefix_is_valid(&allowed, false));
+        assert!(!constraint.output_prefix_is_valid(&rejected, false));
+        assert!(constraint.output_prefix_is_valid(&format!("{TOOL_CALL_OPEN}{allowed}"), false));
+        assert!(!constraint.output_prefix_is_valid(&format!("{TOOL_CALL_OPEN}{rejected}"), false));
+
+        let string_payload = " ".repeat(MAX_STRUCTURAL_WHITESPACE_BYTES * 4);
+        assert!(constraint.output_prefix_is_valid(
+            &format!(
+                "{TOOL_CALL_OPEN}{{\"name\":\"submit_review\",\"arguments\":{{\"verdict\":\"pass\",\"notes\":[\"{string_payload}\"]}}}}{TOOL_CALL_CLOSE}"
+            ),
+            true
+        ));
     }
 
     #[test]
