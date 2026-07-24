@@ -76,8 +76,10 @@ received and decides its actual changes, checks, documentation, review, and comm
 
 The high-level model output is deliberately small: `{"tasks":["first request","second request"]}`.
 Each string is the actual outcome text later passed into a fresh Build workflow. For multiple Tasks,
-the model must preserve every controller source clause verbatim in exactly one request; it may add
-only the context needed to make the boundary independently deliverable. pb retains the exact
+the model must preserve every controller source clause in exactly one request; it may add only the
+context needed to make the boundary independently deliverable. File extensions, function arguments,
+and comma-delimited behavior lists stay intact when pb finds those clauses, and insignificant
+whitespace beside punctuation does not defeat ownership matching. pb retains the exact
 original request and owns Task IDs, derived UI titles, dependencies, acceptance records, Build
 budgets, and authority. Both llama.cpp and FlashMoe constrain generation to this JSON schema and stop
 as soon as the complete value is decoded. Rust proves disjoint ownership and explicit `before`,

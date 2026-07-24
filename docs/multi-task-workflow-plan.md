@@ -6,8 +6,9 @@ Assessment: [2026-07-23 decomposition feasibility probe](benchmarks/multi-task-d
 
 The detailed proposal/review shapes below preserve the original design history. The shipped
 model-facing protocol is now only `{"tasks":["request one","request two"]}`. Each string is the
-request later given to one ordinary Build workflow; Rust recovers verbatim source-clause ownership
-and compiles the richer internal artifacts. There is no default model critic. One Task or bounded
+request later given to one ordinary Build workflow; Rust recovers source-clause ownership while
+preserving dotted paths and comma-delimited code/list syntax, then compiles the richer internal
+artifacts. There is no default model critic. One Task or bounded
 planning failure runs the exact original Build, while automatic Goal-shaped Tasks remain separately
 qualified.
 

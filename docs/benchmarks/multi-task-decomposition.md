@@ -17,7 +17,7 @@ request-list revision removes that accidental complexity:
 - every eligible Build now attempts a constrained partition by default on llama.cpp or FlashMoe;
 - the entire model artifact is `{"tasks":["first executable request","second executable request"]}`;
 - each string is the exact outcome request later fed to one normal Build workflow;
-- multi-Task proposals copy each controller source clause verbatim into exactly one string, while
+- multi-Task proposals preserve each controller source clause in exactly one string, while
   Rust recovers ownership and owns UI titles, requirements, sequential dependencies, acceptance
   records, budgets, and Build-only authority;
 - one Task, invalid output, or planning-budget exhaustion runs

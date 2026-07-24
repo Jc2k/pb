@@ -37,10 +37,11 @@ deterministic harness stages and do not run a model.
 selected local model for a compact high-level partition. This is separate from the existing Build
 `PlanArtifact`. Its complete model-facing artifact is `{"tasks":["request one","request two"]}`:
 an ordered list of self-contained requests that will later enter normal Build planning one at a
-time. The model copies every controller source clause verbatim into exactly one request and may add
-only boundary context. pb recovers exact clause ownership from that text, attaches request-wide
-constraints to every behavior-owning Task, derives the short UI title, creates the sequential
-dependency/commit chain, and assigns the bounded `small` budget. The model cannot author repository
+time. The model preserves every controller source clause in exactly one request and may add only
+boundary context. Sentence boundaries retain dotted paths and comma-delimited code or behavior
+lists; pb ignores only whitespace adjacent to punctuation while recovering clause ownership. It
+attaches request-wide constraints to every behavior-owning Task, derives the short UI title, creates
+the sequential dependency/commit chain, and assigns the bounded `small` budget. The model cannot author repository
 paths, IDs, dependencies, acceptance claims, effort, Goal authority, or numeric budgets.
 
 The proposal is token-constrained to a controller-owned JSON schema in llama.cpp and FlashMoe.
@@ -55,7 +56,7 @@ model critic in default routing and at most one planner revision for a determini
 
 If the constrained proposal contains one Task, pb discards it immediately and runs the exact
 original Build request. It does not summarize or project that generated request. Invocation,
-schema, parse, verbatim-coverage, ordering, and coordination-budget failures also fail soft to that
+schema, parse, source-coverage, ordering, and coordination-budget failures also fail soft to that
 same original Build after the bounded attempts. Cancellation remains terminal. The full local prompt, schema,
 raw constrained output, normalized artifact, typed failure, token/runtime counters, and final
 controller decision are persisted as an expandable Task-planning transcript. This evidence explains

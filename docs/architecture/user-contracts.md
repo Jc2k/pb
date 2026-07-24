@@ -36,7 +36,9 @@ The shipped Task controller applies the same authority rule before high-level de
 selection. Default Build partitioning uses constrained plain JSON in both supported inference
 engines. Its complete model-facing contract is an ordered `tasks` array of request strings. Each
 string is the outcome text later given to one normal Build workflow. For a multi-Task result, every
-controller source clause must appear verbatim in exactly one string. Rust retains the original
+controller source clause must be preserved in exactly one string. Dotted paths and comma-delimited
+code/list syntax remain inside their sentence clause; ownership matching ignores only whitespace
+adjacent to punctuation. Rust retains the original
 objective, recovers exact single ownership, derives UI titles, creates IDs and sequential
 dependencies, assigns Build budgets, and keeps tests, documentation, review, and commits inside the
 normal Build workflow. Rust also enforces explicit `before`, `after`, and `then` order. Constrained

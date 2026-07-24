@@ -16,8 +16,8 @@ use super::{
     TaskPlannerQualification, TaskProposal, TaskRequirement, TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v14";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-request-list-v13";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v15";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-request-list-v14";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 512;
 const MAX_RETRY_FEEDBACK_CHARS: usize = 1_000;
@@ -103,10 +103,14 @@ impl TaskModelProposal {
             if task_request.is_empty() {
                 bail!("Task request text must not be empty");
             }
+            let comparable_request = clause_comparison_text(&task_request);
             let mut task_requirement_ids = constraint_requirement_ids.clone();
             let mut matched_sources = Vec::new();
             for (source_id, description, requirement_id) in &behavior_sources {
-                let occurrences = task_request.match_indices(description).count();
+                let comparable_description = clause_comparison_text(description);
+                let occurrences = comparable_request
+                    .match_indices(&comparable_description)
+                    .count();
                 if occurrences > 1 {
                     bail!(
                         "Task request repeats controller source clause '{description}' more than once"
@@ -124,7 +128,7 @@ impl TaskModelProposal {
             }
             if matched_sources.is_empty() {
                 bail!(
-                    "Each Task request in a multi-Task result must contain at least one controller source clause verbatim"
+                    "Each Task request in a multi-Task result must preserve at least one controller source clause"
                 );
             }
             if matched_sources.len() > MAX_BUILD_TASK_BEHAVIOR_CLAUSES {
@@ -711,7 +715,7 @@ fn source_clauses(objective: &str) -> Vec<String> {
 
 fn request_evidence_clauses(objective: &str) -> Vec<String> {
     let mut clauses = Vec::new();
-    for segment in objective.split(['.', ';', ',', '\n']) {
+    for segment in request_segments(objective) {
         for ordered in ordered_request_subclauses(segment.trim()) {
             let characters = ordered.chars().collect::<Vec<_>>();
             for chunk in characters.chunks(MAX_DESCRIPTION_CHARS) {
@@ -735,6 +739,65 @@ fn request_evidence_clauses(objective: &str) -> Vec<String> {
         );
     }
     clauses
+}
+
+fn request_segments(objective: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (index, character) in objective.char_indices() {
+        let remainder = &objective[index + character.len_utf8()..];
+        let boundary = match character {
+            '\n' | ';' => true,
+            '.' => remainder.chars().next().is_none_or(char::is_whitespace),
+            ',' => remainder
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("with "),
+            _ => false,
+        };
+        if !boundary {
+            continue;
+        }
+        let segment = objective[start..index].trim();
+        if !segment.is_empty() {
+            segments.push(segment);
+        }
+        start = index + character.len_utf8();
+    }
+    let segment = objective[start..].trim();
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    segments
+}
+
+fn clause_comparison_text(clause: &str) -> String {
+    let characters = clause.chars().collect::<Vec<_>>();
+    let mut comparable = String::with_capacity(clause.len());
+    for (index, character) in characters.iter().copied().enumerate() {
+        if !character.is_whitespace() {
+            comparable.push(character);
+            continue;
+        }
+        let previous = comparable.chars().next_back();
+        let next = characters[index + 1..]
+            .iter()
+            .copied()
+            .find(|candidate| !candidate.is_whitespace());
+        if previous.is_some_and(is_compact_clause_punctuation)
+            || next.is_some_and(is_compact_clause_punctuation)
+        {
+            continue;
+        }
+        if previous != Some(' ') {
+            comparable.push(' ');
+        }
+    }
+    comparable.trim().to_string()
+}
+
+fn is_compact_clause_punctuation(character: char) -> bool {
+    matches!(character, ',' | '(' | ')' | '[' | ']' | '{' | '}')
 }
 
 fn ordered_request_subclauses(segment: &str) -> Vec<String> {
@@ -767,7 +830,7 @@ fn explicit_source_order_pairs(objective: &str) -> Vec<(String, String)> {
         .map(|(index, text)| (text.as_str(), source_id(index)))
         .collect::<BTreeMap<_, _>>();
     let mut pairs = Vec::new();
-    for segment in objective.split(['.', ';', ',', '\n']) {
+    for segment in request_segments(objective) {
         let lower = segment.to_ascii_lowercase();
         for (separator, reverse) in [(" before ", false), (" after ", true), (" then ", false)] {
             let Some(index) = lower.find(separator) else {
@@ -1266,6 +1329,41 @@ mod compact_tests {
                 .tasks
                 .iter()
                 .all(|task| task.requirement_ids.contains(&constraint_id))
+        );
+    }
+
+    #[test]
+    fn request_clauses_preserve_dotted_paths_function_arguments_and_behavior_lists() {
+        let objective = "Build a grocery website in index.html and app.js. Users can add, toggle, and delete items. Export addItem(items,text), toggleItem(items,id), and removeItem(items,id) from app.js. Add app.test.mjs with tests.";
+
+        assert_eq!(
+            request_evidence_clauses(objective),
+            vec![
+                "Build a grocery website in index.html and app.js",
+                "Users can add, toggle, and delete items",
+                "Export addItem(items,text), toggleItem(items,id), and removeItem(items,id) from app.js",
+                "Add app.test.mjs with tests",
+            ]
+        );
+    }
+
+    #[test]
+    fn task_ownership_ignores_only_insignificant_whitespace_in_source_clauses() {
+        let objective = "Build a grocery website in index.html and app.js. Export addItem(items,text), toggleItem(items,id), and removeItem(items,id) from app.js. Add app.test.mjs with tests. Satisfy the supplied contract.";
+        let mut model = ScriptedModel::new([
+            r#"{"tasks":["Build a grocery website in index.html and app.js. Export addItem(items, text), toggleItem(items, id), and removeItem(items, id) from app.js.","Add app.test.mjs with tests. Satisfy the supplied contract."]}"#,
+        ]);
+
+        let TaskPlanningOutcome::Accepted(accepted) =
+            run(&mut model, objective, TaskSourceIntent::Build)
+        else {
+            panic!("dotted paths and formatted function arguments must retain Task ownership");
+        };
+        assert_eq!(accepted.plan.artifact.tasks.len(), 2);
+        assert_eq!(accepted.counters.planning_attempts, 1);
+        assert_ne!(
+            clause_comparison_text("add item"),
+            clause_comparison_text("additem")
         );
     }
 
