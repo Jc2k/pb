@@ -404,11 +404,9 @@ impl LlamaCppBackend {
         if let Some(schema) = json_schema {
             let schema = serde_json::to_string(schema)
                 .context("failed to serialize constrained-output JSON schema")?;
-            let grammar = llama_cpp_2::json_schema_to_grammar(&schema)
-                .context("failed to compile constrained-output JSON schema")?;
             samplers.push(
-                LlamaSampler::grammar(&self.model, &grammar, "root")
-                    .context("failed to initialize constrained-output grammar")?,
+                LlamaSampler::llguidance(&self.model, "json_schema", &schema)
+                    .context("failed to initialize constrained-output JSON guidance")?,
             );
         }
         samplers.extend([
