@@ -34,13 +34,14 @@ approval. Project configuration cannot activate a Goal or choose automatic conti
 The shipped Task controller applies the same authority rule before high-level decomposition.
 `.pb/tasks.toml` can narrow budgets but cannot grant authority or authorize automatic Goal
 selection. Default Build partitioning uses constrained plain JSON in both supported inference
-engines. Its model-facing contract contains only Task titles and controller-issued source-clause
-IDs. Rust retains the original objective, requires exact single ownership of every clause, creates
-IDs and sequential dependencies, assigns Build budgets, and keeps tests, documentation, review,
-and commits inside the normal Build workflow. Rust also enforces explicit `before`, `after`, and
-`then` order. The compact critic reports only ordering or independently deliverable-boundary
-concerns as advisory evidence; it cannot rewrite or veto a deterministically valid partition.
-Schema validity does not replace these deterministic checks.
+engines. Its complete model-facing contract is an ordered `tasks` array of request strings. Each
+string is the outcome text later given to one normal Build workflow. For a multi-Task result, every
+controller source clause must appear verbatim in exactly one string. Rust retains the original
+objective, recovers exact single ownership, derives UI titles, creates IDs and sequential
+dependencies, assigns Build budgets, and keeps tests, documentation, review, and commits inside the
+normal Build workflow. Rust also enforces explicit `before`, `after`, and `then` order. Constrained
+generation stops at the first complete JSON value; there is no additional model critic in default
+routing. Schema validity does not replace the deterministic ownership and ordering checks.
 
 A one-Task proposal is discarded, not projected: the exact original request enters the ordinary
 Build workflow. Invalid output gets one revision and then follows that same fail-soft path. Only two

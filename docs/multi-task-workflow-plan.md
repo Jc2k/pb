@@ -5,9 +5,11 @@ Status: design record; default Build partitioning, controller, transcripts, comp
 Assessment: [2026-07-23 decomposition feasibility probe](benchmarks/multi-task-decomposition.md)
 
 The detailed proposal/review shapes below preserve the original design history. The shipped
-model-facing protocol is now the compact `tasks[].{title,covers}` partition plus a two-code advisory
-critic; Rust compiles and gates the richer internal artifacts. One Task or bounded planning failure runs the exact
-original Build, while automatic Goal-shaped Tasks remain separately qualified.
+model-facing protocol is now only `{"tasks":["request one","request two"]}`. Each string is the
+request later given to one ordinary Build workflow; Rust recovers verbatim source-clause ownership
+and compiles the richer internal artifacts. There is no default model critic. One Task or bounded
+planning failure runs the exact original Build, while automatic Goal-shaped Tasks remain separately
+qualified.
 
 ## Decision summary
 
@@ -27,11 +29,11 @@ This is additive. Existing `PlanArtifact`, `PlanStep`, `WorkUnit`, `WorkflowRun`
 current meaning and spelling. The new feature adds only Task-plan/Task-queue types and a conditional
 multi-Task progress surface.
 
-Model-generated decomposition is advisory. The feasibility probe found useful 7B/14B graphs but no
-controller-safe one-shot plan: exact totals were false, dependency mistakes survived, Tasks were
-sometimes oversized, and 4B did not close an artifact. The controller must own numeric allocation,
-graph validation, state transitions, accounting, and Task activation. A fresh model critic may
-recommend revision but cannot waive those checks.
+Model-generated decomposition is advisory. The feasibility probe found useful boundaries but no
+reason to ask the model for controller-owned totals, graph structure, or budgets. The controller
+owns numeric allocation, source-clause coverage, sequential dependencies, state transitions,
+accounting, and Task activation. It may request one bounded planner revision after a deterministic
+rejection; no fresh model critic is part of default routing.
 
 Task count decides whether the new orchestration becomes visible:
 
@@ -60,11 +62,13 @@ Goal complete.
 
 ## Shipped implementation
 
-The controller, dispatch paths, persistence, recovery controls, events, and Tasks UI described by
-this record are shipped. The embedded qualification catalog is intentionally empty after the
-initial model trials failed the promotion contract. Consequently automatic high-level planning is
-not currently selected and ordinary Build/Goal behavior remains the visible default. The following
-existing engines execute a Task once a future exact model/template/protocol tuple is promoted:
+The controller, default Build partitioner, dispatch paths, persistence, recovery controls, events,
+and Tasks UI described by this record are shipped. Every eligible Build attempts the compact
+request-list partition on supported local inference. One Task or bounded failure unwraps to the
+exact ordinary Build experience; two or more accepted requests create the Tasks UI and sequential
+queue. The embedded Goal-promotion catalog remains intentionally empty, so explicit Goal mode is
+unchanged and automatic Task planning cannot amplify Build authority. The following existing
+engines execute each accepted Task:
 
 - `PlanArtifact.steps` are ordered plan facts inside one `WorkflowRun`.
 - `WorkUnitLedger` compiles those plan steps into one active path-bound mutation unit at a time.

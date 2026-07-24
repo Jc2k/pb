@@ -258,6 +258,10 @@ invalid rows before candidate selection and avoiding full-logit host readback. B
 streamed expert schedules converge on this output head. DeepSeek applies the same bitset over its
 existing full-logit Metal output. A low-ranked valid token remains reachable even when every normal
 frontier candidate is invalid, and incomplete terminal JSON is rejected rather than published.
+After a sampled token makes the root JSON value complete, the shared generation lifecycle stops
+immediately instead of waiting for model-selected EOS or the token cap. This applies identically to
+resident and streamed expert schedules; llama.cpp applies the same complete-value stop around its
+LLGuidance sampler.
 
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by

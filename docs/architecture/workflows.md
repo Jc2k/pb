@@ -35,27 +35,28 @@ deterministic harness stages and do not run a model.
 
 **Shipped and on by default for new Builds.** Before an eligible explicit Build starts, pb asks the
 selected local model for a compact high-level partition. This is separate from the existing Build
-`PlanArtifact`. The model-facing proposal contains only an ordered `tasks` array; each item has a
-short title and a `covers` array selected from controller-issued source-clause IDs. The model cannot
-author objectives, descriptions, repository paths, dependencies, acceptance claims, tests,
-documentation claims, effort, Goal authority, or numeric budgets. pb preserves the original
-objective, turns exact source clauses into requirements, requires each clause to be owned exactly
-once, creates the sequential dependency/commit chain, and assigns the bounded `small` budget.
+`PlanArtifact`. Its complete model-facing artifact is `{"tasks":["request one","request two"]}`:
+an ordered list of self-contained requests that will later enter normal Build planning one at a
+time. The model copies every controller source clause verbatim into exactly one request and may add
+only boundary context. pb recovers exact clause ownership from that text, attaches request-wide
+constraints to every behavior-owning Task, derives the short UI title, creates the sequential
+dependency/commit chain, and assigns the bounded `small` budget. The model cannot author repository
+paths, IDs, dependencies, acceptance claims, effort, Goal authority, or numeric budgets.
 
-Proposal and criticism are token-constrained to controller-owned JSON schemas in llama.cpp and
-FlashMoe. FlashMoe builds the same LLGuidance grammar against its active Hugging Face or DeepSeek
-tokenizer. Unsupported tokenizer/schema pairs fail the optional partitioning preflight; neither
-backend substitutes prompt-only JSON. Structural validity is not treated as semantic quality. For
-partitions containing two or more Tasks, a fresh compact critic reports only reversed ordering or
-an independently undeliverable boundary. Its findings are preserved as advisory evidence because
-qualification showed false vetoes even after deterministic defects were removed. Rust owns source
-coverage, disjoint ownership, explicit `before`/`after`/`then` order, IDs, dependency construction,
-budgets, and authority. There is at most one planner revision for a deterministic rejection.
+The proposal is token-constrained to a controller-owned JSON schema in llama.cpp and FlashMoe.
+Both engines stop when the first complete schema-valid JSON value is decoded instead of waiting for
+the model to emit an end token. FlashMoe builds the same LLGuidance grammar against its active Hugging
+Face or DeepSeek tokenizer. Unsupported tokenizer/schema pairs fail the optional partitioning
+preflight; neither backend substitutes prompt-only JSON. The planner receives only the original
+request, its exact source-clause strings, and a bounded component/dependency outline rather than the
+full workspace graph. Rust owns source coverage, disjoint ownership, explicit
+`before`/`after`/`then` order, IDs, dependency construction, budgets, and authority. There is no
+model critic in default routing and at most one planner revision for a deterministic rejection.
 
 If the constrained proposal contains one Task, pb discards it immediately and runs the exact
-original Build request. It does not review, summarize, or project that Task. Invocation, schema,
-parse, coverage, critic, and coordination-budget failures also fail soft to that same original
-Build after the bounded attempts. Cancellation remains terminal. The full local prompt, schema,
+original Build request. It does not summarize or project that generated request. Invocation,
+schema, parse, verbatim-coverage, ordering, and coordination-budget failures also fail soft to that
+same original Build after the bounded attempts. Cancellation remains terminal. The full local prompt, schema,
 raw constrained output, normalized artifact, typed failure, token/runtime counters, and final
 controller decision are persisted as an expandable Task-planning transcript. This evidence explains
 fallbacks without exposing or requesting hidden chain-of-thought.

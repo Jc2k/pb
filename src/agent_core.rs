@@ -2371,12 +2371,29 @@ fn update_sha256_from_file(digest: &mut Sha256, path: &Path) -> Result<()> {
 }
 
 fn task_planning_repository_context(graph: &crate::workspace::WorkspaceGraph) -> Result<String> {
-    let serialized = serde_json::to_string(graph)?;
-    const MAX_CONTEXT_CHARS: usize = 24_000;
-    if serialized.chars().count() <= MAX_CONTEXT_CHARS {
-        return Ok(serialized);
+    const MAX_CONTEXT_CHARS: usize = 4_000;
+    let mut components = Vec::new();
+    for component in graph.components.values() {
+        components.push(serde_json::json!({
+            "id": component.id,
+            "root": component.root,
+            "depends_on": component.depends_on,
+        }));
+        let candidate = serde_json::json!({
+            "components": components.clone(),
+            "truncated": false,
+        });
+        if serde_json::to_string(&candidate)?.chars().count() > MAX_CONTEXT_CHARS {
+            components.pop();
+            break;
+        }
     }
-    Ok(serialized.chars().take(MAX_CONTEXT_CHARS).collect())
+    let truncated = components.len() < graph.components.len();
+    serde_json::to_string(&serde_json::json!({
+        "components": components,
+        "truncated": truncated,
+    }))
+    .context("failed to serialize Task-planning component outline")
 }
 
 fn single_task_request(
@@ -28318,6 +28335,22 @@ the next imagined action"#;
         assert!(!context.user_prompt.contains("Normalized workspace graph"));
         assert!(!context.user_prompt.contains(&oversized_command));
         assert!(context.user_prompt.chars().count() < 30_000);
+    }
+
+    #[test]
+    fn task_planning_context_is_only_a_bounded_component_outline() {
+        let graph = crate::workspace::WorkspaceGraph::legacy(&[format!(
+            "irrelevant-check {}",
+            "x".repeat(10_000)
+        )]);
+        let context = task_planning_repository_context(&graph).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&context).unwrap();
+
+        assert_eq!(value["components"][0]["id"], "repository");
+        assert_eq!(value["components"][0]["root"], ".");
+        assert!(value.get("checks").is_none());
+        assert!(!context.contains("irrelevant-check"));
+        assert!(context.chars().count() <= 4_000);
     }
 
     #[test]

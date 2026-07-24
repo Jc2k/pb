@@ -351,6 +351,13 @@ impl LlamaCppBackend {
                 .context("failed to decode generated token")?;
             n_cur += 1;
             generated_tokens += 1;
+            if json_schema.is_some()
+                && let Some(end) = complete_json_value_end(&output)
+            {
+                output.truncate(end);
+                finish_reason = FinishReason::EndOfGeneration;
+                break;
+            }
         }
 
         let energy =
@@ -691,6 +698,13 @@ impl LlamaCppChatSession<'_> {
             n_cur += 1;
             generated_tokens += 1;
             sample_index = batch.n_tokens() - 1;
+            if request.json_schema.is_some()
+                && let Some(end) = complete_json_value_end(&output)
+            {
+                output.truncate(end);
+                finish_reason = FinishReason::EndOfGeneration;
+                break;
+            }
         }
 
         let prompt_token_count = evaluated_tokens.len().saturating_sub(generated_tokens);
@@ -1071,6 +1085,12 @@ fn prune_session_cache(root: &Path, current: &Path, max_bytes: u64) -> Result<()
     Ok(())
 }
 
+fn complete_json_value_end(output: &str) -> Option<usize> {
+    let mut values = serde_json::Deserializer::from_str(output).into_iter::<Value>();
+    values.next()?.ok()?;
+    Some(values.byte_offset())
+}
+
 fn ensure_prompt_fits_context(prompt_tokens: usize, max_tokens: i32, n_ctx: u32) -> Result<()> {
     let n_ctx = usize::try_from(n_ctx).context("context size does not fit usize")?;
     let requested_generation_tokens = usize::try_from(max_tokens.max(0))
@@ -1177,6 +1197,16 @@ mod tests {
 
         assert!(err.contains("prompt is too long"), "error was: {err}");
         assert!(err.contains("--ctx-size"), "error was: {err}");
+    }
+
+    #[test]
+    fn structured_generation_detects_the_first_complete_json_value() {
+        assert_eq!(complete_json_value_end("{\"tasks\":[\"one\"]}"), Some(17));
+        assert_eq!(
+            complete_json_value_end("{\"tasks\":[\"one\"]}\nignored"),
+            Some(17)
+        );
+        assert_eq!(complete_json_value_end("{\"tasks\":[\"one\"]"), None);
     }
 
     #[test]

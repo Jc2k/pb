@@ -74,15 +74,15 @@ request is usefully divided into outcome-shaped **Tasks**. This sits above ordin
 after the previous Task commits, each Build Task starts a fresh normal plan against the repository it
 received and decides its actual changes, checks, documentation, review, and commit boundary.
 
-The high-level model output is deliberately small. It can return only Task titles and choose which
-controller-issued source-clause IDs each Task owns. pb retains the exact original request and owns
-Task IDs, descriptions, dependencies, acceptance records, Build budgets, and authority. Both
-llama.cpp and FlashMoe constrain every output token to this JSON schema; FlashMoe uses LLGuidance
-with the active model tokenizer. Rust proves disjoint ownership and explicit `before`, `after`, and
-`then` order. A compact fresh critic reports possible ordering or over-broad boundaries as advisory
-evidence; qualification showed that letting the small model veto an otherwise valid partition made
-routing less accurate. The critic cannot add requirements or implementation advice. There is at
-most one revision for a deterministic rejection.
+The high-level model output is deliberately small: `{"tasks":["first request","second request"]}`.
+Each string is the actual outcome text later passed into a fresh Build workflow. For multiple Tasks,
+the model must preserve every controller source clause verbatim in exactly one request; it may add
+only the context needed to make the boundary independently deliverable. pb retains the exact
+original request and owns Task IDs, derived UI titles, dependencies, acceptance records, Build
+budgets, and authority. Both llama.cpp and FlashMoe constrain generation to this JSON schema and stop
+as soon as the complete value is decoded. Rust proves disjoint ownership and explicit `before`,
+`after`, and `then` order. There is no extra model critic, and there is at most one revision for a
+deterministic rejection.
 
 The number of accepted Tasks determines the experience:
 

@@ -819,11 +819,19 @@ impl FlashMoeEngine {
                 } else {
                     false
                 };
+                let complete_json = if let Some(constraint) = json_constraint.as_mut() {
+                    constraint.has_complete_value()?
+                } else {
+                    false
+                };
                 generation.record_sampled_token(
                     token,
                     self.tokenizer.is_eos(token),
                     terminal_tool_call,
                 );
+                if complete_json {
+                    generation.stop_at_json_value();
+                }
             }
         }
         let prefill_or_ttft_wall = prefill_or_ttft_started.elapsed();
@@ -904,11 +912,19 @@ impl FlashMoeEngine {
                 } else {
                     false
                 };
+                let complete_json = if let Some(constraint) = json_constraint.as_mut() {
+                    constraint.has_complete_value()?
+                } else {
+                    false
+                };
                 generation.record_sampled_token(
                     token,
                     self.tokenizer.is_eos(token),
                     terminal_tool_call,
                 );
+                if complete_json {
+                    generation.stop_at_json_value();
+                }
             }
         }
         let decode_wall = decode_phase_started.elapsed();

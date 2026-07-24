@@ -359,8 +359,9 @@ initializes it as a new scratch root. A non-empty existing directory is treated 
 candidate and is rejected unless it contains the expected Git workspace, so unrelated contents
 are never adopted or overwritten.
 
-The optional `task-planning-transcript.json` preserves every compact planner/critic prompt, schema,
-raw and normalized artifact, typed failure, usage record, and final controller decision. The
+The optional `task-planning-transcript.json` preserves every compact planner prompt, schema, raw and
+normalized artifact, typed failure, usage record, and final controller decision. Historical
+transcripts can also contain the retired advisory-critic role. The
 optional `multi-task-checkpoint.json` mirrors the latest accepted multi-Task parent checkpoint
 for qualification and recovery inspection. It contains the accepted plan, controller-owned
 budgets, active child checkpoint, usage watermarks, repository boundary, and terminal reason. It is

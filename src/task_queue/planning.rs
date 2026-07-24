@@ -16,17 +16,17 @@ use super::{
     TaskPlannerQualification, TaskProposal, TaskRequirement, TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v13";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-partition-review-v12";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v14";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-request-list-v13";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
-const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 1_024;
-const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 512;
-const MAX_RETRY_FEEDBACK_CHARS: usize = 4_000;
+const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 512;
+const MAX_RETRY_FEEDBACK_CHARS: usize = 1_000;
 const MAX_PLANNING_FACTS: usize = 32;
-const MAX_TITLE_CHARS: usize = 256;
 // llama.cpp's grammar parser rejects bounded repetitions above 2,000. Keep the shared schema
 // comfortably below that backend limit so the same contract compiles in llama.cpp and FlashMoe.
 const MAX_DESCRIPTION_CHARS: usize = 1_024;
+const MAX_TASK_REQUEST_CHARS: usize = 1_024;
+const MAX_DERIVED_TITLE_CHARS: usize = 96;
 const MAX_BUILD_TASK_BEHAVIOR_CLAUSES: usize = 3;
 const MAX_TASK_PLANNING_ATTEMPTS: usize = 2;
 
@@ -49,43 +49,7 @@ pub struct TaskModelOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TaskModelProposal {
-    tasks: Vec<TaskModelTask>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct TaskModelTask {
-    title: String,
-    covers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum TaskModelReviewDecision {
-    Accept,
-    Revise,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct TaskModelReview {
-    decision: TaskModelReviewDecision,
-    issues: Vec<TaskModelReviewIssue>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct TaskModelReviewIssue {
-    code: TaskModelReviewIssueCode,
-    task_ids: Vec<String>,
-    source_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum TaskModelReviewIssueCode {
-    BadOrder,
-    TooBroad,
+    tasks: Vec<String>,
 }
 
 impl TaskModelProposal {
@@ -108,19 +72,20 @@ impl TaskModelProposal {
             .map(|requirement| (requirement.description.clone(), requirement.id.clone()))
             .collect::<BTreeMap<_, _>>();
         let behavior_evidence = behavior_evidence_clauses(objective);
-        let requirement_ids = behavior_evidence
+        let behavior_sources = behavior_evidence
             .iter()
             .enumerate()
             .map(|(index, description)| {
                 (
                     source_id(index),
+                    description.clone(),
                     requirement_ids_by_description
                         .get(description)
                         .expect("behavior evidence is a request clause")
                         .clone(),
                 )
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Vec<_>>();
         let behavior_set = behavior_evidence.into_iter().collect::<BTreeSet<_>>();
         let constraint_requirement_ids = requirements
             .iter()
@@ -132,40 +97,41 @@ impl TaskModelProposal {
         let mut acceptance = Vec::new();
         let mut tasks = Vec::with_capacity(self.tasks.len());
 
-        for (task_index, task) in self.tasks.into_iter().enumerate() {
+        for (task_index, task_request) in self.tasks.into_iter().enumerate() {
             let id = format!("task-{:02}", task_index + 1);
-            if task.covers.is_empty() {
-                bail!(
-                    "Task '{}' must cover at least one source clause",
-                    task.title
-                );
-            }
-            if task.covers.len() > MAX_BUILD_TASK_BEHAVIOR_CLAUSES {
-                bail!(
-                    "Task '{}' covers {} source clauses; maximum is {MAX_BUILD_TASK_BEHAVIOR_CLAUSES}",
-                    task.title,
-                    task.covers.len()
-                );
+            let task_request = task_request.trim().to_string();
+            if task_request.is_empty() {
+                bail!("Task request text must not be empty");
             }
             let mut task_requirement_ids = constraint_requirement_ids.clone();
-            let mut descriptions = Vec::with_capacity(task.covers.len());
-            for source_id in task.covers {
+            let mut matched_sources = Vec::new();
+            for (source_id, description, requirement_id) in &behavior_sources {
+                let occurrences = task_request.match_indices(description).count();
+                if occurrences > 1 {
+                    bail!(
+                        "Task request repeats controller source clause '{description}' more than once"
+                    );
+                }
+                if occurrences == 0 {
+                    continue;
+                }
                 if !covered.insert(source_id.clone()) {
-                    bail!("source clause '{source_id}' is assigned more than once");
+                    bail!("controller source clause '{description}' is assigned more than once");
                 }
                 source_task_positions.insert(source_id.clone(), task_index);
-                let requirement_id = requirement_ids.get(&source_id).with_context(|| {
-                    format!(
-                        "Task '{}' cites unknown source clause '{source_id}'",
-                        task.title
-                    )
-                })?;
                 task_requirement_ids.push(requirement_id.clone());
-                let requirement = requirements
-                    .iter()
-                    .find(|candidate| candidate.id == *requirement_id)
-                    .expect("controller requirement exists");
-                descriptions.push(requirement.description.clone());
+                matched_sources.push(description.clone());
+            }
+            if matched_sources.is_empty() {
+                bail!(
+                    "Each Task request in a multi-Task result must contain at least one controller source clause verbatim"
+                );
+            }
+            if matched_sources.len() > MAX_BUILD_TASK_BEHAVIOR_CLAUSES {
+                bail!(
+                    "Task request covers {} source clauses; maximum is {MAX_BUILD_TASK_BEHAVIOR_CLAUSES}",
+                    matched_sources.len()
+                );
             }
             let acceptance_id = format!("accept-{:03}", task_index + 1);
             let assigned_descriptions = task_requirement_ids
@@ -187,8 +153,8 @@ impl TaskModelProposal {
 
             tasks.push(TaskProposal {
                 id,
-                title: task.title,
-                description: descriptions.join(". "),
+                title: derive_task_title(&task_request),
+                description: task_request,
                 requirement_ids: task_requirement_ids,
                 depends_on: task_index
                     .checked_sub(1)
@@ -202,7 +168,10 @@ impl TaskModelProposal {
             });
         }
 
-        let expected = requirement_ids.keys().cloned().collect::<BTreeSet<_>>();
+        let expected = behavior_sources
+            .iter()
+            .map(|(source_id, _, _)| source_id.clone())
+            .collect::<BTreeSet<_>>();
         if covered != expected {
             let missing = expected.difference(&covered).cloned().collect::<Vec<_>>();
             bail!(
@@ -635,132 +604,13 @@ fn plan_tasks_inner(
                 },
             ));
         }
-        let remaining_tokens = budget
-            .generated_tokens
-            .saturating_sub(counters.generated_tokens);
-        let max_tokens = remaining_tokens.min(MAX_TASK_REVIEW_OUTPUT_TOKENS);
-        if max_tokens == 0
-            || counters.model_invocations >= budget.model_invocations
-            || counters.advisory_calls >= budget.advisory_calls
-        {
-            return accepted_task_plan(
-                input,
-                plan,
-                counters,
-                transcript,
-                "The deterministic partition was accepted without optional criticism",
-            );
-        }
-        let review_prompt = reviewer_prompt(input, &plan)?;
-        let review_schema = reviewer_schema(input, &plan);
-        let started = Instant::now();
-        let output = match model.generate(
-            TaskPlanningRole::Reviewer,
-            &review_prompt,
-            max_tokens,
-            &review_schema,
-        ) {
-            Ok(output) => output,
-            Err(error) => {
-                counters.model_invocations = counters.model_invocations.saturating_add(1);
-                counters.advisory_calls = counters.advisory_calls.saturating_add(1);
-                counters.elapsed_ms = counters
-                    .elapsed_ms
-                    .saturating_add(elapsed_ms(started.elapsed()));
-                let reason = format!("Task-plan review invocation failed: {error:#}");
-                failures.push(TaskPlanAttemptFailure {
-                    attempt,
-                    stage: TaskPlanningRole::Reviewer,
-                    reason: reason.clone(),
-                });
-                transcript.push(failed_transcript_entry(
-                    attempt,
-                    TaskPlanningRole::Reviewer,
-                    review_prompt,
-                    review_schema,
-                    reason.clone(),
-                    elapsed_ms(started.elapsed()),
-                ));
-                return accepted_task_plan(
-                    input,
-                    plan,
-                    counters,
-                    transcript,
-                    "The deterministic partition was accepted; optional criticism was unavailable",
-                );
-            }
-        };
-        counters.advisory_calls = counters.advisory_calls.saturating_add(1);
-        record_output(&mut counters, &output);
-        if !counters.fits_within(&budget) {
-            failures.push(TaskPlanAttemptFailure {
-                attempt,
-                stage: TaskPlanningRole::Reviewer,
-                reason: "Task-plan review exhausted the coordination budget".to_string(),
-            });
-            transcript.push(output_transcript_entry(
-                attempt,
-                TaskPlanningRole::Reviewer,
-                review_prompt,
-                review_schema,
-                &output,
-                None,
-                Some("Task-plan review exhausted the coordination budget".to_string()),
-            ));
-            return Ok(build_fallback_or_rejected(
-                input,
-                TaskPlanRejectionOutcome::BudgetExhausted,
-                TaskPlanningDecision::OneBuildBudgetFallback,
-                "Task criticism exhausted its coordination budget",
-                failures,
-                counters,
-                transcript,
-            ));
-        }
-        let model_review = match parse_json::<TaskModelReview>(&output.text)
-            .and_then(|review| validate_model_review(review, input, &plan))
-        {
-            Ok(review) => review,
-            Err(error) => {
-                let reason = format!("Task criticism rejected: {error:#}");
-                failures.push(TaskPlanAttemptFailure {
-                    attempt,
-                    stage: TaskPlanningRole::Reviewer,
-                    reason: reason.clone(),
-                });
-                transcript.push(output_transcript_entry(
-                    attempt,
-                    TaskPlanningRole::Reviewer,
-                    review_prompt,
-                    review_schema,
-                    &output,
-                    None,
-                    Some(reason.clone()),
-                ));
-                return accepted_task_plan(
-                    input,
-                    plan,
-                    counters,
-                    transcript,
-                    "The deterministic partition was accepted; optional criticism was invalid",
-                );
-            }
-        };
-        transcript.push(output_transcript_entry(
-            attempt,
-            TaskPlanningRole::Reviewer,
-            review_prompt,
-            review_schema,
-            &output,
-            Some(serde_json::to_value(&model_review)?),
-            None,
-        ));
-        let summary = if model_review.decision == TaskModelReviewDecision::Accept {
-            "The deterministic partition was accepted and optional criticism found no issue"
-        } else {
-            "The deterministic partition was accepted; model criticism is preserved as advisory evidence"
-        };
-        return accepted_task_plan(input, plan, counters, transcript, summary);
+        return accepted_task_plan(
+            input,
+            plan,
+            counters,
+            transcript,
+            "The ordered Task requests passed controller validation",
+        );
     }
 
     Ok(build_fallback_or_rejected(
@@ -832,67 +682,21 @@ fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str)
     };
     let sources = source_clauses(input.objective);
     format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nReturn only JSON matching the schema. Partition the Build request into an ordered queue of independently deliverable, independently committed Tasks for a smaller implementation model. A Task is an outcome boundary, not a list of files or edits; its normal Build workflow will plan exact changes after the previous Task commits. Use every source ID exactly once. Put foundations and migrations before consumers. Do not create separate test, documentation, review, integration, or cleanup Tasks. If the work is tightly coupled or one Task is sufficient, return exactly one Task; pb will then run the original Build unchanged. For a multi-Task partition, each Task may cover at most {MAX_BUILD_TASK_BEHAVIOR_CLAUSES} source clauses. Return no fields except tasks, title, and covers.\n\nAttempt: {attempt}\nOriginal Build request:\n{}\n\nController source clauses:\n{}\n\nBounded repository context:\n{}\n{retry}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nReturn only JSON matching the schema. tasks is an ordered list of requests that pb will execute and commit one at a time using the normal Build workflow. Each string must be an independently deliverable outcome for a smaller implementation model, not a list of files or edits. In a multi-Task result, copy every controller source clause verbatim into exactly one Task request; you may add only the context needed to make that request self-contained. Put foundations and migrations before consumers. Do not create separate test, documentation, review, integration, or cleanup Tasks because pb attaches request-wide constraints to the behavior-owning Tasks. If the work is tightly coupled or one Task is sufficient, return exactly one string; pb will then run the original Build unchanged. Each multi-Task request may contain at most {MAX_BUILD_TASK_BEHAVIOR_CLAUSES} source clauses.\n\nAttempt: {attempt}\nOriginal Build request:\n{}\n\nController source clauses to copy verbatim:\n{}\n\nRepository component outline:\n{}\n{retry}",
         input.objective,
         serde_json::to_string_pretty(&sources).expect("source clauses serialize"),
         input.repository_context
     )
 }
 
-fn reviewer_prompt(
-    input: &TaskPlanningInput<'_>,
-    plan: &ArtifactEnvelope<TaskPlanArtifact>,
-) -> Result<String> {
-    let sources = source_clauses(input.objective);
-    let tasks = plan
-        .artifact
-        .tasks
-        .iter()
-        .map(|task| {
-            json!({
-                "id": task.id,
-                "title": task.title,
-                "covers": task.requirement_ids.iter().filter_map(|requirement_id| {
-                    plan.artifact.requirements.iter().position(|requirement| {
-                        requirement.id == *requirement_id
-                    }).map(source_id)
-                }).collect::<Vec<_>>()
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nReturn only JSON matching the schema. Review this ordered Task partition, not the implementation details. Rust has already proven exact source coverage, disjoint ownership, sequential dependencies, budgets, and Build-only authority; do not re-audit or challenge those facts. Accept unless one of two semantic defects is present: bad_order (a prerequisite follows its consumer) or too_broad (a Task is not independently deliverable by a smaller model). A necessary foundation or migration is not an unnecessary Task. Use only the supplied Task IDs and source IDs. Do not invent missing requirements, files, tests, or implementation advice. decision=accept requires issues=[]; decision=revise requires at least one issue.\n\nOriginal Build request:\n{}\n\nController source clauses:\n{}\n\nOrdered partition:\n{}",
-        input.objective,
-        serde_json::to_string_pretty(&sources)?,
-        serde_json::to_string_pretty(&tasks)?
-    ))
-}
-
 fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
-    let source_ids = source_clauses(input.objective)
-        .into_iter()
-        .map(|source| source["id"].clone())
-        .collect::<Vec<_>>();
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
             "tasks": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "title": bounded_string(MAX_TITLE_CHARS),
-                        "covers": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": source_ids},
-                            "minItems": 1,
-                            "maxItems": MAX_PLANNING_FACTS
-                        }
-                    },
-                    "required": ["title", "covers"]
-                },
+                "items": bounded_string(MAX_TASK_REQUEST_CHARS),
                 "minItems": 1,
                 "maxItems": input.policy.aggregate.max_tasks
             }
@@ -901,61 +705,8 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
     })
 }
 
-fn reviewer_schema(
-    input: &TaskPlanningInput<'_>,
-    plan: &ArtifactEnvelope<TaskPlanArtifact>,
-) -> Value {
-    let task_ids = plan
-        .artifact
-        .tasks
-        .iter()
-        .map(|task| Value::String(task.id.clone()))
-        .collect::<Vec<_>>();
-    let source_ids = source_clauses(input.objective)
-        .into_iter()
-        .map(|source| source["id"].clone())
-        .collect::<Vec<_>>();
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "decision": {"type": "string", "enum": ["accept", "revise"]},
-            "issues": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "code": {"type": "string", "enum": ["bad_order", "too_broad"]},
-                        "task_ids": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": task_ids.clone()},
-                            "minItems": 1,
-                            "maxItems": plan.artifact.tasks.len()
-                        },
-                        "source_ids": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": source_ids},
-                            "minItems": 0,
-                            "maxItems": MAX_PLANNING_FACTS
-                        }
-                    },
-                    "required": ["code", "task_ids", "source_ids"]
-                },
-                "minItems": 0,
-                "maxItems": 8
-            }
-        },
-        "required": ["decision", "issues"]
-    })
-}
-
-fn source_clauses(objective: &str) -> Vec<Value> {
+fn source_clauses(objective: &str) -> Vec<String> {
     behavior_evidence_clauses(objective)
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| json!({"id": source_id(index), "text": text}))
-        .collect()
 }
 
 fn request_evidence_clauses(objective: &str) -> Vec<String> {
@@ -1045,51 +796,6 @@ fn explicit_source_order_pairs(objective: &str) -> Vec<(String, String)> {
     pairs
 }
 
-fn validate_model_review(
-    review: TaskModelReview,
-    input: &TaskPlanningInput<'_>,
-    plan: &ArtifactEnvelope<TaskPlanArtifact>,
-) -> Result<TaskModelReview> {
-    match review.decision {
-        TaskModelReviewDecision::Accept if !review.issues.is_empty() => {
-            bail!("an accepted Task partition cannot contain issues")
-        }
-        TaskModelReviewDecision::Revise if review.issues.is_empty() => {
-            bail!("a Task partition revision must identify an issue")
-        }
-        _ => {}
-    }
-    let allowed_tasks = plan
-        .artifact
-        .tasks
-        .iter()
-        .map(|task| task.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let allowed_sources = behavior_evidence_clauses(input.objective)
-        .iter()
-        .enumerate()
-        .map(|(index, _)| source_id(index))
-        .collect::<BTreeSet<_>>();
-    for issue in &review.issues {
-        if issue.task_ids.is_empty()
-            || issue
-                .task_ids
-                .iter()
-                .any(|task_id| !allowed_tasks.contains(task_id.as_str()))
-        {
-            bail!("Task criticism references an unknown or empty Task selection");
-        }
-        if issue
-            .source_ids
-            .iter()
-            .any(|source| !allowed_sources.contains(source))
-        {
-            bail!("Task criticism references an unknown source clause");
-        }
-    }
-    Ok(review)
-}
-
 fn controller_review(
     objective: &str,
     plan: &ArtifactEnvelope<TaskPlanArtifact>,
@@ -1129,7 +835,7 @@ fn controller_review(
                     "pb verified every controller source clause is assigned exactly once"
                 }
                 TaskPlanAuditCategory::TaskBoundaries => {
-                    "the partition passed controller size bounds; model criticism is diagnostic"
+                    "each Task request owns bounded source clauses and passed controller validation"
                 }
                 TaskPlanAuditCategory::DependencyOrder => {
                     "pb created the sequential dependency and commit order from the partition"
@@ -1159,6 +865,33 @@ fn controller_review(
 
 fn bounded_string(max_chars: usize) -> Value {
     json!({"type": "string", "minLength": 1, "maxLength": max_chars})
+}
+
+fn derive_task_title(request: &str) -> String {
+    let compact = request.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sentence = compact
+        .split_once(". ")
+        .map(|(first, _)| first)
+        .unwrap_or(compact.as_str())
+        .trim_end_matches(['.', ';', ':'])
+        .trim();
+    let mut title = sentence
+        .chars()
+        .take(MAX_DERIVED_TITLE_CHARS)
+        .collect::<String>();
+    if sentence.chars().count() > MAX_DERIVED_TITLE_CHARS {
+        title = title
+            .chars()
+            .take(MAX_DERIVED_TITLE_CHARS.saturating_sub(1))
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        title.push('…');
+    }
+    let Some(first) = title.chars().next() else {
+        return "Build Task".to_string();
+    };
+    first.to_uppercase().chain(title.chars().skip(1)).collect()
 }
 
 fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T> {
@@ -1404,9 +1137,8 @@ mod compact_tests {
     }
 
     #[test]
-    fn one_task_keeps_the_original_build_without_criticism() {
-        let mut model =
-            ScriptedModel::new([r#"{"tasks":[{"title":"One Build","covers":["source-001"]}]}"#]);
+    fn one_task_keeps_the_original_build() {
+        let mut model = ScriptedModel::new([r#"{"tasks":["Rewrite this request"]}"#]);
         let TaskPlanningOutcome::OneBuild(bypass) =
             run(&mut model, "Fix average", TaskSourceIntent::Build)
         else {
@@ -1421,10 +1153,9 @@ mod compact_tests {
     }
 
     #[test]
-    fn compact_multi_task_partition_compiles_controller_owned_artifacts() {
+    fn task_request_list_compiles_controller_owned_artifacts() {
         let mut model = ScriptedModel::new([
-            r#"{"tasks":[{"title":"Add storage","covers":["source-001"]},{"title":"Expose health","covers":["source-002"]}]}"#,
-            r#"{"decision":"accept","issues":[]}"#,
+            r#"{"tasks":["Add durable storage. Commit the storage foundation before API work.","Expose health using the committed storage."]}"#,
         ]);
         let TaskPlanningOutcome::Accepted(accepted) = run(
             &mut model,
@@ -1436,21 +1167,27 @@ mod compact_tests {
         assert_eq!(accepted.plan.artifact.tasks.len(), 2);
         assert_eq!(accepted.plan.artifact.tasks[0].kind, TaskKind::Build);
         assert_eq!(accepted.plan.artifact.tasks[1].depends_on, vec!["task-01"]);
+        assert_eq!(
+            accepted.plan.artifact.tasks[0].description,
+            "Add durable storage. Commit the storage foundation before API work."
+        );
+        assert_eq!(accepted.plan.artifact.tasks[0].title, "Add durable storage");
         assert_eq!(accepted.plan.artifact.acceptance.len(), 2);
         assert_eq!(
             accepted.review.artifact.verdict,
             TaskPlanReviewVerdict::Pass
         );
-        assert_eq!(accepted.transcript.attempts.len(), 2);
+        assert_eq!(accepted.counters.model_invocations, 1);
+        assert_eq!(accepted.counters.advisory_calls, 0);
+        assert_eq!(accepted.transcript.attempts.len(), 1);
         accepted.review.artifact.validate(&accepted.plan).unwrap();
     }
 
     #[test]
     fn duplicate_or_missing_source_ownership_gets_one_revision() {
         let mut model = ScriptedModel::new([
-            r#"{"tasks":[{"title":"First","covers":["source-001"]},{"title":"Duplicate","covers":["source-001"]}]}"#,
-            r#"{"tasks":[{"title":"First","covers":["source-001"]},{"title":"Second","covers":["source-002"]}]}"#,
-            r#"{"decision":"accept","issues":[]}"#,
+            r#"{"tasks":["Add storage","Repeat Add storage"]}"#,
+            r#"{"tasks":["Add storage","Expose health"]}"#,
         ]);
         let TaskPlanningOutcome::Accepted(accepted) = run(
             &mut model,
@@ -1460,16 +1197,13 @@ mod compact_tests {
             panic!("corrected partition must pass");
         };
         assert_eq!(accepted.counters.planning_attempts, 2);
-        assert_eq!(accepted.transcript.attempts.len(), 3);
+        assert_eq!(accepted.transcript.attempts.len(), 2);
         assert!(accepted.transcript.attempts[0].failure.is_some());
     }
 
     #[test]
     fn controller_attaches_decomposition_wide_constraints_to_each_task() {
-        let mut model = ScriptedModel::new([
-            r#"{"tasks":[{"title":"Storage","covers":["source-001"]},{"title":"Health","covers":["source-002"]}]}"#,
-            r#"{"decision":"accept","issues":[]}"#,
-        ]);
+        let mut model = ScriptedModel::new([r#"{"tasks":["Add storage","Expose health"]}"#]);
         let TaskPlanningOutcome::Accepted(accepted) = run(
             &mut model,
             "Add storage. Expose health. Each Task includes its applicable tests and documentation",
@@ -1512,8 +1246,7 @@ mod compact_tests {
         );
 
         let mut model = ScriptedModel::new([
-            r#"{"tasks":[{"title":"Storage and migration","covers":["source-001"]},{"title":"Compatible APIs","covers":["source-002"]}]}"#,
-            r#"{"decision":"accept","issues":[]}"#,
+            r#"{"tasks":["Add durable import lifecycle storage and a rollback-safe migration. Commit the foundation first.","exposing compatible status and cancel APIs using the committed storage."]}"#,
         ]);
         let TaskPlanningOutcome::Accepted(accepted) =
             run(&mut model, objective, TaskSourceIntent::Build)
@@ -1522,6 +1255,10 @@ mod compact_tests {
         };
         let constraint_id = accepted.plan.artifact.requirements[2].id.clone();
         assert_eq!(accepted.plan.artifact.tasks[1].depends_on, vec!["task-01"]);
+        assert_eq!(
+            accepted.plan.artifact.tasks[1].title,
+            "Exposing compatible status and cancel APIs using the committed storage"
+        );
         assert!(
             accepted
                 .plan
@@ -1533,12 +1270,8 @@ mod compact_tests {
     }
 
     #[test]
-    fn critic_findings_are_preserved_without_vetoing_a_valid_partition() {
-        let partition = r#"{"tasks":[{"title":"Consumer","covers":["source-002"]},{"title":"Foundation","covers":["source-001"]}]}"#;
-        let mut model = ScriptedModel::new([
-            partition,
-            r#"{"decision":"revise","issues":[{"code":"bad_order","task_ids":["task-01","task-02"],"source_ids":["source-001","source-002"]}]}"#,
-        ]);
+    fn valid_task_requests_do_not_invoke_a_model_critic() {
+        let mut model = ScriptedModel::new([r#"{"tasks":["Add storage","Expose health"]}"#]);
         let TaskPlanningOutcome::Accepted(accepted) = run(
             &mut model,
             "Add storage. Expose health",
@@ -1547,17 +1280,16 @@ mod compact_tests {
             panic!("valid deterministic partition must pass");
         };
         assert_eq!(accepted.counters.planning_attempts, 1);
-        assert_eq!(accepted.counters.advisory_calls, 1);
-        assert!(accepted.transcript.summary.contains("advisory evidence"));
-        assert_eq!(accepted.transcript.attempts.len(), 2);
+        assert_eq!(accepted.counters.advisory_calls, 0);
+        assert_eq!(accepted.transcript.attempts.len(), 1);
+        assert_eq!(model.calls, vec![TaskPlanningRole::Planner]);
     }
 
     #[test]
     fn explicit_before_order_is_a_deterministic_gate() {
         let mut model = ScriptedModel::new([
-            r#"{"tasks":[{"title":"API","covers":["source-002"]},{"title":"Storage","covers":["source-001"]}]}"#,
-            r#"{"tasks":[{"title":"Storage","covers":["source-001"]},{"title":"API","covers":["source-002"]}]}"#,
-            r#"{"decision":"accept","issues":[]}"#,
+            r#"{"tasks":["exposing the API","Add storage"]}"#,
+            r#"{"tasks":["Add storage","exposing the API"]}"#,
         ]);
         let TaskPlanningOutcome::Accepted(accepted) = run(
             &mut model,
@@ -1592,7 +1324,7 @@ mod compact_tests {
     }
 
     #[test]
-    fn compact_schemas_expose_only_partition_and_veto_fields() {
+    fn compact_schema_is_only_a_bounded_list_of_request_strings() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(TaskSourceIntent::Build);
         let input = TaskPlanningInput {
@@ -1606,12 +1338,10 @@ mod compact_tests {
         let schema = planner_schema(&input);
         crate::inference::flashmoe::validate_native_tool_schema(&schema).unwrap();
         crate::inference::flashmoe::validate_llguidance_json_schema(&schema).unwrap();
-        let properties = schema["properties"]["tasks"]["items"]["properties"]
-            .as_object()
-            .unwrap();
+        assert_eq!(schema["properties"]["tasks"]["items"]["type"], "string");
         assert_eq!(
-            properties.keys().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from(["covers".to_string(), "title".to_string()])
+            schema["properties"]["tasks"]["items"]["maxLength"],
+            MAX_TASK_REQUEST_CHARS
         );
     }
 

@@ -10,18 +10,23 @@ reserved until each Task activates.
 ## Shipped default-partition revision — 2026-07-24
 
 The original qualification gate made the feature a no-op because its embedded promotion catalog
-was empty. The shipped revision separates safe Build partitioning from authority promotion:
+was empty. The first default revision then proved that source-ID partitions were viable, but its
+planner/critic protocol still made a small model reproduce controller-owned structure. The shipped
+request-list revision removes that accidental complexity:
 
 - every eligible Build now attempts a constrained partition by default on llama.cpp or FlashMoe;
-- the model artifact is reduced to `tasks[].{title,covers}` over controller source IDs;
-- Rust owns requirements, descriptions, sequential dependencies, acceptance records, budgets, and
-  Build-only authority;
+- the entire model artifact is `{"tasks":["first executable request","second executable request"]}`;
+- each string is the exact outcome request later fed to one normal Build workflow;
+- multi-Task proposals copy each controller source clause verbatim into exactly one string, while
+  Rust recovers ownership and owns UI titles, requirements, sequential dependencies, acceptance
+  records, budgets, and Build-only authority;
 - one Task, invalid output, or planning-budget exhaustion runs
   the exact original Build unchanged after at most one revision;
 - cancellation still stops rather than starting work;
 - all constrained prompts, schemas, raw/normalized outputs, failures, usage, and routing decisions
-  are locally persisted and visible in session details; and
-- compact critic findings are preserved as advisory evidence rather than trusted as a veto; and
+  are locally persisted and visible in session details;
+- both inference engines stop at the first complete constrained JSON value, and default routing has
+  no second model critic call; and
 - a multi-Task parent reaches `Ready` only after a requirement-to-result completion audit matches
   the terminal repository.
 
@@ -39,26 +44,28 @@ same storage-before-API request. `--max-tokens 1` applied only after Task routin
 direct Build terminated quickly; the Task planner retained its controller cap. That downstream
 step-limit is an experiment control, not an implementation-quality result.
 
-| Engine / model | Calls / generated | Route | Audit |
+| Engine / model | Calls / generated tokens | Route | Audit |
 | --- | --- | --- | --- |
-| FlashMoe / Qwen3-Coder-Next 4-bit | 2 / 167 | two Build Tasks | Planner produced storage/migration before compatible APIs; Rust attached the per-behavior test/documentation constraint to both. The critic returned false `bad_order`/`too_broad` concerns, preserved as advisory evidence. |
-| llama.cpp / Qwen2.5-Coder 7B Q4_K_M | 2 / 81 | two Build Tasks | Same ordered partition and inherited constraint; critic accepted. Total model runtime was 2.7 seconds. |
-| llama.cpp / Qwen2.5-Coder 7B Q4_K_M | 1 / 34 | exact one-Build bypass | Trivial request produced one Task, no critic call or parent checkpoint, and entered ordinary Build Planning unchanged. |
+| llama.cpp / Qwen3 4B | 1 / 32 | two Build Tasks | Produced the storage/migration request followed by the compatible status/cancel API request in 0.789 seconds. The preceding object/critic protocol needed 3 calls, generated 2,560 tokens, took 25.151 seconds, and ended with trailing invalid JSON. |
+| llama.cpp / Qwen2.5-Coder 7B Q4_K_M | 1 / 32 | two Build Tasks | Produced the same ordered executable requests in 1.016 seconds. Rust recovered disjoint clause ownership and attached the shared constraint to both. |
+| FlashMoe / Qwen3-Coder-Next 4-bit | 1 / 32 | two Build Tasks | Produced the same requests in 8.215 seconds. The preceding protocol needed 2 calls, generated 167 tokens, and took 33.498 seconds. |
+| llama.cpp / Qwen3 4B | 1 / 20 | exact one-Build bypass | Trivial request produced one Task in 0.684 seconds, created no parent checkpoint, and entered ordinary Build Planning with the exact original request. The deliberately one-step downstream Build limit then ended the probe, as intended. |
 
 The preserved paths are:
 
-- `/private/tmp/pb-default-tasks-storage-api-v5-20260724/`
-- `/private/tmp/pb-default-tasks-llama7b-20260724/`
-- `/private/tmp/pb-default-tasks-one-build-llama7b-20260724/`
+- `/private/tmp/pb-task-request-list-qwen3-4b-final-20260724/`
+- `/private/tmp/pb-task-request-list-qwen25-7b-final-20260724/`
+- `/private/tmp/pb-task-request-list-flashmoe-final-20260724/`
+- `/private/tmp/pb-task-request-list-one-build-4b-final-20260724/`
 
-Earlier preserved v2-v4 runs exposed two pb control defects and one model limitation. Coarse source
-atomization made a test/documentation catch-all representable; deterministic ordering atomization
-and constraint attachment fixed it. FlashMoe's critic then repeatedly rejected the correct planner
-partition, so criticism became diagnostic instead of a veto. The planner itself produced the same
-corrected two-Task boundary in three consecutive post-atomization runs. This supports default
-Build-only use with exact fallback; it does not support automatic Goal promotion.
+The required release FlashMoe raw one-token smoke exited zero and returned `5` twice for `2+2=`.
+That is not a mathematically correct answer, but it matches the already-recorded upstream MLX-LM
+output for this exact Qwen3 checkpoint and therefore is not structured-generation drift. The Task
+planner probe exercises the changed constrained path directly and completed with one schema-valid
+32-token value. Together these results support default Build-only request partitioning with exact
+fallback; they do not support automatic Goal promotion.
 
-## Decision
+## Initial probe decision
 
 Model-assisted Task decomposition is viable only as a proposal-and-review stage. It is not
 reliable enough to let a model define executable task budgets or start child workflows directly.

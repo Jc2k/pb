@@ -170,6 +170,12 @@ impl FlashMoeGenerationState {
         self.stopped_by_terminal_tool_call
     }
 
+    pub(crate) fn stop_at_json_value(&mut self) {
+        self.stopped = true;
+        self.stopped_by_terminal_tool_call = false;
+        self.stopped_by_constraint_payload_limit = false;
+    }
+
     pub(crate) fn stop_at_constraint_payload_limit(&mut self) {
         self.stopped = true;
         self.stopped_by_terminal_tool_call = false;

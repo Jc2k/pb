@@ -155,6 +155,10 @@ impl JsonConstraintSession {
         &self.schema_sha256
     }
 
+    pub(super) fn has_complete_value(&mut self) -> Result<bool> {
+        Ok(self.matcher.is_stopped() || self.matcher.is_accepting()?)
+    }
+
     pub(super) fn terminal_state(&mut self) -> Result<&'static str> {
         if self.matcher.is_stopped() {
             Ok("complete_json")
@@ -211,6 +215,7 @@ mod tests {
         consume_text(&mut session, "100");
 
         assert_eq!(session.terminal_state().unwrap(), "accepting_json");
+        assert!(session.has_complete_value().unwrap());
     }
 
     #[test]

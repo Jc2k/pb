@@ -68,8 +68,8 @@ with the local session. The responsive Goal UI calls the same loopback daemon AP
 controls. Goal mode adds no cloud scheduler, hosted inference fallback, analytics edge, or automatic
 publication path.
 
-High-level Task planning and the multi-Task controller follow the same local path. Planner and critic
-inference use the selected local model; there is no hosted fallback or automatic model escalation.
+High-level Task planning and the multi-Task controller follow the same local path. Planner
+inference uses the selected local model; there is no hosted fallback or automatic model escalation.
 Every compact planning attempt also remains local: its prompt, JSON schema, raw constrained output,
 normalized artifact, typed failure, usage, and controller routing decision are stored in the
 containing session Git note. This is diagnostic model I/O, not hidden chain-of-thought. The accepted
