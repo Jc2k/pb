@@ -15,8 +15,8 @@ use super::{
     TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v11";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v10";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v12";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v11";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
 const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
@@ -31,6 +31,7 @@ const MAX_TITLE_CHARS: usize = 256;
 // llama.cpp's grammar parser rejects bounded repetitions above 2,000. Keep the shared schema
 // comfortably below that backend limit so the same contract compiles in llama.cpp and FlashMoe.
 const MAX_DESCRIPTION_CHARS: usize = 1_024;
+const MAX_BUILD_TASK_BEHAVIOR_CLAUSES: usize = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +88,25 @@ impl TaskModelProposal {
                 {
                     bail!(
                         "Task '{}' owns only decomposition constraints; tests, documentation, ordering, and final validation must stay with a behavior-owning Task",
+                        task.title
+                    );
+                }
+                let behavior_count = task
+                    .request_evidence
+                    .iter()
+                    .filter(|evidence| !is_decomposition_constraint(evidence))
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                if task.kind == TaskKind::Build && behavior_count > MAX_BUILD_TASK_BEHAVIOR_CLAUSES
+                {
+                    bail!(
+                        "Build Task '{}' owns {behavior_count} behavioral request clauses; maximum is {MAX_BUILD_TASK_BEHAVIOR_CLAUSES}",
+                        task.title
+                    );
+                }
+                if task.acceptance.len() < behavior_count || task.tests.len() < behavior_count {
+                    bail!(
+                        "Task '{}' needs at least one outcome acceptance fact and test fact for each of its {behavior_count} behavioral request clauses",
                         task.title
                     );
                 }
@@ -230,6 +250,7 @@ fn is_decomposition_constraint(evidence: &str) -> bool {
         || evidence.contains("each task")
         || evidence.contains("every task")
         || evidence.contains("tasks suitable for")
+        || evidence.contains("dependencies must")
 }
 
 fn behavior_evidence_clauses(objective: &str) -> Vec<String> {
@@ -608,7 +629,7 @@ fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str)
         )
     };
     format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Every Task must own concrete test work and documentation work or a concrete documentation-impact decision; standalone testing, documentation, validation, integration, or ordering Tasks are forbidden catch-alls. Never include an objective, IDs, references, dependencies, effort, or numeric budgets: pb owns them and makes the array a sequential queue. Array order is the dependency order and commit order: item 1 completes before item 2 can start. A later item cannot make an earlier consumer retroactively compatible, so put foundations and migrations before every service, API, or UI consumer that needs them.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Select each Task's request_evidence only from the controller behavioral choices, verbatim. pb automatically attaches every decomposition-wide constraint to every Task, so do not create a Task for testing, documentation, ordering, final validation, or smaller-model sizing. Assign every behavioral choice to at least one Task and never weaken words such as existing, compatible, rollback-safe, before, without, or must in the Task outcome. Each Task also contains observable outcome acceptance, owned tests, and owned documentation.\n\nBefore responding, silently audit the artifact: cover every controller behavioral request-evidence choice. Check every controller-owned decomposition constraint against the whole queue, including tests, documentation, ordering, rollback, explicit non-goals, and smaller-model sizing. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work. For every before/after clause, compare the two affected array positions and correct any reversed order.\n\nAttempt: {attempt}\nOriginal request:\n{}\n\nController behavioral request-evidence choices:\n{}\n\nController-owned decomposition constraints (automatically attached to every Task):\n{}\n\nBounded repository context:\n{}\n{retry}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. In a multi-Task queue, a build Task may own at most {MAX_BUILD_TASK_BEHAVIOR_CLAUSES} behavioral request-evidence choices and must provide at least one distinct outcome acceptance fact and test fact per owned choice. Every Task must own concrete documentation work or a concrete documentation-impact decision. Standalone testing, documentation, validation, integration, or ordering Tasks are forbidden catch-alls. Never include an objective, IDs, references, dependencies, effort, or numeric budgets: pb owns them and makes the array a sequential queue. Array order is the dependency order and commit order: item 1 completes before item 2 can start. A later item cannot make an earlier consumer retroactively compatible, so put foundations and migrations before every service, API, or UI consumer that needs them.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Select each Task's request_evidence only from the controller behavioral choices, verbatim. pb automatically attaches every decomposition-wide constraint to every Task, so do not create a Task for testing, documentation, ordering, final validation, or smaller-model sizing. Assign every behavioral choice to at least one Task and never weaken words such as existing, compatible, rollback-safe, before, without, or must in the Task outcome. Each Task also contains observable outcome acceptance, owned tests, and owned documentation.\n\nBefore responding, silently audit the artifact: cover every controller behavioral request-evidence choice. Check every controller-owned decomposition constraint against the whole queue, including tests, documentation, ordering, rollback, explicit non-goals, and smaller-model sizing. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work. For every before/after clause, compare the two affected array positions and correct any reversed order.\n\nAttempt: {attempt}\nOriginal request:\n{}\n\nController behavioral request-evidence choices:\n{}\n\nController-owned decomposition constraints (automatically attached to every Task):\n{}\n\nBounded repository context:\n{}\n{retry}",
         input.policy.aggregate.max_tasks,
         input.objective,
         serde_json::to_string_pretty(&behavior_evidence_clauses(input.objective))
@@ -838,7 +859,7 @@ fn reviewer_schema(
 
 fn request_evidence_clauses(objective: &str) -> Vec<String> {
     let mut clauses = Vec::new();
-    for segment in objective.split(['.', ';', '\n']) {
+    for segment in objective.split(['.', ';', ',', '\n']) {
         let characters = segment.trim().chars().collect::<Vec<_>>();
         for chunk in characters.chunks(MAX_DESCRIPTION_CHARS) {
             let clause = chunk.iter().collect::<String>().trim().to_string();
@@ -1463,6 +1484,58 @@ mod tests {
             plan.tasks
                 .iter()
                 .all(|task| task.requirement_ids == ["req-002", "req-001"])
+        );
+    }
+
+    #[test]
+    fn controller_splits_compound_clauses_and_bounds_build_task_ownership() {
+        let policy = TaskConfigDocument::default().compile().unwrap();
+        let objective = "Add a rollback-safe schema, migrate reads behind its boundary, preserve restart idempotency, and expose health.";
+        assert_eq!(
+            behavior_evidence_clauses(objective),
+            [
+                "Add a rollback-safe schema",
+                "migrate reads behind its boundary",
+                "preserve restart idempotency",
+                "and expose health"
+            ]
+        );
+        let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
+            "tasks": [
+                {
+                    "title": "Storage foundation",
+                    "description": "Deliver schema, boundary, and restart behavior",
+                    "request_evidence": [
+                        "Add a rollback-safe schema",
+                        "migrate reads behind its boundary",
+                        "preserve restart idempotency"
+                    ],
+                    "acceptance": ["Schema works", "Reads migrate", "Restart is safe"],
+                    "tests": ["Test schema", "Test reads", "Test restart"],
+                    "documentation": ["Document storage behavior"],
+                    "scope_hints": ["storage"],
+                    "kind": "build"
+                },
+                {
+                    "title": "Expose health",
+                    "description": "Expose health",
+                    "request_evidence": ["and expose health"],
+                    "acceptance": ["Health is visible"],
+                    "tests": ["Test health"],
+                    "documentation": ["Document health"],
+                    "scope_hints": ["operations"],
+                    "kind": "build"
+                }
+            ],
+            "risks": []
+        }))
+        .unwrap();
+        assert!(
+            model
+                .into_controller_proposal(&policy, objective)
+                .unwrap_err()
+                .to_string()
+                .contains("maximum is 2")
         );
     }
 

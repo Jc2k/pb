@@ -51,11 +51,13 @@ required fields, invalid enums, and structural array overflows are therefore mas
 rather than left to prompt compliance. This structural guarantee does not judge whether a
 decomposition is useful. A fresh critic reviews the compiled plan, while Rust rejects empty facts,
 missing coverage, invalid Goal contracts, unqualified automatic Goal selection, and aggregate
-overflow before any child starts. The model selects only behavioral request clauses. Rust attaches
-every decomposition-wide test, documentation, ordering, generic-validation, and smaller-model
-constraint to every behavior-owning Task. In a multi-Task proposal, Rust also rejects a Task that
-claims only those constraints. Planning has three attempts and its own invocation, token, advisory,
-and wall-time allowance.
+overflow before any child starts. The controller splits punctuation-delimited compound request
+clauses before presenting the exact behavioral choices. The model selects only those choices. Rust
+attaches every decomposition-wide test, documentation, ordering, generic-validation, and
+smaller-model constraint to every behavior-owning Task. In a multi-Task proposal, Rust also rejects
+a Task that claims only those constraints. A Build Task may own at most two behavioral clauses and
+must carry at least one outcome acceptance fact and test fact per owned clause. Planning has three
+attempts and its own invocation, token, advisory, and wall-time allowance.
 
 Before those aggregate audits, the critic must assess every controller-supplied source-request
 clause exactly once and identify the Tasks that preserve its meaning. Rust rejects missing,

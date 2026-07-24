@@ -79,12 +79,14 @@ and proposes the actual changes, checks, and commit boundary for that Task.
 The full selected local model artifact must exactly match pb's embedded
 model/backend/template/protocol qualification record; split GGUF qualifications bind every shard.
 pb constrains both the proposed plan and its fresh review to exact JSON
-schemas while each token is selected. The model orders Tasks and selects their behavioral
-requirements from verbatim request clauses supplied by pb. pb automatically attaches
+schemas while each token is selected. pb splits compound request sentences at punctuation
+boundaries; the model orders Tasks and selects their behavioral requirements from those verbatim
+request clauses. pb automatically attaches
 decomposition-wide constraints to every Task. Each Task separately states outcome acceptance, test
 work, and documentation work or impact. pb retains the original objective and assigns IDs,
 dependencies, qualitative effort, and budgets so summarization and bookkeeping mistakes cannot
-enter the queue. pb rejects a multi-Task queue entry that claims only decomposition constraints, so
+enter the queue. A Build Task in a multi-Task queue can own at most two behavioral clauses and needs
+an outcome acceptance fact and test fact for each. pb rejects a queue entry that claims only decomposition constraints, so
 testing, documentation, ordering, and generic final validation cannot become catch-all Tasks.
 Deterministic validation and review still decide whether the result is complete and useful. The
 embedded catalog is empty in this release, and `.pb/tasks.toml`

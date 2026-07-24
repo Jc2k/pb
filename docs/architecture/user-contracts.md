@@ -37,11 +37,13 @@ selection. Qualification is an embedded controller-owned record for the exact mo
 prompt template, artifact protocol, and structured-output contract. The planner and critic are
 token-constrained to exact controller schemas in both supported inference engines; schema validity
 does not replace deterministic coverage, graph, authority, or budget validation, nor the fresh
-semantic critique. The controller retains the verbatim objective and supplies the only behavioral
-request clauses a Task may claim; it automatically attaches decomposition-wide constraints to
-every Task. Each Task separately declares outcome acceptance, owned tests, and documentation work
-or impact. The critic must assess every supplied clause exactly once before its aggregate audits
-can pass. A multi-Task proposal cannot create a queue entry that owns only decomposition
+semantic critique. The controller retains the verbatim objective, splits compound clauses at
+punctuation boundaries, and supplies the only behavioral request clauses a Task may claim. It
+automatically attaches decomposition-wide constraints to every Task. Each Task separately declares
+outcome acceptance, owned tests, and documentation work or impact. In a multi-Task queue, a Build
+Task may own at most two behavioral clauses and must have an outcome acceptance fact and test fact
+for each. The critic must assess every supplied clause exactly once before its aggregate audits can
+pass. A multi-Task proposal cannot create a queue entry that owns only decomposition
 constraints; tests, documentation, ordering, and final validation remain with a behavior-owning
 Task. An unqualified model stays on the ordinary Build path. A
 qualified one-Task result unwraps into the same Build or Goal experience; only two or more Tasks
