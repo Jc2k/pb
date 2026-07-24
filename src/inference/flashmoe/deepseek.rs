@@ -6,7 +6,7 @@
 //! stores and a load-time graph manifest; it never makes fallback decisions by
 //! inspecting the source model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -527,6 +527,41 @@ impl DeepSeekV4Tokenizer {
 
     pub(crate) fn vocab_size(&self) -> usize {
         self.tokens.len()
+    }
+
+    pub(crate) fn constraint_token_bytes(&self) -> Result<Vec<Vec<u8>>> {
+        let special_ids = self
+            .special_tokens
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        self.tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| {
+                let id = u32::try_from(index).context("DeepSeek tokenizer token id exceeds u32")?;
+                if special_ids.contains(&id) {
+                    let mut bytes = Vec::with_capacity(token.len() + 1);
+                    bytes.push(llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER);
+                    bytes.extend_from_slice(token.as_bytes());
+                    return Ok(bytes);
+                }
+                if token.contains('｜') {
+                    return Ok(token.as_bytes().to_vec());
+                }
+                token
+                    .chars()
+                    .map(|character| {
+                        gpt2_codepoint_to_byte(character as u32).with_context(|| {
+                            format!(
+                                "DeepSeek tokenizer token {id} contains unmapped GPT-2 codepoint U+{:04X}",
+                                character as u32
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     fn encode_text_bytes(&self, text: &[u8], out: &mut Vec<u32>) -> Result<()> {
@@ -2105,6 +2140,34 @@ fn tensor_layer(name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joyai_constraint_bytes_preserve_byte_bpe_and_mark_special_tokens() {
+        let tokenizer = DeepSeekV4Tokenizer {
+            tokens: vec!["a".to_string(), "Ġ".to_string(), "<｜end｜>".to_string()],
+            token_to_id: BTreeMap::from([
+                ("a".to_string(), 0),
+                ("Ġ".to_string(), 1),
+                ("<｜end｜>".to_string(), 2),
+            ]),
+            merge_rank: BTreeMap::new(),
+            special_tokens: BTreeMap::from([("<｜end｜>".to_string(), 2)]),
+            eos_id: 2,
+        };
+
+        let bytes = tokenizer.constraint_token_bytes().unwrap();
+
+        assert_eq!(bytes[0], b"a");
+        assert_eq!(bytes[1], b" ");
+        assert_eq!(
+            bytes[2],
+            [
+                &[llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER],
+                "<｜end｜>".as_bytes(),
+            ]
+            .concat()
+        );
+    }
 
     fn value_u32(value: usize) -> GgufValue {
         GgufValue::Uint32(value as u32)

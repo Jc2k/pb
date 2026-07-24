@@ -1,5 +1,18 @@
 use super::*;
 
+fn validate_structured_constraint_request(request: &StructuredGenerationRequest) -> Result<()> {
+    if request.json_schema.is_some()
+        && (!request.tools.is_empty()
+            || request.tool_constraint_mode != NativeToolConstraintMode::Auto
+            || !request.terminal_tool_names.is_empty())
+    {
+        bail!(
+            "strict JSON schema generation cannot be combined with native tools or tool constraints"
+        );
+    }
+    Ok(())
+}
+
 impl FlashMoeEngine {
     pub fn set_metal_working_set_limit_bytes(&mut self, limit: usize) -> Result<()> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -107,6 +120,12 @@ impl FlashMoeEngine {
         &self,
         request: &StructuredGenerationRequest,
     ) -> Result<(String, Vec<u32>)> {
+        validate_structured_constraint_request(request)?;
+        if let Some(schema) = request.json_schema.as_ref() {
+            // Compile during preflight as well as generation so unsupported schemas
+            // fail before any model work or durable invocation accounting begins.
+            let _ = self.tokenizer.compile_json_constraint(schema)?;
+        }
         if !self.executor.is_deepseek_v4() {
             // Compile during preflight as well as generation so unsupported schema features
             // fail before any model work or durable invocation accounting begins.
@@ -397,6 +416,12 @@ impl FlashMoeEngine {
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let encode_elapsed = encode_started.elapsed();
         let deepseek_v4 = self.executor.is_deepseek_v4();
+        validate_structured_constraint_request(request)?;
+        let mut json_constraint = request
+            .json_schema
+            .as_ref()
+            .map(|schema| self.tokenizer.compile_json_constraint(schema))
+            .transpose()?;
         let mut tool_constraint = if deepseek_v4 {
             None
         } else {
@@ -756,6 +781,7 @@ impl FlashMoeEngine {
                     request.trace_candidates,
                     &progress,
                     tool_constraint.as_mut(),
+                    json_constraint.as_mut(),
                 )?
             };
             report_generation_progress(&progress, || {
@@ -841,6 +867,7 @@ impl FlashMoeEngine {
                     request.trace_candidates,
                     progress.clone(),
                     tool_constraint.as_mut(),
+                    json_constraint.as_mut(),
                 )?
             };
             let token = sampled.token;
@@ -939,6 +966,25 @@ impl FlashMoeEngine {
                     rejected_candidates: constraint.rejected_candidates(),
                     terminal_state: constraint.terminal_state(&decoded).to_string(),
                 });
+        let json_constraints = json_constraint
+            .as_mut()
+            .map(|constraint| -> Result<NativeJsonConstraintStats> {
+                Ok(NativeJsonConstraintStats {
+                    schema_sha256: constraint.schema_sha256().to_string(),
+                    terminal_state: constraint.terminal_state()?.to_string(),
+                })
+            })
+            .transpose()?;
+        if let Some(constraint) = json_constraints.as_ref() {
+            if constraint.terminal_state == "incomplete_json" {
+                bail!(
+                    "constrained JSON generation stopped before a complete artifact after {} tokens",
+                    generated.len()
+                );
+            }
+            let _: serde_json::Value = serde_json::from_str(&content)
+                .context("LLGuidance generation ended with invalid JSON")?;
+        }
         let performance = NativeGenerationStats {
             fresh_prefill_tokens: prompt_len.saturating_sub(prefill_start),
             cached_tokens: prefill_start,
@@ -1001,6 +1047,7 @@ impl FlashMoeEngine {
                 restore_ms: prompt_cache_restore_ms,
             },
             tool_constraints,
+            json_constraints,
             performance,
         };
         let total_wall = generation_started.elapsed();
@@ -1516,6 +1563,7 @@ impl FlashMoeEngine {
                 false,
                 &None,
                 None,
+                None,
             )?;
             if !self.tokenizer.is_eos(token) {
                 generated.push(token);
@@ -1534,6 +1582,7 @@ impl FlashMoeEngine {
                 MropePosition::text(runtime_inputs.next_mrope_position() + generated.len() - 1),
                 None,
                 false,
+                None,
                 None,
                 None,
             )?;
@@ -1563,6 +1612,7 @@ impl FlashMoeEngine {
                 restore_ms: 0,
             },
             tool_constraints: None,
+            json_constraints: None,
             performance: NativeGenerationStats {
                 fresh_prefill_tokens: runtime_inputs.prompt_tokens().len(),
                 cached_tokens: 0,
@@ -1639,6 +1689,7 @@ impl FlashMoeEngine {
         trace_candidates: bool,
         progress: GenerationProgress<'_>,
         tool_constraint: Option<&mut NativeToolConstraint>,
+        json_constraint: Option<&mut JsonConstraintSession>,
     ) -> Result<SampledDecode> {
         let previous = generated
             .last()
@@ -1670,6 +1721,7 @@ impl FlashMoeEngine {
             trace_candidates,
             &progress,
             tool_constraint,
+            json_constraint,
         )?;
         let elapsed = sample_started.elapsed();
         if let Some(mut token_timing) = token_timing {
@@ -1692,6 +1744,7 @@ impl FlashMoeEngine {
         trace_candidates: bool,
         progress: &GenerationProgress<'_>,
         tool_constraint: Option<&mut NativeToolConstraint>,
+        json_constraint: Option<&mut JsonConstraintSession>,
     ) -> Result<u32> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -1704,6 +1757,7 @@ impl FlashMoeEngine {
                     trace_candidates,
                     progress,
                     tool_constraint,
+                    json_constraint,
                 )
             });
         }
@@ -1716,6 +1770,7 @@ impl FlashMoeEngine {
             trace_candidates,
             progress,
             tool_constraint,
+            json_constraint,
         )
     }
 
@@ -1728,10 +1783,76 @@ impl FlashMoeEngine {
         trace_candidates: bool,
         progress: &GenerationProgress<'_>,
         mut tool_constraint: Option<&mut NativeToolConstraint>,
+        json_constraint: Option<&mut JsonConstraintSession>,
     ) -> Result<u32> {
         if let Some(constraint) = tool_constraint.as_deref_mut()
             && let Some(token) = constraint.forced_next_token(&self.tokenizer, generated)?
         {
+            return Ok(token);
+        }
+        if let Some(constraint) = json_constraint {
+            let allowed = constraint.allowed_tokens()?;
+            let mut candidates = if let Some(graph) = self.executor.deepseek_v4_graph() {
+                let mut logits = self.metal.deepseek_v4_logits(graph, hidden)?;
+                allowed.iter_unset_entries(|token| {
+                    logits[token] = f32::NEG_INFINITY;
+                });
+                let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+                trace_sampling_candidates(
+                    progress,
+                    &self.tokenizer,
+                    prompt_tokens.len(),
+                    generated,
+                    &candidates,
+                    trace_candidates.then_some((hidden, logits.as_slice())),
+                );
+                candidates
+            } else {
+                let vocab_size = self.tokenizer.vocab_size();
+                let top_k = sampler.candidate_limit().min(vocab_size).max(1);
+                let repeated = sampler.repeated_tokens(prompt_tokens, generated);
+                let repeated_vocab_tokens =
+                    repeated.iter().filter(|token| **token < vocab_size).count();
+                let raw_candidate_count = top_k
+                    .saturating_add(repeated_vocab_tokens)
+                    .min(vocab_size)
+                    .max(1);
+                let raw_candidates = self.dense.lm_head_raw_top_candidates_with_metal_masked(
+                    &self.metal,
+                    hidden,
+                    vocab_size,
+                    raw_candidate_count,
+                    allowed.as_slice(),
+                )?;
+                rerank_resident_lm_head_candidates(
+                    &raw_candidates,
+                    top_k,
+                    sampler.repeat_penalty,
+                    &repeated,
+                )
+            };
+            candidates.retain(|(token, score)| {
+                *token < allowed.len() && allowed.is_allowed(*token as u32) && score.is_finite()
+            });
+            sampler.truncate_for_sampling(&mut candidates);
+            if candidates.is_empty() {
+                bail!(
+                    "LLGuidance allowed tokens have no finite model logits at generated token {}",
+                    generated.len()
+                );
+            }
+            if self.executor.deepseek_v4_graph().is_none() {
+                trace_sampling_candidates(
+                    progress,
+                    &self.tokenizer,
+                    prompt_tokens.len(),
+                    generated,
+                    &candidates,
+                    None,
+                );
+            }
+            let token = sampler.sample_candidates(candidates)?;
+            constraint.commit(token)?;
             return Ok(token);
         }
         if let Some(graph) = self.executor.deepseek_v4_graph() {

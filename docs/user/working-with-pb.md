@@ -79,7 +79,11 @@ and proposes the actual changes, checks, and commit boundary for that Task.
 The full selected local model artifact must exactly match pb's embedded
 model/backend/template/protocol qualification record; split GGUF qualifications bind every shard.
 pb constrains both the proposed plan and its fresh review to exact JSON
-schemas while each token is selected. pb splits compound request sentences at punctuation
+schemas while each token is selected. Both inference engines return those artifacts as plain JSON;
+FlashMoe uses LLGuidance with the active Hugging Face or DeepSeek tokenizer rather than asking the
+model to wrap the artifact in a tool call. If that tokenizer or schema cannot be constrained, the
+artifact request fails before generation instead of accepting prompt-shaped JSON. This does not
+change the native action tools used inside an ordinary Build or Goal. pb splits compound request sentences at punctuation
 boundaries; the model orders Tasks and selects their behavioral requirements from those verbatim
 request clauses. pb automatically attaches
 decomposition-wide constraints to every Task. Each Task separately states outcome acceptance, test

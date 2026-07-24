@@ -2127,6 +2127,17 @@ fn arm_macos_resident_dense_mmap_batch_matches_cpu_reference() {
                 "{dtype} topK score {actual_score} != {expected_score}"
             );
         }
+        let masked_candidates = metal
+            .resident_top_candidates_masked(&projections[index], &input, 2, 1, &[0b10])
+            .unwrap();
+        assert_eq!(masked_candidates.len(), 1);
+        assert_eq!(masked_candidates[0].0, 1, "{dtype} ignored vocabulary mask");
+        assert!(
+            (masked_candidates[0].1 - expected[1]).abs() <= 1e-5,
+            "{dtype} masked topK score {} != {}",
+            masked_candidates[0].1,
+            expected[1]
+        );
     }
 }
 

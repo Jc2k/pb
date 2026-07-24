@@ -444,6 +444,11 @@ per-prefill deltas, allowing the scalar reference and promoted device-resident l
 be compared without inferring traffic from model geometry. `infer --no-thinking`
 asks a checkpoint's chat template to suppress emitted reasoning; it cannot be combined with
 `--raw`, which bypasses the chat template entirely.
+`infer --json-schema PATH` loads a JSON Schema before model generation, disables emitted reasoning,
+and exercises the production LLGuidance constraint session. It is text-only, cannot be combined
+with prefill parity, and fails closed if the active Hugging Face or DeepSeek tokenizer cannot
+compile the schema. This is the qualification surface for checking real-model structured output;
+it does not change production configuration.
 For Qwen prefill qualification, `infer --prefill-mode auto|scalar|layer-major` selects the promoted
 policy, exact scalar reference, or an explicit layer-major request. `auto` promotes only a prepared
 Qwen3-Coder-Next affine-Q4 graph with at least 32 fresh tokens and sufficient live Metal reserve.

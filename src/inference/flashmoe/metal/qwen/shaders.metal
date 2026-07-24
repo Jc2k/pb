@@ -1799,6 +1799,8 @@ kernel void topk_vocab(
     device float* values [[buffer(2)]],
     constant uint& vocab [[buffer(3)]],
     constant uint& top_k [[buffer(4)]],
+    device const uint* allowed_tokens [[buffer(5)]],
+    constant uint& use_allowed_tokens [[buffer(6)]],
     uint slot [[thread_position_in_grid]]) {
     if (slot != 0) { return; }
     uint limit = min(top_k, vocab);
@@ -1807,6 +1809,10 @@ kernel void topk_vocab(
         uint best_i = 0;
         bool found = false;
         for (uint i = 0; i < vocab; ++i) {
+            if (use_allowed_tokens != 0
+                && ((allowed_tokens[i >> 5] >> (i & 31)) & 1u) == 0) {
+                continue;
+            }
             float raw_value = logits[i];
             float value = isfinite(raw_value) ? raw_value : -INFINITY;
             bool already_used = false;

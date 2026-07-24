@@ -1524,6 +1524,27 @@ impl MetalExecutionContext {
         .execute(projection, input, output_rows, top_k)
     }
 
+    pub(crate) fn resident_top_candidates_masked(
+        &self,
+        projection: &ResidentMmapMatvecProjection,
+        input: &[f32],
+        output_rows: usize,
+        top_k: usize,
+        allowed_tokens: &[u32],
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        let dense_weights = self.dense_weights.as_ref().context(
+            "FlashMoe unsupported masked resident topK path: resident dense Metal weights are unavailable",
+        )?;
+        MetalResidentTopKBuilder::new(
+            self.runtime.device,
+            self.runtime.command_queue,
+            &self.runtime.pipelines,
+            dense_weights,
+            &self.buffers,
+        )
+        .execute_masked(projection, input, output_rows, top_k, allowed_tokens)
+    }
+
     pub(crate) fn resident_post_attention_prep_topk(
         &self,
         projections: &Cmd2ResidentPostAttentionPrepProjections,
@@ -2614,6 +2635,34 @@ impl<'a> MetalResidentTopKBuilder<'a> {
         output_rows: usize,
         top_k: usize,
     ) -> anyhow::Result<Vec<(usize, f32)>> {
+        self.execute_with_allowed_tokens(projection, input, output_rows, top_k, None)
+    }
+
+    pub(crate) fn execute_masked(
+        &self,
+        projection: &ResidentMmapMatvecProjection,
+        input: &[f32],
+        output_rows: usize,
+        top_k: usize,
+        allowed_tokens: &[u32],
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        self.execute_with_allowed_tokens(
+            projection,
+            input,
+            output_rows,
+            top_k,
+            Some(allowed_tokens),
+        )
+    }
+
+    fn execute_with_allowed_tokens(
+        &self,
+        projection: &ResidentMmapMatvecProjection,
+        input: &[f32],
+        output_rows: usize,
+        top_k: usize,
+        allowed_tokens: Option<&[u32]>,
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
         if output_rows == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
@@ -2628,7 +2677,16 @@ impl<'a> MetalResidentTopKBuilder<'a> {
         validate_resident_projection(projection, input.len(), self.dense_weights.len)?;
 
         let top_k = top_k.min(output_rows).max(1);
-        unsafe { self.encode_and_read(projection, input, output_rows, top_k) }
+        let required_mask_words = output_rows.div_ceil(32);
+        if let Some(allowed_tokens) = allowed_tokens
+            && allowed_tokens.len() < required_mask_words
+        {
+            anyhow::bail!(
+                "Metal resident topK token mask has {} words, expected at least {required_mask_words}",
+                allowed_tokens.len()
+            );
+        }
+        unsafe { self.encode_and_read(projection, input, output_rows, top_k, allowed_tokens) }
     }
 
     unsafe fn transient_buffer(
@@ -2657,9 +2715,10 @@ impl<'a> MetalResidentTopKBuilder<'a> {
         input: &[f32],
         rows: usize,
         top_k: usize,
+        allowed_tokens: Option<&[u32]>,
     ) -> anyhow::Result<Vec<(usize, f32)>> {
         unsafe {
-            let mut transient = Vec::with_capacity(4);
+            let mut transient = Vec::with_capacity(5);
             let input_buffer =
                 self.transient_buffer(std::mem::size_of_val(input), &mut transient)?;
             let input_contents = msg_send_ptr0(input_buffer, sel("contents"));
@@ -2674,6 +2733,17 @@ impl<'a> MetalResidentTopKBuilder<'a> {
                 self.transient_buffer(top_k * std::mem::size_of::<u32>(), &mut transient)?;
             let values_buffer =
                 self.transient_buffer(top_k * std::mem::size_of::<f32>(), &mut transient)?;
+            let use_allowed_tokens = u32::from(allowed_tokens.is_some());
+            let fallback_mask = [u32::MAX];
+            let allowed_tokens = allowed_tokens.unwrap_or(&fallback_mask);
+            let allowed_buffer =
+                self.transient_buffer(std::mem::size_of_val(allowed_tokens), &mut transient)?;
+            let allowed_contents = msg_send_ptr0(allowed_buffer, sel("contents"));
+            ptr::copy_nonoverlapping(
+                allowed_tokens.as_ptr().cast::<u8>(),
+                allowed_contents.cast::<u8>(),
+                std::mem::size_of_val(allowed_tokens),
+            );
 
             let constants = (|| -> anyhow::Result<_> {
                 Ok((
@@ -2688,7 +2758,6 @@ impl<'a> MetalResidentTopKBuilder<'a> {
                     return Err(error);
                 }
             };
-
             let mut encoding = match MetalCommandEncoding::new(
                 self.command_queue,
                 Arc::clone(self.buffers.resources()),
@@ -2724,6 +2793,8 @@ impl<'a> MetalResidentTopKBuilder<'a> {
             set_buffer(encoder, values_buffer, 2);
             set_bytes(encoder, u32_as_bytes(&rows_u32), 3);
             set_bytes(encoder, u32_as_bytes(&top_k_u32), 4);
+            set_buffer(encoder, allowed_buffer, 5);
+            set_bytes(encoder, u32_as_bytes(&use_allowed_tokens), 6);
             dispatch_threads(encoder, 1);
             encoding.end_encoding();
 

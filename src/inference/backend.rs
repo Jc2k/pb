@@ -189,6 +189,7 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
         let structured = crate::inference::flashmoe::StructuredGenerationRequest {
             messages: request.messages.clone(),
             tools: request.tools.clone(),
+            json_schema: None,
             add_generation_prompt: request.add_generation_prompt,
             enable_thinking: true,
             raw_prompt: false,
@@ -278,6 +279,7 @@ mod tests {
                 generated_tokens: 24,
                 prompt_cache: Default::default(),
                 tool_constraints: None,
+                json_constraints: None,
                 performance: Default::default(),
             },
             10,

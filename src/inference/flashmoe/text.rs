@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -8,6 +9,7 @@ use tokenizers::Tokenizer;
 
 use super::deepseek::DeepSeekV4Tokenizer;
 use super::generation_progress::{GenerationProgress, report_generation_progress};
+use super::json_constraints::{JsonConstraintFactory, JsonConstraintSession};
 use super::math::{compare_scored_tokens, softmax_in_place};
 use super::types::*;
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
@@ -80,6 +82,7 @@ fn vector_rms_max_finite(values: &[f32]) -> (f32, f32, bool) {
 #[derive(Debug, Clone)]
 pub(super) struct QwenTokenizer {
     tokenizer: TokenizerBackend,
+    json_constraints: std::result::Result<JsonConstraintFactory, Arc<str>>,
     config: QwenTokenizerConfig,
     eos_tokens: BTreeSet<u32>,
     primary_eos_token: u32,
@@ -154,12 +157,20 @@ impl QwenTokenizer {
             }
             let eos = tokenizer.eos_id();
             let vocab_size = tokenizer.vocab_size();
+            let json_constraints = tokenizer
+                .constraint_token_bytes()
+                .and_then(|token_bytes| {
+                    JsonConstraintFactory::from_token_bytes(token_bytes, &[eos])
+                })
+                .context("failed to prepare DeepSeek tokenizer for constrained JSON generation")
+                .map_err(|error| Arc::<str>::from(format!("{error:#}")));
             #[cfg(test)]
             let candidate_ids = (0..u32::try_from(vocab_size)
                 .context("DeepSeek tokenizer vocabulary exceeds u32")?)
                 .collect();
             return Ok(Self {
                 tokenizer: TokenizerBackend::DeepSeekV4(tokenizer),
+                json_constraints,
                 config: QwenTokenizerConfig::default(),
                 eos_tokens: BTreeSet::from([eos]),
                 primary_eos_token: eos,
@@ -243,7 +254,6 @@ impl QwenTokenizer {
         config_bytes: &[u8],
         external_chat_template: Option<&[u8]>,
     ) -> Result<Self> {
-        let _ = bytes;
         let config = QwenTokenizerConfig::from_bytes(config_bytes, external_chat_template)?;
         if config.split_special_tokens {
             bail!(
@@ -296,6 +306,24 @@ impl QwenTokenizer {
             .max()
             .unwrap_or(primary_eos_token) as usize;
         let vocab_size = max_id + 1;
+        let json_constraints = (|| -> Result<JsonConstraintFactory> {
+            let tokenizer_json: Value = serde_json::from_slice(bytes)
+                .context("tokenizer JSON is invalid for LLGuidance")?;
+            let token_bytes = llguidance::token_bytes_from_tokenizer_json(&tokenizer_json)
+                .context("failed to derive tokenizer bytes for constrained JSON generation")?;
+            if token_bytes.len() != vocab_size {
+                bail!(
+                    "LLGuidance tokenizer vocabulary has {} entries, expected {vocab_size}",
+                    token_bytes.len()
+                );
+            }
+            JsonConstraintFactory::from_token_bytes(
+                token_bytes,
+                &eos_tokens.iter().copied().collect::<Vec<_>>(),
+            )
+            .context("failed to prepare tokenizer for constrained JSON generation")
+        })()
+        .map_err(|error| Arc::<str>::from(format!("{error:#}")));
         #[cfg(test)]
         let candidate_ids = {
             let mut ids: Vec<u32> = vocabulary
@@ -312,6 +340,7 @@ impl QwenTokenizer {
         };
         Ok(Self {
             tokenizer: TokenizerBackend::HuggingFace(tokenizer),
+            json_constraints,
             config,
             eos_tokens,
             primary_eos_token,
@@ -479,6 +508,15 @@ impl QwenTokenizer {
 
     pub(super) fn eos_token_id(&self) -> u32 {
         self.primary_eos_token
+    }
+
+    pub(super) fn compile_json_constraint(&self, schema: &Value) -> Result<JsonConstraintSession> {
+        match &self.json_constraints {
+            Ok(factory) => factory.compile(schema),
+            Err(error) => {
+                bail!("constrained JSON generation is unavailable for this tokenizer: {error}")
+            }
+        }
     }
 
     /// Look up a token string and return its ID, or `None` if not present.

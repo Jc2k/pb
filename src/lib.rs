@@ -713,6 +713,10 @@ pub struct FlashMoeInferArgs {
     #[arg(long)]
     pub raw: bool,
 
+    /// Constrain text generation to the JSON Schema loaded from this file
+    #[arg(long, value_name = "PATH")]
+    pub json_schema: Option<PathBuf>,
+
     /// Select automatic Qwen prefill, the scalar reference, or forced layer-major qualification
     #[arg(long, value_enum, default_value_t = FlashMoePrefillModeArg::Auto)]
     pub prefill_mode: FlashMoePrefillModeArg,
@@ -2213,6 +2217,9 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     if args.prefill_parity && !args.images.is_empty() {
         bail!("--prefill-parity currently qualifies text Qwen inference only");
     }
+    if args.prefill_parity && args.json_schema.is_some() {
+        bail!("--prefill-parity cannot be combined with --json-schema");
+    }
     if let Some(prefix_tokens) = args.prefill_parity_prefix_tokens {
         if !args.raw {
             bail!("--prefill-parity-prefix-tokens requires --raw");
@@ -2238,6 +2245,20 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     if !args.images.is_empty() && (args.repeat != 1 || args.session_id.is_some()) {
         bail!("--repeat and --session-id currently support text FlashMoe inference only");
     }
+    if !args.images.is_empty() && args.json_schema.is_some() {
+        bail!("--json-schema currently qualifies text FlashMoe inference only");
+    }
+
+    let json_schema = args
+        .json_schema
+        .as_ref()
+        .map(|path| {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("failed to read JSON Schema {}", path.display()))?;
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .with_context(|| format!("failed to parse JSON Schema {}", path.display()))
+        })
+        .transpose()?;
 
     let user_config = UserConfig::load()?;
     let models_root = args
@@ -2342,7 +2363,8 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     let mut structured_request =
         inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
     structured_request.trace_candidates = args.trace_candidates;
-    structured_request.enable_thinking = !args.no_thinking;
+    structured_request.enable_thinking = !args.no_thinking && json_schema.is_none();
+    structured_request.json_schema = json_schema;
     structured_request.prefill_mode = args.prefill_mode.into();
     structured_request.prefill_state_summary = args.prefill_state_summary || prefill_parity;
     structured_request.prefill_chunk_tokens = args.prefill_chunk_tokens;
@@ -2807,6 +2829,7 @@ fn print_flashmoe_native_summary(
     let json = serde_json::to_string(&serde_json::json!({
         "generation": &output.performance,
         "tool_constraints": &output.tool_constraints,
+        "json_constraints": &output.json_constraints,
     }))
     .context("failed to encode native generation summary")?;
     match prompt {
@@ -4464,6 +4487,23 @@ mod tests {
         assert_eq!(infer.expert_storage, Some(FlashMoeExpertStorageArg::Bf16));
         assert_eq!(infer.images, vec![PathBuf::from("public/icon-192.png")]);
 
+        let constrained = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "infer",
+            "Return the object",
+            "--json-schema",
+            "schema.json",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Infer(constrained),
+        } = constrained.command
+        else {
+            panic!("expected harness infer command");
+        };
+        assert_eq!(constrained.json_schema, Some(PathBuf::from("schema.json")));
+
         let no_thinking =
             Cli::try_parse_from(["pb", "harness", "infer", "What is 2+2?", "--no-thinking"])
                 .unwrap();
@@ -4810,6 +4850,7 @@ mod tests {
                 generated_tokens: 1,
                 prompt_cache: Default::default(),
                 tool_constraints: None,
+                json_constraints: None,
                 performance: Default::default(),
             },
             timing: crate::inference::flashmoe::FlashMoeGenerationTiming {
@@ -4894,6 +4935,7 @@ mod tests {
                 generated_tokens: 3,
                 prompt_cache: Default::default(),
                 tool_constraints: None,
+                json_constraints: None,
                 performance: Default::default(),
             },
             timing: crate::inference::flashmoe::FlashMoeGenerationTiming {

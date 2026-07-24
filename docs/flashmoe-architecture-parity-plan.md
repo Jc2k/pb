@@ -248,6 +248,17 @@ The implementation contract and complete evidence are retained in the
 [device-resident graph plan](qwen3-coder-next-device-resident-prefill-plan.md) and
 [prefill qualification](benchmarks/qwen3-coder-next-prefill-qualification.md).
 
+Strict JSON artifact generation uses a tokenizer-scoped LLGuidance factory and a fresh
+request-scoped matcher. Hugging Face Qwen/GLM/VL tokenizers derive exact bytes from byte-level or
+byte-fallback tokenizer JSON; DeepSeek derives them from its pinned JoyAI GPT-2 byte-BPE cache and
+marks native special tokens explicitly. Schema and tokenizer failures stop during request preflight.
+The matcher produces a full-vocabulary allowed-token bitset before top-k and consumes every sampled
+token. Qwen-family sampling uploads that bitset to the resident Metal vocabulary kernel, excluding
+invalid rows before candidate selection and avoiding full-logit host readback. Both resident and
+streamed expert schedules converge on this output head. DeepSeek applies the same bitset over its
+existing full-logit Metal output. A low-ranked valid token remains reachable even when every normal
+frontier candidate is invalid, and incomplete terminal JSON is rejected rather than published.
+
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by
 the deterministic agent controller; executor capability and schema validation remain authoritative.
@@ -255,7 +266,8 @@ Qwen requests compile that subset during prompt preflight. Constrained sampling 
 LM-head frontier, validates decoded token prefixes against the native envelope and schema, and scans
 farther only when the normal frontier has no valid token. Diagnostics retain the mode, schema hash,
 rejected-candidate count, and terminal state without argument content. DeepSeek keeps its separate
-DSML parser and llama.cpp keeps its existing grammar behavior.
+DSML parser for ordinary tool actions; strict JSON artifacts use the shared LLGuidance contract.
+llama.cpp keeps its existing LLGuidance sampler integration.
 Constraint-valid non-EOS candidates must increase the visible decoded prefix. When an open
 `write_file` or `replace_file` string reaches its schema limit, generation stops before a synthetic
 close can turn a cut-off payload into an executable mutation. The agent controller sees the named,

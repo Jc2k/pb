@@ -266,6 +266,9 @@ pub enum NativePrefillMode {
 pub struct StructuredGenerationRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ChatTool>,
+    /// Optional strict JSON artifact schema. This is mutually exclusive with
+    /// native tool generation and is enforced token by token.
+    pub json_schema: Option<Value>,
     pub add_generation_prompt: bool,
     /// Whether the tokenizer chat template should permit emitted reasoning.
     /// Structured harness recovery turns disable this so their bounded budget
@@ -303,6 +306,7 @@ impl StructuredGenerationRequest {
         Self {
             messages: vec![ChatMessage::text(ChatRole::User, request.prompt.clone())],
             tools: Vec::new(),
+            json_schema: None,
             add_generation_prompt: true,
             enable_thinking: true,
             raw_prompt: false,
@@ -355,6 +359,7 @@ pub struct GenerationOutput {
     pub generated_tokens: usize,
     pub prompt_cache: PromptCacheStats,
     pub tool_constraints: Option<NativeToolConstraintStats>,
+    pub json_constraints: Option<NativeJsonConstraintStats>,
     pub performance: NativeGenerationStats,
 }
 
@@ -363,6 +368,12 @@ pub struct NativeToolConstraintStats {
     pub mode: NativeToolConstraintMode,
     pub schema_sha256: String,
     pub rejected_candidates: usize,
+    pub terminal_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeJsonConstraintStats {
+    pub schema_sha256: String,
     pub terminal_state: String,
 }
 

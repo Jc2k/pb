@@ -37,7 +37,11 @@ selection. Qualification is an embedded controller-owned record for the exact mo
 prompt template, artifact protocol, and structured-output contract. The planner and critic are
 token-constrained to exact controller schemas in both supported inference engines; schema validity
 does not replace deterministic coverage, graph, authority, or budget validation, nor the fresh
-semantic critique. The controller retains the verbatim objective, splits compound clauses at
+semantic critique. These artifacts are plain JSON in both engines. FlashMoe compiles LLGuidance
+against the active Hugging Face or DeepSeek tokenizer and fails the artifact request at preflight if
+that exact tokenizer/schema pair is unsupported; it does not substitute a synthetic tool call or
+prompt-only parsing. Native Build and Goal action tools retain their existing Qwen or DeepSeek wire
+protocols. The controller retains the verbatim objective, splits compound clauses at
 punctuation boundaries, and supplies the only behavioral request clauses a Task may claim. It
 automatically attaches decomposition-wide constraints to every Task. Each Task separately declares
 outcome acceptance, owned tests, and documentation work or impact. In a multi-Task queue, a Build

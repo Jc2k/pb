@@ -21,6 +21,7 @@ use super::deepseek_session::{
 };
 use super::experts::ExpertSlotStore;
 use super::generation_progress::{GenerationProgress, report_generation_progress};
+use super::json_constraints::JsonConstraintSession;
 use super::math::*;
 use super::metal::*;
 use super::model_family::{QwenModelConfig, QwenMoeFamily, QwenMoeModelLayout};
@@ -1008,6 +1009,31 @@ impl MetalExecutionFacade {
         {
             let _ = (projection, input, output_rows, top_k);
             bail!("FlashMoe unsupported resident topK path: Apple Silicon Metal is required")
+        }
+    }
+
+    pub(super) fn resident_top_candidates_masked(
+        &self,
+        projection: &ResidentMmapMatvecProjection,
+        input: &[f32],
+        output_rows: usize,
+        top_k: usize,
+        allowed_tokens: &[u32],
+    ) -> Result<Vec<(usize, f32)>> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.resident_top_candidates_masked(
+                projection,
+                input,
+                output_rows,
+                top_k,
+                allowed_tokens,
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (projection, input, output_rows, top_k, allowed_tokens);
+            bail!("FlashMoe unsupported masked resident topK path: Apple Silicon Metal is required")
         }
     }
 

@@ -1643,6 +1643,37 @@ impl DenseStore {
         metal.resident_top_candidates(&projection, hidden, vocab_size, candidate_count)
     }
 
+    pub(in crate::inference::flashmoe) fn lm_head_raw_top_candidates_with_metal_masked(
+        &self,
+        metal: &MetalExecutionFacade,
+        hidden: &[f32],
+        vocab_size: usize,
+        candidate_count: usize,
+        allowed_tokens: &[u32],
+    ) -> Result<Vec<(usize, f32)>> {
+        metal.require_resident_dense_weights()?;
+        let lm_head_name = self.lm_head_tensor_name()?;
+        let entry = self.registry.require(lm_head_name)?;
+        let (rows, cols) =
+            validate_lm_head_matvec_shape(entry, lm_head_name, vocab_size, hidden.len())?;
+
+        let candidate_count = candidate_count.min(vocab_size).max(1);
+        let projection = self
+            .resident_mmap_projection(lm_head_name, rows, cols)?
+            .with_context(|| {
+                format!(
+                    "FlashMoe unsupported resolved LM-head path: missing resident projection {lm_head_name}"
+                )
+            })?;
+        metal.resident_top_candidates_masked(
+            &projection,
+            hidden,
+            vocab_size,
+            candidate_count,
+            allowed_tokens,
+        )
+    }
+
     pub(in crate::inference::flashmoe) fn lm_head_logits(
         &self,
         lm_head_name: &str,

@@ -2624,6 +2624,13 @@ fn resident_topk_builder_rejects_invalid_bindings_before_encoding() {
         input_error.to_string().contains("input len 15"),
         "{input_error:#}"
     );
+    let mask_error = builder
+        .execute_masked(&projection, &[0.0; 16], 4, 2, &[])
+        .unwrap_err();
+    assert!(
+        mask_error.to_string().contains("expected at least 1"),
+        "{mask_error:#}"
+    );
 
     let mut unsupported_dtype = test_q4_projection("lm_head.weight", 4, 16);
     unsupported_dtype.scale_bias_dtype = "F16".to_string();

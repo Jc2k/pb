@@ -2039,6 +2039,7 @@ dependencies = [
  "indicatif",
  "libc",
  "llama-cpp-2",
+ "llguidance",
  "memmap2",
  "mime_guess",
  "minijinja",

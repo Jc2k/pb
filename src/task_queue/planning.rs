@@ -1698,6 +1698,7 @@ mod tests {
 
         for schema in [build_schema, goal_schema, review_schema] {
             crate::inference::flashmoe::validate_native_tool_schema(&schema).unwrap();
+            crate::inference::flashmoe::validate_llguidance_json_schema(&schema).unwrap();
             let schema = serde_json::to_string(&schema).unwrap();
             let grammar = llama_cpp_2::json_schema_to_grammar(&schema).unwrap();
             assert!(grammar.contains("root"));

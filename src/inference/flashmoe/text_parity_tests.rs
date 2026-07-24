@@ -917,6 +917,9 @@ fn qwen_tokenizer_uses_byte_level_bpe_from_tokenizer_json() {
         tokenizer.encode("<|im_start|>hello<|im_end|>").unwrap(),
         vec![100, 8, 101]
     );
+    tokenizer
+        .compile_json_constraint(&serde_json::json!({"type":"object"}))
+        .unwrap();
 }
 
 #[test]

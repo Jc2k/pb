@@ -43,12 +43,15 @@ dependencies, effort, or executable numeric budgets. pb assigns stable IDs, dedu
 facts, compiles array order into the sequential dependency chain, assigns Build Tasks the bounded
 small preset, and assigns Goal Tasks the largest preset that keeps the whole queue within its
 aggregate ceiling. The fresh effort/Goal audit can still reject a Task that is too broad for its
-controller-assigned allowance. Proposal and review
-generation are token-constrained to controller-owned JSON schemas:
-llama.cpp applies its tokenizer-aware LLGuidance JSON-schema sampler, while FlashMoe exposes one
-required terminal schema call through its native constraint parser. Unknown fields, missing
-required fields, invalid enums, and structural array overflows are therefore masked during sampling
-rather than left to prompt compliance. This structural guarantee does not judge whether a
+controller-assigned allowance. Proposal and review generation are token-constrained to
+controller-owned JSON schemas. llama.cpp uses its tokenizer-aware LLGuidance sampler. FlashMoe
+builds the same LLGuidance grammar contract directly from Hugging Face byte-level/byte-fallback
+tokenizer JSON or the native DeepSeek JoyAI byte-BPE table, and returns the artifact as plain JSON
+rather than disguising it as a required tool call. Unknown fields, missing required fields, invalid
+enums, numeric bounds, Unicode escapes, and structural array overflows are therefore masked during
+sampling rather than left to prompt compliance. A tokenizer or schema that cannot compile fails the
+structured request during preflight; ordinary Build and Goal tool generation remains available and
+never silently falls back to prompt-only JSON. This structural guarantee does not judge whether a
 decomposition is useful. A fresh critic reviews the compiled plan, while Rust rejects empty facts,
 missing coverage, invalid Goal contracts, unqualified automatic Goal selection, and aggregate
 overflow before any child starts. The controller splits punctuation-delimited compound request
@@ -518,6 +521,14 @@ than force-closing and executing a cut-off file. Escaped string prefixes are mea
 decoding, so schema `maxLength`
 remains authoritative. These guards only select output accepted by the compiled schema; the normal
 parser, capability checks, and executor validation still run afterward.
+
+Strict JSON artifacts use a separate tokenizer-neutral constraint session and cannot be combined with
+native tools in one request. FlashMoe computes the LLGuidance allowed-token set before top-k. On
+Qwen-family output heads, the bitset is uploaded to the resident Metal vocabulary kernel so invalid
+tokens are excluded before candidate selection and full vocabulary logits are not read back to the
+host. Resident and streamed experts share this output-head path. DeepSeek applies the same bitset to
+its existing full-logit Metal output. Every sampled token is committed back to LLGuidance, and pb
+rejects an incomplete or unparsable terminal artifact even if the model exhausts its token budget.
 
 Implementation and repair turns keep their edit tools after a rejected prose final. They are not
 narrowed to `submit_implementation` before the model has had another chance to make the repository

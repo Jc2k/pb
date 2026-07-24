@@ -13844,14 +13844,7 @@ impl CompletionEngine for FlashMoeCompletionEngine {
         enable_thinking: bool,
     ) -> Result<CompletionOutput> {
         let mut engine = self.runtime.lock()?;
-        generate_flashmoe_completion_with_required_tool(
-            &mut engine,
-            args,
-            messages,
-            std::slice::from_ref(schema),
-            enable_thinking,
-            Some(&schema.name),
-        )
+        generate_flashmoe_json_completion(&mut engine, args, messages, schema, enable_thinking)
     }
 
     fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
@@ -13913,14 +13906,7 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
         schema: &BuiltInToolSchema,
         enable_thinking: bool,
     ) -> Result<CompletionOutput> {
-        generate_flashmoe_completion_with_required_tool(
-            self.engine,
-            args,
-            messages,
-            std::slice::from_ref(schema),
-            enable_thinking,
-            Some(&schema.name),
-        )
+        generate_flashmoe_json_completion(self.engine, args, messages, schema, enable_thinking)
     }
 
     fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
@@ -13957,8 +13943,6 @@ fn generate_flashmoe_completion_with_required_tool(
     enable_thinking: bool,
     required_tool_name: Option<&str>,
 ) -> Result<CompletionOutput> {
-    let energy_start = energy::sample();
-    let started = Instant::now();
     let request = flashmoe_structured_request_with_required_tool(
         args,
         messages,
@@ -13966,7 +13950,53 @@ fn generate_flashmoe_completion_with_required_tool(
         enable_thinking,
         required_tool_name,
     )?;
-    let output = if engine.supports_session_snapshots() {
+    generate_flashmoe_completion_from_request(engine, args, request)
+}
+
+fn generate_flashmoe_json_completion(
+    engine: &mut crate::inference::flashmoe::FlashMoeEngine,
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    schema: &BuiltInToolSchema,
+    enable_thinking: bool,
+) -> Result<CompletionOutput> {
+    let request = flashmoe_json_request(args, messages, schema, enable_thinking)?;
+    generate_flashmoe_completion_from_request(engine, args, request)
+}
+
+fn flashmoe_json_request(
+    args: &AgentRequest,
+    messages: &[ChatMessage],
+    schema: &BuiltInToolSchema,
+    enable_thinking: bool,
+) -> Result<StructuredGenerationRequest> {
+    let schema_text = serde_json::to_string(&schema.input_schema)
+        .context("failed to serialize Task artifact schema for FlashMoe prompt")?;
+    let mut constrained_messages = messages.to_vec();
+    let schema_position = constrained_messages.len().saturating_sub(1);
+    constrained_messages.insert(
+        schema_position,
+        ChatMessage::text(
+            "system",
+            format!(
+                "Required output JSON Schema (the sampler enforces it token by token):\n{schema_text}"
+            ),
+        ),
+    );
+    let mut request =
+        flashmoe_structured_request(args, &constrained_messages, &[], enable_thinking)?;
+    request.json_schema = Some(schema.input_schema.clone());
+    Ok(request)
+}
+
+fn generate_flashmoe_completion_from_request(
+    engine: &mut crate::inference::flashmoe::FlashMoeEngine,
+    args: &AgentRequest,
+    request: StructuredGenerationRequest,
+) -> Result<CompletionOutput> {
+    let energy_start = energy::sample();
+    let started = Instant::now();
+    let output = if engine.supports_session_snapshots() && request.json_schema.is_none() {
         let session_id = flashmoe_generation_session_id(
             &args.session_id,
             args.workflow_stage,
@@ -13977,7 +14007,8 @@ fn generate_flashmoe_completion_with_required_tool(
         engine.generate_structured(&request)?
     };
     let performance = &output.performance;
-    let constraints = output.tool_constraints.as_ref();
+    let tool_constraints = output.tool_constraints.as_ref();
+    let json_constraints = output.json_constraints.as_ref();
     let native = crate::events::NativeGenerationUsage {
         fresh_prefill_tokens: performance.fresh_prefill_tokens,
         cached_tokens: performance.cached_tokens,
@@ -13994,10 +14025,17 @@ fn generate_flashmoe_completion_with_required_tool(
         expert_strategy: performance.expert_strategy.clone(),
         prefill_command_kind: performance.prefill_command_kind.clone(),
         thinking_enabled: performance.thinking_enabled,
-        tool_constraint_mode: constraints.map(|stats| stats.mode.as_str().to_string()),
-        tool_schema_sha256: constraints.map(|stats| stats.schema_sha256.clone()),
-        rejected_constraint_candidates: constraints.map_or(0, |stats| stats.rejected_candidates),
-        constraint_terminal_state: constraints.map(|stats| stats.terminal_state.clone()),
+        tool_constraint_mode: tool_constraints
+            .map(|stats| stats.mode.as_str().to_string())
+            .or_else(|| json_constraints.map(|_| "json_schema".to_string())),
+        tool_schema_sha256: tool_constraints
+            .map(|stats| stats.schema_sha256.clone())
+            .or_else(|| json_constraints.map(|stats| stats.schema_sha256.clone())),
+        rejected_constraint_candidates: tool_constraints
+            .map_or(0, |stats| stats.rejected_candidates),
+        constraint_terminal_state: tool_constraints
+            .map(|stats| stats.terminal_state.clone())
+            .or_else(|| json_constraints.map(|stats| stats.terminal_state.clone())),
     };
     let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
     Ok(CompletionOutput {
@@ -14102,6 +14140,7 @@ fn flashmoe_structured_request_with_required_tool(
     Ok(StructuredGenerationRequest {
         messages: to_model_messages(messages)?,
         tools: to_model_tools(tools),
+        json_schema: None,
         add_generation_prompt: true,
         enable_thinking,
         raw_prompt: false,
@@ -21741,6 +21780,34 @@ mod tests {
             terminal_request.terminal_tool_names,
             vec!["submit_plan_review"]
         );
+    }
+
+    #[test]
+    fn flashmoe_json_artifacts_use_schema_constraints_without_native_tools() {
+        let request = test_agent_request(AgentProfile::Plan, 512);
+        let messages = vec![ChatMessage::text("user", "decompose the request")];
+        let schema = BuiltInToolSchema {
+            name: "submit_task_plan".to_string(),
+            description: "Return the Task plan".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"tasks": {"type": "array"}},
+                "required": ["tasks"],
+                "additionalProperties": false
+            }),
+        };
+
+        let native = flashmoe_json_request(&request, &messages, &schema, false).unwrap();
+
+        assert!(native.tools.is_empty());
+        assert_eq!(
+            native.tool_constraint_mode,
+            crate::inference::flashmoe::NativeToolConstraintMode::Auto
+        );
+        assert!(native.terminal_tool_names.is_empty());
+        assert_eq!(native.json_schema, Some(schema.input_schema));
+        assert_eq!(native.messages.len(), messages.len() + 1);
+        assert!(format!("{:?}", native.messages[0]).contains("sampler enforces it token by token"));
     }
 
     #[test]
