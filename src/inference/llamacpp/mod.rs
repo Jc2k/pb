@@ -333,8 +333,7 @@ impl LlamaCppBackend {
         let mut finish_reason = FinishReason::MaxTokens;
 
         while generated_tokens < usize::try_from(max_tokens).unwrap_or(0) {
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
+            let token = sample_and_accept_token(&mut sampler, &ctx, batch.n_tokens() - 1);
             if self.model.is_eog_token(token) {
                 finish_reason = FinishReason::EndOfGeneration;
                 break;
@@ -498,8 +497,7 @@ impl LlamaCppBackend {
         let mut sample_index = -1;
 
         while generated_tokens < usize::try_from(request.max_tokens).unwrap_or(0) {
-            let token = sampler.sample(&ctx, sample_index);
-            sampler.accept(token);
+            let token = sample_and_accept_token(&mut sampler, &ctx, sample_index);
             if self.model.is_eog_token(token) {
                 finish_reason = FinishReason::EndOfGeneration;
                 break;
@@ -670,8 +668,7 @@ impl LlamaCppChatSession<'_> {
         };
 
         while generated_tokens < usize::try_from(request.max_tokens).unwrap_or(0) {
-            let token = sampler.sample(&cached.context, sample_index);
-            sampler.accept(token);
+            let token = sample_and_accept_token(&mut sampler, &cached.context, sample_index);
             if self.backend.model.is_eog_token(token) {
                 finish_reason = FinishReason::EndOfGeneration;
                 break;
@@ -948,6 +945,16 @@ fn find_multimodal_projector(model_path: &Path) -> Result<PathBuf> {
             model_path.display()
         )
     })
+}
+
+fn sample_and_accept_token(
+    sampler: &mut LlamaSampler,
+    context: &LlamaContext<'_>,
+    logits_index: i32,
+) -> LlamaToken {
+    // LlamaSampler::sample delegates to llama_sampler_sample, which both selects and accepts the
+    // token. Calling accept again corrupts stateful samplers such as grammars and penalties.
+    sampler.sample(context, logits_index)
 }
 
 fn prompt_batch_ranges(token_count: usize, batch_size: usize) -> Vec<Range<usize>> {
