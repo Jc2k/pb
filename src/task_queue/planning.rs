@@ -15,8 +15,8 @@ use super::{
     TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v8";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v7";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v9";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v8";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
 const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
@@ -51,7 +51,6 @@ pub struct TaskModelOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TaskModelProposal {
-    objective: String,
     tasks: Vec<TaskModelTask>,
     #[serde(default)]
     risks: Vec<TaskRisk>,
@@ -62,8 +61,10 @@ struct TaskModelProposal {
 struct TaskModelTask {
     title: String,
     description: String,
-    requirements: Vec<String>,
+    request_evidence: Vec<String>,
     acceptance: Vec<String>,
+    tests: Vec<String>,
+    documentation: Vec<String>,
     #[serde(default)]
     scope_hints: Vec<String>,
     kind: TaskKind,
@@ -72,9 +73,24 @@ struct TaskModelTask {
 }
 
 impl TaskModelProposal {
-    fn into_controller_proposal(self, policy: &CompiledTaskPolicy) -> TaskPlanProposal {
-        let mut requirements = Vec::new();
-        let mut requirement_ids = BTreeMap::<String, String>::new();
+    fn into_controller_proposal(
+        self,
+        policy: &CompiledTaskPolicy,
+        objective: &str,
+    ) -> Result<TaskPlanProposal> {
+        let request_evidence = request_evidence_clauses(objective);
+        let requirements = request_evidence
+            .iter()
+            .enumerate()
+            .map(|(index, description)| TaskRequirement {
+                id: format!("req-{:03}", index + 1),
+                description: description.clone(),
+            })
+            .collect::<Vec<_>>();
+        let requirement_ids = requirements
+            .iter()
+            .map(|requirement| (requirement.description.clone(), requirement.id.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut acceptance = Vec::new();
         let mut acceptance_ids = BTreeMap::<String, String>::new();
         let mut tasks = Vec::with_capacity(self.tasks.len());
@@ -83,27 +99,31 @@ impl TaskModelProposal {
             let id = format!("task-{:02}", task_index + 1);
             let mut task_requirement_ids = Vec::new();
             let mut seen_requirements = BTreeSet::new();
-            for description in task.requirements {
-                let description = description.trim().to_string();
-                let requirement_id = requirement_ids
-                    .entry(description.clone())
-                    .or_insert_with(|| {
-                        let requirement_id = format!("req-{:03}", requirements.len() + 1);
-                        requirements.push(TaskRequirement {
-                            id: requirement_id.clone(),
-                            description,
-                        });
-                        requirement_id
-                    })
-                    .clone();
+            for description in task.request_evidence {
+                let description = description.trim();
+                let requirement_id = requirement_ids.get(description).with_context(|| {
+                    format!(
+                        "Task '{}' cites request evidence not supplied by the controller",
+                        task.title
+                    )
+                })?;
                 if seen_requirements.insert(requirement_id.clone()) {
-                    task_requirement_ids.push(requirement_id);
+                    task_requirement_ids.push(requirement_id.clone());
                 }
             }
 
             let mut task_acceptance_ids = Vec::new();
             let mut seen_acceptance = BTreeSet::new();
-            for description in task.acceptance {
+            let acceptance_facts = task
+                .acceptance
+                .into_iter()
+                .chain(task.tests.into_iter().map(|fact| format!("Tests: {fact}")))
+                .chain(
+                    task.documentation
+                        .into_iter()
+                        .map(|fact| format!("Documentation: {fact}")),
+                );
+            for description in acceptance_facts {
                 let description = description.trim().to_string();
                 let acceptance_id = acceptance_ids
                     .entry(description.clone())
@@ -161,13 +181,13 @@ impl TaskModelProposal {
             };
         }
 
-        TaskPlanProposal {
-            objective: self.objective,
+        Ok(TaskPlanProposal {
+            objective: objective.to_string(),
             requirements,
             tasks,
             acceptance,
             risks: self.risks,
-        }
+        })
     }
 }
 
@@ -356,7 +376,7 @@ fn plan_tasks_inner(
             ));
         }
         let proposal = match parse_json::<TaskModelProposal>(&output.text)
-            .map(|proposal| proposal.into_controller_proposal(input.policy))
+            .and_then(|proposal| proposal.into_controller_proposal(input.policy, input.objective))
             .and_then(|proposal| {
                 proposal
                     .validate_and_compile(authority, input.policy)
@@ -533,8 +553,12 @@ fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str)
         )
     };
     format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Put tests and documentation in the Task that owns the behavior; never invent a final testing or documentation catch-all. Never include IDs, references, dependencies, effort, or numeric budgets: pb assigns them and makes the array a sequential queue. Array order is delivery and commit order, so place prerequisites before their consumers.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Each Task contains its own applicable requirement clauses and observable acceptance facts.\n\nBefore responding, silently audit the artifact: treat every clause of the request as a requirement, including compatibility, tests, documentation, ordering, rollback, and explicit non-goals; do not discard them as meta-instructions. Put every distinct requirement in each Task that owns it and give every Task at least one observable acceptance fact. When the request assigns tests or documentation to behavior-owning Tasks, state that ownership in each applicable Task and acceptance fact. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
-        input.policy.aggregate.max_tasks, input.objective, input.repository_context
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Every Task must own concrete test work and documentation work or a concrete documentation-impact decision; never invent a final testing or documentation catch-all. Never include an objective, IDs, references, dependencies, effort, or numeric budgets: pb owns them and makes the array a sequential queue. Array order is delivery and commit order, so place prerequisites before their consumers.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Select each Task's request_evidence only from the controller choices, verbatim. Assign every choice to at least one Task and never weaken words such as existing, compatible, rollback-safe, before, without, or must in the Task outcome. Each Task also contains observable outcome acceptance, owned tests, and owned documentation.\n\nBefore responding, silently audit the artifact: cover every controller request-evidence choice, including compatibility, tests, documentation, ordering, rollback, explicit non-goals, and decomposition constraints. When one choice governs several behavior-owning Tasks, assign it to each of them. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nOriginal request:\n{}\n\nController request evidence choices:\n{}\n\nBounded repository context:\n{}\n{retry}",
+        input.policy.aggregate.max_tasks,
+        input.objective,
+        serde_json::to_string_pretty(&request_evidence_clauses(input.objective))
+            .expect("request evidence serializes"),
+        input.repository_context
     )
 }
 
@@ -544,7 +568,7 @@ fn reviewer_prompt(
 ) -> Result<String> {
     let request_evidence = request_evidence_clauses(input.objective);
     Ok(format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic with authority bounded by the original request. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Independently compare every clause of the original request with the proposed queue. Complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, and explicit non-goals even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. Treat equivalent wording as coverage. Fail only for an omitted or contradicted request clause, an unobservable requested outcome, duplicated ownership, or a Task too broad to deliver independently. Every challenge must select request_evidence verbatim from the controller evidence list and ask for the minimum correction supported by that exact text. Do not claim the evidence says more than it does. Do not invent HTTP status codes, filenames, algorithms, integrity techniques, test names, documentation cross-links, failure modes, or other behavior absent from the request. Shared components do not imply overlap when Tasks own distinct outcomes. A pass means every audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nController request evidence choices:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic with authority bounded by the original request. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. First complete one request_assessment for every controller request-evidence choice exactly once. For each, cite the Tasks that preserve its exact meaning and fail contradictions such as new versus existing, breaking versus compatible, after versus before, or forward-only versus rollback-safe. Then complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, explicit non-goals, and decomposition constraints even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. Treat genuinely equivalent wording as coverage, but do not treat a related outcome as equivalent to an exact constraint. Fail only for an omitted or contradicted request clause, an unobservable requested outcome, duplicated ownership, or a Task too broad to deliver independently. Every challenge must select request_evidence verbatim from the controller evidence list and ask for the minimum correction supported by that exact text. Do not claim the evidence says more than it does. Do not invent HTTP status codes, filenames, algorithms, integrity techniques, test names, documentation cross-links, failure modes, or other behavior absent from the request. Shared components do not imply overlap when Tasks own distinct outcomes. A pass means every request assessment and audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed request assessment or audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nController request evidence choices:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
         input.objective,
         serde_json::to_string_pretty(&request_evidence)?,
         plan.sha256,
@@ -569,11 +593,27 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
             bounded_string(MAX_DESCRIPTION_CHARS),
         ),
         (
-            "requirements".to_string(),
-            bounded_nonempty_string_array(MAX_PLANNING_FACTS, MAX_DESCRIPTION_CHARS),
+            "request_evidence".to_string(),
+            json!({
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": request_evidence_clauses(input.objective)
+                },
+                "minItems": 1,
+                "maxItems": MAX_PLANNING_FACTS
+            }),
         ),
         (
             "acceptance".to_string(),
+            bounded_nonempty_string_array(MAX_PLANNING_FACTS, MAX_DESCRIPTION_CHARS),
+        ),
+        (
+            "tests".to_string(),
+            bounded_nonempty_string_array(MAX_PLANNING_FACTS, MAX_DESCRIPTION_CHARS),
+        ),
+        (
+            "documentation".to_string(),
             bounded_nonempty_string_array(MAX_PLANNING_FACTS, MAX_DESCRIPTION_CHARS),
         ),
         (
@@ -591,8 +631,10 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
     let mut required = vec![
         "title",
         "description",
-        "requirements",
+        "request_evidence",
         "acceptance",
+        "tests",
+        "documentation",
         "scope_hints",
         "kind",
     ];
@@ -608,7 +650,6 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "objective": bounded_string(MAX_DESCRIPTION_CHARS),
             "tasks": {
                 "type": "array",
                 "items": {
@@ -627,7 +668,7 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
                 MAX_RISKS
             )
         },
-        "required": ["objective", "tasks", "risks"]
+        "required": ["tasks", "risks"]
     })
 }
 
@@ -647,6 +688,30 @@ fn reviewer_schema(
         "properties": {
             "task_plan_sha256": {"type": "string", "enum": [plan.sha256.clone()]},
             "verdict": {"type": "string", "enum": ["pass", "revise"]},
+            "request_assessments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "request_evidence": {
+                            "type": "string",
+                            "enum": request_evidence_clauses(input.objective)
+                        },
+                        "verdict": {"type": "string", "enum": ["pass", "fail"]},
+                        "detail": bounded_string(MAX_DESCRIPTION_CHARS),
+                        "task_ids": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": task_ids.clone()},
+                            "minItems": 0,
+                            "maxItems": plan.artifact.tasks.len()
+                        }
+                    },
+                    "required": ["request_evidence", "verdict", "detail", "task_ids"]
+                },
+                "minItems": request_evidence_clauses(input.objective).len(),
+                "maxItems": request_evidence_clauses(input.objective).len()
+            },
             "audits": {
                 "type": "array",
                 "items": {
@@ -705,7 +770,7 @@ fn reviewer_schema(
                 "maxItems": MAX_REVIEW_CHALLENGES
             }
         },
-        "required": ["task_plan_sha256", "verdict", "audits", "challenges"]
+        "required": ["task_plan_sha256", "verdict", "request_assessments", "audits", "challenges"]
     })
 }
 
@@ -739,9 +804,21 @@ fn validate_review_request_evidence(
     review: &TaskPlanReviewArtifact,
     objective: &str,
 ) -> Result<()> {
-    let clauses = request_evidence_clauses(objective)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let clauses = request_evidence_clauses(objective);
+    let allowed = clauses.iter().cloned().collect::<BTreeSet<_>>();
+    let mut assessed = BTreeSet::new();
+    for assessment in &review.request_assessments {
+        if !allowed.contains(&assessment.request_evidence) {
+            bail!("Task-plan request assessment does not cite controller request evidence");
+        }
+        if !assessed.insert(assessment.request_evidence.clone()) {
+            bail!("Task-plan request assessment repeats controller request evidence");
+        }
+    }
+    if assessed != allowed {
+        bail!("Task-plan review must assess every controller request-evidence clause exactly once");
+    }
+    let clauses = clauses.into_iter().collect::<BTreeSet<_>>();
     for challenge in &review.challenges {
         if !clauses.contains(&challenge.request_evidence) {
             bail!(
@@ -939,12 +1016,13 @@ mod tests {
 
     fn proposal(label: &str) -> serde_json::Value {
         serde_json::json!({
-            "objective": "Fix average",
             "tasks": [{
                 "title": format!("Fix average {label}"),
                 "description": "Correct the divisor and add its regression test",
-                "requirements": ["Use the correct divisor"],
+                "request_evidence": ["Fix average"],
                 "acceptance": ["Regression test passes"],
+                "tests": ["Run the average regression test"],
+                "documentation": ["Record that no user-facing documentation changes are needed"],
                 "scope_hints": ["src"],
                 "kind": "build"
             }],
@@ -993,6 +1071,12 @@ mod tests {
         serde_json::json!({
             "task_plan_sha256": envelope.sha256,
             "verdict": verdict,
+            "request_assessments": [{
+                "request_evidence": "Fix average",
+                "verdict": if verdict == "revise" { "fail" } else { "pass" },
+                "detail": "The requested average correction is traced to task-01",
+                "task_ids": ["task-01"]
+            }],
             "audits": audits,
             "challenges": if verdict == "pass" { serde_json::json!([]) } else { serde_json::json!([{
                 "id": "c1",
@@ -1009,7 +1093,8 @@ mod tests {
     fn compiled(value: &serde_json::Value, policy: &CompiledTaskPolicy) -> TaskPlanArtifact {
         serde_json::from_value::<TaskModelProposal>(value.clone())
             .unwrap()
-            .into_controller_proposal(policy)
+            .into_controller_proposal(policy, "Fix average")
+            .unwrap()
             .validate_and_compile(
                 TaskPlanAuthority {
                     source_intent: TaskSourceIntent::Build,
@@ -1044,8 +1129,7 @@ mod tests {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(false);
         let invalid = serde_json::json!({
-            "objective": "Fix average",
-            "tasks": [{"title": "Fix", "description": "Fix", "requirements": [], "acceptance": ["Pass"], "scope_hints": [], "kind": "build"}],
+            "tasks": [{"title": "Fix", "description": "Fix", "request_evidence": [], "acceptance": ["Pass"], "tests": ["Run tests"], "documentation": ["Record documentation impact"], "scope_hints": [], "kind": "build"}],
             "risks": []
         });
         let valid = proposal("revised");
@@ -1151,21 +1235,24 @@ mod tests {
     fn controller_assigns_fact_ids_and_sequential_dependencies() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let value = serde_json::json!({
-            "objective": "Migrate storage before its API consumer",
             "tasks": [
                 {
                     "title": "Storage compatibility",
                     "description": "Deliver the compatibility boundary",
-                    "requirements": ["Preserve compatibility", "Add durable storage"],
+                    "request_evidence": ["Fix average"],
                     "acceptance": ["Storage compatibility tests pass"],
+                    "tests": ["Run storage compatibility tests"],
+                    "documentation": ["Document the storage compatibility boundary"],
                     "scope_hints": ["storage"],
                     "kind": "build"
                 },
                 {
                     "title": "API consumer",
                     "description": "Move API reads to the boundary",
-                    "requirements": ["Preserve compatibility", "Migrate API reads"],
+                    "request_evidence": ["Fix average"],
                     "acceptance": ["API compatibility tests pass"],
+                    "tests": ["Run API compatibility tests"],
+                    "documentation": ["Document the API compatibility behavior"],
                     "scope_hints": ["api"],
                     "kind": "build"
                 }
@@ -1179,11 +1266,57 @@ mod tests {
         assert!(plan.tasks[0].depends_on.is_empty());
         assert_eq!(plan.tasks[1].id, "task-02");
         assert_eq!(plan.tasks[1].depends_on, ["task-01"]);
-        assert_eq!(plan.requirements.len(), 3);
-        assert_eq!(plan.acceptance.len(), 2);
+        assert_eq!(plan.requirements.len(), 1);
+        assert_eq!(plan.acceptance.len(), 6);
         assert_eq!(
             plan.tasks[0].requirement_ids[0],
             plan.tasks[1].requirement_ids[0]
+        );
+        assert!(
+            plan.acceptance
+                .iter()
+                .any(|fact| fact.description.starts_with("Tests: "))
+        );
+        assert!(
+            plan.acceptance
+                .iter()
+                .any(|fact| fact.description.starts_with("Documentation: "))
+        );
+    }
+
+    #[test]
+    fn controller_keeps_the_verbatim_objective_and_requires_every_request_clause() {
+        let policy = TaskConfigDocument::default().compile().unwrap();
+        let objective = "Keep the existing API. Update its documentation.";
+        let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
+            "tasks": [{
+                "title": "Keep the API",
+                "description": "Preserve the existing API behavior",
+                "request_evidence": ["Keep the existing API"],
+                "acceptance": ["Existing clients remain compatible"],
+                "tests": ["Run API compatibility tests"],
+                "documentation": ["Update the API documentation"],
+                "scope_hints": ["api"],
+                "kind": "build"
+            }],
+            "risks": []
+        }))
+        .unwrap();
+        let proposal = model.into_controller_proposal(&policy, objective).unwrap();
+        assert_eq!(proposal.objective, objective);
+        let error = proposal
+            .validate_and_compile(
+                TaskPlanAuthority {
+                    source_intent: TaskSourceIntent::Build,
+                    task_planning_qualified: true,
+                    automatic_goal_selection_qualified: false,
+                },
+                &policy,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            super::super::TaskPlanErrorCode::UncoveredRequirement
         );
     }
 
@@ -1195,8 +1328,10 @@ mod tests {
                 serde_json::json!({
                     "title": format!("Goal {index}"),
                     "description": format!("Deliver Goal outcome {index}"),
-                    "requirements": [format!("Requirement {index}")],
+                    "request_evidence": ["Deliver four evidence-driven outcomes"],
                     "acceptance": [format!("Outcome {index} is verified")],
+                    "tests": [format!("Verify outcome {index}")],
+                    "documentation": [format!("Document outcome {index}")],
                     "scope_hints": [],
                     "kind": "goal",
                     "goal_contract": {
@@ -1211,13 +1346,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
-            "objective": "Deliver four evidence-driven outcomes",
             "tasks": tasks,
             "risks": []
         }))
         .unwrap();
 
-        let proposal = model.into_controller_proposal(&policy);
+        let proposal = model
+            .into_controller_proposal(&policy, "Deliver four evidence-driven outcomes")
+            .unwrap();
         assert_eq!(
             proposal
                 .tasks
@@ -1238,16 +1374,26 @@ mod tests {
     fn reviewer_challenges_must_cite_verbatim_request_evidence() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let plan = compiled(&proposal("evidence"), &policy);
-        let mut review: TaskPlanReviewArtifact =
+        let mut review_artifact: TaskPlanReviewArtifact =
             serde_json::from_str(&review(&plan, 1, "revise")).unwrap();
-        validate_review_request_evidence(&review, "Fix average").unwrap();
+        validate_review_request_evidence(&review_artifact, "Fix average").unwrap();
 
-        review.challenges[0].request_evidence = "Invented requirement".to_string();
+        review_artifact.challenges[0].request_evidence = "Invented requirement".to_string();
         assert!(
-            validate_review_request_evidence(&review, "Fix average")
+            validate_review_request_evidence(&review_artifact, "Fix average")
                 .unwrap_err()
                 .to_string()
                 .contains("does not cite controller request evidence")
+        );
+
+        let mut missing_assessment: TaskPlanReviewArtifact =
+            serde_json::from_str(&review(&plan, 1, "revise")).unwrap();
+        missing_assessment.request_assessments.clear();
+        assert!(
+            validate_review_request_evidence(&missing_assessment, "Fix average")
+                .unwrap_err()
+                .to_string()
+                .contains("assess every controller request-evidence clause")
         );
     }
 
@@ -1286,7 +1432,16 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            build_schema.pointer("/properties/tasks/items/properties/requirements/minItems"),
+            build_schema.pointer("/properties/tasks/items/properties/request_evidence/minItems"),
+            Some(&json!(1))
+        );
+        assert!(build_schema.pointer("/properties/objective").is_none());
+        assert_eq!(
+            build_schema.pointer("/properties/tasks/items/properties/tests/minItems"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            build_schema.pointer("/properties/tasks/items/properties/documentation/minItems"),
             Some(&json!(1))
         );
 
@@ -1311,6 +1466,10 @@ mod tests {
         assert_eq!(
             review_schema.pointer("/properties/task_plan_sha256/enum/0"),
             Some(&json!(envelope.sha256))
+        );
+        assert_eq!(
+            review_schema.pointer("/properties/request_assessments/minItems"),
+            Some(&json!(1))
         );
         assert_eq!(
             review_schema

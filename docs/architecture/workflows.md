@@ -36,7 +36,9 @@ deterministic harness stages and do not run a model.
 **Shipped controller; no planner currently qualified.** Before a new explicit Build starts, pb can
 ask an exactly qualified local model for a model-facing high-level proposal. This is separate from
 the existing Build `PlanArtifact`: each ordered outcome-shaped Task contains its Build or Goal kind,
-owned requirement clauses, and owned acceptance facts. It cannot contain IDs, cross-references,
+exact controller-supplied request-evidence clauses, outcome acceptance, owned test facts, and owned
+documentation facts. The original objective remains controller-owned rather than being repeated or
+summarized by the model. A proposal cannot contain IDs, cross-references,
 dependencies, effort, or executable numeric budgets. pb assigns stable IDs, deduplicates shared
 facts, compiles array order into the sequential dependency chain, assigns Build Tasks the bounded
 small preset, and assigns Goal Tasks the largest preset that keeps the whole queue within its
@@ -52,7 +54,10 @@ missing coverage, invalid Goal contracts, unqualified automatic Goal selection, 
 overflow before any child starts. Planning has three attempts and its own invocation, token,
 advisory, and wall-time allowance.
 
-The critic must return six controller-validated audit records exactly once: request coverage, Task
+Before those aggregate audits, the critic must assess every controller-supplied source-request
+clause exactly once and identify the Tasks that preserve its meaning. Rust rejects missing,
+repeated, or invented clause assessments. The critic must then return six controller-validated
+audit records exactly once: request coverage, Task
 boundaries, dependency order, acceptance observability, test/documentation ownership, and
 effort/Goal authority. A passing review requires every audit to pass. Revision requires both a
 failed audit and a blocking challenge. Every challenge's request evidence is selected from a

@@ -37,7 +37,10 @@ selection. Qualification is an embedded controller-owned record for the exact mo
 prompt template, artifact protocol, and structured-output contract. The planner and critic are
 token-constrained to exact controller schemas in both supported inference engines; schema validity
 does not replace deterministic coverage, graph, authority, or budget validation, nor the fresh
-semantic critique. An unqualified model stays on the ordinary Build path. A
+semantic critique. The controller retains the verbatim objective and supplies the only request
+clauses a Task may claim; every Task separately declares outcome acceptance, owned tests, and
+documentation work or impact. The critic must assess every supplied clause exactly once before its
+aggregate audits can pass. An unqualified model stays on the ordinary Build path. A
 qualified one-Task result unwraps into the same Build or Goal experience; only two or more Tasks
 create a durable queue and Tasks UI.
 

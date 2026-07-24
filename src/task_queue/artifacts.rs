@@ -384,6 +384,16 @@ pub struct TaskPlanAudit {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct TaskPlanRequestAssessment {
+    pub request_evidence: String,
+    pub verdict: TaskPlanAuditVerdict,
+    pub detail: String,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TaskPlanChallenge {
     pub id: String,
     pub code: String,
@@ -399,6 +409,8 @@ pub struct TaskPlanChallenge {
 pub struct TaskPlanReviewArtifact {
     pub task_plan_sha256: String,
     pub verdict: TaskPlanReviewVerdict,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_assessments: Vec<TaskPlanRequestAssessment>,
     #[serde(default)]
     pub audits: Vec<TaskPlanAudit>,
     #[serde(default)]
@@ -428,6 +440,21 @@ impl TaskPlanReviewArtifact {
         let required_audits = REQUIRED_TASK_PLAN_AUDIT_CATEGORIES
             .into_iter()
             .collect::<HashSet<_>>();
+        for assessment in &self.request_assessments {
+            required(
+                "Task-plan request assessment evidence",
+                &assessment.request_evidence,
+            )?;
+            required("Task-plan request assessment detail", &assessment.detail)?;
+            for task_id in &assessment.task_ids {
+                if !task_ids.contains(task_id.as_str()) {
+                    return Err(TaskPlanError::new(
+                        TaskPlanErrorCode::UnknownTask,
+                        format!("Task-plan request assessment references unknown Task '{task_id}'"),
+                    ));
+                }
+            }
+        }
         let mut audit_categories = HashSet::new();
         for audit in &self.audits {
             required("Task-plan audit detail", &audit.detail)?;
@@ -487,16 +514,24 @@ impl TaskPlanReviewArtifact {
             .audits
             .iter()
             .any(|audit| audit.verdict == TaskPlanAuditVerdict::Fail);
-        if self.verdict == TaskPlanReviewVerdict::Pass && (blocking || failed_audit) {
+        let failed_request_assessment = self
+            .request_assessments
+            .iter()
+            .any(|assessment| assessment.verdict == TaskPlanAuditVerdict::Fail);
+        if self.verdict == TaskPlanReviewVerdict::Pass
+            && (blocking || failed_audit || failed_request_assessment)
+        {
             return Err(TaskPlanError::new(
                 TaskPlanErrorCode::ReviewInvalid,
-                "Task-plan review cannot pass with a failed audit or blocking challenge",
+                "Task-plan review cannot pass with a failed request assessment, failed audit, or blocking challenge",
             ));
         }
-        if self.verdict == TaskPlanReviewVerdict::Revise && (!blocking || !failed_audit) {
+        if self.verdict == TaskPlanReviewVerdict::Revise
+            && (!blocking || (!failed_audit && !failed_request_assessment))
+        {
             return Err(TaskPlanError::new(
                 TaskPlanErrorCode::ReviewInvalid,
-                "Task-plan revision requires a failed audit and at least one blocking challenge",
+                "Task-plan revision requires a failed request assessment or audit and at least one blocking challenge",
             ));
         }
         Ok(())
@@ -1039,6 +1074,7 @@ mod tests {
         let review = TaskPlanReviewArtifact {
             task_plan_sha256: plan.sha256.clone(),
             verdict: TaskPlanReviewVerdict::Pass,
+            request_assessments: Vec::new(),
             audits: passing_task_plan_audits(),
             challenges: vec![TaskPlanChallenge {
                 id: "c1".to_string(),

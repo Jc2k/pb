@@ -79,18 +79,22 @@ and proposes the actual changes, checks, and commit boundary for that Task.
 The full selected local model artifact must exactly match pb's embedded
 model/backend/template/protocol qualification record; split GGUF qualifications bind every shard.
 pb constrains both the proposed plan and its fresh review to exact JSON
-schemas while each token is selected. The model orders Tasks and writes their owned requirements and
-acceptance facts; pb assigns their IDs, dependencies, qualitative effort, and budgets so bookkeeping
-mistakes cannot enter the queue. Deterministic validation and review still decide whether the result
-is complete and useful. The embedded catalog is empty in this release, and `.pb/tasks.toml`
+schemas while each token is selected. The model orders Tasks and selects their owned requirements
+from verbatim request clauses supplied by pb. Each Task separately states outcome acceptance, test
+work, and documentation work or impact. pb retains the original objective and assigns IDs,
+dependencies, qualitative effort, and budgets so summarization and bookkeeping mistakes cannot
+enter the queue. Deterministic validation and review still decide whether the result is complete and
+useful. The embedded catalog is empty in this release, and `.pb/tasks.toml`
 cannot turn the feature on. With an unqualified model, pb
 starts the current Build workflow directly, so existing projects do not pay an extra planning turn
 or see a new UI.
 
-The fresh critic must separately audit request coverage, Task boundaries, dependency order,
-observable acceptance, test/documentation ownership, and effort/Goal authority. pb accepts a pass
-only when all six audits pass; a revision must identify a failed audit, select verbatim evidence
-from the original request, and provide a blocking correction grounded in that evidence.
+The fresh critic must first assess every supplied source-request clause exactly once, identifying
+the Tasks that preserve it. It must then separately audit request coverage, Task boundaries,
+dependency order, observable acceptance, test/documentation ownership, and effort/Goal authority.
+pb accepts a pass only when all six audits pass; a revision must identify a failed audit, select
+verbatim evidence from the original request, and provide a blocking correction grounded in that
+evidence.
 
 The number of accepted Tasks determines the experience:
 
