@@ -382,11 +382,7 @@ impl EventSink for HarnessEventSink {
             } => {
                 state.observations.push(Observation {
                     rank: 3,
-                    classification: if summary == "Next accepted-plan creation work unit" {
-                        "positive_evidence"
-                    } else {
-                        "model_limitation"
-                    },
+                    classification: correction_classification(message, summary),
                     title: nonempty_or(summary, "agent correction"),
                     detail: compact_detail(message),
                 });
@@ -1946,6 +1942,21 @@ fn nonempty_or(value: &str, fallback: &str) -> String {
     }
 }
 
+fn correction_classification(message: &str, summary: &str) -> &'static str {
+    if matches!(
+        summary,
+        "Next accepted-plan creation work unit"
+            | "Active accepted-plan work unit"
+            | "Work-unit progress earned one bounded turn"
+    ) || (summary == "Harness diagnostic preview"
+        && message.starts_with("Harness diagnostic preview passed."))
+    {
+        "positive_evidence"
+    } else {
+        "model_limitation"
+    }
+}
+
 fn compact_detail(value: &str) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = compact.chars();
@@ -3062,6 +3073,57 @@ mod tests {
         assert_eq!(audit.checks_passed, 1);
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].classification, "positive_evidence");
+    }
+
+    #[test]
+    fn successful_controller_corrections_are_positive_evidence() {
+        let parent = tempfile::tempdir().unwrap();
+        let events = parent.path().join("events.jsonl");
+        let run_events = parent.path().join("run-events.jsonl");
+        let mut sink = HarnessEventSink::new(
+            &events,
+            &run_events,
+            &events.with_extension("checkpoint.json"),
+        )
+        .unwrap();
+        for (summary, message) in [
+            (
+                "Active accepted-plan work unit",
+                "Harness work unit path:0: create slug.js now",
+            ),
+            (
+                "Work-unit progress earned one bounded turn",
+                "Harness progress credit: work unit path:0 produced a new transition",
+            ),
+            (
+                "Harness diagnostic preview",
+                "Harness diagnostic preview passed. This grants no final evidence.",
+            ),
+        ] {
+            sink.emit(AgentEvent::Correction {
+                message: message.to_string(),
+                summary: summary.to_string(),
+                actor: crate::events::TeamActor::workflow_steward(),
+                assisting_profile: Some(crate::agent_core::AgentProfile::Build),
+                nesting_depth: None,
+                timestamp_ms: None,
+            });
+        }
+
+        let (observations, _, _) = sink.snapshot().unwrap();
+        assert_eq!(observations.len(), 3);
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.classification == "positive_evidence")
+        );
+        assert_eq!(
+            correction_classification(
+                "Harness diagnostic preview failed and grants no final evidence.",
+                "Harness diagnostic preview"
+            ),
+            "model_limitation"
+        );
     }
 
     #[test]
