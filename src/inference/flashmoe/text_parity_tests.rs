@@ -609,9 +609,16 @@ fn qwen3_template_renderer_matches_tool_history_output() {
             true,
         )
         .unwrap();
-    let tool_json = serde_json::to_string(&qwen_tool_schema_value(&tool)).unwrap();
     assert!(rendered.starts_with("<|im_start|>system\nbe precise\n\n<tools>\n"));
-    assert!(rendered.contains(&tool_json));
+    let rendered_tool: serde_json::Value = serde_json::from_str(
+        rendered
+            .split("<tools>\n")
+            .nth(1)
+            .and_then(|tools| tools.lines().next())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rendered_tool, qwen_tool_schema_value(&tool));
     assert!(rendered.contains("<|im_start|>user\nweather?<|im_end|>\n"));
     assert!(rendered.contains("<|im_start|>assistant\nchecking\n<tool_call>\n"));
     assert!(rendered.contains("\"name\": \"get_weather\""));
