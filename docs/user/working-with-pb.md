@@ -83,8 +83,10 @@ schemas while each token is selected. The model orders Tasks and selects their o
 from verbatim request clauses supplied by pb. Each Task separately states outcome acceptance, test
 work, and documentation work or impact. pb retains the original objective and assigns IDs,
 dependencies, qualitative effort, and budgets so summarization and bookkeeping mistakes cannot
-enter the queue. Deterministic validation and review still decide whether the result is complete and
-useful. The embedded catalog is empty in this release, and `.pb/tasks.toml`
+enter the queue. pb rejects a multi-Task queue entry that owns only decomposition constraints, so
+testing, documentation, ordering, and generic final validation cannot become catch-all Tasks.
+Deterministic validation and review still decide whether the result is complete and useful. The
+embedded catalog is empty in this release, and `.pb/tasks.toml`
 cannot turn the feature on. With an unqualified model, pb
 starts the current Build workflow directly, so existing projects do not pay an extra planning turn
 or see a new UI.

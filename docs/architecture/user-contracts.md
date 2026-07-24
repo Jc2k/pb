@@ -40,7 +40,9 @@ does not replace deterministic coverage, graph, authority, or budget validation,
 semantic critique. The controller retains the verbatim objective and supplies the only request
 clauses a Task may claim; every Task separately declares outcome acceptance, owned tests, and
 documentation work or impact. The critic must assess every supplied clause exactly once before its
-aggregate audits can pass. An unqualified model stays on the ordinary Build path. A
+aggregate audits can pass. A multi-Task proposal cannot create a queue entry that owns only
+decomposition constraints; tests, documentation, ordering, and final validation remain with a
+behavior-owning Task. An unqualified model stays on the ordinary Build path. A
 qualified one-Task result unwraps into the same Build or Goal experience; only two or more Tasks
 create a durable queue and Tasks UI.
 

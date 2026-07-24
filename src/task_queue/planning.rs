@@ -15,8 +15,8 @@ use super::{
     TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v9";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v8";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v10";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v9";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
 const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
@@ -78,6 +78,20 @@ impl TaskModelProposal {
         policy: &CompiledTaskPolicy,
         objective: &str,
     ) -> Result<TaskPlanProposal> {
+        if self.tasks.len() > 1 {
+            for task in &self.tasks {
+                if task
+                    .request_evidence
+                    .iter()
+                    .all(|evidence| is_decomposition_constraint(evidence))
+                {
+                    bail!(
+                        "Task '{}' owns only decomposition constraints; tests, documentation, ordering, and final validation must stay with a behavior-owning Task",
+                        task.title
+                    );
+                }
+            }
+        }
         let request_evidence = request_evidence_clauses(objective);
         let requirements = request_evidence
             .iter()
@@ -189,6 +203,16 @@ impl TaskModelProposal {
             risks: self.risks,
         })
     }
+}
+
+fn is_decomposition_constraint(evidence: &str) -> bool {
+    let evidence = evidence.to_ascii_lowercase();
+    evidence.contains("decompose this")
+        || evidence.contains("behavior-owning task")
+        || evidence.contains("behavior owning task")
+        || evidence.contains("each task")
+        || evidence.contains("every task")
+        || evidence.contains("tasks suitable for")
 }
 
 fn model_efforts_fit(tasks: &[TaskProposal], policy: &CompiledTaskPolicy) -> bool {
@@ -553,7 +577,7 @@ fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str)
         )
     };
     format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Every Task must own concrete test work and documentation work or a concrete documentation-impact decision; never invent a final testing or documentation catch-all. Never include an objective, IDs, references, dependencies, effort, or numeric budgets: pb owns them and makes the array a sequential queue. Array order is delivery and commit order, so place prerequisites before their consumers.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Select each Task's request_evidence only from the controller choices, verbatim. Assign every choice to at least one Task and never weaken words such as existing, compatible, rollback-safe, before, without, or must in the Task outcome. Each Task also contains observable outcome acceptance, owned tests, and owned documentation.\n\nBefore responding, silently audit the artifact: cover every controller request-evidence choice, including compatibility, tests, documentation, ordering, rollback, explicit non-goals, and decomposition constraints. When one choice governs several behavior-owning Tasks, assign it to each of them. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nOriginal request:\n{}\n\nController request evidence choices:\n{}\n\nBounded repository context:\n{}\n{retry}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Every Task must own concrete test work and documentation work or a concrete documentation-impact decision; standalone testing, documentation, validation, integration, or ordering Tasks are forbidden catch-alls. Never include an objective, IDs, references, dependencies, effort, or numeric budgets: pb owns them and makes the array a sequential queue. Array order is the dependency order and commit order: item 1 completes before item 2 can start. A later item cannot make an earlier consumer retroactively compatible, so put foundations and migrations before every service, API, or UI consumer that needs them.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Select each Task's request_evidence only from the controller choices, verbatim. Assign every choice to at least one behavior-owning Task and never weaken words such as existing, compatible, rollback-safe, before, without, or must in the Task outcome. A Task may not exist only to satisfy a decomposition, testing, documentation, ordering, or smaller-model instruction. Each Task also contains observable outcome acceptance, owned tests, and owned documentation.\n\nBefore responding, silently audit the artifact: cover every controller request-evidence choice, including compatibility, tests, documentation, ordering, rollback, explicit non-goals, and decomposition constraints. When one choice governs several behavior-owning Tasks, assign it to each of them. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work. For every before/after clause, compare the two affected array positions and correct any reversed order.\n\nAttempt: {attempt}\nOriginal request:\n{}\n\nController request evidence choices:\n{}\n\nBounded repository context:\n{}\n{retry}",
         input.policy.aggregate.max_tasks,
         input.objective,
         serde_json::to_string_pretty(&request_evidence_clauses(input.objective))
@@ -568,7 +592,7 @@ fn reviewer_prompt(
 ) -> Result<String> {
     let request_evidence = request_evidence_clauses(input.objective);
     Ok(format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic with authority bounded by the original request. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. First complete one request_assessment for every controller request-evidence choice exactly once. For each, cite the Tasks that preserve its exact meaning and fail contradictions such as new versus existing, breaking versus compatible, after versus before, or forward-only versus rollback-safe. Then complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, explicit non-goals, and decomposition constraints even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. Treat genuinely equivalent wording as coverage, but do not treat a related outcome as equivalent to an exact constraint. Fail only for an omitted or contradicted request clause, an unobservable requested outcome, duplicated ownership, or a Task too broad to deliver independently. Every challenge must select request_evidence verbatim from the controller evidence list and ask for the minimum correction supported by that exact text. Do not claim the evidence says more than it does. Do not invent HTTP status codes, filenames, algorithms, integrity techniques, test names, documentation cross-links, failure modes, or other behavior absent from the request. Shared components do not imply overlap when Tasks own distinct outcomes. A pass means every request assessment and audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed request assessment or audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nController request evidence choices:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic with authority bounded by the original request. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Task IDs are the exact sequential execution order: task-01 completes before task-02 starts. First complete one request_assessment for every controller request-evidence choice exactly once. For each, cite the Tasks that preserve its exact meaning and fail contradictions such as new versus existing, breaking versus compatible, after versus before, or forward-only versus rollback-safe. For every before/after clause, name the earlier and later Task IDs in the detail and fail if the prerequisite has the larger number. Then complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, explicit non-goals, and decomposition constraints even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. A standalone testing, documentation, validation, integration, ordering, or generic completion Task is a forbidden catch-all when its work belongs in behavior-owning Tasks. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, Build-versus-Goal choice, and qualitative effort. Treat genuinely equivalent wording as coverage, but do not treat a related outcome as equivalent to an exact constraint. Fail only for an omitted or contradicted request clause, an unobservable requested outcome, duplicated ownership, forbidden catch-all, reversed dependency, or a Task too broad to deliver independently. Every challenge must select request_evidence verbatim from the controller evidence list and ask for the minimum correction supported by that exact text. Do not claim the evidence says more than it does. Do not invent HTTP status codes, filenames, algorithms, integrity techniques, test names, documentation cross-links, failure modes, or other behavior absent from the request. Shared components do not imply overlap when Tasks own distinct outcomes. A pass means every request assessment and audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed request assessment or audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nController request evidence choices:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
         input.objective,
         serde_json::to_string_pretty(&request_evidence)?,
         plan.sha256,
@@ -1317,6 +1341,48 @@ mod tests {
         assert_eq!(
             error.code,
             super::super::TaskPlanErrorCode::UncoveredRequirement
+        );
+    }
+
+    #[test]
+    fn controller_rejects_tasks_that_own_only_decomposition_constraints() {
+        let policy = TaskConfigDocument::default().compile().unwrap();
+        let objective = "Add durable storage. Each behavior-owning Task includes tests and documentation. Decompose this into bounded Tasks suitable for a smaller implementation model.";
+        let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
+            "tasks": [
+                {
+                    "title": "Add durable storage",
+                    "description": "Deliver durable storage",
+                    "request_evidence": ["Add durable storage"],
+                    "acceptance": ["Storage survives restart"],
+                    "tests": ["Run restart tests"],
+                    "documentation": ["Document durable storage"],
+                    "scope_hints": ["storage"],
+                    "kind": "build"
+                },
+                {
+                    "title": "Test and document everything",
+                    "description": "Run final tests and write final documentation",
+                    "request_evidence": [
+                        "Each behavior-owning Task includes tests and documentation",
+                        "Decompose this into bounded Tasks suitable for a smaller implementation model"
+                    ],
+                    "acceptance": ["Everything is validated"],
+                    "tests": ["Run all tests"],
+                    "documentation": ["Write all documentation"],
+                    "scope_hints": [],
+                    "kind": "build"
+                }
+            ],
+            "risks": []
+        }))
+        .unwrap();
+        assert!(
+            model
+                .into_controller_proposal(&policy, objective)
+                .unwrap_err()
+                .to_string()
+                .contains("owns only decomposition constraints")
         );
     }
 
