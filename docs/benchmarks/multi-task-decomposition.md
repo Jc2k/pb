@@ -100,6 +100,58 @@ conformance. The reviewer path also increased latency substantially for the 14B 
 models is promoted: the embedded qualification catalog remains empty, so ordinary Build dispatch is
 unchanged in this release.
 
+## Schema-constrained follow-up
+
+Captured: 2026-07-24
+
+The production harness path was then exercised while the planner and critic were constrained at
+token selection time to exact controller-owned JSON schemas. llama.cpp used LLGuidance generated
+from the JSON schema; the same schemas compiled through FlashMoe's native constraint validator.
+This eliminated malformed dictionaries, misspelled keys, unknown IDs, model-authored budgets, and
+invalid enum values as a class of trial failure. It did not make semantically weak plans useful by
+itself.
+
+The controller and protocol were tightened only in response to preserved failures:
+
+- pb now retains the verbatim objective and supplies the only request evidence the model may select;
+- punctuation-delimited compound clauses become separate reviewable facts;
+- decomposition-wide testing, documentation, ordering, and sizing constraints are attached to
+  every behavior-owning Task by Rust rather than copied by the model;
+- every Task has separate outcome, test, and documentation facts;
+- a multi-Task Build may own at most two behavioral clauses and needs an outcome and test fact for
+  each;
+- standalone testing/documentation/validation catch-alls and constraint-only Tasks are rejected;
+- array order, IDs, dependencies, effort, and numeric budgets remain controller-owned; and
+- the critic must assess every exact source clause once, then complete all six aggregate audits.
+
+All llama.cpp trials below used temperature 0, top-k 1, seed 0, an 8,192-token context, Metal
+offload, and the same storage/API request. Temporary qualification records existed only in the
+trial builds and were removed afterward.
+
+| Model / protocol | Calls / generated / wall | Controller result | Manual audit |
+| --- | --- | --- | --- |
+| Qwen2.5-Coder 14B, v8 | 2 / 1,188 / 64 s | accepted four Tasks | false pass: invented a new endpoint inside the existing endpoint and claimed missing per-Task documentation was present |
+| Qwen3-Coder-Next GGUF, v8 | 6 / 8,488 / 294 s | rejected after three attempts | grounded final critique correctly found missing restart-idempotency detail and test/documentation catch-all ownership |
+| Qwen2.5-Coder 14B, v9 | 2 / 2,677 / 132 s | accepted eight Tasks | false pass: standalone documentation/testing Tasks and reversed storage/consumer ordering |
+| Qwen2.5-Coder 14B, v10 | 3 / 2,829 / 116 s | rejected after three attempts | safe rejection; model did not converge while copying a decomposition-wide clause |
+| Qwen2.5-Coder 14B, v11 | 2 / 1,487 / 397 s debug wall | accepted three Tasks | false pass: schema, compatibility, and restart idempotency shared one small Task without restart-specific acceptance or tests |
+| Qwen2.5-Coder 14B, v12 | 4 / 4,093 / 264 s | accepted five Tasks on the second attempt | first manually useful result: bounded schema, compatibility, restart-idempotency, existing-endpoint health, and cutover Tasks with owned tests/docs and correct prerequisite order |
+
+The v11 debug wall time includes unoptimized full-model hashing and is not a production latency
+measurement. The v12 record targets model SHA-256
+`c1e659736d89ac1065fb495330fb824d94001974a4bfa78e7270e43476a8d940`, template SHA-256
+`64a2bea62f0933362cc7f30dee655bfe04c33eb21bc61732242416ab822770b0`, and protocol SHA-256
+`fd8200c26f33b8b610367f1982ef687c3354d77fa2fb0be0821575a99b4a92d3`.
+
+### Follow-up decision
+
+The result establishes technical viability for schema-constrained Task planning and one useful
+storage/API decomposition. It does not qualify a model. Earlier 14B accepted-plan false positives
+and Qwen3-Coder-Next convergence failures show that structural validity and a self-reported critic
+pass are not sufficient evidence. The embedded qualification catalog therefore remains empty.
+Promotion still requires the repeatable three-shape matrix and 95% useful-boundary target below,
+with manual scoring of every accepted plan and zero accepted invalid plans.
+
 ## Classification
 
 ### P2 — Exact budget arithmetic is not a model-owned control boundary
@@ -158,6 +210,12 @@ workspaces:
 - `/private/tmp/pb-task-qualification-14b-storage-v2-1/`
 - `/private/tmp/pb-task-qualification-14b-storage-v2-2/`
 - `/private/tmp/pb-task-qualification-qwen3-8b-storage-v2-1/`
+- `/private/tmp/pb-task-schema-q25-14b-storage-v8-1/`
+- `/private/tmp/pb-task-schema-q3next-storage-v8-1/`
+- `/private/tmp/pb-task-schema-q25-14b-storage-v9-1/`
+- `/private/tmp/pb-task-schema-q25-14b-storage-v10-1/`
+- `/private/tmp/pb-task-schema-q25-14b-storage-v11-1/`
+- `/private/tmp/pb-task-schema-q25-14b-storage-v12-1/`
 
 The first 4B scratch run also records an experiment-environment lock failure before the bounded
 host-authorized rerun. That setup failure is separate from the completed model result.
