@@ -912,7 +912,46 @@ export interface MultiTaskCheckpoint {
     };
     outcome?: MultiTaskOutcome;
     reason?: string;
+    planning_transcript?: TaskPlanningTranscript;
+    completion_audit?: TaskCompletionAudit;
   };
+}
+
+export type TaskPlanningDecision =
+  | "multi_task"
+  | "one_build_single_task"
+  | "one_build_planner_fallback"
+  | "one_build_budget_fallback"
+  | "cancelled"
+  | "rejected";
+
+export interface TaskPlanningTranscript {
+  decision: TaskPlanningDecision;
+  summary: string;
+  attempts: Array<{
+    attempt: number;
+    stage: "planner" | "reviewer";
+    prompt: string;
+    schema: unknown;
+    raw_output?: string;
+    normalized_output?: unknown;
+    failure?: string;
+    prompt_tokens: number;
+    generated_tokens: number;
+    duration_ms: number;
+  }>;
+}
+
+export interface TaskCompletionAudit {
+  plan_sha256: string;
+  requirements: Array<{
+    requirement_id: string;
+    task_ids: string[];
+    acceptance_ids: string[];
+    evidence_refs: string[];
+    commits: string[];
+  }>;
+  completed_at_ms: number;
 }
 
 export interface MultiTaskSummary {
@@ -939,6 +978,7 @@ export interface TaskPlanRejected {
   recovery_actions: Array<
     "retry_planning" | "edit_request" | "run_as_one_build"
   >;
+  transcript?: TaskPlanningTranscript;
 }
 export type WorkflowStage =
   | "planning"
@@ -1047,6 +1087,7 @@ export interface SessionDetails {
   multi_task?: MultiTaskCheckpoint;
   active_multi_task?: boolean;
   task_plan_rejected?: TaskPlanRejected;
+  task_planning_transcript?: TaskPlanningTranscript;
 }
 
 export interface ProjectEntry {

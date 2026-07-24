@@ -7,6 +7,57 @@ Plan: [Task decomposition workflow](../multi-task-workflow-plan.md)
 The resulting design calls each high-level queue entry a Task. Child implementation planning is
 reserved until each Task activates.
 
+## Shipped default-partition revision — 2026-07-24
+
+The original qualification gate made the feature a no-op because its embedded promotion catalog
+was empty. The shipped revision separates safe Build partitioning from authority promotion:
+
+- every eligible Build now attempts a constrained partition by default on llama.cpp or FlashMoe;
+- the model artifact is reduced to `tasks[].{title,covers}` over controller source IDs;
+- Rust owns requirements, descriptions, sequential dependencies, acceptance records, budgets, and
+  Build-only authority;
+- one Task, invalid output, or planning-budget exhaustion runs
+  the exact original Build unchanged after at most one revision;
+- cancellation still stops rather than starting work;
+- all constrained prompts, schemas, raw/normalized outputs, failures, usage, and routing decisions
+  are locally persisted and visible in session details; and
+- compact critic findings are preserved as advisory evidence rather than trusted as a veto; and
+- a multi-Task parent reaches `Ready` only after a requirement-to-result completion audit matches
+  the terminal repository.
+
+Automatic Goal-shaped Tasks remain separately exact-qualified and fail-closed; explicit Goal mode
+is unchanged. The locked paired corpus in
+`fixtures/task-decomposition/default-partition-corpus.json` covers trivial one-Build, storage/API
+ordering, cross-stack delivery, a multi-component refactor, tightly coupled work, and compatibility
+plus non-goals. It keeps a bounded direct-Build comparison prompt beside every broad prompt so
+boundary quality and bounded implementation ability can be evaluated independently.
+
+### Default-path release evidence
+
+Release-binary harness runs used temperature 0, top-k 1, seed 0, an 8,192-token context, and the
+same storage-before-API request. `--max-tokens 1` applied only after Task routing, so an unexpected
+direct Build terminated quickly; the Task planner retained its controller cap. That downstream
+step-limit is an experiment control, not an implementation-quality result.
+
+| Engine / model | Calls / generated | Route | Audit |
+| --- | --- | --- | --- |
+| FlashMoe / Qwen3-Coder-Next 4-bit | 2 / 167 | two Build Tasks | Planner produced storage/migration before compatible APIs; Rust attached the per-behavior test/documentation constraint to both. The critic returned false `bad_order`/`too_broad` concerns, preserved as advisory evidence. |
+| llama.cpp / Qwen2.5-Coder 7B Q4_K_M | 2 / 81 | two Build Tasks | Same ordered partition and inherited constraint; critic accepted. Total model runtime was 2.7 seconds. |
+| llama.cpp / Qwen2.5-Coder 7B Q4_K_M | 1 / 34 | exact one-Build bypass | Trivial request produced one Task, no critic call or parent checkpoint, and entered ordinary Build Planning unchanged. |
+
+The preserved paths are:
+
+- `/private/tmp/pb-default-tasks-storage-api-v5-20260724/`
+- `/private/tmp/pb-default-tasks-llama7b-20260724/`
+- `/private/tmp/pb-default-tasks-one-build-llama7b-20260724/`
+
+Earlier preserved v2-v4 runs exposed two pb control defects and one model limitation. Coarse source
+atomization made a test/documentation catch-all representable; deterministic ordering atomization
+and constraint attachment fixed it. FlashMoe's critic then repeatedly rejected the correct planner
+partition, so criticism became diagnostic instead of a veto. The planner itself produced the same
+corrected two-Task boundary in three consecutive post-atomization runs. This supports default
+Build-only use with exact fallback; it does not support automatic Goal promotion.
+
 ## Decision
 
 Model-assisted Task decomposition is viable only as a proposal-and-review stage. It is not
@@ -220,17 +271,17 @@ workspaces:
 The first 4B scratch run also records an experiment-environment lock failure before the bounded
 host-authorized rerun. That setup failure is separate from the completed model result.
 
-## Qualification gap
+## Remaining qualification boundary
 
 The typed runtime controls are shipped and the checked-in
-`fixtures/task-decomposition/corpus.json` locks the deterministic, semantic-review, qualification,
-and attempt-limit cases. `deno task test:task-decomposition` validates its schema and required
-coverage.
+`fixtures/task-decomposition/corpus.json` continues to lock the internal executable-artifact safety
+cases. `fixtures/task-decomposition/default-partition-corpus.json` locks default routing and paired
+direct-Build comparisons. `deno task test:task-decomposition` validates both.
 
-Automatic rollout still requires a complete repeatable qualification run across at least three
-request shapes: a cross-stack feature, a storage/API migration with rollback, and a scoped
-multi-component refactor, with enough independent trials to establish the plan's 95% useful-boundary
-target. Promotion requires zero accepted invalid graphs or budget overflows, zero false multi-Task
-completion, and bounded convergence to an accepted or truthfully rejected plan within two attempts.
-The exact model bytes, backend, planner template, protocol, and evidence digest must then be added to
-the embedded catalog in source control; repository configuration cannot supply or override it.
+Default Build-only partitioning no longer depends on a frontier-quality threshold because it cannot
+broaden authority and fails soft to the original Build. A sustained useful-boundary rate remains a
+quality metric and can justify model-family defaults, but is not a correctness gate. Promotion of
+automatic Goal-shaped Tasks still requires repeated evidence across the paired corpus, zero accepted
+authority/coverage/budget defects, zero false completion, and an embedded exact model, backend,
+template, protocol, and evidence digest. Repository configuration cannot supply or override that
+promotion.

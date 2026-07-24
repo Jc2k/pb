@@ -445,7 +445,7 @@ const fn default_aggregate_budget() -> MultiTaskBudget {
 
 const fn default_coordination_budget() -> TaskCoordinationBudget {
     TaskCoordinationBudget {
-        planning_attempts: 3,
+        planning_attempts: 2,
         model_invocations: 6,
         generated_tokens: 18_000,
         advisory_calls: 3,

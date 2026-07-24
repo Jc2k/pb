@@ -502,6 +502,10 @@ pub struct AgentRequest {
     /// recovery actions after restart. It grants no authority and is cleared before another run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_plan_rejected: Option<crate::task_queue::TaskPlanRejected>,
+    /// Complete constrained Task-planning attempts and the controller's final routing decision.
+    /// This is local diagnostic evidence, not hidden reasoning or execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_planning_transcript: Option<crate::task_queue::TaskPlanningTranscript>,
     /// Optional trusted, already-normalized workflow policy supplied by daemon-free callers.
     /// Ordinary project sessions load and snapshot `.pb/workflow.toml` when delivery starts.
     #[serde(default)]
@@ -631,6 +635,7 @@ pub struct AgentRunResult {
     pub requested_goal: Option<crate::goal::GoalProposal>,
     pub task_goal: Option<crate::task_queue::GoalTaskProjection>,
     pub task_plan_rejected: Option<crate::task_queue::TaskPlanRejected>,
+    pub task_planning_transcript: Option<crate::task_queue::TaskPlanningTranscript>,
 }
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -2227,6 +2232,43 @@ fn task_planner_model_sha256(
     }
 }
 
+fn basic_task_planner_qualification(
+    model: &str,
+    backend: &str,
+) -> Result<crate::task_queue::TaskPlannerQualification> {
+    let model_sha256 = format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "pb-basic-task-planner-model-v1\0{backend}\0{model}"
+        ))
+    );
+    let evidence_sha256 = format!(
+        "{:x}",
+        Sha256::digest(b"pb-constrained-build-partition-fail-soft-v1")
+    );
+    crate::task_queue::TaskPlannerQualification::new(
+        model_sha256,
+        crate::task_queue::task_planner_template_sha256(),
+        crate::task_queue::task_planner_protocol_sha256(),
+        evidence_sha256,
+        true,
+        false,
+    )
+}
+
+fn task_planning_setup_fallback(
+    reason: impl Into<String>,
+) -> crate::task_queue::TaskPlanningTranscript {
+    crate::task_queue::TaskPlanningTranscript {
+        decision: crate::task_queue::TaskPlanningDecision::OneBuildPlannerFallback,
+        summary: format!(
+            "Task planning was unavailable, so pb kept the original Build request unchanged: {}",
+            reason.into()
+        ),
+        attempts: Vec::new(),
+    }
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -2874,6 +2916,7 @@ fn run_agent_inner<S: EventSink>(
 
     let mut task_planning_metrics = RunMetrics::default();
     let mut task_plan_rejected = None;
+    let mut task_planning_transcript = None;
     let mut multi_task_created = false;
     let mut single_task_goal = None;
     let should_plan_tasks = args.intent == Some(crate::workflow::TurnIntent::Deliver)
@@ -2883,25 +2926,76 @@ fn run_agent_inner<S: EventSink>(
         && !args.turn_id.starts_with("task-request:")
         && !args.repository_less;
     if should_plan_tasks {
-        let catalog = crate::task_queue::TaskPlannerQualificationCatalog::embedded()?;
-        let backend = match text_backend {
-            TextBackendKind::LlamaCpp => "llama_cpp",
-            TextBackendKind::FlashMoe => "flashmoe",
-        };
-        if let Some(qualification) = catalog.candidate(&args.model, backend).cloned() {
-            let model_sha256 = task_planner_model_sha256(
-                &args,
-                models_root,
-                text_backend,
-                flashmoe_plan.as_ref(),
-            )?;
-            let policy = crate::task_queue::TaskConfigDocument::load_or_default(&workspace_root)?;
-            let repository = crate::task_queue::TaskRepositoryState::capture(&workspace_root)?;
-            let repository_context = task_planning_repository_context(
-                workspace_graph
-                    .as_ref()
-                    .context("Task planning requires a workspace graph")?,
-            )?;
+        'task_planning: {
+            let catalog = match crate::task_queue::TaskPlannerQualificationCatalog::embedded() {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    task_planning_transcript = Some(task_planning_setup_fallback(format!(
+                        "qualification catalog could not be loaded: {error:#}"
+                    )));
+                    break 'task_planning;
+                }
+            };
+            let backend = match text_backend {
+                TextBackendKind::LlamaCpp => "llama_cpp",
+                TextBackendKind::FlashMoe => "flashmoe",
+            };
+            let basic_qualification = match basic_task_planner_qualification(&args.model, backend) {
+                Ok(qualification) => qualification,
+                Err(error) => {
+                    task_planning_transcript = Some(task_planning_setup_fallback(format!(
+                        "Build-only planner identity could not be created: {error:#}"
+                    )));
+                    break 'task_planning;
+                }
+            };
+            let qualification = if let Some(candidate) = catalog.candidate(&args.model, backend) {
+                match task_planner_model_sha256(
+                    &args,
+                    models_root,
+                    text_backend,
+                    flashmoe_plan.as_ref(),
+                ) {
+                    Ok(digest) if digest == candidate.model_sha256 => candidate.clone(),
+                    _ => basic_qualification,
+                }
+            } else {
+                basic_qualification
+            };
+            let model_sha256 = qualification.model_sha256.clone();
+            let policy =
+                match crate::task_queue::TaskConfigDocument::load_or_default(&workspace_root) {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        task_planning_transcript = Some(task_planning_setup_fallback(format!(
+                            "Task policy could not be loaded: {error:#}"
+                        )));
+                        break 'task_planning;
+                    }
+                };
+            let repository = match crate::task_queue::TaskRepositoryState::capture(&workspace_root)
+            {
+                Ok(repository) => repository,
+                Err(error) => {
+                    task_planning_transcript = Some(task_planning_setup_fallback(format!(
+                        "repository state could not be captured for Task planning: {error:#}"
+                    )));
+                    break 'task_planning;
+                }
+            };
+            let repository_context = match workspace_graph
+                .as_ref()
+                .context("Task planning requires a workspace graph")
+                .and_then(task_planning_repository_context)
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    task_planning_transcript = Some(task_planning_setup_fallback(format!(
+                        "repository context could not be prepared for Task planning: {error:#}"
+                    )));
+                    break 'task_planning;
+                }
+            };
             let source_task = args.task.clone();
             let source_turn_id = args.turn_id.clone();
             let should_cancel = || sink.should_cancel();
@@ -2928,6 +3022,7 @@ fn run_agent_inner<S: EventSink>(
             task_planning_metrics.add(&metrics);
             match planning {
                 crate::task_queue::TaskPlanningOutcome::Accepted(accepted) => {
+                    task_planning_transcript = Some(accepted.transcript.clone());
                     match accepted.plan.artifact.dispatch()? {
                         crate::task_queue::TaskDispatch::Build { .. } => {
                             let request = single_task_request(
@@ -2952,7 +3047,7 @@ fn run_agent_inner<S: EventSink>(
                                     args.session_id, source_turn_id, accepted.plan.sha256
                                 ))
                             );
-                            let run = crate::task_queue::MultiTaskRun::start(
+                            let mut run = crate::task_queue::MultiTaskRun::start(
                                 run_id,
                                 args.session_id.clone(),
                                 source_turn_id,
@@ -2971,6 +3066,7 @@ fn run_agent_inner<S: EventSink>(
                                 accepted.counters,
                                 now_millis(),
                             )?;
+                            run.planning_transcript = task_planning_transcript.clone();
                             let checkpoint = crate::task_queue::MultiTaskCheckpoint::new(run)?;
                             sink.checkpoint_multi_task(&checkpoint)?;
                             sink.emit(AgentEvent::TaskPlanAccepted {
@@ -2997,7 +3093,11 @@ fn run_agent_inner<S: EventSink>(
                         }
                     }
                 }
+                crate::task_queue::TaskPlanningOutcome::OneBuild(bypass) => {
+                    task_planning_transcript = Some(bypass.transcript);
+                }
                 crate::task_queue::TaskPlanningOutcome::Rejected(rejected) => {
+                    task_planning_transcript = rejected.transcript.clone();
                     sink.emit(AgentEvent::TaskPlanRejected {
                         outcome: rejected.outcome,
                         attempts: rejected.attempts,
@@ -3274,6 +3374,7 @@ fn run_agent_inner<S: EventSink>(
         requested_goal,
         task_goal: single_task_goal,
         task_plan_rejected: task_plan_rejection_result,
+        task_planning_transcript,
     })
 }
 
@@ -21380,6 +21481,22 @@ pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn task_planning_setup_failure_preserves_the_original_build_route() {
+        let transcript = task_planning_setup_fallback("invalid optional policy");
+        assert_eq!(
+            transcript.decision,
+            crate::task_queue::TaskPlanningDecision::OneBuildPlannerFallback
+        );
+        assert!(
+            transcript
+                .summary
+                .contains("original Build request unchanged")
+        );
+        assert!(transcript.summary.contains("invalid optional policy"));
+        assert!(transcript.attempts.is_empty());
+    }
+
     struct RequiredJsonEngine {
         content: String,
         calls: Vec<AgentToolCall>,
@@ -21440,6 +21557,7 @@ mod tests {
             intent: None,
             task_planning: TaskPlanningPreference::Auto,
             task_plan_rejected: None,
+            task_planning_transcript: None,
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
@@ -31362,6 +31480,7 @@ the next imagined action"#;
             intent: Some(crate::workflow::TurnIntent::Discuss),
             task_planning: TaskPlanningPreference::Auto,
             task_plan_rejected: None,
+            task_planning_transcript: None,
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
@@ -31444,6 +31563,7 @@ the next imagined action"#;
             intent: Some(crate::workflow::TurnIntent::Discuss),
             task_planning: TaskPlanningPreference::Auto,
             task_plan_rejected: None,
+            task_planning_transcript: None,
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,

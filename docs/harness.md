@@ -350,6 +350,7 @@ pb-harness-.../
 ├── run-index.jsonl  # append-only started/finished run records
 └── runs/<run-id>/
     ├── events.jsonl # immutable event stream for this invocation
+    ├── task-planning-transcript.json # constrained attempts and route, when attempted
     └── journal.md   # final journal, or running recovery journal if interrupted
 ```
 
@@ -358,11 +359,13 @@ initializes it as a new scratch root. A non-empty existing directory is treated 
 candidate and is rejected unless it contains the expected Git workspace, so unrelated contents
 are never adopted or overwritten.
 
-The optional `multi-task-checkpoint.json` mirrors the latest accepted multi-Task parent checkpoint
+The optional `task-planning-transcript.json` preserves every compact planner/critic prompt, schema,
+raw and normalized artifact, typed failure, usage record, and final controller decision. The
+optional `multi-task-checkpoint.json` mirrors the latest accepted multi-Task parent checkpoint
 for qualification and recovery inspection. It contains the accepted plan, controller-owned
 budgets, active child checkpoint, usage watermarks, repository boundary, and terminal reason. It is
-written only when a qualified proposal creates a multi-Task run; a rejected proposal or one-Task
-unwrap does not fabricate it.
+written only when an accepted proposal creates a multi-Task run; a one-Task or fail-soft Build route
+does not fabricate it.
 
 The harness allocates the run ID and writes the per-run `running` journal plus a `started` index
 record before model loading. Events are flushed to both streams. Final journals are atomically

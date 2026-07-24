@@ -1558,6 +1558,7 @@ article.user div.message-container {
 .task-budget-track { display: block; width: min(15rem, 100%); height: 3px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--border-color, #d7dce5) 80%, transparent); }
 .task-budget-track > span { display: block; height: 100%; border-radius: inherit; background: #6956c9; }
 .task-progress-run-reason { margin: 0; padding: 0.55rem 0.9rem; border-top: 1px solid var(--border-color, #e3e6ec); color: #a53737; font-size: 0.75rem; }
+.task-progress-completion-audit { margin: 0; padding: 0.55rem 0.9rem; border-top: 1px solid var(--border-color, #e3e6ec); color: #18794e; font-size: 0.75rem; }
 
 .task-planning-recovery {
     display: flex;
@@ -1575,6 +1576,39 @@ article.user div.message-container {
 .task-planning-recovery > div { min-width: 0; }
 .task-planning-recovery p { max-width: 48rem; margin: 0; overflow-wrap: anywhere; color: var(--muted, #667085); font-size: 0.76rem; line-height: 1.4; }
 .task-planning-recovery-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 0.42rem; }
+
+.task-planning-details {
+    margin: 0.5rem 0.8rem 0;
+    border: 1px solid var(--border-color, #e3e6ec);
+    border-radius: 0.7rem;
+    background: var(--surface, #fff);
+    font-size: 0.78rem;
+}
+.task-planning-details > summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.7rem 0.85rem;
+    cursor: pointer;
+}
+.task-planning-details > summary > span:first-child { display: grid; gap: 0.12rem; }
+.task-planning-details summary small { color: var(--muted, #667085); font-weight: 400; }
+.task-planning-attempts { display: grid; gap: 0.55rem; padding: 0 0.85rem 0.85rem; }
+.task-planning-attempts > details { border-top: 1px solid var(--border-color, #e3e6ec); padding-top: 0.55rem; }
+.task-planning-attempts summary { cursor: pointer; font-weight: 600; }
+.task-planning-attempts h3 { margin: 0.6rem 0 0.25rem; font-size: 0.75rem; }
+.task-planning-attempts pre {
+    max-height: 18rem;
+    margin: 0;
+    overflow: auto;
+    border-radius: 0.45rem;
+    background: #111827;
+    color: #f3f4f6;
+    padding: 0.65rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
 
 @media (max-width: 576px) {
     .task-progress { margin: 0.5rem 0.55rem 0; border-radius: 0.7rem; }

@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import type { MultiTaskCheckpoint, TaskRun } from "../types";
 import {
   multiTaskStageLabel,
+  TaskPlanningDetails,
   TaskPlanningRecovery,
   TaskProgress,
   taskStateLabel,
@@ -95,6 +96,63 @@ describe("TaskProgress", () => {
   it("uses the Task product language consistently", () => {
     equal(taskStateLabel("no_change"), "Verified no change");
     equal(multiTaskStageLabel("ready"), "Tasks complete");
+  });
+
+  it("shows whole-request audit coverage at terminal readiness", () => {
+    const html = renderToStaticMarkup(
+      <TaskProgress
+        checkpoint={{
+          ...checkpoint,
+          run: {
+            ...checkpoint.run,
+            stage: "ready",
+            active_task_id: undefined,
+            completion_audit: {
+              plan_sha256: checkpoint.run.plan.sha256,
+              completed_at_ms: 70,
+              requirements: [{
+                requirement_id: "r1",
+                task_ids: ["t1"],
+                acceptance_ids: ["a1"],
+                evidence_refs: ["workflow:ready"],
+                commits: ["a".repeat(40)],
+              }],
+            },
+          },
+        }}
+      />,
+    );
+    ok(html.includes("Whole request audited"));
+    ok(html.includes("1 requirement"));
+  });
+});
+
+describe("TaskPlanningDetails", () => {
+  it("shows the controller decision and every preserved constrained attempt", () => {
+    const html = renderToStaticMarkup(
+      <TaskPlanningDetails
+        transcript={{
+          decision: "one_build_planner_fallback",
+          summary: "Task planning failed soft to the original Build",
+          attempts: [{
+            attempt: 1,
+            stage: "planner",
+            prompt: "Partition this Build",
+            schema: { type: "object" },
+            raw_output: "{}",
+            failure: "tasks is required",
+            prompt_tokens: 20,
+            generated_tokens: 2,
+            duration_ms: 5,
+          }],
+        }}
+      />,
+    );
+    ok(html.includes("Task planning details"));
+    ok(html.includes("failed soft to the original Build"));
+    ok(html.includes("tasks is required"));
+    ok(html.includes("Partition this Build"));
+    ok(html.includes("Constrained output"));
   });
 });
 

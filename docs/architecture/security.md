@@ -40,11 +40,13 @@ fingerprints. Later mutations invalidate stale approvals.
 
 ### Task decomposition cannot amplify authority
 
-High-level Task planning is enabled only by an embedded qualification bound to exact model bytes,
-backend, prompt-template version, and artifact protocol. Repository configuration cannot qualify a
-model. The model proposes qualitative effort; Rust owns every executable budget, validates complete
-requirement and acceptance coverage, rejects invalid dependencies and Goal contracts, and persists
-the accepted plan and fresh review before dispatch.
+Default high-level partitioning can produce Build Tasks only. Its constrained model artifact
+contains Task titles and controller-issued source-clause IDs, so it cannot add requirements, paths,
+acceptance claims, budgets, Goal authority, or publication authority. Rust requires exact source
+coverage, creates dependencies and budgets, and discards one-Task or invalid output before running
+the exact original Build. Repository configuration cannot change that authority boundary.
+Automatic Goal-shaped Task selection remains a separate promotion bound to exact model bytes,
+backend, prompt-template version, artifact protocol, and checked-in evidence.
 
 The multi-Task controller carries the source repository, workflow and Goal policies, request cap,
 no-publication boundary, and aggregate allowance as immutable authority. A child receives only its
@@ -55,8 +57,8 @@ stop at the existing safe workflow boundary before the over-budget parent fails 
 
 A user can use the existing Goal amendment flow inside a Goal Task, but the parent admits only a
 bounded revision that preserves the accepted objective and criteria, stays in the same workdir,
-keeps publication disabled, and fits the Task budget. Planning failure does not silently fall back
-to a larger Build; running as one Build is a separate explicit user decision.
+keeps publication disabled, and fits the Task budget. Default Build partitioning may fail soft only
+to the exact original Build request; it cannot substitute a broader summary or gain authority.
 
 ### Delegation cannot amplify authority
 
@@ -224,7 +226,7 @@ coverage, Build/Goal contracts, and controller-projected budgets before producin
 artifact. Numeric budgets in model proposals are rejected rather than treated as limits.
 
 `.pb/tasks.toml` contains effort presets and aggregate ceilings only. It cannot enable planning,
-qualify a model, select Goal automatically, change stage capabilities, or grant network,
+disable planning, qualify automatic Goal selection, change stage capabilities, or grant network,
 credential, mutation, or publication authority. Automatic Goal selection requires a separate
 controller-owned qualification record bound to exact model, template, protocol, and evidence
 digests; explicit Goal intent still enters the existing approval-gated Goal controller.
@@ -236,8 +238,8 @@ unreconciled delivery commits, and automatic pending-Task expansion. A changed B
 its managed commit; a Goal Task must preserve its ordered child commits without a synthetic squash.
 Cancellation retains completed history. The controller is connected to the normal user/session
 dispatch path, but the embedded qualification catalog is empty in this release. Therefore no
-installed model can currently enter automatic Task planning; ordinary Build/Goal dispatch remains
-unchanged until exact qualification evidence is promoted in a future release.
+installed model can currently create Goal-shaped Tasks automatically. Default constrained Build
+partitioning is available across supported local models; explicit Goal mode remains unchanged.
 
 ### Bounded model-source resolution
 

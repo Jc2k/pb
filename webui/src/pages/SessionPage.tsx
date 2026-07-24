@@ -5,7 +5,11 @@ import type { ComposerMode, EventEnvelope, SessionDetails } from "../types";
 import { IntentControl } from "../components/IntentControl";
 import { GoalAmendmentSheet } from "../components/GoalAmendmentSheet";
 import { GoalDrawer } from "../components/GoalDrawer";
-import { TaskPlanningRecovery, TaskProgress } from "../components/TaskProgress";
+import {
+  TaskPlanningDetails,
+  TaskPlanningRecovery,
+  TaskProgress,
+} from "../components/TaskProgress";
 import { GoalModeBanner } from "../components/GoalModeBanner";
 import { GoalPlanReview } from "../components/GoalPlanReview";
 import { GoalStartSheet } from "../components/GoalStartSheet";
@@ -442,6 +446,16 @@ export function SessionPage() {
                 setIntent("deliver");
                 setFollowUp(session.task);
               }}
+            />
+          )
+          : null}
+
+        {session.task_planning_transcript ||
+            session.multi_task?.run.planning_transcript
+          ? (
+            <TaskPlanningDetails
+              transcript={(session.task_planning_transcript ??
+                session.multi_task?.run.planning_transcript)!}
             />
           )
           : null}

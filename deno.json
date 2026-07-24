@@ -3,7 +3,7 @@
   "tasks": {
     "build:web": "deno run --allow-all npm:@rsbuild/core/rsbuild build",
     "test:web": "deno test --allow-read --allow-env --unstable-sloppy-imports webui/src",
-    "test:task-decomposition": "deno test --allow-read scripts/check-task-decomposition-corpus.test.ts && deno run --allow-read scripts/check-task-decomposition-corpus.ts",
+    "test:task-decomposition": "deno test --allow-read scripts/check-task-decomposition-corpus.test.ts scripts/check-default-task-partition-corpus.test.ts && deno run --allow-read scripts/check-task-decomposition-corpus.ts",
     "build:docs": "mdbook build",
     "test:docs": "mdbook build && deno run --allow-read scripts/check-docs.ts site"
   },

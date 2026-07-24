@@ -59,6 +59,25 @@ pub enum TaskState {
     Superseded,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCompletionRequirementAudit {
+    pub requirement_id: String,
+    pub task_ids: Vec<String>,
+    pub acceptance_ids: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub commits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCompletionAudit {
+    pub plan_sha256: String,
+    pub requirements: Vec<TaskCompletionRequirementAudit>,
+    pub terminal_repository: TaskRepositoryState,
+    pub completed_at_ms: u64,
+}
+
 impl TaskState {
     pub const fn is_success(self) -> bool {
         matches!(self, Self::Committed | Self::NoChange)
@@ -416,6 +435,10 @@ pub struct MultiTaskRun {
     pub plan_revision: u32,
     pub plan: ArtifactEnvelope<TaskPlanArtifact>,
     pub plan_review: ArtifactEnvelope<TaskPlanReviewArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_transcript: Option<super::TaskPlanningTranscript>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_audit: Option<TaskCompletionAudit>,
     pub policy: CompiledTaskPolicy,
     pub policy_sha256: String,
     pub authority: TaskAuthorityEnvelope,
@@ -671,6 +694,8 @@ impl MultiTaskRun {
             updated_at_ms: now_ms,
             plan,
             plan_review,
+            planning_transcript: None,
+            completion_audit: None,
             policy,
         };
         run.activate_next(now_ms)?;
@@ -750,6 +775,7 @@ impl MultiTaskRun {
                 self.current_task(&spec.id)
                     .is_some_and(|task| task.state.is_success())
             }) {
+                self.completion_audit = Some(self.build_completion_audit(now_ms)?);
                 self.stage = MultiTaskStage::Ready;
                 self.outcome = Some(MultiTaskOutcome::Ready);
                 self.reason = None;
@@ -778,6 +804,71 @@ impl MultiTaskRun {
         self.reason = None;
         self.updated_at_ms = now_ms;
         Ok(())
+    }
+
+    fn build_completion_audit(&self, now_ms: u64) -> Result<TaskCompletionAudit> {
+        let requirements = self
+            .plan
+            .artifact
+            .requirements
+            .iter()
+            .map(|requirement| {
+                let owners = self
+                    .plan
+                    .artifact
+                    .tasks
+                    .iter()
+                    .filter(|task| task.requirement_ids.contains(&requirement.id))
+                    .collect::<Vec<_>>();
+                if owners.is_empty() {
+                    bail!(
+                        "whole-request completion audit found no Task for requirement '{}'",
+                        requirement.id
+                    );
+                }
+                let mut task_ids = Vec::new();
+                let mut acceptance_ids = BTreeSet::new();
+                let mut evidence_refs = BTreeSet::new();
+                let mut commits = BTreeSet::new();
+                for owner in owners {
+                    let task = self.current_task(&owner.id).with_context(|| {
+                        format!("completion audit cannot find Task '{}'", owner.id)
+                    })?;
+                    if !task.state.is_success() {
+                        bail!(
+                            "whole-request completion audit found unfinished Task '{}'",
+                            owner.id
+                        );
+                    }
+                    let result = task.result.as_ref().with_context(|| {
+                        format!("completion audit found no result for Task '{}'", owner.id)
+                    })?;
+                    task_ids.push(owner.id.clone());
+                    acceptance_ids.extend(owner.acceptance_ids.iter().cloned());
+                    evidence_refs.extend(result.evidence_refs.iter().cloned());
+                    commits.extend(result.commits.iter().cloned());
+                }
+                if evidence_refs.is_empty() {
+                    bail!(
+                        "whole-request completion audit found no evidence for requirement '{}'",
+                        requirement.id
+                    );
+                }
+                Ok(TaskCompletionRequirementAudit {
+                    requirement_id: requirement.id.clone(),
+                    task_ids,
+                    acceptance_ids: acceptance_ids.into_iter().collect(),
+                    evidence_refs: evidence_refs.into_iter().collect(),
+                    commits: commits.into_iter().collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(TaskCompletionAudit {
+            plan_sha256: self.plan.sha256.clone(),
+            requirements,
+            terminal_repository: self.expected_repository.clone(),
+            completed_at_ms: now_ms,
+        })
     }
 
     fn build_request(&self, task_id: &str) -> Result<TaskRequest> {
@@ -983,6 +1074,35 @@ impl MultiTaskRun {
                     })
                 {
                     bail!("ready multi-Task checkpoint has incomplete Tasks");
+                }
+                let audit = self
+                    .completion_audit
+                    .as_ref()
+                    .context("ready multi-Task checkpoint has no whole-request completion audit")?;
+                if audit.plan_sha256 != self.plan.sha256
+                    || audit.terminal_repository != self.expected_repository
+                {
+                    bail!("whole-request completion audit does not match the ready checkpoint");
+                }
+                let expected = self
+                    .plan
+                    .artifact
+                    .requirements
+                    .iter()
+                    .map(|requirement| requirement.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let actual = audit
+                    .requirements
+                    .iter()
+                    .map(|requirement| requirement.requirement_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                if actual != expected
+                    || audit
+                        .requirements
+                        .iter()
+                        .any(|item| item.evidence_refs.is_empty())
+                {
+                    bail!("whole-request completion audit has missing or duplicate coverage");
                 }
             }
             MultiTaskStage::Failed => {
@@ -2596,6 +2716,18 @@ mod tests {
         .unwrap();
         assert_eq!(run.stage, MultiTaskStage::Ready);
         assert_eq!(run.outcome, Some(MultiTaskOutcome::Ready));
+        let audit = run.completion_audit.as_ref().unwrap();
+        assert_eq!(audit.plan_sha256, run.plan.sha256);
+        assert_eq!(
+            audit.requirements.len(),
+            run.plan.artifact.requirements.len()
+        );
+        assert!(
+            audit
+                .requirements
+                .iter()
+                .all(|requirement| !requirement.evidence_refs.is_empty())
+        );
     }
 
     #[test]

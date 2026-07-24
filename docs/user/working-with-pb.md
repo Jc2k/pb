@@ -69,48 +69,26 @@ recoverable from Git.
 
 ## Tasks
 
-**Shipped controller; no planner currently qualified.** For a larger explicit Build request, pb can
-first create a high-level plan of outcome-shaped **Tasks** once an exact qualification is shipped.
-Each Task is either **Build** or
-**Goal**, has its own read-only budget display, and runs in order. This is above ordinary Build
-planning: when a Build Task becomes active, its normal planner still inspects the current repository
-and proposes the actual changes, checks, and commit boundary for that Task.
+**Shipped and on by default for new Builds.** pb first asks the selected local model whether a Build
+request is usefully divided into outcome-shaped **Tasks**. This sits above ordinary Build planning:
+after the previous Task commits, each Build Task starts a fresh normal plan against the repository it
+received and decides its actual changes, checks, documentation, review, and commit boundary.
 
-The full selected local model artifact must exactly match pb's embedded
-model/backend/template/protocol qualification record; split GGUF qualifications bind every shard.
-pb constrains both the proposed plan and its fresh review to exact JSON
-schemas while each token is selected. Both inference engines return those artifacts as plain JSON;
-FlashMoe uses LLGuidance with the active Hugging Face or DeepSeek tokenizer rather than asking the
-model to wrap the artifact in a tool call. If that tokenizer or schema cannot be constrained, the
-artifact request fails before generation instead of accepting prompt-shaped JSON. This does not
-change the native action tools used inside an ordinary Build or Goal. pb splits compound request sentences at punctuation
-boundaries; the model orders Tasks and selects their behavioral requirements from those verbatim
-request clauses. pb automatically attaches
-decomposition-wide constraints to every Task. Each Task separately states outcome acceptance, test
-work, and documentation work or impact. pb retains the original objective and assigns IDs,
-dependencies, qualitative effort, and budgets so summarization and bookkeeping mistakes cannot
-enter the queue. A Build Task in a multi-Task queue can own at most two behavioral clauses and needs
-an outcome acceptance fact and test fact for each. pb rejects a queue entry that claims only decomposition constraints, so
-testing, documentation, ordering, and generic final validation cannot become catch-all Tasks.
-Deterministic validation and review still decide whether the result is complete and useful. The
-embedded catalog is empty in this release, and `.pb/tasks.toml`
-cannot turn the feature on. With an unqualified model, pb
-starts the current Build workflow directly, so existing projects do not pay an extra planning turn
-or see a new UI.
-
-The fresh critic must first assess every supplied source-request clause exactly once, identifying
-the Tasks that preserve it. It must then separately audit request coverage, Task boundaries,
-dependency order, observable acceptance, test/documentation ownership, and effort/Goal authority.
-pb accepts a pass only when all six audits pass; a revision must identify a failed audit, select
-verbatim evidence from the original request, and provide a blocking correction grounded in that
-evidence.
+The high-level model output is deliberately small. It can return only Task titles and choose which
+controller-issued source-clause IDs each Task owns. pb retains the exact original request and owns
+Task IDs, descriptions, dependencies, acceptance records, Build budgets, and authority. Both
+llama.cpp and FlashMoe constrain every output token to this JSON schema; FlashMoe uses LLGuidance
+with the active model tokenizer. Rust proves disjoint ownership and explicit `before`, `after`, and
+`then` order. A compact fresh critic reports possible ordering or over-broad boundaries as advisory
+evidence; qualification showed that letting the small model veto an otherwise valid partition made
+routing less accurate. The critic cannot add requirements or implementation advice. There is at
+most one revision for a deterministic rejection.
 
 The number of accepted Tasks determines the experience:
 
-- One Build Task looks and behaves like the existing Build workflow.
-- One Goal Task looks and behaves like the existing Goal workflow and still waits at its normal
-  Goal plan approval boundary.
-- Two or more Tasks show a **Tasks** panel with ordered state, Build/Goal kind, active Task, budget
+- One Task is discarded and the exact original request continues as the existing Build workflow.
+- Invalid planning also continues with that unchanged Build request.
+- Two or more accepted Tasks show a **Tasks** panel with ordered state, Build kind, active Task, budget
   use, commits, and any blocked reason. An active Goal's existing controls appear inside that Goal
   Task.
 
@@ -120,10 +98,15 @@ state, and only then queues the next Task. Stopping or exhausting a Task preserv
 commits and prevents dependent Tasks from starting. A restart restores the exact active request and
 remaining allowance, paused at a safe boundary.
 
-If high-level planning cannot produce a valid reviewed plan in two attempts, pb does not silently
-run the broad request. The session shows three choices: **Retry planning**, **Edit request**, or
-**Run as one Build**. The final choice is a new explicit decision and enters the unchanged Build
-workflow.
+The expandable **Task planning details** record explains every route. It preserves the local prompt,
+schema, raw constrained JSON, normalized artifact, failure, token/runtime usage, and controller
+decision; it is model I/O, not hidden reasoning. Before a multi-Task run becomes Ready, pb also
+checks every original requirement against successful Task evidence, acceptance IDs, commits, and
+the exact terminal repository.
+
+Default decomposition creates Build Tasks only. Explicit **Goal** mode continues unchanged and still
+waits at its normal approval boundaries. Automatic Goal-shaped Tasks require a separately promoted,
+exact model qualification and are not enabled by `.pb/tasks.toml`.
 
 ## Goal
 

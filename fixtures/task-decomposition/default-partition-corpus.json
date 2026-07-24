@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "trivial_one_build",
+      "category": "single_build",
+      "prompt": "Fix the average divisor and add a regression test.",
+      "paired_build_prompt": "Fix the average divisor and add a regression test.",
+      "expected": { "route": "one_build", "min_tasks": 1, "max_tasks": 1 }
+    },
+    {
+      "id": "storage_before_api",
+      "category": "ordered_multi_task",
+      "prompt": "Add durable import lifecycle storage and a rollback-safe migration before exposing compatible status and cancel APIs, with tests and documentation owned by each behavior change.",
+      "paired_build_prompt": "Add durable import lifecycle storage and a rollback-safe migration, including its tests and documentation.",
+      "expected": {
+        "route": "multi_task",
+        "min_tasks": 2,
+        "max_tasks": 3,
+        "order_terms": [["storage", "api"], ["migration", "api"]]
+      }
+    },
+    {
+      "id": "cross_stack_feature",
+      "category": "multi_task",
+      "prompt": "Persist import progress, expose it through the existing API without breaking clients, and render accessible progress and retry controls in the web UI, with applicable tests and user documentation.",
+      "paired_build_prompt": "Persist import progress with its storage tests and documentation.",
+      "expected": { "route": "multi_task", "min_tasks": 2, "max_tasks": 4 }
+    },
+    {
+      "id": "scoped_multi_component_refactor",
+      "category": "multi_task",
+      "prompt": "Extract the shared repository fingerprint logic, migrate workflow and Goal consumers without changing their persisted formats, then remove the duplicate implementations and update their focused tests.",
+      "paired_build_prompt": "Extract the shared repository fingerprint logic and update its focused tests without changing persisted formats.",
+      "expected": { "route": "multi_task", "min_tasks": 2, "max_tasks": 4 }
+    },
+    {
+      "id": "tightly_coupled_parser_fix",
+      "category": "single_build",
+      "prompt": "Change the parser and its directly coupled serializer so escaped field names round-trip, and add the regression fixture.",
+      "paired_build_prompt": "Change the parser and its directly coupled serializer so escaped field names round-trip, and add the regression fixture.",
+      "expected": { "route": "one_build", "min_tasks": 1, "max_tasks": 1 }
+    },
+    {
+      "id": "compatibility_and_non_goals",
+      "category": "multi_task",
+      "prompt": "Add a versioned local cache while preserving the existing on-disk format and CLI output; expose cache state in the UI, but do not add network sync or change cleanup defaults. Include rollback coverage and documentation.",
+      "paired_build_prompt": "Add a versioned local cache while preserving the existing on-disk format and CLI output, without network sync or cleanup-default changes, including rollback coverage and documentation.",
+      "expected": { "route": "multi_task", "min_tasks": 2, "max_tasks": 4 }
+    }
+  ]
+}

@@ -33,48 +33,32 @@ deterministic harness stages and do not run a model.
 
 ### High-level Tasks
 
-**Shipped controller; no planner currently qualified.** Before a new explicit Build starts, pb can
-ask an exactly qualified local model for a model-facing high-level proposal. This is separate from
-the existing Build `PlanArtifact`: each ordered outcome-shaped Task contains its Build or Goal kind,
-exact controller-supplied request-evidence clauses, outcome acceptance, owned test facts, and owned
-documentation facts. The original objective remains controller-owned rather than being repeated or
-summarized by the model. A proposal cannot contain IDs, cross-references,
-dependencies, effort, or executable numeric budgets. pb assigns stable IDs, deduplicates shared
-facts, compiles array order into the sequential dependency chain, assigns Build Tasks the bounded
-small preset, and assigns Goal Tasks the largest preset that keeps the whole queue within its
-aggregate ceiling. The fresh effort/Goal audit can still reject a Task that is too broad for its
-controller-assigned allowance. Proposal and review generation are token-constrained to
-controller-owned JSON schemas. llama.cpp uses its tokenizer-aware LLGuidance sampler. FlashMoe
-builds the same LLGuidance grammar contract directly from Hugging Face byte-level/byte-fallback
-tokenizer JSON or the native DeepSeek JoyAI byte-BPE table, and returns the artifact as plain JSON
-rather than disguising it as a required tool call. Unknown fields, missing required fields, invalid
-enums, numeric bounds, Unicode escapes, and structural array overflows are therefore masked during
-sampling rather than left to prompt compliance. A tokenizer or schema that cannot compile fails the
-structured request during preflight; ordinary Build and Goal tool generation remains available and
-never silently falls back to prompt-only JSON. This structural guarantee does not judge whether a
-decomposition is useful. A fresh critic reviews the compiled plan, while Rust rejects empty facts,
-missing coverage, invalid Goal contracts, unqualified automatic Goal selection, and aggregate
-overflow before any child starts. The controller splits punctuation-delimited compound request
-clauses before presenting the exact behavioral choices. The model selects only those choices. Rust
-attaches every decomposition-wide test, documentation, ordering, generic-validation, and
-smaller-model constraint to every behavior-owning Task. In a multi-Task proposal, Rust also rejects
-a Task that claims only those constraints. A Build Task may own at most two behavioral clauses and
-must carry at least one outcome acceptance fact and test fact per owned clause. Planning has three
-attempts and its own invocation, token, advisory, and wall-time allowance.
+**Shipped and on by default for new Builds.** Before an eligible explicit Build starts, pb asks the
+selected local model for a compact high-level partition. This is separate from the existing Build
+`PlanArtifact`. The model-facing proposal contains only an ordered `tasks` array; each item has a
+short title and a `covers` array selected from controller-issued source-clause IDs. The model cannot
+author objectives, descriptions, repository paths, dependencies, acceptance claims, tests,
+documentation claims, effort, Goal authority, or numeric budgets. pb preserves the original
+objective, turns exact source clauses into requirements, requires each clause to be owned exactly
+once, creates the sequential dependency/commit chain, and assigns the bounded `small` budget.
 
-Before those aggregate audits, the critic must assess every controller-supplied source-request
-clause exactly once and identify the Tasks that preserve its meaning. Rust rejects missing,
-repeated, or invented clause assessments. The critic must then return six controller-validated
-audit records exactly once: request coverage, Task
-boundaries, dependency order, acceptance observability, test/documentation ownership, and
-effort/Goal authority. A passing review requires every audit to pass. Revision requires both a
-failed audit and a blocking challenge. Every challenge's request evidence is selected from a
-schema enum of bounded verbatim source-request clauses and revalidated before acceptance, so a bare
-`pass`, generic criticism, or fabricated quote cannot cross the review boundary.
+Proposal and criticism are token-constrained to controller-owned JSON schemas in llama.cpp and
+FlashMoe. FlashMoe builds the same LLGuidance grammar against its active Hugging Face or DeepSeek
+tokenizer. Unsupported tokenizer/schema pairs fail the optional partitioning preflight; neither
+backend substitutes prompt-only JSON. Structural validity is not treated as semantic quality. For
+partitions containing two or more Tasks, a fresh compact critic reports only reversed ordering or
+an independently undeliverable boundary. Its findings are preserved as advisory evidence because
+qualification showed false vetoes even after deterministic defects were removed. Rust owns source
+coverage, disjoint ownership, explicit `before`/`after`/`then` order, IDs, dependency construction,
+budgets, and authority. There is at most one planner revision for a deterministic rejection.
 
-One accepted Task is unwrapped. A Build Task enters the ordinary Build workflow, whose planner still
-decides the actual changes against current repository state. A Goal Task enters the existing Goal
-approval and milestone UI. No `MultiTaskRun` or Tasks panel is created for either one-Task case.
+If the constrained proposal contains one Task, pb discards it immediately and runs the exact
+original Build request. It does not review, summarize, or project that Task. Invocation, schema,
+parse, coverage, critic, and coordination-budget failures also fail soft to that same original
+Build after the bounded attempts. Cancellation remains terminal. The full local prompt, schema,
+raw constrained output, normalized artifact, typed failure, token/runtime counters, and final
+controller decision are persisted as an expandable Task-planning transcript. This evidence explains
+fallbacks without exposing or requesting hidden chain-of-thought.
 
 Two or more accepted Tasks create a digest-bound `MultiTaskRun` and an ordered Tasks panel. The
 controller activates only one dependency-ready Task. A Build Task is projected into the existing
@@ -94,18 +78,18 @@ or exceed the parent Task budget.
 The parent checkpoint persists the accepted plan and review, exact model/template/protocol
 qualification, policy, budgets, queue revision, active request, native child checkpoint, repository
 fingerprints, usage, results, and terminal reason in the existing repository-local session Git
-note. Restore pauses active work at a safe boundary. Structured Task events and the session API use
-the same checkpoint digest. A planning failure exposes exactly three decisions: retry planning,
-edit the request, or explicitly run the original request as one Build; there is no silent fallback.
+note. It also persists the planning transcript and, before `Ready`, a whole-request completion audit
+mapping every original requirement to successful Task results, acceptance IDs, evidence references,
+commits, and the exact terminal repository. Missing ownership, result evidence, or repository
+reconciliation prevents a `Ready` outcome. Restore pauses active work at a safe boundary.
 
-Automatic Task planning is fail-closed, and this release's embedded qualification catalog is empty.
-The full selected model artifact, backend, prompt-template version, artifact protocol, and
-structured-output contract must match the embedded controller-owned qualification catalog. A
-single-file GGUF retains its file SHA-256 identity; a split GGUF uses a domain-separated digest over
-the ordered names, lengths, and bytes of every shard, and an incomplete shard set is rejected. Project
-configuration cannot add an entry. An unqualified model follows the pre-existing Build path without
-the extra planning call or Tasks UI. `.pb/tasks.toml` supplies only versioned effort presets and
-ceilings and cannot grant qualification, automatic Goal selection, authority, or publication.
+The default partitioner can create Build Tasks only and cannot amplify authority. Explicit Goal
+mode continues to enter the existing Goal approval and milestone controller without this Build
+preflight. Automatic Goal-shaped Task selection remains a separate fail-closed promotion: it needs
+an embedded qualification bound to exact model bytes, backend, template, protocol, and evidence.
+The embedded promotion catalog is currently empty. `.pb/tasks.toml` supplies versioned budget
+ceilings but cannot disable or enable default partitioning, grant Goal authority, or allow
+publication.
 
 ### 1. Planning
 

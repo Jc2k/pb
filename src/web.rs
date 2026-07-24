@@ -322,6 +322,8 @@ pub struct SessionDetails {
     pub active_multi_task: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_plan_rejected: Option<crate::task_queue::TaskPlanRejected>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_planning_transcript: Option<crate::task_queue::TaskPlanningTranscript>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -865,6 +867,7 @@ async fn start_session_inner(
     request.intent = Some(req.intent.unwrap_or(workflow_policy.default_intent));
     request.task_planning = crate::agent_core::TaskPlanningPreference::Auto;
     request.task_plan_rejected = None;
+    request.task_planning_transcript = None;
     // A new user turn in a restored conversation always uses current workflow policy. The
     // compatibility marker applies only to resuming the exact pre-intent invocation.
     request.legacy_prompt_owned_delivery = false;
@@ -2319,6 +2322,7 @@ async fn recover_task_plan(
     };
     session.request_template.task_planning = preference;
     session.request_template.task_plan_rejected = None;
+    session.request_template.task_planning_transcript = None;
     session.request_template.turn_id = new_turn_id(&id);
     session.request_template.workflow_stage = None;
     session.request_template.workflow_checkpoint = None;
@@ -2770,6 +2774,7 @@ async fn get_session(
         multi_task: latest_multi_task_checkpoint(session).cloned(),
         active_multi_task: session.multi_task.is_some(),
         task_plan_rejected: session.request_template.task_plan_rejected.clone(),
+        task_planning_transcript: session.request_template.task_planning_transcript.clone(),
     }))
 }
 
@@ -3622,6 +3627,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 Ok(Ok(run_result)) => {
                     session.request_template.task_plan_rejected =
                         run_result.task_plan_rejected.clone();
+                    session.request_template.task_planning_transcript =
+                        run_result.task_planning_transcript.clone();
                     session.request_template.repository_context =
                         run_result.repository_context.clone();
                     session.request_template.workspace_graph = run_result.workspace_graph.clone();
@@ -5203,6 +5210,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         multi_task: latest_multi_task_checkpoint(session).cloned(),
         active_multi_task: session.multi_task.is_some(),
         task_plan_rejected: session.request_template.task_plan_rejected.clone(),
+        task_planning_transcript: session.request_template.task_planning_transcript.clone(),
     })
 }
 
@@ -5376,6 +5384,7 @@ mod workflow_tests {
             intent: Some(crate::workflow::TurnIntent::Deliver),
             task_planning: crate::agent_core::TaskPlanningPreference::Auto,
             task_plan_rejected: None,
+            task_planning_transcript: None,
             workflow_policy: Some(
                 crate::workflow::WorkflowConfigDocument::default()
                     .compile()

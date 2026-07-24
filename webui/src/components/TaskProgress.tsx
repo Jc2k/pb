@@ -1,6 +1,7 @@
 import type {
   MultiTaskCheckpoint,
   MultiTaskStage,
+  TaskPlanningTranscript,
   TaskPlanRejected,
   TaskRun,
   TaskState,
@@ -8,6 +9,54 @@ import type {
 import type { ReactNode } from "react";
 
 const successfulStates = new Set<TaskState>(["committed", "no_change"]);
+
+export function TaskPlanningDetails({
+  transcript,
+}: {
+  transcript: TaskPlanningTranscript;
+}) {
+  return (
+    <details className="task-planning-details">
+      <summary>
+        <span>
+          <strong>Task planning details</strong>
+          <small>{transcript.summary}</small>
+        </span>
+        <span>
+          {transcript.attempts.length}{" "}
+          model call{transcript.attempts.length === 1 ? "" : "s"}
+        </span>
+      </summary>
+      <div className="task-planning-attempts">
+        {transcript.attempts.map((attempt, index) => (
+          <details key={`${attempt.attempt}-${attempt.stage}-${index}`}>
+            <summary>
+              Attempt {attempt.attempt} ·{" "}
+              {attempt.stage === "planner" ? "partition" : "criticism"}
+              {attempt.failure ? " · rejected" : ""}
+            </summary>
+            {attempt.failure
+              ? <p className="text-danger">{attempt.failure}</p>
+              : null}
+            <p className="small text-body-secondary">
+              {attempt.prompt_tokens} prompt tokens · {attempt.generated_tokens}
+              {" "}
+              generated · {attempt.duration_ms} ms
+            </p>
+            <h3>Prompt</h3>
+            <pre>{attempt.prompt}</pre>
+            <h3>Constrained output</h3>
+            <pre>{attempt.raw_output ?? "No model output"}</pre>
+            <details>
+              <summary>Schema and normalized artifact</summary>
+              <pre>{JSON.stringify({ schema: attempt.schema, normalized: attempt.normalized_output }, null, 2)}</pre>
+            </details>
+          </details>
+        ))}
+      </div>
+    </details>
+  );
+}
 
 export function taskStateLabel(state: TaskState): string {
   switch (state) {
@@ -152,6 +201,13 @@ export function TaskProgress(
       {run.reason && (
         <p className="task-progress-run-reason" role="status">
           {run.reason}
+        </p>
+      )}
+      {run.completion_audit && (
+        <p className="task-progress-completion-audit" role="status">
+          Whole request audited · {run.completion_audit.requirements.length}
+          {" "}
+          requirement{run.completion_audit.requirements.length === 1 ? "" : "s"}
         </p>
       )}
     </section>

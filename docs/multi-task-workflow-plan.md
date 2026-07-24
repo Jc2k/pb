@@ -1,8 +1,13 @@
 # Task decomposition workflow plan
 
-Status: design record; controller, recovery, and UI shipped; automatic planning unqualified
+Status: design record; default Build partitioning, controller, transcripts, completion audit, and UI shipped
 
 Assessment: [2026-07-23 decomposition feasibility probe](benchmarks/multi-task-decomposition.md)
+
+The detailed proposal/review shapes below preserve the original design history. The shipped
+model-facing protocol is now the compact `tasks[].{title,covers}` partition plus a two-code advisory
+critic; Rust compiles and gates the richer internal artifacts. One Task or bounded planning failure runs the exact
+original Build, while automatic Goal-shaped Tasks remain separately qualified.
 
 ## Decision summary
 

@@ -421,6 +421,7 @@ mod tests {
             intent: Some(crate::workflow::TurnIntent::Discuss),
             task_planning: crate::agent_core::TaskPlanningPreference::Auto,
             task_plan_rejected: None,
+            task_planning_transcript: None,
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,

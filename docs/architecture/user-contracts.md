@@ -32,33 +32,28 @@ Auto turn citing its exact current turn can create one, and creation still stops
 approval. Project configuration cannot activate a Goal or choose automatic continuation.
 
 The shipped Task controller applies the same authority rule before high-level decomposition.
-`.pb/tasks.toml` can narrow budgets but cannot qualify a planner or authorize automatic Goal
-selection. Qualification is an embedded controller-owned record for the exact model bytes, backend,
-prompt template, artifact protocol, and structured-output contract. The planner and critic are
-token-constrained to exact controller schemas in both supported inference engines; schema validity
-does not replace deterministic coverage, graph, authority, or budget validation, nor the fresh
-semantic critique. These artifacts are plain JSON in both engines. FlashMoe compiles LLGuidance
-against the active Hugging Face or DeepSeek tokenizer and fails the artifact request at preflight if
-that exact tokenizer/schema pair is unsupported; it does not substitute a synthetic tool call or
-prompt-only parsing. Native Build and Goal action tools retain their existing Qwen or DeepSeek wire
-protocols. The controller retains the verbatim objective, splits compound clauses at
-punctuation boundaries, and supplies the only behavioral request clauses a Task may claim. It
-automatically attaches decomposition-wide constraints to every Task. Each Task separately declares
-outcome acceptance, owned tests, and documentation work or impact. In a multi-Task queue, a Build
-Task may own at most two behavioral clauses and must have an outcome acceptance fact and test fact
-for each. The critic must assess every supplied clause exactly once before its aggregate audits can
-pass. A multi-Task proposal cannot create a queue entry that owns only decomposition
-constraints; tests, documentation, ordering, and final validation remain with a behavior-owning
-Task. An unqualified model stays on the ordinary Build path. A
-qualified one-Task result unwraps into the same Build or Goal experience; only two or more Tasks
-create a durable queue and Tasks UI.
+`.pb/tasks.toml` can narrow budgets but cannot grant authority or authorize automatic Goal
+selection. Default Build partitioning uses constrained plain JSON in both supported inference
+engines. Its model-facing contract contains only Task titles and controller-issued source-clause
+IDs. Rust retains the original objective, requires exact single ownership of every clause, creates
+IDs and sequential dependencies, assigns Build budgets, and keeps tests, documentation, review,
+and commits inside the normal Build workflow. Rust also enforces explicit `before`, `after`, and
+`then` order. The compact critic reports only ordering or independently deliverable-boundary
+concerns as advisory evidence; it cannot rewrite or veto a deterministically valid partition.
+Schema validity does not replace these deterministic checks.
+
+A one-Task proposal is discarded, not projected: the exact original request enters the ordinary
+Build workflow. Invalid output gets one revision and then follows that same fail-soft path. Only two
+or more accepted Tasks create a durable queue and Tasks UI. Explicit
+Goal intent still uses the existing approval-gated Goal lifecycle. Automatic Goal-shaped Tasks need
+a separate exact embedded qualification and remain fail-closed.
 
 The accepted high-level plan is not mutation authority. It can only narrow the original objective,
 repository, workflow and Goal policies, request cap, aggregate allowance, and no-publication
 boundary. Each queued Task becomes a fresh Build or Goal request only when its dependencies are
 delivered and the repository matches the prior terminal checkpoint. Task-planning failure cannot
-silently reinterpret the broad original request as one Build: retry, edit, and an explicit
-run-as-one-Build decision are distinct user actions.
+reinterpret the broad request: fallback runs the exact original Build task, and the full constrained
+planning transcript plus controller decision remains available in session details.
 
 When planning discovers a materially missing choice, it may ask the user. The answer becomes part of
 the task contract. Guessing would make progress faster at the cost of changing ownership of the

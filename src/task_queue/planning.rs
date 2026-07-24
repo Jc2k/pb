@@ -9,29 +9,26 @@ use sha2::{Digest, Sha256};
 use crate::workflow::ArtifactEnvelope;
 
 use super::{
-    CompiledTaskPolicy, TaskAcceptance, TaskCoordinationCounters, TaskEffort, TaskKind,
-    TaskPlanArtifact, TaskPlanAuthority, TaskPlanProposal, TaskPlanReviewArtifact,
-    TaskPlanReviewVerdict, TaskPlannerQualification, TaskProposal, TaskRequirement, TaskRisk,
-    TaskSourceIntent,
+    CompiledTaskPolicy, REQUIRED_TASK_PLAN_AUDIT_CATEGORIES, TaskAcceptance,
+    TaskCoordinationCounters, TaskEffort, TaskKind, TaskPlanArtifact, TaskPlanAudit,
+    TaskPlanAuditCategory, TaskPlanAuditVerdict, TaskPlanAuthority, TaskPlanProposal,
+    TaskPlanRequestAssessment, TaskPlanReviewArtifact, TaskPlanReviewVerdict,
+    TaskPlannerQualification, TaskProposal, TaskRequirement, TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v12";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v11";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v13";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-partition-review-v12";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
-const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
-const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
+const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 1_024;
+const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 512;
 const MAX_RETRY_FEEDBACK_CHARS: usize = 4_000;
 const MAX_PLANNING_FACTS: usize = 32;
-const MAX_SCOPE_HINTS: usize = 16;
-const MAX_RISKS: usize = 16;
-const MAX_GOAL_CRITERIA: usize = 16;
-const MAX_REVIEW_CHALLENGES: usize = 16;
-const MAX_ID_CHARS: usize = 128;
 const MAX_TITLE_CHARS: usize = 256;
 // llama.cpp's grammar parser rejects bounded repetitions above 2,000. Keep the shared schema
 // comfortably below that backend limit so the same contract compiles in llama.cpp and FlashMoe.
 const MAX_DESCRIPTION_CHARS: usize = 1_024;
-const MAX_BUILD_TASK_BEHAVIOR_CLAUSES: usize = 2;
+const MAX_BUILD_TASK_BEHAVIOR_CLAUSES: usize = 3;
+const MAX_TASK_PLANNING_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -53,24 +50,42 @@ pub struct TaskModelOutput {
 #[serde(deny_unknown_fields)]
 struct TaskModelProposal {
     tasks: Vec<TaskModelTask>,
-    #[serde(default)]
-    risks: Vec<TaskRisk>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TaskModelTask {
     title: String,
-    description: String,
-    request_evidence: Vec<String>,
-    acceptance: Vec<String>,
-    tests: Vec<String>,
-    documentation: Vec<String>,
-    #[serde(default)]
-    scope_hints: Vec<String>,
-    kind: TaskKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    goal_contract: Option<super::TaskGoalContract>,
+    covers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TaskModelReviewDecision {
+    Accept,
+    Revise,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TaskModelReview {
+    decision: TaskModelReviewDecision,
+    issues: Vec<TaskModelReviewIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TaskModelReviewIssue {
+    code: TaskModelReviewIssueCode,
+    task_ids: Vec<String>,
+    source_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TaskModelReviewIssueCode {
+    BadOrder,
+    TooBroad,
 }
 
 impl TaskModelProposal {
@@ -79,39 +94,6 @@ impl TaskModelProposal {
         policy: &CompiledTaskPolicy,
         objective: &str,
     ) -> Result<TaskPlanProposal> {
-        if self.tasks.len() > 1 {
-            for task in &self.tasks {
-                if task
-                    .request_evidence
-                    .iter()
-                    .all(|evidence| is_decomposition_constraint(evidence))
-                {
-                    bail!(
-                        "Task '{}' owns only decomposition constraints; tests, documentation, ordering, and final validation must stay with a behavior-owning Task",
-                        task.title
-                    );
-                }
-                let behavior_count = task
-                    .request_evidence
-                    .iter()
-                    .filter(|evidence| !is_decomposition_constraint(evidence))
-                    .collect::<BTreeSet<_>>()
-                    .len();
-                if task.kind == TaskKind::Build && behavior_count > MAX_BUILD_TASK_BEHAVIOR_CLAUSES
-                {
-                    bail!(
-                        "Build Task '{}' owns {behavior_count} behavioral request clauses; maximum is {MAX_BUILD_TASK_BEHAVIOR_CLAUSES}",
-                        task.title
-                    );
-                }
-                if task.acceptance.len() < behavior_count || task.tests.len() < behavior_count {
-                    bail!(
-                        "Task '{}' needs at least one outcome acceptance fact and test fact for each of its {behavior_count} behavioral request clauses",
-                        task.title
-                    );
-                }
-            }
-        }
         let request_evidence = request_evidence_clauses(objective);
         let requirements = request_evidence
             .iter()
@@ -121,95 +103,125 @@ impl TaskModelProposal {
                 description: description.clone(),
             })
             .collect::<Vec<_>>();
-        let requirement_ids = requirements
+        let requirement_ids_by_description = requirements
             .iter()
             .map(|requirement| (requirement.description.clone(), requirement.id.clone()))
             .collect::<BTreeMap<_, _>>();
-        let constraint_requirement_ids = request_evidence
+        let behavior_evidence = behavior_evidence_clauses(objective);
+        let requirement_ids = behavior_evidence
             .iter()
-            .filter(|evidence| is_decomposition_constraint(evidence))
-            .filter_map(|evidence| requirement_ids.get(evidence).cloned())
+            .enumerate()
+            .map(|(index, description)| {
+                (
+                    source_id(index),
+                    requirement_ids_by_description
+                        .get(description)
+                        .expect("behavior evidence is a request clause")
+                        .clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let behavior_set = behavior_evidence.into_iter().collect::<BTreeSet<_>>();
+        let constraint_requirement_ids = requirements
+            .iter()
+            .filter(|requirement| !behavior_set.contains(&requirement.description))
+            .map(|requirement| requirement.id.clone())
             .collect::<Vec<_>>();
-        let behavior_evidence = behavior_evidence_clauses(objective)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+        let mut covered = BTreeSet::new();
+        let mut source_task_positions = BTreeMap::new();
         let mut acceptance = Vec::new();
-        let mut acceptance_ids = BTreeMap::<String, String>::new();
         let mut tasks = Vec::with_capacity(self.tasks.len());
 
         for (task_index, task) in self.tasks.into_iter().enumerate() {
             let id = format!("task-{:02}", task_index + 1);
+            if task.covers.is_empty() {
+                bail!(
+                    "Task '{}' must cover at least one source clause",
+                    task.title
+                );
+            }
+            if task.covers.len() > MAX_BUILD_TASK_BEHAVIOR_CLAUSES {
+                bail!(
+                    "Task '{}' covers {} source clauses; maximum is {MAX_BUILD_TASK_BEHAVIOR_CLAUSES}",
+                    task.title,
+                    task.covers.len()
+                );
+            }
             let mut task_requirement_ids = constraint_requirement_ids.clone();
-            let mut seen_requirements = task_requirement_ids
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            for description in task.request_evidence {
-                let description = description.trim();
-                if !behavior_evidence.contains(description) {
-                    bail!(
-                        "Task '{}' must select behavioral request evidence; pb owns decomposition-wide constraints",
-                        task.title
-                    );
+            let mut descriptions = Vec::with_capacity(task.covers.len());
+            for source_id in task.covers {
+                if !covered.insert(source_id.clone()) {
+                    bail!("source clause '{source_id}' is assigned more than once");
                 }
-                let requirement_id = requirement_ids.get(description).with_context(|| {
+                source_task_positions.insert(source_id.clone(), task_index);
+                let requirement_id = requirement_ids.get(&source_id).with_context(|| {
                     format!(
-                        "Task '{}' cites request evidence not supplied by the controller",
+                        "Task '{}' cites unknown source clause '{source_id}'",
                         task.title
                     )
                 })?;
-                if seen_requirements.insert(requirement_id.clone()) {
-                    task_requirement_ids.push(requirement_id.clone());
-                }
+                task_requirement_ids.push(requirement_id.clone());
+                let requirement = requirements
+                    .iter()
+                    .find(|candidate| candidate.id == *requirement_id)
+                    .expect("controller requirement exists");
+                descriptions.push(requirement.description.clone());
             }
-
-            let mut task_acceptance_ids = Vec::new();
-            let mut seen_acceptance = BTreeSet::new();
-            let acceptance_facts = task
-                .acceptance
-                .into_iter()
-                .chain(task.tests.into_iter().map(|fact| format!("Tests: {fact}")))
-                .chain(
-                    task.documentation
-                        .into_iter()
-                        .map(|fact| format!("Documentation: {fact}")),
-                );
-            for description in acceptance_facts {
-                let description = description.trim().to_string();
-                let acceptance_id = acceptance_ids
-                    .entry(description.clone())
-                    .or_insert_with(|| {
-                        let acceptance_id = format!("accept-{:03}", acceptance.len() + 1);
-                        acceptance.push(TaskAcceptance {
-                            id: acceptance_id.clone(),
-                            description,
-                        });
-                        acceptance_id
-                    })
-                    .clone();
-                if seen_acceptance.insert(acceptance_id.clone()) {
-                    task_acceptance_ids.push(acceptance_id);
-                }
-            }
+            let acceptance_id = format!("accept-{:03}", task_index + 1);
+            let assigned_descriptions = task_requirement_ids
+                .iter()
+                .filter_map(|id| {
+                    requirements
+                        .iter()
+                        .find(|requirement| requirement.id == *id)
+                        .map(|requirement| requirement.description.as_str())
+                })
+                .collect::<Vec<_>>();
+            acceptance.push(TaskAcceptance {
+                id: acceptance_id.clone(),
+                description: format!(
+                    "The normal Build workflow verifies and commits these assigned source requirements: {}",
+                    assigned_descriptions.join("; ")
+                ),
+            });
 
             tasks.push(TaskProposal {
                 id,
                 title: task.title,
-                description: task.description,
+                description: descriptions.join(". "),
                 requirement_ids: task_requirement_ids,
                 depends_on: task_index
                     .checked_sub(1)
                     .map(|previous| vec![format!("task-{:02}", previous + 1)])
                     .unwrap_or_default(),
-                acceptance_ids: task_acceptance_ids,
-                scope_hints: task.scope_hints,
-                effort: match task.kind {
-                    TaskKind::Build => TaskEffort::Small,
-                    TaskKind::Goal => TaskEffort::Large,
-                },
-                kind: task.kind,
-                goal_contract: task.goal_contract,
+                acceptance_ids: vec![acceptance_id],
+                scope_hints: Vec::new(),
+                effort: TaskEffort::Small,
+                kind: TaskKind::Build,
+                goal_contract: None,
             });
+        }
+
+        let expected = requirement_ids.keys().cloned().collect::<BTreeSet<_>>();
+        if covered != expected {
+            let missing = expected.difference(&covered).cloned().collect::<Vec<_>>();
+            bail!(
+                "Task partition does not cover source clauses: {}",
+                missing.join(", ")
+            );
+        }
+        for (earlier, later) in explicit_source_order_pairs(objective) {
+            let earlier_position = source_task_positions
+                .get(&earlier)
+                .context("explicitly ordered source clause has no Task")?;
+            let later_position = source_task_positions
+                .get(&later)
+                .context("explicitly ordered source clause has no Task")?;
+            if earlier_position > later_position {
+                bail!(
+                    "explicit source order requires '{earlier}' before '{later}' in the Task queue"
+                );
+            }
         }
 
         while !model_efforts_fit(&tasks, policy) {
@@ -237,9 +249,13 @@ impl TaskModelProposal {
             requirements,
             tasks,
             acceptance,
-            risks: self.risks,
+            risks: Vec::new(),
         })
     }
+}
+
+fn source_id(index: usize) -> String {
+    format!("source-{:03}", index + 1)
 }
 
 fn is_decomposition_constraint(evidence: &str) -> bool {
@@ -251,6 +267,12 @@ fn is_decomposition_constraint(evidence: &str) -> bool {
         || evidence.contains("every task")
         || evidence.contains("tasks suitable for")
         || evidence.contains("dependencies must")
+        || ((evidence.contains("test") || evidence.contains("documentation"))
+            && (evidence.contains("each behavior")
+                || evidence.contains("every behavior")
+                || evidence.contains("each task")
+                || evidence.contains("every task")
+                || evidence.contains("owned by")))
 }
 
 fn behavior_evidence_clauses(objective: &str) -> Vec<String> {
@@ -328,6 +350,51 @@ pub struct TaskPlanAttemptFailure {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPlanningDecision {
+    MultiTask,
+    OneBuildSingleTask,
+    OneBuildPlannerFallback,
+    OneBuildBudgetFallback,
+    Cancelled,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskPlanningTranscriptEntry {
+    pub attempt: usize,
+    pub stage: TaskPlanningRole,
+    pub prompt: String,
+    pub schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskPlanningTranscript {
+    pub decision: TaskPlanningDecision,
+    pub summary: String,
+    pub attempts: Vec<TaskPlanningTranscriptEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OneBuildTaskPlan {
+    pub reason: String,
+    pub counters: TaskCoordinationCounters,
+    pub transcript: TaskPlanningTranscript,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskPlanRejected {
@@ -336,6 +403,8 @@ pub struct TaskPlanRejected {
     pub failures: Vec<TaskPlanAttemptFailure>,
     pub counters: TaskCoordinationCounters,
     pub recovery_actions: Vec<TaskPlanRecoveryAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<TaskPlanningTranscript>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -344,12 +413,14 @@ pub struct AcceptedTaskPlan {
     pub plan: ArtifactEnvelope<TaskPlanArtifact>,
     pub review: ArtifactEnvelope<TaskPlanReviewArtifact>,
     pub counters: TaskCoordinationCounters,
+    pub transcript: TaskPlanningTranscript,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum TaskPlanningOutcome {
     Accepted(AcceptedTaskPlan),
+    OneBuild(OneBuildTaskPlan),
     Rejected(TaskPlanRejected),
 }
 
@@ -367,6 +438,12 @@ pub fn plan_tasks(
 ) -> TaskPlanningOutcome {
     match plan_tasks_inner(model, &input) {
         Ok(outcome) => outcome,
+        Err(error) if input.source_intent == TaskSourceIntent::Build => one_build(
+            TaskPlanningDecision::OneBuildPlannerFallback,
+            format!("Task planning was unavailable: {error:#}"),
+            TaskCoordinationCounters::default(),
+            Vec::new(),
+        ),
         Err(error) => rejected(
             TaskPlanRejectionOutcome::QualificationMismatch,
             0,
@@ -394,14 +471,21 @@ fn plan_tasks_inner(
     let mut counters = TaskCoordinationCounters::default();
     let mut failures = Vec::new();
     let mut feedback = String::new();
+    let mut transcript = Vec::new();
+    let max_attempts = budget.planning_attempts.min(MAX_TASK_PLANNING_ATTEMPTS);
 
-    for attempt in 1..=budget.planning_attempts {
+    for attempt in 1..=max_attempts {
         if model.should_cancel() {
-            return Ok(rejected(
+            return Ok(rejected_with_transcript(
                 TaskPlanRejectionOutcome::Cancelled,
                 counters.planning_attempts,
                 failures,
                 counters,
+                TaskPlanningTranscript {
+                    decision: TaskPlanningDecision::Cancelled,
+                    summary: "Task planning was cancelled".to_string(),
+                    attempts: transcript,
+                },
             ));
         }
         counters.planning_attempts = counters.planning_attempts.saturating_add(1);
@@ -412,11 +496,14 @@ fn plan_tasks_inner(
             .saturating_sub(counters.generated_tokens);
         let max_tokens = remaining_tokens.min(MAX_TASK_PLANNER_OUTPUT_TOKENS);
         if max_tokens == 0 || counters.model_invocations >= budget.model_invocations {
-            return Ok(rejected(
+            return Ok(build_fallback_or_rejected(
+                input,
                 TaskPlanRejectionOutcome::BudgetExhausted,
-                counters.planning_attempts,
+                TaskPlanningDecision::OneBuildBudgetFallback,
+                "Task planning had no remaining coordination budget",
                 failures,
                 counters,
+                transcript,
             ));
         }
         let started = Instant::now();
@@ -433,6 +520,14 @@ fn plan_tasks_inner(
                     stage: TaskPlanningRole::Planner,
                     reason: reason.clone(),
                 });
+                transcript.push(failed_transcript_entry(
+                    attempt,
+                    TaskPlanningRole::Planner,
+                    prompt,
+                    schema,
+                    reason.clone(),
+                    elapsed_ms(started.elapsed()),
+                ));
                 feedback = bounded_feedback(&reason);
                 continue;
             }
@@ -444,15 +539,67 @@ fn plan_tasks_inner(
                 stage: TaskPlanningRole::Planner,
                 reason: "planner output exhausted the Task coordination budget".to_string(),
             });
-            return Ok(rejected(
+            transcript.push(output_transcript_entry(
+                attempt,
+                TaskPlanningRole::Planner,
+                prompt,
+                schema,
+                &output,
+                None,
+                Some("planner output exhausted the Task coordination budget".to_string()),
+            ));
+            return Ok(build_fallback_or_rejected(
+                input,
                 TaskPlanRejectionOutcome::BudgetExhausted,
-                counters.planning_attempts,
+                TaskPlanningDecision::OneBuildBudgetFallback,
+                "Task planning exhausted its coordination budget",
                 failures,
                 counters,
+                transcript,
             ));
         }
-        let proposal = match parse_json::<TaskModelProposal>(&output.text)
-            .and_then(|proposal| proposal.into_controller_proposal(input.policy, input.objective))
+        let model_proposal = match parse_json::<TaskModelProposal>(&output.text) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                let reason = format!("Task partition rejected: {error:#}");
+                failures.push(TaskPlanAttemptFailure {
+                    attempt,
+                    stage: TaskPlanningRole::Planner,
+                    reason: reason.clone(),
+                });
+                transcript.push(output_transcript_entry(
+                    attempt,
+                    TaskPlanningRole::Planner,
+                    prompt,
+                    schema,
+                    &output,
+                    None,
+                    Some(reason.clone()),
+                ));
+                feedback = bounded_feedback(&reason);
+                continue;
+            }
+        };
+        let normalized_proposal = serde_json::to_value(&model_proposal)?;
+        transcript.push(output_transcript_entry(
+            attempt,
+            TaskPlanningRole::Planner,
+            prompt,
+            schema,
+            &output,
+            Some(normalized_proposal),
+            None,
+        ));
+        if model_proposal.tasks.len() == 1 && input.source_intent == TaskSourceIntent::Build {
+            return Ok(one_build(
+                TaskPlanningDecision::OneBuildSingleTask,
+                "The partition contained one Task, so pb kept the original Build request unchanged",
+                counters,
+                transcript,
+            ));
+        }
+        let proposal = match model_proposal
+            .into_controller_proposal(input.policy, input.objective)
             .and_then(|proposal| {
                 proposal
                     .validate_and_compile(authority, input.policy)
@@ -466,6 +613,9 @@ fn plan_tasks_inner(
                     stage: TaskPlanningRole::Planner,
                     reason: reason.clone(),
                 });
+                if let Some(entry) = transcript.last_mut() {
+                    entry.failure = Some(reason.clone());
+                }
                 feedback = bounded_feedback(&reason);
                 continue;
             }
@@ -473,11 +623,16 @@ fn plan_tasks_inner(
         let plan = ArtifactEnvelope::new(format!("task-plan-{attempt}"), proposal)?;
 
         if model.should_cancel() {
-            return Ok(rejected(
+            return Ok(rejected_with_transcript(
                 TaskPlanRejectionOutcome::Cancelled,
                 counters.planning_attempts,
                 failures,
                 counters,
+                TaskPlanningTranscript {
+                    decision: TaskPlanningDecision::Cancelled,
+                    summary: "Task planning was cancelled".to_string(),
+                    attempts: transcript,
+                },
             ));
         }
         let remaining_tokens = budget
@@ -488,12 +643,13 @@ fn plan_tasks_inner(
             || counters.model_invocations >= budget.model_invocations
             || counters.advisory_calls >= budget.advisory_calls
         {
-            return Ok(rejected(
-                TaskPlanRejectionOutcome::BudgetExhausted,
-                counters.planning_attempts,
-                failures,
+            return accepted_task_plan(
+                input,
+                plan,
                 counters,
-            ));
+                transcript,
+                "The deterministic partition was accepted without optional criticism",
+            );
         }
         let review_prompt = reviewer_prompt(input, &plan)?;
         let review_schema = reviewer_schema(input, &plan);
@@ -517,8 +673,21 @@ fn plan_tasks_inner(
                     stage: TaskPlanningRole::Reviewer,
                     reason: reason.clone(),
                 });
-                feedback = bounded_feedback(&reason);
-                continue;
+                transcript.push(failed_transcript_entry(
+                    attempt,
+                    TaskPlanningRole::Reviewer,
+                    review_prompt,
+                    review_schema,
+                    reason.clone(),
+                    elapsed_ms(started.elapsed()),
+                ));
+                return accepted_task_plan(
+                    input,
+                    plan,
+                    counters,
+                    transcript,
+                    "The deterministic partition was accepted; optional criticism was unavailable",
+                );
             }
         };
         counters.advisory_calls = counters.advisory_calls.saturating_add(1);
@@ -529,59 +698,101 @@ fn plan_tasks_inner(
                 stage: TaskPlanningRole::Reviewer,
                 reason: "Task-plan review exhausted the coordination budget".to_string(),
             });
-            return Ok(rejected(
+            transcript.push(output_transcript_entry(
+                attempt,
+                TaskPlanningRole::Reviewer,
+                review_prompt,
+                review_schema,
+                &output,
+                None,
+                Some("Task-plan review exhausted the coordination budget".to_string()),
+            ));
+            return Ok(build_fallback_or_rejected(
+                input,
                 TaskPlanRejectionOutcome::BudgetExhausted,
-                counters.planning_attempts,
+                TaskPlanningDecision::OneBuildBudgetFallback,
+                "Task criticism exhausted its coordination budget",
                 failures,
                 counters,
+                transcript,
             ));
         }
-        let review = match parse_json::<TaskPlanReviewArtifact>(&output.text).and_then(|review| {
-            review.validate(&plan).map_err(anyhow::Error::from)?;
-            validate_review_request_evidence(&review, input.objective)?;
-            Ok(review)
-        }) {
+        let model_review = match parse_json::<TaskModelReview>(&output.text)
+            .and_then(|review| validate_model_review(review, input, &plan))
+        {
             Ok(review) => review,
             Err(error) => {
-                let reason = format!("Task-plan review rejected: {error:#}");
+                let reason = format!("Task criticism rejected: {error:#}");
                 failures.push(TaskPlanAttemptFailure {
                     attempt,
                     stage: TaskPlanningRole::Reviewer,
                     reason: reason.clone(),
                 });
-                feedback = bounded_feedback(&reason);
-                continue;
+                transcript.push(output_transcript_entry(
+                    attempt,
+                    TaskPlanningRole::Reviewer,
+                    review_prompt,
+                    review_schema,
+                    &output,
+                    None,
+                    Some(reason.clone()),
+                ));
+                return accepted_task_plan(
+                    input,
+                    plan,
+                    counters,
+                    transcript,
+                    "The deterministic partition was accepted; optional criticism was invalid",
+                );
             }
         };
-        let review_envelope = ArtifactEnvelope::new(format!("task-plan-review-{attempt}"), review)?;
-        if review_envelope.artifact.verdict == TaskPlanReviewVerdict::Pass {
-            return Ok(TaskPlanningOutcome::Accepted(AcceptedTaskPlan {
-                plan,
-                review: review_envelope,
-                counters,
-            }));
-        }
-        let reason = review_envelope
-            .artifact
-            .challenges
-            .iter()
-            .map(|challenge| format!("{}: {}", challenge.code, challenge.description))
-            .collect::<Vec<_>>()
-            .join("\n");
-        failures.push(TaskPlanAttemptFailure {
+        transcript.push(output_transcript_entry(
             attempt,
-            stage: TaskPlanningRole::Reviewer,
-            reason: reason.clone(),
-        });
-        feedback = bounded_feedback(&reason);
+            TaskPlanningRole::Reviewer,
+            review_prompt,
+            review_schema,
+            &output,
+            Some(serde_json::to_value(&model_review)?),
+            None,
+        ));
+        let summary = if model_review.decision == TaskModelReviewDecision::Accept {
+            "The deterministic partition was accepted and optional criticism found no issue"
+        } else {
+            "The deterministic partition was accepted; model criticism is preserved as advisory evidence"
+        };
+        return accepted_task_plan(input, plan, counters, transcript, summary);
     }
 
-    Ok(rejected(
+    Ok(build_fallback_or_rejected(
+        input,
         TaskPlanRejectionOutcome::AttemptsExhausted,
-        counters.planning_attempts,
+        TaskPlanningDecision::OneBuildPlannerFallback,
+        "Task planning did not produce an accepted multi-Task partition",
         failures,
         counters,
+        transcript,
     ))
+}
+
+fn accepted_task_plan(
+    input: &TaskPlanningInput<'_>,
+    plan: ArtifactEnvelope<TaskPlanArtifact>,
+    counters: TaskCoordinationCounters,
+    attempts: Vec<TaskPlanningTranscriptEntry>,
+    summary: impl Into<String>,
+) -> Result<TaskPlanningOutcome> {
+    let review = controller_review(input.objective, &plan);
+    let review_envelope = ArtifactEnvelope::new("task-plan-controller-review", review)?;
+    Ok(TaskPlanningOutcome::Accepted(AcceptedTaskPlan {
+        plan,
+        review: review_envelope,
+        counters,
+        transcript: TaskPlanningTranscript {
+            decision: TaskPlanningDecision::MultiTask,
+            summary: summary.into(),
+            attempts,
+        },
+    }))
 }
 
 fn validate_input(input: &TaskPlanningInput<'_>) -> Result<()> {
@@ -614,33 +825,16 @@ fn validate_input(input: &TaskPlanningInput<'_>) -> Result<()> {
 }
 
 fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str) -> String {
-    let kind_rule = if input.qualification.automatic_goal_selection {
-        "Choose build or goal. Use goal only when the outcome genuinely needs several evidence-driven Builds."
-    } else if input.source_intent == TaskSourceIntent::Goal {
-        "Return exactly one goal Task because Goal was explicitly selected."
-    } else {
-        "Every Task must use kind build; automatic Goal selection is not qualified."
-    };
     let retry = if feedback.is_empty() {
         String::new()
     } else {
-        format!(
-            "\nThe previous attempt was rejected. Correct the grounded parts of this feedback, but do not add behavior that is absent from the original request:\n{feedback}\n"
-        )
+        format!("\nPrevious partition feedback:\n{feedback}\n")
     };
+    let sources = source_clauses(input.objective);
     format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. In a multi-Task queue, a build Task may own at most {MAX_BUILD_TASK_BEHAVIOR_CLAUSES} behavioral request-evidence choices and must provide at least one distinct outcome acceptance fact and test fact per owned choice. Every Task must own concrete documentation work or a concrete documentation-impact decision. Standalone testing, documentation, validation, integration, or ordering Tasks are forbidden catch-alls. Never include an objective, IDs, references, dependencies, effort, or numeric budgets: pb owns them and makes the array a sequential queue. Array order is the dependency order and commit order: item 1 completes before item 2 can start. A later item cannot make an earlier consumer retroactively compatible, so put foundations and migrations before every service, API, or UI consumer that needs them.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Select each Task's request_evidence only from the controller behavioral choices, verbatim. pb automatically attaches every decomposition-wide constraint to every Task, so do not create a Task for testing, documentation, ordering, final validation, or smaller-model sizing. Assign every behavioral choice to at least one Task and never weaken words such as existing, compatible, rollback-safe, before, without, or must in the Task outcome. Each Task also contains observable outcome acceptance, owned tests, and owned documentation.\n\nBefore responding, silently audit the artifact: cover every controller behavioral request-evidence choice. Check every controller-owned decomposition constraint against the whole queue, including tests, documentation, ordering, rollback, explicit non-goals, and smaller-model sizing. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work. For every before/after clause, compare the two affected array positions and correct any reversed order.\n\nAttempt: {attempt}\nOriginal request:\n{}\n\nController behavioral request-evidence choices:\n{}\n\nController-owned decomposition constraints (automatically attached to every Task):\n{}\n\nBounded repository context:\n{}\n{retry}",
-        input.policy.aggregate.max_tasks,
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nReturn only JSON matching the schema. Partition the Build request into an ordered queue of independently deliverable, independently committed Tasks for a smaller implementation model. A Task is an outcome boundary, not a list of files or edits; its normal Build workflow will plan exact changes after the previous Task commits. Use every source ID exactly once. Put foundations and migrations before consumers. Do not create separate test, documentation, review, integration, or cleanup Tasks. If the work is tightly coupled or one Task is sufficient, return exactly one Task; pb will then run the original Build unchanged. For a multi-Task partition, each Task may cover at most {MAX_BUILD_TASK_BEHAVIOR_CLAUSES} source clauses. Return no fields except tasks, title, and covers.\n\nAttempt: {attempt}\nOriginal Build request:\n{}\n\nController source clauses:\n{}\n\nBounded repository context:\n{}\n{retry}",
         input.objective,
-        serde_json::to_string_pretty(&behavior_evidence_clauses(input.objective))
-            .expect("request evidence serializes"),
-        serde_json::to_string_pretty(
-            &request_evidence_clauses(input.objective)
-                .into_iter()
-                .filter(|evidence| is_decomposition_constraint(evidence))
-                .collect::<Vec<_>>()
-        )
-        .expect("decomposition constraints serialize"),
+        serde_json::to_string_pretty(&sources).expect("source clauses serialize"),
         input.repository_context
     )
 }
@@ -649,86 +843,36 @@ fn reviewer_prompt(
     input: &TaskPlanningInput<'_>,
     plan: &ArtifactEnvelope<TaskPlanArtifact>,
 ) -> Result<String> {
-    let request_evidence = request_evidence_clauses(input.objective);
+    let sources = source_clauses(input.objective);
+    let tasks = plan
+        .artifact
+        .tasks
+        .iter()
+        .map(|task| {
+            json!({
+                "id": task.id,
+                "title": task.title,
+                "covers": task.requirement_ids.iter().filter_map(|requirement_id| {
+                    plan.artifact.requirements.iter().position(|requirement| {
+                        requirement.id == *requirement_id
+                    }).map(source_id)
+                }).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic with authority bounded by the original request. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Task IDs are the exact sequential execution order: task-01 completes before task-02 starts. First complete one request_assessment for every controller request-evidence choice exactly once. For each, cite the Tasks that preserve its exact meaning and fail contradictions such as new versus existing, breaking versus compatible, after versus before, or forward-only versus rollback-safe. For every before/after clause, name the earlier and later Task IDs in the detail and fail if the prerequisite has the larger number. Then complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, explicit non-goals, and decomposition constraints even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. A standalone testing, documentation, validation, integration, ordering, or generic completion Task is a forbidden catch-all when its work belongs in behavior-owning Tasks. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, Build-versus-Goal choice, and qualitative effort. Treat genuinely equivalent wording as coverage, but do not treat a related outcome as equivalent to an exact constraint. Fail only for an omitted or contradicted request clause, an unobservable requested outcome, duplicated ownership, forbidden catch-all, reversed dependency, or a Task too broad to deliver independently. Every challenge must select request_evidence verbatim from the controller evidence list and ask for the minimum correction supported by that exact text. Do not claim the evidence says more than it does. Do not invent HTTP status codes, filenames, algorithms, integrity techniques, test names, documentation cross-links, failure modes, or other behavior absent from the request. Shared components do not imply overlap when Tasks own distinct outcomes. A pass means every request assessment and audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed request assessment or audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nController request evidence choices:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nReturn only JSON matching the schema. Review this ordered Task partition, not the implementation details. Rust has already proven exact source coverage, disjoint ownership, sequential dependencies, budgets, and Build-only authority; do not re-audit or challenge those facts. Accept unless one of two semantic defects is present: bad_order (a prerequisite follows its consumer) or too_broad (a Task is not independently deliverable by a smaller model). A necessary foundation or migration is not an unnecessary Task. Use only the supplied Task IDs and source IDs. Do not invent missing requirements, files, tests, or implementation advice. decision=accept requires issues=[]; decision=revise requires at least one issue.\n\nOriginal Build request:\n{}\n\nController source clauses:\n{}\n\nOrdered partition:\n{}",
         input.objective,
-        serde_json::to_string_pretty(&request_evidence)?,
-        plan.sha256,
-        serde_json::to_string_pretty(&plan.artifact)?
+        serde_json::to_string_pretty(&sources)?,
+        serde_json::to_string_pretty(&tasks)?
     ))
 }
 
 fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
-    let explicit_goal = input.source_intent == TaskSourceIntent::Goal;
-    let goal_allowed = explicit_goal || input.qualification.automatic_goal_selection;
-    let task_kinds = if explicit_goal {
-        json!(["goal"])
-    } else if goal_allowed {
-        json!(["build", "goal"])
-    } else {
-        json!(["build"])
-    };
-    let mut task_properties = serde_json::Map::from_iter([
-        ("title".to_string(), bounded_string(MAX_TITLE_CHARS)),
-        (
-            "description".to_string(),
-            bounded_string(MAX_DESCRIPTION_CHARS),
-        ),
-        (
-            "request_evidence".to_string(),
-            json!({
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": behavior_evidence_clauses(input.objective)
-                },
-                "minItems": 1,
-                "maxItems": MAX_PLANNING_FACTS
-            }),
-        ),
-        (
-            "acceptance".to_string(),
-            bounded_nonempty_string_array(MAX_PLANNING_FACTS, MAX_DESCRIPTION_CHARS),
-        ),
-        (
-            "tests".to_string(),
-            bounded_nonempty_string_array(MAX_PLANNING_FACTS, MAX_DESCRIPTION_CHARS),
-        ),
-        (
-            "documentation".to_string(),
-            bounded_nonempty_string_array(MAX_PLANNING_FACTS, MAX_DESCRIPTION_CHARS),
-        ),
-        (
-            "scope_hints".to_string(),
-            bounded_string_array(MAX_SCOPE_HINTS, MAX_DESCRIPTION_CHARS),
-        ),
-        (
-            "kind".to_string(),
-            json!({"type": "string", "enum": task_kinds}),
-        ),
-    ]);
-    if goal_allowed {
-        task_properties.insert("goal_contract".to_string(), goal_contract_schema());
-    }
-    let mut required = vec![
-        "title",
-        "description",
-        "request_evidence",
-        "acceptance",
-        "tests",
-        "documentation",
-        "scope_hints",
-        "kind",
-    ];
-    if explicit_goal {
-        required.push("goal_contract");
-    }
-    let max_tasks = if explicit_goal {
-        1
-    } else {
-        input.policy.aggregate.max_tasks
-    };
+    let source_ids = source_clauses(input.objective)
+        .into_iter()
+        .map(|source| source["id"].clone())
+        .collect::<Vec<_>>();
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -738,20 +882,22 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "properties": task_properties,
-                    "required": required
+                    "properties": {
+                        "title": bounded_string(MAX_TITLE_CHARS),
+                        "covers": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": source_ids},
+                            "minItems": 1,
+                            "maxItems": MAX_PLANNING_FACTS
+                        }
+                    },
+                    "required": ["title", "covers"]
                 },
                 "minItems": 1,
-                "maxItems": max_tasks
-            },
-            "risks": object_array(
-                json!({"description": bounded_string(MAX_DESCRIPTION_CHARS)}),
-                &["description"],
-                0,
-                MAX_RISKS
-            )
+                "maxItems": input.policy.aggregate.max_tasks
+            }
         },
-        "required": ["tasks", "risks"]
+        "required": ["tasks"]
     })
 }
 
@@ -765,108 +911,65 @@ fn reviewer_schema(
         .iter()
         .map(|task| Value::String(task.id.clone()))
         .collect::<Vec<_>>();
+    let source_ids = source_clauses(input.objective)
+        .into_iter()
+        .map(|source| source["id"].clone())
+        .collect::<Vec<_>>();
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "task_plan_sha256": {"type": "string", "enum": [plan.sha256.clone()]},
-            "verdict": {"type": "string", "enum": ["pass", "revise"]},
-            "request_assessments": {
+            "decision": {"type": "string", "enum": ["accept", "revise"]},
+            "issues": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "request_evidence": {
-                            "type": "string",
-                            "enum": request_evidence_clauses(input.objective)
-                        },
-                        "verdict": {"type": "string", "enum": ["pass", "fail"]},
-                        "detail": bounded_string(MAX_DESCRIPTION_CHARS),
+                        "code": {"type": "string", "enum": ["bad_order", "too_broad"]},
                         "task_ids": {
                             "type": "array",
                             "items": {"type": "string", "enum": task_ids.clone()},
-                            "minItems": 0,
+                            "minItems": 1,
                             "maxItems": plan.artifact.tasks.len()
-                        }
-                    },
-                    "required": ["request_evidence", "verdict", "detail", "task_ids"]
-                },
-                "minItems": request_evidence_clauses(input.objective).len(),
-                "maxItems": request_evidence_clauses(input.objective).len()
-            },
-            "audits": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "category": {
-                            "type": "string",
-                            "enum": [
-                                "request_coverage",
-                                "task_boundaries",
-                                "dependency_order",
-                                "acceptance_observability",
-                                "test_documentation_ownership",
-                                "effort_goal_authority"
-                            ]
                         },
-                        "verdict": {"type": "string", "enum": ["pass", "fail"]},
-                        "detail": bounded_string(MAX_DESCRIPTION_CHARS),
-                        "task_ids": {
+                        "source_ids": {
                             "type": "array",
-                            "items": {"type": "string", "enum": task_ids.clone()},
+                            "items": {"type": "string", "enum": source_ids},
                             "minItems": 0,
-                            "maxItems": plan.artifact.tasks.len()
+                            "maxItems": MAX_PLANNING_FACTS
                         }
                     },
-                    "required": ["category", "verdict", "detail", "task_ids"]
-                },
-                "minItems": 6,
-                "maxItems": 6
-            },
-            "challenges": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "id": bounded_string(MAX_ID_CHARS),
-                        "code": bounded_string(MAX_ID_CHARS),
-                        "request_evidence": {
-                            "type": "string",
-                            "enum": request_evidence_clauses(input.objective)
-                        },
-                        "description": bounded_string(MAX_DESCRIPTION_CHARS),
-                        "severity": {"type": "string", "enum": ["blocking", "advisory"]},
-                        "task_ids": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": task_ids},
-                            "minItems": 0,
-                            "maxItems": plan.artifact.tasks.len()
-                        }
-                    },
-                    "required": ["id", "code", "request_evidence", "description", "severity", "task_ids"]
+                    "required": ["code", "task_ids", "source_ids"]
                 },
                 "minItems": 0,
-                "maxItems": MAX_REVIEW_CHALLENGES
+                "maxItems": 8
             }
         },
-        "required": ["task_plan_sha256", "verdict", "request_assessments", "audits", "challenges"]
+        "required": ["decision", "issues"]
     })
+}
+
+fn source_clauses(objective: &str) -> Vec<Value> {
+    behavior_evidence_clauses(objective)
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| json!({"id": source_id(index), "text": text}))
+        .collect()
 }
 
 fn request_evidence_clauses(objective: &str) -> Vec<String> {
     let mut clauses = Vec::new();
     for segment in objective.split(['.', ';', ',', '\n']) {
-        let characters = segment.trim().chars().collect::<Vec<_>>();
-        for chunk in characters.chunks(MAX_DESCRIPTION_CHARS) {
-            let clause = chunk.iter().collect::<String>().trim().to_string();
-            if !clause.is_empty() && !clauses.contains(&clause) {
-                clauses.push(clause);
-                if clauses.len() == MAX_PLANNING_FACTS {
-                    return clauses;
+        for ordered in ordered_request_subclauses(segment.trim()) {
+            let characters = ordered.chars().collect::<Vec<_>>();
+            for chunk in characters.chunks(MAX_DESCRIPTION_CHARS) {
+                let clause = chunk.iter().collect::<String>().trim().to_string();
+                if !clause.is_empty() && !clauses.contains(&clause) {
+                    clauses.push(clause);
+                    if clauses.len() == MAX_PLANNING_FACTS {
+                        return clauses;
+                    }
                 }
             }
         }
@@ -883,98 +986,179 @@ fn request_evidence_clauses(objective: &str) -> Vec<String> {
     clauses
 }
 
-fn validate_review_request_evidence(
-    review: &TaskPlanReviewArtifact,
-    objective: &str,
-) -> Result<()> {
-    let clauses = request_evidence_clauses(objective);
-    let allowed = clauses.iter().cloned().collect::<BTreeSet<_>>();
-    let mut assessed = BTreeSet::new();
-    for assessment in &review.request_assessments {
-        if !allowed.contains(&assessment.request_evidence) {
-            bail!("Task-plan request assessment does not cite controller request evidence");
-        }
-        if !assessed.insert(assessment.request_evidence.clone()) {
-            bail!("Task-plan request assessment repeats controller request evidence");
-        }
-    }
-    if assessed != allowed {
-        bail!("Task-plan review must assess every controller request-evidence clause exactly once");
-    }
-    let clauses = clauses.into_iter().collect::<BTreeSet<_>>();
-    for challenge in &review.challenges {
-        if !clauses.contains(&challenge.request_evidence) {
-            bail!(
-                "Task-plan challenge '{}' does not cite controller request evidence",
-                challenge.id
-            );
+fn ordered_request_subclauses(segment: &str) -> Vec<String> {
+    for (separator, reverse) in [(" before ", false), (" after ", true), (" then ", false)] {
+        let lower = segment.to_ascii_lowercase();
+        if let Some(index) = lower.find(separator) {
+            let left = segment[..index].trim();
+            let right = segment[index + separator.len()..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                let mut left = ordered_request_subclauses(left);
+                let mut right = ordered_request_subclauses(right);
+                return if reverse {
+                    right.append(&mut left);
+                    right
+                } else {
+                    left.append(&mut right);
+                    left
+                };
+            }
         }
     }
-    Ok(())
+    vec![segment.to_string()]
 }
 
-fn goal_contract_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "objective": bounded_string(MAX_DESCRIPTION_CHARS),
-            "criteria": object_array(
-                json!({
-                    "text": bounded_string(MAX_DESCRIPTION_CHARS),
-                    "verifier": {
-                        "type": "string",
-                        "enum": ["workflow_ready", "review_required", "user_confirmation"]
+fn explicit_source_order_pairs(objective: &str) -> Vec<(String, String)> {
+    let behavior = behavior_evidence_clauses(objective);
+    let source_by_text = behavior
+        .iter()
+        .enumerate()
+        .map(|(index, text)| (text.as_str(), source_id(index)))
+        .collect::<BTreeMap<_, _>>();
+    let mut pairs = Vec::new();
+    for segment in objective.split(['.', ';', ',', '\n']) {
+        let lower = segment.to_ascii_lowercase();
+        for (separator, reverse) in [(" before ", false), (" after ", true), (" then ", false)] {
+            let Some(index) = lower.find(separator) else {
+                continue;
+            };
+            let left = ordered_request_subclauses(segment[..index].trim());
+            let right = ordered_request_subclauses(segment[index + separator.len()..].trim());
+            let (earlier, later) = if reverse {
+                (&right, &left)
+            } else {
+                (&left, &right)
+            };
+            for earlier in earlier {
+                let Some(earlier_id) = source_by_text.get(earlier.as_str()) else {
+                    continue;
+                };
+                for later in later {
+                    if let Some(later_id) = source_by_text.get(later.as_str()) {
+                        pairs.push((earlier_id.clone(), later_id.clone()));
                     }
-                }),
-                &["text", "verifier"],
-                1,
-                MAX_GOAL_CRITERIA
-            ),
-            "continuation": {
-                "type": "string",
-                "enum": [
-                    "review_plan_then_automatic",
-                    "manual_milestones",
-                    "automatic_within_limits"
-                ]
+                }
             }
-        },
-        "required": ["objective", "criteria", "continuation"]
-    })
+            break;
+        }
+    }
+    pairs
+}
+
+fn validate_model_review(
+    review: TaskModelReview,
+    input: &TaskPlanningInput<'_>,
+    plan: &ArtifactEnvelope<TaskPlanArtifact>,
+) -> Result<TaskModelReview> {
+    match review.decision {
+        TaskModelReviewDecision::Accept if !review.issues.is_empty() => {
+            bail!("an accepted Task partition cannot contain issues")
+        }
+        TaskModelReviewDecision::Revise if review.issues.is_empty() => {
+            bail!("a Task partition revision must identify an issue")
+        }
+        _ => {}
+    }
+    let allowed_tasks = plan
+        .artifact
+        .tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let allowed_sources = behavior_evidence_clauses(input.objective)
+        .iter()
+        .enumerate()
+        .map(|(index, _)| source_id(index))
+        .collect::<BTreeSet<_>>();
+    for issue in &review.issues {
+        if issue.task_ids.is_empty()
+            || issue
+                .task_ids
+                .iter()
+                .any(|task_id| !allowed_tasks.contains(task_id.as_str()))
+        {
+            bail!("Task criticism references an unknown or empty Task selection");
+        }
+        if issue
+            .source_ids
+            .iter()
+            .any(|source| !allowed_sources.contains(source))
+        {
+            bail!("Task criticism references an unknown source clause");
+        }
+    }
+    Ok(review)
+}
+
+fn controller_review(
+    objective: &str,
+    plan: &ArtifactEnvelope<TaskPlanArtifact>,
+) -> TaskPlanReviewArtifact {
+    let request_assessments = request_evidence_clauses(objective)
+        .into_iter()
+        .enumerate()
+        .map(|(index, request_evidence)| {
+            let requirement_id = format!("req-{:03}", index + 1);
+            let task_ids = plan
+                .artifact
+                .tasks
+                .iter()
+                .filter(|task| task.requirement_ids.contains(&requirement_id))
+                .map(|task| task.id.clone())
+                .collect();
+            TaskPlanRequestAssessment {
+                detail: if is_decomposition_constraint(&request_evidence) {
+                    "pb attached this decomposition-wide source constraint to every Task"
+                        .to_string()
+                } else {
+                    "pb verified exact, single ownership of this source clause".to_string()
+                },
+                request_evidence,
+                verdict: TaskPlanAuditVerdict::Pass,
+                task_ids,
+            }
+        })
+        .collect();
+    let audits = REQUIRED_TASK_PLAN_AUDIT_CATEGORIES
+        .into_iter()
+        .map(|category| TaskPlanAudit {
+            category,
+            verdict: TaskPlanAuditVerdict::Pass,
+            detail: match category {
+                TaskPlanAuditCategory::RequestCoverage => {
+                    "pb verified every controller source clause is assigned exactly once"
+                }
+                TaskPlanAuditCategory::TaskBoundaries => {
+                    "the partition passed controller size bounds; model criticism is diagnostic"
+                }
+                TaskPlanAuditCategory::DependencyOrder => {
+                    "pb created the sequential dependency and commit order from the partition"
+                }
+                TaskPlanAuditCategory::AcceptanceObservability => {
+                    "each Task retains the normal Build planning, checks, review, and commit gates"
+                }
+                TaskPlanAuditCategory::TestDocumentationOwnership => {
+                    "tests and documentation stay within each behavior-owning Build workflow"
+                }
+                TaskPlanAuditCategory::EffortGoalAuthority => {
+                    "pb assigned bounded Build budgets without promoting Goal authority"
+                }
+            }
+            .to_string(),
+            task_ids: Vec::new(),
+        })
+        .collect();
+    TaskPlanReviewArtifact {
+        task_plan_sha256: plan.sha256.clone(),
+        verdict: TaskPlanReviewVerdict::Pass,
+        request_assessments,
+        audits,
+        challenges: Vec::new(),
+    }
 }
 
 fn bounded_string(max_chars: usize) -> Value {
     json!({"type": "string", "minLength": 1, "maxLength": max_chars})
-}
-
-fn bounded_string_array(max_items: usize, max_chars: usize) -> Value {
-    json!({
-        "type": "array",
-        "items": bounded_string(max_chars),
-        "minItems": 0,
-        "maxItems": max_items
-    })
-}
-
-fn bounded_nonempty_string_array(max_items: usize, max_chars: usize) -> Value {
-    let mut schema = bounded_string_array(max_items, max_chars);
-    schema["minItems"] = json!(1);
-    schema
-}
-
-fn object_array(properties: Value, required: &[&str], min_items: usize, max_items: usize) -> Value {
-    json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": properties,
-            "required": required
-        },
-        "minItems": min_items,
-        "maxItems": max_items
-    })
 }
 
 fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T> {
@@ -1002,6 +1186,95 @@ fn record_output(counters: &mut TaskCoordinationCounters, output: &TaskModelOutp
     counters.elapsed_ms = counters.elapsed_ms.saturating_add(output.duration_ms);
 }
 
+fn failed_transcript_entry(
+    attempt: usize,
+    stage: TaskPlanningRole,
+    prompt: String,
+    schema: Value,
+    failure: String,
+    duration_ms: u64,
+) -> TaskPlanningTranscriptEntry {
+    TaskPlanningTranscriptEntry {
+        attempt,
+        stage,
+        prompt,
+        schema,
+        raw_output: None,
+        normalized_output: None,
+        failure: Some(failure),
+        prompt_tokens: 0,
+        generated_tokens: 0,
+        duration_ms,
+    }
+}
+
+fn output_transcript_entry(
+    attempt: usize,
+    stage: TaskPlanningRole,
+    prompt: String,
+    schema: Value,
+    output: &TaskModelOutput,
+    normalized_output: Option<Value>,
+    failure: Option<String>,
+) -> TaskPlanningTranscriptEntry {
+    TaskPlanningTranscriptEntry {
+        attempt,
+        stage,
+        prompt,
+        schema,
+        raw_output: Some(output.text.clone()),
+        normalized_output,
+        failure,
+        prompt_tokens: output.prompt_tokens,
+        generated_tokens: output.generated_tokens,
+        duration_ms: output.duration_ms,
+    }
+}
+
+fn one_build(
+    decision: TaskPlanningDecision,
+    reason: impl Into<String>,
+    counters: TaskCoordinationCounters,
+    attempts: Vec<TaskPlanningTranscriptEntry>,
+) -> TaskPlanningOutcome {
+    let reason = reason.into();
+    TaskPlanningOutcome::OneBuild(OneBuildTaskPlan {
+        reason: reason.clone(),
+        counters,
+        transcript: TaskPlanningTranscript {
+            decision,
+            summary: reason,
+            attempts,
+        },
+    })
+}
+
+fn build_fallback_or_rejected(
+    input: &TaskPlanningInput<'_>,
+    outcome: TaskPlanRejectionOutcome,
+    decision: TaskPlanningDecision,
+    reason: impl Into<String>,
+    failures: Vec<TaskPlanAttemptFailure>,
+    counters: TaskCoordinationCounters,
+    attempts: Vec<TaskPlanningTranscriptEntry>,
+) -> TaskPlanningOutcome {
+    let reason = reason.into();
+    if input.source_intent == TaskSourceIntent::Build {
+        return one_build(decision, reason, counters, attempts);
+    }
+    rejected_with_transcript(
+        outcome,
+        counters.planning_attempts,
+        failures,
+        counters,
+        TaskPlanningTranscript {
+            decision: TaskPlanningDecision::Rejected,
+            summary: reason,
+            attempts,
+        },
+    )
+}
+
 fn rejected(
     outcome: TaskPlanRejectionOutcome,
     attempts: usize,
@@ -1018,7 +1291,24 @@ fn rejected(
             TaskPlanRecoveryAction::EditRequest,
             TaskPlanRecoveryAction::RunAsOneBuild,
         ],
+        transcript: None,
     })
+}
+
+fn rejected_with_transcript(
+    outcome: TaskPlanRejectionOutcome,
+    attempts: usize,
+    failures: Vec<TaskPlanAttemptFailure>,
+    counters: TaskCoordinationCounters,
+    transcript: TaskPlanningTranscript,
+) -> TaskPlanningOutcome {
+    let TaskPlanningOutcome::Rejected(mut rejected) =
+        rejected(outcome, attempts, failures, counters)
+    else {
+        unreachable!("rejected always returns a rejected outcome")
+    };
+    rejected.transcript = Some(transcript);
+    TaskPlanningOutcome::Rejected(rejected)
 }
 
 fn bounded_feedback(value: &str) -> String {
@@ -1030,7 +1320,7 @@ fn elapsed_ms(duration: std::time::Duration) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+mod compact_tests {
     use std::collections::VecDeque;
 
     use super::*;
@@ -1038,21 +1328,21 @@ mod tests {
 
     struct ScriptedModel {
         outputs: VecDeque<Result<TaskModelOutput>>,
-        calls: Vec<(TaskPlanningRole, usize)>,
+        calls: Vec<TaskPlanningRole>,
         cancelled: bool,
     }
 
     impl ScriptedModel {
-        fn new(outputs: impl IntoIterator<Item = String>) -> Self {
+        fn new(outputs: impl IntoIterator<Item = &'static str>) -> Self {
             Self {
                 outputs: outputs
                     .into_iter()
                     .map(|text| {
                         Ok(TaskModelOutput {
-                            text,
-                            prompt_tokens: 200,
-                            generated_tokens: 100,
-                            duration_ms: 10,
+                            text: text.to_string(),
+                            prompt_tokens: 40,
+                            generated_tokens: 20,
+                            duration_ms: 5,
                         })
                     })
                     .collect(),
@@ -1067,13 +1357,13 @@ mod tests {
             &mut self,
             role: TaskPlanningRole,
             _prompt: &str,
-            max_tokens: usize,
+            _max_tokens: usize,
             _schema: &Value,
         ) -> Result<TaskModelOutput> {
-            self.calls.push((role, max_tokens));
+            self.calls.push(role);
             self.outputs
                 .pop_front()
-                .context("scripted Task-planning output exhausted")?
+                .context("scripted Task planning output exhausted")?
         }
 
         fn should_cancel(&self) -> bool {
@@ -1081,663 +1371,258 @@ mod tests {
         }
     }
 
-    fn model_digest() -> String {
-        "a".repeat(64)
-    }
-
-    fn qualification(goal: bool) -> TaskPlannerQualification {
+    fn qualification(source_intent: TaskSourceIntent) -> TaskPlannerQualification {
         TaskPlannerQualification::new(
-            model_digest(),
+            "a".repeat(64),
             task_planner_template_sha256(),
             task_planner_protocol_sha256(),
             "b".repeat(64),
             true,
-            goal,
+            source_intent == TaskSourceIntent::Goal,
         )
         .unwrap()
     }
 
-    fn proposal(label: &str) -> serde_json::Value {
-        serde_json::json!({
-            "tasks": [{
-                "title": format!("Fix average {label}"),
-                "description": "Correct the divisor and add its regression test",
-                "request_evidence": ["Fix average"],
-                "acceptance": ["Regression test passes"],
-                "tests": ["Run the average regression test"],
-                "documentation": ["Record that no user-facing documentation changes are needed"],
-                "scope_hints": ["src"],
-                "kind": "build"
-            }],
-            "risks": []
-        })
-    }
-
-    fn input<'a>(
-        policy: &'a CompiledTaskPolicy,
-        qualification: &'a TaskPlannerQualification,
-    ) -> TaskPlanningInput<'a> {
-        TaskPlanningInput {
-            objective: "Fix average",
-            repository_context: "Rust component with unit tests",
-            source_intent: TaskSourceIntent::Build,
-            model_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            qualification,
-            policy,
-        }
-    }
-
-    fn review(plan: &TaskPlanArtifact, attempt: usize, verdict: &str) -> String {
-        let envelope = ArtifactEnvelope::new(format!("task-plan-{attempt}"), plan.clone()).unwrap();
-        let audits = [
-            "request_coverage",
-            "task_boundaries",
-            "dependency_order",
-            "acceptance_observability",
-            "test_documentation_ownership",
-            "effort_goal_authority",
-        ]
-        .into_iter()
-        .map(|category| {
-            serde_json::json!({
-                "category": category,
-                "verdict": if verdict == "revise" && category == "task_boundaries" {
-                    "fail"
-                } else {
-                    "pass"
-                },
-                "detail": format!("{category} was checked"),
-                "task_ids": []
-            })
-        })
-        .collect::<Vec<_>>();
-        serde_json::json!({
-            "task_plan_sha256": envelope.sha256,
-            "verdict": verdict,
-            "request_assessments": [{
-                "request_evidence": "Fix average",
-                "verdict": if verdict == "revise" { "fail" } else { "pass" },
-                "detail": "The requested average correction is traced to task-01",
-                "task_ids": ["task-01"]
-            }],
-            "audits": audits,
-            "challenges": if verdict == "pass" { serde_json::json!([]) } else { serde_json::json!([{
-                "id": "c1",
-                "code": "task_too_broad",
-                "request_evidence": "Fix average",
-                "description": "Split the catch-all Task",
-                "severity": "blocking",
-                "task_ids": ["task-01"]
-            }]) }
-        })
-        .to_string()
-    }
-
-    fn compiled(value: &serde_json::Value, policy: &CompiledTaskPolicy) -> TaskPlanArtifact {
-        serde_json::from_value::<TaskModelProposal>(value.clone())
-            .unwrap()
-            .into_controller_proposal(policy, "Fix average")
-            .unwrap()
-            .validate_and_compile(
-                TaskPlanAuthority {
-                    source_intent: TaskSourceIntent::Build,
-                    task_planning_qualified: true,
-                    automatic_goal_selection_qualified: false,
-                },
-                policy,
-            )
-            .unwrap()
+    fn run(
+        model: &mut ScriptedModel,
+        objective: &str,
+        source_intent: TaskSourceIntent,
+    ) -> TaskPlanningOutcome {
+        let policy = TaskConfigDocument::default().compile().unwrap();
+        let qualification = qualification(source_intent);
+        plan_tasks(
+            model,
+            TaskPlanningInput {
+                objective,
+                repository_context: "{}",
+                source_intent,
+                model_sha256: &"a".repeat(64),
+                qualification: &qualification,
+                policy: &policy,
+            },
+        )
     }
 
     #[test]
-    fn accepted_plan_is_reviewed_and_keeps_exact_coordination_usage() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let qualification = qualification(false);
-        let value = proposal("accepted");
-        let plan = compiled(&value, &policy);
-        let mut model = ScriptedModel::new([value.to_string(), review(&plan, 1, "pass")]);
-        let outcome = plan_tasks(&mut model, input(&policy, &qualification));
-        let TaskPlanningOutcome::Accepted(accepted) = outcome else {
-            panic!("plan should be accepted");
-        };
-        assert_eq!(accepted.plan.artifact.tasks.len(), 1);
-        assert_eq!(accepted.counters.planning_attempts, 1);
-        assert_eq!(accepted.counters.model_invocations, 2);
-        assert_eq!(accepted.counters.advisory_calls, 1);
-        assert_eq!(accepted.counters.generated_tokens, 200);
-    }
-
-    #[test]
-    fn deterministic_rejection_gets_one_bounded_revision_attempt() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let qualification = qualification(false);
-        let invalid = serde_json::json!({
-            "tasks": [{"title": "Fix", "description": "Fix", "request_evidence": [], "acceptance": ["Pass"], "tests": ["Run tests"], "documentation": ["Record documentation impact"], "scope_hints": [], "kind": "build"}],
-            "risks": []
-        });
-        let valid = proposal("revised");
-        let plan = compiled(&valid, &policy);
-        let mut model = ScriptedModel::new([
-            invalid.to_string(),
-            valid.to_string(),
-            review(&plan, 2, "pass"),
-        ]);
-        let TaskPlanningOutcome::Accepted(accepted) =
-            plan_tasks(&mut model, input(&policy, &qualification))
+    fn one_task_keeps_the_original_build_without_criticism() {
+        let mut model =
+            ScriptedModel::new([r#"{"tasks":[{"title":"One Build","covers":["source-001"]}]}"#]);
+        let TaskPlanningOutcome::OneBuild(bypass) =
+            run(&mut model, "Fix average", TaskSourceIntent::Build)
         else {
-            panic!("revised plan should be accepted");
+            panic!("one Task must preserve the original Build");
+        };
+        assert_eq!(
+            bypass.transcript.decision,
+            TaskPlanningDecision::OneBuildSingleTask
+        );
+        assert_eq!(model.calls, vec![TaskPlanningRole::Planner]);
+        assert_eq!(bypass.transcript.attempts.len(), 1);
+    }
+
+    #[test]
+    fn compact_multi_task_partition_compiles_controller_owned_artifacts() {
+        let mut model = ScriptedModel::new([
+            r#"{"tasks":[{"title":"Add storage","covers":["source-001"]},{"title":"Expose health","covers":["source-002"]}]}"#,
+            r#"{"decision":"accept","issues":[]}"#,
+        ]);
+        let TaskPlanningOutcome::Accepted(accepted) = run(
+            &mut model,
+            "Add durable storage. Expose health",
+            TaskSourceIntent::Build,
+        ) else {
+            panic!("valid compact partition must pass");
+        };
+        assert_eq!(accepted.plan.artifact.tasks.len(), 2);
+        assert_eq!(accepted.plan.artifact.tasks[0].kind, TaskKind::Build);
+        assert_eq!(accepted.plan.artifact.tasks[1].depends_on, vec!["task-01"]);
+        assert_eq!(accepted.plan.artifact.acceptance.len(), 2);
+        assert_eq!(
+            accepted.review.artifact.verdict,
+            TaskPlanReviewVerdict::Pass
+        );
+        assert_eq!(accepted.transcript.attempts.len(), 2);
+        accepted.review.artifact.validate(&accepted.plan).unwrap();
+    }
+
+    #[test]
+    fn duplicate_or_missing_source_ownership_gets_one_revision() {
+        let mut model = ScriptedModel::new([
+            r#"{"tasks":[{"title":"First","covers":["source-001"]},{"title":"Duplicate","covers":["source-001"]}]}"#,
+            r#"{"tasks":[{"title":"First","covers":["source-001"]},{"title":"Second","covers":["source-002"]}]}"#,
+            r#"{"decision":"accept","issues":[]}"#,
+        ]);
+        let TaskPlanningOutcome::Accepted(accepted) = run(
+            &mut model,
+            "Add storage. Expose health",
+            TaskSourceIntent::Build,
+        ) else {
+            panic!("corrected partition must pass");
         };
         assert_eq!(accepted.counters.planning_attempts, 2);
-        assert_eq!(accepted.counters.model_invocations, 3);
+        assert_eq!(accepted.transcript.attempts.len(), 3);
+        assert!(accepted.transcript.attempts[0].failure.is_some());
     }
 
     #[test]
-    fn three_invalid_attempts_stop_with_explicit_recovery_actions() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let qualification = qualification(false);
-        let invalid = "{\"objective\":\"bad\",\"tasks\":[],\"risks\":[]}";
+    fn controller_attaches_decomposition_wide_constraints_to_each_task() {
         let mut model = ScriptedModel::new([
-            invalid.to_string(),
-            invalid.to_string(),
-            invalid.to_string(),
+            r#"{"tasks":[{"title":"Storage","covers":["source-001"]},{"title":"Health","covers":["source-002"]}]}"#,
+            r#"{"decision":"accept","issues":[]}"#,
         ]);
-        let TaskPlanningOutcome::Rejected(rejected) =
-            plan_tasks(&mut model, input(&policy, &qualification))
-        else {
-            panic!("invalid plans must be rejected");
+        let TaskPlanningOutcome::Accepted(accepted) = run(
+            &mut model,
+            "Add storage. Expose health. Each Task includes its applicable tests and documentation",
+            TaskSourceIntent::Build,
+        ) else {
+            panic!("valid partition must pass");
         };
-        assert_eq!(
-            rejected.outcome,
-            TaskPlanRejectionOutcome::AttemptsExhausted
-        );
-        assert_eq!(rejected.attempts, 3);
-        assert_eq!(
-            rejected.recovery_actions,
-            vec![
-                TaskPlanRecoveryAction::RetryPlanning,
-                TaskPlanRecoveryAction::EditRequest,
-                TaskPlanRecoveryAction::RunAsOneBuild
-            ]
-        );
-    }
-
-    #[test]
-    fn blocking_review_forces_the_second_planning_attempt() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let qualification = qualification(false);
-        let first = proposal("first");
-        let second = proposal("second");
-        let first_plan = compiled(&first, &policy);
-        let second_plan = compiled(&second, &policy);
-        let mut revise =
-            serde_json::from_str::<serde_json::Value>(&review(&first_plan, 1, "revise")).unwrap();
-        revise["challenges"][0]["task_ids"] = serde_json::json!(["task-01"]);
-        let mut model = ScriptedModel::new([
-            first.to_string(),
-            revise.to_string(),
-            second.to_string(),
-            review(&second_plan, 2, "pass"),
-        ]);
-        let TaskPlanningOutcome::Accepted(accepted) =
-            plan_tasks(&mut model, input(&policy, &qualification))
-        else {
-            panic!("second plan should pass");
-        };
-        assert_eq!(accepted.plan.artifact.tasks[0].id, "task-01");
-        assert!(accepted.plan.artifact.tasks[0].title.ends_with("second"));
-        assert_eq!(accepted.counters.model_invocations, 4);
-        assert_eq!(accepted.counters.advisory_calls, 2);
-    }
-
-    #[test]
-    fn qualification_must_match_the_exact_template_and_protocol() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let qualification = TaskPlannerQualification::new(
-            model_digest(),
-            "c".repeat(64),
-            task_planner_protocol_sha256(),
-            "b".repeat(64),
-            true,
-            false,
-        )
-        .unwrap();
-        let mut model = ScriptedModel::new(Vec::<String>::new());
-        let TaskPlanningOutcome::Rejected(rejected) =
-            plan_tasks(&mut model, input(&policy, &qualification))
-        else {
-            panic!("mismatched qualification must fail");
-        };
-        assert_eq!(
-            rejected.outcome,
-            TaskPlanRejectionOutcome::QualificationMismatch
-        );
-        assert!(model.calls.is_empty());
-    }
-
-    #[test]
-    fn controller_assigns_fact_ids_and_sequential_dependencies() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let value = serde_json::json!({
-            "tasks": [
-                {
-                    "title": "Storage compatibility",
-                    "description": "Deliver the compatibility boundary",
-                    "request_evidence": ["Fix average"],
-                    "acceptance": ["Storage compatibility tests pass"],
-                    "tests": ["Run storage compatibility tests"],
-                    "documentation": ["Document the storage compatibility boundary"],
-                    "scope_hints": ["storage"],
-                    "kind": "build"
-                },
-                {
-                    "title": "API consumer",
-                    "description": "Move API reads to the boundary",
-                    "request_evidence": ["Fix average"],
-                    "acceptance": ["API compatibility tests pass"],
-                    "tests": ["Run API compatibility tests"],
-                    "documentation": ["Document the API compatibility behavior"],
-                    "scope_hints": ["api"],
-                    "kind": "build"
-                }
-            ],
-            "risks": []
-        });
-
-        let plan = compiled(&value, &policy);
-        assert_eq!(plan.tasks[0].id, "task-01");
-        assert_eq!(plan.tasks[0].effort, TaskEffort::Small);
-        assert!(plan.tasks[0].depends_on.is_empty());
-        assert_eq!(plan.tasks[1].id, "task-02");
-        assert_eq!(plan.tasks[1].depends_on, ["task-01"]);
-        assert_eq!(plan.requirements.len(), 1);
-        assert_eq!(plan.acceptance.len(), 6);
-        assert_eq!(
-            plan.tasks[0].requirement_ids[0],
-            plan.tasks[1].requirement_ids[0]
-        );
-        assert!(
-            plan.acceptance
-                .iter()
-                .any(|fact| fact.description.starts_with("Tests: "))
-        );
-        assert!(
-            plan.acceptance
-                .iter()
-                .any(|fact| fact.description.starts_with("Documentation: "))
-        );
-    }
-
-    #[test]
-    fn controller_keeps_the_verbatim_objective_and_requires_every_request_clause() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let objective = "Keep the existing API. Update its documentation.";
-        let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
-            "tasks": [{
-                "title": "Keep the API",
-                "description": "Preserve the existing API behavior",
-                "request_evidence": ["Keep the existing API"],
-                "acceptance": ["Existing clients remain compatible"],
-                "tests": ["Run API compatibility tests"],
-                "documentation": ["Update the API documentation"],
-                "scope_hints": ["api"],
-                "kind": "build"
-            }],
-            "risks": []
-        }))
-        .unwrap();
-        let proposal = model.into_controller_proposal(&policy, objective).unwrap();
-        assert_eq!(proposal.objective, objective);
-        let error = proposal
-            .validate_and_compile(
-                TaskPlanAuthority {
-                    source_intent: TaskSourceIntent::Build,
-                    task_planning_qualified: true,
-                    automatic_goal_selection_qualified: false,
-                },
-                &policy,
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.code,
-            super::super::TaskPlanErrorCode::UncoveredRequirement
-        );
-    }
-
-    #[test]
-    fn controller_rejects_tasks_that_own_only_decomposition_constraints() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let objective = "Add durable storage. Each behavior-owning Task includes tests and documentation. Decompose this into bounded Tasks suitable for a smaller implementation model.";
-        let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
-            "tasks": [
-                {
-                    "title": "Add durable storage",
-                    "description": "Deliver durable storage",
-                    "request_evidence": ["Add durable storage"],
-                    "acceptance": ["Storage survives restart"],
-                    "tests": ["Run restart tests"],
-                    "documentation": ["Document durable storage"],
-                    "scope_hints": ["storage"],
-                    "kind": "build"
-                },
-                {
-                    "title": "Test and document everything",
-                    "description": "Run final tests and write final documentation",
-                    "request_evidence": [
-                        "Each behavior-owning Task includes tests and documentation",
-                        "Decompose this into bounded Tasks suitable for a smaller implementation model"
-                    ],
-                    "acceptance": ["Everything is validated"],
-                    "tests": ["Run all tests"],
-                    "documentation": ["Write all documentation"],
-                    "scope_hints": [],
-                    "kind": "build"
-                }
-            ],
-            "risks": []
-        }))
-        .unwrap();
-        assert!(
-            model
-                .into_controller_proposal(&policy, objective)
-                .unwrap_err()
-                .to_string()
-                .contains("owns only decomposition constraints")
-        );
-    }
-
-    #[test]
-    fn controller_attaches_decomposition_constraints_to_every_behavior_task() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let objective =
-            "Add durable storage. Each behavior-owning Task includes tests and documentation.";
-        let task = |title: &str| {
-            serde_json::json!({
-                "title": title,
-                "description": format!("Deliver {title}"),
-                "request_evidence": ["Add durable storage"],
-                "acceptance": [format!("{title} is delivered")],
-                "tests": [format!("Test {title}")],
-                "documentation": [format!("Document {title}")],
-                "scope_hints": [],
-                "kind": "build"
-            })
-        };
-        let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
-            "tasks": [task("storage schema"), task("storage adapter")],
-            "risks": []
-        }))
-        .unwrap();
-        let plan = model
-            .into_controller_proposal(&policy, objective)
-            .unwrap()
-            .validate_and_compile(
-                TaskPlanAuthority {
-                    source_intent: TaskSourceIntent::Build,
-                    task_planning_qualified: true,
-                    automatic_goal_selection_qualified: false,
-                },
-                &policy,
-            )
+        let constraint = accepted
+            .plan
+            .artifact
+            .requirements
+            .iter()
+            .find(|requirement| requirement.description.starts_with("Each Task"))
             .unwrap();
-        assert_eq!(plan.requirements.len(), 2);
         assert!(
-            plan.tasks
-                .iter()
-                .all(|task| task.requirement_ids == ["req-002", "req-001"])
-        );
-    }
-
-    #[test]
-    fn controller_splits_compound_clauses_and_bounds_build_task_ownership() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let objective = "Add a rollback-safe schema, migrate reads behind its boundary, preserve restart idempotency, and expose health.";
-        assert_eq!(
-            behavior_evidence_clauses(objective),
-            [
-                "Add a rollback-safe schema",
-                "migrate reads behind its boundary",
-                "preserve restart idempotency",
-                "and expose health"
-            ]
-        );
-        let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
-            "tasks": [
-                {
-                    "title": "Storage foundation",
-                    "description": "Deliver schema, boundary, and restart behavior",
-                    "request_evidence": [
-                        "Add a rollback-safe schema",
-                        "migrate reads behind its boundary",
-                        "preserve restart idempotency"
-                    ],
-                    "acceptance": ["Schema works", "Reads migrate", "Restart is safe"],
-                    "tests": ["Test schema", "Test reads", "Test restart"],
-                    "documentation": ["Document storage behavior"],
-                    "scope_hints": ["storage"],
-                    "kind": "build"
-                },
-                {
-                    "title": "Expose health",
-                    "description": "Expose health",
-                    "request_evidence": ["and expose health"],
-                    "acceptance": ["Health is visible"],
-                    "tests": ["Test health"],
-                    "documentation": ["Document health"],
-                    "scope_hints": ["operations"],
-                    "kind": "build"
-                }
-            ],
-            "risks": []
-        }))
-        .unwrap();
-        assert!(
-            model
-                .into_controller_proposal(&policy, objective)
-                .unwrap_err()
-                .to_string()
-                .contains("maximum is 2")
-        );
-    }
-
-    #[test]
-    fn controller_normalizes_goal_effort_to_the_aggregate_budget() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let tasks = (1..=4)
-            .map(|index| {
-                serde_json::json!({
-                    "title": format!("Goal {index}"),
-                    "description": format!("Deliver Goal outcome {index}"),
-                    "request_evidence": ["Deliver four evidence-driven outcomes"],
-                    "acceptance": [format!("Outcome {index} is verified")],
-                    "tests": [format!("Verify outcome {index}")],
-                    "documentation": [format!("Document outcome {index}")],
-                    "scope_hints": [],
-                    "kind": "goal",
-                    "goal_contract": {
-                        "objective": format!("Deliver Goal outcome {index}"),
-                        "criteria": [{
-                            "text": format!("Outcome {index} is verified"),
-                            "verifier": "workflow_ready"
-                        }],
-                        "continuation": "review_plan_then_automatic"
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
-            "tasks": tasks,
-            "risks": []
-        }))
-        .unwrap();
-
-        let proposal = model
-            .into_controller_proposal(&policy, "Deliver four evidence-driven outcomes")
-            .unwrap();
-        assert_eq!(
-            proposal
+            accepted
+                .plan
+                .artifact
                 .tasks
                 .iter()
-                .map(|task| task.effort)
-                .collect::<Vec<_>>(),
-            [
-                TaskEffort::Large,
-                TaskEffort::Medium,
-                TaskEffort::Medium,
-                TaskEffort::Medium
+                .all(|task| task.requirement_ids.contains(&constraint.id))
+        );
+    }
+
+    #[test]
+    fn controller_atomizes_ordering_and_keeps_test_documentation_ownership_global() {
+        let objective = "Add durable import lifecycle storage and a rollback-safe migration before exposing compatible status and cancel APIs, with tests and documentation owned by each behavior change.";
+        assert_eq!(
+            request_evidence_clauses(objective),
+            vec![
+                "Add durable import lifecycle storage and a rollback-safe migration",
+                "exposing compatible status and cancel APIs",
+                "with tests and documentation owned by each behavior change"
             ]
         );
-        assert!(model_efforts_fit(&proposal.tasks, &policy));
-    }
-
-    #[test]
-    fn reviewer_challenges_must_cite_verbatim_request_evidence() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let plan = compiled(&proposal("evidence"), &policy);
-        let mut review_artifact: TaskPlanReviewArtifact =
-            serde_json::from_str(&review(&plan, 1, "revise")).unwrap();
-        validate_review_request_evidence(&review_artifact, "Fix average").unwrap();
-
-        review_artifact.challenges[0].request_evidence = "Invented requirement".to_string();
-        assert!(
-            validate_review_request_evidence(&review_artifact, "Fix average")
-                .unwrap_err()
-                .to_string()
-                .contains("does not cite controller request evidence")
+        assert_eq!(behavior_evidence_clauses(objective).len(), 2);
+        assert_eq!(
+            ordered_request_subclauses("Expose health after adding storage"),
+            vec!["adding storage", "Expose health"]
         );
 
-        let mut missing_assessment: TaskPlanReviewArtifact =
-            serde_json::from_str(&review(&plan, 1, "revise")).unwrap();
-        missing_assessment.request_assessments.clear();
-        assert!(
-            validate_review_request_evidence(&missing_assessment, "Fix average")
-                .unwrap_err()
-                .to_string()
-                .contains("assess every controller request-evidence clause")
-        );
-    }
-
-    #[test]
-    fn constrained_output_schemas_compile_for_both_inference_engines() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let qualification = qualification(false);
-        let build_input = input(&policy, &qualification);
-        let build_schema = planner_schema(&build_input);
-        assert_eq!(
-            build_schema.pointer("/properties/tasks/maxItems"),
-            Some(&json!(policy.aggregate.max_tasks))
-        );
-        assert_eq!(
-            build_schema.pointer("/properties/tasks/items/properties/kind/enum"),
-            Some(&json!(["build"]))
-        );
-        assert!(
-            build_schema
-                .pointer("/properties/tasks/items/properties/goal_contract")
-                .is_none()
-        );
-        assert!(
-            build_schema
-                .pointer("/properties/tasks/items/properties/id")
-                .is_none()
-        );
-        assert!(
-            build_schema
-                .pointer("/properties/tasks/items/properties/depends_on")
-                .is_none()
-        );
-        assert!(
-            build_schema
-                .pointer("/properties/tasks/items/properties/effort")
-                .is_none()
-        );
-        assert_eq!(
-            build_schema.pointer("/properties/tasks/items/properties/request_evidence/minItems"),
-            Some(&json!(1))
-        );
-        assert!(build_schema.pointer("/properties/objective").is_none());
-        assert_eq!(
-            build_schema.pointer("/properties/tasks/items/properties/tests/minItems"),
-            Some(&json!(1))
-        );
-        assert_eq!(
-            build_schema.pointer("/properties/tasks/items/properties/documentation/minItems"),
-            Some(&json!(1))
-        );
-
-        let mut goal_input = input(&policy, &qualification);
-        goal_input.source_intent = TaskSourceIntent::Goal;
-        let goal_schema = planner_schema(&goal_input);
-        assert_eq!(
-            goal_schema.pointer("/properties/tasks/maxItems"),
-            Some(&json!(1))
-        );
-        assert!(
-            goal_schema
-                .pointer("/properties/tasks/items/required")
-                .and_then(Value::as_array)
-                .is_some_and(|required| required.contains(&json!("goal_contract")))
-        );
-
-        let value = proposal("schema");
-        let plan = compiled(&value, &policy);
-        let envelope = ArtifactEnvelope::new("task-plan-schema-test", plan).unwrap();
-        let review_schema = reviewer_schema(&build_input, &envelope);
-        assert_eq!(
-            review_schema.pointer("/properties/task_plan_sha256/enum/0"),
-            Some(&json!(envelope.sha256))
-        );
-        assert_eq!(
-            review_schema.pointer("/properties/request_assessments/minItems"),
-            Some(&json!(1))
-        );
-        assert_eq!(
-            review_schema
-                .pointer("/properties/challenges/items/properties/request_evidence/enum/0"),
-            Some(&json!("Fix average"))
-        );
-
-        for schema in [build_schema, goal_schema, review_schema] {
-            crate::inference::flashmoe::validate_native_tool_schema(&schema).unwrap();
-            crate::inference::flashmoe::validate_llguidance_json_schema(&schema).unwrap();
-            let schema = serde_json::to_string(&schema).unwrap();
-            let grammar = llama_cpp_2::json_schema_to_grammar(&schema).unwrap();
-            assert!(grammar.contains("root"));
-            assert!(!grammar.contains("{1,2048}"));
-        }
-    }
-
-    #[test]
-    fn model_authored_numeric_budget_is_rejected_on_every_attempt() {
-        let policy = TaskConfigDocument::default().compile().unwrap();
-        let qualification = qualification(false);
-        let mut value = proposal("budget");
-        value["tasks"][0]["budget"] = serde_json::json!({"generated_tokens": 999999});
-        let mut model =
-            ScriptedModel::new([value.to_string(), value.to_string(), value.to_string()]);
-        let TaskPlanningOutcome::Rejected(rejected) =
-            plan_tasks(&mut model, input(&policy, &qualification))
+        let mut model = ScriptedModel::new([
+            r#"{"tasks":[{"title":"Storage and migration","covers":["source-001"]},{"title":"Compatible APIs","covers":["source-002"]}]}"#,
+            r#"{"decision":"accept","issues":[]}"#,
+        ]);
+        let TaskPlanningOutcome::Accepted(accepted) =
+            run(&mut model, objective, TaskSourceIntent::Build)
         else {
-            panic!("model budgets must fail");
+            panic!("ordered partition must pass");
         };
-        assert_eq!(rejected.attempts, 3);
+        let constraint_id = accepted.plan.artifact.requirements[2].id.clone();
+        assert_eq!(accepted.plan.artifact.tasks[1].depends_on, vec!["task-01"]);
         assert!(
-            rejected
-                .failures
+            accepted
+                .plan
+                .artifact
+                .tasks
                 .iter()
-                .all(|failure| failure.reason.contains("unknown field `budget`"))
+                .all(|task| task.requirement_ids.contains(&constraint_id))
         );
     }
 
     #[test]
-    fn cancellation_stops_without_invoking_the_model() {
+    fn critic_findings_are_preserved_without_vetoing_a_valid_partition() {
+        let partition = r#"{"tasks":[{"title":"Consumer","covers":["source-002"]},{"title":"Foundation","covers":["source-001"]}]}"#;
+        let mut model = ScriptedModel::new([
+            partition,
+            r#"{"decision":"revise","issues":[{"code":"bad_order","task_ids":["task-01","task-02"],"source_ids":["source-001","source-002"]}]}"#,
+        ]);
+        let TaskPlanningOutcome::Accepted(accepted) = run(
+            &mut model,
+            "Add storage. Expose health",
+            TaskSourceIntent::Build,
+        ) else {
+            panic!("valid deterministic partition must pass");
+        };
+        assert_eq!(accepted.counters.planning_attempts, 1);
+        assert_eq!(accepted.counters.advisory_calls, 1);
+        assert!(accepted.transcript.summary.contains("advisory evidence"));
+        assert_eq!(accepted.transcript.attempts.len(), 2);
+    }
+
+    #[test]
+    fn explicit_before_order_is_a_deterministic_gate() {
+        let mut model = ScriptedModel::new([
+            r#"{"tasks":[{"title":"API","covers":["source-002"]},{"title":"Storage","covers":["source-001"]}]}"#,
+            r#"{"tasks":[{"title":"Storage","covers":["source-001"]},{"title":"API","covers":["source-002"]}]}"#,
+            r#"{"decision":"accept","issues":[]}"#,
+        ]);
+        let TaskPlanningOutcome::Accepted(accepted) = run(
+            &mut model,
+            "Add storage before exposing the API",
+            TaskSourceIntent::Build,
+        ) else {
+            panic!("corrected explicit order must pass");
+        };
+        assert_eq!(accepted.counters.planning_attempts, 2);
+        assert!(
+            accepted.transcript.attempts[0]
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains("explicit source order")
+        );
+    }
+
+    #[test]
+    fn invalid_partitions_fail_soft_to_the_original_build() {
+        let mut model = ScriptedModel::new(["{}", "{}"]);
+        let TaskPlanningOutcome::OneBuild(fallback) =
+            run(&mut model, "Fix average", TaskSourceIntent::Build)
+        else {
+            panic!("invalid automatic planning must fail soft");
+        };
+        assert_eq!(
+            fallback.transcript.decision,
+            TaskPlanningDecision::OneBuildPlannerFallback
+        );
+        assert_eq!(fallback.transcript.attempts.len(), 2);
+    }
+
+    #[test]
+    fn compact_schemas_expose_only_partition_and_veto_fields() {
         let policy = TaskConfigDocument::default().compile().unwrap();
-        let qualification = qualification(false);
-        let mut model = ScriptedModel::new(Vec::<String>::new());
+        let qualification = qualification(TaskSourceIntent::Build);
+        let input = TaskPlanningInput {
+            objective: "Add storage. Expose health",
+            repository_context: "{}",
+            source_intent: TaskSourceIntent::Build,
+            model_sha256: &"a".repeat(64),
+            qualification: &qualification,
+            policy: &policy,
+        };
+        let schema = planner_schema(&input);
+        crate::inference::flashmoe::validate_native_tool_schema(&schema).unwrap();
+        crate::inference::flashmoe::validate_llguidance_json_schema(&schema).unwrap();
+        let properties = schema["properties"]["tasks"]["items"]["properties"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            properties.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["covers".to_string(), "title".to_string()])
+        );
+    }
+
+    #[test]
+    fn cancellation_remains_terminal_instead_of_starting_a_build() {
+        let mut model = ScriptedModel::new([]);
         model.cancelled = true;
         let TaskPlanningOutcome::Rejected(rejected) =
-            plan_tasks(&mut model, input(&policy, &qualification))
+            run(&mut model, "Fix average", TaskSourceIntent::Build)
         else {
-            panic!("cancelled planning must reject");
+            panic!("cancellation must stop work");
         };
         assert_eq!(rejected.outcome, TaskPlanRejectionOutcome::Cancelled);
         assert!(model.calls.is_empty());

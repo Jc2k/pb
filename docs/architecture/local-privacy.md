@@ -70,10 +70,13 @@ publication path.
 
 High-level Task planning and the multi-Task controller follow the same local path. Planner and critic
 inference use the selected local model; there is no hosted fallback or automatic model escalation.
-The accepted plan, planner-qualification digests, exact budgets and consumption, Task requests and
-results, repository fingerprints, and native active Build or Goal checkpoint remain in the
-containing session Git note. The Tasks UI reads that state through the loopback daemon. The feature
-adds no hosted scheduler, telemetry, remote persistence, or publication edge.
+Every compact planning attempt also remains local: its prompt, JSON schema, raw constrained output,
+normalized artifact, typed failure, usage, and controller routing decision are stored in the
+containing session Git note. This is diagnostic model I/O, not hidden chain-of-thought. The accepted
+plan, qualification/identity digests, exact budgets and consumption, Task requests and results,
+whole-request completion audit, repository fingerprints, and native active Build or Goal checkpoint
+use the same local store. The Tasks UI reads that state through the loopback daemon. The feature adds
+no hosted scheduler, telemetry, remote persistence, or publication edge.
 
 ## Explicit external edges
 

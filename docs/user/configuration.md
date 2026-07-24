@@ -319,20 +319,18 @@ strict-workflow, durable-Goal, and Task-decomposition foundations.
 
 ## Task decomposition policy
 
-**Shipped policy; automatic planning currently unavailable.** `.pb/tasks.toml` is a versioned, hashed ceiling document for
+**Shipped policy; Build partitioning is on by default.** `.pb/tasks.toml` is a versioned, hashed ceiling document for
 high-level Task-plan validation and controller-owned budget projection. It defines `small`,
 `medium`, and `large` qualitative effort presets, an eight-Task aggregate ceiling by default, and a
-three-attempt coordination allowance. pb assigns Build Tasks the `small` preset and Goal Tasks the
-largest preset that keeps the queue within the aggregate ceiling; executable numeric budgets are
-compiled from this document and included in the accepted artifact digest.
+two-attempt coordination allowance. Default partitions use bounded Build Tasks with the `small`
+preset; executable numeric budgets are compiled from this document and included in the accepted
+artifact digest.
 
-The file cannot enable Task planning, qualify a model, authorize automatic Goal selection, start a
-Goal, expand workflow authority, or allow publication. Planner qualification is controller-owned
-evidence for an exact model/backend/template/protocol and structured-output contract. This
-release's embedded qualification catalog is empty. Existing `.pb/workflow.toml` and
-`.pb/goal.toml` formats and limits are unchanged. Qualified multi-Task sessions use these ceilings
-for the durable controller and read-only Tasks UI; an unqualified model retains ordinary Build
-behavior.
+The file cannot disable or enable Task planning, qualify automatic Goal selection, start a Goal,
+expand workflow authority, or allow publication. Exact model/backend/template/protocol evidence is
+required only for the separate automatic Goal-shaped Task promotion; that embedded catalog is
+empty. Existing `.pb/workflow.toml` and `.pb/goal.toml` formats and limits are unchanged. Accepted
+multi-Task Builds use these ceilings for the durable controller and read-only Tasks UI.
 
 ## Goal policy
 

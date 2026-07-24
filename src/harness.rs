@@ -53,6 +53,7 @@ struct ScratchLayout {
     run_id: String,
     run_events: PathBuf,
     run_journal: PathBuf,
+    run_task_planning_transcript: PathBuf,
     task_baseline: PathBuf,
     adoptions: PathBuf,
     workflow_checkpoint: PathBuf,
@@ -748,6 +749,10 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     println!("pb harness: run_events={}", layout.run_events.display());
     println!("pb harness: run_journal={}", layout.run_journal.display());
     println!(
+        "pb harness: task_planning_transcript={}",
+        layout.run_task_planning_transcript.display()
+    );
+    println!(
         "pb harness: multi_task_checkpoint={}",
         layout.multi_task_checkpoint.display()
     );
@@ -790,6 +795,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         intent: Some(args.intent),
         task_planning: crate::agent_core::TaskPlanningPreference::Auto,
         task_plan_rejected: None,
+        task_planning_transcript: None,
         workflow_policy: Some(workflow_policy),
         workflow_stage: None,
         workflow_expected_content_fingerprint: None,
@@ -877,6 +883,14 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         sink.configure_goal_context(goal)?;
     }
     let run_result = run_agent(request, &models_root, sink.clone());
+    if let Ok(result) = &run_result
+        && let Some(transcript) = &result.task_planning_transcript
+    {
+        atomic_write(
+            &layout.run_task_planning_transcript,
+            &serde_json::to_vec_pretty(transcript)?,
+        )?;
+    }
     let (mut observations, summary, audit) = sink.snapshot()?;
     add_run_observations(&mut observations, &run_result, &layout.workspace, &summary);
     write_journal(
@@ -1296,6 +1310,7 @@ fn prepare_scratch(requested: Option<&Path>) -> Result<ScratchLayout> {
         run_index: root.join("run-index.jsonl"),
         run_events: run_dir.join("events.jsonl"),
         run_journal: run_dir.join("journal.md"),
+        run_task_planning_transcript: run_dir.join("task-planning-transcript.json"),
         task_baseline: root.join("task-baseline.json"),
         adoptions: root.join("adoptions.jsonl"),
         workflow_checkpoint: root.join("workflow-checkpoint.json"),
@@ -1995,6 +2010,7 @@ mod tests {
                 requested_goal: None,
                 task_goal: None,
                 task_plan_rejected: None,
+                task_planning_transcript: None,
             }
         };
 
@@ -2561,6 +2577,7 @@ mod tests {
             requested_goal: None,
             task_goal: None,
             task_plan_rejected: None,
+            task_planning_transcript: None,
         });
         append_run_index_started(&layout, &run.task, None, &metadata).unwrap();
         append_run_index_finished(&layout, &result, &audit, None, &metadata).unwrap();
@@ -2633,6 +2650,7 @@ mod tests {
             requested_goal: None,
             task_goal: None,
             task_plan_rejected: None,
+            task_planning_transcript: None,
         });
         let summary = CapturedSummary {
             summary: "No changes were needed.".to_string(),
@@ -2672,6 +2690,7 @@ mod tests {
             requested_goal: None,
             task_goal: None,
             task_plan_rejected: None,
+            task_planning_transcript: None,
         });
         let summary = CapturedSummary {
             summary: "Discussion answer.".to_string(),
@@ -2711,6 +2730,7 @@ mod tests {
             requested_goal: None,
             task_goal: None,
             task_plan_rejected: None,
+            task_planning_transcript: None,
         });
         let summary = CapturedSummary {
             summary: "Model setup failed before delivery began.".to_string(),
@@ -2751,6 +2771,7 @@ mod tests {
             requested_goal: None,
             task_goal: None,
             task_plan_rejected: None,
+            task_planning_transcript: None,
         });
         let summary = CapturedSummary {
             summary: "Implementation stopped at its step limit.".to_string(),
@@ -2912,6 +2933,7 @@ mod tests {
             }),
             task_goal: None,
             task_plan_rejected: None,
+            task_planning_transcript: None,
         });
         let mut observations = Vec::new();
 
@@ -3117,6 +3139,7 @@ mod tests {
             requested_goal: None,
             task_goal: None,
             task_plan_rejected: None,
+            task_planning_transcript: None,
         });
         write_journal(
             layout,
