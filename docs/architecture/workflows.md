@@ -36,9 +36,12 @@ deterministic harness stages and do not run a model.
 **Shipped controller; no planner currently qualified.** Before a new explicit Build starts, pb can
 ask an exactly qualified local model for a model-facing high-level proposal. This is separate from
 the existing Build `PlanArtifact`: each ordered outcome-shaped Task contains its Build or Goal kind,
-qualitative effort, owned requirement clauses, and owned acceptance facts. It cannot contain IDs,
-cross-references, dependencies, or executable numeric budgets. pb assigns stable IDs, deduplicates
-shared facts, and compiles array order into the sequential dependency chain. Proposal and review
+owned requirement clauses, and owned acceptance facts. It cannot contain IDs, cross-references,
+dependencies, effort, or executable numeric budgets. pb assigns stable IDs, deduplicates shared
+facts, compiles array order into the sequential dependency chain, assigns Build Tasks the bounded
+small preset, and assigns Goal Tasks the largest preset that keeps the whole queue within its
+aggregate ceiling. The fresh effort/Goal audit can still reject a Task that is too broad for its
+controller-assigned allowance. Proposal and review
 generation are token-constrained to controller-owned JSON schemas:
 llama.cpp applies its tokenizer-aware LLGuidance JSON-schema sampler, while FlashMoe exposes one
 required terminal schema call through its native constraint parser. Unknown fields, missing

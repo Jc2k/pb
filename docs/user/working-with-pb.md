@@ -80,9 +80,9 @@ The full selected local model artifact must exactly match pb's embedded
 model/backend/template/protocol qualification record; split GGUF qualifications bind every shard.
 pb constrains both the proposed plan and its fresh review to exact JSON
 schemas while each token is selected. The model orders Tasks and writes their owned requirements and
-acceptance facts; pb assigns their IDs, dependencies, and budgets so bookkeeping mistakes cannot
-enter the queue. Deterministic validation and review still decide whether the result is complete and
-useful. The embedded catalog is empty in this release, and `.pb/tasks.toml`
+acceptance facts; pb assigns their IDs, dependencies, qualitative effort, and budgets so bookkeeping
+mistakes cannot enter the queue. Deterministic validation and review still decide whether the result
+is complete and useful. The embedded catalog is empty in this release, and `.pb/tasks.toml`
 cannot turn the feature on. With an unqualified model, pb
 starts the current Build workflow directly, so existing projects do not pay an extra planning turn
 or see a new UI.

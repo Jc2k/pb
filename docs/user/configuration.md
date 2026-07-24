@@ -322,8 +322,9 @@ strict-workflow, durable-Goal, and Task-decomposition foundations.
 **Shipped policy; automatic planning currently unavailable.** `.pb/tasks.toml` is a versioned, hashed ceiling document for
 high-level Task-plan validation and controller-owned budget projection. It defines `small`,
 `medium`, and `large` qualitative effort presets, an eight-Task aggregate ceiling by default, and a
-three-attempt coordination allowance. Models propose only qualitative effort; executable numeric
-budgets are compiled from this document and included in the accepted artifact digest.
+three-attempt coordination allowance. pb assigns Build Tasks the `small` preset and Goal Tasks the
+largest preset that keeps the queue within the aggregate ceiling; executable numeric budgets are
+compiled from this document and included in the accepted artifact digest.
 
 The file cannot enable Task planning, qualify a model, authorize automatic Goal selection, start a
 Goal, expand workflow authority, or allow publication. Planner qualification is controller-owned

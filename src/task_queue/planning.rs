@@ -9,13 +9,14 @@ use sha2::{Digest, Sha256};
 use crate::workflow::ArtifactEnvelope;
 
 use super::{
-    CompiledTaskPolicy, TaskAcceptance, TaskCoordinationCounters, TaskPlanArtifact,
-    TaskPlanAuthority, TaskPlanProposal, TaskPlanReviewArtifact, TaskPlanReviewVerdict,
-    TaskPlannerQualification, TaskProposal, TaskRequirement, TaskRisk, TaskSourceIntent,
+    CompiledTaskPolicy, TaskAcceptance, TaskCoordinationCounters, TaskEffort, TaskKind,
+    TaskPlanArtifact, TaskPlanAuthority, TaskPlanProposal, TaskPlanReviewArtifact,
+    TaskPlanReviewVerdict, TaskPlannerQualification, TaskProposal, TaskRequirement, TaskRisk,
+    TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v6";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v5";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v7";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v6";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
 const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
@@ -65,14 +66,13 @@ struct TaskModelTask {
     acceptance: Vec<String>,
     #[serde(default)]
     scope_hints: Vec<String>,
-    effort: super::TaskEffort,
-    kind: super::TaskKind,
+    kind: TaskKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     goal_contract: Option<super::TaskGoalContract>,
 }
 
 impl TaskModelProposal {
-    fn into_controller_proposal(self) -> TaskPlanProposal {
+    fn into_controller_proposal(self, policy: &CompiledTaskPolicy) -> TaskPlanProposal {
         let mut requirements = Vec::new();
         let mut requirement_ids = BTreeMap::<String, String>::new();
         let mut acceptance = Vec::new();
@@ -132,10 +132,33 @@ impl TaskModelProposal {
                     .unwrap_or_default(),
                 acceptance_ids: task_acceptance_ids,
                 scope_hints: task.scope_hints,
-                effort: task.effort,
+                effort: match task.kind {
+                    TaskKind::Build => TaskEffort::Small,
+                    TaskKind::Goal => TaskEffort::Large,
+                },
                 kind: task.kind,
                 goal_contract: task.goal_contract,
             });
+        }
+
+        while !model_efforts_fit(&tasks, policy) {
+            let candidate = tasks
+                .iter()
+                .rposition(|task| task.effort == TaskEffort::Large)
+                .or_else(|| {
+                    tasks
+                        .iter()
+                        .rposition(|task| task.effort == TaskEffort::Medium)
+                });
+            let Some(task_index) = candidate else {
+                break;
+            };
+            let task = &mut tasks[task_index];
+            task.effort = match task.effort {
+                TaskEffort::Large => TaskEffort::Medium,
+                TaskEffort::Medium => TaskEffort::Small,
+                TaskEffort::Small => unreachable!("small Tasks are not normalization candidates"),
+            };
         }
 
         TaskPlanProposal {
@@ -146,6 +169,18 @@ impl TaskModelProposal {
             risks: self.risks,
         }
     }
+}
+
+fn model_efforts_fit(tasks: &[TaskProposal], policy: &CompiledTaskPolicy) -> bool {
+    let Some((first, remaining)) = tasks.split_first() else {
+        return false;
+    };
+    let allocated = remaining
+        .iter()
+        .try_fold(policy.budget_for(first.effort), |allocated, task| {
+            allocated.checked_add(policy.budget_for(task.effort)).ok()
+        });
+    allocated.is_some_and(|allocated| allocated.fits_within(&policy.aggregate.tasks))
 }
 
 pub trait TaskPlanningModel {
@@ -321,7 +356,7 @@ fn plan_tasks_inner(
             ));
         }
         let proposal = match parse_json::<TaskModelProposal>(&output.text)
-            .map(TaskModelProposal::into_controller_proposal)
+            .map(|proposal| proposal.into_controller_proposal(input.policy))
             .and_then(|proposal| {
                 proposal
                     .validate_and_compile(authority, input.policy)
@@ -499,7 +534,7 @@ fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str)
         )
     };
     format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Put tests and documentation in the Task that owns the behavior; never invent a final testing or documentation catch-all. Never include IDs, references, dependencies, or numeric budgets: pb assigns IDs and makes the array a sequential queue. Array order is delivery and commit order, so place prerequisites before their consumers. Prefer effort small; use medium only for a cohesive cross-component outcome and large only when it cannot safely be divided.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Each Task contains its own applicable requirement clauses and observable acceptance facts.\n\nBefore responding, silently audit the artifact: treat every clause of the request as a requirement, including compatibility, tests, documentation, ordering, rollback, and explicit non-goals; do not discard them as meta-instructions. Put every distinct requirement in each Task that owns it and give every Task at least one observable acceptance fact. When the request assigns tests or documentation to behavior-owning Tasks, state that ownership in each applicable Task and acceptance fact. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Put tests and documentation in the Task that owns the behavior; never invent a final testing or documentation catch-all. Never include IDs, references, dependencies, effort, or numeric budgets: pb assigns them and makes the array a sequential queue. Array order is delivery and commit order, so place prerequisites before their consumers.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Each Task contains its own applicable requirement clauses and observable acceptance facts.\n\nBefore responding, silently audit the artifact: treat every clause of the request as a requirement, including compatibility, tests, documentation, ordering, rollback, and explicit non-goals; do not discard them as meta-instructions. Put every distinct requirement in each Task that owns it and give every Task at least one observable acceptance fact. When the request assigns tests or documentation to behavior-owning Tasks, state that ownership in each applicable Task and acceptance fact. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
         input.policy.aggregate.max_tasks, input.objective, input.repository_context
     )
 }
@@ -545,10 +580,6 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
             bounded_string_array(MAX_SCOPE_HINTS, MAX_DESCRIPTION_CHARS),
         ),
         (
-            "effort".to_string(),
-            json!({"type": "string", "enum": ["small", "medium", "large"]}),
-        ),
-        (
             "kind".to_string(),
             json!({"type": "string", "enum": task_kinds}),
         ),
@@ -562,7 +593,6 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
         "requirements",
         "acceptance",
         "scope_hints",
-        "effort",
         "kind",
     ];
     if explicit_goal {
@@ -864,7 +894,6 @@ mod tests {
                 "requirements": ["Use the correct divisor"],
                 "acceptance": ["Regression test passes"],
                 "scope_hints": ["src"],
-                "effort": "small",
                 "kind": "build"
             }],
             "risks": []
@@ -927,7 +956,7 @@ mod tests {
     fn compiled(value: &serde_json::Value, policy: &CompiledTaskPolicy) -> TaskPlanArtifact {
         serde_json::from_value::<TaskModelProposal>(value.clone())
             .unwrap()
-            .into_controller_proposal()
+            .into_controller_proposal(policy)
             .validate_and_compile(
                 TaskPlanAuthority {
                     source_intent: TaskSourceIntent::Build,
@@ -963,7 +992,7 @@ mod tests {
         let qualification = qualification(false);
         let invalid = serde_json::json!({
             "objective": "Fix average",
-            "tasks": [{"title": "Fix", "description": "Fix", "requirements": [], "acceptance": ["Pass"], "scope_hints": [], "effort": "small", "kind": "build"}],
+            "tasks": [{"title": "Fix", "description": "Fix", "requirements": [], "acceptance": ["Pass"], "scope_hints": [], "kind": "build"}],
             "risks": []
         });
         let valid = proposal("revised");
@@ -1077,7 +1106,6 @@ mod tests {
                     "requirements": ["Preserve compatibility", "Add durable storage"],
                     "acceptance": ["Storage compatibility tests pass"],
                     "scope_hints": ["storage"],
-                    "effort": "small",
                     "kind": "build"
                 },
                 {
@@ -1086,7 +1114,6 @@ mod tests {
                     "requirements": ["Preserve compatibility", "Migrate API reads"],
                     "acceptance": ["API compatibility tests pass"],
                     "scope_hints": ["api"],
-                    "effort": "small",
                     "kind": "build"
                 }
             ],
@@ -1095,6 +1122,7 @@ mod tests {
 
         let plan = compiled(&value, &policy);
         assert_eq!(plan.tasks[0].id, "task-01");
+        assert_eq!(plan.tasks[0].effort, TaskEffort::Small);
         assert!(plan.tasks[0].depends_on.is_empty());
         assert_eq!(plan.tasks[1].id, "task-02");
         assert_eq!(plan.tasks[1].depends_on, ["task-01"]);
@@ -1104,6 +1132,53 @@ mod tests {
             plan.tasks[0].requirement_ids[0],
             plan.tasks[1].requirement_ids[0]
         );
+    }
+
+    #[test]
+    fn controller_normalizes_goal_effort_to_the_aggregate_budget() {
+        let policy = TaskConfigDocument::default().compile().unwrap();
+        let tasks = (1..=4)
+            .map(|index| {
+                serde_json::json!({
+                    "title": format!("Goal {index}"),
+                    "description": format!("Deliver Goal outcome {index}"),
+                    "requirements": [format!("Requirement {index}")],
+                    "acceptance": [format!("Outcome {index} is verified")],
+                    "scope_hints": [],
+                    "kind": "goal",
+                    "goal_contract": {
+                        "objective": format!("Deliver Goal outcome {index}"),
+                        "criteria": [{
+                            "text": format!("Outcome {index} is verified"),
+                            "verifier": "workflow_ready"
+                        }],
+                        "continuation": "review_plan_then_automatic"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let model: TaskModelProposal = serde_json::from_value(serde_json::json!({
+            "objective": "Deliver four evidence-driven outcomes",
+            "tasks": tasks,
+            "risks": []
+        }))
+        .unwrap();
+
+        let proposal = model.into_controller_proposal(&policy);
+        assert_eq!(
+            proposal
+                .tasks
+                .iter()
+                .map(|task| task.effort)
+                .collect::<Vec<_>>(),
+            [
+                TaskEffort::Large,
+                TaskEffort::Medium,
+                TaskEffort::Medium,
+                TaskEffort::Medium
+            ]
+        );
+        assert!(model_efforts_fit(&proposal.tasks, &policy));
     }
 
     #[test]
@@ -1133,6 +1208,11 @@ mod tests {
         assert!(
             build_schema
                 .pointer("/properties/tasks/items/properties/depends_on")
+                .is_none()
+        );
+        assert!(
+            build_schema
+                .pointer("/properties/tasks/items/properties/effort")
                 .is_none()
         );
         assert_eq!(
