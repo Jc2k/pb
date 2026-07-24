@@ -387,6 +387,7 @@ pub struct TaskPlanAudit {
 pub struct TaskPlanChallenge {
     pub id: String,
     pub code: String,
+    pub request_evidence: String,
     pub description: String,
     pub severity: TaskPlanChallengeSeverity,
     #[serde(default)]
@@ -458,6 +459,10 @@ impl TaskPlanReviewArtifact {
         for challenge in &self.challenges {
             required("Task-plan challenge id", &challenge.id)?;
             required("Task-plan challenge code", &challenge.code)?;
+            required(
+                "Task-plan challenge request evidence",
+                &challenge.request_evidence,
+            )?;
             required("Task-plan challenge description", &challenge.description)?;
             if !challenge_ids.insert(challenge.id.as_str()) {
                 return Err(TaskPlanError::new(
@@ -1038,6 +1043,7 @@ mod tests {
             challenges: vec![TaskPlanChallenge {
                 id: "c1".to_string(),
                 code: "catch_all_task".to_string(),
+                request_evidence: "Fix average".to_string(),
                 description: "Task is a catch-all".to_string(),
                 severity: TaskPlanChallengeSeverity::Blocking,
                 task_ids: vec!["t1".to_string()],

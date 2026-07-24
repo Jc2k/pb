@@ -15,8 +15,8 @@ use super::{
     TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v7";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v6";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v8";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v7";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
 const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
@@ -400,7 +400,7 @@ fn plan_tasks_inner(
             ));
         }
         let review_prompt = reviewer_prompt(input, &plan)?;
-        let review_schema = reviewer_schema(&plan);
+        let review_schema = reviewer_schema(input, &plan);
         let started = Instant::now();
         let output = match model.generate(
             TaskPlanningRole::Reviewer,
@@ -441,10 +441,9 @@ fn plan_tasks_inner(
             ));
         }
         let review = match parse_json::<TaskPlanReviewArtifact>(&output.text).and_then(|review| {
-            review
-                .validate(&plan)
-                .map(|_| review)
-                .map_err(anyhow::Error::from)
+            review.validate(&plan).map_err(anyhow::Error::from)?;
+            validate_review_request_evidence(&review, input.objective)?;
+            Ok(review)
         }) {
             Ok(review) => review,
             Err(error) => {
@@ -543,9 +542,11 @@ fn reviewer_prompt(
     input: &TaskPlanningInput<'_>,
     plan: &ArtifactEnvelope<TaskPlanArtifact>,
 ) -> Result<String> {
+    let request_evidence = request_evidence_clauses(input.objective);
     Ok(format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic with authority bounded by the original request. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Independently compare every clause of the original request with the proposed queue. Complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, and explicit non-goals even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. Treat equivalent wording as coverage. Fail only for an omitted or contradicted request clause, an unobservable requested outcome, duplicated ownership, or a Task too broad to deliver independently. Every blocking challenge must identify the exact original-request words it enforces and ask for the minimum correction. Do not invent HTTP status codes, filenames, algorithms, integrity techniques, test names, documentation cross-links, failure modes, or other behavior absent from the request. Shared components do not imply overlap when Tasks own distinct outcomes. A pass means every audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic with authority bounded by the original request. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Independently compare every clause of the original request with the proposed queue. Complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, and explicit non-goals even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. Treat equivalent wording as coverage. Fail only for an omitted or contradicted request clause, an unobservable requested outcome, duplicated ownership, or a Task too broad to deliver independently. Every challenge must select request_evidence verbatim from the controller evidence list and ask for the minimum correction supported by that exact text. Do not claim the evidence says more than it does. Do not invent HTTP status codes, filenames, algorithms, integrity techniques, test names, documentation cross-links, failure modes, or other behavior absent from the request. Shared components do not imply overlap when Tasks own distinct outcomes. A pass means every audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nController request evidence choices:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
         input.objective,
+        serde_json::to_string_pretty(&request_evidence)?,
         plan.sha256,
         serde_json::to_string_pretty(&plan.artifact)?
     ))
@@ -630,7 +631,10 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
     })
 }
 
-fn reviewer_schema(plan: &ArtifactEnvelope<TaskPlanArtifact>) -> Value {
+fn reviewer_schema(
+    input: &TaskPlanningInput<'_>,
+    plan: &ArtifactEnvelope<TaskPlanArtifact>,
+) -> Value {
     let task_ids = plan
         .artifact
         .tasks
@@ -682,6 +686,10 @@ fn reviewer_schema(plan: &ArtifactEnvelope<TaskPlanArtifact>) -> Value {
                     "properties": {
                         "id": bounded_string(MAX_ID_CHARS),
                         "code": bounded_string(MAX_ID_CHARS),
+                        "request_evidence": {
+                            "type": "string",
+                            "enum": request_evidence_clauses(input.objective)
+                        },
                         "description": bounded_string(MAX_DESCRIPTION_CHARS),
                         "severity": {"type": "string", "enum": ["blocking", "advisory"]},
                         "task_ids": {
@@ -691,7 +699,7 @@ fn reviewer_schema(plan: &ArtifactEnvelope<TaskPlanArtifact>) -> Value {
                             "maxItems": plan.artifact.tasks.len()
                         }
                     },
-                    "required": ["id", "code", "description", "severity", "task_ids"]
+                    "required": ["id", "code", "request_evidence", "description", "severity", "task_ids"]
                 },
                 "minItems": 0,
                 "maxItems": MAX_REVIEW_CHALLENGES
@@ -699,6 +707,50 @@ fn reviewer_schema(plan: &ArtifactEnvelope<TaskPlanArtifact>) -> Value {
         },
         "required": ["task_plan_sha256", "verdict", "audits", "challenges"]
     })
+}
+
+fn request_evidence_clauses(objective: &str) -> Vec<String> {
+    let mut clauses = Vec::new();
+    for segment in objective.split(['.', ';', '\n']) {
+        let characters = segment.trim().chars().collect::<Vec<_>>();
+        for chunk in characters.chunks(MAX_DESCRIPTION_CHARS) {
+            let clause = chunk.iter().collect::<String>().trim().to_string();
+            if !clause.is_empty() && !clauses.contains(&clause) {
+                clauses.push(clause);
+                if clauses.len() == MAX_PLANNING_FACTS {
+                    return clauses;
+                }
+            }
+        }
+    }
+    if clauses.is_empty() {
+        clauses.push(
+            objective
+                .trim()
+                .chars()
+                .take(MAX_DESCRIPTION_CHARS)
+                .collect(),
+        );
+    }
+    clauses
+}
+
+fn validate_review_request_evidence(
+    review: &TaskPlanReviewArtifact,
+    objective: &str,
+) -> Result<()> {
+    let clauses = request_evidence_clauses(objective)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for challenge in &review.challenges {
+        if !clauses.contains(&challenge.request_evidence) {
+            bail!(
+                "Task-plan challenge '{}' does not cite controller request evidence",
+                challenge.id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn goal_contract_schema() -> Value {
@@ -945,6 +997,7 @@ mod tests {
             "challenges": if verdict == "pass" { serde_json::json!([]) } else { serde_json::json!([{
                 "id": "c1",
                 "code": "task_too_broad",
+                "request_evidence": "Fix average",
                 "description": "Split the catch-all Task",
                 "severity": "blocking",
                 "task_ids": ["task-01"]
@@ -1182,6 +1235,23 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_challenges_must_cite_verbatim_request_evidence() {
+        let policy = TaskConfigDocument::default().compile().unwrap();
+        let plan = compiled(&proposal("evidence"), &policy);
+        let mut review: TaskPlanReviewArtifact =
+            serde_json::from_str(&review(&plan, 1, "revise")).unwrap();
+        validate_review_request_evidence(&review, "Fix average").unwrap();
+
+        review.challenges[0].request_evidence = "Invented requirement".to_string();
+        assert!(
+            validate_review_request_evidence(&review, "Fix average")
+                .unwrap_err()
+                .to_string()
+                .contains("does not cite controller request evidence")
+        );
+    }
+
+    #[test]
     fn constrained_output_schemas_compile_for_both_inference_engines() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(false);
@@ -1237,10 +1307,15 @@ mod tests {
         let value = proposal("schema");
         let plan = compiled(&value, &policy);
         let envelope = ArtifactEnvelope::new("task-plan-schema-test", plan).unwrap();
-        let review_schema = reviewer_schema(&envelope);
+        let review_schema = reviewer_schema(&build_input, &envelope);
         assert_eq!(
             review_schema.pointer("/properties/task_plan_sha256/enum/0"),
             Some(&json!(envelope.sha256))
+        );
+        assert_eq!(
+            review_schema
+                .pointer("/properties/challenges/items/properties/request_evidence/enum/0"),
+            Some(&json!("Fix average"))
         );
 
         for schema in [build_schema, goal_schema, review_schema] {

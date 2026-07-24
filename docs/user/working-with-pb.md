@@ -89,7 +89,8 @@ or see a new UI.
 
 The fresh critic must separately audit request coverage, Task boundaries, dependency order,
 observable acceptance, test/documentation ownership, and effort/Goal authority. pb accepts a pass
-only when all six audits pass; a revision must identify a failed audit and a blocking correction.
+only when all six audits pass; a revision must identify a failed audit, select verbatim evidence
+from the original request, and provide a blocking correction grounded in that evidence.
 
 The number of accepted Tasks determines the experience:
 
