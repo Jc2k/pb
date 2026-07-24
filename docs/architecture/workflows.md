@@ -46,7 +46,7 @@ required fields, invalid enums, and structural array overflows are therefore mas
 rather than left to prompt compliance. This structural guarantee does not judge whether a
 decomposition is useful. A fresh critic reviews the compiled plan, while Rust rejects empty facts,
 missing coverage, invalid Goal contracts, unqualified automatic Goal selection, and aggregate
-overflow before any child starts. Planning has two attempts and its own invocation, token,
+overflow before any child starts. Planning has three attempts and its own invocation, token,
 advisory, and wall-time allowance.
 
 The critic must return six controller-validated audit records exactly once: request coverage, Task

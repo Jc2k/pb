@@ -14,8 +14,8 @@ use super::{
     TaskPlannerQualification, TaskProposal, TaskRequirement, TaskRisk, TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v5";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v4";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v6";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v5";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
 const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
@@ -494,7 +494,9 @@ fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str)
     let retry = if feedback.is_empty() {
         String::new()
     } else {
-        format!("\nThe previous attempt was rejected. Correct these facts:\n{feedback}\n")
+        format!(
+            "\nThe previous attempt was rejected. Correct the grounded parts of this feedback, but do not add behavior that is absent from the original request:\n{feedback}\n"
+        )
     };
     format!(
         "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Put tests and documentation in the Task that owns the behavior; never invent a final testing or documentation catch-all. Never include IDs, references, dependencies, or numeric budgets: pb assigns IDs and makes the array a sequential queue. Array order is delivery and commit order, so place prerequisites before their consumers. Prefer effort small; use medium only for a cohesive cross-component outcome and large only when it cannot safely be divided.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Each Task contains its own applicable requirement clauses and observable acceptance facts.\n\nBefore responding, silently audit the artifact: treat every clause of the request as a requirement, including compatibility, tests, documentation, ordering, rollback, and explicit non-goals; do not discard them as meta-instructions. Put every distinct requirement in each Task that owns it and give every Task at least one observable acceptance fact. When the request assigns tests or documentation to behavior-owning Tasks, state that ownership in each applicable Task and acceptance fact. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
@@ -507,7 +509,7 @@ fn reviewer_prompt(
     plan: &ArtifactEnvelope<TaskPlanArtifact>,
 ) -> Result<String> {
     Ok(format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Independently compare every clause of the original request with the proposed queue. Complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, and explicit non-goals even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. A pass means every audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are a fresh Task-plan critic with authority bounded by the original request. The runtime constrains your response to the exact review JSON schema; fill every required field and return no prose. Independently compare every clause of the original request with the proposed queue. Complete all six audit categories exactly once with concise evidence. request_coverage includes compatibility, tests, documentation, ordering, rollback, and explicit non-goals even when they look like meta-instructions. test_documentation_ownership fails when requested tests or documentation are absent from any applicable behavior-owning Task or its acceptance facts. Also check each Task's size for a smaller implementation model, dependency and migration/rollback order, observable acceptance, commit boundaries, catch-all Tasks, Build-versus-Goal choice, and qualitative effort. Treat equivalent wording as coverage. Fail only for an omitted or contradicted request clause, an unobservable requested outcome, duplicated ownership, or a Task too broad to deliver independently. Every blocking challenge must identify the exact original-request words it enforces and ask for the minimum correction. Do not invent HTTP status codes, filenames, algorithms, integrity techniques, test names, documentation cross-links, failure modes, or other behavior absent from the request. Shared components do not imply overlap when Tasks own distinct outcomes. A pass means every audit passes and the queue is executable as written and completely delivers the request. verdict pass must contain no blocking challenges; verdict revise must contain a failed audit and at least one precise blocking challenge that tells the planner what fact to correct.\n\nOriginal request:\n{}\n\nTask plan digest: {}\nTask plan:\n{}",
         input.objective,
         plan.sha256,
         serde_json::to_string_pretty(&plan.artifact)?
@@ -981,11 +983,15 @@ mod tests {
     }
 
     #[test]
-    fn two_invalid_attempts_stop_with_explicit_recovery_actions() {
+    fn three_invalid_attempts_stop_with_explicit_recovery_actions() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(false);
         let invalid = "{\"objective\":\"bad\",\"tasks\":[],\"risks\":[]}";
-        let mut model = ScriptedModel::new([invalid.to_string(), invalid.to_string()]);
+        let mut model = ScriptedModel::new([
+            invalid.to_string(),
+            invalid.to_string(),
+            invalid.to_string(),
+        ]);
         let TaskPlanningOutcome::Rejected(rejected) =
             plan_tasks(&mut model, input(&policy, &qualification))
         else {
@@ -995,7 +1001,7 @@ mod tests {
             rejected.outcome,
             TaskPlanRejectionOutcome::AttemptsExhausted
         );
-        assert_eq!(rejected.attempts, 2);
+        assert_eq!(rejected.attempts, 3);
         assert_eq!(
             rejected.recovery_actions,
             vec![
@@ -1167,18 +1173,19 @@ mod tests {
     }
 
     #[test]
-    fn model_authored_numeric_budget_is_rejected_on_both_attempts() {
+    fn model_authored_numeric_budget_is_rejected_on_every_attempt() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(false);
         let mut value = proposal("budget");
         value["tasks"][0]["budget"] = serde_json::json!({"generated_tokens": 999999});
-        let mut model = ScriptedModel::new([value.to_string(), value.to_string()]);
+        let mut model =
+            ScriptedModel::new([value.to_string(), value.to_string(), value.to_string()]);
         let TaskPlanningOutcome::Rejected(rejected) =
             plan_tasks(&mut model, input(&policy, &qualification))
         else {
             panic!("model budgets must fail");
         };
-        assert_eq!(rejected.attempts, 2);
+        assert_eq!(rejected.attempts, 3);
         assert!(
             rejected
                 .failures

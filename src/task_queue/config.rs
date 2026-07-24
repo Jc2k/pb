@@ -17,7 +17,7 @@ const HARD_MAX_GENERATED_TOKENS: usize = 4_000_000;
 const HARD_MAX_ADVISORY_CALLS: usize = 128;
 const HARD_MAX_CYCLES: usize = 64;
 const HARD_MAX_WALL_TIME_MINUTES: u64 = 24 * 60;
-const HARD_MAX_PLANNING_ATTEMPTS: usize = 2;
+const HARD_MAX_PLANNING_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -445,11 +445,11 @@ const fn default_aggregate_budget() -> MultiTaskBudget {
 
 const fn default_coordination_budget() -> TaskCoordinationBudget {
     TaskCoordinationBudget {
-        planning_attempts: 2,
-        model_invocations: 4,
-        generated_tokens: 12_000,
-        advisory_calls: 2,
-        wall_time_minutes: 10,
+        planning_attempts: 3,
+        model_invocations: 6,
+        generated_tokens: 18_000,
+        advisory_calls: 3,
+        wall_time_minutes: 15,
     }
 }
 

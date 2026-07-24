@@ -2767,7 +2767,7 @@ mod tests {
         deliver_no_change(&mut run, 30);
         run.apply(MultiTaskEvent::CoordinationUsageRecorded {
             usage: TaskCoordinationCounters {
-                planning_attempts: 2,
+                planning_attempts: 3,
                 model_invocations: 1,
                 generated_tokens: 100,
                 advisory_calls: 0,
@@ -2778,7 +2778,7 @@ mod tests {
         .unwrap();
         assert_eq!(run.stage, MultiTaskStage::Failed);
         assert_eq!(run.outcome, Some(MultiTaskOutcome::BudgetExhausted));
-        assert_eq!(run.counters.coordination.planning_attempts, 3);
+        assert_eq!(run.counters.coordination.planning_attempts, 4);
         assert_eq!(run.current_task("t1").unwrap().state, TaskState::NoChange);
         assert_eq!(run.current_task("t2").unwrap().state, TaskState::Queued);
     }
