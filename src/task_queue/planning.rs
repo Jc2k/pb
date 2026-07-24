@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -8,13 +9,13 @@ use sha2::{Digest, Sha256};
 use crate::workflow::ArtifactEnvelope;
 
 use super::{
-    CompiledTaskPolicy, TaskCoordinationCounters, TaskPlanArtifact, TaskPlanAuthority,
-    TaskPlanProposal, TaskPlanReviewArtifact, TaskPlanReviewVerdict, TaskPlannerQualification,
-    TaskSourceIntent,
+    CompiledTaskPolicy, TaskAcceptance, TaskCoordinationCounters, TaskPlanArtifact,
+    TaskPlanAuthority, TaskPlanProposal, TaskPlanReviewArtifact, TaskPlanReviewVerdict,
+    TaskPlannerQualification, TaskProposal, TaskRequirement, TaskRisk, TaskSourceIntent,
 };
 
-const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v4";
-const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v3";
+const TASK_PLANNER_TEMPLATE_VERSION: &str = "pb-task-planner-template-v5";
+const TASK_PLANNER_PROTOCOL_VERSION: &str = "pb-task-plan-proposal-review-v4";
 const MAX_TASK_PLANNING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TASK_PLANNER_OUTPUT_TOKENS: usize = 4_096;
 const MAX_TASK_REVIEW_OUTPUT_TOKENS: usize = 2_048;
@@ -44,6 +45,107 @@ pub struct TaskModelOutput {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TaskModelProposal {
+    objective: String,
+    tasks: Vec<TaskModelTask>,
+    #[serde(default)]
+    risks: Vec<TaskRisk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TaskModelTask {
+    title: String,
+    description: String,
+    requirements: Vec<String>,
+    acceptance: Vec<String>,
+    #[serde(default)]
+    scope_hints: Vec<String>,
+    effort: super::TaskEffort,
+    kind: super::TaskKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal_contract: Option<super::TaskGoalContract>,
+}
+
+impl TaskModelProposal {
+    fn into_controller_proposal(self) -> TaskPlanProposal {
+        let mut requirements = Vec::new();
+        let mut requirement_ids = BTreeMap::<String, String>::new();
+        let mut acceptance = Vec::new();
+        let mut acceptance_ids = BTreeMap::<String, String>::new();
+        let mut tasks = Vec::with_capacity(self.tasks.len());
+
+        for (task_index, task) in self.tasks.into_iter().enumerate() {
+            let id = format!("task-{:02}", task_index + 1);
+            let mut task_requirement_ids = Vec::new();
+            let mut seen_requirements = BTreeSet::new();
+            for description in task.requirements {
+                let description = description.trim().to_string();
+                let requirement_id = requirement_ids
+                    .entry(description.clone())
+                    .or_insert_with(|| {
+                        let requirement_id = format!("req-{:03}", requirements.len() + 1);
+                        requirements.push(TaskRequirement {
+                            id: requirement_id.clone(),
+                            description,
+                        });
+                        requirement_id
+                    })
+                    .clone();
+                if seen_requirements.insert(requirement_id.clone()) {
+                    task_requirement_ids.push(requirement_id);
+                }
+            }
+
+            let mut task_acceptance_ids = Vec::new();
+            let mut seen_acceptance = BTreeSet::new();
+            for description in task.acceptance {
+                let description = description.trim().to_string();
+                let acceptance_id = acceptance_ids
+                    .entry(description.clone())
+                    .or_insert_with(|| {
+                        let acceptance_id = format!("accept-{:03}", acceptance.len() + 1);
+                        acceptance.push(TaskAcceptance {
+                            id: acceptance_id.clone(),
+                            description,
+                        });
+                        acceptance_id
+                    })
+                    .clone();
+                if seen_acceptance.insert(acceptance_id.clone()) {
+                    task_acceptance_ids.push(acceptance_id);
+                }
+            }
+
+            tasks.push(TaskProposal {
+                id,
+                title: task.title,
+                description: task.description,
+                requirement_ids: task_requirement_ids,
+                depends_on: task_index
+                    .checked_sub(1)
+                    .map(|previous| vec![format!("task-{:02}", previous + 1)])
+                    .unwrap_or_default(),
+                acceptance_ids: task_acceptance_ids,
+                scope_hints: task.scope_hints,
+                effort: task.effort,
+                kind: task.kind,
+                goal_contract: task.goal_contract,
+            });
+        }
+
+        TaskPlanProposal {
+            objective: self.objective,
+            requirements,
+            tasks,
+            acceptance,
+            risks: self.risks,
+        }
+    }
 }
 
 pub trait TaskPlanningModel {
@@ -218,11 +320,8 @@ fn plan_tasks_inner(
                 counters,
             ));
         }
-        let proposal = match parse_json::<TaskPlanProposal>(&output.text)
-            .and_then(|proposal| {
-                let canonical = serde_json::to_string(&proposal)?;
-                TaskPlanProposal::from_model_json(&canonical).map_err(anyhow::Error::from)
-            })
+        let proposal = match parse_json::<TaskModelProposal>(&output.text)
+            .map(TaskModelProposal::into_controller_proposal)
             .and_then(|proposal| {
                 proposal
                     .validate_and_compile(authority, input.policy)
@@ -398,7 +497,7 @@ fn planner_prompt(input: &TaskPlanningInput<'_>, attempt: usize, feedback: &str)
         format!("\nThe previous attempt was rejected. Correct these facts:\n{feedback}\n")
     };
     format!(
-        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Put tests and documentation in the Task that owns the behavior; never invent a final testing or documentation catch-all. Never include numeric budgets. Prefer effort small; use medium only for a cohesive cross-component outcome and large only when it cannot safely be divided.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Dependencies must point only to earlier prerequisites and remain acyclic.\n\nBefore responding, silently audit the artifact: treat every clause of the request as a requirement, including compatibility, tests, documentation, ordering, rollback, and explicit non-goals; do not discard them as meta-instructions. Give every distinct requirement exactly one stable id. Map every requirement and every observable acceptance fact to at least one Task. When the request assigns tests or documentation to behavior-owning Tasks, state that ownership in each applicable Task and acceptance fact. Check each Task can be independently delivered and committed, and that the complete queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
+        "{TASK_PLANNER_TEMPLATE_VERSION}\nYou are the high-level Task planner. The runtime constrains your response to the exact Task-plan JSON schema; fill every required field and return no prose. Decompose the request into the smallest useful sequence of outcome-shaped Tasks for a smaller implementation model. Return between 1 and {} Tasks and combine closely coupled behavior instead of exceeding this ceiling. These are Tasks, not a Build's implementation plan: describe delivered outcomes and commit boundaries, not exact edits. Put tests and documentation in the Task that owns the behavior; never invent a final testing or documentation catch-all. Never include IDs, references, dependencies, or numeric budgets: pb assigns IDs and makes the array a sequential queue. Array order is delivery and commit order, so place prerequisites before their consumers. Prefer effort small; use medium only for a cohesive cross-component outcome and large only when it cannot safely be divided.\n\n{kind_rule}\nA build Task must omit goal_contract. A goal Task must include it. Each Task contains its own applicable requirement clauses and observable acceptance facts.\n\nBefore responding, silently audit the artifact: treat every clause of the request as a requirement, including compatibility, tests, documentation, ordering, rollback, and explicit non-goals; do not discard them as meta-instructions. Put every distinct requirement in each Task that owns it and give every Task at least one observable acceptance fact. When the request assigns tests or documentation to behavior-owning Tasks, state that ownership in each applicable Task and acceptance fact. Check each Task can be independently delivered and committed, and that the complete ordered queue satisfies the request without catch-all work.\n\nAttempt: {attempt}\nRequest:\n{}\n\nBounded repository context:\n{}\n{retry}",
         input.policy.aggregate.max_tasks, input.objective, input.repository_context
     )
 }
@@ -426,23 +525,18 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
         json!(["build"])
     };
     let mut task_properties = serde_json::Map::from_iter([
-        ("id".to_string(), bounded_string(MAX_ID_CHARS)),
         ("title".to_string(), bounded_string(MAX_TITLE_CHARS)),
         (
             "description".to_string(),
             bounded_string(MAX_DESCRIPTION_CHARS),
         ),
         (
-            "requirement_ids".to_string(),
-            bounded_string_array(MAX_PLANNING_FACTS, MAX_ID_CHARS),
+            "requirements".to_string(),
+            bounded_nonempty_string_array(MAX_PLANNING_FACTS, MAX_DESCRIPTION_CHARS),
         ),
         (
-            "depends_on".to_string(),
-            bounded_string_array(input.policy.aggregate.max_tasks, MAX_ID_CHARS),
-        ),
-        (
-            "acceptance_ids".to_string(),
-            bounded_string_array(MAX_PLANNING_FACTS, MAX_ID_CHARS),
+            "acceptance".to_string(),
+            bounded_nonempty_string_array(MAX_PLANNING_FACTS, MAX_DESCRIPTION_CHARS),
         ),
         (
             "scope_hints".to_string(),
@@ -461,12 +555,10 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
         task_properties.insert("goal_contract".to_string(), goal_contract_schema());
     }
     let mut required = vec![
-        "id",
         "title",
         "description",
-        "requirement_ids",
-        "depends_on",
-        "acceptance_ids",
+        "requirements",
+        "acceptance",
         "scope_hints",
         "effort",
         "kind",
@@ -484,15 +576,6 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
         "additionalProperties": false,
         "properties": {
             "objective": bounded_string(MAX_DESCRIPTION_CHARS),
-            "requirements": object_array(
-                json!({
-                    "id": bounded_string(MAX_ID_CHARS),
-                    "description": bounded_string(MAX_DESCRIPTION_CHARS)
-                }),
-                &["id", "description"],
-                1,
-                MAX_PLANNING_FACTS
-            ),
             "tasks": {
                 "type": "array",
                 "items": {
@@ -504,15 +587,6 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
                 "minItems": 1,
                 "maxItems": max_tasks
             },
-            "acceptance": object_array(
-                json!({
-                    "id": bounded_string(MAX_ID_CHARS),
-                    "description": bounded_string(MAX_DESCRIPTION_CHARS)
-                }),
-                &["id", "description"],
-                1,
-                MAX_PLANNING_FACTS
-            ),
             "risks": object_array(
                 json!({"description": bounded_string(MAX_DESCRIPTION_CHARS)}),
                 &["description"],
@@ -520,7 +594,7 @@ fn planner_schema(input: &TaskPlanningInput<'_>) -> Value {
                 MAX_RISKS
             )
         },
-        "required": ["objective", "requirements", "tasks", "acceptance", "risks"]
+        "required": ["objective", "tasks", "risks"]
     })
 }
 
@@ -637,6 +711,12 @@ fn bounded_string_array(max_items: usize, max_chars: usize) -> Value {
         "minItems": 0,
         "maxItems": max_items
     })
+}
+
+fn bounded_nonempty_string_array(max_items: usize, max_chars: usize) -> Value {
+    let mut schema = bounded_string_array(max_items, max_chars);
+    schema["minItems"] = json!(1);
+    schema
 }
 
 fn object_array(properties: Value, required: &[&str], min_items: usize, max_items: usize) -> Value {
@@ -773,22 +853,18 @@ mod tests {
         .unwrap()
     }
 
-    fn proposal(id: &str) -> serde_json::Value {
+    fn proposal(label: &str) -> serde_json::Value {
         serde_json::json!({
             "objective": "Fix average",
-            "requirements": [{"id": "r1", "description": "Use the correct divisor"}],
             "tasks": [{
-                "id": id,
-                "title": "Fix average",
+                "title": format!("Fix average {label}"),
                 "description": "Correct the divisor and add its regression test",
-                "requirement_ids": ["r1"],
-                "depends_on": [],
-                "acceptance_ids": ["a1"],
+                "requirements": ["Use the correct divisor"],
+                "acceptance": ["Regression test passes"],
                 "scope_hints": ["src"],
                 "effort": "small",
                 "kind": "build"
             }],
-            "acceptance": [{"id": "a1", "description": "Regression test passes"}],
             "risks": []
         })
     }
@@ -840,15 +916,16 @@ mod tests {
                 "code": "task_too_broad",
                 "description": "Split the catch-all Task",
                 "severity": "blocking",
-                "task_ids": ["t1"]
+                "task_ids": ["task-01"]
             }]) }
         })
         .to_string()
     }
 
     fn compiled(value: &serde_json::Value, policy: &CompiledTaskPolicy) -> TaskPlanArtifact {
-        serde_json::from_value::<TaskPlanProposal>(value.clone())
+        serde_json::from_value::<TaskModelProposal>(value.clone())
             .unwrap()
+            .into_controller_proposal()
             .validate_and_compile(
                 TaskPlanAuthority {
                     source_intent: TaskSourceIntent::Build,
@@ -864,7 +941,7 @@ mod tests {
     fn accepted_plan_is_reviewed_and_keeps_exact_coordination_usage() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(false);
-        let value = proposal("t1");
+        let value = proposal("accepted");
         let plan = compiled(&value, &policy);
         let mut model = ScriptedModel::new([value.to_string(), review(&plan, 1, "pass")]);
         let outcome = plan_tasks(&mut model, input(&policy, &qualification));
@@ -884,11 +961,10 @@ mod tests {
         let qualification = qualification(false);
         let invalid = serde_json::json!({
             "objective": "Fix average",
-            "requirements": [{"id": "r1", "description": "Fix"}],
-            "tasks": [{"id": "t1", "title": "Fix", "description": "Fix", "requirement_ids": ["missing"], "acceptance_ids": ["a1"], "effort": "small", "kind": "build"}],
-            "acceptance": [{"id": "a1", "description": "Pass"}]
+            "tasks": [{"title": "Fix", "description": "Fix", "requirements": [], "acceptance": ["Pass"], "scope_hints": [], "effort": "small", "kind": "build"}],
+            "risks": []
         });
-        let valid = proposal("t1");
+        let valid = proposal("revised");
         let plan = compiled(&valid, &policy);
         let mut model = ScriptedModel::new([
             invalid.to_string(),
@@ -908,7 +984,7 @@ mod tests {
     fn two_invalid_attempts_stop_with_explicit_recovery_actions() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(false);
-        let invalid = "{\"objective\":\"bad\",\"requirements\":[],\"tasks\":[],\"acceptance\":[]}";
+        let invalid = "{\"objective\":\"bad\",\"tasks\":[],\"risks\":[]}";
         let mut model = ScriptedModel::new([invalid.to_string(), invalid.to_string()]);
         let TaskPlanningOutcome::Rejected(rejected) =
             plan_tasks(&mut model, input(&policy, &qualification))
@@ -934,13 +1010,13 @@ mod tests {
     fn blocking_review_forces_the_second_planning_attempt() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(false);
-        let first = proposal("t1");
-        let second = proposal("t2");
+        let first = proposal("first");
+        let second = proposal("second");
         let first_plan = compiled(&first, &policy);
         let second_plan = compiled(&second, &policy);
         let mut revise =
             serde_json::from_str::<serde_json::Value>(&review(&first_plan, 1, "revise")).unwrap();
-        revise["challenges"][0]["task_ids"] = serde_json::json!(["t1"]);
+        revise["challenges"][0]["task_ids"] = serde_json::json!(["task-01"]);
         let mut model = ScriptedModel::new([
             first.to_string(),
             revise.to_string(),
@@ -952,7 +1028,8 @@ mod tests {
         else {
             panic!("second plan should pass");
         };
-        assert_eq!(accepted.plan.artifact.tasks[0].id, "t2");
+        assert_eq!(accepted.plan.artifact.tasks[0].id, "task-01");
+        assert!(accepted.plan.artifact.tasks[0].title.ends_with("second"));
         assert_eq!(accepted.counters.model_invocations, 4);
         assert_eq!(accepted.counters.advisory_calls, 2);
     }
@@ -983,6 +1060,47 @@ mod tests {
     }
 
     #[test]
+    fn controller_assigns_fact_ids_and_sequential_dependencies() {
+        let policy = TaskConfigDocument::default().compile().unwrap();
+        let value = serde_json::json!({
+            "objective": "Migrate storage before its API consumer",
+            "tasks": [
+                {
+                    "title": "Storage compatibility",
+                    "description": "Deliver the compatibility boundary",
+                    "requirements": ["Preserve compatibility", "Add durable storage"],
+                    "acceptance": ["Storage compatibility tests pass"],
+                    "scope_hints": ["storage"],
+                    "effort": "small",
+                    "kind": "build"
+                },
+                {
+                    "title": "API consumer",
+                    "description": "Move API reads to the boundary",
+                    "requirements": ["Preserve compatibility", "Migrate API reads"],
+                    "acceptance": ["API compatibility tests pass"],
+                    "scope_hints": ["api"],
+                    "effort": "small",
+                    "kind": "build"
+                }
+            ],
+            "risks": []
+        });
+
+        let plan = compiled(&value, &policy);
+        assert_eq!(plan.tasks[0].id, "task-01");
+        assert!(plan.tasks[0].depends_on.is_empty());
+        assert_eq!(plan.tasks[1].id, "task-02");
+        assert_eq!(plan.tasks[1].depends_on, ["task-01"]);
+        assert_eq!(plan.requirements.len(), 3);
+        assert_eq!(plan.acceptance.len(), 2);
+        assert_eq!(
+            plan.tasks[0].requirement_ids[0],
+            plan.tasks[1].requirement_ids[0]
+        );
+    }
+
+    #[test]
     fn constrained_output_schemas_compile_for_both_inference_engines() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(false);
@@ -1001,6 +1119,20 @@ mod tests {
                 .pointer("/properties/tasks/items/properties/goal_contract")
                 .is_none()
         );
+        assert!(
+            build_schema
+                .pointer("/properties/tasks/items/properties/id")
+                .is_none()
+        );
+        assert!(
+            build_schema
+                .pointer("/properties/tasks/items/properties/depends_on")
+                .is_none()
+        );
+        assert_eq!(
+            build_schema.pointer("/properties/tasks/items/properties/requirements/minItems"),
+            Some(&json!(1))
+        );
 
         let mut goal_input = input(&policy, &qualification);
         goal_input.source_intent = TaskSourceIntent::Goal;
@@ -1016,7 +1148,7 @@ mod tests {
                 .is_some_and(|required| required.contains(&json!("goal_contract")))
         );
 
-        let value = proposal("t1");
+        let value = proposal("schema");
         let plan = compiled(&value, &policy);
         let envelope = ArtifactEnvelope::new("task-plan-schema-test", plan).unwrap();
         let review_schema = reviewer_schema(&envelope);
@@ -1038,7 +1170,7 @@ mod tests {
     fn model_authored_numeric_budget_is_rejected_on_both_attempts() {
         let policy = TaskConfigDocument::default().compile().unwrap();
         let qualification = qualification(false);
-        let mut value = proposal("t1");
+        let mut value = proposal("budget");
         value["tasks"][0]["budget"] = serde_json::json!({"generated_tokens": 999999});
         let mut model = ScriptedModel::new([value.to_string(), value.to_string()]);
         let TaskPlanningOutcome::Rejected(rejected) =
@@ -1047,12 +1179,12 @@ mod tests {
             panic!("model budgets must fail");
         };
         assert_eq!(rejected.attempts, 2);
-        assert!(rejected.failures.iter().all(|failure| {
-            failure
-                .reason
-                .contains("model Task proposals cannot contain executable numeric budgets")
-                || failure.reason.contains("unknown field `budget`")
-        }));
+        assert!(
+            rejected
+                .failures
+                .iter()
+                .all(|failure| failure.reason.contains("unknown field `budget`"))
+        );
     }
 
     #[test]

@@ -34,18 +34,20 @@ deterministic harness stages and do not run a model.
 ### High-level Tasks
 
 **Shipped controller; no planner currently qualified.** Before a new explicit Build starts, pb can
-ask an exactly qualified local model for a high-level `TaskPlanProposal`. This is separate from the
-existing Build `PlanArtifact`: it contains outcome-shaped Tasks of kind Build or Goal, qualitative
-effort, dependencies, requirement mappings, and acceptance mappings. It cannot contain executable
-numeric budgets. Proposal and review generation are token-constrained to controller-owned JSON schemas:
+ask an exactly qualified local model for a model-facing high-level proposal. This is separate from
+the existing Build `PlanArtifact`: each ordered outcome-shaped Task contains its Build or Goal kind,
+qualitative effort, owned requirement clauses, and owned acceptance facts. It cannot contain IDs,
+cross-references, dependencies, or executable numeric budgets. pb assigns stable IDs, deduplicates
+shared facts, and compiles array order into the sequential dependency chain. Proposal and review
+generation are token-constrained to controller-owned JSON schemas:
 llama.cpp applies its tokenizer-aware LLGuidance JSON-schema sampler, while FlashMoe exposes one
 required terminal schema call through its native constraint parser. Unknown fields, missing
 required fields, invalid enums, and structural array overflows are therefore masked during sampling
-rather than left to prompt compliance. This structural guarantee does not judge whether a decomposition is useful. A
-fresh critic reviews the proposal, while Rust rejects unknown references, missing
-coverage, cycles, invalid Goal contracts, unqualified automatic Goal selection, and aggregate
-overflow before any child starts. Planning has two attempts and its own invocation, token, advisory,
-and wall-time allowance.
+rather than left to prompt compliance. This structural guarantee does not judge whether a
+decomposition is useful. A fresh critic reviews the compiled plan, while Rust rejects empty facts,
+missing coverage, invalid Goal contracts, unqualified automatic Goal selection, and aggregate
+overflow before any child starts. Planning has two attempts and its own invocation, token,
+advisory, and wall-time allowance.
 
 The critic must return six controller-validated audit records exactly once: request coverage, Task
 boundaries, dependency order, acceptance observability, test/documentation ownership, and
