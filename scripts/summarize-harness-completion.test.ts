@@ -60,10 +60,25 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
           event: {
             type: "llm_invocation",
             prompt_tokens: 120,
-            prompt_cache: { cached_tokens: 80, prefilled_tokens: 40 },
+            prompt_cache: {
+              cached_tokens: 80,
+              prefilled_tokens: 40,
+              root: {
+                tokens: 60,
+                reused_tokens: 60,
+                rendered_token_sha256: "root-a",
+                authority_class: "planning",
+              },
+            },
             native: {
               fresh_prefill_tokens: 40,
               tool_schema_sha256: "schema-a",
+              refill: {
+                cache_lookup_wall_ms: 2,
+                state_hydration_wall_ms: 3,
+                fresh_suffix_prefill_wall_ms: 30,
+                snapshot_capture_wall_ms: 5,
+              },
             },
           },
         }),
@@ -75,10 +90,22 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
               cached_tokens: 0,
               prefilled_tokens: 80,
               miss_reason: "prompt_diverged",
+              root: {
+                tokens: 50,
+                reused_tokens: 0,
+                rendered_token_sha256: "root-b",
+                authority_class: "code_review",
+              },
             },
             native: {
               fresh_prefill_tokens: 80,
               tool_schema_sha256: "schema-b",
+              refill: {
+                cache_lookup_wall_ms: 7,
+                state_hydration_wall_ms: 11,
+                fresh_suffix_prefill_wall_ms: 60,
+                snapshot_capture_wall_ms: 13,
+              },
             },
           },
         }),
@@ -110,11 +137,32 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
     assert(summary.cached_prefix_tokens === 80, JSON.stringify(summary));
     assert(summary.fresh_prefill_tokens === 120, JSON.stringify(summary));
     assert(summary.prompt_cache_hit_invocations === 1, JSON.stringify(summary));
+    assert(summary.eligible_root_tokens === 110, JSON.stringify(summary));
+    assert(summary.reused_root_tokens === 60, JSON.stringify(summary));
+    assert(summary.prompt_root_hit_invocations === 1, JSON.stringify(summary));
+    assert(summary.prompt_root_sha256s.length === 2, JSON.stringify(summary));
+    assert(
+      summary.prompt_root_authority_classes.planning === 1,
+      JSON.stringify(summary),
+    );
     assert(
       summary.prompt_cache_miss_reasons.prompt_diverged === 1,
       JSON.stringify(summary),
     );
     assert(summary.tool_schema_sha256s.length === 2, JSON.stringify(summary));
+    assert(summary.refill_cache_lookup_wall_ms === 9, JSON.stringify(summary));
+    assert(
+      summary.refill_state_hydration_wall_ms === 14,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.refill_fresh_suffix_prefill_wall_ms === 90,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.refill_snapshot_capture_wall_ms === 18,
+      JSON.stringify(summary),
+    );
   } finally {
     await Deno.remove(root, { recursive: true });
   }

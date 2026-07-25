@@ -86,6 +86,7 @@ pub struct Output {
     pub prompt_cache_source: Option<String>,
     pub prompt_cache_restore_ms: u64,
     pub prompt_cache_miss_reason: Option<PromptCacheMissReason>,
+    pub prompt_root: Option<crate::inference::BackendPromptRoot>,
     pub duration_ms: u64,
     pub energy: Option<EnergyEstimate>,
 }
@@ -374,6 +375,7 @@ impl LlamaCppBackend {
             prompt_cache_source: None,
             prompt_cache_restore_ms: 0,
             prompt_cache_miss_reason: Some(PromptCacheMissReason::CacheDisabled),
+            prompt_root: None,
             duration_ms: duration_millis(started),
             energy,
         })
@@ -540,6 +542,7 @@ impl LlamaCppBackend {
             prompt_cache_source: None,
             prompt_cache_restore_ms: 0,
             prompt_cache_miss_reason: Some(PromptCacheMissReason::RuntimeUnsupported),
+            prompt_root: None,
             duration_ms: duration_millis(started),
             energy,
         })
@@ -559,6 +562,7 @@ impl LlamaCppChatSession<'_> {
             .model
             .str_to_token(&prompt, add_bos)
             .context("failed to tokenize chat prompt")?;
+        let prompt_root = self.backend.stable_chat_prompt_root(request, &tokens)?;
         let settings = LlamaSessionSettings {
             ctx_size: request.ctx_size,
             threads: request.threads,
@@ -745,6 +749,7 @@ impl LlamaCppChatSession<'_> {
             prompt_cache_source,
             prompt_cache_restore_ms,
             prompt_cache_miss_reason,
+            prompt_root,
             duration_ms: duration_millis(started),
             energy,
         })
@@ -863,6 +868,48 @@ impl LlamaCppBackend {
         Ok((format!("{:x}", Sha256::digest(bytes)), bytes.len()))
     }
 
+    fn stable_chat_prompt_root(
+        &self,
+        request: &LlamaCppChatRequest,
+        prompt_tokens: &[LlamaToken],
+    ) -> Result<Option<crate::inference::BackendPromptRoot>> {
+        let Some(first) = request
+            .messages
+            .as_array()
+            .and_then(|messages| messages.first())
+        else {
+            return Ok(None);
+        };
+        if first.get("role").and_then(Value::as_str) != Some("system") {
+            return Ok(None);
+        }
+        let messages = Value::Array(vec![first.clone()]);
+        let (rendered, add_bos) =
+            self.render_chat_prompt_with_generation(&messages, &request.tools, false)?;
+        let root_tokens = self
+            .model
+            .str_to_token(&rendered, add_bos)
+            .context("failed to tokenize stable llama.cpp chat root")?;
+        let root_len = common_token_prefix_len(prompt_tokens, &root_tokens);
+        if root_len == 0 {
+            return Ok(None);
+        }
+        let mut digest = Sha256::new();
+        for token in &prompt_tokens[..root_len] {
+            digest.update(token.0.to_le_bytes());
+        }
+        Ok(Some(crate::inference::BackendPromptRoot {
+            descriptor_version: crate::inference::PROMPT_ROOT_DESCRIPTOR_VERSION,
+            backend: "llamacpp".to_string(),
+            model_namespace_sha256: llama_model_namespace_sha256(
+                &self.model_path,
+                request.ctx_size,
+            ),
+            rendered_token_sha256: format!("{:x}", digest.finalize()),
+            tokens: root_len,
+        }))
+    }
+
     fn render_prompt(&self, prompt: &str) -> Result<(String, AddBos)> {
         if prompt.contains("<|im_start|>") {
             return Ok((prompt.to_string(), AddBos::Never));
@@ -879,14 +926,26 @@ impl LlamaCppBackend {
     }
 
     fn render_chat_prompt(&self, messages: &Value, tools: &Value) -> Result<(String, AddBos)> {
+        self.render_chat_prompt_with_generation(messages, tools, true)
+    }
+
+    fn render_chat_prompt_with_generation(
+        &self,
+        messages: &Value,
+        tools: &Value,
+        add_generation_prompt: bool,
+    ) -> Result<(String, AddBos)> {
         let Some(chat_template) = &self.chat_template else {
-            return Ok((render_plain_chat_prompt(messages), AddBos::Always));
+            return Ok((
+                render_plain_chat_prompt(messages, add_generation_prompt),
+                AddBos::Always,
+            ));
         };
         let rendered = chat_template.render(
             messages,
             tools,
             ChatTemplateOptions {
-                add_generation_prompt: true,
+                add_generation_prompt,
                 ..ChatTemplateOptions::default()
             },
         )?;
@@ -894,7 +953,7 @@ impl LlamaCppBackend {
     }
 }
 
-fn render_plain_chat_prompt(messages: &Value) -> String {
+fn render_plain_chat_prompt(messages: &Value, add_generation_prompt: bool) -> String {
     let mut prompt = String::new();
     prompt.push_str("<conversation>\n");
     if let Some(messages) = messages.as_array() {
@@ -935,7 +994,9 @@ fn render_plain_chat_prompt(messages: &Value) -> String {
             prompt.push_str("\n\n");
         }
     }
-    prompt.push_str("[assistant]\n");
+    if add_generation_prompt {
+        prompt.push_str("[assistant]\n");
+    }
     prompt
 }
 
@@ -1039,6 +1100,19 @@ fn llama_session_cache_path(
     session_id: &str,
     ctx_size: u32,
 ) -> PathBuf {
+    let mut digest = llama_model_namespace_hasher(model_path, ctx_size);
+    digest.update(session_id.as_bytes());
+    root.join(format!("{:x}.state", digest.finalize()))
+}
+
+fn llama_model_namespace_sha256(model_path: &Path, ctx_size: u32) -> String {
+    format!(
+        "{:x}",
+        llama_model_namespace_hasher(model_path, ctx_size).finalize()
+    )
+}
+
+fn llama_model_namespace_hasher(model_path: &Path, ctx_size: u32) -> Sha256 {
     let canonical_model = model_path
         .canonicalize()
         .unwrap_or_else(|_| model_path.to_path_buf());
@@ -1056,8 +1130,7 @@ fn llama_session_cache_path(
     digest.update(size.to_le_bytes());
     digest.update(modified_nanos.to_le_bytes());
     digest.update(ctx_size.to_le_bytes());
-    digest.update(session_id.as_bytes());
-    root.join(format!("{:x}.state", digest.finalize()))
+    digest
 }
 
 fn replace_cache_file(source: &Path, destination: &Path) -> Result<()> {

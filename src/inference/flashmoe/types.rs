@@ -349,6 +349,7 @@ pub struct PromptCacheStats {
     pub prefilled_tokens: usize,
     pub restore_ms: u64,
     pub miss_reason: Option<crate::inference::PromptCacheMissReason>,
+    pub root: Option<crate::inference::BackendPromptRoot>,
 }
 
 #[derive(Debug, Clone)]
@@ -398,8 +399,17 @@ pub struct NativeGenerationStats {
     pub expert_strategy: String,
     pub prefill_command_kind: String,
     pub thinking_enabled: bool,
+    pub refill: NativeRefillStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_state: Option<NativePrefillStateStats>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRefillStats {
+    pub cache_lookup_wall_ms: u64,
+    pub state_hydration_wall_ms: u64,
+    pub fresh_suffix_prefill_wall_ms: u64,
+    pub snapshot_capture_wall_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

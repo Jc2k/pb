@@ -8527,15 +8527,16 @@ fn record_completion_metrics(
         completion.energy,
     );
     let read_cache_hits = std::mem::take(&mut metrics.pending_read_cache_hits);
+    let purpose = model_invocation_purpose(args, tools, None, completion);
     sink.emit(AgentEvent::LlmInvocation {
         step,
-        purpose: model_invocation_purpose(args, tools, None, completion),
+        purpose,
         workflow_stage: args.workflow_stage,
         profile: Some(args.profile),
         duration_ms: completion.duration_ms,
         prompt_tokens: completion.prompt_tokens,
         generated_tokens: completion.generated_tokens,
-        prompt_cache: completion.prompt_cache.clone(),
+        prompt_cache: prompt_cache_usage_for_event(completion, args, tools, purpose),
         native: completion.native.clone(),
         context: Some(completion_context_usage(
             prepared,
@@ -8621,6 +8622,93 @@ fn model_invocation_purpose(
         }
         _ => ModelInvocationPurpose::Unclassified,
     }
+}
+
+fn backend_prompt_root_usage(
+    root: crate::inference::BackendPromptRoot,
+) -> crate::events::PromptRootUsage {
+    crate::events::PromptRootUsage {
+        descriptor_version: root.descriptor_version,
+        backend: root.backend,
+        model_namespace_sha256: root.model_namespace_sha256,
+        rendered_token_sha256: root.rendered_token_sha256,
+        tokens: root.tokens,
+        reused_tokens: 0,
+        authority_class: crate::events::PromptRootAuthorityClass::Unclassified,
+        tool_schema_sha256: None,
+        output_constraint_mode: None,
+    }
+}
+
+fn prompt_root_authority_class(
+    args: &AgentRequest,
+    tools: &[BuiltInToolSchema],
+    purpose: crate::events::ModelInvocationPurpose,
+) -> crate::events::PromptRootAuthorityClass {
+    use crate::events::{ModelInvocationPurpose, PromptRootAuthorityClass};
+    use crate::workflow::WorkflowStage;
+
+    if purpose == ModelInvocationPurpose::TaskPartitioning {
+        return PromptRootAuthorityClass::TaskArtifact;
+    }
+    let Some(stage) = args.workflow_stage else {
+        return PromptRootAuthorityClass::Conversation;
+    };
+    let has_mutation = tools.iter().any(|tool| mutation_tool(&tool.name));
+    let terminal_only = workflow_terminal_tool_name(stage).is_some_and(|terminal| {
+        !tools.is_empty() && tools.iter().all(|tool| tool.name == terminal)
+    });
+    match stage {
+        WorkflowStage::Planning | WorkflowStage::PlanRevision => PromptRootAuthorityClass::Planning,
+        WorkflowStage::PlanReview => PromptRootAuthorityClass::PlanReview,
+        WorkflowStage::Implementing if terminal_only => {
+            PromptRootAuthorityClass::ImplementationClosure
+        }
+        WorkflowStage::Implementing if has_mutation => {
+            PromptRootAuthorityClass::ImplementationMutation
+        }
+        WorkflowStage::Implementing => PromptRootAuthorityClass::ImplementationRead,
+        WorkflowStage::Repairing if terminal_only => PromptRootAuthorityClass::RepairClosure,
+        WorkflowStage::Repairing if has_mutation => PromptRootAuthorityClass::RepairMutation,
+        WorkflowStage::Repairing => PromptRootAuthorityClass::RepairRead,
+        WorkflowStage::CodeReview => PromptRootAuthorityClass::CodeReview,
+        _ => PromptRootAuthorityClass::Unclassified,
+    }
+}
+
+fn prompt_cache_usage_for_event(
+    completion: &CompletionOutput,
+    args: &AgentRequest,
+    tools: &[BuiltInToolSchema],
+    purpose: crate::events::ModelInvocationPurpose,
+) -> Option<PromptCacheUsage> {
+    let mut usage = completion.prompt_cache.clone()?;
+    let tool_schema_sha256 = (!tools.is_empty()).then(|| {
+        let bytes = serde_json::to_vec(&model_tools_value(tools)).unwrap_or_default();
+        format!("{:x}", Sha256::digest(bytes))
+    });
+    if let Some(root) = usage.root.as_mut() {
+        root.reused_tokens = root.tokens.min(usage.cached_tokens);
+        root.authority_class = prompt_root_authority_class(args, tools, purpose);
+        root.tool_schema_sha256 = tool_schema_sha256;
+        root.output_constraint_mode = completion
+            .native
+            .as_ref()
+            .and_then(|native| native.tool_constraint_mode.clone())
+            .or_else(|| {
+                Some(
+                    if purpose == crate::events::ModelInvocationPurpose::TaskPartitioning {
+                        "json_schema"
+                    } else if tools.is_empty() {
+                        "none"
+                    } else {
+                        "unconstrained"
+                    }
+                    .to_string(),
+                )
+            });
+    }
+    Some(usage)
 }
 
 fn completion_context_usage(
@@ -10914,7 +11002,12 @@ impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
             duration_ms: output.duration_ms,
             prompt_tokens: output.prompt_tokens,
             generated_tokens: output.generated_tokens,
-            prompt_cache: output.prompt_cache.clone(),
+            prompt_cache: prompt_cache_usage_for_event(
+                &output,
+                &args,
+                std::slice::from_ref(&output_schema),
+                crate::events::ModelInvocationPurpose::TaskPartitioning,
+            ),
             context: None,
             native: output.native.clone(),
             energy_joules: output.energy.map(|estimate| estimate.joules),
@@ -14400,6 +14493,7 @@ fn llama_completion_output(
             prefilled_tokens: output.prefilled_prompt_tokens,
             restore_ms: output.prompt_cache_restore_ms,
             miss_reason: output.prompt_cache_miss_reason,
+            root: output.prompt_root.map(backend_prompt_root_usage),
         }),
         native: None,
         duration_ms: output.duration_ms,
@@ -14661,6 +14755,12 @@ fn generate_flashmoe_completion_from_request(
         expert_strategy: performance.expert_strategy.clone(),
         prefill_command_kind: performance.prefill_command_kind.clone(),
         thinking_enabled: performance.thinking_enabled,
+        refill: Some(crate::events::NativeRefillUsage {
+            cache_lookup_wall_ms: performance.refill.cache_lookup_wall_ms,
+            state_hydration_wall_ms: performance.refill.state_hydration_wall_ms,
+            fresh_suffix_prefill_wall_ms: performance.refill.fresh_suffix_prefill_wall_ms,
+            snapshot_capture_wall_ms: performance.refill.snapshot_capture_wall_ms,
+        }),
         tool_constraint_mode: tool_constraints
             .map(|stats| stats.mode.as_str().to_string())
             .or_else(|| json_constraints.map(|_| "json_schema".to_string())),
@@ -14705,6 +14805,7 @@ fn generate_flashmoe_completion_from_request(
             prefilled_tokens: output.prompt_cache.prefilled_tokens,
             restore_ms: output.prompt_cache.restore_ms,
             miss_reason: output.prompt_cache.miss_reason,
+            root: output.prompt_cache.root.map(backend_prompt_root_usage),
         }),
         native: Some(native),
         duration_ms: duration_millis(started),
@@ -14878,15 +14979,21 @@ fn generate_and_parse_action_with_retries(
             completion.energy,
         );
         let read_cache_hits = std::mem::take(&mut metrics.pending_read_cache_hits);
+        let purpose = model_invocation_purpose(&request, attempt_tools, retry_reason, &completion);
         sink.emit(AgentEvent::LlmInvocation {
             step,
-            purpose: model_invocation_purpose(&request, attempt_tools, retry_reason, &completion),
+            purpose,
             workflow_stage: request.workflow_stage,
             profile: Some(request.profile),
             duration_ms: completion.duration_ms,
             prompt_tokens: completion.prompt_tokens,
             generated_tokens: completion.generated_tokens,
-            prompt_cache: completion.prompt_cache.clone(),
+            prompt_cache: prompt_cache_usage_for_event(
+                &completion,
+                &request,
+                attempt_tools,
+                purpose,
+            ),
             native: completion.native.clone(),
             context: Some(completion_context_usage(
                 &prepared,
@@ -30316,6 +30423,36 @@ the next imagined action"#;
                 true,
             ),
             "agent-1:workflow:CodeReview"
+        );
+    }
+
+    #[test]
+    fn prompt_root_authority_class_tracks_exact_stage_capability_shape() {
+        use crate::events::{ModelInvocationPurpose, PromptRootAuthorityClass};
+        use crate::workflow::WorkflowStage;
+
+        let mut args = test_agent_request(AgentProfile::Build, 256);
+        args.workflow_stage = Some(WorkflowStage::Planning);
+        let read = vec![builtin_tool("read_file", "read", json!({}))];
+        assert_eq!(
+            prompt_root_authority_class(&args, &read, ModelInvocationPurpose::WorkflowPlanning),
+            PromptRootAuthorityClass::Planning
+        );
+
+        args.workflow_stage = Some(WorkflowStage::Implementing);
+        assert_eq!(
+            prompt_root_authority_class(&args, &read, ModelInvocationPurpose::WorkflowEvidence),
+            PromptRootAuthorityClass::ImplementationRead
+        );
+        let mutation = vec![builtin_tool("replace_file", "replace", json!({}))];
+        assert_eq!(
+            prompt_root_authority_class(&args, &mutation, ModelInvocationPurpose::WorkflowMutation),
+            PromptRootAuthorityClass::ImplementationMutation
+        );
+        let closure = vec![builtin_tool("submit_implementation", "submit", json!({}))];
+        assert_eq!(
+            prompt_root_authority_class(&args, &closure, ModelInvocationPurpose::WorkflowClosure),
+            PromptRootAuthorityClass::ImplementationClosure
         );
     }
 

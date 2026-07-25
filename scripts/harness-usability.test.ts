@@ -135,6 +135,14 @@ function fakeAudit(
       cached_prefix_tokens: 5,
       fresh_prefill_tokens: 25,
       prompt_cache_miss_reasons: { cold_session: 1 },
+      eligible_root_tokens: 10,
+      reused_root_tokens: 5,
+      prompt_root_hit_invocations: 1,
+      prompt_root_authority_classes: { planning: 1 },
+      refill_cache_lookup_wall_ms: 1,
+      refill_state_hydration_wall_ms: 2,
+      refill_fresh_suffix_prefill_wall_ms: 3,
+      refill_snapshot_capture_wall_ms: 4,
       generated_tokens: 20,
       tool_calls: 2,
       total_energy_kwh: 0.001,
@@ -163,6 +171,26 @@ Deno.test("aggregate keeps correctness, verified completion, and efficiency sepa
   assert(aggregate.total_llm_invocations === 3, "invocations");
   assert(aggregate.total_rendered_prompt_tokens === 90, "prompt tokens");
   assert(aggregate.total_fresh_prefill_tokens === 75, "fresh prefill");
+  assert(aggregate.total_eligible_root_tokens === 30, "eligible roots");
+  assert(aggregate.total_reused_root_tokens === 15, "reused roots");
+  assert(aggregate.total_prompt_root_hit_invocations === 3, "root hits");
+  assert(
+    aggregate.prompt_root_authority_classes.planning === 3,
+    "root authorities",
+  );
+  assert(aggregate.total_refill_cache_lookup_wall_ms === 3, "refill lookup");
+  assert(
+    aggregate.total_refill_state_hydration_wall_ms === 6,
+    "refill hydration",
+  );
+  assert(
+    aggregate.total_refill_fresh_suffix_prefill_wall_ms === 9,
+    "refill suffix",
+  );
+  assert(
+    aggregate.total_refill_snapshot_capture_wall_ms === 12,
+    "refill snapshot",
+  );
   assert(
     aggregate.prompt_cache_miss_reasons.cold_session === 3,
     "cache misses",

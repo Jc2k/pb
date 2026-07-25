@@ -506,6 +506,29 @@ export type AgentEvent =
         | "cache_unreadable"
         | "context_reset"
         | "runtime_unsupported";
+      root?: {
+        descriptor_version: number;
+        backend: string;
+        model_namespace_sha256: string;
+        rendered_token_sha256: string;
+        tokens: number;
+        reused_tokens: number;
+        authority_class:
+          | "unclassified"
+          | "conversation"
+          | "task_artifact"
+          | "planning"
+          | "plan_review"
+          | "implementation_read"
+          | "implementation_mutation"
+          | "implementation_closure"
+          | "repair_read"
+          | "repair_mutation"
+          | "repair_closure"
+          | "code_review";
+        tool_schema_sha256?: string;
+        output_constraint_mode?: string;
+      };
     };
     context?: {
       context_capacity: number;
@@ -549,6 +572,12 @@ export type AgentEvent =
       expert_strategy: string;
       prefill_command_kind: string;
       thinking_enabled: boolean;
+      refill?: {
+        cache_lookup_wall_ms: number;
+        state_hydration_wall_ms: number;
+        fresh_suffix_prefill_wall_ms: number;
+        snapshot_capture_wall_ms: number;
+      };
       tool_constraint_mode?: string;
       tool_schema_sha256?: string;
       rejected_constraint_candidates: number;

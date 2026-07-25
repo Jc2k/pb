@@ -54,6 +54,14 @@ export interface UsabilityAudit {
     cached_prefix_tokens?: number;
     fresh_prefill_tokens?: number;
     prompt_cache_miss_reasons: Record<string, number>;
+    eligible_root_tokens?: number;
+    reused_root_tokens?: number;
+    prompt_root_hit_invocations?: number;
+    prompt_root_authority_classes: Record<string, number>;
+    refill_cache_lookup_wall_ms?: number;
+    refill_state_hydration_wall_ms?: number;
+    refill_fresh_suffix_prefill_wall_ms?: number;
+    refill_snapshot_capture_wall_ms?: number;
     generated_tokens?: number;
     tool_calls?: number;
     total_energy_kwh?: number;
@@ -83,6 +91,14 @@ export interface UsabilityAggregate {
   total_cached_prefix_tokens: number;
   total_fresh_prefill_tokens: number;
   prompt_cache_miss_reasons: Record<string, number>;
+  total_eligible_root_tokens: number;
+  total_reused_root_tokens: number;
+  total_prompt_root_hit_invocations: number;
+  prompt_root_authority_classes: Record<string, number>;
+  total_refill_cache_lookup_wall_ms: number;
+  total_refill_state_hydration_wall_ms: number;
+  total_refill_fresh_suffix_prefill_wall_ms: number;
+  total_refill_snapshot_capture_wall_ms: number;
   total_generated_tokens: number;
   total_tool_calls: number;
   total_energy_kwh: number;
@@ -263,6 +279,15 @@ export async function auditScratch(
       cached_prefix_tokens: summary.cached_prefix_tokens,
       fresh_prefill_tokens: summary.fresh_prefill_tokens,
       prompt_cache_miss_reasons: summary.prompt_cache_miss_reasons,
+      eligible_root_tokens: summary.eligible_root_tokens,
+      reused_root_tokens: summary.reused_root_tokens,
+      prompt_root_hit_invocations: summary.prompt_root_hit_invocations,
+      prompt_root_authority_classes: summary.prompt_root_authority_classes,
+      refill_cache_lookup_wall_ms: summary.refill_cache_lookup_wall_ms,
+      refill_state_hydration_wall_ms: summary.refill_state_hydration_wall_ms,
+      refill_fresh_suffix_prefill_wall_ms:
+        summary.refill_fresh_suffix_prefill_wall_ms,
+      refill_snapshot_capture_wall_ms: summary.refill_snapshot_capture_wall_ms,
       generated_tokens: summary.generated_tokens,
       tool_calls: summary.tool_calls,
       total_energy_kwh: summary.total_energy_kwh,
@@ -293,6 +318,7 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
     byLanguage[audit.language] = language;
   }
   const promptCacheMissReasons: Record<string, number> = {};
+  const promptRootAuthorityClasses: Record<string, number> = {};
   for (const audit of audits) {
     for (
       const [reason, count] of Object.entries(
@@ -301,6 +327,16 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
     ) {
       promptCacheMissReasons[reason] = (promptCacheMissReasons[reason] ?? 0) +
         count;
+    }
+  }
+  for (const audit of audits) {
+    for (
+      const [authority, count] of Object.entries(
+        audit.efficiency.prompt_root_authority_classes,
+      )
+    ) {
+      promptRootAuthorityClasses[authority] =
+        (promptRootAuthorityClasses[authority] ?? 0) + count;
     }
   }
   return {
@@ -335,6 +371,40 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
       0,
     ),
     prompt_cache_miss_reasons: promptCacheMissReasons,
+    total_eligible_root_tokens: audits.reduce(
+      (total, item) => total + (item.efficiency.eligible_root_tokens ?? 0),
+      0,
+    ),
+    total_reused_root_tokens: audits.reduce(
+      (total, item) => total + (item.efficiency.reused_root_tokens ?? 0),
+      0,
+    ),
+    total_prompt_root_hit_invocations: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.prompt_root_hit_invocations ?? 0),
+      0,
+    ),
+    prompt_root_authority_classes: promptRootAuthorityClasses,
+    total_refill_cache_lookup_wall_ms: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.refill_cache_lookup_wall_ms ?? 0),
+      0,
+    ),
+    total_refill_state_hydration_wall_ms: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.refill_state_hydration_wall_ms ?? 0),
+      0,
+    ),
+    total_refill_fresh_suffix_prefill_wall_ms: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.refill_fresh_suffix_prefill_wall_ms ?? 0),
+      0,
+    ),
+    total_refill_snapshot_capture_wall_ms: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.refill_snapshot_capture_wall_ms ?? 0),
+      0,
+    ),
     total_generated_tokens: audits.reduce(
       (total, item) => total + (item.efficiency.generated_tokens ?? 0),
       0,

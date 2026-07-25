@@ -1005,7 +1005,17 @@ export function MessageBubble({
                   ? ` · miss: ${
                     e.prompt_cache.miss_reason.replaceAll("_", " ")
                   }`
+                  : "") +
+                (e.prompt_cache.root
+                  ? ` · root ${
+                    formatNumber(e.prompt_cache.root.reused_tokens)
+                  }/${formatNumber(e.prompt_cache.root.tokens)} (${
+                    e.prompt_cache.root.authority_class.replaceAll("_", " ")
+                  })`
                   : "")
+              : ""}
+            {e.native?.refill
+              ? ` · refill lookup ${e.native.refill.cache_lookup_wall_ms}, hydrate ${e.native.refill.state_hydration_wall_ms}, suffix ${e.native.refill.fresh_suffix_prefill_wall_ms}, snapshot ${e.native.refill.snapshot_capture_wall_ms} ms`
               : ""}
             {e.energy_joules !== undefined
               ? ` · ${formatEnergy(e.energy_joules)}`

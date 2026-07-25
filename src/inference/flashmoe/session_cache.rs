@@ -476,7 +476,7 @@ fn model_fingerprint(plan: &FlashMoePlan) -> [u8; 32] {
     digest.finalize().into()
 }
 
-fn model_fingerprint_hex(plan: &FlashMoePlan) -> String {
+pub(crate) fn model_fingerprint_hex(plan: &FlashMoePlan) -> String {
     model_fingerprint(plan)
         .iter()
         .map(|byte| format!("{byte:02x}"))

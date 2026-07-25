@@ -541,6 +541,16 @@ largest serialized action, mutation payload allowance, and carried-evidence byte
 events add call, parallel-safe, useful, bookkeeping-only, and dependency-rejection counts. These
 fields are optional/defaulted so existing journals remain readable.
 
+Cache-capable agent invocations also report a privacy-safe `prompt_cache.root` record. It includes
+the local backend, model-namespace and exact rendered-token digests, eligible/reused root tokens,
+bounded stage-authority class, tool-schema digest, and output-constraint mode. The completion
+summarizer and usability auditor aggregate eligible roots, reused roots, complete root hits, and
+authority-class counts without storing prompt or source content.
+
+`native.refill` records cache lookup, state hydration, fresh-suffix prefill, and snapshot-capture
+milliseconds separately. The usability summary and aggregate preserve each total, so a cache-policy
+change cannot claim a prefill improvement by moving work into restore or checkpoint capture.
+
 ## Control evaluation
 
 Run the deterministic, model-free control suite with:

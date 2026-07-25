@@ -30,6 +30,15 @@ export interface CompletionRunSummary {
   fresh_prefill_tokens?: number;
   prompt_cache_hit_invocations?: number;
   prompt_cache_miss_reasons: Record<string, number>;
+  eligible_root_tokens?: number;
+  reused_root_tokens?: number;
+  prompt_root_hit_invocations?: number;
+  prompt_root_sha256s: string[];
+  prompt_root_authority_classes: Record<string, number>;
+  refill_cache_lookup_wall_ms?: number;
+  refill_state_hydration_wall_ms?: number;
+  refill_fresh_suffix_prefill_wall_ms?: number;
+  refill_snapshot_capture_wall_ms?: number;
   tool_schema_sha256s: string[];
   generated_tokens?: number;
   tool_calls?: number;
@@ -221,6 +230,40 @@ export async function summarizeScratch(
       },
       {},
     );
+    const roots = invocations.flatMap((event) => {
+      const cache = event.prompt_cache;
+      if (cache === null || typeof cache !== "object") return [];
+      const root = (cache as Record<string, unknown>).root;
+      return root !== null && typeof root === "object"
+        ? [root as Record<string, unknown>]
+        : [];
+    });
+    const eligibleRootTokens = roots.reduce(
+      (total, root) => total + numberOrZero(root.tokens),
+      0,
+    );
+    const reusedRootTokens = roots.reduce(
+      (total, root) => total + numberOrZero(root.reused_tokens),
+      0,
+    );
+    const promptRootHitInvocations = roots.filter((root) => {
+      const tokens = numberOrZero(root.tokens);
+      return tokens > 0 && numberOrZero(root.reused_tokens) === tokens;
+    }).length;
+    const promptRootSha256s = Array.from(
+      new Set(roots.flatMap((root) => {
+        const digest = optionalString(root.rendered_token_sha256);
+        return digest ? [digest] : [];
+      })),
+    );
+    const promptRootAuthorityClasses = roots.reduce<Record<string, number>>(
+      (counts, root) => {
+        const authority = optionalString(root.authority_class);
+        if (authority) counts[authority] = (counts[authority] ?? 0) + 1;
+        return counts;
+      },
+      {},
+    );
     const toolSchemaSha256s = Array.from(
       new Set(invocations.flatMap((event) => {
         const native = event.native;
@@ -231,6 +274,21 @@ export async function summarizeScratch(
         return digest ? [digest] : [];
       })),
     );
+    const refills = invocations.flatMap((event) => {
+      const native = event.native;
+      if (native === null || typeof native !== "object") return [];
+      const refill = (native as Record<string, unknown>).refill;
+      return refill !== null && typeof refill === "object"
+        ? [refill as Record<string, unknown>]
+        : [];
+    });
+    const refillTotal = (field: string): number | undefined =>
+      refills.length > 0
+        ? refills.reduce(
+          (total, refill) => total + numberOrZero(refill[field]),
+          0,
+        )
+        : undefined;
     const audit = finished.audit ?? {};
     const contractStatus = requiredString(
       finished.contract_status,
@@ -278,6 +336,19 @@ export async function summarizeScratch(
         ? promptCacheHitInvocations
         : undefined,
       prompt_cache_miss_reasons: promptCacheMissReasons,
+      eligible_root_tokens: roots.length > 0 ? eligibleRootTokens : undefined,
+      reused_root_tokens: roots.length > 0 ? reusedRootTokens : undefined,
+      prompt_root_hit_invocations: roots.length > 0
+        ? promptRootHitInvocations
+        : undefined,
+      prompt_root_sha256s: promptRootSha256s,
+      prompt_root_authority_classes: promptRootAuthorityClasses,
+      refill_cache_lookup_wall_ms: refillTotal("cache_lookup_wall_ms"),
+      refill_state_hydration_wall_ms: refillTotal("state_hydration_wall_ms"),
+      refill_fresh_suffix_prefill_wall_ms: refillTotal(
+        "fresh_suffix_prefill_wall_ms",
+      ),
+      refill_snapshot_capture_wall_ms: refillTotal("snapshot_capture_wall_ms"),
       tool_schema_sha256s: toolSchemaSha256s,
       generated_tokens: optionalNumber(metrics?.generated_tokens),
       tool_calls: optionalNumber(metrics?.tool_calls),

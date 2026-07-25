@@ -666,6 +666,18 @@ Successful partial or full reuse has no miss reason. These fields distinguish co
 performed without guessing at cache behavior from latency alone, and the terminal and web transcript
 surface the same attribution.
 
+When a backend can identify a reusable stable root, the cache record also carries a versioned exact
+rendered-token digest, model-namespace digest, eligible and reused root-token counts, and a
+controller-owned bounded authority class. The controller label is diagnostic only: the backend's
+exact rendered-token comparison remains the reuse authority. Tool-schema and output-constraint
+digests are recorded separately because a decode-only constraint can change without invalidating
+identical prefetched KV state.
+
+FlashMoe native usage further separates cache lookup, validated state hydration, actual fresh-suffix
+prefill, and prompt-snapshot capture. These non-overlapping lifecycle counters keep a fast cache hit,
+slow disk decode, slow Metal restore, and slow model prefill from being collapsed into one TTFT
+number.
+
 ## Where the workflow ends
 
 Ready means local delivery is complete under the configured contract. Publication is a separate

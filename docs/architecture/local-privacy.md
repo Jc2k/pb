@@ -58,6 +58,10 @@ Deterministic controller actions do not add another data path. Eligible file byt
 inspections, typed receipts, prompt blocks, and evaluator artifacts remain on the same local
 controller, local model, session, and explicitly selected scratch/output roots. The intrinsic
 behavior adds no telemetry, hosted inference fallback, remote persistence, or network authority.
+Local inference events may retain versioned model-namespace, rendered-token-root, and tool-schema
+digests plus token counts and bounded workflow authority labels. Those values make cache reuse
+auditable without copying prompt, task, path, tool-argument, or source content into diagnostic
+fields. They remain in the same local session history and are not transmitted by this behavior.
 Durable actor fields contain only a local profile or workflow-steward identity and optional
 assisting profile. Character presentation adds no network request and does not send repository
 content to a separate service.

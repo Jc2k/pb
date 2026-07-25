@@ -373,6 +373,7 @@ pub fn render_event(event: &AgentEvent) {
             prompt_tokens,
             generated_tokens,
             prompt_cache,
+            native,
             energy_joules,
             average_power_watts,
             ..
@@ -392,16 +393,39 @@ pub fn render_event(event: &AgentEvent) {
                         .miss_reason
                         .map(|reason| format!(", miss={}", reason.as_str()))
                         .unwrap_or_default();
+                    let root = cache
+                        .root
+                        .as_ref()
+                        .map(|root| {
+                            format!(
+                                ", root={}/{} {:?}",
+                                root.reused_tokens, root.tokens, root.authority_class
+                            )
+                        })
+                        .unwrap_or_default();
                     format!(
-                        ", cache={} reused/{} fresh via {}{miss}",
+                        ", cache={} reused/{} fresh via {}{miss}{root}",
                         cache.cached_tokens, cache.prefilled_tokens, cache.source
+                    )
+                })
+                .unwrap_or_default();
+            let refill = native
+                .as_ref()
+                .and_then(|native| native.refill.as_ref())
+                .map(|refill| {
+                    format!(
+                        ", refill={} lookup/{} hydrate/{} suffix/{} snapshot ms",
+                        refill.cache_lookup_wall_ms,
+                        refill.state_hydration_wall_ms,
+                        refill.fresh_suffix_prefill_wall_ms,
+                        refill.snapshot_capture_wall_ms
                     )
                 })
                 .unwrap_or_default();
             print_header(
                 "llm",
                 &format!(
-                    "{} step {step}: {duration_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens{cache}{energy}",
+                    "{} step {step}: {duration_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens{cache}{refill}{energy}",
                     purpose.as_str()
                 ),
             );

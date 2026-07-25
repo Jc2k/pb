@@ -441,6 +441,25 @@ impl FlashMoeEngine {
         } else {
             self.stable_base_prefix_len(request, &prompt_tokens)?
         };
+        let stable_root_len = if deepseek_v4 {
+            deepseek_stable_prefix_len
+        } else {
+            base_prefix_len
+        };
+        let prompt_root = (stable_root_len > 0).then(|| {
+            let mut digest = Sha256::new();
+            for token in &prompt_tokens[..stable_root_len] {
+                digest.update(token.to_le_bytes());
+            }
+            crate::inference::BackendPromptRoot {
+                descriptor_version: crate::inference::PROMPT_ROOT_DESCRIPTOR_VERSION,
+                backend: "flashmoe".to_string(),
+                model_namespace_sha256:
+                    crate::inference::flashmoe::session_cache::model_fingerprint_hex(&self.plan),
+                rendered_token_sha256: format!("{:x}", digest.finalize()),
+                tokens: stable_root_len,
+            }
+        });
         let max_tokens = request.max_tokens.max(0) as usize;
         validate_context_capacity(prompt_tokens.len(), max_tokens, request.context_size)?;
         if let Some(graph) = self.executor.deepseek_v4_graph() {
@@ -452,6 +471,7 @@ impl FlashMoeEngine {
             self.metal.prepare_deepseek_v4_state(graph, capacity)?;
         }
         let deepseek_restore_started = Instant::now();
+        let mut state_hydration_wall = Duration::ZERO;
         let deepseek_reuse = if deepseek_v4 {
             session_id
                 .map(|session_id| {
@@ -460,8 +480,10 @@ impl FlashMoeEngine {
                         .and_then(|checkpoint| {
                             checkpoint
                                 .map(|(prefix, checkpoint)| {
+                                    let hydration_started = Instant::now();
                                     self.metal
                                         .restore_deepseek_v4_session_state(checkpoint.state())?;
+                                    state_hydration_wall += hydration_started.elapsed();
                                     Ok((prefix, checkpoint.last_hidden().to_vec()))
                                 })
                                 .transpose()
@@ -472,6 +494,9 @@ impl FlashMoeEngine {
         } else {
             None
         };
+        let deepseek_cache_lookup_wall = deepseek_restore_started
+            .elapsed()
+            .saturating_sub(state_hydration_wall);
         if let Some(glm) = self.config.glm.as_ref()
             && glm.index_topk > 0
         {
@@ -514,6 +539,7 @@ impl FlashMoeEngine {
             request.tools.len(),
             session_id.unwrap_or("<none>")
         );
+        let cache_lookup_started = Instant::now();
         let mut generation = if deepseek_v4 {
             let (prefill_start, cached_last_hidden, cache_source, restore_ms, miss_reason) =
                 if let Some((prefix, hidden)) = deepseek_reuse {
@@ -557,6 +583,11 @@ impl FlashMoeEngine {
                 self.config.num_hidden_layers,
             )
         };
+        let cache_lookup_wall = if deepseek_v4 {
+            deepseek_cache_lookup_wall
+        } else {
+            cache_lookup_started.elapsed()
+        };
         let prefill_start = generation.prefill_start();
         let prompt_len = generation.prompt_len();
         let prompt_cache_source = generation.cache_source();
@@ -570,6 +601,7 @@ impl FlashMoeEngine {
             );
         }
         if !deepseek_v4 {
+            let hydration_started = Instant::now();
             if prefill_start == 0 {
                 self.metal.reset_linear_attention_state()?;
             } else {
@@ -579,9 +611,12 @@ impl FlashMoeEngine {
                 self.metal
                     .restore_linear_attention_session_state(&recurrent)?;
             }
+            state_hydration_wall += hydration_started.elapsed();
         }
         let prefill_resources_before = self.metal_resource_snapshot();
         let prefill_or_ttft_started = Instant::now();
+        let mut fresh_suffix_prefill_wall = Duration::ZERO;
+        let mut snapshot_capture_wall = Duration::ZERO;
         let mut deepseek_stable_checkpoint = None;
         let prefill_hidden = if prefill_start == prompt_len {
             debug!(
@@ -618,7 +653,8 @@ impl FlashMoeEngine {
                     } else {
                         None
                     };
-                    self.prefill_range(
+                    let range_started = Instant::now();
+                    let hidden = self.prefill_range(
                         prompt_tokens,
                         cursor,
                         base_prefix_len,
@@ -628,8 +664,11 @@ impl FlashMoeEngine {
                         request.prefill_state_summary,
                         detailed,
                         progress.clone(),
-                    )?
+                    )?;
+                    fresh_suffix_prefill_wall += range_started.elapsed();
+                    hidden
                 });
+                let capture_started = Instant::now();
                 let recurrent = self.metal.capture_linear_attention_session_state()?;
                 generation.capture_base_cache(
                     hidden
@@ -638,6 +677,7 @@ impl FlashMoeEngine {
                         .clone(),
                     recurrent,
                 );
+                snapshot_capture_wall += capture_started.elapsed();
                 cursor = base_prefix_len;
             }
             if deepseek_v4
@@ -652,7 +692,8 @@ impl FlashMoeEngine {
                     } else {
                         None
                     };
-                    self.prefill_range(
+                    let range_started = Instant::now();
+                    let hidden = self.prefill_range(
                         prompt_tokens,
                         cursor,
                         deepseek_stable_prefix_len,
@@ -662,8 +703,11 @@ impl FlashMoeEngine {
                         request.prefill_state_summary,
                         detailed,
                         progress.clone(),
-                    )?
+                    )?;
+                    fresh_suffix_prefill_wall += range_started.elapsed();
+                    hidden
                 });
+                let capture_started = Instant::now();
                 deepseek_stable_checkpoint = Some(DeepSeekV4SessionCheckpoint::new(
                     DeepSeekV4CheckpointKind::StablePrompt,
                     generation.prompt_tokens_through(deepseek_stable_prefix_len),
@@ -673,6 +717,7 @@ impl FlashMoeEngine {
                         .clone(),
                     self.metal.capture_deepseek_v4_session_state()?,
                 ));
+                snapshot_capture_wall += capture_started.elapsed();
                 cursor = deepseek_stable_prefix_len;
             }
             if cursor < prompt_len {
@@ -683,7 +728,8 @@ impl FlashMoeEngine {
                     } else {
                         None
                     };
-                    self.prefill_range(
+                    let range_started = Instant::now();
+                    let hidden = self.prefill_range(
                         prompt_tokens,
                         cursor,
                         prompt_len,
@@ -693,7 +739,9 @@ impl FlashMoeEngine {
                         request.prefill_state_summary,
                         detailed,
                         progress.clone(),
-                    )?
+                    )?;
+                    fresh_suffix_prefill_wall += range_started.elapsed();
+                    hidden
                 });
             }
             let hidden = hidden.context("FlashMoe prefill produced no final hidden state")?;
@@ -714,6 +762,7 @@ impl FlashMoeEngine {
         };
         if deepseek_v4 {
             if let Some(session_id) = session_id {
+                let capture_started = Instant::now();
                 if let Some(checkpoint) = deepseek_stable_checkpoint {
                     self.deepseek_sessions
                         .replace_stable_prompt(session_id, checkpoint);
@@ -737,10 +786,13 @@ impl FlashMoeEngine {
                     self.deepseek_sessions
                         .push_checkpoint(session_id, checkpoint);
                 }
+                snapshot_capture_wall += capture_started.elapsed();
             }
         } else if generation.requires_prompt_snapshot() {
+            let capture_started = Instant::now();
             let recurrent = self.metal.capture_linear_attention_session_state()?;
             generation.capture_prompt_cache(prefill_hidden.clone(), recurrent);
+            snapshot_capture_wall += capture_started.elapsed();
         }
 
         let prefill_state = if request.prefill_state_summary {
@@ -753,7 +805,9 @@ impl FlashMoeEngine {
                 generation.prefill_state_sha256();
             let (full_attention_kv_layer_sha256, router_recurrent_layer_sha256) =
                 generation.prefill_layer_state_sha256();
+            let capture_started = Instant::now();
             let recurrent = self.metal.capture_linear_attention_session_state()?;
+            snapshot_capture_wall += capture_started.elapsed();
             Some(NativePrefillStateStats {
                 final_hidden_sha256: f32_values_sha256(
                     b"pb.flashmoe.final-prefill-hidden.v1\0",
@@ -1061,6 +1115,12 @@ impl FlashMoeEngine {
             }
             .to_string(),
             thinking_enabled: request.enable_thinking && self.supports_thinking(),
+            refill: NativeRefillStats {
+                cache_lookup_wall_ms: duration_millis(cache_lookup_wall),
+                state_hydration_wall_ms: duration_millis(state_hydration_wall),
+                fresh_suffix_prefill_wall_ms: duration_millis(fresh_suffix_prefill_wall),
+                snapshot_capture_wall_ms: duration_millis(snapshot_capture_wall),
+            },
             prefill_state,
         };
         let output = GenerationOutput {
@@ -1075,6 +1135,7 @@ impl FlashMoeEngine {
                 prefilled_tokens: prompt_len.saturating_sub(prefill_start),
                 restore_ms: prompt_cache_restore_ms,
                 miss_reason: prompt_cache_miss_reason,
+                root: prompt_root,
             },
             tool_constraints,
             json_constraints,
@@ -1641,6 +1702,7 @@ impl FlashMoeEngine {
                 prefilled_tokens: runtime_inputs.prompt_tokens().len(),
                 restore_ms: 0,
                 miss_reason: Some(crate::inference::PromptCacheMissReason::RuntimeUnsupported),
+                root: None,
             },
             tool_constraints: None,
             json_constraints: None,

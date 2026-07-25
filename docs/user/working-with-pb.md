@@ -110,7 +110,9 @@ Model-inference rows show why the call was needed, prompt and generated token co
 is measurable, and prompt-cache work. A zero-reuse call includes the backend's reason—such as a cold
 session, changed prompt, unavailable stable prefix, unreadable cache, required context reset,
 disabled cache, or an unsupported runtime path. A cache hit reports reused and fresh token counts and
-does not carry a miss reason.
+does not carry a miss reason. When a stable root is available, the row additionally shows how many
+eligible root tokens were reused and the bounded workflow authority class. The stored diagnostic
+uses local digests and token counts rather than prompt or repository text.
 
 Sessions saved before actor attribution remain readable. Their model tool actions appear as
 **Legacy action** rather than being guessed from the closest chat message.

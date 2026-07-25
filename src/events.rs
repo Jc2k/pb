@@ -413,6 +413,41 @@ pub struct PromptCacheUsage {
     pub restore_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub miss_reason: Option<PromptCacheMissReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PromptRootUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptRootAuthorityClass {
+    #[default]
+    Unclassified,
+    Conversation,
+    TaskArtifact,
+    Planning,
+    PlanReview,
+    ImplementationRead,
+    ImplementationMutation,
+    ImplementationClosure,
+    RepairRead,
+    RepairMutation,
+    RepairClosure,
+    CodeReview,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptRootUsage {
+    pub descriptor_version: u32,
+    pub backend: String,
+    pub model_namespace_sha256: String,
+    pub rendered_token_sha256: String,
+    pub tokens: usize,
+    pub reused_tokens: usize,
+    pub authority_class: PromptRootAuthorityClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_schema_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_constraint_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -437,6 +472,8 @@ pub struct NativeGenerationUsage {
     pub prefill_command_kind: String,
     pub thinking_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refill: Option<NativeRefillUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_constraint_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_schema_sha256: Option<String>,
@@ -444,6 +481,14 @@ pub struct NativeGenerationUsage {
     pub rejected_constraint_candidates: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint_terminal_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRefillUsage {
+    pub cache_lookup_wall_ms: u64,
+    pub state_hydration_wall_ms: u64,
+    pub fresh_suffix_prefill_wall_ms: u64,
+    pub snapshot_capture_wall_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2458,6 +2503,17 @@ mod tests {
                 prefilled_tokens: 864,
                 restore_ms: 0,
                 miss_reason: Some(PromptCacheMissReason::PromptDiverged),
+                root: Some(PromptRootUsage {
+                    descriptor_version: 1,
+                    backend: "flashmoe".to_string(),
+                    model_namespace_sha256: "model".to_string(),
+                    rendered_token_sha256: "root".to_string(),
+                    tokens: 2048,
+                    reused_tokens: 2048,
+                    authority_class: PromptRootAuthorityClass::CodeReview,
+                    tool_schema_sha256: Some("abc".to_string()),
+                    output_constraint_mode: Some("tool_required".to_string()),
+                }),
             }),
             context: Some(context.clone()),
             native: Some(NativeGenerationUsage {
@@ -2476,6 +2532,12 @@ mod tests {
                 expert_strategy: "resident_complete_corpus".to_string(),
                 prefill_command_kind: "qwen_chunked_token_batch".to_string(),
                 thinking_enabled: false,
+                refill: Some(NativeRefillUsage {
+                    cache_lookup_wall_ms: 2,
+                    state_hydration_wall_ms: 3,
+                    fresh_suffix_prefill_wall_ms: 100,
+                    snapshot_capture_wall_ms: 15,
+                }),
                 tool_constraint_mode: Some("tool_required".to_string()),
                 tool_schema_sha256: Some("abc".to_string()),
                 rejected_constraint_candidates: 4,
@@ -2496,6 +2558,11 @@ mod tests {
                 prompt_cache: Some(PromptCacheUsage {
                     cached_tokens: 4096,
                     miss_reason: Some(PromptCacheMissReason::PromptDiverged),
+                    root: Some(PromptRootUsage {
+                        reused_tokens: 2048,
+                        authority_class: PromptRootAuthorityClass::CodeReview,
+                        ..
+                    }),
                     ..
                 }),
                 native: Some(NativeGenerationUsage {
@@ -2503,6 +2570,10 @@ mod tests {
                     prefill_metal_commands: 48,
                     prefill_host_upload_bytes: 1_024,
                     prefill_host_readback_bytes: 512,
+                    refill: Some(NativeRefillUsage {
+                        fresh_suffix_prefill_wall_ms: 100,
+                        ..
+                    }),
                     ..
                 }),
                 ..
