@@ -187,8 +187,14 @@ promotion gates.
 
 `scripts/summarize-harness-completion.ts` reports rendered prompt tokens, reused cached-prefix
 tokens, actual fresh-prefill tokens, cache-hit invocation count, and observed native tool-schema
-digests separately. These fields measure prefix reuse without treating cached tokens as work avoided
-by a weaker contract.
+digests separately. The usability auditor also aggregates cache misses by reason. These fields
+measure prefix reuse without treating cached tokens as work avoided by a weaker contract.
+
+Each `llm_invocation.prompt_cache` also records a typed `miss_reason` when no prefix was reused:
+`cache_disabled`, `cold_session`, `prompt_diverged`, `stable_prefix_unavailable`,
+`cache_unreadable`, `context_reset`, or `runtime_unsupported`. A partial or full hit omits the field.
+This taxonomy comes from the active inference backend, so preserved-run audits can separate expected
+cold starts and unsupported paths from prompt instability or broken persisted state.
 
 The same directory contains a schema-validated 11-case TC3 candidate corpus spanning ordered
 creation, repair after a failed check, a one-file fix, regression tests, related multi-file work,

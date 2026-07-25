@@ -656,8 +656,12 @@ and profile when present. Duration, prompt/generated tokens, prompt-cache usage,
 therefore remain attributable even for constrained Task-planning calls outside the stage loop.
 
 Each `llm_invocation` records total prompt tokens, cached tokens, actually-prefilled tokens, cache
-source, and disk-restore time. These counts distinguish context size from work performed and make a
-cache miss or invalidation visible in the web transcript.
+source, disk-restore time, and a backend-owned reason when no prefix was reused. The typed reasons
+distinguish disabled caching, a cold session, prompt divergence, a missing stable prefix, an
+unreadable persisted cache, a required context reset, and a runtime path that cannot reuse state.
+Successful partial or full reuse has no miss reason. These fields distinguish context size from work
+performed without guessing at cache behavior from latency alone, and the terminal and web transcript
+surface the same attribution.
 
 ## Where the workflow ends
 

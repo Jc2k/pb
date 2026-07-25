@@ -14370,11 +14370,14 @@ fn llama_completion_output(
         },
         prompt_tokens: output.prompt_tokens,
         generated_tokens: output.generated_tokens,
-        prompt_cache: output.prompt_cache_source.map(|source| PromptCacheUsage {
-            source,
+        prompt_cache: Some(PromptCacheUsage {
+            source: output
+                .prompt_cache_source
+                .unwrap_or_else(|| "none".to_string()),
             cached_tokens: output.cached_prompt_tokens,
             prefilled_tokens: output.prefilled_prompt_tokens,
             restore_ms: output.prompt_cache_restore_ms,
+            miss_reason: output.prompt_cache_miss_reason,
         }),
         native: None,
         duration_ms: output.duration_ms,
@@ -14679,6 +14682,7 @@ fn generate_flashmoe_completion_from_request(
             cached_tokens: output.prompt_cache.cached_tokens,
             prefilled_tokens: output.prompt_cache.prefilled_tokens,
             restore_ms: output.prompt_cache.restore_ms,
+            miss_reason: output.prompt_cache.miss_reason,
         }),
         native: Some(native),
         duration_ms: duration_millis(started),

@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::agent_core::{AgentProfile, SessionAttachment};
+use crate::inference::PromptCacheMissReason;
 use crate::session_store::now_millis;
 
 pub const EVENT_SCHEMA_VERSION: &str = "v1";
@@ -410,6 +411,8 @@ pub struct PromptCacheUsage {
     pub prefilled_tokens: usize,
     #[serde(default)]
     pub restore_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miss_reason: Option<PromptCacheMissReason>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -2454,6 +2457,7 @@ mod tests {
                 cached_tokens: 4096,
                 prefilled_tokens: 864,
                 restore_ms: 0,
+                miss_reason: Some(PromptCacheMissReason::PromptDiverged),
             }),
             context: Some(context.clone()),
             native: Some(NativeGenerationUsage {
@@ -2489,7 +2493,11 @@ mod tests {
             restored.event,
             AgentEvent::LlmInvocation {
                 context: Some(restored),
-                prompt_cache: Some(PromptCacheUsage { cached_tokens: 4096, .. }),
+                prompt_cache: Some(PromptCacheUsage {
+                    cached_tokens: 4096,
+                    miss_reason: Some(PromptCacheMissReason::PromptDiverged),
+                    ..
+                }),
                 native: Some(NativeGenerationUsage {
                     active_experts_per_token: Some(10),
                     prefill_metal_commands: 48,

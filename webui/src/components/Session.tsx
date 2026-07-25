@@ -994,15 +994,18 @@ export function MessageBubble({
         >
           <span>
             Model inference {e.step}
-            {e.purpose
-              ? ` (${e.purpose.replaceAll("_", " ")})`
-              : ""} · {formatHumanDurationMs(e.duration_ms)} ·
-            {" "}
+            {e.purpose ? ` (${e.purpose.replaceAll("_", " ")})` : ""} ·{" "}
+            {formatHumanDurationMs(e.duration_ms)} ·{" "}
             {formatNumber(e.prompt_tokens + e.generated_tokens)} tokens
             {e.prompt_cache
               ? ` · ${formatNumber(e.prompt_cache.cached_tokens)} cached, ${
                 formatNumber(e.prompt_cache.prefilled_tokens)
-              } prefilled (${e.prompt_cache.source.replaceAll("_", " ")})`
+              } prefilled (${e.prompt_cache.source.replaceAll("_", " ")})` +
+                (e.prompt_cache.miss_reason
+                  ? ` · miss: ${
+                    e.prompt_cache.miss_reason.replaceAll("_", " ")
+                  }`
+                  : "")
               : ""}
             {e.energy_joules !== undefined
               ? ` · ${formatEnergy(e.energy_joules)}`

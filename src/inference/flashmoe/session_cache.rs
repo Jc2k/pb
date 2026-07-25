@@ -16,6 +16,7 @@ use super::state::{
     KvCache, reusable_session_prefix_len,
 };
 use super::types::PromptCacheSource;
+use crate::inference::PromptCacheMissReason;
 
 const CACHE_VERSION: &str = "flashmoe-session-v1";
 const MAGIC: &[u8; 8] = b"PBFMKV01";
@@ -601,17 +602,22 @@ impl FlashMoeSessionCache {
         if let Some(id) = session_id {
             self.session_order.retain(|existing| existing != id);
         }
-        let mut cached = session_id
-            .and_then(|id| self.entries.remove(id))
-            .and_then(|states| {
-                states
-                    .into_iter()
-                    .filter_map(|state| {
-                        reusable_session_prefix_len(&state.cpu.tokens, &prompt_tokens)
-                            .map(|prefix_len| (prefix_len, state))
-                    })
-                    .max_by_key(|(prefix_len, _)| *prefix_len)
-            });
+        let memory_session = session_id.and_then(|id| self.entries.remove(id));
+        let mut incompatible_checkpoint_seen = false;
+        let mut cache_unreadable = false;
+        let mut cached = memory_session.and_then(|states| {
+            let found = states
+                .into_iter()
+                .filter_map(|state| {
+                    reusable_session_prefix_len(&state.cpu.tokens, &prompt_tokens)
+                        .map(|prefix_len| (prefix_len, state))
+                })
+                .max_by_key(|(prefix_len, _)| *prefix_len);
+            if found.is_none() {
+                incompatible_checkpoint_seen = true;
+            }
+            found
+        });
         let mut cache_source = if cached.is_some() {
             PromptCacheSource::MemorySession
         } else {
@@ -641,6 +647,7 @@ impl FlashMoeSessionCache {
         {
             match disk.load_session(id) {
                 Ok(states) => {
+                    let had_states = !states.is_empty();
                     if let Some(found) = states
                         .into_iter()
                         .filter_map(|state| {
@@ -652,13 +659,18 @@ impl FlashMoeSessionCache {
                         cached = Some(found);
                         cache_source = PromptCacheSource::DiskSession;
                         used_disk = true;
+                    } else if had_states {
+                        incompatible_checkpoint_seen = true;
                     }
                 }
-                Err(error) => tracing::warn!(
-                    session = id,
-                    error = %format!("{error:#}"),
-                    "ignored unreadable FlashMoe session cache"
-                ),
+                Err(error) => {
+                    cache_unreadable = true;
+                    tracing::warn!(
+                        session = id,
+                        error = %format!("{error:#}"),
+                        "ignored unreadable FlashMoe session cache"
+                    );
+                }
             }
         }
         if cached.is_none()
@@ -673,13 +685,29 @@ impl FlashMoeSessionCache {
                     used_disk = true;
                 }
                 Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    prefix = key,
-                    error = %format!("{error:#}"),
-                    "ignored unreadable FlashMoe prefix cache"
-                ),
+                Err(error) => {
+                    cache_unreadable = true;
+                    tracing::warn!(
+                        prefix = key,
+                        error = %format!("{error:#}"),
+                        "ignored unreadable FlashMoe prefix cache"
+                    );
+                }
             }
         }
+        let cache_miss_reason = cached.is_none().then(|| {
+            if session_id.is_none() {
+                PromptCacheMissReason::CacheDisabled
+            } else if cache_unreadable {
+                PromptCacheMissReason::CacheUnreadable
+            } else if incompatible_checkpoint_seen {
+                PromptCacheMissReason::PromptDiverged
+            } else if base_prefix_len == 0 {
+                PromptCacheMissReason::StablePrefixUnavailable
+            } else {
+                PromptCacheMissReason::ColdSession
+            }
+        });
         let restore_ms = used_disk
             .then(|| u64::try_from(restore_started.elapsed().as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
@@ -715,6 +743,7 @@ impl FlashMoeSessionCache {
             generated_recurrent: None,
             cache_source,
             cache_restore_ms: restore_ms,
+            cache_miss_reason,
             base_prefix_len,
             base_cache: None,
             base_recurrent: None,
@@ -734,6 +763,7 @@ impl FlashMoeSessionCache {
         layers: usize,
         cache_source: PromptCacheSource,
         cache_restore_ms: u64,
+        cache_miss_reason: Option<PromptCacheMissReason>,
     ) -> Result<FlashMoeGenerationState> {
         if prefill_start > prompt_tokens.len() {
             bail!(
@@ -763,6 +793,7 @@ impl FlashMoeSessionCache {
             generated_recurrent: None,
             cache_source,
             cache_restore_ms,
+            cache_miss_reason,
             base_prefix_len: 0,
             base_cache: None,
             base_recurrent: None,
@@ -906,6 +937,38 @@ mod tests {
             ])
             .unwrap(),
         }
+    }
+
+    #[test]
+    fn cache_miss_reasons_distinguish_cold_diverged_and_disabled_sessions() {
+        let mut cache = FlashMoeSessionCache::default();
+        let cold = cache.begin_generation_with_base(Some("cold"), vec![1, 2], 1, 1, 2);
+        assert_eq!(
+            cold.cache_miss_reason(),
+            Some(PromptCacheMissReason::ColdSession)
+        );
+
+        let disabled = cache.begin_generation(None, vec![1, 2], 1, 2);
+        assert_eq!(
+            disabled.cache_miss_reason(),
+            Some(PromptCacheMissReason::CacheDisabled)
+        );
+
+        cache
+            .entries
+            .insert("diverged".to_string(), vec![fixture_state()]);
+        let diverged = cache.begin_generation(Some("diverged"), vec![1, 2], 1, 2);
+        assert_eq!(
+            diverged.cache_miss_reason(),
+            Some(PromptCacheMissReason::PromptDiverged)
+        );
+
+        cache
+            .entries
+            .insert("reused".to_string(), vec![fixture_state()]);
+        let reused = cache.begin_generation(Some("reused"), vec![10, 20, 30], 1, 2);
+        assert_eq!(reused.cache_source(), PromptCacheSource::MemorySession);
+        assert_eq!(reused.cache_miss_reason(), None);
     }
 
     #[test]

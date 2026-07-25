@@ -29,6 +29,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::energy::{self, EnergyEstimate};
+use crate::inference::PromptCacheMissReason;
 use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate};
 
 const BATCH_SIZE: usize = 512;
@@ -84,6 +85,7 @@ pub struct Output {
     pub prefilled_prompt_tokens: usize,
     pub prompt_cache_source: Option<String>,
     pub prompt_cache_restore_ms: u64,
+    pub prompt_cache_miss_reason: Option<PromptCacheMissReason>,
     pub duration_ms: u64,
     pub energy: Option<EnergyEstimate>,
 }
@@ -371,6 +373,7 @@ impl LlamaCppBackend {
             prefilled_prompt_tokens: tokens.len(),
             prompt_cache_source: None,
             prompt_cache_restore_ms: 0,
+            prompt_cache_miss_reason: Some(PromptCacheMissReason::CacheDisabled),
             duration_ms: duration_millis(started),
             energy,
         })
@@ -536,6 +539,7 @@ impl LlamaCppBackend {
             prefilled_prompt_tokens: chunks.total_positions() as usize,
             prompt_cache_source: None,
             prompt_cache_restore_ms: 0,
+            prompt_cache_miss_reason: Some(PromptCacheMissReason::RuntimeUnsupported),
             duration_ms: duration_millis(started),
             energy,
         })
@@ -573,10 +577,13 @@ impl LlamaCppChatSession<'_> {
             .cached
             .as_ref()
             .is_none_or(|cached| cached.settings != settings);
+        let mut prompt_cache_miss_reason = None;
         if needs_context {
             let mut context = self.backend.new_text_context(settings)?;
             let restore_started = Instant::now();
-            let evaluated_tokens = self.load_persisted_state(&mut context, settings, &tokens);
+            let (evaluated_tokens, miss_reason) =
+                self.load_persisted_state(&mut context, settings, &tokens);
+            prompt_cache_miss_reason = miss_reason;
             let restored_from_disk = !evaluated_tokens.is_empty();
             self.cached = Some(CachedLlamaContext {
                 context,
@@ -595,7 +602,9 @@ impl LlamaCppChatSession<'_> {
             .context("llama session context is missing")?;
         ensure_prompt_fits_context(tokens.len(), request.max_tokens, cached.context.n_ctx())?;
 
+        let previous_cached_tokens = cached.evaluated_tokens.len();
         let mut prefill_start = common_token_prefix_len(&cached.evaluated_tokens, &tokens);
+        let mut context_reset = false;
         if prefill_start < cached.evaluated_tokens.len() {
             // A shorter prompt needs its final token evaluated again because llama.cpp's logits
             // buffer still belongs to the longer cached sequence.
@@ -614,6 +623,7 @@ impl LlamaCppChatSession<'_> {
             if !truncated {
                 cached.context = self.backend.new_text_context(settings)?;
                 prefill_start = 0;
+                context_reset = true;
             }
         }
 
@@ -635,6 +645,12 @@ impl LlamaCppChatSession<'_> {
         } else {
             0
         };
+        prompt_cache_miss_reason = llama_prompt_cache_miss_reason(
+            prefill_start,
+            previous_cached_tokens,
+            context_reset,
+            prompt_cache_miss_reason,
+        );
         cached.restored_from_disk = false;
         cached.restore_ms = 0;
 
@@ -728,6 +744,7 @@ impl LlamaCppChatSession<'_> {
             prefilled_prompt_tokens: prompt_token_count.saturating_sub(prefill_start),
             prompt_cache_source,
             prompt_cache_restore_ms,
+            prompt_cache_miss_reason,
             duration_ms: duration_millis(started),
             energy,
         })
@@ -738,12 +755,12 @@ impl LlamaCppChatSession<'_> {
         context: &mut LlamaContext<'_>,
         settings: LlamaSessionSettings,
         prompt_tokens: &[LlamaToken],
-    ) -> Vec<LlamaToken> {
+    ) -> (Vec<LlamaToken>, Option<PromptCacheMissReason>) {
         let Some(path) = self.cache_path(settings) else {
-            return Vec::new();
+            return (Vec::new(), Some(PromptCacheMissReason::CacheDisabled));
         };
         if !path.is_file() {
-            return Vec::new();
+            return (Vec::new(), Some(PromptCacheMissReason::ColdSession));
         }
         match context.state_load_file(&path, settings.ctx_size as usize) {
             Ok(tokens) => {
@@ -755,7 +772,9 @@ impl LlamaCppChatSession<'_> {
                     reusable_prefix_tokens = prefix_len,
                     "loaded llama.cpp session cache"
                 );
-                tokens
+                let miss_reason =
+                    (prefix_len == 0).then_some(PromptCacheMissReason::PromptDiverged);
+                (tokens, miss_reason)
             }
             Err(error) => {
                 context.clear_kv_cache();
@@ -765,7 +784,7 @@ impl LlamaCppChatSession<'_> {
                     error = %error,
                     "ignored incompatible llama.cpp session cache"
                 );
-                Vec::new()
+                (Vec::new(), Some(PromptCacheMissReason::CacheUnreadable))
             }
         }
     }
@@ -994,6 +1013,26 @@ fn common_token_prefix_len(left: &[LlamaToken], right: &[LlamaToken]) -> usize {
         .count()
 }
 
+fn llama_prompt_cache_miss_reason(
+    reused_tokens: usize,
+    previous_cached_tokens: usize,
+    context_reset: bool,
+    load_miss_reason: Option<PromptCacheMissReason>,
+) -> Option<PromptCacheMissReason> {
+    if reused_tokens > 0 {
+        return None;
+    }
+    load_miss_reason.or_else(|| {
+        Some(if context_reset {
+            PromptCacheMissReason::ContextReset
+        } else if previous_cached_tokens > 0 {
+            PromptCacheMissReason::PromptDiverged
+        } else {
+            PromptCacheMissReason::ColdSession
+        })
+    })
+}
+
 fn llama_session_cache_path(
     root: &Path,
     model_path: &Path,
@@ -1136,6 +1175,36 @@ mod tests {
 
         assert_eq!(common_token_prefix_len(&cached, &extended), 4);
         assert_eq!(common_token_prefix_len(&cached, &changed), 2);
+    }
+
+    #[test]
+    fn prompt_cache_miss_reason_preserves_backend_causes_and_clears_on_reuse() {
+        assert_eq!(
+            llama_prompt_cache_miss_reason(0, 0, false, None),
+            Some(PromptCacheMissReason::ColdSession)
+        );
+        assert_eq!(
+            llama_prompt_cache_miss_reason(0, 10, false, None),
+            Some(PromptCacheMissReason::PromptDiverged)
+        );
+        assert_eq!(
+            llama_prompt_cache_miss_reason(
+                0,
+                0,
+                false,
+                Some(PromptCacheMissReason::CacheUnreadable)
+            ),
+            Some(PromptCacheMissReason::CacheUnreadable)
+        );
+        assert_eq!(
+            llama_prompt_cache_miss_reason(
+                4,
+                10,
+                false,
+                Some(PromptCacheMissReason::PromptDiverged)
+            ),
+            None
+        );
     }
 
     #[test]

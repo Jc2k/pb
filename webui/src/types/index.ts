@@ -498,6 +498,14 @@ export type AgentEvent =
       cached_tokens: number;
       prefilled_tokens: number;
       restore_ms?: number;
+      miss_reason?:
+        | "cache_disabled"
+        | "cold_session"
+        | "prompt_diverged"
+        | "stable_prefix_unavailable"
+        | "cache_unreadable"
+        | "context_reset"
+        | "runtime_unsupported";
     };
     context?: {
       context_capacity: number;

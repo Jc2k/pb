@@ -29,6 +29,7 @@ export interface CompletionRunSummary {
   cached_prefix_tokens?: number;
   fresh_prefill_tokens?: number;
   prompt_cache_hit_invocations?: number;
+  prompt_cache_miss_reasons: Record<string, number>;
   tool_schema_sha256s: string[];
   generated_tokens?: number;
   tool_calls?: number;
@@ -185,9 +186,10 @@ export async function summarizeScratch(
     );
     const cachedPrefixTokens = invocations.reduce((total, event) => {
       const cache = event.prompt_cache;
-      return total + (cache !== null && typeof cache === "object"
-        ? numberOrZero((cache as Record<string, unknown>).cached_tokens)
-        : 0);
+      return total +
+        (cache !== null && typeof cache === "object"
+          ? numberOrZero((cache as Record<string, unknown>).cached_tokens)
+          : 0);
     }, 0);
     const freshPrefillTokens = invocations.reduce((total, event) => {
       const native = event.native;
@@ -197,23 +199,38 @@ export async function summarizeScratch(
         );
       }
       const cache = event.prompt_cache;
-      return total + (cache !== null && typeof cache === "object"
-        ? numberOrZero((cache as Record<string, unknown>).prefilled_tokens)
-        : numberOrZero(event.prompt_tokens));
+      return total +
+        (cache !== null && typeof cache === "object"
+          ? numberOrZero((cache as Record<string, unknown>).prefilled_tokens)
+          : numberOrZero(event.prompt_tokens));
     }, 0);
     const promptCacheHitInvocations = invocations.filter((event) => {
       const cache = event.prompt_cache;
       return cache !== null && typeof cache === "object" &&
         numberOrZero((cache as Record<string, unknown>).cached_tokens) > 0;
     }).length;
-    const toolSchemaSha256s = Array.from(new Set(invocations.flatMap((event) => {
-      const native = event.native;
-      if (native === null || typeof native !== "object") return [];
-      const digest = optionalString(
-        (native as Record<string, unknown>).tool_schema_sha256,
-      );
-      return digest ? [digest] : [];
-    })));
+    const promptCacheMissReasons = invocations.reduce<Record<string, number>>(
+      (counts, event) => {
+        const cache = event.prompt_cache;
+        if (cache === null || typeof cache !== "object") return counts;
+        const reason = optionalString(
+          (cache as Record<string, unknown>).miss_reason,
+        );
+        if (reason) counts[reason] = (counts[reason] ?? 0) + 1;
+        return counts;
+      },
+      {},
+    );
+    const toolSchemaSha256s = Array.from(
+      new Set(invocations.flatMap((event) => {
+        const native = event.native;
+        if (native === null || typeof native !== "object") return [];
+        const digest = optionalString(
+          (native as Record<string, unknown>).tool_schema_sha256,
+        );
+        return digest ? [digest] : [];
+      })),
+    );
     const audit = finished.audit ?? {};
     const contractStatus = requiredString(
       finished.contract_status,
@@ -260,6 +277,7 @@ export async function summarizeScratch(
       prompt_cache_hit_invocations: invocations.length > 0
         ? promptCacheHitInvocations
         : undefined,
+      prompt_cache_miss_reasons: promptCacheMissReasons,
       tool_schema_sha256s: toolSchemaSha256s,
       generated_tokens: optionalNumber(metrics?.generated_tokens),
       tool_calls: optionalNumber(metrics?.tool_calls),

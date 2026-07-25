@@ -71,7 +71,11 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
           event: {
             type: "llm_invocation",
             prompt_tokens: 80,
-            prompt_cache: { cached_tokens: 0, prefilled_tokens: 80 },
+            prompt_cache: {
+              cached_tokens: 0,
+              prefilled_tokens: 80,
+              miss_reason: "prompt_diverged",
+            },
             native: {
               fresh_prefill_tokens: 80,
               tool_schema_sha256: "schema-b",
@@ -106,6 +110,10 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
     assert(summary.cached_prefix_tokens === 80, JSON.stringify(summary));
     assert(summary.fresh_prefill_tokens === 120, JSON.stringify(summary));
     assert(summary.prompt_cache_hit_invocations === 1, JSON.stringify(summary));
+    assert(
+      summary.prompt_cache_miss_reasons.prompt_diverged === 1,
+      JSON.stringify(summary),
+    );
     assert(summary.tool_schema_sha256s.length === 2, JSON.stringify(summary));
   } finally {
     await Deno.remove(root, { recursive: true });

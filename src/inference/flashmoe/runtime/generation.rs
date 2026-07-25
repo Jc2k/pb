@@ -515,7 +515,7 @@ impl FlashMoeEngine {
             session_id.unwrap_or("<none>")
         );
         let mut generation = if deepseek_v4 {
-            let (prefill_start, cached_last_hidden, cache_source, restore_ms) =
+            let (prefill_start, cached_last_hidden, cache_source, restore_ms, miss_reason) =
                 if let Some((prefix, hidden)) = deepseek_reuse {
                     (
                         prefix,
@@ -523,9 +523,20 @@ impl FlashMoeEngine {
                         PromptCacheSource::MemorySession,
                         u64::try_from(deepseek_restore_started.elapsed().as_millis())
                             .unwrap_or(u64::MAX),
+                        None,
                     )
                 } else {
-                    (0, None, PromptCacheSource::None, 0)
+                    (
+                        0,
+                        None,
+                        PromptCacheSource::None,
+                        0,
+                        Some(if session_id.is_some() {
+                            crate::inference::PromptCacheMissReason::ColdSession
+                        } else {
+                            crate::inference::PromptCacheMissReason::CacheDisabled
+                        }),
+                    )
                 };
             FlashMoeSessionCache::begin_external_prefix_generation(
                 prompt_tokens,
@@ -535,6 +546,7 @@ impl FlashMoeEngine {
                 self.config.num_hidden_layers,
                 cache_source,
                 restore_ms,
+                miss_reason,
             )?
         } else {
             self.session_cache.begin_generation_with_base(
@@ -549,6 +561,7 @@ impl FlashMoeEngine {
         let prompt_len = generation.prompt_len();
         let prompt_cache_source = generation.cache_source();
         let prompt_cache_restore_ms = generation.cache_restore_ms();
+        let prompt_cache_miss_reason = generation.cache_miss_reason();
         if prefill_start > 0 {
             debug!(
                 target: "flashmoe::lifecycle",
@@ -1061,6 +1074,7 @@ impl FlashMoeEngine {
                 cached_tokens: prefill_start,
                 prefilled_tokens: prompt_len.saturating_sub(prefill_start),
                 restore_ms: prompt_cache_restore_ms,
+                miss_reason: prompt_cache_miss_reason,
             },
             tool_constraints,
             json_constraints,
@@ -1626,6 +1640,7 @@ impl FlashMoeEngine {
                 cached_tokens: 0,
                 prefilled_tokens: runtime_inputs.prompt_tokens().len(),
                 restore_ms: 0,
+                miss_reason: Some(crate::inference::PromptCacheMissReason::RuntimeUnsupported),
             },
             tool_constraints: None,
             json_constraints: None,

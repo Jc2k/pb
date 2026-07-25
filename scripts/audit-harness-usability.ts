@@ -53,6 +53,7 @@ export interface UsabilityAudit {
     rendered_prompt_tokens?: number;
     cached_prefix_tokens?: number;
     fresh_prefill_tokens?: number;
+    prompt_cache_miss_reasons: Record<string, number>;
     generated_tokens?: number;
     tool_calls?: number;
     total_energy_kwh?: number;
@@ -81,6 +82,7 @@ export interface UsabilityAggregate {
   total_rendered_prompt_tokens: number;
   total_cached_prefix_tokens: number;
   total_fresh_prefill_tokens: number;
+  prompt_cache_miss_reasons: Record<string, number>;
   total_generated_tokens: number;
   total_tool_calls: number;
   total_energy_kwh: number;
@@ -260,6 +262,7 @@ export async function auditScratch(
       rendered_prompt_tokens: summary.rendered_prompt_tokens,
       cached_prefix_tokens: summary.cached_prefix_tokens,
       fresh_prefill_tokens: summary.fresh_prefill_tokens,
+      prompt_cache_miss_reasons: summary.prompt_cache_miss_reasons,
       generated_tokens: summary.generated_tokens,
       tool_calls: summary.tool_calls,
       total_energy_kwh: summary.total_energy_kwh,
@@ -288,6 +291,17 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
       audit.safety.verified_clean_completion,
     );
     byLanguage[audit.language] = language;
+  }
+  const promptCacheMissReasons: Record<string, number> = {};
+  for (const audit of audits) {
+    for (
+      const [reason, count] of Object.entries(
+        audit.efficiency.prompt_cache_miss_reasons,
+      )
+    ) {
+      promptCacheMissReasons[reason] = (promptCacheMissReasons[reason] ?? 0) +
+        count;
+    }
   }
   return {
     version: "usability-aggregate-v1",
@@ -320,6 +334,7 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
       (total, item) => total + (item.efficiency.fresh_prefill_tokens ?? 0),
       0,
     ),
+    prompt_cache_miss_reasons: promptCacheMissReasons,
     total_generated_tokens: audits.reduce(
       (total, item) => total + (item.efficiency.generated_tokens ?? 0),
       0,

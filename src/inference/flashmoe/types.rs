@@ -348,6 +348,7 @@ pub struct PromptCacheStats {
     pub cached_tokens: usize,
     pub prefilled_tokens: usize,
     pub restore_ms: u64,
+    pub miss_reason: Option<crate::inference::PromptCacheMissReason>,
 }
 
 #[derive(Debug, Clone)]

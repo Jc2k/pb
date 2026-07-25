@@ -134,6 +134,7 @@ function fakeAudit(
       rendered_prompt_tokens: 30,
       cached_prefix_tokens: 5,
       fresh_prefill_tokens: 25,
+      prompt_cache_miss_reasons: { cold_session: 1 },
       generated_tokens: 20,
       tool_calls: 2,
       total_energy_kwh: 0.001,
@@ -162,6 +163,10 @@ Deno.test("aggregate keeps correctness, verified completion, and efficiency sepa
   assert(aggregate.total_llm_invocations === 3, "invocations");
   assert(aggregate.total_rendered_prompt_tokens === 90, "prompt tokens");
   assert(aggregate.total_fresh_prefill_tokens === 75, "fresh prefill");
+  assert(
+    aggregate.prompt_cache_miss_reasons.cold_session === 3,
+    "cache misses",
+  );
   assert(aggregate.total_tool_calls === 6, "tools");
   assert(aggregate.energy_complete, "energy completeness");
 });

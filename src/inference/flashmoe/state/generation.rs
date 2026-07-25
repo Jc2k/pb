@@ -17,6 +17,8 @@ pub(in crate::inference::flashmoe) struct FlashMoeGenerationState {
         Option<FlashMoeLinearAttentionSessionSnapshot>,
     pub(in crate::inference::flashmoe) cache_source: PromptCacheSource,
     pub(in crate::inference::flashmoe) cache_restore_ms: u64,
+    pub(in crate::inference::flashmoe) cache_miss_reason:
+        Option<crate::inference::PromptCacheMissReason>,
     pub(in crate::inference::flashmoe) base_prefix_len: usize,
     pub(in crate::inference::flashmoe) base_cache: Option<FlashMoeSessionState<KvCache>>,
     pub(in crate::inference::flashmoe) base_recurrent:
@@ -55,6 +57,10 @@ impl FlashMoeGenerationState {
 
     pub(crate) fn cache_restore_ms(&self) -> u64 {
         self.cache_restore_ms
+    }
+
+    pub(crate) fn cache_miss_reason(&self) -> Option<crate::inference::PromptCacheMissReason> {
+        self.cache_miss_reason
     }
 
     pub(crate) fn base_prefix_len(&self) -> usize {

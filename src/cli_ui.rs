@@ -372,6 +372,7 @@ pub fn render_event(event: &AgentEvent) {
             duration_ms,
             prompt_tokens,
             generated_tokens,
+            prompt_cache,
             energy_joules,
             average_power_watts,
             ..
@@ -384,10 +385,23 @@ pub fn render_event(event: &AgentEvent) {
                     format!(", {}{power}", format_energy(joules))
                 })
                 .unwrap_or_default();
+            let cache = prompt_cache
+                .as_ref()
+                .map(|cache| {
+                    let miss = cache
+                        .miss_reason
+                        .map(|reason| format!(", miss={}", reason.as_str()))
+                        .unwrap_or_default();
+                    format!(
+                        ", cache={} reused/{} fresh via {}{miss}",
+                        cache.cached_tokens, cache.prefilled_tokens, cache.source
+                    )
+                })
+                .unwrap_or_default();
             print_header(
                 "llm",
                 &format!(
-                    "{} step {step}: {duration_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens{energy}",
+                    "{} step {step}: {duration_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens{cache}{energy}",
                     purpose.as_str()
                 ),
             );
