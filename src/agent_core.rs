@@ -4697,12 +4697,15 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
         ),
         builtin_tool(
             "edit_file",
-            "Replace an exact text occurrence in a project file. When this is the final accepted work unit, the exposed completion field can close implementation without another model turn.",
+            "Replace an exact text occurrence in a project file. old_text and new_text are literal: new_text must preserve all required whitespace, indentation, and syntax. When this is the final accepted work unit, the exposed completion field can close implementation without another model turn.",
             mutation_schema_with_inline_completion(object_schema(
                 [
                     string_property("path", "Project-relative file path to edit."),
                     string_property("old_text", "Exact text to replace."),
-                    string_property("new_text", "Replacement text."),
+                    string_property(
+                        "new_text",
+                        "Literal replacement text; preserve required whitespace, indentation, and syntax.",
+                    ),
                 ],
                 ["path", "old_text", "new_text"],
             )),
@@ -23016,6 +23019,22 @@ mod tests {
         assert_eq!(
             schema("edit_file").pointer("/properties/old_text/maxLength"),
             Some(&json!(limit / 2))
+        );
+        assert_eq!(
+            schema("edit_file")
+                .pointer("/properties/new_text/description")
+                .and_then(Value::as_str),
+            Some(
+                "Literal replacement text; preserve required whitespace, indentation, and syntax."
+            )
+        );
+        assert!(
+            tools
+                .iter()
+                .find(|tool| tool.name == "edit_file")
+                .unwrap()
+                .description
+                .contains("old_text and new_text are literal")
         );
         assert!(
             schema("edit_file")
