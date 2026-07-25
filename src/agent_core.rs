@@ -12281,6 +12281,24 @@ fn failed_check_diagnostic_paths(
     focused
 }
 
+fn failed_check_repair_paths(
+    changed_paths: &[String],
+    failures: &[crate::checks::CheckFailureSummary],
+    contract_allowed_paths: Option<&[String]>,
+) -> Vec<String> {
+    let focused = failed_check_diagnostic_paths(changed_paths, failures);
+    if !focused.is_empty() {
+        return focused;
+    }
+    contract_allowed_paths
+        .filter(|paths| paths.len() == 1)
+        .and_then(|paths| paths.first())
+        .filter(|path| changed_paths.contains(path))
+        .cloned()
+        .into_iter()
+        .collect()
+}
+
 fn run_delivery_checks(
     run: &mut crate::workflow::WorkflowRun,
     graph: &crate::workspace::WorkspaceGraph,
@@ -12432,7 +12450,11 @@ fn run_delivery_checks(
         .task_baseline
         .content
         .changed_paths(&content_after);
-    let diagnostic_paths = failed_check_diagnostic_paths(&changed_paths, &summary.failures);
+    let diagnostic_paths = failed_check_repair_paths(
+        &changed_paths,
+        &summary.failures,
+        contract.map(|contract| contract.allowed_paths.as_slice()),
+    );
     let diagnostic_focus = if diagnostic_paths.is_empty() {
         String::new()
     } else {
@@ -23825,6 +23847,28 @@ the next imagined action"#;
         assert_eq!(
             failed_check_diagnostic_paths(&changed_paths, &failures),
             vec!["slugify.test.mjs"]
+        );
+        assert_eq!(
+            failed_check_repair_paths(
+                &["src/Component.tsx".to_string()],
+                &[crate::checks::CheckFailureSummary {
+                    check_id: "behavior".to_string(),
+                    exit_status: 1,
+                    timed_out: false,
+                    output: "rendered markup did not satisfy the assertion".to_string(),
+                    skip_reason: None,
+                }],
+                Some(&["src/Component.tsx".to_string()]),
+            ),
+            vec!["src/Component.tsx"]
+        );
+        assert!(
+            failed_check_repair_paths(
+                &["alpha.ts".to_string(), "beta.ts".to_string()],
+                &[],
+                Some(&["alpha.ts".to_string(), "beta.ts".to_string()]),
+            )
+            .is_empty()
         );
         assert!(!diagnostic_output_mentions_path(
             "slugify.test.mjs.backup:1",

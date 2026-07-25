@@ -208,15 +208,18 @@ after a check makes older evidence stale.
 For a failed check, pb compares its bounded diagnostic text only with the exact current task paths.
 Paths named as complete diagnostic tokens are listed as repair focus, so a local model can inspect
 the implicated files first. The hint is not evidence, does not narrow or expand mutation authority,
-and does not claim that unnamed paths are irrelevant.
+and does not claim that unnamed paths are irrelevant. If a trusted contract authorizes exactly one
+changed path, pb deterministically reopens that path even when an assertion reports only rendered
+output or another symptom rather than repeating the filename. Multi-path failures still require an
+explicit path match before the controller chooses a repair target.
 
-When the trusted contract authorizes exactly one path and that same work unit has focused failed-check
-evidence, the repair stage no longer exposes `request_replan`: another plan cannot grant a different
-path, and the accepted work unit already binds the required repository transition, so replanning
-would only repeat planning and review without changing authority. The model receives the current
-read or repair action instead. Replan remains available when the
-contract allows multiple paths, when no contract fixes the path set, when no active unit covers the
-failure, or when repository state has put the active unit in `blocked_for_replan`.
+When the trusted contract authorizes exactly one path and that same changed work unit has
+failed-check evidence, the repair stage no longer exposes `request_replan`: another plan cannot grant
+a different path, and the accepted work unit already binds the required repository transition, so
+replanning would only repeat planning and review without changing authority. The model receives the
+current read or repair action instead. Replan remains available when the contract allows multiple
+paths, when no contract fixes the path set, when an uncovered failure has no unique contract target,
+or when repository state has put the active unit in `blocked_for_replan`.
 
 ### 5. Code review
 

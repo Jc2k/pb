@@ -368,6 +368,9 @@ the path: pb inserts the ledger path into the durable call before validation and
 modify/delete targets require a current complete read; adopted task-owned deltas can already be
 structurally complete without false model authorship. Exact-path diagnostic failures invalidate
 older reads and reopen only that path as a repair; they do not repeat the original create operation.
+Under a trusted one-path contract, a failed check also reopens that sole changed path when its
+assertion text describes only the observed symptom and omits the filename. Multi-path work does not
+receive that inference.
 
 For the last unfinished controller-rendered work unit, mutation schemas require the typed
 implementation completion beside the mutation payload. The executor applies the mutation before
@@ -377,8 +380,8 @@ reports `mutation_succeeded=true` and keeps the bounded implementation-submissio
 A diagnostic-failed work unit under a trusted one-path `allowed_paths` contract exposes only its
 focused read and then target-bound repair tools. `request_replan` is omitted because another plan
 cannot select a different authorized path and would discard current review/check state without
-changing authority. Multi-path or contract-free work, uncovered failures, and
-`blocked_for_replan` filesystem transitions retain the existing replan route.
+changing authority. Multi-path or contract-free work, uncovered failures without a unique contract
+target, and `blocked_for_replan` filesystem transitions retain the existing replan route.
 
 Creation units execute one controller-bound path per model action, so an unknown multi-file payload
 cannot consume the turn before the first accepted-plan path is complete. One real content/evidence

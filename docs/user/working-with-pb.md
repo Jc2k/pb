@@ -59,9 +59,10 @@ compact: pb supplies controller-owned plan identity and does not require empty e
 concerns and failures still need specific reasons and fresh evidence.
 
 If a required check fails against the only contract-allowed path, pb keeps the accepted plan and
-offers a focused read or repair rather than another identical planning cycle. Replanning remains
-available for real scope choices and repository-state blockers; the single-path rule cannot widen or
-change the trusted contract.
+offers a focused read or repair rather than another identical planning cycle, including when an
+assertion reports rendered output without repeating the filename. Replanning remains available for
+real scope choices and repository-state blockers; the single-path rule cannot widen or change the
+trusted contract.
 
 You may see pb pause for a planning question when a missing choice would materially change the
 work. Answering that question updates the user-owned contract; it does not hand the model a general
