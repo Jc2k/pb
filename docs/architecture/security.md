@@ -273,6 +273,14 @@ records under the per-session operation lock, includes the associated session wo
 retry, and removes a record only after verified container, network, cache, and workspace cleanup
 succeeds. A dirty workspace is preserved and keeps the recovery record rather than being erased.
 
+Local inference session caches use separate exact `llamacpp-session-v1` and
+`flashmoe-session-v1` namespaces under the typed storage root. FlashMoe checkpoint and manifest
+reads reject symlinks, non-directories, oversized records, malformed data, version or model
+fingerprint changes, and incompatible state before graph mutation. Prompt-root memory retention is
+byte-bounded LRU; dirty eviction attempts atomic owner-only disk publication and reports durable
+failure rather than claiming reuse. `pb cache clean` is a dry run unless `--yes` is explicit and
+can remove only a selected resolved versioned namespace; it never targets the storage root itself.
+
 ## Important limits
 
 | Surface | Boundary |

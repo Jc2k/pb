@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::agent_core::{AgentProfile, SessionAttachment};
 use crate::inference::PromptCacheMissReason;
+pub use crate::inference::StageRootAuthorityClass as PromptRootAuthorityClass;
 use crate::session_store::now_millis;
 
 pub const EVENT_SCHEMA_VERSION: &str = "v1";
@@ -196,6 +197,14 @@ pub struct SessionMetricsSnapshot {
     pub generated_tokens: usize,
     pub tool_calls: usize,
     pub tool_runtime_ms: u64,
+    #[serde(default)]
+    pub cache_persistence_queued_checkpoints: usize,
+    #[serde(default)]
+    pub cache_persistence_completed_checkpoints: usize,
+    #[serde(default)]
+    pub cache_persistence_wall_ms: u64,
+    #[serde(default)]
+    pub cache_persistence_failures: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_energy_joules: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,6 +254,10 @@ impl SessionMetricsSnapshot {
             generated_tokens,
             tool_calls,
             tool_runtime_ms,
+            cache_persistence_queued_checkpoints,
+            cache_persistence_completed_checkpoints,
+            cache_persistence_wall_ms,
+            cache_persistence_failures,
             llm_energy_joules,
             llm_energy_kwh,
             tool_energy_joules,
@@ -274,6 +287,10 @@ impl SessionMetricsSnapshot {
                 generated_tokens: *generated_tokens,
                 tool_calls: *tool_calls,
                 tool_runtime_ms: *tool_runtime_ms,
+                cache_persistence_queued_checkpoints: *cache_persistence_queued_checkpoints,
+                cache_persistence_completed_checkpoints: *cache_persistence_completed_checkpoints,
+                cache_persistence_wall_ms: *cache_persistence_wall_ms,
+                cache_persistence_failures: *cache_persistence_failures,
                 llm_energy_joules: *llm_energy_joules,
                 llm_energy_kwh: *llm_energy_kwh,
                 tool_energy_joules: *tool_energy_joules,
@@ -306,6 +323,18 @@ impl SessionMetricsSnapshot {
         self.generated_tokens = self.generated_tokens.saturating_add(other.generated_tokens);
         self.tool_calls = self.tool_calls.saturating_add(other.tool_calls);
         self.tool_runtime_ms = self.tool_runtime_ms.saturating_add(other.tool_runtime_ms);
+        self.cache_persistence_queued_checkpoints = self
+            .cache_persistence_queued_checkpoints
+            .saturating_add(other.cache_persistence_queued_checkpoints);
+        self.cache_persistence_completed_checkpoints = self
+            .cache_persistence_completed_checkpoints
+            .saturating_add(other.cache_persistence_completed_checkpoints);
+        self.cache_persistence_wall_ms = self
+            .cache_persistence_wall_ms
+            .saturating_add(other.cache_persistence_wall_ms);
+        self.cache_persistence_failures = self
+            .cache_persistence_failures
+            .saturating_add(other.cache_persistence_failures);
         self.wall_runtime_ms = self.wall_runtime_ms.saturating_add(other.wall_runtime_ms);
         self.started_at_ms = match (self.started_at_ms, other.started_at_ms) {
             (Some(left), Some(right)) => Some(left.min(right)),
@@ -414,35 +443,23 @@ pub struct PromptCacheUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub miss_reason: Option<PromptCacheMissReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_detail: Option<crate::inference::PromptCacheLookupDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<PromptRootUsage>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptRootAuthorityClass {
-    #[default]
-    Unclassified,
-    Conversation,
-    TaskArtifact,
-    Planning,
-    PlanReview,
-    ImplementationRead,
-    ImplementationMutation,
-    ImplementationClosure,
-    RepairRead,
-    RepairMutation,
-    RepairClosure,
-    CodeReview,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptRootUsage {
     pub descriptor_version: u32,
     pub backend: String,
+    #[serde(default)]
+    pub cache_format_version: String,
     pub model_namespace_sha256: String,
     pub rendered_token_sha256: String,
     pub tokens: usize,
     pub reused_tokens: usize,
+    pub system_instruction_version: Option<String>,
+    pub workflow_stage: Option<crate::workflow::WorkflowStage>,
     pub authority_class: PromptRootAuthorityClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_schema_sha256: Option<String>,
@@ -470,6 +487,8 @@ pub struct NativeGenerationUsage {
     pub active_experts_per_token: Option<usize>,
     pub expert_strategy: String,
     pub prefill_command_kind: String,
+    #[serde(default)]
+    pub prefill_command_reason: String,
     pub thinking_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refill: Option<NativeRefillUsage>,
@@ -486,9 +505,15 @@ pub struct NativeGenerationUsage {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeRefillUsage {
     pub cache_lookup_wall_ms: u64,
+    #[serde(default)]
+    pub disk_read_decode_wall_ms: u64,
+    #[serde(default)]
+    pub cpu_state_validation_allocation_wall_ms: u64,
     pub state_hydration_wall_ms: u64,
     pub fresh_suffix_prefill_wall_ms: u64,
     pub snapshot_capture_wall_ms: u64,
+    #[serde(default)]
+    pub persistence_queue_wall_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1089,6 +1114,14 @@ pub enum AgentEvent {
         generated_tokens: usize,
         tool_calls: usize,
         tool_runtime_ms: u64,
+        #[serde(default)]
+        cache_persistence_queued_checkpoints: usize,
+        #[serde(default)]
+        cache_persistence_completed_checkpoints: usize,
+        #[serde(default)]
+        cache_persistence_wall_ms: u64,
+        #[serde(default)]
+        cache_persistence_failures: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         llm_energy_joules: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -2040,6 +2073,10 @@ impl EventEnvelope {
                 generated_tokens,
                 tool_calls,
                 tool_runtime_ms,
+                cache_persistence_queued_checkpoints,
+                cache_persistence_completed_checkpoints,
+                cache_persistence_wall_ms,
+                cache_persistence_failures,
                 llm_energy_joules,
                 llm_energy_kwh,
                 tool_energy_joules,
@@ -2070,6 +2107,10 @@ impl EventEnvelope {
                     generated_tokens,
                     tool_calls,
                     tool_runtime_ms,
+                    cache_persistence_queued_checkpoints,
+                    cache_persistence_completed_checkpoints,
+                    cache_persistence_wall_ms,
+                    cache_persistence_failures,
                     llm_energy_joules,
                     llm_energy_kwh,
                     tool_energy_joules,
@@ -2503,13 +2544,19 @@ mod tests {
                 prefilled_tokens: 864,
                 restore_ms: 0,
                 miss_reason: Some(PromptCacheMissReason::PromptDiverged),
+                lookup_detail: Some(
+                    crate::inference::PromptCacheLookupDetail::SessionDivergedRootHit,
+                ),
                 root: Some(PromptRootUsage {
                     descriptor_version: 1,
                     backend: "flashmoe".to_string(),
+                    cache_format_version: "flashmoe-session-v1".to_string(),
                     model_namespace_sha256: "model".to_string(),
                     rendered_token_sha256: "root".to_string(),
                     tokens: 2048,
                     reused_tokens: 2048,
+                    system_instruction_version: Some("agent-system-v1".to_string()),
+                    workflow_stage: Some(crate::workflow::WorkflowStage::CodeReview),
                     authority_class: PromptRootAuthorityClass::CodeReview,
                     tool_schema_sha256: Some("abc".to_string()),
                     output_constraint_mode: Some("tool_required".to_string()),
@@ -2531,12 +2578,16 @@ mod tests {
                 active_experts_per_token: Some(10),
                 expert_strategy: "resident_complete_corpus".to_string(),
                 prefill_command_kind: "qwen_chunked_token_batch".to_string(),
+                prefill_command_reason: "fresh_suffix_at_or_above_threshold".to_string(),
                 thinking_enabled: false,
                 refill: Some(NativeRefillUsage {
                     cache_lookup_wall_ms: 2,
+                    disk_read_decode_wall_ms: 4,
+                    cpu_state_validation_allocation_wall_ms: 5,
                     state_hydration_wall_ms: 3,
                     fresh_suffix_prefill_wall_ms: 100,
                     snapshot_capture_wall_ms: 15,
+                    persistence_queue_wall_ms: 6,
                 }),
                 tool_constraint_mode: Some("tool_required".to_string()),
                 tool_schema_sha256: Some("abc".to_string()),

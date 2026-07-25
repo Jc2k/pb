@@ -30,18 +30,34 @@ export interface CompletionRunSummary {
   fresh_prefill_tokens?: number;
   prompt_cache_hit_invocations?: number;
   prompt_cache_miss_reasons: Record<string, number>;
+  prompt_cache_lookup_details: Record<string, number>;
+  prompt_cache_miss_reasons_by_stage: Record<string, Record<string, number>>;
+  prompt_cache_miss_reasons_by_authority_class: Record<
+    string,
+    Record<string, number>
+  >;
+  prompt_cache_reconciliation_failures: number;
   eligible_root_tokens?: number;
   reused_root_tokens?: number;
   prompt_root_hit_invocations?: number;
   prompt_root_sha256s: string[];
   prompt_root_authority_classes: Record<string, number>;
   refill_cache_lookup_wall_ms?: number;
+  refill_disk_read_decode_wall_ms?: number;
+  refill_cpu_state_validation_allocation_wall_ms?: number;
   refill_state_hydration_wall_ms?: number;
   refill_fresh_suffix_prefill_wall_ms?: number;
   refill_snapshot_capture_wall_ms?: number;
+  refill_persistence_queue_wall_ms?: number;
+  prefill_command_kinds: Record<string, number>;
+  prefill_command_reasons: Record<string, number>;
   tool_schema_sha256s: string[];
   generated_tokens?: number;
   tool_calls?: number;
+  cache_persistence_queued_checkpoints?: number;
+  cache_persistence_completed_checkpoints?: number;
+  cache_persistence_wall_ms?: number;
+  cache_persistence_failures?: number;
   total_energy_kwh?: number;
   energy_complete?: boolean;
 }
@@ -106,6 +122,16 @@ function numberRecord(value: unknown): Record<string, number> {
       typeof entry[1] === "number" && Number.isFinite(entry[1])
     ),
   );
+}
+
+function incrementNestedCount(
+  counts: Record<string, Record<string, number>>,
+  group: string,
+  value: string,
+): void {
+  const grouped = counts[group] ?? {};
+  grouped[value] = (grouped[value] ?? 0) + 1;
+  counts[group] = grouped;
 }
 
 export function parseJsonLines(text: string, label: string): unknown[] {
@@ -230,6 +256,60 @@ export async function summarizeScratch(
       },
       {},
     );
+    const promptCacheLookupDetails = invocations.reduce<Record<string, number>>(
+      (counts, event) => {
+        const cache = event.prompt_cache;
+        if (cache === null || typeof cache !== "object") return counts;
+        const detail = optionalString(
+          (cache as Record<string, unknown>).lookup_detail,
+        );
+        if (detail) counts[detail] = (counts[detail] ?? 0) + 1;
+        return counts;
+      },
+      {},
+    );
+    const promptCacheMissReasonsByStage: Record<
+      string,
+      Record<string, number>
+    > = {};
+    const promptCacheMissReasonsByAuthorityClass: Record<
+      string,
+      Record<string, number>
+    > = {};
+    let promptCacheReconciliationFailures = 0;
+    for (const event of invocations) {
+      const cache = event.prompt_cache;
+      if (cache === null || typeof cache !== "object") continue;
+      const cacheRecord = cache as Record<string, unknown>;
+      const root = cacheRecord.root;
+      const rootRecord = root !== null && typeof root === "object"
+        ? root as Record<string, unknown>
+        : undefined;
+      const reason = optionalString(cacheRecord.miss_reason);
+      if (reason) {
+        incrementNestedCount(
+          promptCacheMissReasonsByStage,
+          optionalString(event.workflow_stage) ?? "unclassified",
+          reason,
+        );
+        incrementNestedCount(
+          promptCacheMissReasonsByAuthorityClass,
+          optionalString(rootRecord?.authority_class) ?? "unclassified",
+          reason,
+        );
+      }
+
+      const promptTokens = numberOrZero(event.prompt_tokens);
+      const cachedTokens = numberOrZero(cacheRecord.cached_tokens);
+      const prefilledTokens = numberOrZero(cacheRecord.prefilled_tokens);
+      const rootTokens = numberOrZero(rootRecord?.tokens);
+      const reusedRootTokens = numberOrZero(rootRecord?.reused_tokens);
+      const reconciled = cachedTokens <= promptTokens &&
+        cachedTokens + prefilledTokens === promptTokens &&
+        rootTokens <= promptTokens && reusedRootTokens <= rootTokens &&
+        reusedRootTokens <= cachedTokens;
+      if (!reconciled) promptCacheReconciliationFailures += 1;
+    }
     const roots = invocations.flatMap((event) => {
       const cache = event.prompt_cache;
       if (cache === null || typeof cache !== "object") return [];
@@ -282,6 +362,16 @@ export async function summarizeScratch(
         ? [refill as Record<string, unknown>]
         : [];
     });
+    const nativeStringCounts = (field: string): Record<string, number> =>
+      invocations.reduce<Record<string, number>>((counts, event) => {
+        const native = event.native;
+        if (native === null || typeof native !== "object") return counts;
+        const value = optionalString(
+          (native as Record<string, unknown>)[field],
+        );
+        if (value) counts[value] = (counts[value] ?? 0) + 1;
+        return counts;
+      }, {});
     const refillTotal = (field: string): number | undefined =>
       refills.length > 0
         ? refills.reduce(
@@ -336,6 +426,11 @@ export async function summarizeScratch(
         ? promptCacheHitInvocations
         : undefined,
       prompt_cache_miss_reasons: promptCacheMissReasons,
+      prompt_cache_lookup_details: promptCacheLookupDetails,
+      prompt_cache_miss_reasons_by_stage: promptCacheMissReasonsByStage,
+      prompt_cache_miss_reasons_by_authority_class:
+        promptCacheMissReasonsByAuthorityClass,
+      prompt_cache_reconciliation_failures: promptCacheReconciliationFailures,
       eligible_root_tokens: roots.length > 0 ? eligibleRootTokens : undefined,
       reused_root_tokens: roots.length > 0 ? reusedRootTokens : undefined,
       prompt_root_hit_invocations: roots.length > 0
@@ -344,14 +439,35 @@ export async function summarizeScratch(
       prompt_root_sha256s: promptRootSha256s,
       prompt_root_authority_classes: promptRootAuthorityClasses,
       refill_cache_lookup_wall_ms: refillTotal("cache_lookup_wall_ms"),
+      refill_disk_read_decode_wall_ms: refillTotal("disk_read_decode_wall_ms"),
+      refill_cpu_state_validation_allocation_wall_ms: refillTotal(
+        "cpu_state_validation_allocation_wall_ms",
+      ),
       refill_state_hydration_wall_ms: refillTotal("state_hydration_wall_ms"),
       refill_fresh_suffix_prefill_wall_ms: refillTotal(
         "fresh_suffix_prefill_wall_ms",
       ),
       refill_snapshot_capture_wall_ms: refillTotal("snapshot_capture_wall_ms"),
+      refill_persistence_queue_wall_ms: refillTotal(
+        "persistence_queue_wall_ms",
+      ),
+      prefill_command_kinds: nativeStringCounts("prefill_command_kind"),
+      prefill_command_reasons: nativeStringCounts("prefill_command_reason"),
       tool_schema_sha256s: toolSchemaSha256s,
       generated_tokens: optionalNumber(metrics?.generated_tokens),
       tool_calls: optionalNumber(metrics?.tool_calls),
+      cache_persistence_queued_checkpoints: optionalNumber(
+        metrics?.cache_persistence_queued_checkpoints,
+      ),
+      cache_persistence_completed_checkpoints: optionalNumber(
+        metrics?.cache_persistence_completed_checkpoints,
+      ),
+      cache_persistence_wall_ms: optionalNumber(
+        metrics?.cache_persistence_wall_ms,
+      ),
+      cache_persistence_failures: optionalNumber(
+        metrics?.cache_persistence_failures,
+      ),
       total_energy_kwh: optionalNumber(metrics?.total_energy_kwh),
       energy_complete: typeof metrics?.energy_complete === "boolean"
         ? metrics.energy_complete

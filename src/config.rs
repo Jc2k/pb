@@ -40,6 +40,7 @@ struct LegacyAgentConfig {
 
 pub const DEFAULT_SESSION_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const DEFAULT_FLASHMOE_MEMORY_SESSIONS: usize = 2;
+pub const DEFAULT_FLASHMOE_MEMORY_PROMPT_ROOT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const DEFAULT_FLASHMOE_RESIDENT_MODELS: usize = 2;
 pub const DEFAULT_FLASHMOE_IDLE_SECONDS: u64 = 15 * 60;
 
@@ -65,6 +66,7 @@ pub struct InferenceConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct FlashMoeConfig {
     pub memory_sessions: Option<usize>,
+    pub memory_prompt_root_max_bytes: Option<u64>,
     pub resident_models: Option<usize>,
     pub idle_seconds: Option<u64>,
 }
@@ -80,6 +82,7 @@ pub struct ResolvedSessionCacheConfig {
 pub struct ResolvedFlashMoeConfig {
     pub session_cache: ResolvedSessionCacheConfig,
     pub memory_sessions: usize,
+    pub memory_prompt_root_max_bytes: u64,
     pub resident_models: usize,
     pub idle_seconds: u64,
 }
@@ -226,6 +229,10 @@ impl UserConfig {
             "flashmoe.memory_sessions" => {
                 self.flashmoe.memory_sessions.map(|value| value.to_string())
             }
+            "flashmoe.memory_prompt_root_max_bytes" => self
+                .flashmoe
+                .memory_prompt_root_max_bytes
+                .map(|value| value.to_string()),
             "flashmoe.resident_models" => {
                 self.flashmoe.resident_models.map(|value| value.to_string())
             }
@@ -278,6 +285,9 @@ impl UserConfig {
             }
             "flashmoe.memory_sessions" => {
                 self.flashmoe.memory_sessions = Some(parse_positive(key, value)?)
+            }
+            "flashmoe.memory_prompt_root_max_bytes" => {
+                self.flashmoe.memory_prompt_root_max_bytes = Some(parse_positive(key, value)?)
             }
             "flashmoe.resident_models" => {
                 self.flashmoe.resident_models = Some(parse_positive(key, value)?)
@@ -424,6 +434,10 @@ impl UserConfig {
                 .flashmoe
                 .memory_sessions
                 .unwrap_or(DEFAULT_FLASHMOE_MEMORY_SESSIONS),
+            memory_prompt_root_max_bytes: self
+                .flashmoe
+                .memory_prompt_root_max_bytes
+                .unwrap_or(DEFAULT_FLASHMOE_MEMORY_PROMPT_ROOT_MAX_BYTES),
             resident_models: self
                 .flashmoe
                 .resident_models
@@ -447,6 +461,10 @@ impl UserConfig {
             self.inference.flashmoe_session_cache_max_bytes,
         )?;
         validate_optional_positive("flashmoe.memory_sessions", self.flashmoe.memory_sessions)?;
+        validate_optional_positive(
+            "flashmoe.memory_prompt_root_max_bytes",
+            self.flashmoe.memory_prompt_root_max_bytes,
+        )?;
         validate_optional_positive("flashmoe.resident_models", self.flashmoe.resident_models)?;
         validate_optional_positive("flashmoe.idle_seconds", self.flashmoe.idle_seconds)?;
         Ok(())
@@ -517,7 +535,7 @@ where
 
 fn bail_unknown_key<T>(key: &str) -> Result<T> {
     bail!(
-        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, memory.personal_repo, storage.state_dir, storage.cache_dir, inference.llamacpp_session_cache_enabled, inference.llamacpp_session_cache_max_bytes, inference.flashmoe_session_cache_enabled, inference.flashmoe_session_cache_max_bytes, flashmoe.memory_sessions, flashmoe.resident_models, flashmoe.idle_seconds. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, source_container_image, verified_manifest_digest, container_runtime, args, env, working_directory, capabilities, and disabled fields. MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, secret_env, and operator-audited read_only_tools. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
+        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, memory.personal_repo, storage.state_dir, storage.cache_dir, inference.llamacpp_session_cache_enabled, inference.llamacpp_session_cache_max_bytes, inference.flashmoe_session_cache_enabled, inference.flashmoe_session_cache_max_bytes, flashmoe.memory_sessions, flashmoe.memory_prompt_root_max_bytes, flashmoe.resident_models, flashmoe.idle_seconds. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, source_container_image, verified_manifest_digest, container_runtime, args, env, working_directory, capabilities, and disabled fields. MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, secret_env, and operator-audited read_only_tools. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, container_runtime, args, env, working_directory, language_ids, workspace_access, network_access, cache_ids, and disabled fields"
     )
 }
 
@@ -662,6 +680,9 @@ controller_delete_elision = true
             .set("inference.flashmoe_session_cache_max_bytes", "2048")
             .unwrap();
         config.set("flashmoe.memory_sessions", "3").unwrap();
+        config
+            .set("flashmoe.memory_prompt_root_max_bytes", "4096")
+            .unwrap();
         config.set("flashmoe.resident_models", "4").unwrap();
         config.set("flashmoe.idle_seconds", "60").unwrap();
         config.save_to_path(&path).unwrap();
@@ -677,6 +698,7 @@ controller_delete_elision = true
         assert_eq!(flashmoe.session_cache.root, Some(cache_dir));
         assert_eq!(flashmoe.session_cache.max_bytes, 2048);
         assert_eq!(flashmoe.memory_sessions, 3);
+        assert_eq!(flashmoe.memory_prompt_root_max_bytes, 4096);
         assert_eq!(flashmoe.resident_models, 4);
         assert_eq!(flashmoe.idle_seconds, 60);
     }
@@ -691,6 +713,11 @@ controller_delete_elision = true
                 .is_err()
         );
         assert!(config.set("flashmoe.memory_sessions", "0").is_err());
+        assert!(
+            config
+                .set("flashmoe.memory_prompt_root_max_bytes", "0")
+                .is_err()
+        );
         assert!(config.set("flashmoe.idle_seconds", "0").is_err());
     }
 

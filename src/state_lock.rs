@@ -26,14 +26,19 @@ impl StateFileLock {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
+            use std::os::unix::fs::OpenOptionsExt;
 
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&path)
                 .with_context(|| format!("failed to open state lock {}", path.display()))?;
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to secure state lock {}", path.display()))?;
             let started = Instant::now();
             loop {
                 let result =

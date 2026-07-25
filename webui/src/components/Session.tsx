@@ -1006,6 +1006,11 @@ export function MessageBubble({
                     e.prompt_cache.miss_reason.replaceAll("_", " ")
                   }`
                   : "") +
+                (e.prompt_cache.lookup_detail
+                  ? ` · detail: ${
+                    e.prompt_cache.lookup_detail.replaceAll("_", " ")
+                  }`
+                  : "") +
                 (e.prompt_cache.root
                   ? ` · root ${
                     formatNumber(e.prompt_cache.root.reused_tokens)
@@ -1014,8 +1019,16 @@ export function MessageBubble({
                   })`
                   : "")
               : ""}
+            {e.native
+              ? ` · prefill ${
+                e.native.prefill_command_kind.replaceAll("_", " ")
+              }` +
+                (e.native.prefill_command_reason
+                  ? ` (${e.native.prefill_command_reason.replaceAll("_", " ")})`
+                  : "")
+              : ""}
             {e.native?.refill
-              ? ` · refill lookup ${e.native.refill.cache_lookup_wall_ms}, hydrate ${e.native.refill.state_hydration_wall_ms}, suffix ${e.native.refill.fresh_suffix_prefill_wall_ms}, snapshot ${e.native.refill.snapshot_capture_wall_ms} ms`
+              ? ` · refill lookup ${e.native.refill.cache_lookup_wall_ms}, disk ${e.native.refill.disk_read_decode_wall_ms}, validate/allocate ${e.native.refill.cpu_state_validation_allocation_wall_ms}, hydrate ${e.native.refill.state_hydration_wall_ms}, suffix ${e.native.refill.fresh_suffix_prefill_wall_ms}, snapshot ${e.native.refill.snapshot_capture_wall_ms}, queue ${e.native.refill.persistence_queue_wall_ms} ms`
               : ""}
             {e.energy_joules !== undefined
               ? ` · ${formatEnergy(e.energy_joules)}`
@@ -1120,6 +1133,18 @@ export function MessageBubble({
               : null}
             {totalEnergyJoules === undefined && e.energy_exclusive === false
               ? " Power estimate unavailable: the system meter is unsupported or already in use."
+              : null}
+            {(e.cache_persistence_queued_checkpoints ?? 0) > 0 ||
+                (e.cache_persistence_failures ?? 0) > 0
+              ? ` Cache persistence: ${
+                formatNumber(e.cache_persistence_completed_checkpoints ?? 0)
+              }/${
+                formatNumber(e.cache_persistence_queued_checkpoints ?? 0)
+              } checkpoints in ${
+                formatNumber(e.cache_persistence_wall_ms ?? 0)
+              } ms; ${
+                formatNumber(e.cache_persistence_failures ?? 0)
+              } failures.`
               : null}
           </span>
           {e.timestamp_ms

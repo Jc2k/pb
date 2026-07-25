@@ -84,3 +84,9 @@ snapshots. Use `inference.flashmoe_session_cache_enabled` or remove `flashmoe-se
 equivalent FlashMoe control. The corresponding `*_session_cache_max_bytes` settings bound each
 cache independently. These are user-config values managed by `pb config get/set`, so the daemon and
 CLI resolve the same policy regardless of their parent process environment.
+
+`pb cache status` reports only the resolved versioned namespace path, backend/format label, enabled
+state, budget, aggregate file/byte count, and oldest-file age. It does not decode checkpoints or
+print recovered tokens, tensors, prompts, prompt-derived paths, or tool arguments. `pb cache clean`
+lists exact selected namespaces without deleting by default; `--yes` removes only the selected
+`llamacpp-session-v1` and/or `flashmoe-session-v1` tree beneath the configured cache root.

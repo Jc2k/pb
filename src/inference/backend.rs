@@ -98,6 +98,7 @@ impl InferenceBackend for crate::inference::llamacpp::LlamaCppBackend {
         let llama_request = crate::inference::llamacpp::LlamaCppChatRequest {
             messages: serde_json::to_value(&request.messages)?,
             tools: serde_json::to_value(&request.tools)?,
+            stage_root: None,
             json_schema: None,
             ctx_size: llama_ctx_size(&request.options)?,
             threads: request.options.threads,
@@ -189,6 +190,7 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
         let structured = crate::inference::flashmoe::StructuredGenerationRequest {
             messages: request.messages.clone(),
             tools: request.tools.clone(),
+            stage_root: None,
             json_schema: None,
             add_generation_prompt: request.add_generation_prompt,
             enable_thinking: true,

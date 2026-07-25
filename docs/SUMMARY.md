@@ -61,6 +61,7 @@
   - [Open-weight workflow evaluation](harness-workflow-model-evaluation.md)
   - [Stable prompt roots and FlashMoe refill](stable-prompt-cache-and-refill-plan.md)
   - [Private-workload usability corpus](benchmarks/private-workload-usability.md)
+  - [Prompt-root Phase 0 baseline](benchmarks/prompt-root-phase0.md)
 - [External publication follow-on](external-publication-workflow-follow-on.md)
 - [FlashMoe architecture parity](flashmoe-architecture-parity-plan.md)
   - [Resource baseline](benchmarks/harness-r0-baseline.md)

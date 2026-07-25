@@ -506,26 +506,41 @@ export type AgentEvent =
         | "cache_unreadable"
         | "context_reset"
         | "runtime_unsupported";
+      lookup_detail?:
+        | "session_checkpoint_missing"
+        | "session_checkpoint_diverged"
+        | "exact_root_checkpoint_missing"
+        | "session_diverged_root_missing"
+        | "session_diverged_root_hit";
       root?: {
         descriptor_version: number;
         backend: string;
+        cache_format_version?: string;
         model_namespace_sha256: string;
         rendered_token_sha256: string;
         tokens: number;
         reused_tokens: number;
+        system_instruction_version?: string;
+        workflow_stage?: WorkflowStage;
         authority_class:
           | "unclassified"
           | "conversation"
           | "task_artifact"
           | "planning"
+          | "planning_evidence"
+          | "planning_closure"
           | "plan_review"
+          | "plan_review_evidence"
+          | "plan_review_closure"
           | "implementation_read"
           | "implementation_mutation"
           | "implementation_closure"
           | "repair_read"
           | "repair_mutation"
           | "repair_closure"
-          | "code_review";
+          | "code_review"
+          | "code_review_evidence"
+          | "code_review_closure";
         tool_schema_sha256?: string;
         output_constraint_mode?: string;
       };
@@ -571,12 +586,16 @@ export type AgentEvent =
       active_experts_per_token?: number;
       expert_strategy: string;
       prefill_command_kind: string;
+      prefill_command_reason?: string;
       thinking_enabled: boolean;
       refill?: {
         cache_lookup_wall_ms: number;
+        disk_read_decode_wall_ms: number;
+        cpu_state_validation_allocation_wall_ms: number;
         state_hydration_wall_ms: number;
         fresh_suffix_prefill_wall_ms: number;
         snapshot_capture_wall_ms: number;
+        persistence_queue_wall_ms: number;
       };
       tool_constraint_mode?: string;
       tool_schema_sha256?: string;
@@ -597,6 +616,10 @@ export type AgentEvent =
     generated_tokens: number;
     tool_calls: number;
     tool_runtime_ms: number;
+    cache_persistence_queued_checkpoints?: number;
+    cache_persistence_completed_checkpoints?: number;
+    cache_persistence_wall_ms?: number;
+    cache_persistence_failures?: number;
     llm_energy_joules?: number;
     llm_energy_kwh?: number;
     tool_energy_joules?: number;

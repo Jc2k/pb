@@ -27,6 +27,7 @@ mod runtime;
 mod safetensors;
 mod scheduler;
 mod session_cache;
+pub(crate) use session_cache::CACHE_VERSION as FLASHMOE_SESSION_CACHE_VERSION;
 mod state;
 #[cfg(test)]
 mod test_fixtures;

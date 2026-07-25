@@ -246,7 +246,11 @@ fn memory_session_cache_evicts_the_least_recently_used_conversation() {
 
 #[test]
 fn configured_memory_session_limit_is_enforced_on_commit() {
-    let mut sessions = FlashMoeSessionCache::new(None, 1);
+    let mut sessions = FlashMoeSessionCache::new(
+        None,
+        1,
+        crate::config::DEFAULT_FLASHMOE_MEMORY_PROMPT_ROOT_MAX_BYTES,
+    );
     for (session_id, token) in [("first", 10), ("second", 20)] {
         let mut generation = sessions.begin_generation(Some(session_id), vec![token], 1, 1);
         generation.capture_prompt_cache(vec![token as f32], recurrent_session_snapshot());

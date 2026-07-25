@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "status": "phase0_single_case_diagnostic",
+  "date": "2026-07-25",
+  "pb_revision": "f6fd5a71d5a0bebbdbdb222cdf593a7a5cdabc0d",
+  "release_binary_sha256": "48e3767b8ff298a40d844cf029cc81e369cd26ec44588cb0451d0f0a50cc6077",
+  "model": "hf://mlx-community/Qwen3-Coder-Next-4bit",
+  "backend": "flashmoe-v2-mlxq4",
+  "parameters": {
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0,
+    "max_steps": 7,
+    "max_tokens": 1792
+  },
+  "scratch_root": "/private/tmp/pb-prompt-root-phase0-rust-20260725/rust_registry_removal",
+  "run_id": "1785000957605-30830-0",
+  "excluded_setup_run": {
+    "run_id": "1785000911750-30674-0",
+    "classification": "experiment_error",
+    "reason": "The Deno wrapper child could not acquire a Metal device; the direct release-binary run used Metal normally."
+  },
+  "audit": {
+    "case_id": "rust_registry_removal",
+    "language": "rust",
+    "classification": "positive_evidence",
+    "official_task_passed": true,
+    "pb_verified_completed": true,
+    "verified_clean_completion": true,
+    "false_verified_completion": false,
+    "semantic_commit": true,
+    "commit_oid_matches": true,
+    "workspace_clean": true,
+    "changed_paths_allowed": true
+  },
+  "efficiency": {
+    "wall_runtime_ms": 172786,
+    "llm_invocations": 4,
+    "rendered_prompt_tokens": 18523,
+    "cached_prefix_tokens": 9488,
+    "fresh_prefill_tokens": 9035,
+    "eligible_root_tokens": 9488,
+    "reused_root_tokens": 9488,
+    "prompt_root_hit_invocations": 4,
+    "prompt_cache_miss_reasons": {},
+    "prompt_root_authority_classes": {
+      "planning": 1,
+      "plan_review": 1,
+      "implementation_mutation": 1,
+      "code_review": 1
+    },
+    "prompt_root_sha256s": [
+      "48d58d7d86c3c54c02bcfd216effeca7b2be907a0b40871c806ca7ea3c4742cf",
+      "9c2bb140d49f573fab1d155325f3e26ed1eed7691606301d61067bf25f60d1fb",
+      "a29ed2506ad8fd41da08f440e0ca14887c01ab759ffdc0da326894bd98b84fda",
+      "3952e4c6a7796407b9545d757c5e33070ca23d500892a94a743c7291ae56604f"
+    ],
+    "refill_cache_lookup_wall_ms": 810,
+    "refill_state_hydration_wall_ms": 9,
+    "refill_fresh_suffix_prefill_wall_ms": 78978,
+    "refill_snapshot_capture_wall_ms": 48,
+    "generated_tokens": 511,
+    "tool_calls": 4,
+    "total_energy_kwh": 0.00245617551393738,
+    "energy_complete": true
+  },
+  "interpretation": {
+    "root_reuse": "All four eligible stage roots were restored completely from disk.",
+    "dominant_refill_phase": "fresh_suffix_prefill",
+    "phase0_gate": "open",
+    "open_reason": "This retained single Rust case predates disk-decode, CPU validation/allocation, queue, and durable-completion counters and does not replace the locked three-language Phase 0 sample."
+  }
+}

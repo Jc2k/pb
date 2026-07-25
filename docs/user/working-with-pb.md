@@ -260,6 +260,19 @@ pb queue --profile build "Add the missing test" --workdir /path/to/project
 Advisory profiles can give the primary session fresh-context input. They cannot mutate the primary
 workspace, delegate again, or advance its workflow stage.
 
+## Inspecting local inference caches
+
+Run `pb cache status` to see the exact local llama.cpp and FlashMoe session-cache namespaces,
+format versions, byte budgets, and aggregate usage. Cleanup is deliberately two-step:
+
+```bash
+pb cache clean --backend flash-moe
+pb cache clean --backend flash-moe --yes
+```
+
+The first command is a dry run. The confirmed command removes only the selected versioned session
+namespace; model artifacts and the other backend's cache are outside its target.
+
 ## Reading outcomes
 
 A delivery result is deliberately more precise than “the model stopped talking.”

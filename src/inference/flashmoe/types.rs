@@ -266,6 +266,8 @@ pub enum NativePrefillMode {
 pub struct StructuredGenerationRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ChatTool>,
+    /// Controller-owned stable-root identity for managed invocations. Raw inference omits it.
+    pub stage_root: Option<crate::inference::StageRootDescriptor>,
     /// Optional strict JSON artifact schema. This is mutually exclusive with
     /// native tool generation and is enforced token by token.
     pub json_schema: Option<Value>,
@@ -306,6 +308,7 @@ impl StructuredGenerationRequest {
         Self {
             messages: vec![ChatMessage::text(ChatRole::User, request.prompt.clone())],
             tools: Vec::new(),
+            stage_root: None,
             json_schema: None,
             add_generation_prompt: true,
             enable_thinking: true,
@@ -349,6 +352,7 @@ pub struct PromptCacheStats {
     pub prefilled_tokens: usize,
     pub restore_ms: u64,
     pub miss_reason: Option<crate::inference::PromptCacheMissReason>,
+    pub lookup_detail: Option<crate::inference::PromptCacheLookupDetail>,
     pub root: Option<crate::inference::BackendPromptRoot>,
 }
 
@@ -398,6 +402,8 @@ pub struct NativeGenerationStats {
     pub active_experts_per_token: Option<usize>,
     pub expert_strategy: String,
     pub prefill_command_kind: String,
+    #[serde(default)]
+    pub prefill_command_reason: String,
     pub thinking_enabled: bool,
     pub refill: NativeRefillStats,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -407,9 +413,24 @@ pub struct NativeGenerationStats {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeRefillStats {
     pub cache_lookup_wall_ms: u64,
+    #[serde(default)]
+    pub disk_read_decode_wall_ms: u64,
+    #[serde(default)]
+    pub cpu_state_validation_allocation_wall_ms: u64,
     pub state_hydration_wall_ms: u64,
     pub fresh_suffix_prefill_wall_ms: u64,
     pub snapshot_capture_wall_ms: u64,
+    #[serde(default)]
+    pub persistence_queue_wall_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCachePersistenceStats {
+    pub queued_checkpoints: usize,
+    pub completed_checkpoints: usize,
+    #[serde(default)]
+    pub failed_checkpoints: usize,
+    pub wall_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -55,6 +55,7 @@ fn load_shared_with_settings(
         metal_working_set_limit_bytes: None,
         session_cache: settings.session_cache.clone(),
         memory_sessions: settings.memory_sessions,
+        memory_prompt_root_max_bytes: settings.memory_prompt_root_max_bytes,
     };
     let key = runtime_key(plan, &load_options);
     {

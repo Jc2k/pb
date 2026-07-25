@@ -110,6 +110,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Inspect or clean exact versioned local inference-cache namespaces
+    #[command(name = "cache")]
+    Cache {
+        #[command(subcommand)]
+        command: InferenceCacheCommand,
+    },
     /// Manage named projects in the user-global registry
     #[command(name = "projects", alias = "project")]
     Projects {
@@ -228,6 +234,33 @@ pub enum ConfigCommand {
     Get(ConfigGetArgs),
     /// Show the user configuration TOML
     Show,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InferenceCacheCommand {
+    /// Show local session-cache paths, format versions, budgets, and aggregate usage
+    Status,
+    /// List or remove selected versioned session-cache namespaces
+    Clean(InferenceCacheCleanArgs),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum InferenceCacheBackendArg {
+    #[default]
+    All,
+    LlamaCpp,
+    FlashMoe,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct InferenceCacheCleanArgs {
+    /// Cache backend namespace to clean
+    #[arg(long, value_enum, default_value_t = InferenceCacheBackendArg::All)]
+    pub backend: InferenceCacheBackendArg,
+
+    /// Delete the selected namespace. Without this flag the command is a dry run.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1118,6 +1151,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Goal { command } => run_goal_command(command).await,
         Commands::Serve => run_serve().await,
         Commands::Config { command } => run_config_command(command),
+        Commands::Cache { command } => run_inference_cache_command(command),
         Commands::Projects { command } => run_projects_command(command).await,
         Commands::Env { command } => run_env_command(command),
         Commands::Mcp { command } => run_mcp_command(command).await,
@@ -1258,6 +1292,212 @@ fn run_config_command(command: ConfigCommand) -> Result<()> {
         ConfigCommand::Show => {
             let config = UserConfig::load()?;
             print!("{}", config.to_pretty_toml()?);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InferenceCacheNamespace {
+    backend: &'static str,
+    format_version: &'static str,
+    path: PathBuf,
+    enabled: bool,
+    budget_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct InferenceCacheInventory {
+    files: usize,
+    bytes: u64,
+    oldest_age_seconds: Option<u64>,
+}
+
+fn inference_cache_namespaces(config: &UserConfig) -> Result<Vec<InferenceCacheNamespace>> {
+    let root = config
+        .effective_cache_dir()
+        .context("cannot resolve the local inference-cache storage root")?;
+    if !root.is_absolute() {
+        bail!(
+            "inference-cache storage root must be absolute: {}",
+            root.display()
+        );
+    }
+    let llama = config.effective_llamacpp_session_cache();
+    let flashmoe = config.effective_flashmoe();
+    Ok(vec![
+        InferenceCacheNamespace {
+            backend: "llamacpp",
+            format_version: inference::llamacpp::LLAMA_SESSION_CACHE_VERSION,
+            path: root.join(inference::llamacpp::LLAMA_SESSION_CACHE_VERSION),
+            enabled: llama.enabled,
+            budget_bytes: llama.max_bytes,
+        },
+        InferenceCacheNamespace {
+            backend: "flashmoe",
+            format_version: inference::flashmoe::FLASHMOE_SESSION_CACHE_VERSION,
+            path: root.join(inference::flashmoe::FLASHMOE_SESSION_CACHE_VERSION),
+            enabled: flashmoe.session_cache.enabled,
+            budget_bytes: flashmoe.session_cache.max_bytes,
+        },
+    ])
+}
+
+fn inference_cache_inventory(path: &Path) -> Result<InferenceCacheInventory> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(InferenceCacheInventory::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("inference-cache namespace is a symlink: {}", path.display());
+    }
+    if !metadata.is_dir() {
+        bail!(
+            "inference-cache namespace is not a directory: {}",
+            path.display()
+        );
+    }
+    let mut inventory = InferenceCacheInventory::default();
+    let now = std::time::SystemTime::now();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("failed to read {}", directory.display()))?
+        {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            inventory.files = inventory.files.saturating_add(1);
+            inventory.bytes = inventory.bytes.saturating_add(metadata.len());
+            if let Ok(modified) = metadata.modified()
+                && let Ok(age) = now.duration_since(modified)
+            {
+                let age = age.as_secs();
+                inventory.oldest_age_seconds = Some(
+                    inventory
+                        .oldest_age_seconds
+                        .map_or(age, |current| current.max(age)),
+                );
+            }
+        }
+    }
+    Ok(inventory)
+}
+
+fn selected_inference_cache_namespace(
+    backend: InferenceCacheBackendArg,
+    namespace: &InferenceCacheNamespace,
+) -> bool {
+    match backend {
+        InferenceCacheBackendArg::All => true,
+        InferenceCacheBackendArg::LlamaCpp => namespace.backend == "llamacpp",
+        InferenceCacheBackendArg::FlashMoe => namespace.backend == "flashmoe",
+    }
+}
+
+fn clean_inference_cache_namespaces(
+    namespaces: &[InferenceCacheNamespace],
+    backend: InferenceCacheBackendArg,
+    yes: bool,
+) -> Result<usize> {
+    let mut removed = 0usize;
+    for namespace in namespaces
+        .iter()
+        .filter(|namespace| selected_inference_cache_namespace(backend, namespace))
+    {
+        let parent = namespace
+            .path
+            .parent()
+            .context("inference-cache namespace has no storage root")?;
+        if namespace.path.file_name().and_then(|name| name.to_str())
+            != Some(namespace.format_version)
+        {
+            bail!(
+                "refusing to clean unresolved inference-cache namespace {}",
+                namespace.path.display()
+            );
+        }
+        if let Ok(metadata) = std::fs::symlink_metadata(parent)
+            && metadata.file_type().is_symlink()
+        {
+            bail!(
+                "inference-cache storage root is a symlink: {}",
+                parent.display()
+            );
+        }
+        let metadata = match std::fs::symlink_metadata(&namespace.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        println!(
+            "{}\t{}\t{}",
+            if yes { "remove" } else { "would-remove" },
+            namespace.backend,
+            namespace.path.display()
+        );
+        if !yes {
+            continue;
+        }
+        if metadata.file_type().is_symlink() || metadata.is_file() {
+            std::fs::remove_file(&namespace.path)?;
+        } else if metadata.is_dir() {
+            std::fs::remove_dir_all(&namespace.path)?;
+        } else {
+            bail!(
+                "refusing to clean unsupported cache entry {}",
+                namespace.path.display()
+            );
+        }
+        removed = removed.saturating_add(1);
+    }
+    Ok(removed)
+}
+
+fn run_inference_cache_command(command: InferenceCacheCommand) -> Result<()> {
+    let config = UserConfig::load()?;
+    let namespaces = inference_cache_namespaces(&config)?;
+    match command {
+        InferenceCacheCommand::Status => {
+            for namespace in namespaces {
+                let inventory = inference_cache_inventory(&namespace.path)?;
+                println!(
+                    "{}\tformat={}\tenabled={}\tbudget_bytes={}\tfiles={}\tbytes={}\toldest_age_seconds={}\t{}",
+                    namespace.backend,
+                    namespace.format_version,
+                    namespace.enabled,
+                    namespace.budget_bytes,
+                    inventory.files,
+                    inventory.bytes,
+                    inventory
+                        .oldest_age_seconds
+                        .map_or_else(|| "none".to_string(), |age| age.to_string()),
+                    namespace.path.display()
+                );
+            }
+        }
+        InferenceCacheCommand::Clean(args) => {
+            let removed = clean_inference_cache_namespaces(&namespaces, args.backend, args.yes)?;
+            if args.yes {
+                println!("removed {removed} inference-cache namespace(s)");
+            } else {
+                println!("dry run only; pass --yes to remove the listed namespace(s)");
+            }
         }
     }
     Ok(())
@@ -2799,6 +3039,7 @@ fn flashmoe_load_options(
         metal_working_set_limit_bytes: limit_bytes,
         session_cache: flashmoe.session_cache,
         memory_sessions: flashmoe.memory_sessions,
+        memory_prompt_root_max_bytes: flashmoe.memory_prompt_root_max_bytes,
     })
 }
 
@@ -5255,6 +5496,78 @@ mod tests {
     #[test]
     fn shell_single_quote_escapes_embedded_single_quotes() {
         assert_eq!(shell_single_quote("abc'def"), "'abc'\\''def'");
+    }
+
+    #[test]
+    fn inference_cache_cli_is_explicit_and_dry_run_by_default() {
+        let status = Cli::try_parse_from(["pb", "cache", "status"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Commands::Cache {
+                command: InferenceCacheCommand::Status
+            }
+        ));
+
+        let clean =
+            Cli::try_parse_from(["pb", "cache", "clean", "--backend", "flash-moe"]).unwrap();
+        let Commands::Cache {
+            command: InferenceCacheCommand::Clean(clean),
+        } = clean.command
+        else {
+            panic!("expected cache clean command");
+        };
+        assert_eq!(clean.backend, InferenceCacheBackendArg::FlashMoe);
+        assert!(!clean.yes);
+    }
+
+    #[test]
+    fn inference_cache_cleanup_targets_only_selected_versioned_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let llama_path = tmp.path().join("llamacpp-session-v1");
+        let flashmoe_path = tmp.path().join("flashmoe-session-v1");
+        std::fs::create_dir_all(&llama_path).unwrap();
+        std::fs::create_dir_all(&flashmoe_path).unwrap();
+        std::fs::write(llama_path.join("state.bin"), [1_u8, 2, 3]).unwrap();
+        std::fs::write(flashmoe_path.join("state.bin"), [4_u8, 5]).unwrap();
+        let namespaces = vec![
+            InferenceCacheNamespace {
+                backend: "llamacpp",
+                format_version: "llamacpp-session-v1",
+                path: llama_path.clone(),
+                enabled: true,
+                budget_bytes: 10,
+            },
+            InferenceCacheNamespace {
+                backend: "flashmoe",
+                format_version: "flashmoe-session-v1",
+                path: flashmoe_path.clone(),
+                enabled: true,
+                budget_bytes: 10,
+            },
+        ];
+
+        assert_eq!(inference_cache_inventory(&llama_path).unwrap().bytes, 3);
+        assert_eq!(
+            clean_inference_cache_namespaces(
+                &namespaces,
+                InferenceCacheBackendArg::LlamaCpp,
+                false,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(llama_path.exists());
+        assert_eq!(
+            clean_inference_cache_namespaces(
+                &namespaces,
+                InferenceCacheBackendArg::LlamaCpp,
+                true,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(!llama_path.exists());
+        assert!(flashmoe_path.exists());
     }
 }
 

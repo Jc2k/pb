@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -18,13 +18,21 @@ use super::state::{
 use super::types::PromptCacheSource;
 use crate::inference::PromptCacheMissReason;
 
-const CACHE_VERSION: &str = "flashmoe-session-v1";
+pub(crate) const CACHE_VERSION: &str = "flashmoe-session-v1";
 const MAGIC: &[u8; 8] = b"PBFMKV01";
 const MAX_TOKENS: usize = 1_000_000;
 const MAX_VECTOR_FLOATS: usize = 32 * 1024 * 1024;
+const MAX_SESSION_MANIFEST_BYTES: u64 = 1024 * 1024;
+const CACHE_WRITE_LOCK: &str = ".write.lock";
+const CACHE_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 #[derive(Debug)]
 pub(super) struct FlashMoeDiskCache {
+    storage_root: PathBuf,
     root: PathBuf,
     fingerprint: [u8; 32],
     layers: usize,
@@ -46,12 +54,12 @@ impl FlashMoeDiskCache {
         if !settings.enabled {
             return None;
         }
-        let root = settings
-            .root
-            .as_ref()?
+        let storage_root = settings.root.as_ref()?.clone();
+        let root = storage_root
             .join(CACHE_VERSION)
             .join(model_fingerprint_hex(plan));
         Some(Self {
+            storage_root,
             root,
             fingerprint: model_fingerprint(plan),
             layers,
@@ -69,13 +77,20 @@ impl FlashMoeDiskCache {
     }
 
     pub(super) fn load_prefix(&self, tokens: &[u32]) -> Result<Option<FlashMoeCachedSessionState>> {
+        if !self.ensure_namespace(false)? {
+            return Ok(None);
+        }
         self.load_checkpoint(&Self::token_key(tokens))
     }
 
     pub(super) fn load_session(&self, session_id: &str) -> Result<Vec<FlashMoeCachedSessionState>> {
+        if !self.ensure_namespace(false)? {
+            return Ok(Vec::new());
+        }
         let path = self.session_manifest_path(session_id);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let bytes = match read_cache_file(&path, MAX_SESSION_MANIFEST_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(Vec::new()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to read {}", path.display()));
@@ -96,6 +111,7 @@ impl FlashMoeDiskCache {
     }
 
     pub(super) fn persist_prefix(&self, state: &FlashMoeCachedSessionState) -> Result<()> {
+        let _lock = self.acquire_write_lock()?;
         let _ = self.persist_checkpoint(state)?;
         Ok(())
     }
@@ -105,6 +121,7 @@ impl FlashMoeDiskCache {
         session_id: &str,
         states: &[FlashMoeCachedSessionState],
     ) -> Result<()> {
+        let _lock = self.acquire_write_lock()?;
         let mut ordered = states.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|state| std::cmp::Reverse(state.cpu.tokens.len()));
         let mut keys = Vec::new();
@@ -138,13 +155,56 @@ impl FlashMoeDiskCache {
         Ok(())
     }
 
+    fn acquire_write_lock(&self) -> Result<crate::state_lock::StateFileLock> {
+        self.ensure_namespace(true)?;
+        crate::state_lock::StateFileLock::acquire(
+            self.root.join(CACHE_WRITE_LOCK),
+            CACHE_WRITE_LOCK_TIMEOUT,
+        )
+    }
+
+    /// Validate each cache-owned path component before reading or creating files.
+    ///
+    /// `storage_root` is the user-selected trust boundary. Its parents retain normal OS path
+    /// semantics, but neither it nor a version/model namespace below it may be a symlink.
+    fn ensure_namespace(&self, create: bool) -> Result<bool> {
+        if !validate_cache_directory(&self.storage_root, create)? {
+            return Ok(false);
+        }
+        let relative = self
+            .root
+            .strip_prefix(&self.storage_root)
+            .with_context(|| {
+                format!(
+                    "FlashMoe cache namespace {} is outside configured storage root {}",
+                    self.root.display(),
+                    self.storage_root.display()
+                )
+            })?;
+        let mut current = self.storage_root.clone();
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                bail!(
+                    "FlashMoe cache namespace contains an unsafe component: {}",
+                    self.root.display()
+                );
+            };
+            current.push(component);
+            if !validate_cache_directory(&current, create)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn load_checkpoint(&self, key: &str) -> Result<Option<FlashMoeCachedSessionState>> {
         if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Ok(None);
         }
         let path = self.checkpoint_path(key);
-        let file = match File::open(&path) {
-            Ok(file) => file,
+        let file = match open_cache_file(&path) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to open {}", path.display()));
@@ -179,8 +239,14 @@ impl FlashMoeDiskCache {
         }
         let key = Self::token_key(&state.cpu.tokens);
         let path = self.checkpoint_path(&key);
-        if path.is_file() {
-            return Ok(Some(key));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("refused symlink FlashMoe checkpoint {}", path.display());
+            }
+            Ok(metadata) if metadata.is_file() => return Ok(Some(key)),
+            Ok(_) => bail!("FlashMoe checkpoint path is not a file: {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let parent = path.parent().context("checkpoint path has no parent")?;
         secure_directory(&self.root)?;
@@ -201,7 +267,7 @@ impl FlashMoeDiskCache {
         }
         temporary.as_file().sync_all()?;
         match temporary.persist_noclobber(&path) {
-            Ok(_) => {}
+            Ok(_) => sync_directory(parent)?,
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(error.error)
@@ -240,9 +306,64 @@ impl FlashMoeDiskCache {
             if preserve.iter().any(|preserve| preserve == &path) {
                 continue;
             }
-            fs::remove_file(&path)
-                .with_context(|| format!("failed to prune {}", path.display()))?;
+            if let Some(key) = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|_| path.extension().and_then(|value| value.to_str()) == Some("bin"))
+            {
+                self.remove_checkpoint_from_manifests(key)?;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    if let Some(parent) = path.parent() {
+                        sync_directory(parent)?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to prune {}", path.display()));
+                }
+            }
             total = total.saturating_sub(bytes);
+        }
+        Ok(())
+    }
+
+    fn remove_checkpoint_from_manifests(&self, key: &str) -> Result<()> {
+        let sessions = self.root.join("sessions");
+        let entries = match fs::read_dir(&sessions) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_symlink() || !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(bytes) = read_cache_file(&path, MAX_SESSION_MANIFEST_BYTES)? else {
+                continue;
+            };
+            let Ok(mut manifest) = serde_json::from_slice::<SessionManifest>(&bytes) else {
+                continue;
+            };
+            if manifest.version != CACHE_VERSION
+                || !manifest
+                    .checkpoints
+                    .iter()
+                    .any(|checkpoint| checkpoint == key)
+            {
+                continue;
+            }
+            manifest.checkpoints.retain(|checkpoint| checkpoint != key);
+            if manifest.checkpoints.is_empty() {
+                fs::remove_file(&path)?;
+                sync_directory(&sessions)?;
+            } else {
+                atomic_write(&path, &serde_json::to_vec(&manifest)?)?;
+            }
         }
         Ok(())
     }
@@ -485,6 +606,14 @@ pub(crate) fn model_fingerprint_hex(plan: &FlashMoePlan) -> String {
 
 fn secure_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "refused non-directory or symlink cache path {}",
+            path.display()
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -492,6 +621,104 @@ fn secure_directory(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to secure {}", path.display()))?;
     }
     Ok(())
+}
+
+fn validate_cache_directory(path: &Path, create: bool) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "refused non-directory or symlink cache path {}",
+                path.display()
+            );
+        }
+        Ok(_) => {
+            #[cfg(unix)]
+            if create {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("failed to secure {}", path.display()))?;
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to create {}", path.display()));
+                }
+            }
+            validate_cache_directory(path, true)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect cache directory {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("failed to open cache directory {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync cache directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn open_cache_file(path: &Path) -> std::io::Result<Option<File>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("refused symlink cache file {}", path.display()),
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("cache path is not a regular file: {}", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map(Some)
+}
+
+fn read_cache_file(path: &Path, max_bytes: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let Some(file) = open_cache_file(path)? else {
+        return Ok(None);
+    };
+    if file.metadata()?.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cache file exceeds {max_bytes} bytes: {}", path.display()),
+        ));
+    }
+    let capacity = usize::try_from(max_bytes.min(1024 * 1024)).unwrap_or(1024 * 1024);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cache file exceeds {max_bytes} bytes: {}", path.display()),
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -511,6 +738,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("failed to replace {}", path.display()))?;
+    sync_directory(parent)?;
     Ok(())
 }
 
@@ -518,10 +746,17 @@ fn collect_cache_files(root: &Path, files: &mut Vec<(PathBuf, u64, Duration)>) -
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
+        let file_type = entry.file_type()?;
+        if entry.file_name() == CACHE_WRITE_LOCK {
+            continue;
+        }
+        if file_type.is_symlink() {
+            continue;
+        }
         let metadata = entry.metadata()?;
-        if metadata.is_dir() {
+        if file_type.is_dir() {
             collect_cache_files(&path, files)?;
-        } else if metadata.is_file() {
+        } else if file_type.is_file() {
             let modified = metadata
                 .modified()
                 .ok()
@@ -538,11 +773,15 @@ pub(super) struct FlashMoeSessionCache {
     pub(super) entries: BTreeMap<String, Vec<FlashMoeCachedSessionState>>,
     pub(super) session_order: VecDeque<String>,
     prefixes: BTreeMap<String, FlashMoeCachedSessionState>,
+    prefix_sizes: BTreeMap<String, u64>,
+    prefix_bytes: u64,
     prefix_order: VecDeque<String>,
     dirty_sessions: BTreeSet<String>,
     dirty_prefixes: BTreeSet<String>,
     disk: Option<FlashMoeDiskCache>,
     memory_session_limit: usize,
+    memory_prefix_max_bytes: u64,
+    deferred_persistence: super::types::PromptCachePersistenceStats,
 }
 
 impl Default for FlashMoeSessionCache {
@@ -551,11 +790,15 @@ impl Default for FlashMoeSessionCache {
             entries: BTreeMap::new(),
             session_order: VecDeque::new(),
             prefixes: BTreeMap::new(),
+            prefix_sizes: BTreeMap::new(),
+            prefix_bytes: 0,
             prefix_order: VecDeque::new(),
             dirty_sessions: BTreeSet::new(),
             dirty_prefixes: BTreeSet::new(),
             disk: None,
             memory_session_limit: crate::config::DEFAULT_FLASHMOE_MEMORY_SESSIONS,
+            memory_prefix_max_bytes: crate::config::DEFAULT_FLASHMOE_MEMORY_PROMPT_ROOT_MAX_BYTES,
+            deferred_persistence: super::types::PromptCachePersistenceStats::default(),
         }
     }
 }
@@ -567,10 +810,15 @@ pub(super) struct FlashMoeCachedSessionState {
 }
 
 impl FlashMoeSessionCache {
-    pub(crate) fn new(disk: Option<FlashMoeDiskCache>, memory_session_limit: usize) -> Self {
+    pub(crate) fn new(
+        disk: Option<FlashMoeDiskCache>,
+        memory_session_limit: usize,
+        memory_prefix_max_bytes: u64,
+    ) -> Self {
         Self {
             disk,
             memory_session_limit,
+            memory_prefix_max_bytes,
             ..Self::default()
         }
     }
@@ -594,6 +842,9 @@ impl FlashMoeSessionCache {
         max_tokens: usize,
         layers: usize,
     ) -> FlashMoeGenerationState {
+        let preparation_started = Instant::now();
+        let mut disk_read_decode_wall = Duration::ZERO;
+        let mut cpu_state_validation_allocation_wall = Duration::ZERO;
         let capacity = prompt_tokens.len() + max_tokens;
         // A harness workflow keeps one logical session id while moving between
         // fresh stage prompts. Once the new prompt diverges, the cached state
@@ -645,8 +896,11 @@ impl FlashMoeSessionCache {
         if cached.is_none()
             && let (Some(id), Some(disk)) = (session_id, self.disk.as_ref())
         {
+            let disk_started = Instant::now();
             match disk.load_session(id) {
                 Ok(states) => {
+                    disk_read_decode_wall += disk_started.elapsed();
+                    let validation_started = Instant::now();
                     let had_states = !states.is_empty();
                     if let Some(found) = states
                         .into_iter()
@@ -662,8 +916,10 @@ impl FlashMoeSessionCache {
                     } else if had_states {
                         incompatible_checkpoint_seen = true;
                     }
+                    cpu_state_validation_allocation_wall += validation_started.elapsed();
                 }
                 Err(error) => {
+                    disk_read_decode_wall += disk_started.elapsed();
                     cache_unreadable = true;
                     tracing::warn!(
                         session = id,
@@ -676,16 +932,23 @@ impl FlashMoeSessionCache {
         if cached.is_none()
             && let (Some(key), Some(disk)) = (base_key.as_ref(), self.disk.as_ref())
         {
+            let disk_started = Instant::now();
             match disk.load_prefix(&prompt_tokens[..base_prefix_len]) {
                 Ok(Some(state)) => {
-                    self.prefixes.insert(key.clone(), state.clone());
+                    disk_read_decode_wall += disk_started.elapsed();
+                    let validation_started = Instant::now();
+                    self.insert_prefix(key.clone(), state.clone());
                     self.touch_prefix(key);
                     cached = Some((base_prefix_len, state));
                     cache_source = PromptCacheSource::DiskPrefix;
                     used_disk = true;
+                    cpu_state_validation_allocation_wall += validation_started.elapsed();
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    disk_read_decode_wall += disk_started.elapsed();
+                }
                 Err(error) => {
+                    disk_read_decode_wall += disk_started.elapsed();
                     cache_unreadable = true;
                     tracing::warn!(
                         prefix = key,
@@ -708,9 +971,23 @@ impl FlashMoeSessionCache {
                 PromptCacheMissReason::ColdSession
             }
         });
+        let cache_lookup_detail = if incompatible_checkpoint_seen && cached.is_some() {
+            Some(crate::inference::PromptCacheLookupDetail::SessionDivergedRootHit)
+        } else if incompatible_checkpoint_seen && base_prefix_len > 0 {
+            Some(crate::inference::PromptCacheLookupDetail::SessionDivergedRootMissing)
+        } else if incompatible_checkpoint_seen {
+            Some(crate::inference::PromptCacheLookupDetail::SessionCheckpointDiverged)
+        } else if cached.is_none() && base_prefix_len > 0 {
+            Some(crate::inference::PromptCacheLookupDetail::ExactRootCheckpointMissing)
+        } else if cached.is_none() && session_id.is_some() {
+            Some(crate::inference::PromptCacheLookupDetail::SessionCheckpointMissing)
+        } else {
+            None
+        };
         let restore_ms = used_disk
             .then(|| u64::try_from(restore_started.elapsed().as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
+        let allocation_started = Instant::now();
         let (kv_cache, prefill_start, cached_last_hidden, cached_recurrent) =
             if let Some((prefix_len, state)) = cached {
                 let FlashMoeSessionState {
@@ -729,6 +1006,11 @@ impl FlashMoeSessionCache {
             } else {
                 (KvCache::new(layers, capacity), 0, None, None)
             };
+        cpu_state_validation_allocation_wall += allocation_started.elapsed();
+        let cache_lookup_wall = preparation_started
+            .elapsed()
+            .saturating_sub(disk_read_decode_wall)
+            .saturating_sub(cpu_state_validation_allocation_wall);
 
         FlashMoeGenerationState {
             session_id: session_id.map(str::to_owned),
@@ -743,7 +1025,13 @@ impl FlashMoeSessionCache {
             generated_recurrent: None,
             cache_source,
             cache_restore_ms: restore_ms,
+            cache_lookup_ms: duration_millis(cache_lookup_wall),
+            disk_read_decode_ms: duration_millis(disk_read_decode_wall),
+            cpu_state_validation_allocation_ms: duration_millis(
+                cpu_state_validation_allocation_wall,
+            ),
             cache_miss_reason,
+            cache_lookup_detail,
             base_prefix_len,
             base_cache: None,
             base_recurrent: None,
@@ -763,6 +1051,9 @@ impl FlashMoeSessionCache {
         layers: usize,
         cache_source: PromptCacheSource,
         cache_restore_ms: u64,
+        cache_lookup_ms: u64,
+        disk_read_decode_ms: u64,
+        cpu_state_validation_allocation_ms: u64,
         cache_miss_reason: Option<PromptCacheMissReason>,
     ) -> Result<FlashMoeGenerationState> {
         if prefill_start > prompt_tokens.len() {
@@ -793,7 +1084,11 @@ impl FlashMoeSessionCache {
             generated_recurrent: None,
             cache_source,
             cache_restore_ms,
+            cache_lookup_ms,
+            disk_read_decode_ms,
+            cpu_state_validation_allocation_ms,
             cache_miss_reason,
+            cache_lookup_detail: None,
             base_prefix_len: 0,
             base_cache: None,
             base_recurrent: None,
@@ -808,9 +1103,9 @@ impl FlashMoeSessionCache {
     pub(crate) fn commit_generation(
         &mut self,
         generation: &mut FlashMoeGenerationState,
-    ) -> Result<()> {
+    ) -> Result<super::types::PromptCachePersistenceStats> {
         let Some(session_id) = generation.session_id.as_ref() else {
-            return Ok(());
+            return Ok(super::types::PromptCachePersistenceStats::default());
         };
         let cpu = generation
             .prompt_cache
@@ -830,25 +1125,20 @@ impl FlashMoeSessionCache {
         self.entries.insert(session_id.clone(), checkpoints);
         self.touch_session(session_id);
         self.dirty_sessions.insert(session_id.clone());
-        self.evict_excess_sessions(self.memory_session_limit);
+        let mut persistence = self.evict_excess_sessions(self.memory_session_limit);
         if let (Some(cpu), Some(recurrent)) = (
             generation.base_cache.take(),
             generation.base_recurrent.take(),
         ) {
             let state = FlashMoeCachedSessionState { cpu, recurrent };
             let key = FlashMoeDiskCache::token_key(&state.cpu.tokens);
-            self.prefixes.insert(key.clone(), state);
+            self.insert_prefix(key.clone(), state);
             self.touch_prefix(&key);
             self.dirty_prefixes.insert(key);
-            while self.prefixes.len() > 4 {
-                let Some(oldest) = self.prefix_order.pop_front() else {
-                    break;
-                };
-                self.prefixes.remove(&oldest);
-                self.dirty_prefixes.remove(&oldest);
-            }
+            add_persistence_stats(&mut persistence, self.evict_excess_prefixes());
         }
-        Ok(())
+        add_persistence_stats(&mut self.deferred_persistence, persistence);
+        Ok(persistence)
     }
 
     fn touch_prefix(&mut self, key: &str) {
@@ -856,12 +1146,66 @@ impl FlashMoeSessionCache {
         self.prefix_order.push_back(key.to_string());
     }
 
+    fn insert_prefix(&mut self, key: String, state: FlashMoeCachedSessionState) {
+        if let Some(previous) = self.prefix_sizes.remove(&key) {
+            self.prefix_bytes = self.prefix_bytes.saturating_sub(previous);
+        }
+        let bytes = checkpoint_size(&state);
+        self.prefix_bytes = self.prefix_bytes.saturating_add(bytes);
+        self.prefix_sizes.insert(key.clone(), bytes);
+        self.prefixes.insert(key, state);
+    }
+
     fn touch_session(&mut self, session_id: &str) {
         self.session_order.retain(|existing| existing != session_id);
         self.session_order.push_back(session_id.to_string());
     }
 
-    pub(super) fn evict_excess_sessions(&mut self, limit: usize) {
+    fn evict_excess_prefixes(&mut self) -> super::types::PromptCachePersistenceStats {
+        let mut persistence = super::types::PromptCachePersistenceStats::default();
+        while self.prefix_bytes > self.memory_prefix_max_bytes {
+            let Some(oldest) = self.prefix_order.pop_front() else {
+                break;
+            };
+            if self.dirty_prefixes.contains(&oldest)
+                && let (Some(disk), Some(state)) = (self.disk.as_ref(), self.prefixes.get(&oldest))
+            {
+                persistence.queued_checkpoints = persistence.queued_checkpoints.saturating_add(1);
+                let started = Instant::now();
+                match disk.persist_prefix(state) {
+                    Ok(()) => {
+                        persistence.completed_checkpoints =
+                            persistence.completed_checkpoints.saturating_add(1);
+                        self.dirty_prefixes.remove(&oldest);
+                    }
+                    Err(error) => {
+                        persistence.failed_checkpoints =
+                            persistence.failed_checkpoints.saturating_add(1);
+                        tracing::warn!(
+                            prefix = oldest,
+                            error = %format!("{error:#}"),
+                            "could not persist evicted FlashMoe prompt-root cache"
+                        );
+                    }
+                }
+                persistence.wall_ms = persistence
+                    .wall_ms
+                    .saturating_add(duration_millis(started.elapsed()));
+            }
+            self.prefixes.remove(&oldest);
+            if let Some(bytes) = self.prefix_sizes.remove(&oldest) {
+                self.prefix_bytes = self.prefix_bytes.saturating_sub(bytes);
+            }
+            self.dirty_prefixes.remove(&oldest);
+        }
+        persistence
+    }
+
+    pub(super) fn evict_excess_sessions(
+        &mut self,
+        limit: usize,
+    ) -> super::types::PromptCachePersistenceStats {
+        let mut persistence = super::types::PromptCachePersistenceStats::default();
         while self.entries.len() > limit {
             let Some(oldest) = self.session_order.pop_front() else {
                 break;
@@ -871,27 +1215,66 @@ impl FlashMoeSessionCache {
                     self.disk.as_ref(),
                     self.entries.get(&oldest).and_then(|states| states.first()),
                 )
-                && let Err(error) = disk.persist_session(&oldest, std::slice::from_ref(safe_prompt))
             {
-                tracing::warn!(
-                    session = oldest,
-                    error = %format!("{error:#}"),
-                    "could not persist evicted FlashMoe session cache"
-                );
+                persistence.queued_checkpoints = persistence.queued_checkpoints.saturating_add(1);
+                let started = Instant::now();
+                match disk.persist_session(&oldest, std::slice::from_ref(safe_prompt)) {
+                    Ok(()) => {
+                        persistence.completed_checkpoints =
+                            persistence.completed_checkpoints.saturating_add(1);
+                    }
+                    Err(error) => {
+                        persistence.failed_checkpoints =
+                            persistence.failed_checkpoints.saturating_add(1);
+                        tracing::warn!(
+                            session = oldest,
+                            error = %format!("{error:#}"),
+                            "could not persist evicted FlashMoe session cache"
+                        );
+                    }
+                }
+                persistence.wall_ms = persistence
+                    .wall_ms
+                    .saturating_add(duration_millis(started.elapsed()));
             }
             self.entries.remove(&oldest);
             self.dirty_sessions.remove(&oldest);
         }
+        persistence
     }
 
-    pub(crate) fn persist_session(&mut self, session_id: &str) -> Result<()> {
+    pub(crate) fn persist_session(
+        &mut self,
+        session_id: &str,
+    ) -> Result<super::types::PromptCachePersistenceStats> {
+        let mut persistence = std::mem::take(&mut self.deferred_persistence);
         let Some(disk) = self.disk.as_ref() else {
-            return Ok(());
+            return Ok(persistence);
         };
         let prefix_keys = self.dirty_prefixes.iter().cloned().collect::<Vec<_>>();
         for key in &prefix_keys {
             if let Some(state) = self.prefixes.get(key) {
-                disk.persist_prefix(state)?;
+                persistence.queued_checkpoints = persistence.queued_checkpoints.saturating_add(1);
+                let started = Instant::now();
+                match disk.persist_prefix(state) {
+                    Ok(()) => {
+                        persistence.completed_checkpoints =
+                            persistence.completed_checkpoints.saturating_add(1);
+                        self.dirty_prefixes.remove(key);
+                    }
+                    Err(error) => {
+                        persistence.failed_checkpoints =
+                            persistence.failed_checkpoints.saturating_add(1);
+                        tracing::warn!(
+                            prefix = key,
+                            error = %format!("{error:#}"),
+                            "could not persist FlashMoe prompt-root cache"
+                        );
+                    }
+                }
+                persistence.wall_ms = persistence
+                    .wall_ms
+                    .saturating_add(duration_millis(started.elapsed()));
             }
         }
         if self.dirty_sessions.contains(session_id)
@@ -901,14 +1284,46 @@ impl FlashMoeSessionCache {
             // The generated head is a speculative in-memory accelerator. Persist
             // only the canonical prompt boundary so restart durability does not
             // double checkpoint writes or depend on output re-tokenization.
-            disk.persist_session(session_id, std::slice::from_ref(safe_prompt))?;
+            persistence.queued_checkpoints = persistence.queued_checkpoints.saturating_add(1);
+            let started = Instant::now();
+            match disk.persist_session(session_id, std::slice::from_ref(safe_prompt)) {
+                Ok(()) => {
+                    persistence.completed_checkpoints =
+                        persistence.completed_checkpoints.saturating_add(1);
+                    self.dirty_sessions.remove(session_id);
+                }
+                Err(error) => {
+                    persistence.failed_checkpoints =
+                        persistence.failed_checkpoints.saturating_add(1);
+                    tracing::warn!(
+                        session = session_id,
+                        error = %format!("{error:#}"),
+                        "could not persist FlashMoe session cache"
+                    );
+                }
+            }
+            persistence.wall_ms = persistence
+                .wall_ms
+                .saturating_add(duration_millis(started.elapsed()));
         }
-        for key in prefix_keys {
-            self.dirty_prefixes.remove(&key);
-        }
-        self.dirty_sessions.remove(session_id);
-        Ok(())
+        Ok(persistence)
     }
+}
+
+fn add_persistence_stats(
+    target: &mut super::types::PromptCachePersistenceStats,
+    value: super::types::PromptCachePersistenceStats,
+) {
+    target.queued_checkpoints = target
+        .queued_checkpoints
+        .saturating_add(value.queued_checkpoints);
+    target.completed_checkpoints = target
+        .completed_checkpoints
+        .saturating_add(value.completed_checkpoints);
+    target.failed_checkpoints = target
+        .failed_checkpoints
+        .saturating_add(value.failed_checkpoints);
+    target.wall_ms = target.wall_ms.saturating_add(value.wall_ms);
 }
 
 #[cfg(test)]
@@ -939,6 +1354,16 @@ mod tests {
         }
     }
 
+    fn disk_cache(root: PathBuf) -> FlashMoeDiskCache {
+        FlashMoeDiskCache {
+            storage_root: root.clone(),
+            root,
+            fingerprint: [9_u8; 32],
+            layers: 2,
+            max_bytes: 1024 * 1024,
+        }
+    }
+
     #[test]
     fn cache_miss_reasons_distinguish_cold_diverged_and_disabled_sessions() {
         let mut cache = FlashMoeSessionCache::default();
@@ -962,6 +1387,10 @@ mod tests {
             diverged.cache_miss_reason(),
             Some(PromptCacheMissReason::PromptDiverged)
         );
+        assert_eq!(
+            diverged.cache_lookup_detail(),
+            Some(crate::inference::PromptCacheLookupDetail::SessionCheckpointDiverged)
+        );
 
         cache
             .entries
@@ -969,6 +1398,33 @@ mod tests {
         let reused = cache.begin_generation(Some("reused"), vec![10, 20, 30], 1, 2);
         assert_eq!(reused.cache_source(), PromptCacheSource::MemorySession);
         assert_eq!(reused.cache_miss_reason(), None);
+    }
+
+    #[test]
+    fn session_mismatch_can_fall_through_to_an_exact_disk_root_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = disk_cache(tmp.path().join("cache"));
+        let root = fixture_state();
+        disk.persist_prefix(&root).unwrap();
+        let mut diverged = fixture_state();
+        diverged.cpu.tokens = vec![90, 91];
+        let mut cache = FlashMoeSessionCache::new(
+            Some(disk),
+            2,
+            crate::config::DEFAULT_FLASHMOE_MEMORY_PROMPT_ROOT_MAX_BYTES,
+        );
+        cache.entries.insert("session".to_string(), vec![diverged]);
+
+        let generation =
+            cache.begin_generation_with_base(Some("session"), vec![10, 20, 30], 2, 1, 2);
+
+        assert_eq!(generation.cache_source(), PromptCacheSource::DiskPrefix);
+        assert_eq!(generation.prefill_start(), 2);
+        assert_eq!(generation.cache_miss_reason(), None);
+        assert_eq!(
+            generation.cache_lookup_detail(),
+            Some(crate::inference::PromptCacheLookupDetail::SessionDivergedRootHit)
+        );
     }
 
     #[test]
@@ -1008,12 +1464,7 @@ mod tests {
     #[test]
     fn disk_cache_round_trip_uses_hashed_session_manifests() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = FlashMoeDiskCache {
-            root: tmp.path().join("cache"),
-            fingerprint: [9_u8; 32],
-            layers: 2,
-            max_bytes: 1024 * 1024,
-        };
+        let cache = disk_cache(tmp.path().join("cache"));
         let state = fixture_state();
         cache.persist_prefix(&state).unwrap();
         cache
@@ -1031,5 +1482,167 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(manifests.len(), 1);
         assert!(!manifests[0].contains("private"));
+    }
+
+    #[test]
+    fn concurrent_cache_writers_publish_complete_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let first_root = root.clone();
+        let second_root = root.clone();
+        let first = std::thread::spawn(move || {
+            let cache = disk_cache(first_root);
+            cache
+                .persist_session("first", std::slice::from_ref(&fixture_state()))
+                .unwrap();
+        });
+        let second = std::thread::spawn(move || {
+            let cache = disk_cache(second_root);
+            cache
+                .persist_session("second", std::slice::from_ref(&fixture_state()))
+                .unwrap();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let cache = disk_cache(root);
+        assert_eq!(cache.load_session("first").unwrap().len(), 1);
+        assert_eq!(cache.load_session("second").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prompt_root_memory_budget_evicts_lru_and_persists_dirty_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = disk_cache(tmp.path().join("cache"));
+        let first = fixture_state();
+        let mut second = fixture_state();
+        second.cpu.tokens = vec![30, 40];
+        let first_key = FlashMoeDiskCache::token_key(&first.cpu.tokens);
+        let second_key = FlashMoeDiskCache::token_key(&second.cpu.tokens);
+        let budget = checkpoint_size(&first).max(checkpoint_size(&second));
+        let mut cache = FlashMoeSessionCache::new(Some(disk), 2, budget);
+        cache.insert_prefix(first_key.clone(), first.clone());
+        cache.insert_prefix(second_key.clone(), second);
+        cache.prefix_order = VecDeque::from([first_key.clone(), second_key.clone()]);
+        cache.dirty_prefixes = BTreeSet::from([first_key.clone(), second_key.clone()]);
+
+        cache.evict_excess_prefixes();
+
+        assert!(!cache.prefixes.contains_key(&first_key));
+        assert!(cache.prefixes.contains_key(&second_key));
+        assert!(cache.prefix_bytes <= budget);
+        assert_eq!(cache.prefix_sizes.len(), cache.prefixes.len());
+        assert!(!cache.dirty_prefixes.contains(&first_key));
+        assert!(cache.dirty_prefixes.contains(&second_key));
+        let restored = cache
+            .disk
+            .as_ref()
+            .unwrap()
+            .load_prefix(&first.cpu.tokens)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.cpu.tokens, first.cpu.tokens);
+    }
+
+    #[test]
+    fn checkpoint_pruning_removes_dangling_manifest_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = disk_cache(tmp.path().join("cache"));
+        let state = fixture_state();
+        cache
+            .persist_session("session", std::slice::from_ref(&state))
+            .unwrap();
+        let key = FlashMoeDiskCache::token_key(&state.cpu.tokens);
+
+        cache.max_bytes = 1;
+        cache.prune(&[]).unwrap();
+
+        assert!(!cache.session_manifest_path("session").exists());
+        assert!(!cache.checkpoint_path(&key).exists());
+    }
+
+    #[test]
+    fn partial_checkpoint_falls_back_to_truthful_fresh_prefill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = disk_cache(tmp.path().join("cache"));
+        cache.ensure_namespace(true).unwrap();
+        let tokens = [10_u32, 20];
+        let key = FlashMoeDiskCache::token_key(&tokens);
+        let path = cache.checkpoint_path(&key);
+        secure_directory(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"interrupted checkpoint").unwrap();
+        let mut sessions = FlashMoeSessionCache::new(
+            Some(cache),
+            2,
+            crate::config::DEFAULT_FLASHMOE_MEMORY_PROMPT_ROOT_MAX_BYTES,
+        );
+
+        let generation =
+            sessions.begin_generation_with_base(Some("session"), vec![10, 20, 30], 2, 1, 2);
+
+        assert_eq!(generation.prefill_start(), 0);
+        assert_eq!(generation.cache_source(), PromptCacheSource::None);
+        assert_eq!(
+            generation.cache_miss_reason(),
+            Some(PromptCacheMissReason::CacheUnreadable)
+        );
+    }
+
+    #[test]
+    fn full_cache_budget_skips_oversized_checkpoint_without_partial_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = disk_cache(tmp.path().join("cache"));
+        let state = fixture_state();
+        cache.max_bytes = checkpoint_size(&state).saturating_sub(1);
+
+        cache.persist_prefix(&state).unwrap();
+
+        assert!(cache.load_prefix(&state.cpu.tokens).unwrap().is_none());
+        assert!(
+            !cache
+                .checkpoint_path(&FlashMoeDiskCache::token_key(&state.cpu.tokens))
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_loading_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = disk_cache(tmp.path().join("cache"));
+        let tokens = [10_u32, 20];
+        let key = FlashMoeDiskCache::token_key(&tokens);
+        let path = cache.checkpoint_path(&key);
+        secure_directory(path.parent().unwrap()).unwrap();
+        let outside = tmp.path().join("outside.bin");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &path).unwrap();
+
+        let error = cache.load_prefix(&tokens).unwrap_err();
+        assert!(format!("{error:#}").contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_loading_rejects_configured_root_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let storage_root = tmp.path().join("cache-link");
+        symlink(&outside, &storage_root).unwrap();
+        let cache = FlashMoeDiskCache {
+            root: storage_root.join(CACHE_VERSION).join("model"),
+            storage_root,
+            fingerprint: [9_u8; 32],
+            layers: 2,
+            max_bytes: 1024 * 1024,
+        };
+
+        let error = cache.load_prefix(&[10, 20]).unwrap_err();
+        assert!(format!("{error:#}").contains("symlink"));
     }
 }

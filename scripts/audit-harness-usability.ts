@@ -11,6 +11,7 @@ import type { CorpusCase } from "./run-harness-task-corpus.ts";
 export type AuditClassification =
   | "positive_evidence"
   | "pb_defect_false_verification"
+  | "pb_defect_telemetry_invariant"
   | "model_or_control_limit"
   | "experiment_error";
 
@@ -54,16 +55,35 @@ export interface UsabilityAudit {
     cached_prefix_tokens?: number;
     fresh_prefill_tokens?: number;
     prompt_cache_miss_reasons: Record<string, number>;
+    prompt_cache_lookup_details: Record<string, number>;
+    prompt_cache_miss_reasons_by_stage: Record<
+      string,
+      Record<string, number>
+    >;
+    prompt_cache_miss_reasons_by_authority_class: Record<
+      string,
+      Record<string, number>
+    >;
+    prompt_cache_reconciliation_failures: number;
     eligible_root_tokens?: number;
     reused_root_tokens?: number;
     prompt_root_hit_invocations?: number;
     prompt_root_authority_classes: Record<string, number>;
     refill_cache_lookup_wall_ms?: number;
+    refill_disk_read_decode_wall_ms?: number;
+    refill_cpu_state_validation_allocation_wall_ms?: number;
     refill_state_hydration_wall_ms?: number;
     refill_fresh_suffix_prefill_wall_ms?: number;
     refill_snapshot_capture_wall_ms?: number;
+    refill_persistence_queue_wall_ms?: number;
+    prefill_command_kinds: Record<string, number>;
+    prefill_command_reasons: Record<string, number>;
     generated_tokens?: number;
     tool_calls?: number;
+    cache_persistence_queued_checkpoints?: number;
+    cache_persistence_completed_checkpoints?: number;
+    cache_persistence_wall_ms?: number;
+    cache_persistence_failures?: number;
     total_energy_kwh?: number;
     energy_complete?: boolean;
   };
@@ -91,16 +111,32 @@ export interface UsabilityAggregate {
   total_cached_prefix_tokens: number;
   total_fresh_prefill_tokens: number;
   prompt_cache_miss_reasons: Record<string, number>;
+  prompt_cache_lookup_details: Record<string, number>;
+  prompt_cache_miss_reasons_by_stage: Record<string, Record<string, number>>;
+  prompt_cache_miss_reasons_by_authority_class: Record<
+    string,
+    Record<string, number>
+  >;
+  total_prompt_cache_reconciliation_failures: number;
   total_eligible_root_tokens: number;
   total_reused_root_tokens: number;
   total_prompt_root_hit_invocations: number;
   prompt_root_authority_classes: Record<string, number>;
   total_refill_cache_lookup_wall_ms: number;
+  total_refill_disk_read_decode_wall_ms: number;
+  total_refill_cpu_state_validation_allocation_wall_ms: number;
   total_refill_state_hydration_wall_ms: number;
   total_refill_fresh_suffix_prefill_wall_ms: number;
   total_refill_snapshot_capture_wall_ms: number;
+  total_refill_persistence_queue_wall_ms: number;
+  prefill_command_kinds: Record<string, number>;
+  prefill_command_reasons: Record<string, number>;
   total_generated_tokens: number;
   total_tool_calls: number;
+  total_cache_persistence_queued_checkpoints: number;
+  total_cache_persistence_completed_checkpoints: number;
+  total_cache_persistence_wall_ms: number;
+  total_cache_persistence_failures: number;
   total_energy_kwh: number;
   energy_complete: boolean;
 }
@@ -171,9 +207,11 @@ export function classifyAudit(
   pbVerified: boolean,
   experimentValid = true,
   verifiedClean = officialPassed && pbVerified,
+  telemetryValid = true,
 ): AuditClassification {
   if (!experimentValid) return "experiment_error";
   if (pbVerified && !verifiedClean) return "pb_defect_false_verification";
+  if (!telemetryValid) return "pb_defect_telemetry_invariant";
   if (verifiedClean) return "positive_evidence";
   return "model_or_control_limit";
 }
@@ -279,17 +317,37 @@ export async function auditScratch(
       cached_prefix_tokens: summary.cached_prefix_tokens,
       fresh_prefill_tokens: summary.fresh_prefill_tokens,
       prompt_cache_miss_reasons: summary.prompt_cache_miss_reasons,
+      prompt_cache_lookup_details: summary.prompt_cache_lookup_details,
+      prompt_cache_miss_reasons_by_stage:
+        summary.prompt_cache_miss_reasons_by_stage,
+      prompt_cache_miss_reasons_by_authority_class:
+        summary.prompt_cache_miss_reasons_by_authority_class,
+      prompt_cache_reconciliation_failures:
+        summary.prompt_cache_reconciliation_failures,
       eligible_root_tokens: summary.eligible_root_tokens,
       reused_root_tokens: summary.reused_root_tokens,
       prompt_root_hit_invocations: summary.prompt_root_hit_invocations,
       prompt_root_authority_classes: summary.prompt_root_authority_classes,
       refill_cache_lookup_wall_ms: summary.refill_cache_lookup_wall_ms,
+      refill_disk_read_decode_wall_ms: summary.refill_disk_read_decode_wall_ms,
+      refill_cpu_state_validation_allocation_wall_ms:
+        summary.refill_cpu_state_validation_allocation_wall_ms,
       refill_state_hydration_wall_ms: summary.refill_state_hydration_wall_ms,
       refill_fresh_suffix_prefill_wall_ms:
         summary.refill_fresh_suffix_prefill_wall_ms,
       refill_snapshot_capture_wall_ms: summary.refill_snapshot_capture_wall_ms,
+      refill_persistence_queue_wall_ms:
+        summary.refill_persistence_queue_wall_ms,
+      prefill_command_kinds: summary.prefill_command_kinds,
+      prefill_command_reasons: summary.prefill_command_reasons,
       generated_tokens: summary.generated_tokens,
       tool_calls: summary.tool_calls,
+      cache_persistence_queued_checkpoints:
+        summary.cache_persistence_queued_checkpoints,
+      cache_persistence_completed_checkpoints:
+        summary.cache_persistence_completed_checkpoints,
+      cache_persistence_wall_ms: summary.cache_persistence_wall_ms,
+      cache_persistence_failures: summary.cache_persistence_failures,
       total_energy_kwh: summary.total_energy_kwh,
       energy_complete: summary.energy_complete,
     },
@@ -298,6 +356,7 @@ export async function auditScratch(
       summary.verified_completed,
       true,
       verifiedClean,
+      summary.prompt_cache_reconciliation_failures === 0,
     ),
   };
 }
@@ -318,7 +377,18 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
     byLanguage[audit.language] = language;
   }
   const promptCacheMissReasons: Record<string, number> = {};
+  const promptCacheLookupDetails: Record<string, number> = {};
+  const promptCacheMissReasonsByStage: Record<
+    string,
+    Record<string, number>
+  > = {};
+  const promptCacheMissReasonsByAuthorityClass: Record<
+    string,
+    Record<string, number>
+  > = {};
   const promptRootAuthorityClasses: Record<string, number> = {};
+  const prefillCommandKinds: Record<string, number> = {};
+  const prefillCommandReasons: Record<string, number> = {};
   for (const audit of audits) {
     for (
       const [reason, count] of Object.entries(
@@ -326,6 +396,53 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
       )
     ) {
       promptCacheMissReasons[reason] = (promptCacheMissReasons[reason] ?? 0) +
+        count;
+    }
+    for (
+      const [detail, count] of Object.entries(
+        audit.efficiency.prompt_cache_lookup_details,
+      )
+    ) {
+      promptCacheLookupDetails[detail] =
+        (promptCacheLookupDetails[detail] ?? 0) + count;
+    }
+    for (
+      const [stage, reasons] of Object.entries(
+        audit.efficiency.prompt_cache_miss_reasons_by_stage,
+      )
+    ) {
+      for (const [reason, count] of Object.entries(reasons)) {
+        const grouped = promptCacheMissReasonsByStage[stage] ?? {};
+        grouped[reason] = (grouped[reason] ?? 0) + count;
+        promptCacheMissReasonsByStage[stage] = grouped;
+      }
+    }
+    for (
+      const [authority, reasons] of Object.entries(
+        audit.efficiency.prompt_cache_miss_reasons_by_authority_class,
+      )
+    ) {
+      for (const [reason, count] of Object.entries(reasons)) {
+        const grouped = promptCacheMissReasonsByAuthorityClass[authority] ?? {};
+        grouped[reason] = (grouped[reason] ?? 0) + count;
+        promptCacheMissReasonsByAuthorityClass[authority] = grouped;
+      }
+    }
+  }
+  for (const audit of audits) {
+    for (
+      const [kind, count] of Object.entries(
+        audit.efficiency.prefill_command_kinds,
+      )
+    ) {
+      prefillCommandKinds[kind] = (prefillCommandKinds[kind] ?? 0) + count;
+    }
+    for (
+      const [reason, count] of Object.entries(
+        audit.efficiency.prefill_command_reasons,
+      )
+    ) {
+      prefillCommandReasons[reason] = (prefillCommandReasons[reason] ?? 0) +
         count;
     }
   }
@@ -371,6 +488,15 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
       0,
     ),
     prompt_cache_miss_reasons: promptCacheMissReasons,
+    prompt_cache_lookup_details: promptCacheLookupDetails,
+    prompt_cache_miss_reasons_by_stage: promptCacheMissReasonsByStage,
+    prompt_cache_miss_reasons_by_authority_class:
+      promptCacheMissReasonsByAuthorityClass,
+    total_prompt_cache_reconciliation_failures: audits.reduce(
+      (total, item) =>
+        total + item.efficiency.prompt_cache_reconciliation_failures,
+      0,
+    ),
     total_eligible_root_tokens: audits.reduce(
       (total, item) => total + (item.efficiency.eligible_root_tokens ?? 0),
       0,
@@ -390,6 +516,17 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
         total + (item.efficiency.refill_cache_lookup_wall_ms ?? 0),
       0,
     ),
+    total_refill_disk_read_decode_wall_ms: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.refill_disk_read_decode_wall_ms ?? 0),
+      0,
+    ),
+    total_refill_cpu_state_validation_allocation_wall_ms: audits.reduce(
+      (total, item) =>
+        total +
+        (item.efficiency.refill_cpu_state_validation_allocation_wall_ms ?? 0),
+      0,
+    ),
     total_refill_state_hydration_wall_ms: audits.reduce(
       (total, item) =>
         total + (item.efficiency.refill_state_hydration_wall_ms ?? 0),
@@ -405,12 +542,38 @@ export function aggregateAudits(audits: UsabilityAudit[]): UsabilityAggregate {
         total + (item.efficiency.refill_snapshot_capture_wall_ms ?? 0),
       0,
     ),
+    total_refill_persistence_queue_wall_ms: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.refill_persistence_queue_wall_ms ?? 0),
+      0,
+    ),
+    prefill_command_kinds: prefillCommandKinds,
+    prefill_command_reasons: prefillCommandReasons,
     total_generated_tokens: audits.reduce(
       (total, item) => total + (item.efficiency.generated_tokens ?? 0),
       0,
     ),
     total_tool_calls: audits.reduce(
       (total, item) => total + (item.efficiency.tool_calls ?? 0),
+      0,
+    ),
+    total_cache_persistence_queued_checkpoints: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.cache_persistence_queued_checkpoints ?? 0),
+      0,
+    ),
+    total_cache_persistence_completed_checkpoints: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.cache_persistence_completed_checkpoints ?? 0),
+      0,
+    ),
+    total_cache_persistence_wall_ms: audits.reduce(
+      (total, item) => total + (item.efficiency.cache_persistence_wall_ms ?? 0),
+      0,
+    ),
+    total_cache_persistence_failures: audits.reduce(
+      (total, item) =>
+        total + (item.efficiency.cache_persistence_failures ?? 0),
       0,
     ),
     total_energy_kwh: audits.reduce(

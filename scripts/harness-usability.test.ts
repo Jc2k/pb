@@ -86,6 +86,11 @@ Deno.test("audit classification treats false verification as a pb defect", () =>
       "pb_defect_false_verification",
     "dirty or unsafe verified completion",
   );
+  assert(
+    classifyAudit(true, true, true, true, false) ===
+      "pb_defect_telemetry_invariant",
+    "invalid cache telemetry",
+  );
 });
 
 function fakeAudit(
@@ -135,16 +140,33 @@ function fakeAudit(
       cached_prefix_tokens: 5,
       fresh_prefill_tokens: 25,
       prompt_cache_miss_reasons: { cold_session: 1 },
+      prompt_cache_lookup_details: { exact_root_checkpoint_missing: 1 },
+      prompt_cache_miss_reasons_by_stage: {
+        planning: { cold_session: 1 },
+      },
+      prompt_cache_miss_reasons_by_authority_class: {
+        planning: { cold_session: 1 },
+      },
+      prompt_cache_reconciliation_failures: 0,
       eligible_root_tokens: 10,
       reused_root_tokens: 5,
       prompt_root_hit_invocations: 1,
       prompt_root_authority_classes: { planning: 1 },
       refill_cache_lookup_wall_ms: 1,
+      refill_disk_read_decode_wall_ms: 5,
+      refill_cpu_state_validation_allocation_wall_ms: 6,
       refill_state_hydration_wall_ms: 2,
       refill_fresh_suffix_prefill_wall_ms: 3,
       refill_snapshot_capture_wall_ms: 4,
+      refill_persistence_queue_wall_ms: 7,
+      prefill_command_kinds: { qwen_layer_major_matrix: 1 },
+      prefill_command_reasons: { fresh_suffix_at_or_above_threshold: 1 },
       generated_tokens: 20,
       tool_calls: 2,
+      cache_persistence_queued_checkpoints: 3,
+      cache_persistence_completed_checkpoints: 3,
+      cache_persistence_wall_ms: 8,
+      cache_persistence_failures: 0,
       total_energy_kwh: 0.001,
       energy_complete: true,
     },
@@ -179,6 +201,11 @@ Deno.test("aggregate keeps correctness, verified completion, and efficiency sepa
     "root authorities",
   );
   assert(aggregate.total_refill_cache_lookup_wall_ms === 3, "refill lookup");
+  assert(aggregate.total_refill_disk_read_decode_wall_ms === 15, "refill disk");
+  assert(
+    aggregate.total_refill_cpu_state_validation_allocation_wall_ms === 18,
+    "refill validation",
+  );
   assert(
     aggregate.total_refill_state_hydration_wall_ms === 6,
     "refill hydration",
@@ -192,8 +219,50 @@ Deno.test("aggregate keeps correctness, verified completion, and efficiency sepa
     "refill snapshot",
   );
   assert(
+    aggregate.total_refill_persistence_queue_wall_ms === 21,
+    "refill queue",
+  );
+  assert(
+    aggregate.prefill_command_kinds.qwen_layer_major_matrix === 3,
+    "prefill commands",
+  );
+  assert(
+    aggregate.prefill_command_reasons.fresh_suffix_at_or_above_threshold === 3,
+    "prefill reasons",
+  );
+  assert(
+    aggregate.total_cache_persistence_queued_checkpoints === 9,
+    "persistence queued",
+  );
+  assert(
+    aggregate.total_cache_persistence_completed_checkpoints === 9,
+    "persistence completed",
+  );
+  assert(aggregate.total_cache_persistence_wall_ms === 24, "persistence wall");
+  assert(
+    aggregate.total_cache_persistence_failures === 0,
+    "persistence failures",
+  );
+  assert(
     aggregate.prompt_cache_miss_reasons.cold_session === 3,
     "cache misses",
+  );
+  assert(
+    aggregate.prompt_cache_lookup_details.exact_root_checkpoint_missing === 3,
+    "cache lookup details",
+  );
+  assert(
+    aggregate.prompt_cache_miss_reasons_by_stage.planning.cold_session === 3,
+    "cache misses by stage",
+  );
+  assert(
+    aggregate.prompt_cache_miss_reasons_by_authority_class.planning
+      .cold_session === 3,
+    "cache misses by authority",
+  );
+  assert(
+    aggregate.total_prompt_cache_reconciliation_failures === 0,
+    "cache reconciliation",
   );
   assert(aggregate.total_tool_calls === 6, "tools");
   assert(aggregate.energy_complete, "energy completeness");

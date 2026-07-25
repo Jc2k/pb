@@ -13,6 +13,52 @@ fn validate_structured_constraint_request(request: &StructuredGenerationRequest)
     Ok(())
 }
 
+fn prefill_command_diagnostic(
+    deepseek_v4: bool,
+    graph: QwenPrefillGraphCapability,
+    mode: NativePrefillMode,
+    forced_chunk_tokens: Option<usize>,
+    fresh_suffix_tokens: usize,
+    resources: Option<&FlashMoeMetalResourceSnapshot>,
+) -> (&'static str, &'static str) {
+    if fresh_suffix_tokens == 0 {
+        return ("cache_only", "complete_root_restore");
+    }
+    if deepseek_v4 {
+        return if deepseek_v4_uses_batch_prefill(fresh_suffix_tokens) {
+            (
+                "deepseek_layer_major_batch",
+                "fresh_suffix_at_or_above_threshold",
+            )
+        } else {
+            ("scalar_token", "fresh_suffix_below_threshold")
+        };
+    }
+    if mode == NativePrefillMode::Scalar {
+        return ("scalar_token", "forced_scalar_reference");
+    }
+    if !graph.supports_layer_major() {
+        return ("scalar_token", "layer_major_graph_unsupported");
+    }
+    if forced_chunk_tokens.is_some() || mode == NativePrefillMode::LayerMajor {
+        return (
+            "qwen_layer_major_matrix",
+            "forced_layer_major_qualification",
+        );
+    }
+    if qwen_prefill_chunk_tokens(graph, fresh_suffix_tokens, resources).is_some() {
+        return (
+            "qwen_layer_major_matrix",
+            "fresh_suffix_at_or_above_threshold",
+        );
+    }
+    if fresh_suffix_tokens < QWEN_BATCH_PREFILL_MIN_TOKENS {
+        ("scalar_token", "fresh_suffix_below_threshold")
+    } else {
+        ("scalar_token", "layer_major_resource_limit")
+    }
+}
+
 impl FlashMoeEngine {
     pub fn set_metal_working_set_limit_bytes(&mut self, limit: usize) -> Result<()> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -446,19 +492,18 @@ impl FlashMoeEngine {
         } else {
             base_prefix_len
         };
-        let prompt_root = (stable_root_len > 0).then(|| {
-            let mut digest = Sha256::new();
-            for token in &prompt_tokens[..stable_root_len] {
-                digest.update(token.to_le_bytes());
-            }
-            crate::inference::BackendPromptRoot {
-                descriptor_version: crate::inference::PROMPT_ROOT_DESCRIPTOR_VERSION,
-                backend: "flashmoe".to_string(),
-                model_namespace_sha256:
-                    crate::inference::flashmoe::session_cache::model_fingerprint_hex(&self.plan),
-                rendered_token_sha256: format!("{:x}", digest.finalize()),
-                tokens: stable_root_len,
-            }
+        let prompt_root = (stable_root_len > 0).then(|| crate::inference::BackendPromptRoot {
+            descriptor_version: crate::inference::PROMPT_ROOT_DESCRIPTOR_VERSION,
+            backend: "flashmoe".to_string(),
+            cache_format_version: crate::inference::flashmoe::session_cache::CACHE_VERSION
+                .to_string(),
+            model_namespace_sha256:
+                crate::inference::flashmoe::session_cache::model_fingerprint_hex(&self.plan),
+            rendered_token_sha256: crate::inference::rendered_token_sha256(
+                prompt_tokens[..stable_root_len].iter().copied(),
+            ),
+            tokens: stable_root_len,
+            stage: request.stage_root.clone(),
         });
         let max_tokens = request.max_tokens.max(0) as usize;
         validate_context_capacity(prompt_tokens.len(), max_tokens, request.context_size)?;
@@ -539,7 +584,6 @@ impl FlashMoeEngine {
             request.tools.len(),
             session_id.unwrap_or("<none>")
         );
-        let cache_lookup_started = Instant::now();
         let mut generation = if deepseek_v4 {
             let (prefill_start, cached_last_hidden, cache_source, restore_ms, miss_reason) =
                 if let Some((prefix, hidden)) = deepseek_reuse {
@@ -572,6 +616,9 @@ impl FlashMoeEngine {
                 self.config.num_hidden_layers,
                 cache_source,
                 restore_ms,
+                duration_millis(deepseek_cache_lookup_wall),
+                0,
+                0,
                 miss_reason,
             )?
         } else {
@@ -583,16 +630,16 @@ impl FlashMoeEngine {
                 self.config.num_hidden_layers,
             )
         };
-        let cache_lookup_wall = if deepseek_v4 {
-            deepseek_cache_lookup_wall
-        } else {
-            cache_lookup_started.elapsed()
-        };
+        let cache_lookup_wall_ms = generation.cache_lookup_ms();
+        let disk_read_decode_wall_ms = generation.disk_read_decode_ms();
+        let cpu_state_validation_allocation_wall_ms =
+            generation.cpu_state_validation_allocation_ms();
         let prefill_start = generation.prefill_start();
         let prompt_len = generation.prompt_len();
         let prompt_cache_source = generation.cache_source();
         let prompt_cache_restore_ms = generation.cache_restore_ms();
         let prompt_cache_miss_reason = generation.cache_miss_reason();
+        let prompt_cache_lookup_detail = generation.cache_lookup_detail();
         if prefill_start > 0 {
             debug!(
                 target: "flashmoe::lifecycle",
@@ -614,9 +661,18 @@ impl FlashMoeEngine {
             state_hydration_wall += hydration_started.elapsed();
         }
         let prefill_resources_before = self.metal_resource_snapshot();
+        let (prefill_command_kind, prefill_command_reason) = prefill_command_diagnostic(
+            deepseek_v4,
+            self.qwen_prefill_graph,
+            request.prefill_mode,
+            request.prefill_chunk_tokens,
+            prompt_len.saturating_sub(prefill_start),
+            prefill_resources_before.as_ref(),
+        );
         let prefill_or_ttft_started = Instant::now();
         let mut fresh_suffix_prefill_wall = Duration::ZERO;
         let mut snapshot_capture_wall = Duration::ZERO;
+        let mut persistence_queue_wall = Duration::ZERO;
         let mut deepseek_stable_checkpoint = None;
         let prefill_hidden = if prefill_start == prompt_len {
             debug!(
@@ -1019,7 +1075,11 @@ impl FlashMoeEngine {
         }
 
         if !deepseek_v4 {
-            self.session_cache.commit_generation(&mut generation)?;
+            let queue_started = Instant::now();
+            let persistence = self.session_cache.commit_generation(&mut generation)?;
+            persistence_queue_wall += queue_started
+                .elapsed()
+                .saturating_sub(Duration::from_millis(persistence.wall_ms));
         }
 
         let stopped_by_terminal_tool_call = generation.stopped_by_terminal_tool_call();
@@ -1093,33 +1153,17 @@ impl FlashMoeEngine {
                 }
             }
             .to_string(),
-            prefill_command_kind: if prefill_start == prompt_len {
-                "cache_only"
-            } else if deepseek_v4
-                && deepseek_v4_uses_batch_prefill(prompt_len.saturating_sub(prefill_start))
-            {
-                "deepseek_layer_major_batch"
-            } else if self.qwen_prefill_graph.supports_layer_major()
-                && (request.prefill_mode == NativePrefillMode::LayerMajor
-                    || (request.prefill_mode == NativePrefillMode::Auto
-                        && qwen_prefill_chunk_tokens(
-                            self.qwen_prefill_graph,
-                            prompt_len.saturating_sub(prefill_start),
-                            self.metal_resource_snapshot().as_ref(),
-                        )
-                        .is_some()))
-            {
-                "qwen_layer_major_matrix"
-            } else {
-                "scalar_token"
-            }
-            .to_string(),
+            prefill_command_kind: prefill_command_kind.to_string(),
+            prefill_command_reason: prefill_command_reason.to_string(),
             thinking_enabled: request.enable_thinking && self.supports_thinking(),
             refill: NativeRefillStats {
-                cache_lookup_wall_ms: duration_millis(cache_lookup_wall),
+                cache_lookup_wall_ms,
+                disk_read_decode_wall_ms,
+                cpu_state_validation_allocation_wall_ms,
                 state_hydration_wall_ms: duration_millis(state_hydration_wall),
                 fresh_suffix_prefill_wall_ms: duration_millis(fresh_suffix_prefill_wall),
                 snapshot_capture_wall_ms: duration_millis(snapshot_capture_wall),
+                persistence_queue_wall_ms: duration_millis(persistence_queue_wall),
             },
             prefill_state,
         };
@@ -1135,6 +1179,7 @@ impl FlashMoeEngine {
                 prefilled_tokens: prompt_len.saturating_sub(prefill_start),
                 restore_ms: prompt_cache_restore_ms,
                 miss_reason: prompt_cache_miss_reason,
+                lookup_detail: prompt_cache_lookup_detail,
                 root: prompt_root,
             },
             tool_constraints,
@@ -1702,6 +1747,7 @@ impl FlashMoeEngine {
                 prefilled_tokens: runtime_inputs.prompt_tokens().len(),
                 restore_ms: 0,
                 miss_reason: Some(crate::inference::PromptCacheMissReason::RuntimeUnsupported),
+                lookup_detail: None,
                 root: None,
             },
             tool_constraints: None,
@@ -1721,6 +1767,7 @@ impl FlashMoeEngine {
                 }
                 .to_string(),
                 prefill_command_kind: "scalar_multimodal".to_string(),
+                prefill_command_reason: "multimodal_runtime".to_string(),
                 thinking_enabled: false,
                 ..NativeGenerationStats::default()
             },
@@ -2077,5 +2124,45 @@ impl FlashMoeEngine {
             active_experts_per_token: Some(self.routing_policy.active_experts),
             shared_experts: nonzero_usize(self.model_layout.shared_experts),
         }
+    }
+}
+
+#[cfg(test)]
+mod refill_selection_tests {
+    use super::*;
+
+    #[test]
+    fn auto_refill_selection_reports_the_actual_suffix_boundary_reason() {
+        let graph = QwenPrefillGraphCapability::LayerMajorAffineQ4;
+        assert_eq!(
+            prefill_command_diagnostic(false, graph, NativePrefillMode::Auto, None, 0, None),
+            ("cache_only", "complete_root_restore")
+        );
+        assert_eq!(
+            prefill_command_diagnostic(false, graph, NativePrefillMode::Auto, None, 31, None),
+            ("scalar_token", "fresh_suffix_below_threshold")
+        );
+        assert_eq!(
+            prefill_command_diagnostic(false, graph, NativePrefillMode::Auto, None, 32, None),
+            (
+                "qwen_layer_major_matrix",
+                "fresh_suffix_at_or_above_threshold"
+            )
+        );
+        assert_eq!(
+            prefill_command_diagnostic(false, graph, NativePrefillMode::Scalar, None, 256, None),
+            ("scalar_token", "forced_scalar_reference")
+        );
+        assert_eq!(
+            prefill_command_diagnostic(
+                false,
+                QwenPrefillGraphCapability::ScalarToken,
+                NativePrefillMode::Auto,
+                None,
+                256,
+                None,
+            ),
+            ("scalar_token", "layer_major_graph_unsupported")
+        );
     }
 }

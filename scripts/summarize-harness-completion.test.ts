@@ -59,6 +59,7 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
         JSON.stringify({
           event: {
             type: "llm_invocation",
+            workflow_stage: "planning",
             prompt_tokens: 120,
             prompt_cache: {
               cached_tokens: 80,
@@ -72,12 +73,17 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
             },
             native: {
               fresh_prefill_tokens: 40,
+              prefill_command_kind: "qwen_layer_major_matrix",
+              prefill_command_reason: "fresh_suffix_at_or_above_threshold",
               tool_schema_sha256: "schema-a",
               refill: {
                 cache_lookup_wall_ms: 2,
+                disk_read_decode_wall_ms: 4,
+                cpu_state_validation_allocation_wall_ms: 6,
                 state_hydration_wall_ms: 3,
                 fresh_suffix_prefill_wall_ms: 30,
                 snapshot_capture_wall_ms: 5,
+                persistence_queue_wall_ms: 8,
               },
             },
           },
@@ -85,11 +91,13 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
         JSON.stringify({
           event: {
             type: "llm_invocation",
+            workflow_stage: "code_review",
             prompt_tokens: 80,
             prompt_cache: {
               cached_tokens: 0,
               prefilled_tokens: 80,
               miss_reason: "prompt_diverged",
+              lookup_detail: "session_diverged_root_missing",
               root: {
                 tokens: 50,
                 reused_tokens: 0,
@@ -99,12 +107,17 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
             },
             native: {
               fresh_prefill_tokens: 80,
+              prefill_command_kind: "qwen_layer_major_matrix",
+              prefill_command_reason: "fresh_suffix_at_or_above_threshold",
               tool_schema_sha256: "schema-b",
               refill: {
                 cache_lookup_wall_ms: 7,
+                disk_read_decode_wall_ms: 10,
+                cpu_state_validation_allocation_wall_ms: 12,
                 state_hydration_wall_ms: 11,
                 fresh_suffix_prefill_wall_ms: 60,
                 snapshot_capture_wall_ms: 13,
+                persistence_queue_wall_ms: 14,
               },
             },
           },
@@ -117,6 +130,10 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
             prompt_tokens: 200,
             generated_tokens: 100,
             tool_calls: 4,
+            cache_persistence_queued_checkpoints: 5,
+            cache_persistence_completed_checkpoints: 5,
+            cache_persistence_wall_ms: 17,
+            cache_persistence_failures: 0,
             total_energy_kwh: 0.002,
             energy_complete: true,
           },
@@ -149,8 +166,34 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
       summary.prompt_cache_miss_reasons.prompt_diverged === 1,
       JSON.stringify(summary),
     );
+    assert(
+      summary.prompt_cache_lookup_details.session_diverged_root_missing === 1,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.prompt_cache_miss_reasons_by_stage.code_review
+        .prompt_diverged === 1,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.prompt_cache_miss_reasons_by_authority_class.code_review
+        .prompt_diverged === 1,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.prompt_cache_reconciliation_failures === 0,
+      JSON.stringify(summary),
+    );
     assert(summary.tool_schema_sha256s.length === 2, JSON.stringify(summary));
     assert(summary.refill_cache_lookup_wall_ms === 9, JSON.stringify(summary));
+    assert(
+      summary.refill_disk_read_decode_wall_ms === 14,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.refill_cpu_state_validation_allocation_wall_ms === 18,
+      JSON.stringify(summary),
+    );
     assert(
       summary.refill_state_hydration_wall_ms === 14,
       JSON.stringify(summary),
@@ -163,6 +206,28 @@ Deno.test("summarizeScratch keeps completion and efficiency evidence separate", 
       summary.refill_snapshot_capture_wall_ms === 18,
       JSON.stringify(summary),
     );
+    assert(
+      summary.refill_persistence_queue_wall_ms === 22,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.prefill_command_kinds.qwen_layer_major_matrix === 2,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.prefill_command_reasons.fresh_suffix_at_or_above_threshold === 2,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.cache_persistence_queued_checkpoints === 5,
+      JSON.stringify(summary),
+    );
+    assert(
+      summary.cache_persistence_completed_checkpoints === 5,
+      JSON.stringify(summary),
+    );
+    assert(summary.cache_persistence_wall_ms === 17, JSON.stringify(summary));
+    assert(summary.cache_persistence_failures === 0, JSON.stringify(summary));
   } finally {
     await Deno.remove(root, { recursive: true });
   }

@@ -234,11 +234,23 @@ Deno.test("session metrics expose the canonical estimate and its measurement qua
   ok(component.includes("e.prompt_cache.cached_tokens"));
   ok(component.includes("e.prompt_cache.prefilled_tokens"));
   ok(component.includes("e.prompt_cache.miss_reason"));
+  ok(component.includes("e.prompt_cache.lookup_detail"));
   ok(component.includes("e.prompt_cache.root.reused_tokens"));
   ok(component.includes("e.prompt_cache.root.tokens"));
   ok(component.includes("e.prompt_cache.root.authority_class"));
+  ok(types.includes("cache_format_version"));
   ok(component.includes("e.native?.refill"));
   ok(component.includes("e.native.refill.fresh_suffix_prefill_wall_ms"));
+  ok(component.includes("e.native.prefill_command_kind"));
+  ok(component.includes("e.native.prefill_command_reason"));
+  ok(component.includes("e.native.refill.disk_read_decode_wall_ms"));
+  ok(
+    component.includes(
+      "e.native.refill.cpu_state_validation_allocation_wall_ms",
+    ),
+  );
+  ok(component.includes("e.native.refill.persistence_queue_wall_ms"));
+  ok(component.includes("e.cache_persistence_completed_checkpoints"));
   ok(component.includes('e.prompt_cache.source.replaceAll("_", " ")'));
   ok(component.includes("Power-estimate details"));
   ok(component.includes("Measurement coverage"));

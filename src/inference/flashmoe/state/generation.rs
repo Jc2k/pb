@@ -17,8 +17,13 @@ pub(in crate::inference::flashmoe) struct FlashMoeGenerationState {
         Option<FlashMoeLinearAttentionSessionSnapshot>,
     pub(in crate::inference::flashmoe) cache_source: PromptCacheSource,
     pub(in crate::inference::flashmoe) cache_restore_ms: u64,
+    pub(in crate::inference::flashmoe) cache_lookup_ms: u64,
+    pub(in crate::inference::flashmoe) disk_read_decode_ms: u64,
+    pub(in crate::inference::flashmoe) cpu_state_validation_allocation_ms: u64,
     pub(in crate::inference::flashmoe) cache_miss_reason:
         Option<crate::inference::PromptCacheMissReason>,
+    pub(in crate::inference::flashmoe) cache_lookup_detail:
+        Option<crate::inference::PromptCacheLookupDetail>,
     pub(in crate::inference::flashmoe) base_prefix_len: usize,
     pub(in crate::inference::flashmoe) base_cache: Option<FlashMoeSessionState<KvCache>>,
     pub(in crate::inference::flashmoe) base_recurrent:
@@ -59,8 +64,24 @@ impl FlashMoeGenerationState {
         self.cache_restore_ms
     }
 
+    pub(crate) fn cache_lookup_ms(&self) -> u64 {
+        self.cache_lookup_ms
+    }
+
+    pub(crate) fn disk_read_decode_ms(&self) -> u64 {
+        self.disk_read_decode_ms
+    }
+
+    pub(crate) fn cpu_state_validation_allocation_ms(&self) -> u64 {
+        self.cpu_state_validation_allocation_ms
+    }
+
     pub(crate) fn cache_miss_reason(&self) -> Option<crate::inference::PromptCacheMissReason> {
         self.cache_miss_reason
+    }
+
+    pub(crate) fn cache_lookup_detail(&self) -> Option<crate::inference::PromptCacheLookupDetail> {
+        self.cache_lookup_detail
     }
 
     pub(crate) fn base_prefix_len(&self) -> usize {

@@ -137,6 +137,13 @@ Full-attention KV, compressed MLA KV, linear-attention conv/SSM state, final hid
 ids are stored together, so hybrid Qwen and GLM checkpoints restore the state their forward graph
 actually needs.
 
+Shared prompt roots use an LRU bounded by bytes rather than by a guessed stage count. The default
+in-memory prompt-root budget is 4 GiB; set `flashmoe.memory_prompt_root_max_bytes` to another
+positive byte count. When a dirty root crosses that budget, pb attempts the configured durable
+cache write before releasing the memory copy. Durable successes and failures are reported in the
+session metrics; a failed write is discarded under the memory bound and causes a truthful fresh
+prefill if that root is needed again.
+
 DeepSeek V4 Flash is deliberately excluded from that reuse. Its four hyperconnection
 streams plus raw, compressed, and indexer KV form one typed state that the current snapshot format
 cannot represent. Every ordinary DeepSeek request therefore starts from a freshly reset
@@ -156,13 +163,25 @@ or `inference.flashmoe_session_cache_enabled` to `false` to retain memory reuse 
 prompt-derived state. Only the canonical prompt boundary is written for a session; the speculative
 generated head stays in memory, avoiding a second large durable write per turn. A checkpoint larger
 than the whole budget is skipped rather than making generation fail.
+Checkpoint and manifest reads reject symlinks and oversized records. Pruning removes a checkpoint
+from session manifests before deleting it, so a published manifest does not retain a dangling
+reference.
+
+Use `pb cache status` to inspect the resolved llama.cpp and FlashMoe versioned session namespaces,
+their configured budgets, file counts, byte totals, and oldest-file age without decoding cached
+tokens or tensors. `pb cache clean` is a dry run. Select `--backend llama-cpp` or
+`--backend flash-moe`, inspect the exact versioned path, then pass `--yes` to remove only that
+namespace.
 
 ```bash
 pb config set flashmoe.memory_sessions 2
+pb config set flashmoe.memory_prompt_root_max_bytes 4294967296
 pb config set flashmoe.resident_models 2
 pb config set flashmoe.idle_seconds 900
 pb config set inference.flashmoe_session_cache_enabled false
 pb config set inference.flashmoe_session_cache_max_bytes 8589934592
+pb cache status
+pb cache clean --backend flash-moe
 ```
 
 For llama.cpp text sessions, pb probes the requested context after loading an accelerated model.

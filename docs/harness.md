@@ -543,13 +543,24 @@ fields are optional/defaulted so existing journals remain readable.
 
 Cache-capable agent invocations also report a privacy-safe `prompt_cache.root` record. It includes
 the local backend, model-namespace and exact rendered-token digests, eligible/reused root tokens,
-bounded stage-authority class, tool-schema digest, and output-constraint mode. The completion
+explicit system-instruction version and workflow stage, bounded stage-authority class, tool-schema
+digest, and output-constraint mode. The descriptor is bound before inference rather than inferred
+from model output. The completion
 summarizer and usability auditor aggregate eligible roots, reused roots, complete root hits, and
 authority-class counts without storing prompt or source content.
+The optional bounded `lookup_detail` separates missing/divergent session state from exact-root
+fallthrough hits and misses; it contains no prompt or repository content. Aggregate reports retain
+those detail counts and miss counts grouped by stage and authority class. Token reconciliation
+violations are classified as pb telemetry defects rather than accepted as performance evidence.
 
-`native.refill` records cache lookup, state hydration, fresh-suffix prefill, and snapshot-capture
-milliseconds separately. The usability summary and aggregate preserve each total, so a cache-policy
-change cannot claim a prefill improvement by moving work into restore or checkpoint capture.
+`native.refill` records memory lookup, disk read/decode, CPU validation/allocation, state hydration,
+fresh-suffix prefill, snapshot capture, and persistence-queue milliseconds separately. Terminal
+session metrics record queued and completed durable checkpoints, durable wall time, and failures.
+Native usage records the selected prefill command and a bounded reason such as complete-root
+restore, below-threshold suffix, qualified layer-major suffix, forced scalar reference, unsupported
+graph, or resource limit. The auditor aggregates command and reason counts.
+The usability summary and aggregate preserve each total, so a cache-policy change cannot claim a
+prefill improvement by moving work into restore, checkpoint capture, or persistence.
 
 ## Control evaluation
 

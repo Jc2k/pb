@@ -1303,6 +1303,13 @@ Baseline reviewed on 2026-07-11:
   generated head remains memory-only. Agent events and the web transcript report cache source, reused tokens,
   actually-prefilled tokens, and restore latency. Hidden `harness infer --session-id --repeat`
   exercises live and restart restoration through the production path.
+- Shared prompt-root retention is a typed byte-bounded LRU, not a hard-coded number of stage roots.
+  Dirty roots attempt synchronous publication through the owner-only atomic disk format before
+  memory eviction; completion and failure are counted separately. Checkpoint pruning first removes
+  the key from every session manifest. Reads reject
+  symlink files and oversized manifests/checkpoints. Native generation separates lookup, disk
+  decode, CPU validation/allocation, Metal hydration, suffix prefill, snapshot capture, and queue
+  time; terminal session metrics record durable completion and failure separately.
 - Deferred CMD3 ownership is now Metal-native. `MetalScheduledCmd3Submission` owns command/buffer
   lifetime and exposes validated `MetalStateBuffer` views for hidden and next-layer normed state;
   `runtime.rs` no longer wraps raw pointers or carries a non-Metal ready continuation. The

@@ -687,6 +687,10 @@ struct RunMetrics {
     llm_energy_kwh: f64,
     tool_energy_joules: f64,
     tool_energy_kwh: f64,
+    cache_persistence_queued_checkpoints: usize,
+    cache_persistence_completed_checkpoints: usize,
+    cache_persistence_wall_ms: u64,
+    cache_persistence_failures: usize,
     pending_read_cache_hits: usize,
 }
 
@@ -705,6 +709,18 @@ impl RunMetrics {
         self.llm_energy_kwh += other.llm_energy_kwh;
         self.tool_energy_joules += other.tool_energy_joules;
         self.tool_energy_kwh += other.tool_energy_kwh;
+        self.cache_persistence_queued_checkpoints = self
+            .cache_persistence_queued_checkpoints
+            .saturating_add(other.cache_persistence_queued_checkpoints);
+        self.cache_persistence_completed_checkpoints = self
+            .cache_persistence_completed_checkpoints
+            .saturating_add(other.cache_persistence_completed_checkpoints);
+        self.cache_persistence_wall_ms = self
+            .cache_persistence_wall_ms
+            .saturating_add(other.cache_persistence_wall_ms);
+        self.cache_persistence_failures = self
+            .cache_persistence_failures
+            .saturating_add(other.cache_persistence_failures);
     }
 }
 
@@ -3291,12 +3307,35 @@ fn run_agent_inner<S: EventSink>(
         )
     };
     outcome.metrics.add(&task_planning_metrics);
-    if let Err(error) = generator.persist_session_cache(&args.session_id) {
-        tracing::warn!(
-            session = %args.session_id,
-            error = %format!("{error:#}"),
-            "failed to persist FlashMoe session cache; generation remains valid"
-        );
+    match generator.persist_session_cache(&args.session_id) {
+        Ok(Some(persistence)) => {
+            outcome.metrics.cache_persistence_queued_checkpoints = outcome
+                .metrics
+                .cache_persistence_queued_checkpoints
+                .saturating_add(persistence.queued_checkpoints);
+            outcome.metrics.cache_persistence_completed_checkpoints = outcome
+                .metrics
+                .cache_persistence_completed_checkpoints
+                .saturating_add(persistence.completed_checkpoints);
+            outcome.metrics.cache_persistence_wall_ms = outcome
+                .metrics
+                .cache_persistence_wall_ms
+                .saturating_add(persistence.wall_ms);
+            outcome.metrics.cache_persistence_failures = outcome
+                .metrics
+                .cache_persistence_failures
+                .saturating_add(persistence.failed_checkpoints);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            outcome.metrics.cache_persistence_failures =
+                outcome.metrics.cache_persistence_failures.saturating_add(1);
+            tracing::warn!(
+                session = %args.session_id,
+                error = %format!("{error:#}"),
+                "failed to persist FlashMoe session cache; generation remains valid"
+            );
+        }
     }
     let reached_final = outcome.reached_final;
     let contract_status = outcome.contract_status;
@@ -3386,6 +3425,12 @@ fn run_agent_inner<S: EventSink>(
         generated_tokens: outcome.metrics.generated_tokens,
         tool_calls: outcome.metrics.tool_calls,
         tool_runtime_ms: outcome.metrics.tool_runtime_ms,
+        cache_persistence_queued_checkpoints: outcome.metrics.cache_persistence_queued_checkpoints,
+        cache_persistence_completed_checkpoints: outcome
+            .metrics
+            .cache_persistence_completed_checkpoints,
+        cache_persistence_wall_ms: outcome.metrics.cache_persistence_wall_ms,
+        cache_persistence_failures: outcome.metrics.cache_persistence_failures,
         llm_energy_joules: nonzero_f64(outcome.metrics.llm_energy_joules),
         llm_energy_kwh: nonzero_f64(outcome.metrics.llm_energy_kwh),
         tool_energy_joules: nonzero_f64(outcome.metrics.tool_energy_joules),
@@ -4254,18 +4299,38 @@ fn available_tool_specs_with_allowlist(
 }
 
 fn to_model_tools(tools: &[BuiltInToolSchema]) -> Vec<ModelChatTool> {
-    tools
-        .iter()
+    canonical_model_tools(tools)
+        .into_iter()
         .map(|tool| ModelChatTool {
             name: tool.name.clone(),
             description: Some(tool.description.clone()),
-            input_schema: tool.input_schema.clone(),
+            input_schema: canonical_json_value(&tool.input_schema),
         })
         .collect()
 }
 
 fn model_tools_value(tools: &[BuiltInToolSchema]) -> Value {
-    Value::Array(tools.iter().map(model_tool_schema_value).collect())
+    Value::Array(
+        canonical_model_tools(tools)
+            .into_iter()
+            .map(model_tool_schema_value)
+            .collect(),
+    )
+}
+
+fn canonical_model_tools(tools: &[BuiltInToolSchema]) -> Vec<&BuiltInToolSchema> {
+    let mut ordered = tools.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.description.cmp(&right.description))
+            .then_with(|| {
+                canonical_json_value(&left.input_schema)
+                    .to_string()
+                    .cmp(&canonical_json_value(&right.input_schema).to_string())
+            })
+    });
+    ordered
 }
 
 fn model_tool_schema_value(tool: &BuiltInToolSchema) -> Value {
@@ -4274,9 +4339,25 @@ fn model_tool_schema_value(tool: &BuiltInToolSchema) -> Value {
         "function": {
             "name": tool.name.clone(),
             "description": tool.description.clone(),
-            "parameters": tool.input_schema.clone(),
+            "parameters": canonical_json_value(&tool.input_schema),
         }
     })
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json_value(&values[key]));
+            }
+            Value::Object(canonical)
+        }
+        value => value.clone(),
+    }
 }
 
 fn model_messages_value(messages: &[ChatMessage]) -> Result<Value> {
@@ -8536,7 +8617,7 @@ fn record_completion_metrics(
         duration_ms: completion.duration_ms,
         prompt_tokens: completion.prompt_tokens,
         generated_tokens: completion.generated_tokens,
-        prompt_cache: prompt_cache_usage_for_event(completion, args, tools, purpose),
+        prompt_cache: prompt_cache_usage_for_event(completion),
         native: completion.native.clone(),
         context: Some(completion_context_usage(
             prepared,
@@ -8627,86 +8708,118 @@ fn model_invocation_purpose(
 fn backend_prompt_root_usage(
     root: crate::inference::BackendPromptRoot,
 ) -> crate::events::PromptRootUsage {
+    let stage = root.stage;
     crate::events::PromptRootUsage {
         descriptor_version: root.descriptor_version,
         backend: root.backend,
+        cache_format_version: root.cache_format_version,
         model_namespace_sha256: root.model_namespace_sha256,
         rendered_token_sha256: root.rendered_token_sha256,
         tokens: root.tokens,
         reused_tokens: 0,
-        authority_class: crate::events::PromptRootAuthorityClass::Unclassified,
-        tool_schema_sha256: None,
-        output_constraint_mode: None,
+        system_instruction_version: stage
+            .as_ref()
+            .map(|descriptor| descriptor.system_instruction_version.clone()),
+        workflow_stage: stage
+            .as_ref()
+            .and_then(|descriptor| descriptor.workflow_stage),
+        authority_class: stage.as_ref().map_or(
+            crate::inference::StageRootAuthorityClass::Unclassified,
+            |descriptor| descriptor.authority_class,
+        ),
+        tool_schema_sha256: stage
+            .as_ref()
+            .and_then(|descriptor| descriptor.tool_schema_sha256.clone()),
+        output_constraint_mode: stage
+            .map(|descriptor| descriptor.output_constraint_mode.as_str().to_string()),
     }
 }
 
 fn prompt_root_authority_class(
     args: &AgentRequest,
     tools: &[BuiltInToolSchema],
-    purpose: crate::events::ModelInvocationPurpose,
-) -> crate::events::PromptRootAuthorityClass {
-    use crate::events::{ModelInvocationPurpose, PromptRootAuthorityClass};
+    task_artifact: bool,
+) -> crate::inference::StageRootAuthorityClass {
+    use crate::inference::StageRootAuthorityClass;
     use crate::workflow::WorkflowStage;
 
-    if purpose == ModelInvocationPurpose::TaskPartitioning {
-        return PromptRootAuthorityClass::TaskArtifact;
+    if task_artifact {
+        return StageRootAuthorityClass::TaskArtifact;
     }
     let Some(stage) = args.workflow_stage else {
-        return PromptRootAuthorityClass::Conversation;
+        return StageRootAuthorityClass::Conversation;
     };
     let has_mutation = tools.iter().any(|tool| mutation_tool(&tool.name));
     let terminal_only = workflow_terminal_tool_name(stage).is_some_and(|terminal| {
         !tools.is_empty() && tools.iter().all(|tool| tool.name == terminal)
     });
+    let terminal_present = workflow_terminal_tool_name(stage)
+        .is_some_and(|terminal| tools.iter().any(|tool| tool.name == terminal));
     match stage {
-        WorkflowStage::Planning | WorkflowStage::PlanRevision => PromptRootAuthorityClass::Planning,
-        WorkflowStage::PlanReview => PromptRootAuthorityClass::PlanReview,
+        WorkflowStage::Planning | WorkflowStage::PlanRevision if terminal_only => {
+            StageRootAuthorityClass::PlanningClosure
+        }
+        WorkflowStage::Planning | WorkflowStage::PlanRevision if !terminal_present => {
+            StageRootAuthorityClass::PlanningEvidence
+        }
+        WorkflowStage::Planning | WorkflowStage::PlanRevision => StageRootAuthorityClass::Planning,
+        WorkflowStage::PlanReview if terminal_only => StageRootAuthorityClass::PlanReviewClosure,
+        WorkflowStage::PlanReview if !terminal_present => {
+            StageRootAuthorityClass::PlanReviewEvidence
+        }
+        WorkflowStage::PlanReview => StageRootAuthorityClass::PlanReview,
         WorkflowStage::Implementing if terminal_only => {
-            PromptRootAuthorityClass::ImplementationClosure
+            StageRootAuthorityClass::ImplementationClosure
         }
         WorkflowStage::Implementing if has_mutation => {
-            PromptRootAuthorityClass::ImplementationMutation
+            StageRootAuthorityClass::ImplementationMutation
         }
-        WorkflowStage::Implementing => PromptRootAuthorityClass::ImplementationRead,
-        WorkflowStage::Repairing if terminal_only => PromptRootAuthorityClass::RepairClosure,
-        WorkflowStage::Repairing if has_mutation => PromptRootAuthorityClass::RepairMutation,
-        WorkflowStage::Repairing => PromptRootAuthorityClass::RepairRead,
-        WorkflowStage::CodeReview => PromptRootAuthorityClass::CodeReview,
-        _ => PromptRootAuthorityClass::Unclassified,
+        WorkflowStage::Implementing => StageRootAuthorityClass::ImplementationRead,
+        WorkflowStage::Repairing if terminal_only => StageRootAuthorityClass::RepairClosure,
+        WorkflowStage::Repairing if has_mutation => StageRootAuthorityClass::RepairMutation,
+        WorkflowStage::Repairing => StageRootAuthorityClass::RepairRead,
+        WorkflowStage::CodeReview if terminal_only => StageRootAuthorityClass::CodeReviewClosure,
+        WorkflowStage::CodeReview if !terminal_present => {
+            StageRootAuthorityClass::CodeReviewEvidence
+        }
+        WorkflowStage::CodeReview => StageRootAuthorityClass::CodeReview,
+        _ => StageRootAuthorityClass::Unclassified,
     }
 }
 
-fn prompt_cache_usage_for_event(
-    completion: &CompletionOutput,
+fn stage_root_descriptor(
     args: &AgentRequest,
     tools: &[BuiltInToolSchema],
-    purpose: crate::events::ModelInvocationPurpose,
-) -> Option<PromptCacheUsage> {
-    let mut usage = completion.prompt_cache.clone()?;
+    output_constraint_mode: crate::inference::StageRootConstraintMode,
+    task_artifact: bool,
+) -> Result<crate::inference::StageRootDescriptor> {
     let tool_schema_sha256 = (!tools.is_empty()).then(|| {
         let bytes = serde_json::to_vec(&model_tools_value(tools)).unwrap_or_default();
         format!("{:x}", Sha256::digest(bytes))
     });
+    let authority_class = prompt_root_authority_class(args, tools, task_artifact);
+    if args.workflow_stage.is_some()
+        && authority_class == crate::inference::StageRootAuthorityClass::Unclassified
+    {
+        bail!(
+            "managed model invocation has no stable-root authority class for workflow stage {:?}",
+            args.workflow_stage
+        );
+    }
+    Ok(crate::inference::StageRootDescriptor {
+        descriptor_version: crate::inference::PROMPT_ROOT_DESCRIPTOR_VERSION,
+        system_instruction_version: crate::inference::AGENT_SYSTEM_INSTRUCTION_VERSION.to_string(),
+        workflow_stage: args.workflow_stage,
+        authority_class,
+        tool_schema_sha256,
+        output_constraint_mode,
+    })
+}
+
+fn prompt_cache_usage_for_event(completion: &CompletionOutput) -> Option<PromptCacheUsage> {
+    let mut usage = completion.prompt_cache.clone()?;
     if let Some(root) = usage.root.as_mut() {
         root.reused_tokens = root.tokens.min(usage.cached_tokens);
-        root.authority_class = prompt_root_authority_class(args, tools, purpose);
-        root.tool_schema_sha256 = tool_schema_sha256;
-        root.output_constraint_mode = completion
-            .native
-            .as_ref()
-            .and_then(|native| native.tool_constraint_mode.clone())
-            .or_else(|| {
-                Some(
-                    if purpose == crate::events::ModelInvocationPurpose::TaskPartitioning {
-                        "json_schema"
-                    } else if tools.is_empty() {
-                        "none"
-                    } else {
-                        "unconstrained"
-                    }
-                    .to_string(),
-                )
-            });
     }
     Some(usage)
 }
@@ -10923,8 +11036,11 @@ trait CompletionEngine {
         bail!("completion engine does not support schema-constrained JSON")
     }
 
-    fn persist_session_cache(&mut self, _session_id: &str) -> Result<()> {
-        Ok(())
+    fn persist_session_cache(
+        &mut self,
+        _session_id: &str,
+    ) -> Result<Option<crate::inference::flashmoe::PromptCachePersistenceStats>> {
+        Ok(None)
     }
 }
 
@@ -11002,12 +11118,7 @@ impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
             duration_ms: output.duration_ms,
             prompt_tokens: output.prompt_tokens,
             generated_tokens: output.generated_tokens,
-            prompt_cache: prompt_cache_usage_for_event(
-                &output,
-                &args,
-                std::slice::from_ref(&output_schema),
-                crate::events::ModelInvocationPurpose::TaskPartitioning,
-            ),
+            prompt_cache: prompt_cache_usage_for_event(&output),
             context: None,
             native: output.native.clone(),
             energy_joules: output.energy.map(|estimate| estimate.joules),
@@ -11089,6 +11200,24 @@ pub(crate) struct StageRunOutcome {
     metrics: RunMetrics,
 }
 
+fn stage_prompt_messages(
+    system_prompt: String,
+    mut user_prompt: String,
+    environment_evidence: Option<&str>,
+    mutation_payload_limit: Option<usize>,
+) -> Vec<ChatMessage> {
+    append_environment_evidence_context(&mut user_prompt, environment_evidence);
+    if let Some(payload_limit) = mutation_payload_limit {
+        user_prompt.push_str(&format!(
+            "\n\nBounded edit contract: this turn permits at most {payload_limit} characters of serialized mutation payload. Every tool action remains atomic. If a missing final file will not fit, create the smallest complete loadable scaffold, then add one accepted-plan feature per later bounded edit; never emit a partial JSON string or assume a capped action ran."
+        ));
+    }
+    vec![
+        ChatMessage::text("system", system_prompt),
+        ChatMessage::text("user", user_prompt),
+    ]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_stage(
     generator: &mut dyn CompletionEngine,
@@ -11134,25 +11263,17 @@ fn run_stage(
     // accidentally remove the required typed terminal action or add authority to this stage.
     args.tool_allowlist = None;
 
-    let mut system_prompt = context.system_prompt;
-    append_environment_evidence_context(
-        &mut system_prompt,
-        base_args.environment_evidence_context.as_deref(),
-    );
-    let mut user_prompt = context.user_prompt;
-    if matches!(
+    let mutation_payload_limit = matches!(
         contract.stage,
         crate::workflow::WorkflowStage::Implementing | crate::workflow::WorkflowStage::Repairing
-    ) {
-        let payload_limit = mutation_payload_char_limit(boosted_max_tokens(&args));
-        user_prompt.push_str(&format!(
-            "\n\nBounded edit contract: this turn permits at most {payload_limit} characters of serialized mutation payload. Every tool action remains atomic. If a missing final file will not fit, create the smallest complete loadable scaffold, then add one accepted-plan feature per later bounded edit; never emit a partial JSON string or assume a capped action ran."
-        ));
-    }
-    let mut messages = vec![
-        ChatMessage::text("system", system_prompt),
-        ChatMessage::text("user", user_prompt),
-    ];
+    )
+    .then(|| mutation_payload_char_limit(boosted_max_tokens(&args)));
+    let mut messages = stage_prompt_messages(
+        context.system_prompt,
+        context.user_prompt,
+        base_args.environment_evidence_context.as_deref(),
+        mutation_payload_limit,
+    );
     let budget_before = {
         let budget = run_budget.borrow();
         (
@@ -13999,6 +14120,7 @@ impl LocalModelEvalEngine {
                     metal_working_set_limit_bytes: None,
                     session_cache: settings.session_cache,
                     memory_sessions: settings.memory_sessions,
+                    memory_prompt_root_max_bytes: settings.memory_prompt_root_max_bytes,
                 },
             )
             .map(Self::FlashMoe)
@@ -14201,7 +14323,10 @@ impl CompletionEngine for PromptRecordingEngine<'_> {
         self.inner.generate(args, messages, tools, enable_thinking)
     }
 
-    fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
+    fn persist_session_cache(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<crate::inference::flashmoe::PromptCachePersistenceStats>> {
         self.inner.persist_session_cache(session_id)
     }
 }
@@ -14463,6 +14588,12 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         );
         let mut request = llama_chat_request(args, &constrained_messages, &[])?;
         request.json_schema = Some(schema.input_schema.clone());
+        request.stage_root = Some(stage_root_descriptor(
+            args,
+            std::slice::from_ref(schema),
+            crate::inference::StageRootConstraintMode::JsonSchema,
+            true,
+        )?);
         llama_completion_output(self.session.generate_chat(&request)?)
     }
 }
@@ -14493,6 +14624,7 @@ fn llama_completion_output(
             prefilled_tokens: output.prefilled_prompt_tokens,
             restore_ms: output.prompt_cache_restore_ms,
             miss_reason: output.prompt_cache_miss_reason,
+            lookup_detail: output.prompt_cache_lookup_detail,
             root: output.prompt_root.map(backend_prompt_root_usage),
         }),
         native: None,
@@ -14506,9 +14638,15 @@ fn llama_chat_request(
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
 ) -> Result<LlamaCppChatRequest> {
+    let constraint_mode = if tools.is_empty() {
+        crate::inference::StageRootConstraintMode::None
+    } else {
+        crate::inference::StageRootConstraintMode::Unconstrained
+    };
     Ok(LlamaCppChatRequest {
         messages: model_messages_value(messages)?,
         tools: model_tools_value(tools),
+        stage_root: Some(stage_root_descriptor(args, tools, constraint_mode, false)?),
         json_schema: None,
         ctx_size: args.ctx_size,
         threads: args.threads,
@@ -14577,12 +14715,15 @@ impl CompletionEngine for FlashMoeCompletionEngine {
         generate_flashmoe_json_completion(&mut engine, args, messages, schema, enable_thinking)
     }
 
-    fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
+    fn persist_session_cache(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<crate::inference::flashmoe::PromptCachePersistenceStats>> {
         let mut engine = self.runtime.lock()?;
         if engine.supports_session_snapshots() {
-            engine.persist_session_cache(session_id)
+            engine.persist_session_cache(session_id).map(Some)
         } else {
-            Ok(())
+            Ok(None)
         }
     }
 }
@@ -14639,11 +14780,14 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
         generate_flashmoe_json_completion(self.engine, args, messages, schema, enable_thinking)
     }
 
-    fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
+    fn persist_session_cache(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<crate::inference::flashmoe::PromptCachePersistenceStats>> {
         if self.engine.supports_session_snapshots() {
-            self.engine.persist_session_cache(session_id)
+            self.engine.persist_session_cache(session_id).map(Some)
         } else {
-            Ok(())
+            Ok(None)
         }
     }
 }
@@ -14716,6 +14860,12 @@ fn flashmoe_json_request(
     let mut request =
         flashmoe_structured_request(args, &constrained_messages, &[], enable_thinking)?;
     request.json_schema = Some(schema.input_schema.clone());
+    request.stage_root = Some(stage_root_descriptor(
+        args,
+        std::slice::from_ref(schema),
+        crate::inference::StageRootConstraintMode::JsonSchema,
+        true,
+    )?);
     Ok(request)
 }
 
@@ -14754,12 +14904,18 @@ fn generate_flashmoe_completion_from_request(
         active_experts_per_token: performance.active_experts_per_token,
         expert_strategy: performance.expert_strategy.clone(),
         prefill_command_kind: performance.prefill_command_kind.clone(),
+        prefill_command_reason: performance.prefill_command_reason.clone(),
         thinking_enabled: performance.thinking_enabled,
         refill: Some(crate::events::NativeRefillUsage {
             cache_lookup_wall_ms: performance.refill.cache_lookup_wall_ms,
+            disk_read_decode_wall_ms: performance.refill.disk_read_decode_wall_ms,
+            cpu_state_validation_allocation_wall_ms: performance
+                .refill
+                .cpu_state_validation_allocation_wall_ms,
             state_hydration_wall_ms: performance.refill.state_hydration_wall_ms,
             fresh_suffix_prefill_wall_ms: performance.refill.fresh_suffix_prefill_wall_ms,
             snapshot_capture_wall_ms: performance.refill.snapshot_capture_wall_ms,
+            persistence_queue_wall_ms: performance.refill.persistence_queue_wall_ms,
         }),
         tool_constraint_mode: tool_constraints
             .map(|stats| stats.mode.as_str().to_string())
@@ -14805,6 +14961,7 @@ fn generate_flashmoe_completion_from_request(
             prefilled_tokens: output.prompt_cache.prefilled_tokens,
             restore_ms: output.prompt_cache.restore_ms,
             miss_reason: output.prompt_cache.miss_reason,
+            lookup_detail: output.prompt_cache.lookup_detail,
             root: output.prompt_cache.root.map(backend_prompt_root_usage),
         }),
         native: Some(native),
@@ -14875,28 +15032,49 @@ fn flashmoe_structured_request_with_required_tool(
         .or(workflow_terminal)
         .map(|terminal| vec![terminal.to_string()])
         .unwrap_or_default();
+    let tool_constraint_mode = if required_tool_name.is_some()
+        || (args.workflow_stage.is_some()
+            && tools.len() == 1
+            && args
+                .workflow_stage
+                .and_then(workflow_terminal_tool_name)
+                .is_some_and(|terminal| tools[0].name == terminal))
+    {
+        crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
+    } else if args.workflow_stage.is_some() && !tools.is_empty() {
+        crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed
+    } else {
+        crate::inference::flashmoe::NativeToolConstraintMode::Auto
+    };
+    let root_constraint_mode = match tool_constraint_mode {
+        crate::inference::flashmoe::NativeToolConstraintMode::Auto if tools.is_empty() => {
+            crate::inference::StageRootConstraintMode::None
+        }
+        crate::inference::flashmoe::NativeToolConstraintMode::Auto => {
+            crate::inference::StageRootConstraintMode::Unconstrained
+        }
+        crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed => {
+            crate::inference::StageRootConstraintMode::ToolsAllowed
+        }
+        crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired => {
+            crate::inference::StageRootConstraintMode::ToolRequired
+        }
+    };
     Ok(StructuredGenerationRequest {
         messages: to_model_messages(messages)?,
         tools: to_model_tools(tools),
+        stage_root: Some(stage_root_descriptor(
+            args,
+            tools,
+            root_constraint_mode,
+            false,
+        )?),
         json_schema: None,
         add_generation_prompt: true,
         enable_thinking,
         raw_prompt: false,
         trace_candidates: false,
-        tool_constraint_mode: if required_tool_name.is_some()
-            || (args.workflow_stage.is_some()
-                && tools.len() == 1
-                && args
-                    .workflow_stage
-                    .and_then(workflow_terminal_tool_name)
-                    .is_some_and(|terminal| tools[0].name == terminal))
-        {
-            crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
-        } else if args.workflow_stage.is_some() && !tools.is_empty() {
-            crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed
-        } else {
-            crate::inference::flashmoe::NativeToolConstraintMode::Auto
-        },
+        tool_constraint_mode,
         terminal_tool_names,
         prefill_mode: crate::inference::flashmoe::NativePrefillMode::Auto,
         prefill_state_summary: false,
@@ -14988,12 +15166,7 @@ fn generate_and_parse_action_with_retries(
             duration_ms: completion.duration_ms,
             prompt_tokens: completion.prompt_tokens,
             generated_tokens: completion.generated_tokens,
-            prompt_cache: prompt_cache_usage_for_event(
-                &completion,
-                &request,
-                attempt_tools,
-                purpose,
-            ),
+            prompt_cache: prompt_cache_usage_for_event(&completion),
             native: completion.native.clone(),
             context: Some(completion_context_usage(
                 &prepared,
@@ -19876,7 +20049,7 @@ fn run_sub_agent(
             &mut flashmoe_generator
         }
     };
-    let outcome = run_agent_steps(
+    let mut outcome = run_agent_steps(
         generator,
         context.text_backend,
         context.llamacpp,
@@ -19894,12 +20067,35 @@ fn run_sub_agent(
         context.request.sub_agent_depth + 1,
         sink,
     )?;
-    if let Err(error) = generator.persist_session_cache(&sub_request.session_id) {
-        tracing::warn!(
-            session = %sub_request.session_id,
-            error = %format!("{error:#}"),
-            "failed to persist FlashMoe sub-agent session cache; generation remains valid"
-        );
+    match generator.persist_session_cache(&sub_request.session_id) {
+        Ok(Some(persistence)) => {
+            outcome.metrics.cache_persistence_queued_checkpoints = outcome
+                .metrics
+                .cache_persistence_queued_checkpoints
+                .saturating_add(persistence.queued_checkpoints);
+            outcome.metrics.cache_persistence_completed_checkpoints = outcome
+                .metrics
+                .cache_persistence_completed_checkpoints
+                .saturating_add(persistence.completed_checkpoints);
+            outcome.metrics.cache_persistence_wall_ms = outcome
+                .metrics
+                .cache_persistence_wall_ms
+                .saturating_add(persistence.wall_ms);
+            outcome.metrics.cache_persistence_failures = outcome
+                .metrics
+                .cache_persistence_failures
+                .saturating_add(persistence.failed_checkpoints);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            outcome.metrics.cache_persistence_failures =
+                outcome.metrics.cache_persistence_failures.saturating_add(1);
+            tracing::warn!(
+                session = %sub_request.session_id,
+                error = %format!("{error:#}"),
+                "failed to persist FlashMoe sub-agent session cache; generation remains valid"
+            );
+        }
     }
 
     metrics.add(&outcome.metrics);
@@ -22860,6 +23056,36 @@ mod tests {
                 .to_string()
                 .contains("nested/beta.txt")
         );
+    }
+
+    #[test]
+    fn model_tool_rendering_is_canonical_across_input_order() {
+        let mut forward = vec![
+            builtin_tool("zeta", "last", json!({"type": "object"})),
+            builtin_tool("alpha", "first", json!({"type": "object"})),
+        ];
+        let rendered = model_tools_value(&forward);
+        forward.reverse();
+        assert_eq!(rendered, model_tools_value(&forward));
+        assert_eq!(to_model_tools(&forward)[0].name, "alpha");
+
+        let mut first_properties = serde_json::Map::new();
+        first_properties.insert("zeta".to_string(), json!({"type": "string"}));
+        first_properties.insert("alpha".to_string(), json!({"type": "number"}));
+        let mut second_properties = serde_json::Map::new();
+        second_properties.insert("alpha".to_string(), json!({"type": "number"}));
+        second_properties.insert("zeta".to_string(), json!({"type": "string"}));
+        let first = builtin_tool(
+            "ordered",
+            "schema",
+            json!({"type": "object", "properties": first_properties}),
+        );
+        let second = builtin_tool(
+            "ordered",
+            "schema",
+            json!({"properties": second_properties, "type": "object"}),
+        );
+        assert_eq!(model_tools_value(&[first]), model_tools_value(&[second]));
     }
 
     #[test]
@@ -30428,32 +30654,127 @@ the next imagined action"#;
 
     #[test]
     fn prompt_root_authority_class_tracks_exact_stage_capability_shape() {
-        use crate::events::{ModelInvocationPurpose, PromptRootAuthorityClass};
+        use crate::events::PromptRootAuthorityClass;
         use crate::workflow::WorkflowStage;
 
         let mut args = test_agent_request(AgentProfile::Build, 256);
         args.workflow_stage = Some(WorkflowStage::Planning);
         let read = vec![builtin_tool("read_file", "read", json!({}))];
         assert_eq!(
-            prompt_root_authority_class(&args, &read, ModelInvocationPurpose::WorkflowPlanning),
+            prompt_root_authority_class(&args, &read, false),
+            PromptRootAuthorityClass::PlanningEvidence
+        );
+        let planning = vec![
+            builtin_tool("read_file", "read", json!({})),
+            builtin_tool("submit_plan", "submit", json!({})),
+        ];
+        assert_eq!(
+            prompt_root_authority_class(&args, &planning, false),
             PromptRootAuthorityClass::Planning
+        );
+        let planning_closure = vec![builtin_tool("submit_plan", "submit", json!({}))];
+        assert_eq!(
+            prompt_root_authority_class(&args, &planning_closure, false),
+            PromptRootAuthorityClass::PlanningClosure
         );
 
         args.workflow_stage = Some(WorkflowStage::Implementing);
         assert_eq!(
-            prompt_root_authority_class(&args, &read, ModelInvocationPurpose::WorkflowEvidence),
+            prompt_root_authority_class(&args, &read, false),
             PromptRootAuthorityClass::ImplementationRead
         );
         let mutation = vec![builtin_tool("replace_file", "replace", json!({}))];
         assert_eq!(
-            prompt_root_authority_class(&args, &mutation, ModelInvocationPurpose::WorkflowMutation),
+            prompt_root_authority_class(&args, &mutation, false),
             PromptRootAuthorityClass::ImplementationMutation
         );
         let closure = vec![builtin_tool("submit_implementation", "submit", json!({}))];
         assert_eq!(
-            prompt_root_authority_class(&args, &closure, ModelInvocationPurpose::WorkflowClosure),
+            prompt_root_authority_class(&args, &closure, false),
             PromptRootAuthorityClass::ImplementationClosure
         );
+    }
+
+    #[test]
+    fn stage_root_descriptor_is_request_owned_stable_and_fail_closed() {
+        use crate::inference::{StageRootAuthorityClass, StageRootConstraintMode};
+        use crate::workflow::WorkflowStage;
+
+        let mut first = test_agent_request(AgentProfile::Plan, 256);
+        first.workflow_stage = Some(WorkflowStage::Planning);
+        let tools = vec![builtin_tool(
+            "submit_plan",
+            "submit",
+            json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+        )];
+        let descriptor =
+            stage_root_descriptor(&first, &tools, StageRootConstraintMode::ToolsAllowed, false)
+                .unwrap();
+        let mut another_task = first.clone();
+        another_task.task = "a different repository task".to_string();
+        assert_eq!(
+            descriptor,
+            stage_root_descriptor(
+                &another_task,
+                &tools,
+                StageRootConstraintMode::ToolsAllowed,
+                false,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            descriptor.authority_class,
+            StageRootAuthorityClass::PlanningClosure
+        );
+        assert_eq!(descriptor.workflow_stage, Some(WorkflowStage::Planning));
+        assert!(descriptor.tool_schema_sha256.is_some());
+
+        let changed_tools = vec![builtin_tool(
+            "submit_plan",
+            "submit",
+            json!({"type": "object", "properties": {"summary": {"type": "string"}}}),
+        )];
+        assert_ne!(
+            descriptor.tool_schema_sha256,
+            stage_root_descriptor(
+                &first,
+                &changed_tools,
+                StageRootConstraintMode::ToolsAllowed,
+                false,
+            )
+            .unwrap()
+            .tool_schema_sha256
+        );
+
+        first.workflow_stage = Some(WorkflowStage::Checking);
+        assert!(
+            stage_root_descriptor(&first, &[], StageRootConstraintMode::None, false,)
+                .unwrap_err()
+                .to_string()
+                .contains("no stable-root authority class")
+        );
+    }
+
+    #[test]
+    fn dynamic_environment_evidence_stays_after_the_stable_stage_root() {
+        let first = stage_prompt_messages(
+            "stable stage authority".to_string(),
+            "task evidence".to_string(),
+            Some("repository alpha environment"),
+            None,
+        );
+        let second = stage_prompt_messages(
+            "stable stage authority".to_string(),
+            "different task evidence".to_string(),
+            Some("repository beta environment"),
+            None,
+        );
+
+        assert_eq!(first[0].role, "system");
+        assert_eq!(first[0].content, second[0].content);
+        assert!(!first[0].content.contains("repository alpha"));
+        assert!(first[1].content.contains("repository alpha"));
+        assert!(second[1].content.contains("repository beta"));
     }
 
     #[test]

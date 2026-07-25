@@ -1,6 +1,6 @@
 # Stable prompt roots and FlashMoe refill
 
-Status: **Design record; implementation and production qualification are open.**
+Status: **Design record; Phases 0–2 are in progress and production qualification is open.**
 
 This plan closes the efficiency gap left after the bounded-workflow call-reduction work. That work
 reduced the locked Rust/Python/React sample from 35 model calls and 100,249 fresh-prefill tokens to
@@ -460,9 +460,9 @@ Each phase appends a dated row rather than rewriting the original baseline:
 | Phase | Revision | Artifact | Result | Status |
 | --- | --- | --- | --- | --- |
 | Call-reduction baseline | `a69239ce` | `benchmarks/private-workload-usability.md` and locked JSON baseline | 3/3 verified clean; 14 calls; 47,271 fresh-prefill tokens; 15m 52s; 9.97 Wh | Shipped baseline |
-| Phase 0 root baseline | — | New machine-readable root/refill record | Not run | Open |
-| Phase 1 stable roots | — | Root-stability fixture and warm/restart matrix | Not run | Open |
-| Phase 2 cache lifecycle | — | Namespace, retention, corruption, concurrency record | Not run | Open |
+| Phase 0 root baseline | `f6fd5a71` | [Single-case diagnostic](benchmarks/prompt-root-phase0.md) and `fixtures/harness-usability/baselines/2026-07-25-prompt-root-phase0-rust.json` | Rust 1/1 verified clean; 4/4 complete disk-root hits; suffix prefill dominated | Partial; three-language rerun open |
+| Phase 1 stable roots | worktree after `f6fd5a71` | Controller descriptor, canonical-tool, target-path, and fail-closed fixtures | Implementation present; cross-repository/backend/restart matrix not run | In progress |
+| Phase 2 cache lifecycle | worktree after `f6fd5a71` | Typed byte-budget LRU and corruption/symlink/manifest fixtures | Implementation present; concurrency/full-disk/live restart matrix not run | In progress |
 | Phase 3 refill | — | Scalar/layer-major restored-suffix qualification | Not run | Open |
 | Phase 4 workflow | — | Locked three-language rerun | Not run | Open |
 | Phase 5 production | — | Complete 24-case and release qualification | Not run | Open |

@@ -5,18 +5,17 @@ pub struct FlashMoeLoadOptions {
     pub metal_working_set_limit_bytes: Option<usize>,
     pub session_cache: crate::config::ResolvedSessionCacheConfig,
     pub memory_sessions: usize,
+    pub memory_prompt_root_max_bytes: u64,
 }
 
 impl Default for FlashMoeLoadOptions {
     fn default() -> Self {
+        let settings = crate::config::UserConfig::default().effective_flashmoe();
         Self {
             metal_working_set_limit_bytes: None,
-            session_cache: crate::config::ResolvedSessionCacheConfig {
-                enabled: true,
-                root: dirs::cache_dir().map(|root| root.join("pb")),
-                max_bytes: crate::config::DEFAULT_SESSION_CACHE_MAX_BYTES,
-            },
-            memory_sessions: crate::config::DEFAULT_FLASHMOE_MEMORY_SESSIONS,
+            session_cache: settings.session_cache,
+            memory_sessions: settings.memory_sessions,
+            memory_prompt_root_max_bytes: settings.memory_prompt_root_max_bytes,
         }
     }
 }
@@ -255,6 +254,7 @@ where
     let session_cache = FlashMoeSessionCache::new(
         FlashMoeDiskCache::from_plan(plan, config.num_hidden_layers, &options.session_cache),
         options.memory_sessions,
+        options.memory_prompt_root_max_bytes,
     );
     Ok(FlashMoeEngine {
         plan: plan.clone(),

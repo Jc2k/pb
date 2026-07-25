@@ -393,6 +393,10 @@ pub fn render_event(event: &AgentEvent) {
                         .miss_reason
                         .map(|reason| format!(", miss={}", reason.as_str()))
                         .unwrap_or_default();
+                    let detail = cache
+                        .lookup_detail
+                        .map(|detail| format!(", detail={detail:?}"))
+                        .unwrap_or_default();
                     let root = cache
                         .root
                         .as_ref()
@@ -404,7 +408,7 @@ pub fn render_event(event: &AgentEvent) {
                         })
                         .unwrap_or_default();
                     format!(
-                        ", cache={} reused/{} fresh via {}{miss}{root}",
+                        ", cache={} reused/{} fresh via {}{miss}{detail}{root}",
                         cache.cached_tokens, cache.prefilled_tokens, cache.source
                     )
                 })
@@ -414,18 +418,32 @@ pub fn render_event(event: &AgentEvent) {
                 .and_then(|native| native.refill.as_ref())
                 .map(|refill| {
                     format!(
-                        ", refill={} lookup/{} hydrate/{} suffix/{} snapshot ms",
+                        ", refill={} lookup/{} disk/{} validate-allocate/{} hydrate/{} suffix/{} snapshot/{} queue ms",
                         refill.cache_lookup_wall_ms,
+                        refill.disk_read_decode_wall_ms,
+                        refill.cpu_state_validation_allocation_wall_ms,
                         refill.state_hydration_wall_ms,
                         refill.fresh_suffix_prefill_wall_ms,
-                        refill.snapshot_capture_wall_ms
+                        refill.snapshot_capture_wall_ms,
+                        refill.persistence_queue_wall_ms,
                     )
+                })
+                .unwrap_or_default();
+            let prefill_command = native
+                .as_ref()
+                .map(|native| {
+                    let reason = if native.prefill_command_reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", native.prefill_command_reason)
+                    };
+                    format!(", prefill={}{}", native.prefill_command_kind, reason)
                 })
                 .unwrap_or_default();
             print_header(
                 "llm",
                 &format!(
-                    "{} step {step}: {duration_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens{cache}{refill}{energy}",
+                    "{} step {step}: {duration_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens{cache}{prefill_command}{refill}{energy}",
                     purpose.as_str()
                 ),
             );
@@ -437,6 +455,10 @@ pub fn render_event(event: &AgentEvent) {
             generated_tokens,
             tool_calls,
             tool_runtime_ms,
+            cache_persistence_queued_checkpoints,
+            cache_persistence_completed_checkpoints,
+            cache_persistence_wall_ms,
+            cache_persistence_failures,
             llm_energy_joules,
             tool_energy_joules,
             wall_runtime_ms,
@@ -466,10 +488,19 @@ pub fn render_event(event: &AgentEvent) {
                     tool_energy_joules.map_or_else(|| "n/a".into(), |value| format_energy(value)),
                 )
             }).unwrap_or_default();
+            let persistence = if *cache_persistence_queued_checkpoints > 0
+                || *cache_persistence_failures > 0
+            {
+                format!(
+                    "; cache persistence: {cache_persistence_completed_checkpoints}/{cache_persistence_queued_checkpoints} checkpoints in {cache_persistence_wall_ms} ms, {cache_persistence_failures} failures"
+                )
+            } else {
+                String::new()
+            };
             print_header(
                 "metrics",
                 &format!(
-                    "wall: {wall_runtime_ms} ms; llm: {llm_invocations} calls, {llm_runtime_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens; tools: {tool_calls} calls, {tool_runtime_ms} ms{energy}"
+                    "wall: {wall_runtime_ms} ms; llm: {llm_invocations} calls, {llm_runtime_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens; tools: {tool_calls} calls, {tool_runtime_ms} ms{persistence}{energy}"
                 ),
             );
         }

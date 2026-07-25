@@ -34,7 +34,7 @@ use crate::inference::chat_template::{ChatTemplateOptions, TokenizerChatTemplate
 
 const BATCH_SIZE: usize = 512;
 const MIN_GENERATION_CONTEXT_TOKENS: usize = 1;
-const LLAMA_SESSION_CACHE_VERSION: &str = "llamacpp-session-v1";
+pub(crate) const LLAMA_SESSION_CACHE_VERSION: &str = "llamacpp-session-v1";
 
 /// Parameters for a single generation call.
 #[derive(Debug, Clone)]
@@ -55,6 +55,8 @@ pub struct LlamaCppRequest {
 pub struct LlamaCppChatRequest {
     pub messages: Value,
     pub tools: Value,
+    /// Controller-owned stable-root identity for managed invocations. Generic chat omits it.
+    pub stage_root: Option<crate::inference::StageRootDescriptor>,
     /// Optional JSON schema enforced token-by-token during generation.
     pub json_schema: Option<Value>,
     pub ctx_size: u32,
@@ -86,6 +88,7 @@ pub struct Output {
     pub prompt_cache_source: Option<String>,
     pub prompt_cache_restore_ms: u64,
     pub prompt_cache_miss_reason: Option<PromptCacheMissReason>,
+    pub prompt_cache_lookup_detail: Option<crate::inference::PromptCacheLookupDetail>,
     pub prompt_root: Option<crate::inference::BackendPromptRoot>,
     pub duration_ms: u64,
     pub energy: Option<EnergyEstimate>,
@@ -375,6 +378,7 @@ impl LlamaCppBackend {
             prompt_cache_source: None,
             prompt_cache_restore_ms: 0,
             prompt_cache_miss_reason: Some(PromptCacheMissReason::CacheDisabled),
+            prompt_cache_lookup_detail: None,
             prompt_root: None,
             duration_ms: duration_millis(started),
             energy,
@@ -542,6 +546,7 @@ impl LlamaCppBackend {
             prompt_cache_source: None,
             prompt_cache_restore_ms: 0,
             prompt_cache_miss_reason: Some(PromptCacheMissReason::RuntimeUnsupported),
+            prompt_cache_lookup_detail: None,
             prompt_root: None,
             duration_ms: duration_millis(started),
             energy,
@@ -655,6 +660,15 @@ impl LlamaCppChatSession<'_> {
             context_reset,
             prompt_cache_miss_reason,
         );
+        let prompt_cache_lookup_detail = match prompt_cache_miss_reason {
+            Some(PromptCacheMissReason::ColdSession) => {
+                Some(crate::inference::PromptCacheLookupDetail::SessionCheckpointMissing)
+            }
+            Some(PromptCacheMissReason::PromptDiverged) => {
+                Some(crate::inference::PromptCacheLookupDetail::SessionCheckpointDiverged)
+            }
+            _ => None,
+        };
         cached.restored_from_disk = false;
         cached.restore_ms = 0;
 
@@ -749,6 +763,7 @@ impl LlamaCppChatSession<'_> {
             prompt_cache_source,
             prompt_cache_restore_ms,
             prompt_cache_miss_reason,
+            prompt_cache_lookup_detail,
             prompt_root,
             duration_ms: duration_millis(started),
             energy,
@@ -894,19 +909,21 @@ impl LlamaCppBackend {
         if root_len == 0 {
             return Ok(None);
         }
-        let mut digest = Sha256::new();
-        for token in &prompt_tokens[..root_len] {
-            digest.update(token.0.to_le_bytes());
-        }
         Ok(Some(crate::inference::BackendPromptRoot {
             descriptor_version: crate::inference::PROMPT_ROOT_DESCRIPTOR_VERSION,
             backend: "llamacpp".to_string(),
+            cache_format_version: LLAMA_SESSION_CACHE_VERSION.to_string(),
             model_namespace_sha256: llama_model_namespace_sha256(
                 &self.model_path,
                 request.ctx_size,
             ),
-            rendered_token_sha256: format!("{:x}", digest.finalize()),
+            rendered_token_sha256: crate::inference::rendered_token_sha256(
+                prompt_tokens[..root_len]
+                    .iter()
+                    .map(|token| u32::from_le_bytes(token.0.to_le_bytes())),
+            ),
             tokens: root_len,
+            stage: request.stage_root.clone(),
         }))
     }
 

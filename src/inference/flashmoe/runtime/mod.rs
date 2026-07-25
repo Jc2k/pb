@@ -1418,12 +1418,15 @@ impl MetalExecutionFacade {
 }
 
 impl FlashMoeEngine {
-    pub fn persist_session_cache(&mut self, session_id: &str) -> Result<()> {
+    pub fn persist_session_cache(
+        &mut self,
+        session_id: &str,
+    ) -> Result<super::types::PromptCachePersistenceStats> {
         if session_id.trim().is_empty() {
-            return Ok(());
+            return Ok(super::types::PromptCachePersistenceStats::default());
         }
         if self.executor.is_deepseek_v4() {
-            return Ok(());
+            return Ok(super::types::PromptCachePersistenceStats::default());
         }
         self.session_cache.persist_session(session_id)
     }

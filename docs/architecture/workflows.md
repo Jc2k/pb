@@ -668,15 +668,27 @@ surface the same attribution.
 
 When a backend can identify a reusable stable root, the cache record also carries a versioned exact
 rendered-token digest, model-namespace digest, eligible and reused root-token counts, and a
-controller-owned bounded authority class. The controller label is diagnostic only: the backend's
-exact rendered-token comparison remains the reuse authority. Tool-schema and output-constraint
-digests are recorded separately because a decode-only constraint can change without invalidating
-identical prefetched KV state.
+controller-owned bounded authority class. Before inference, the controller binds an explicit system
+instruction version, workflow stage, authority class, canonical rendered-tool-schema digest, and
+decode-constraint mode to the request. Model-facing tools are sorted canonically; dynamic task,
+repository, branch, environment, plan, and evidence content remains after the root. Planning,
+review, implementation, repair, and closure use finite evidence/authorized/terminal authority
+classes instead of incidental readiness combinations. Any managed workflow state without a
+classified authority fails before inference. These labels are diagnostic only: the
+backend's exact rendered-token comparison remains the reuse authority. A decode-only constraint can
+change without invalidating identical prefetched KV state, but the fresh constraint remains recorded
+and enforced.
 
-FlashMoe native usage further separates cache lookup, validated state hydration, actual fresh-suffix
-prefill, and prompt-snapshot capture. These non-overlapping lifecycle counters keep a fast cache hit,
-slow disk decode, slow Metal restore, and slow model prefill from being collapsed into one TTFT
-number.
+FlashMoe native usage further separates memory lookup, disk open/read/decode, CPU validation and
+allocation, Metal state hydration, actual fresh-suffix prefill, prompt-snapshot capture, and durable
+write queueing. Session metrics report how many queued checkpoints completed, their wall time, and
+any failure. A bounded lookup-detail enum distinguishes a missing session, a divergent session, a
+missing exact root, and a divergent-session fallthrough that hit or missed the root. These
+non-overlapping lifecycle counters keep a fast cache hit, slow disk decode, slow
+Metal restore, slow model prefill, and slow persistence from being collapsed into one TTFT number.
+The native record also names the selected scalar, cache-only, DeepSeek batch, or Qwen layer-major
+command and a bounded selection reason derived from the actual remaining suffix and prepared
+resource state.
 
 ## Where the workflow ends
 
