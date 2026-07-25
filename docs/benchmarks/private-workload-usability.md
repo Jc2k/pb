@@ -92,6 +92,11 @@ harness outcomes, keeps every workspace, event stream, journal, and run index
 beneath the supplied scratch parent, and appends the process result for each
 case to `run-results.jsonl`.
 
+On a qualification host where a Deno child cannot see Metal, add `--prepare-only`. The runner
+materializes the same immutable case and prints its typed paths, task, and limits as JSON without
+starting pb. Invoke the release `pb harness agent` binary directly with those values; this preserves
+the corpus contract while keeping Metal access outside the orchestration sandbox.
+
 Independently audit one or more retained runs:
 
 ```bash

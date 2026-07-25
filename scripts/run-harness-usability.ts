@@ -6,6 +6,7 @@ interface Options {
   binary: string;
   caseIds: string[];
   list: boolean;
+  prepareOnly: boolean;
 }
 
 function parseOptions(args: string[]): Options {
@@ -13,6 +14,7 @@ function parseOptions(args: string[]): Options {
   let binary = "target/aarch64-apple-darwin/release/pb";
   const caseIds: string[] = [];
   let list = false;
+  let prepareOnly = false;
   for (let index = 0; index < args.length; index++) {
     const argument = args[index];
     const value = args[index + 1];
@@ -27,6 +29,8 @@ function parseOptions(args: string[]): Options {
       index++;
     } else if (argument === "--list") {
       list = true;
+    } else if (argument === "--prepare-only") {
+      prepareOnly = true;
     } else {
       throw new Error(`${argument} requires a value or is unknown`);
     }
@@ -34,7 +38,7 @@ function parseOptions(args: string[]): Options {
   if (!list && !scratchParent) {
     throw new Error("--scratch-parent is required unless --list is used");
   }
-  return { scratchParent, binary, caseIds, list };
+  return { scratchParent, binary, caseIds, list, prepareOnly };
 }
 
 async function main(): Promise<void> {
@@ -65,6 +69,17 @@ async function main(): Promise<void> {
     const startedAt = new Date().toISOString();
     console.error(`running ${corpusCase.id} (${corpusCase.language})`);
     const prepared = await prepareCorpusCase(corpusCase, scratchRoot);
+    if (options.prepareOnly) {
+      console.log(JSON.stringify({
+        version: 1,
+        case_id: corpusCase.id,
+        language: corpusCase.language,
+        task: corpusCase.task,
+        limits: corpusCase.limits,
+        ...prepared,
+      }));
+      continue;
+    }
     const status = await new Deno.Command(options.binary, {
       args: [
         "harness",
