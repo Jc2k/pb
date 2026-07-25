@@ -165,7 +165,10 @@ generated head stays in memory, avoiding a second large durable write per turn. 
 than the whole budget is skipped rather than making generation fail.
 Checkpoint and manifest reads reject symlinks and oversized records. Pruning removes a checkpoint
 from session manifests before deleting it, so a published manifest does not retain a dangling
-reference.
+reference. A successfully validated checkpoint or session-manifest restore refreshes its disk LRU
+recency, so roots that remain useful across tasks survive ahead of newer but unused state. Updating
+that retention hint is best effort: a valid read-only cache hit remains usable even when its
+timestamp cannot be changed.
 
 Use `pb cache status` to inspect the resolved llama.cpp and FlashMoe versioned session namespaces,
 their configured budgets, file counts, byte totals, and oldest-file age without decoding cached

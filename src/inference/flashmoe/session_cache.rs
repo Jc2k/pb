@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -88,14 +88,16 @@ impl FlashMoeDiskCache {
             return Ok(Vec::new());
         }
         let path = self.session_manifest_path(session_id);
-        let bytes = match read_cache_file(&path, MAX_SESSION_MANIFEST_BYTES) {
-            Ok(Some(bytes)) => bytes,
+        let mut file = match open_cache_file(&path) {
+            Ok(Some(file)) => file,
             Ok(None) => return Ok(Vec::new()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to read {}", path.display()));
             }
         };
+        let bytes = read_cache_file_contents(&mut file, &path, MAX_SESSION_MANIFEST_BYTES)
+            .with_context(|| format!("failed to read {}", path.display()))?;
         let manifest: SessionManifest = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         if manifest.version != CACHE_VERSION {
@@ -107,6 +109,7 @@ impl FlashMoeDiskCache {
                 checkpoints.push(checkpoint);
             }
         }
+        refresh_cache_file_recency(&file, &path);
         Ok(checkpoints)
     }
 
@@ -218,11 +221,13 @@ impl FlashMoeDiskCache {
             );
             return Ok(None);
         }
-        let state = read_checkpoint(BufReader::new(file), self.fingerprint, self.layers)
+        let mut reader = BufReader::new(file);
+        let state = read_checkpoint(&mut reader, self.fingerprint, self.layers)
             .with_context(|| format!("failed to restore {}", path.display()))?;
         if Self::token_key(&state.cpu.tokens) != key {
             return Ok(None);
         }
+        refresh_cache_file_recency(reader.get_ref(), &path);
         Ok(Some(state))
     }
 
@@ -243,7 +248,12 @@ impl FlashMoeDiskCache {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 bail!("refused symlink FlashMoe checkpoint {}", path.display());
             }
-            Ok(metadata) if metadata.is_file() => return Ok(Some(key)),
+            Ok(metadata) if metadata.is_file() => {
+                if let Some(file) = open_cache_file(&path)? {
+                    refresh_cache_file_recency(&file, &path);
+                }
+                return Ok(Some(key));
+            }
             Ok(_) => bail!("FlashMoe checkpoint path is not a file: {}", path.display()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -699,9 +709,17 @@ fn open_cache_file(path: &Path) -> std::io::Result<Option<File>> {
 }
 
 fn read_cache_file(path: &Path, max_bytes: u64) -> std::io::Result<Option<Vec<u8>>> {
-    let Some(file) = open_cache_file(path)? else {
+    let Some(mut file) = open_cache_file(path)? else {
         return Ok(None);
     };
+    read_cache_file_contents(&mut file, path, max_bytes).map(Some)
+}
+
+fn read_cache_file_contents(
+    file: &mut File,
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
     if file.metadata()?.len() > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -718,7 +736,18 @@ fn read_cache_file(path: &Path, max_bytes: u64) -> std::io::Result<Option<Vec<u8
             format!("cache file exceeds {max_bytes} bytes: {}", path.display()),
         ));
     }
-    Ok(Some(bytes))
+    Ok(bytes)
+}
+
+fn refresh_cache_file_recency(file: &File, path: &Path) {
+    let times = FileTimes::new().set_modified(SystemTime::now());
+    if let Err(error) = file.set_times(times) {
+        tracing::debug!(
+            path = %path.display(),
+            %error,
+            "could not refresh FlashMoe cache retention recency"
+        );
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1562,6 +1591,35 @@ mod tests {
     }
 
     #[test]
+    fn successful_checkpoint_restore_refreshes_disk_lru_recency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = disk_cache(tmp.path().join("cache"));
+        let first = fixture_state();
+        let mut second = fixture_state();
+        second.cpu.tokens = vec![30, 40];
+        cache.persist_prefix(&first).unwrap();
+        cache.persist_prefix(&second).unwrap();
+
+        let first_path = cache.checkpoint_path(&FlashMoeDiskCache::token_key(&first.cpu.tokens));
+        let second_path = cache.checkpoint_path(&FlashMoeDiskCache::token_key(&second.cpu.tokens));
+        let first_file = File::open(&first_path).unwrap();
+        let second_file = File::open(&second_path).unwrap();
+        first_file
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+            .unwrap();
+        second_file
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(2)))
+            .unwrap();
+
+        cache.load_prefix(&first.cpu.tokens).unwrap().unwrap();
+        cache.max_bytes = fs::metadata(&first_path).unwrap().len();
+        cache.prune(&[]).unwrap();
+
+        assert!(first_path.exists());
+        assert!(!second_path.exists());
+    }
+
+    #[test]
     fn partial_checkpoint_falls_back_to_truthful_fresh_prefill() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = disk_cache(tmp.path().join("cache"));
@@ -1598,6 +1656,45 @@ mod tests {
         cache.persist_prefix(&state).unwrap();
 
         assert!(cache.load_prefix(&state.cpu.tokens).unwrap().is_none());
+        assert!(
+            !cache
+                .checkpoint_path(&FlashMoeDiskCache::token_key(&state.cpu.tokens))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn changing_storage_root_does_not_discover_or_rewrite_old_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = disk_cache(tmp.path().join("first"));
+        let second = disk_cache(tmp.path().join("second"));
+        let state = fixture_state();
+        first.persist_prefix(&state).unwrap();
+
+        assert!(second.load_prefix(&state.cpu.tokens).unwrap().is_none());
+        assert!(first.load_prefix(&state.cpu.tokens).unwrap().is_some());
+        assert!(!second.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_namespace_fails_before_publishing_partial_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked_parent = tmp.path().join("blocked");
+        fs::create_dir(&blocked_parent).unwrap();
+        let original_permissions = fs::metadata(&blocked_parent).unwrap().permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o500);
+        fs::set_permissions(&blocked_parent, read_only).unwrap();
+        let cache = disk_cache(blocked_parent.join("cache"));
+
+        let state = fixture_state();
+        let result = cache.persist_prefix(&state);
+        fs::set_permissions(&blocked_parent, original_permissions).unwrap();
+
+        assert!(result.is_err());
         assert!(
             !cache
                 .checkpoint_path(&FlashMoeDiskCache::token_key(&state.cpu.tokens))

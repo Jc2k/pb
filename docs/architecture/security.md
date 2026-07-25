@@ -278,8 +278,10 @@ Local inference session caches use separate exact `llamacpp-session-v1` and
 reads reject symlinks, non-directories, oversized records, malformed data, version or model
 fingerprint changes, and incompatible state before graph mutation. Prompt-root memory retention is
 byte-bounded LRU; dirty eviction attempts atomic owner-only disk publication and reports durable
-failure rather than claiming reuse. `pb cache clean` is a dry run unless `--yes` is explicit and
-can remove only a selected resolved versioned namespace; it never targets the storage root itself.
+failure rather than claiming reuse. Disk pruning refreshes recency only after a checkpoint or
+manifest has passed validation; failure to update that best-effort hint cannot convert a valid hit
+into an inference failure. `pb cache clean` is a dry run unless `--yes` is explicit and can remove
+only a selected resolved versioned namespace; it never targets the storage root itself.
 
 ## Important limits
 
