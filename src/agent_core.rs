@@ -12513,6 +12513,97 @@ fn failed_check_repair_paths(
         .collect()
 }
 
+const MAX_DIAGNOSTIC_SUPPORT_FILES: usize = 2;
+const MAX_DIAGNOSTIC_SUPPORT_FILE_BYTES: u64 = 16 * 1024;
+const MAX_DIAGNOSTIC_SUPPORT_RENDER_CHARS: usize = 6_000;
+
+/// Render bounded, read-only source that a failed check explicitly cited.
+///
+/// These excerpts explain an external assertion or compiler diagnostic to a focused repair. They
+/// never add read evidence, check credit, or mutation authority, and paths are resolved through the
+/// same workspace boundary as model-requested reads.
+fn failed_check_support_material(
+    workspace_root: &Path,
+    changed_paths: &[String],
+    failures: &[crate::checks::CheckFailureSummary],
+) -> String {
+    let Ok(canonical_root) = workspace_root.canonicalize() else {
+        return String::new();
+    };
+    let changed_paths = changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut support_paths = BTreeSet::new();
+    for failure in failures {
+        for token in failure.output.replace('\\', "/").split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    ':' | '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                )
+        }) {
+            if token.is_empty() || token == "file" {
+                continue;
+            }
+            let candidate = Path::new(token);
+            if !candidate.is_absolute() && !token.starts_with("./") && !token.contains('/') {
+                continue;
+            }
+            let Ok(resolved) = resolve_workspace_path(&canonical_root, token, true) else {
+                continue;
+            };
+            let Ok(relative) = resolved.strip_prefix(&canonical_root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative.starts_with(".git/") || changed_paths.contains(relative.as_str()) {
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(&resolved) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > MAX_DIAGNOSTIC_SUPPORT_FILE_BYTES
+            {
+                continue;
+            }
+            support_paths.insert(relative);
+        }
+    }
+
+    let mut rendered = String::new();
+    for relative in support_paths.into_iter().take(MAX_DIAGNOSTIC_SUPPORT_FILES) {
+        let Ok(resolved) = resolve_workspace_path(&canonical_root, &relative, true) else {
+            continue;
+        };
+        let Ok(text) = read_bounded_utf8_file(
+            &resolved,
+            MAX_DIAGNOSTIC_SUPPORT_FILE_BYTES,
+            "failed-check support path",
+        ) else {
+            continue;
+        };
+        if rendered.is_empty() {
+            rendered.push_str(
+                "\n\nHarness diagnostic support (controller-read, read-only; grants no mutation, check, review, or completion evidence):",
+            );
+        }
+        rendered.push_str(&format!(
+            "\n===== {relative} (explicitly cited by failed check) =====\n{}",
+            render_bounded_read_file(
+                &relative,
+                &text,
+                1,
+                None,
+                MAX_DIAGNOSTIC_SUPPORT_RENDER_CHARS,
+            )
+        ));
+    }
+    rendered
+}
+
 fn run_delivery_checks(
     run: &mut crate::workflow::WorkflowRun,
     graph: &crate::workspace::WorkspaceGraph,
@@ -12677,7 +12768,9 @@ fn run_delivery_checks(
             diagnostic_paths.join(", ")
         )
     };
-    let feedback = format!("{failure_details}{diagnostic_focus}");
+    let diagnostic_support =
+        failed_check_support_material(workspace_root, &changed_paths, &summary.failures);
+    let feedback = format!("{failure_details}{diagnostic_focus}{diagnostic_support}");
     if run.work_units.is_initialized() && !diagnostic_paths.is_empty() {
         let diagnostic_path_set = diagnostic_paths.iter().collect::<BTreeSet<_>>();
         run.stage_evidence
@@ -24215,6 +24308,42 @@ the next imagined action"#;
             "error at file:///private/tmp/run/workspace/app.js.backup:128:9",
             "app.js"
         ));
+    }
+
+    #[test]
+    fn failed_check_support_is_bounded_read_only_and_workspace_confined() {
+        let repo = init_contract_test_repo();
+        std::fs::create_dir_all(repo.path().join("tests")).unwrap();
+        let support = repo.path().join("tests/component_test.tsx");
+        std::fs::write(
+            &support,
+            "assert(html.includes('class=\"alert alert--error\"'));\n",
+        )
+        .unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "private outside evidence\n").unwrap();
+        let failures = vec![crate::checks::CheckFailureSummary {
+            check_id: "behavior".to_string(),
+            exit_status: 1,
+            timed_out: false,
+            output: format!(
+                "at file://{}:14:3\nat file://{}:1:1",
+                support.display(),
+                outside.path().display()
+            ),
+            skip_reason: None,
+        }];
+
+        let material = failed_check_support_material(
+            repo.path(),
+            &["src/Component.tsx".to_string()],
+            &failures,
+        );
+
+        assert!(material.contains("tests/component_test.tsx"));
+        assert!(material.contains("alert alert--error"));
+        assert!(material.contains("grants no mutation, check, review, or completion evidence"));
+        assert!(!material.contains("private outside evidence"));
     }
 
     #[test]

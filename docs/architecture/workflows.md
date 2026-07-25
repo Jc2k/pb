@@ -213,6 +213,13 @@ changed path, pb deterministically reopens that path even when an assertion repo
 output or another symptom rather than repeating the filename. Multi-path failures still require an
 explicit path match before the controller chooses a repair target.
 
+When the bounded check output explicitly cites another regular UTF-8 file inside the workspace,
+pb may carry at most two small excerpts into the focused repair as controller-read diagnostic
+support. This commonly exposes the exact local test assertion or compiler source location that
+explains the symptom. Support files remain read-only context: their paths do not become repair
+targets, their bytes grant no read/check/review evidence, and paths outside the workspace, changed
+task paths, symlinks, binary files, and oversized files are omitted.
+
 When the trusted contract authorizes exactly one path and that same changed work unit has
 failed-check evidence, the repair stage no longer exposes `request_replan`: another plan cannot grant
 a different path, and the accepted work unit already binds the required repository transition, so

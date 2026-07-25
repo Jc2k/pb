@@ -64,6 +64,10 @@ assertion reports rendered output without repeating the filename. Replanning rem
 real scope choices and repository-state blockers; the single-path rule cannot widen or change the
 trusted contract.
 
+If the failed output cites a local test or other small support file, pb can show that bounded source
+to the repair model automatically. The cited file remains read-only and does not become an allowed
+change; all required checks still rerun after the repair.
+
 You may see pb pause for a planning question when a missing choice would materially change the
 work. Answering that question updates the user-owned contract; it does not hand the model a general
 permission to improvise.

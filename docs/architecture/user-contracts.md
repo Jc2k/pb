@@ -173,6 +173,11 @@ completion. Its result is repair feedback, not acceptance evidence: required che
 typed implementation artifact, and only that authoritative run can satisfy checking, review,
 commit, or verified completion.
 
+A failed check may name a local support file such as a test in its bounded output. pb can include a
+small, workspace-confined, read-only excerpt from at most two such regular UTF-8 files in repair
+feedback. This does not add mutation authority or acceptance evidence, and it never follows a cited
+path outside the workspace.
+
 Configured LSPs add an intrinsic diagnostic contract. pb automatically inspects supported changed
 task paths: syntax-classified errors during partial implementation and all error-severity
 diagnostics once work is settled or being handed off. Reports are bound to the current workspace
