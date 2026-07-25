@@ -1,0 +1,7 @@
+[servers.mcp-sentry]
+container_image = "ghcr.io/crunchy-pb/mcp-sentry:latest"
+container_runtime = "docker"
+args = []
+disabled = false
+
+[servers.mcp-sentry.env]
