@@ -887,6 +887,30 @@ export function MessageBubble({
         </article>
       );
 
+    case "user_message":
+      return (
+        <article className="user message-row user-message compact">
+          <div className="message-container">
+            <div className="author-line">
+              <strong>You</strong>
+              <span>Message to running agent</span>
+              {e.timestamp_ms
+                ? <time>{formatEventTime(e.timestamp_ms)}</time>
+                : null}
+            </div>
+            <div className="bubble user-bubble">
+              <p>{e.message}</p>
+            </div>
+          </div>
+          <div className="user-avatar">
+            <img src="/api/current-user.png" alt="Current user" />
+          </div>
+        </article>
+      );
+
+    case "user_message_applied":
+      return null;
+
     case "sub_agent_started":
       const saDepth = e.nesting_depth || 0;
       return (
@@ -1180,6 +1204,10 @@ function activityLabel(envelope: EventEnvelope): string | undefined {
       return "Waiting for an answer";
     case "user_answer":
       return "Answer received";
+    case "user_message":
+      return "Message sent to running agent";
+    case "user_message_applied":
+      return "Running agent received message";
     case "final":
       return "Response completed";
     case "session_summary":

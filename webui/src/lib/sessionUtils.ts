@@ -344,6 +344,7 @@ function isHiddenChatEvent(event: EventEnvelope): boolean {
   ].includes(event.event.summary || "");
   return event.event.type === "sub_agent_started" ||
     event.event.type === "sub_agent_finished" ||
+    event.event.type === "user_message_applied" ||
     event.event.type === "executor_started" ||
     event.event.type === "check_result" ||
     event.event.type === "commit_result" ||

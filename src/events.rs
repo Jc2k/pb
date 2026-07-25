@@ -449,6 +449,12 @@ pub struct ContextSectionUsage {
     pub chars: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedUserMessage {
+    pub message_id: String,
+    pub message: String,
+}
+
 fn add_optional(target: &mut Option<f64>, value: Option<f64>) {
     if let Some(value) = value {
         *target = Some(target.unwrap_or(0.0) + value);
@@ -898,6 +904,17 @@ pub enum AgentEvent {
     UserAnswer {
         question_id: String,
         answer: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    UserMessage {
+        message_id: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
+    UserMessageApplied {
+        message_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -1785,6 +1802,25 @@ impl EventEnvelope {
                 event: AgentEvent::UserAnswer {
                     question_id,
                     answer,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::UserMessage {
+                message_id,
+                message,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::UserMessage {
+                    message_id,
+                    message,
+                    timestamp_ms: Some(now),
+                },
+            },
+            AgentEvent::UserMessageApplied { message_id, .. } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::UserMessageApplied {
+                    message_id,
                     timestamp_ms: Some(now),
                 },
             },

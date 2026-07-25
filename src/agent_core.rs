@@ -51,7 +51,7 @@ use crate::environment::{
 };
 use crate::events::{
     AgentContextUsage, AgentEvent, AgentRetryReason, ContextSectionUsage, ContractStatus,
-    FinalGraceStatus, PromptCacheUsage, TerminationReason,
+    FinalGraceStatus, PromptCacheUsage, QueuedUserMessage, TerminationReason,
 };
 use crate::handoff::{HandoffAttempt, ManagedCommitOutcome, managed_commit, run_handoff};
 use crate::lsp::{self, LspToolRegistry};
@@ -165,6 +165,29 @@ struct WebSearchResult {
 
 pub trait EventSink {
     fn emit(&mut self, event: AgentEvent);
+
+    /// Report whether user-authored messages are waiting without acknowledging them. Workflow
+    /// controllers use this at role and deterministic boundaries so reviewers never consume
+    /// feedback intended for an authoring stage.
+    fn has_user_messages(&self) -> bool {
+        false
+    }
+
+    /// Return user-authored messages that arrived after this run started. Daemon-managed sinks
+    /// acknowledge them durably when they are handed to the harness; direct runs have none.
+    fn take_user_messages(&mut self) -> Vec<QueuedUserMessage> {
+        Vec::new()
+    }
+
+    /// Atomically close the running-message window if no message is pending. Returning `false`
+    /// means a message won the race and the controller must route it before finalizing.
+    fn seal_user_messages(&mut self) -> bool {
+        !self.has_user_messages()
+    }
+
+    /// Reopen the message window when a containing controller starts another model stage after a
+    /// nested workflow reached its own finalization boundary.
+    fn open_user_messages(&mut self) {}
 
     fn supports_user_questions(&self) -> bool {
         false
@@ -6286,6 +6309,9 @@ fn run_agent_steps(
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<StepRunOutcome> {
+    if nesting_depth == 0 {
+        sink.open_user_messages();
+    }
     let stage_capabilities = active_stage_capabilities(args)?;
     let mut metrics = RunMetrics::default();
     let original_max_steps = args.max_steps;
@@ -6368,6 +6394,9 @@ fn run_agent_steps(
     }
 
     while step <= effective_max_steps {
+        if nesting_depth == 0 && stage_accepts_user_messages(args.workflow_stage) {
+            append_user_messages(messages, sink);
+        }
         if sink.should_cancel() {
             sink.emit(AgentEvent::Correction {
                 message: "The user cancelled this run; repository content and collected evidence are being preserved."
@@ -6989,6 +7018,23 @@ fn run_agent_steps(
 
         match action {
             AgentAction::Final { content, thinking } => {
+                let intervening_messages =
+                    if nesting_depth == 0 && stage_accepts_user_messages(args.workflow_stage) {
+                        sink.take_user_messages()
+                    } else {
+                        Vec::new()
+                    };
+                if !intervening_messages.is_empty() {
+                    messages.push(ChatMessage::text("assistant", output));
+                    messages.extend(
+                        intervening_messages
+                            .into_iter()
+                            .map(|message| ChatMessage::text("user", message.message)),
+                    );
+                    effective_max_steps = effective_max_steps.saturating_add(1);
+                    step = step.saturating_add(1);
+                    continue;
+                }
                 if let Some(reasoning) = thinking {
                     sink.emit(AgentEvent::Reasoning {
                         content: reasoning,
@@ -7365,6 +7411,20 @@ fn run_agent_steps(
                         });
                     }
                 }
+                if nesting_depth == 0 && !sink.seal_user_messages() {
+                    let intervening_messages = sink.take_user_messages();
+                    if !intervening_messages.is_empty() {
+                        messages.push(ChatMessage::text("assistant", output));
+                        messages.extend(
+                            intervening_messages
+                                .into_iter()
+                                .map(|message| ChatMessage::text("user", message.message)),
+                        );
+                        effective_max_steps = effective_max_steps.saturating_add(1);
+                        step = step.saturating_add(1);
+                        continue;
+                    }
+                }
                 sink.emit(AgentEvent::Final {
                     content: content.clone(),
                     profile: args.profile,
@@ -7511,6 +7571,20 @@ fn run_agent_steps(
                         metrics,
                         gate_state: gate_state.into_inner(),
                     });
+                }
+                if gate_state_has_terminal_action(&gate_state)
+                    && apply_user_messages_before_terminal_action(
+                        args,
+                        nesting_depth,
+                        &output,
+                        messages,
+                        sink,
+                        &gate_state,
+                        &mut effective_max_steps,
+                    )
+                {
+                    step = step.saturating_add(1);
+                    continue;
                 }
                 if gate_state.borrow().workflow_submission.is_some()
                     || gate_state.borrow().requested_delivery.is_some()
@@ -7679,6 +7753,20 @@ fn run_agent_steps(
                         gate_state: gate_state.into_inner(),
                     });
                 }
+                if gate_state_has_terminal_action(&gate_state)
+                    && apply_user_messages_before_terminal_action(
+                        args,
+                        nesting_depth,
+                        &output,
+                        messages,
+                        sink,
+                        &gate_state,
+                        &mut effective_max_steps,
+                    )
+                {
+                    step = step.saturating_add(1);
+                    continue;
+                }
                 if gate_state.borrow().workflow_submission.is_some()
                     || gate_state.borrow().requested_delivery.is_some()
                     || gate_state.borrow().requested_goal.is_some()
@@ -7774,6 +7862,33 @@ fn run_agent_steps(
             let gate_feedback =
                 request_completion_gate_feedback(args, &gate_state.borrow(), workspace_root)?;
             if gate_feedback.is_none() {
+                if nesting_depth == 0 {
+                    let intervening_messages = sink.take_user_messages();
+                    if !intervening_messages.is_empty() {
+                        messages.extend(
+                            intervening_messages
+                                .into_iter()
+                                .map(|message| ChatMessage::text("user", message.message)),
+                        );
+                        effective_max_steps = effective_max_steps.saturating_add(1);
+                        step = step.saturating_add(1);
+                        continue;
+                    }
+                    if !sink.seal_user_messages() {
+                        let intervening_messages = sink.take_user_messages();
+                        if intervening_messages.is_empty() {
+                            bail!("running-message window could not be sealed before final grace");
+                        }
+                        messages.extend(
+                            intervening_messages
+                                .into_iter()
+                                .map(|message| ChatMessage::text("user", message.message)),
+                        );
+                        effective_max_steps = effective_max_steps.saturating_add(1);
+                        step = step.saturating_add(1);
+                        continue;
+                    }
+                }
                 return run_final_grace(
                     generator,
                     args,
@@ -7854,6 +7969,63 @@ fn run_agent_steps(
         metrics,
         gate_state: gate_state.into_inner(),
     })
+}
+
+fn append_user_messages(messages: &mut Vec<ChatMessage>, sink: &mut dyn EventSink) {
+    messages.extend(
+        sink.take_user_messages()
+            .into_iter()
+            .map(|message| ChatMessage::text("user", message.message)),
+    );
+}
+
+const fn stage_accepts_user_messages(stage: Option<crate::workflow::WorkflowStage>) -> bool {
+    !matches!(
+        stage,
+        Some(
+            crate::workflow::WorkflowStage::PlanReview | crate::workflow::WorkflowStage::CodeReview
+        )
+    )
+}
+
+fn gate_state_has_terminal_action(gate_state: &RefCell<GateState>) -> bool {
+    let gate = gate_state.borrow();
+    gate.workflow_submission.is_some()
+        || gate.requested_delivery.is_some()
+        || gate.requested_goal.is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_user_messages_before_terminal_action(
+    args: &AgentRequest,
+    nesting_depth: usize,
+    output: &str,
+    messages: &mut Vec<ChatMessage>,
+    sink: &mut dyn EventSink,
+    gate_state: &RefCell<GateState>,
+    effective_max_steps: &mut usize,
+) -> bool {
+    if nesting_depth != 0 || !stage_accepts_user_messages(args.workflow_stage) {
+        return false;
+    }
+    let intervening_messages = sink.take_user_messages();
+    if intervening_messages.is_empty() {
+        return false;
+    }
+    {
+        let mut gate = gate_state.borrow_mut();
+        gate.workflow_submission = None;
+        gate.requested_delivery = None;
+        gate.requested_goal = None;
+    }
+    messages.push(ChatMessage::text("assistant", output));
+    messages.extend(
+        intervening_messages
+            .into_iter()
+            .map(|message| ChatMessage::text("user", message.message)),
+    );
+    *effective_max_steps = effective_max_steps.saturating_add(1);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10773,6 +10945,41 @@ fn checkpoint_delivery(run: &crate::workflow::WorkflowRun, sink: &mut dyn EventS
     sink.checkpoint_workflow(&checkpoint)
 }
 
+fn route_pending_workflow_intervention(
+    run: &mut crate::workflow::WorkflowRun,
+    workspace_root: &Path,
+    sink: &mut dyn EventSink,
+) -> Result<bool> {
+    if !sink.has_user_messages()
+        || !matches!(
+            run.stage,
+            crate::workflow::WorkflowStage::PlanReview
+                | crate::workflow::WorkflowStage::Checking
+                | crate::workflow::WorkflowStage::CodeReview
+                | crate::workflow::WorkflowStage::Committing
+        )
+    {
+        return Ok(false);
+    }
+    let interrupted_stage = run.stage;
+    let planning_snapshot = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    run.apply(crate::workflow::WorkflowEvent::UserInterventionQueued { planning_snapshot })?;
+    sink.emit(AgentEvent::ControllerClosure {
+        workflow_id: run.id.clone(),
+        stage: interrupted_stage,
+        reason: format!(
+            "queued user feedback redirected {interrupted_stage:?} to the {:?} authoring stage",
+            run.stage
+        ),
+        actor: crate::events::TeamActor::workflow_steward(),
+        assisting_profile: None,
+        nesting_depth: None,
+        timestamp_ms: Some(now_millis()),
+    });
+    checkpoint_delivery(run, sink)?;
+    Ok(true)
+}
+
 struct WorkflowCheckpointingSink<'a> {
     run: &'a mut crate::workflow::WorkflowRun,
     sink: &'a mut dyn EventSink,
@@ -10793,6 +11000,22 @@ impl EventSink for WorkflowCheckpointingSink<'_> {
 
     fn emit(&mut self, event: AgentEvent) {
         self.sink.emit(event);
+    }
+
+    fn has_user_messages(&self) -> bool {
+        self.sink.has_user_messages()
+    }
+
+    fn take_user_messages(&mut self) -> Vec<QueuedUserMessage> {
+        self.sink.take_user_messages()
+    }
+
+    fn seal_user_messages(&mut self) -> bool {
+        self.sink.seal_user_messages()
+    }
+
+    fn open_user_messages(&mut self) {
+        self.sink.open_user_messages();
     }
 
     fn checkpoint_workflow(
@@ -11155,6 +11378,13 @@ fn run_delivery_workflow(
                 checkpoint: crate::workflow::WorkflowCheckpoint::new(run)?,
             });
         }
+        if route_pending_workflow_intervention(&mut run, workspace_root, sink)? {
+            validation_feedback = None;
+            validation_signature = None;
+            repeated_validation_failures = 0;
+            repair_context = None;
+            continue;
+        }
         if run.stage == crate::workflow::WorkflowStage::Checking {
             repair_context = run_delivery_checks(
                 &mut run,
@@ -11168,6 +11398,16 @@ fn run_delivery_workflow(
             continue;
         }
         if run.stage == crate::workflow::WorkflowStage::Committing {
+            if !sink.seal_user_messages() {
+                if route_pending_workflow_intervention(&mut run, workspace_root, sink)? {
+                    validation_feedback = None;
+                    validation_signature = None;
+                    repeated_validation_failures = 0;
+                    repair_context = None;
+                    continue;
+                }
+                bail!("running-message window could not be sealed before commit");
+            }
             run_delivery_commit(
                 &mut run,
                 graph,
@@ -11225,8 +11465,9 @@ fn run_delivery_workflow(
             stage,
             timestamp_ms: Some(now_millis()),
         });
-        if let Some(implementation) =
-            controller_no_change_implementation(args, &run, workspace_root)?
+        if !sink.has_user_messages()
+            && let Some(implementation) =
+                controller_no_change_implementation(args, &run, workspace_root)?
         {
             validate_implementation_submission(&implementation, &run, workspace_root)?;
             sink.emit(AgentEvent::ControllerClosure {
@@ -11428,6 +11669,35 @@ fn run_delivery_workflow(
                         .to_string(),
                 })?;
                 return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
+            }
+        }
+        if sink.has_user_messages() {
+            checkpoint_delivery(&run, sink)?;
+            if matches!(
+                stage,
+                crate::workflow::WorkflowStage::Planning
+                    | crate::workflow::WorkflowStage::PlanRevision
+                    | crate::workflow::WorkflowStage::Implementing
+                    | crate::workflow::WorkflowStage::Repairing
+            ) {
+                sink.emit(AgentEvent::ControllerClosure {
+                    workflow_id: run.id.clone(),
+                    stage,
+                    reason: "a user message arrived at the stage submission boundary; the submission was discarded so the author can apply it"
+                        .to_string(),
+                    actor: crate::events::TeamActor::workflow_steward(),
+                    assisting_profile: Some(args.profile),
+                    nesting_depth: None,
+                    timestamp_ms: Some(now_millis()),
+                });
+                continue;
+            }
+            if route_pending_workflow_intervention(&mut run, workspace_root, sink)? {
+                validation_feedback = None;
+                validation_signature = None;
+                repeated_validation_failures = 0;
+                repair_context = None;
+                continue;
             }
         }
         checkpoint_delivery(&run, sink)?;
@@ -11877,6 +12147,9 @@ fn run_delivery_checks(
         return Ok(None);
     }
     let evidence = runtime.ledger().clone();
+    if route_pending_workflow_intervention(run, workspace_root, sink)? {
+        return Ok(None);
+    }
     if summary.all_succeeded() {
         let no_change = run
             .implementation
@@ -11894,11 +12167,22 @@ fn run_delivery_checks(
                 None,
             )?
         {
+            if !sink.seal_user_messages()
+                && route_pending_workflow_intervention(run, workspace_root, sink)?
+            {
+                return Ok(None);
+            }
             run.apply(crate::workflow::WorkflowEvent::Failed {
                 outcome: crate::workflow::WorkflowOutcome::ContractUnsatisfied,
                 reason: feedback,
             })?;
             checkpoint_delivery(run, sink)?;
+            return Ok(None);
+        }
+        if no_change
+            && !sink.seal_user_messages()
+            && route_pending_workflow_intervention(run, workspace_root, sink)?
+        {
             return Ok(None);
         }
         run.apply(crate::workflow::WorkflowEvent::ChecksPassed {
@@ -11921,6 +12205,12 @@ fn run_delivery_checks(
         .chain(summary.skipped.iter())
         .cloned()
         .collect::<Vec<_>>();
+    if run.counters.repair_cycles >= run.policy.limits.repair_cycles
+        && !sink.seal_user_messages()
+        && route_pending_workflow_intervention(run, workspace_root, sink)?
+    {
+        return Ok(None);
+    }
     let failure_details = summary
         .failures
         .iter()
@@ -21473,6 +21763,95 @@ pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct UserMessageSink {
+        pending: Vec<QueuedUserMessage>,
+    }
+
+    impl EventSink for UserMessageSink {
+        fn emit(&mut self, _event: AgentEvent) {}
+
+        fn has_user_messages(&self) -> bool {
+            !self.pending.is_empty()
+        }
+
+        fn take_user_messages(&mut self) -> Vec<QueuedUserMessage> {
+            std::mem::take(&mut self.pending)
+        }
+    }
+
+    #[test]
+    fn running_user_messages_are_injected_once_as_plain_user_chat() {
+        let mut sink = UserMessageSink {
+            pending: vec![QueuedUserMessage {
+                message_id: "message-1".to_string(),
+                message: "Use the existing parser.".to_string(),
+            }],
+        };
+        let mut messages = vec![ChatMessage::text("user", "Initial task")];
+
+        append_user_messages(&mut messages, &mut sink);
+        append_user_messages(&mut messages, &mut sink);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "Use the existing parser.");
+    }
+
+    #[test]
+    fn workflow_critics_do_not_accept_running_user_messages() {
+        assert!(!stage_accepts_user_messages(Some(
+            crate::workflow::WorkflowStage::PlanReview
+        )));
+        assert!(!stage_accepts_user_messages(Some(
+            crate::workflow::WorkflowStage::CodeReview
+        )));
+        assert!(stage_accepts_user_messages(Some(
+            crate::workflow::WorkflowStage::PlanRevision
+        )));
+        assert!(stage_accepts_user_messages(Some(
+            crate::workflow::WorkflowStage::Repairing
+        )));
+    }
+
+    #[test]
+    fn review_boundary_redirects_feedback_without_consuming_it() {
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let policy = crate::workflow::WorkflowConfigDocument::default()
+            .compile()
+            .unwrap();
+        let mut run = crate::workflow::WorkflowRun::start(
+            "workflow-message-routing",
+            "turn-message-routing",
+            "apply the feedback",
+            policy,
+            repository,
+        )
+        .unwrap();
+        run.stage = crate::workflow::WorkflowStage::CodeReview;
+        let mut sink = UserMessageSink {
+            pending: vec![QueuedUserMessage {
+                message_id: "message-review".to_string(),
+                message: "Keep the public API stable.".to_string(),
+            }],
+        };
+
+        assert!(route_pending_workflow_intervention(&mut run, repo.path(), &mut sink).unwrap());
+        assert_eq!(run.stage, crate::workflow::WorkflowStage::Planning);
+        assert!(sink.has_user_messages());
+
+        let mut messages = Vec::new();
+        append_user_messages(&mut messages, &mut sink);
+        assert_eq!(messages[0].content, "Keep the public API stable.");
+        assert!(!sink.has_user_messages());
+    }
 
     #[test]
     fn task_planning_setup_failure_preserves_the_original_build_route() {

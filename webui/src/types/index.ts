@@ -410,6 +410,17 @@ export type AgentEvent =
     timestamp_ms?: number;
   }
   | {
+    type: "user_message";
+    message_id: string;
+    message: string;
+    timestamp_ms?: number;
+  }
+  | {
+    type: "user_message_applied";
+    message_id: string;
+    timestamp_ms?: number;
+  }
+  | {
     type: "correction";
     message: string;
     summary?: string;

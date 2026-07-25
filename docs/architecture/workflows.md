@@ -17,6 +17,34 @@ user message → read-only investigation → answer
 The proposal is not self-authorization. The transition happens only after explicit user intent is
 recorded by the calling surface.
 
+### In-flight user messages
+
+**Shipped.** A daemon-managed running session accepts bounded user messages independently of turn
+intent. The web composer posts the message to the existing session; it does not create a new turn,
+Task, delivery proposal, or Goal. The daemon appends a durable `user_message` event and keeps the
+message pending until the primary agent harness takes it. At the next agent step boundary the
+harness appends the whitespace-trimmed text as a normal `user` chat message and records
+`user_message_applied`. Pending messages survive session persistence and daemon restart.
+
+The boundary is intentionally between model/tool loops: pb does not interrupt a model inference or
+partially executed tool batch. Message delivery is controller-owned and role-aware. Planning and
+build authors may take pending messages; plan-review and code-review critics may not. Feedback
+queued during plan review redirects the workflow to plan revision before a review verdict can be
+accepted. Feedback queued after a build submission, during checks or code review, or before commit
+invalidates the stale downstream artifacts and restarts planning from the current repository
+snapshot. The next authoring stage then takes the message as ordinary user conversation input.
+
+Every stage artifact and successful task-finalization boundary performs the same pending-message
+check. This includes prose `final`, typed stage submissions, deterministic checks-to-review
+transitions, review-to-commit, and the no-change or commit success path. Immediately before an
+irreversible final response or managed commit, the daemon atomically closes that run's message
+window. A message either wins that boundary and is routed, or its POST is rejected with conflict;
+pb never acknowledges a message that the completed run cannot see. A containing Goal or multi-Task
+controller reopens the window when it starts its next model stage.
+Workflow stage capabilities, accepted-plan scope, checks, review, commit ownership, Goal controls,
+budgets, and publication authority remain controller-owned; user conversation content alone cannot
+mutate or widen those state machines.
+
 ## Delivery
 
 Delivery is a harness-owned state machine:

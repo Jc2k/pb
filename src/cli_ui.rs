@@ -320,6 +320,14 @@ pub fn render_event(event: &AgentEvent) {
             answer,
             ..
         } => print_block(&format!("answer {question_id}"), answer),
+        AgentEvent::UserMessage {
+            message_id,
+            message,
+            ..
+        } => print_block(&format!("user message {message_id}"), message),
+        AgentEvent::UserMessageApplied { message_id, .. } => {
+            print_header("user message", &format!("{message_id} applied"));
+        }
         AgentEvent::Correction {
             actor,
             summary,

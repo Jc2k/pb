@@ -924,6 +924,16 @@ article.user div.message-container {
     flex: 0 0 42px;
 }
 
+.running-message-field {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.running-message-field small {
+    display: block;
+    margin: 0.3rem 0.25rem 0;
+}
+
 @media (max-width: 1199.98px) {
     .session-shell {
         grid-template-columns: minmax(0, 1fr);

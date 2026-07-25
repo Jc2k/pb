@@ -243,6 +243,31 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
   );
 });
 
+Deno.test("running user messages stay in chat while delivery acknowledgements stay internal", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "v1",
+      event: {
+        type: "user_message",
+        message_id: "message-1",
+        message: "Keep the API stable.",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "user_message_applied",
+        message_id: "message-1",
+      },
+    },
+  ];
+
+  deepEqual(
+    chatEventsWithOnlyLatestStep(events).map((event) => event.event.type),
+    ["user_message"],
+  );
+});
+
 Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated by final message", () => {
   const events: EventEnvelope[] = [
     {

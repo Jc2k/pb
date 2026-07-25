@@ -9,12 +9,12 @@ use base64::Engine as _;
 use futures::StreamExt;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -24,7 +24,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent_core::{
     AgentProfile, AgentRequest, EventSink, SessionAttachment, run_agent_managed,
 };
-use crate::events::{AgentEvent, EventEnvelope, HandoffOutcome, SessionMetricsSnapshot};
+use crate::events::{
+    AgentEvent, EventEnvelope, HandoffOutcome, QueuedUserMessage, SessionMetricsSnapshot,
+};
 use crate::integrations::{
     self, InstalledIntegration, IntegrationConfigSchema, IntegrationInstallRequest,
     MarketplaceIntegration,
@@ -37,6 +39,9 @@ use crate::sleep_prevention::{SleepPrevention, SleepPreventionStatus};
 
 const MAX_HISTORY_EVENTS: usize = 1_000;
 const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
+const MAX_USER_MESSAGE_CHARS: usize = 8_000;
+const MAX_PENDING_USER_MESSAGES: usize = 32;
+static USER_MESSAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const SERVICE_WORKER_JS: &str = r#"self.addEventListener("install",(event)=>{self.skipWaiting();});
 self.addEventListener("activate",(event)=>{event.waitUntil(self.clients.claim());});
@@ -101,6 +106,16 @@ pub struct ContinueSessionRequest {
     pub intent: Option<crate::workflow::TurnIntent>,
     #[serde(default)]
     pub proposal_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendSessionMessageRequest {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendSessionMessageResponse {
+    pub message_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +443,8 @@ struct SessionState {
     completed_goals: Vec<crate::goal::GoalCheckpoint>,
     multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
     completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
+    pending_user_messages: Arc<StdMutex<VecDeque<QueuedUserMessage>>>,
+    accepting_user_messages: Arc<AtomicBool>,
     pause_token: Arc<AtomicBool>,
     cancel_token: Arc<AtomicBool>,
     updated_at_ms: u64,
@@ -543,6 +560,7 @@ pub async fn run_server_with_ready(
             get(get_session).delete(delete_session),
         )
         .route("/api/sessions/{id}/continue", post(continue_session))
+        .route("/api/sessions/{id}/message", post(send_session_message))
         .route("/api/sessions/{id}/resume", post(resume_session))
         .route(
             "/api/sessions/{id}/retry-task-planning",
@@ -926,6 +944,8 @@ async fn start_session_inner(
         completed_goals: Vec::new(),
         multi_task: None,
         completed_multi_tasks: Vec::new(),
+        pending_user_messages: Arc::new(StdMutex::new(VecDeque::new())),
+        accepting_user_messages: Arc::new(AtomicBool::new(false)),
         pause_token: Arc::new(AtomicBool::new(false)),
         cancel_token: Arc::new(AtomicBool::new(false)),
         updated_at_ms: now,
@@ -1096,6 +1116,8 @@ async fn start_goal_inner(
         completed_goals: Vec::new(),
         multi_task: None,
         completed_multi_tasks: Vec::new(),
+        pending_user_messages: Arc::new(StdMutex::new(VecDeque::new())),
+        accepting_user_messages: Arc::new(AtomicBool::new(false)),
         pause_token: Arc::new(AtomicBool::new(false)),
         cancel_token: Arc::new(AtomicBool::new(false)),
         updated_at_ms: now,
@@ -2122,6 +2144,54 @@ async fn continue_session(
     Ok(Json(SessionResponse { session_id: id }))
 }
 
+async fn send_session_message(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<SendSessionMessageRequest>,
+) -> Result<Json<SendSessionMessageResponse>, StatusCode> {
+    let message = req.message.trim().to_string();
+    if message.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if message.chars().count() > MAX_USER_MESSAGE_CHARS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+    if session.status != SessionStatus::Running || !session.running {
+        return Err(StatusCode::CONFLICT);
+    }
+    let message_id = new_user_message_id(&id);
+    let mut pending = session
+        .pending_user_messages
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !session.accepting_user_messages.load(Ordering::SeqCst) {
+        return Err(StatusCode::CONFLICT);
+    }
+    if pending.len() >= MAX_PENDING_USER_MESSAGES {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    pending.push_back(QueuedUserMessage {
+        message_id: message_id.clone(),
+        message: message.clone(),
+    });
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::UserMessage {
+            message_id: message_id.clone(),
+            message,
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+    drop(pending);
+    session.updated_at_ms = now_millis();
+    persist_live_session(&id, session);
+    Ok(Json(SendSessionMessageResponse { message_id }))
+}
+
 async fn resume_session(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
@@ -2566,6 +2636,9 @@ async fn answer_question_inner(
         session.paused = false;
         session.running = true;
         session.status = SessionStatus::Running;
+        session
+            .accepting_user_messages
+            .store(true, Ordering::SeqCst);
         session.updated_at_ms = now_millis();
         publish_event(
             &sender,
@@ -2957,6 +3030,8 @@ struct WebEventSink {
     completed_goals: Vec<crate::goal::GoalCheckpoint>,
     multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
     completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
+    pending_user_messages: Arc<StdMutex<VecDeque<QueuedUserMessage>>>,
+    accepting_user_messages: Arc<AtomicBool>,
     pause_token: Arc<AtomicBool>,
     cancel_token: Arc<AtomicBool>,
 }
@@ -3052,6 +3127,67 @@ impl EventSink for WebEventSink {
             self.multi_task.clone(),
             self.completed_multi_tasks.clone(),
         );
+    }
+
+    fn has_user_messages(&self) -> bool {
+        self.pending_user_messages
+            .lock()
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(true)
+    }
+
+    fn take_user_messages(&mut self) -> Vec<QueuedUserMessage> {
+        let mut pending = match self.pending_user_messages.lock() {
+            Ok(pending) => pending,
+            Err(_) => return Vec::new(),
+        };
+        let messages = pending.drain(..).collect::<Vec<_>>();
+        if messages.is_empty() {
+            return messages;
+        }
+        for message in &messages {
+            publish_event(
+                &self.sender,
+                &self.history,
+                AgentEvent::UserMessageApplied {
+                    message_id: message.message_id.clone(),
+                    timestamp_ms: Some(now_millis()),
+                },
+            );
+        }
+        drop(pending);
+        persist_session_snapshot(
+            &self.session_id,
+            &self.request_template,
+            self.persisted_branch.clone(),
+            self.persisted_workdir.clone(),
+            SessionStatus::Running,
+            &self.history,
+            &self.usage_records,
+            self.workflow.clone(),
+            self.completed_workflows.clone(),
+            self.goal.clone(),
+            self.completed_goals.clone(),
+            self.multi_task.clone(),
+            self.completed_multi_tasks.clone(),
+        );
+        messages
+    }
+
+    fn seal_user_messages(&mut self) -> bool {
+        let pending = match self.pending_user_messages.lock() {
+            Ok(pending) => pending,
+            Err(_) => return false,
+        };
+        if !pending.is_empty() {
+            return false;
+        }
+        self.accepting_user_messages.store(false, Ordering::SeqCst);
+        true
+    }
+
+    fn open_user_messages(&mut self) {
+        self.accepting_user_messages.store(true, Ordering::SeqCst);
     }
 
     fn checkpoint_workflow(
@@ -3471,6 +3607,9 @@ fn dispatch_next_session(state: AppState) {
                 session.running = true;
                 session.paused = false;
                 session.status = SessionStatus::Running;
+                session
+                    .accepting_user_messages
+                    .store(true, Ordering::SeqCst);
                 session.updated_at_ms = now_millis();
                 (
                     Some((
@@ -3545,6 +3684,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             completed_goals,
             multi_task,
             completed_multi_tasks,
+            pending_user_messages,
+            accepting_user_messages,
             pause_token,
             cancel_token,
         ) = {
@@ -3566,6 +3707,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 session.completed_goals.clone(),
                 session.multi_task.clone(),
                 session.completed_multi_tasks.clone(),
+                Arc::clone(&session.pending_user_messages),
+                Arc::clone(&session.accepting_user_messages),
                 Arc::clone(&session.pause_token),
                 Arc::clone(&session.cancel_token),
             )
@@ -3600,6 +3743,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 completed_goals,
                 multi_task,
                 completed_multi_tasks,
+                pending_user_messages,
+                accepting_user_messages,
                 pause_token,
                 cancel_token,
             };
@@ -4981,7 +5126,7 @@ fn build_project_usage_cache(
     cache
 }
 
-fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState) {
+fn session_from_persisted(mut persisted: PersistedSession) -> (String, SessionState) {
     let (sender, _) = broadcast::channel(256);
     let session_id = persisted.session_id.clone();
     let title = latest_session_title(&persisted.events).or(persisted.title);
@@ -4998,7 +5143,14 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
         .metrics
         .clone()
         .or_else(|| combined_metrics(&usage_records));
+    let pending_user_messages = if persisted.pending_user_messages.is_empty() {
+        pending_user_messages_from_events(&persisted.events)
+    } else {
+        std::mem::take(&mut persisted.pending_user_messages)
+    };
     let history = Arc::new(StdMutex::new(persisted.events));
+    let pending_user_messages =
+        Arc::new(StdMutex::new(pending_user_messages.into_iter().collect()));
     let interrupted = persisted.running || persisted.status == Some(SessionStatus::Running);
     let status = if interrupted {
         SessionStatus::Paused
@@ -5029,6 +5181,8 @@ fn session_from_persisted(persisted: PersistedSession) -> (String, SessionState)
             completed_goals: persisted.completed_goals,
             multi_task: persisted.multi_task,
             completed_multi_tasks: persisted.completed_multi_tasks,
+            pending_user_messages,
+            accepting_user_messages: Arc::new(AtomicBool::new(false)),
             pause_token: Arc::new(AtomicBool::new(false)),
             cancel_token: Arc::new(AtomicBool::new(false)),
             updated_at_ms: persisted.updated_at_ms,
@@ -5067,6 +5221,7 @@ fn persist_session_snapshot(
         .lock()
         .map(|records| records.clone())
         .unwrap_or_default();
+    let pending_user_messages = pending_user_messages_from_events(&events);
     let mut persisted = PersistedSession::from_parts(
         session_id.to_string(),
         request_template.clone(),
@@ -5086,9 +5241,31 @@ fn persist_session_snapshot(
     persisted.completed_goals = completed_goals;
     persisted.multi_task = multi_task;
     persisted.completed_multi_tasks = completed_multi_tasks;
+    persisted.pending_user_messages = pending_user_messages;
     if let Err(err) = session_store::save_session(&persisted) {
         eprintln!("failed to persist pb session {session_id}: {err:#}");
     }
+}
+
+fn pending_user_messages_from_events(events: &[EventEnvelope]) -> Vec<QueuedUserMessage> {
+    let mut pending = VecDeque::new();
+    for envelope in events {
+        match &envelope.event {
+            AgentEvent::UserMessage {
+                message_id,
+                message,
+                ..
+            } => pending.push_back(QueuedUserMessage {
+                message_id: message_id.clone(),
+                message: message.clone(),
+            }),
+            AgentEvent::UserMessageApplied { message_id, .. } => {
+                pending.retain(|message| message.message_id != *message_id);
+            }
+            _ => {}
+        }
+    }
+    pending.into_iter().collect()
 }
 
 fn persist_live_session(session_id: &str, session: &SessionState) {
@@ -5265,6 +5442,11 @@ fn new_turn_id(session_id: &str) -> String {
     format!("turn-{session_id}-{}", now_millis())
 }
 
+fn new_user_message_id(session_id: &str) -> String {
+    let sequence = USER_MESSAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("message-{session_id}-{}-{sequence}", now_millis())
+}
+
 fn workflow_policy_for_request(
     workdir: Option<&std::path::Path>,
 ) -> Result<crate::workflow::CompiledWorkflowPolicy> {
@@ -5376,6 +5558,95 @@ fn publish_event(
 #[cfg(test)]
 mod workflow_tests {
     use super::*;
+
+    #[test]
+    fn user_messages_remain_pending_until_the_agent_loop_applies_them() {
+        let queued = EventEnvelope::new(AgentEvent::UserMessage {
+            message_id: "message-1".to_string(),
+            message: "Please keep the public API unchanged.".to_string(),
+            timestamp_ms: Some(1),
+        });
+        let applied = EventEnvelope::new(AgentEvent::UserMessageApplied {
+            message_id: "message-1".to_string(),
+            timestamp_ms: Some(2),
+        });
+
+        assert_eq!(
+            pending_user_messages_from_events(std::slice::from_ref(&queued)),
+            vec![QueuedUserMessage {
+                message_id: "message-1".to_string(),
+                message: "Please keep the public API unchanged.".to_string(),
+            }]
+        );
+        assert!(pending_user_messages_from_events(&[queued, applied]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_session_message_endpoint_queues_conversation_input() {
+        let mut request = request(std::path::Path::new("."));
+        request.workdir = None;
+        request.branch = None;
+        request.repository_less = true;
+        let persisted = PersistedSession::from_parts(
+            request.session_id.clone(),
+            request.clone(),
+            None,
+            None,
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        let (session_id, mut session) = session_from_persisted(persisted);
+        session.running = true;
+        session.status = SessionStatus::Running;
+        session
+            .accepting_user_messages
+            .store(true, Ordering::SeqCst);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+        };
+
+        let response = send_session_message(
+            Path(session_id.clone()),
+            State((state.clone(), request.clone())),
+            Json(SendSessionMessageRequest {
+                message: "  Keep the API stable.  ".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let accepting_user_messages = {
+            let sessions = state.sessions.lock().await;
+            let session = sessions.get(&session_id).unwrap();
+            let pending = session.pending_user_messages.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].message_id, response.message_id);
+            assert_eq!(pending[0].message, "Keep the API stable.");
+            assert!(session.history.lock().unwrap().iter().any(|envelope| {
+                matches!(
+                    &envelope.event,
+                    AgentEvent::UserMessage { message, .. } if message == "Keep the API stable."
+                )
+            }));
+            Arc::clone(&session.accepting_user_messages)
+        };
+        accepting_user_messages.store(false, Ordering::SeqCst);
+
+        let rejected = send_session_message(
+            Path(session_id),
+            State((state, request)),
+            Json(SendSessionMessageRequest {
+                message: "This arrived after the final boundary.".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(rejected.unwrap_err(), StatusCode::CONFLICT);
+    }
 
     fn request(workdir: &std::path::Path) -> AgentRequest {
         AgentRequest {

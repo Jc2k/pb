@@ -135,6 +135,16 @@ Deno.test("workflow controls preserve work and restore conversation after termin
   ok(page.includes("<IntentControl intent={intent} onChange={setIntent} />"));
 });
 
+Deno.test("running sessions keep a plain-message composer without intent controls", async () => {
+  const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+
+  ok(page.includes("`/api/sessions/${sessionId}/message`"));
+  ok(page.includes('placeholder="Message the running agent…"'));
+  ok(page.includes('aria-label="Send message to running agent"'));
+  ok(page.includes("{isRunning"));
+  ok(page.includes("body: JSON.stringify({ message })"));
+});
+
 Deno.test("paused session composer keeps resume action at intrinsic width", async () => {
   const markup = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
   const css = await Deno.readTextFile("webui/src/session.css");

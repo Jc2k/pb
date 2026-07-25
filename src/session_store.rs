@@ -53,6 +53,8 @@ pub struct PersistedSession {
     pub multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_user_messages: Vec<crate::events::QueuedUserMessage>,
     pub events: Vec<EventEnvelope>,
 }
 
@@ -88,6 +90,7 @@ impl PersistedSession {
             completed_goals: Vec::new(),
             multi_task: None,
             completed_multi_tasks: Vec::new(),
+            pending_user_messages: Vec::new(),
             events: trim_events(events),
         }
     }

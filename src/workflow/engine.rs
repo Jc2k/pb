@@ -193,6 +193,9 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         planning_snapshot: Option<ContentSnapshot>,
     },
+    UserInterventionQueued {
+        planning_snapshot: ContentSnapshot,
+    },
     ImplementationSubmitted {
         implementation: ArtifactEnvelope<ImplementationArtifact>,
     },
@@ -354,6 +357,36 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.commit = None;
             run.ready_evidence = None;
             run.stage = WorkflowStage::Planning;
+        }
+        WorkflowEvent::UserInterventionQueued { planning_snapshot } => {
+            require_stage(
+                run.stage,
+                &[
+                    WorkflowStage::PlanReview,
+                    WorkflowStage::Implementing,
+                    WorkflowStage::Repairing,
+                    WorkflowStage::Checking,
+                    WorkflowStage::CodeReview,
+                    WorkflowStage::Committing,
+                ],
+                "route user intervention",
+            )?;
+            run.planning_snapshot = Some(planning_snapshot);
+            run.plan_review = None;
+            run.work_units = super::WorkUnitLedger::default();
+            run.implementation = None;
+            run.selected_checks.clear();
+            run.checks = CheckEvidenceLedger::default();
+            run.content_fingerprint = None;
+            run.code_review = None;
+            run.commit = None;
+            run.ready_evidence = None;
+            if run.stage == WorkflowStage::PlanReview {
+                run.stage = WorkflowStage::PlanRevision;
+            } else {
+                run.plan = None;
+                run.stage = WorkflowStage::Planning;
+            }
         }
         WorkflowEvent::ImplementationSubmitted { implementation } => {
             require_stage(
@@ -884,6 +917,47 @@ mod tests {
         .unwrap();
         assert_eq!(run.stage, WorkflowStage::PlanRevision);
         assert_eq!(run.counters.plan_cycles, 1);
+    }
+
+    #[test]
+    fn user_intervention_during_plan_review_returns_to_the_planner() {
+        let mut run = run();
+        let plan = plan();
+        run.apply(WorkflowEvent::PlanSubmitted { plan: plan.clone() })
+            .unwrap();
+        let snapshot = run.planning_content().clone();
+
+        run.apply(WorkflowEvent::UserInterventionQueued {
+            planning_snapshot: snapshot,
+        })
+        .unwrap();
+
+        assert_eq!(run.stage, WorkflowStage::PlanRevision);
+        assert_eq!(run.plan, Some(plan));
+        assert!(run.plan_review.is_none());
+        assert_eq!(run.counters.plan_cycles, 0);
+    }
+
+    #[test]
+    fn late_build_feedback_invalidates_review_and_returns_to_planning() {
+        let mut run = run();
+        run.stage = WorkflowStage::CodeReview;
+        run.plan = Some(plan());
+        run.content_fingerprint = Some("checked".to_string());
+        run.selected_checks.push("test".to_string());
+        let snapshot = run.planning_content().clone();
+
+        run.apply(WorkflowEvent::UserInterventionQueued {
+            planning_snapshot: snapshot.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(run.stage, WorkflowStage::Planning);
+        assert_eq!(run.planning_snapshot, Some(snapshot));
+        assert!(run.plan.is_none());
+        assert!(run.content_fingerprint.is_none());
+        assert!(run.selected_checks.is_empty());
+        assert!(run.code_review.is_none());
     }
 
     #[test]

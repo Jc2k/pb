@@ -62,6 +62,22 @@ When planning discovers a materially missing choice, it may ask the user. The an
 the task contract. Guessing would make progress faster at the cost of changing ownership of the
 decision, so the workflow pauses instead.
 
+While a session is running, the user may also send an ordinary in-flight message. This is
+conversation input to the current primary agent, not a new turn, Task, intent selection, Goal,
+approval, or automatic state transition. pb records the message before delivery and injects it at
+the next agent loop boundary. The text may clarify or narrow the requested approach, but it cannot
+widen repository scope, stage capabilities, an accepted plan, Goal limits, or publication
+authority. Changes that require a new approval or controller transition must still use that
+explicit lifecycle.
+
+Review agents never consume these messages. If feedback arrives while a plan or code critic is
+running, the controller discards any now-stale review submission and routes the pending message to
+the planner-side authoring path. Feedback that arrives after implementation but before commit
+invalidates downstream check and review evidence and restarts planning against the current bytes.
+At the final response or commit boundary, acceptance closes atomically: the message is either
+queued before closure and routed, or the send is rejected as a conflict. It is never accepted into
+a session that can complete without applying it.
+
 ## Scope contract
 
 The repository root, task focus, allowed paths, configured tasks, and expected outputs constrain

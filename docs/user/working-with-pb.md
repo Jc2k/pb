@@ -51,6 +51,30 @@ You may see pb pause for a planning question when a missing choice would materia
 work. Answering that question updates the user-owned contract; it does not hand the model a general
 permission to improvise.
 
+### Message a running task
+
+**Shipped.** The session composer remains available while a task is running. A message sent there
+is added to the existing agent conversation at the next primary agent loop boundary; it does not
+start a follow-up Task, select Discuss, Build, or Goal, or create a Goal. This lets you correct an
+assumption, add context, or redirect the current approach without stopping the session.
+
+Messages are recorded before the agent receives them and acknowledged when the harness adds them to
+the prompt. If pb restarts before that boundary, the still-pending message is restored with the
+paused session. A message cannot widen the current stage's tool authority, accepted plan, repository
+scope, or publication boundary. During a long model inference or tool action, the current operation
+finishes first; the message is picked up on the next loop.
+
+The workflow routes feedback to an author, never to a fresh-context critic. A message sent during
+plan review sends the workflow back to plan revision. A message sent after the implementation
+submission, during checks or code review, or just before commit invalidates the stale downstream
+evidence and restarts planning from the current repository state. A typed stage submission is
+deferred in the same way as an ordinary final response when a message is already waiting.
+
+Immediately before the task emits its final response or creates its managed commit, pb atomically
+stops accepting in-flight messages. A send that loses that final race reports a conflict instead of
+appearing accepted and then being ignored. Goal and multi-Task sessions reopen the message window
+when their next model stage begins.
+
 ### Actions in web and terminal
 
 pb performs narrowly safe routine work—such as an eligible file read or changed-path inspection—

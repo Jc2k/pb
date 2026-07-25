@@ -45,6 +45,8 @@ export function SessionPage() {
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [sessionRunning, setSessionRunning] = useState(false);
   const [followUp, setFollowUp] = useState("");
+  const [runningMessage, setRunningMessage] = useState("");
+  const [runningMessageError, setRunningMessageError] = useState("");
   const [intent, setIntent] = useState<ComposerMode>("discuss");
   const [goalStartOpen, setGoalStartOpen] = useState(false);
   const [goalDetailsOpen, setGoalDetailsOpen] = useState(false);
@@ -80,8 +82,11 @@ export function SessionPage() {
         ) {
           void fetchSession();
         }
-        if (parsed.event.type === "user_question") {
+        if (parsed.event.type === "started") {
+          setSessionRunning(true);
+        } else if (parsed.event.type === "user_question") {
           setSessionRunning(false);
+          void fetchSession();
         } else if (parsed.event.type === "user_answer") {
           setSessionRunning(true);
         } else if (
@@ -129,6 +134,31 @@ export function SessionPage() {
     });
     setFollowUp("");
     setSessionRunning(false);
+  };
+
+  const sendRunningMessage = async () => {
+    const message = runningMessage.trim();
+    if (!message) return;
+    setRunningMessageError("");
+    const response = await fetch(`/api/sessions/${sessionId}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    });
+    if (response.ok) {
+      setRunningMessage("");
+      return;
+    }
+    if (response.status === 409) {
+      setRunningMessageError(
+        "The task stopped accepting in-flight messages before this could be sent.",
+      );
+      await fetchSession();
+    } else if (response.status === 429) {
+      setRunningMessageError("Too many messages are waiting to be picked up.");
+    } else {
+      setRunningMessageError("Message could not be sent.");
+    }
   };
 
   const mutateGoal = async (
@@ -298,7 +328,7 @@ export function SessionPage() {
     return () => window.clearTimeout(timer);
   }, [shareMessage]);
 
-  const isRunning = session?.status === "running" || false;
+  const isRunning = sessionRunning;
   const activeGoal = session?.active_goal ? session.goal : undefined;
   const activeGoalBanner = activeGoal
     ? (
@@ -685,7 +715,44 @@ export function SessionPage() {
           </div>
         )}
 
-        {activeGoal
+        {isRunning
+          ? (
+            <form
+              className="composer running-message-composer"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void sendRunningMessage();
+              }}
+            >
+              <div className="running-message-field">
+                <input
+                  className="form-control"
+                  value={runningMessage}
+                  onChange={(e) => setRunningMessage(e.target.value)}
+                  placeholder="Message the running agent…"
+                  aria-label="Message the running agent"
+                  maxLength={8000}
+                />
+                {runningMessageError
+                  ? (
+                    <small className="text-danger" role="status">
+                      {runningMessageError}
+                    </small>
+                  )
+                  : null}
+              </div>
+              <button
+                className="btn btn-primary rounded-circle"
+                type="submit"
+                disabled={!runningMessage.trim()}
+                aria-label="Send message to running agent"
+                title="Picked up at the next agent loop"
+              >
+                <i className="bi bi-arrow-up"></i>
+              </button>
+            </form>
+          )
+          : activeGoal
           ? null
           : session.status === "paused" && session.pending_question
           ? (
