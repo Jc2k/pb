@@ -542,6 +542,10 @@ pub struct AgentRequest {
     /// memory; persisted and direct requests cannot use it to manufacture terminal eligibility.
     #[serde(skip)]
     pub(crate) workflow_expected_content_fingerprint: Option<String>,
+    /// Harness-owned accepted-plan identity for review projection. Strict stage setup derives this
+    /// from the durable plan so the reviewer does not spend tokens copying controller-known hashes.
+    #[serde(skip)]
+    pub(crate) workflow_plan_identity: Option<(String, String)>,
     /// Harness-owned hint for a first implementation turn whose accepted plan contains only
     /// creation of currently missing paths. This is calculated from the validated plan and
     /// current workspace, never accepted from persisted input.
@@ -2960,12 +2964,23 @@ fn run_agent_inner<S: EventSink>(
     let mut task_planning_transcript = None;
     let mut multi_task_created = false;
     let mut single_task_goal = None;
-    let should_plan_tasks = args.intent == Some(crate::workflow::TurnIntent::Deliver)
+    let task_planning_eligible = args.intent == Some(crate::workflow::TurnIntent::Deliver)
         && args.workflow_checkpoint.is_none()
         && args.goal_context.is_none()
         && args.task_planning == TaskPlanningPreference::Auto
         && !args.turn_id.starts_with("task-request:")
         && !args.repository_less;
+    let partition_bypass_reason = task_planning_eligible
+        .then(|| crate::task_queue::single_build_partition_bypass_reason(&args.task))
+        .flatten();
+    let should_plan_tasks = task_planning_eligible && partition_bypass_reason.is_none();
+    if let Some(reason) = partition_bypass_reason {
+        task_planning_transcript = Some(crate::task_queue::TaskPlanningTranscript {
+            decision: crate::task_queue::TaskPlanningDecision::OneBuildSimpleRequest,
+            summary: reason,
+            attempts: Vec::new(),
+        });
+    }
     if should_plan_tasks {
         'task_planning: {
             let catalog = match crate::task_queue::TaskPlannerQualificationCatalog::embedded() {
@@ -3039,12 +3054,12 @@ fn run_agent_inner<S: EventSink>(
             };
             let source_task = args.task.clone();
             let source_turn_id = args.turn_id.clone();
-            let should_cancel = || sink.should_cancel();
             let (planning, metrics) = {
                 let mut model = TaskPlanningCompletionModel {
                     generator,
                     args: &args,
-                    should_cancel: &should_cancel,
+                    sink: &mut sink,
+                    invocation_step: 0,
                     metrics: RunMetrics::default(),
                 };
                 let planning = crate::task_queue::plan_tasks(
@@ -4932,7 +4947,7 @@ fn assessment_schema(kinds: &[&str]) -> Value {
             "evidence": {"type": "array", "items": evidence_reference_schema()},
             "explanation": {"type": "string"},
         },
-        "required": ["kind", "status", "evidence", "explanation"],
+        "required": ["kind", "status"],
         "additionalProperties": false,
     })
 }
@@ -5054,7 +5069,7 @@ fn plan_review_submission_schema() -> Value {
                 },
                 "verdict": {"type": "string", "enum": ["pass", "revise"]},
             },
-            "required": ["plan_id", "plan_sha256", "assessments", "challenges", "verdict"],
+            "required": ["assessments", "challenges", "verdict"],
             "additionalProperties": false,
         }),
     )
@@ -5313,6 +5328,26 @@ fn configure_inline_completion_schema(
     inline_completion_eligible: bool,
 ) {
     if inline_completion_eligible {
+        for tool in tools {
+            if tool
+                .input_schema
+                .pointer("/properties/completion")
+                .is_none()
+            {
+                continue;
+            }
+            let required = tool
+                .input_schema
+                .get_mut("required")
+                .and_then(Value::as_array_mut)
+                .expect("mutation schema with completion must declare required fields");
+            if !required.iter().any(|field| field == "completion") {
+                required.push(json!("completion"));
+            }
+            tool.description.push_str(
+                " This is the final remaining accepted work unit: include the required completion object so the successful mutation can close implementation without another model turn.",
+            );
+        }
         return;
     }
     for tool in tools {
@@ -5322,6 +5357,13 @@ fn configure_inline_completion_schema(
             .and_then(Value::as_object_mut)
         {
             properties.remove("completion");
+        }
+        if let Some(required) = tool
+            .input_schema
+            .get_mut("required")
+            .and_then(Value::as_array_mut)
+        {
+            required.retain(|field| field != "completion");
         }
     }
 }
@@ -6583,6 +6625,24 @@ fn run_agent_steps(
                 ledger.reconcile(&current, &evidence_paths)?;
             }
         }
+        if matches!(
+            args.workflow_stage,
+            Some(
+                crate::workflow::WorkflowStage::Planning
+                    | crate::workflow::WorkflowStage::PlanRevision
+            )
+        ) {
+            let _ = maybe_inject_controller_planning_observations(
+                generator,
+                args,
+                workspace_root,
+                &available_tools,
+                &gate_state,
+                messages,
+                nesting_depth,
+                sink,
+            )?;
+        }
         if args.workflow_stage == Some(crate::workflow::WorkflowStage::CodeReview) {
             let _ = maybe_inject_controller_review_observations(
                 generator,
@@ -6737,7 +6797,8 @@ fn run_agent_steps(
                 &mut scoped_tools,
                 work_units
                     .as_ref()
-                    .is_some_and(|ledger| active_unit_can_inline_completion(ledger, unit)),
+                    .is_some_and(|ledger| active_unit_can_inline_completion(ledger, unit))
+                    && args.observation_rendering.is_controller(),
             );
             if gate_state
                 .borrow()
@@ -8436,6 +8497,9 @@ fn record_completion_metrics(
     let read_cache_hits = std::mem::take(&mut metrics.pending_read_cache_hits);
     sink.emit(AgentEvent::LlmInvocation {
         step,
+        purpose: model_invocation_purpose(args, tools, None, completion),
+        workflow_stage: args.workflow_stage,
+        profile: Some(args.profile),
         duration_ms: completion.duration_ms,
         prompt_tokens: completion.prompt_tokens,
         generated_tokens: completion.generated_tokens,
@@ -8458,6 +8522,73 @@ fn record_completion_metrics(
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
+}
+
+fn model_invocation_purpose(
+    args: &AgentRequest,
+    tools: &[BuiltInToolSchema],
+    retry_reason: Option<AgentRetryReason>,
+    completion: &CompletionOutput,
+) -> crate::events::ModelInvocationPurpose {
+    use crate::events::ModelInvocationPurpose;
+    use crate::workflow::WorkflowStage;
+
+    if retry_reason.is_some() {
+        return ModelInvocationPurpose::WorkflowRecovery;
+    }
+    let Some(stage) = args.workflow_stage else {
+        return ModelInvocationPurpose::Conversation;
+    };
+    let action_tools = completion
+        .tool_calls
+        .iter()
+        .map(|call| call.tool.as_str())
+        .collect::<Vec<_>>();
+    let exposed_tools = tools.iter().map(|tool| tool.name.as_str());
+    let has_tool = |name: &str| {
+        if action_tools.is_empty() {
+            tools.iter().any(|tool| tool.name == name)
+        } else {
+            action_tools.contains(&name)
+        }
+    };
+    let evidence_action = action_tools.iter().any(|tool| {
+        matches!(
+            *tool,
+            "read_file"
+                | "inspect_change"
+                | "glob"
+                | "ripgrep"
+                | "search"
+                | "git_log"
+                | "session_changes"
+        )
+    });
+    if evidence_action {
+        return ModelInvocationPurpose::WorkflowEvidence;
+    }
+    if action_tools.iter().any(|tool| mutation_tool(tool)) {
+        return ModelInvocationPurpose::WorkflowMutation;
+    }
+    match stage {
+        WorkflowStage::Planning | WorkflowStage::PlanRevision => {
+            ModelInvocationPurpose::WorkflowPlanning
+        }
+        WorkflowStage::PlanReview | WorkflowStage::CodeReview => {
+            ModelInvocationPurpose::WorkflowReview
+        }
+        WorkflowStage::Implementing | WorkflowStage::Repairing => {
+            let terminal_only = workflow_terminal_tool_name(stage).is_some_and(|terminal| {
+                has_tool(terminal) && exposed_tools.clone().all(|tool| tool == terminal)
+            });
+            if terminal_only || has_tool("submit_implementation") {
+                ModelInvocationPurpose::WorkflowClosure
+            } else {
+                ModelInvocationPurpose::WorkflowEvidence
+            }
+        }
+        _ => ModelInvocationPurpose::Unclassified,
+    }
 }
 
 fn completion_context_usage(
@@ -9839,6 +9970,19 @@ fn project_code_review_submission(arguments: &Value, request: &AgentRequest) -> 
     Ok(projected)
 }
 
+fn project_plan_review_submission(arguments: &Value, request: &AgentRequest) -> Result<Value> {
+    let Some((plan_id, plan_sha256)) = request.workflow_plan_identity.as_ref() else {
+        return Ok(arguments.clone());
+    };
+    let mut projected = arguments.clone();
+    let object = projected
+        .as_object_mut()
+        .context("submit_plan_review arguments must be an object")?;
+    object.insert("plan_id".to_string(), json!(plan_id));
+    object.insert("plan_sha256".to_string(), json!(plan_sha256));
+    Ok(projected)
+}
+
 fn append_workflow_content_fingerprint(
     args: &AgentRequest,
     tool: &str,
@@ -10667,7 +10811,8 @@ trait CompletionEngine {
 struct TaskPlanningCompletionModel<'a> {
     generator: &'a mut dyn CompletionEngine,
     args: &'a AgentRequest,
-    should_cancel: &'a dyn Fn() -> bool,
+    sink: &'a mut dyn EventSink,
+    invocation_step: usize,
     metrics: RunMetrics,
 }
 
@@ -10711,23 +10856,7 @@ impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
         let output = self
             .generator
             .generate_json(&args, &messages, &output_schema, false)?;
-        if let Some(error) = output.tool_parse_error.as_deref() {
-            bail!("Task planning structured output could not be parsed: {error}");
-        }
-        let text = match output.tool_calls.as_slice() {
-            [] => output.content.clone(),
-            [call] if call.tool == output_schema.name && output.content.trim().is_empty() => {
-                serde_json::to_string(&call.arguments)
-                    .context("failed to serialize constrained Task artifact")?
-            }
-            [call] if call.tool != output_schema.name => bail!(
-                "Task planning returned tool '{}' instead of required structured output '{}'",
-                call.tool,
-                output_schema.name
-            ),
-            [_] => bail!("Task planning structured output also contained unsupported prose"),
-            _ => bail!("Task planning returned more than one structured output"),
-        };
+        self.invocation_step = self.invocation_step.saturating_add(1);
         self.metrics.llm_invocations = self.metrics.llm_invocations.saturating_add(1);
         self.metrics.llm_runtime_ms = self
             .metrics
@@ -10745,6 +10874,40 @@ impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
             self.metrics.llm_energy_joules += energy.joules;
             self.metrics.llm_energy_kwh += energy.kwh;
         }
+        self.sink.emit(AgentEvent::LlmInvocation {
+            step: self.invocation_step,
+            purpose: crate::events::ModelInvocationPurpose::TaskPartitioning,
+            workflow_stage: None,
+            profile: Some(args.profile),
+            duration_ms: output.duration_ms,
+            prompt_tokens: output.prompt_tokens,
+            generated_tokens: output.generated_tokens,
+            prompt_cache: output.prompt_cache.clone(),
+            context: None,
+            native: output.native.clone(),
+            energy_joules: output.energy.map(|estimate| estimate.joules),
+            energy_kwh: output.energy.map(|estimate| estimate.kwh),
+            average_power_watts: output.energy.map(|estimate| estimate.average_watts),
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        });
+        if let Some(error) = output.tool_parse_error.as_deref() {
+            bail!("Task planning structured output could not be parsed: {error}");
+        }
+        let text = match output.tool_calls.as_slice() {
+            [] => output.content.clone(),
+            [call] if call.tool == output_schema.name && output.content.trim().is_empty() => {
+                serde_json::to_string(&call.arguments)
+                    .context("failed to serialize constrained Task artifact")?
+            }
+            [call] if call.tool != output_schema.name => bail!(
+                "Task planning returned tool '{}' instead of required structured output '{}'",
+                call.tool,
+                output_schema.name
+            ),
+            [_] => bail!("Task planning structured output also contained unsupported prose"),
+            _ => bail!("Task planning returned more than one structured output"),
+        };
         Ok(crate::task_queue::TaskModelOutput {
             text,
             prompt_tokens: output.prompt_tokens,
@@ -10754,7 +10917,7 @@ impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
     }
 
     fn should_cancel(&self) -> bool {
-        (self.should_cancel)()
+        self.sink.should_cancel()
     }
 }
 
@@ -11559,6 +11722,10 @@ fn run_delivery_workflow(
         let mut stage_args = args.clone();
         stage_args.prior_check_evidence = run.checks.clone();
         stage_args.workflow_stage_evidence = Some(run.stage_evidence.current(stage_root)?);
+        stage_args.workflow_plan_identity = run
+            .plan
+            .as_ref()
+            .map(|plan| (plan.id.clone(), plan.sha256.clone()));
         let stage_outcome = {
             let mut checkpointing_sink = WorkflowCheckpointingSink {
                 run: &mut run,
@@ -12584,20 +12751,20 @@ Use the native function-call interface described by the system tool schema. If t
 
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan_review function exactly once with arguments shaped as:
-{"id":"plan-review-1","plan_id":"<exact plan id>","plan_sha256":"<exact plan sha256>","assessments":[{"kind":"requirement_coverage","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"component_impact","status":"pass","evidence":[],"explanation":"..."},{"kind":"test_strategy","status":"pass","evidence":[],"explanation":"..."},{"kind":"failure_modes","status":"pass","evidence":[],"explanation":"..."},{"kind":"assumptions","status":"pass","evidence":[],"explanation":"..."}],"challenges":[],"verdict":"pass"}
-Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]} and set verdict to revise. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, include no p0/p1 challenge. Do not return prose or a final action."#;
+{"id":"plan-review-1","assessments":[{"kind":"requirement_coverage","status":"pass"},{"kind":"architecture","status":"pass"},{"kind":"component_impact","status":"pass"},{"kind":"test_strategy","status":"pass"},{"kind":"failure_modes","status":"pass"},{"kind":"assumptions","status":"pass"}],"challenges":[],"verdict":"pass"}
+pb supplies the exact accepted plan id and digest. Passing assessments need no repetitive explanation; concern or fail assessments require a specific explanation, and every cited repository path must have current review evidence. Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]} and set verdict to revise. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, include no p0/p1 challenge. Do not return prose or a final action."#;
 
 const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
 When the plan creates a missing file, call write_file with arguments such as {"path":"path/to/file.ext","content":"exact contents"}. Never call write_file for a path that already exists. For an existing file, first call read_file as one turn with {"path":"path/to/file.ext"}; after pb returns the real contents, call replace_file in a later turn with {"path":"path/to/file.ext","content":"complete replacement contents"}, or use edit_file/apply_patch with their declared schemas. Paths are relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Use the native function-call interface described by the system tool schema. If native calls are unavailable, use exactly one compatibility action with no markdown or surrounding prose, for example {"type":"tool_call","tool":"write_file","arguments":{"path":"...","content":"..."}}, {"type":"tool_call","tool":"read_file","arguments":{"path":"..."}}, or {"type":"tool_call","tool":"replace_file","arguments":{"path":"...","content":"..."}}. Never return an argument object by itself. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
-One action ends the current turn. After closing a compatibility JSON object, stop generating immediately. Never imitate pb's transcript or invent later tool results: do not output `Tool calls:`, `[tool]`, or `[assistant]`, and do not act as though a file changed until pb returns the real tool result and content fingerprint. When the final mutation schema exposes completion, you may put the same model-authored implementation accounting object in that field; pb executes the mutation first, projects structural facts only after success, and ignores or rejects premature completion without pretending the mutation failed.
+One action ends the current turn. After closing a compatibility JSON object, stop generating immediately. Never imitate pb's transcript or invent later tool results: do not output `Tool calls:`, `[tool]`, or `[assistant]`, and do not act as though a file changed until pb returns the real tool result and content fingerprint. When the final mutation schema exposes the required completion field, put the same model-authored implementation accounting object there; pb executes the mutation first, projects structural facts only after success, and ignores or rejects premature completion without pretending the mutation failed.
 After the last work unit is structurally complete, call the provided submit_implementation function exactly once with arguments shaped as:
 {"id":"implementation-1","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","summary":"..."}],"summary":"...","semantic_commit_subject":"feat: concise semantic subject"}
 pb supplies the accepted plan id and digest, exact current content fingerprint, actual task-delta paths for each named step, and no-change judgment. Do not copy or invent those harness-owned fields. Call submit_implementation natively or use exactly {"type":"tool_call","tool":"submit_implementation","arguments":<the argument object above>} with no markdown or surrounding prose. For a genuine no-change result, use status no_change and an empty semantic_commit_subject. Do not return an argument object, prose, or a final action."#;
 
 const CODE_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_code_review function exactly once with arguments shaped as:
-{"id":"code-review-1","assessments":[{"kind":"correctness","status":"pass","evidence":[],"explanation":"..."},{"kind":"requirements","status":"pass","evidence":[],"explanation":"..."},{"kind":"architecture","status":"pass","evidence":[],"explanation":"..."},{"kind":"tests","status":"pass","evidence":[],"explanation":"..."},{"kind":"regressions","status":"pass","evidence":[],"explanation":"..."},{"kind":"maintainability","status":"pass","evidence":[],"explanation":"..."}],"findings":[],"verdict":"pass"}
-pb supplies the exact checked content fingerprint and retains the successful selected-check identifiers as harness-owned evidence.
+{"id":"code-review-1","assessments":[{"kind":"correctness","status":"pass"},{"kind":"requirements","status":"pass"},{"kind":"architecture","status":"pass"},{"kind":"tests","status":"pass"},{"kind":"regressions","status":"pass"},{"kind":"maintainability","status":"pass"}],"findings":[],"verdict":"pass"}
+pb supplies the exact checked content fingerprint and retains the successful selected-check identifiers as harness-owned evidence. Passing assessments need no repetitive explanation; concern or fail assessments require a specific explanation, and findings retain their complete evidence.
 Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_code_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a finding shaped exactly as {"id":"finding-1","severity":"p1","path":"path/to/file.ext","line":1,"requirement_ids":["r1"],"plan_step_ids":["s1"],"evidence":[{"path":"path/to/file.ext","line":1,"description":"..."}],"explanation":"..."} and set verdict to revise. The field is severity with lowercase p1, not kind. For pass, include no p0/p1 finding. Do not return prose or a final action."#;
 
 fn workflow_terminal_submission_guidance(stage: crate::workflow::WorkflowStage) -> &'static str {
@@ -14655,6 +14822,9 @@ fn generate_and_parse_action_with_retries(
         let read_cache_hits = std::mem::take(&mut metrics.pending_read_cache_hits);
         sink.emit(AgentEvent::LlmInvocation {
             step,
+            purpose: model_invocation_purpose(&request, attempt_tools, retry_reason, &completion),
+            workflow_stage: request.workflow_stage,
+            profile: Some(request.profile),
             duration_ms: completion.duration_ms,
             prompt_tokens: completion.prompt_tokens,
             generated_tokens: completion.generated_tokens,
@@ -16130,6 +16300,199 @@ fn controller_observations_are_current(
                 .get(&candidate.receipt.path)
                 .is_some_and(|path| path.fingerprint == candidate.receipt.path_fingerprint)
     }))
+}
+
+fn build_controller_planning_observations(
+    args: &AgentRequest,
+    workspace_root: &Path,
+    gate_state: &RefCell<GateState>,
+) -> Result<Vec<PreparedControllerObservation>> {
+    use crate::workflow::{
+        ControllerObservationAuthority, ControllerObservationOperation,
+        ControllerObservationOrigin, ObservationCoverage, ObservationRange,
+    };
+
+    if !args.observation_rendering.is_controller()
+        || !matches!(
+            args.workflow_stage,
+            Some(
+                crate::workflow::WorkflowStage::Planning
+                    | crate::workflow::WorkflowStage::PlanRevision
+            )
+        )
+    {
+        return Ok(Vec::new());
+    }
+    let Some(contract) = args.contract.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let snapshot = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let result_budget = agent_context::tool_result_char_budget(
+        args.ctx_size as usize,
+        usize::try_from(boosted_max_tokens(args).max(1)).unwrap_or(usize::MAX),
+    );
+    let mut candidates = Vec::new();
+    for path in &contract.allowed_paths {
+        if gate_state.borrow().read_paths.contains(path) {
+            continue;
+        }
+        let Some(path_content) = snapshot.paths.get(path) else {
+            continue;
+        };
+        let Ok(resolved) = resolve_workspace_entry_path(workspace_root, path, true) else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(&resolved) else {
+            continue;
+        };
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len()
+                > u64::try_from(crate::workflow::MAX_STAGE_EVIDENCE_ENTRY_BYTES).unwrap_or(u64::MAX)
+        {
+            continue;
+        }
+        let Ok(bytes) = read_bounded_file_bytes(
+            &resolved,
+            u64::try_from(crate::workflow::MAX_STAGE_EVIDENCE_ENTRY_BYTES).unwrap_or(u64::MAX),
+            "controller planning observation",
+        ) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let result = render_bounded_read_file(path, text, 1, None, result_budget);
+        if result.contains("[read_file continuation]")
+            || result.contains("(no complete line fits the current read-result budget)")
+        {
+            continue;
+        }
+        let arguments = json!({"path": path});
+        let action_material = format!(
+            "planning_read_file\n{:?}\n{}\n{}\n{}\n{}",
+            args.workflow_stage,
+            path,
+            snapshot.fingerprint,
+            path_content.fingerprint,
+            crate::environment_lock::sha256(&bytes)
+        );
+        let action_id = format!("{:x}", Sha256::digest(action_material.as_bytes()));
+        let included_ranges = if bytes.is_empty() {
+            Vec::new()
+        } else {
+            vec![ObservationRange {
+                start_byte: 0,
+                end_byte: bytes.len(),
+                sha256: crate::environment_lock::sha256(&bytes),
+            }]
+        };
+        let receipt = crate::workflow::ControllerObservationReceipt {
+            version: crate::workflow::CONTROLLER_OBSERVATION_SCHEMA_VERSION,
+            action_id,
+            actual_origin: ControllerObservationOrigin::Controller,
+            prompt_representation: args.observation_rendering,
+            stage: args
+                .workflow_stage
+                .expect("controller planning observation requires a workflow stage"),
+            work_unit_id: None,
+            operation: ControllerObservationOperation::ReadFile,
+            path: path.clone(),
+            workspace_fingerprint: snapshot.fingerprint.clone(),
+            path_fingerprint: path_content.fingerprint.clone(),
+            content_sha256: crate::environment_lock::sha256(&bytes),
+            coverage: ObservationCoverage::Full,
+            observed_bytes: bytes.len(),
+            prompt_bytes: 0,
+            included_ranges,
+            included_in_prompt: false,
+            authority_effects: vec![
+                ControllerObservationAuthority::PromptContext,
+                ControllerObservationAuthority::ReadBeforeWrite,
+            ],
+            fallback_reason: None,
+        };
+        let stage_entry = crate::workflow::StageEvidenceEntry::complete_file(
+            path.clone(),
+            path_content.fingerprint.clone(),
+            snapshot.fingerprint.clone(),
+            args.workflow_stage
+                .expect("controller planning observation requires a workflow stage"),
+            "controller_contract_read_file".to_string(),
+            agent_context::normalized_arguments_sha256(&arguments),
+            text.to_string(),
+            now_millis(),
+        )?;
+        let (receipt, prompt_messages) = controller_observation_messages(receipt, &result)?;
+        candidates.push(PreparedControllerObservation {
+            receipt,
+            prompt_messages,
+            stage_entry: Some(stage_entry),
+        });
+    }
+    Ok(candidates)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_inject_controller_planning_observations(
+    generator: &mut dyn CompletionEngine,
+    args: &AgentRequest,
+    workspace_root: &Path,
+    available_tools: &[BuiltInToolSchema],
+    gate_state: &RefCell<GateState>,
+    messages: &mut Vec<ChatMessage>,
+    nesting_depth: usize,
+    sink: &mut dyn EventSink,
+) -> Result<bool> {
+    let candidates = build_controller_planning_observations(args, workspace_root, gate_state)?;
+    if candidates.is_empty()
+        || !controller_observations_survive_preflight(
+            generator,
+            args,
+            messages,
+            available_tools,
+            &candidates,
+        )?
+        || !controller_observations_are_current(workspace_root, &candidates)?
+    {
+        return Ok(false);
+    }
+    let contract_fingerprint = git_worktree_content_fingerprint(workspace_root)?;
+    {
+        let mut gate = gate_state.borrow_mut();
+        for candidate in &candidates {
+            gate.read_paths.insert(candidate.receipt.path.clone());
+            gate.read_content_fingerprints.insert(
+                candidate.receipt.path.clone(),
+                candidate.receipt.content_sha256.clone(),
+            );
+            gate.contract_read_evidence
+                .insert(candidate.receipt.path.clone(), contract_fingerprint.clone());
+        }
+        gate.stage_evidence
+            .merge(crate::workflow::StageEvidenceBundle {
+                entries: candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.stage_entry.clone())
+                    .collect(),
+                controller_observations: candidates
+                    .iter()
+                    .map(|candidate| candidate.receipt.clone())
+                    .collect(),
+                ..crate::workflow::StageEvidenceBundle::default()
+            })?;
+    }
+    for candidate in candidates {
+        messages.extend(candidate.prompt_messages);
+        sink.emit(AgentEvent::ControllerObservation {
+            receipt: candidate.receipt,
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(args.profile),
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+    }
+    Ok(true)
 }
 
 fn build_controller_review_observations(
@@ -17659,7 +18022,8 @@ fn run_tool(
             Ok(result)
         }
         "submit_plan_review" => {
-            let (review, normalized_json_string) = parse_submission_artifact(arguments, "review")?;
+            let projected = project_plan_review_submission(arguments, context.request)?;
+            let (review, normalized_json_string) = parse_submission_artifact(&projected, "review")?;
             accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::PlanReview { review },
@@ -21933,6 +22297,7 @@ mod tests {
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
+            workflow_plan_identity: None,
             workflow_action_first_turn: false,
             workflow_creation_path_order: Vec::new(),
             workflow_work_units: None,
@@ -21986,7 +22351,7 @@ mod tests {
             requested_schema: None,
         };
         let request = test_agent_request(AgentProfile::Build, 512);
-        let should_cancel = || false;
+        let mut events = Vec::new();
         let schema = json!({
             "type": "object",
             "additionalProperties": false,
@@ -21997,7 +22362,8 @@ mod tests {
             let mut model = TaskPlanningCompletionModel {
                 generator: &mut engine,
                 args: &request,
-                should_cancel: &should_cancel,
+                sink: &mut |event| events.push(event),
+                invocation_step: 0,
                 metrics: RunMetrics::default(),
             };
             crate::task_queue::TaskPlanningModel::generate(
@@ -22016,6 +22382,13 @@ mod tests {
         let requested = engine.requested_schema.unwrap();
         assert_eq!(requested.name, "emit_task_plan");
         assert_eq!(requested.input_schema, schema);
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::LlmInvocation {
+                purpose: crate::events::ModelInvocationPurpose::TaskPartitioning,
+                ..
+            }]
+        ));
     }
 
     fn init_contract_test_repo() -> tempfile::TempDir {
@@ -22095,6 +22468,18 @@ mod tests {
             6
         );
         assert_eq!(
+            schema("submit_plan_review").pointer("/properties/assessments/items/required"),
+            Some(&json!(["kind", "status"]))
+        );
+        assert!(
+            !schema("submit_plan_review")
+                .pointer("/required")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .contains(&json!("plan_sha256"))
+        );
+        assert_eq!(
             schema("submit_implementation")
                 .pointer("/properties/steps/items/properties/status/enum")
                 .unwrap(),
@@ -22108,6 +22493,10 @@ mod tests {
                 .unwrap()
                 .len(),
             6
+        );
+        assert_eq!(
+            schema("submit_code_review").pointer("/properties/assessments/items/required"),
+            Some(&json!(["kind", "status"]))
         );
         assert!(!PLAN_SUBMISSION_GUIDANCE.contains("\"plan\":{"));
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("evaluated in step order"));
@@ -22170,12 +22559,106 @@ mod tests {
                 .pointer("/properties/completion/properties/steps")
                 .is_some()
         );
+        configure_inline_completion_schema(&mut tools, true);
+        let edit_schema = &tools
+            .iter()
+            .find(|tool| tool.name == "edit_file")
+            .unwrap()
+            .input_schema;
+        assert!(
+            edit_schema
+                .pointer("/required")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .contains(&json!("completion"))
+        );
+        let missing_completion = agent_tool_errors::validate_arguments(
+            edit_schema,
+            &json!({"path": "game.js", "old_text": "old", "new_text": "new"}),
+        )
+        .expect("the final controller-owned mutation must reject missing completion");
+        assert_eq!(
+            missing_completion.reason,
+            agent_tool_errors::ToolFailureReason::MissingArgument
+        );
+        assert!(missing_completion.message.contains("completion"));
         configure_inline_completion_schema(&mut tools, false);
         assert!(tools.iter().all(|tool| {
             tool.input_schema
                 .pointer("/properties/completion")
                 .is_none()
         }));
+    }
+
+    #[test]
+    fn plan_review_identity_is_projected_from_the_durable_accepted_plan() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Review, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanReview);
+        request.workflow_plan_identity = Some(("plan-trusted".to_string(), "a".repeat(64)));
+        let projected = project_plan_review_submission(
+            &json!({
+                "id": "review-1",
+                "plan_id": "invented",
+                "plan_sha256": "b".repeat(64),
+                "assessments": [],
+                "challenges": [],
+                "verdict": "pass"
+            }),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(projected["plan_id"], "plan-trusted");
+        assert_eq!(projected["plan_sha256"], "a".repeat(64));
+    }
+
+    #[test]
+    fn model_invocation_purpose_tracks_native_stage_actions_and_recovery() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        let completion = |tool: &str| CompletionOutput {
+            content: String::new(),
+            tool_calls: vec![AgentToolCall {
+                id: None,
+                tool: tool.to_string(),
+                arguments: json!({}),
+            }],
+            tool_parse_error: None,
+            finish_reason: CompletionFinishReason::EndOfGeneration,
+            prompt_tokens: 1,
+            generated_tokens: 1,
+            prompt_cache: None,
+            native: None,
+            duration_ms: 1,
+            energy: None,
+        };
+        let tools = all_builtin_tool_specs();
+
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        assert_eq!(
+            model_invocation_purpose(&request, &tools, None, &completion("edit_file")),
+            crate::events::ModelInvocationPurpose::WorkflowMutation
+        );
+        assert_eq!(
+            model_invocation_purpose(&request, &tools, None, &completion("read_file")),
+            crate::events::ModelInvocationPurpose::WorkflowEvidence
+        );
+        assert_eq!(
+            model_invocation_purpose(
+                &request,
+                &tools,
+                Some(AgentRetryReason::ThinkingOffAfterTruncation),
+                &completion("edit_file")
+            ),
+            crate::events::ModelInvocationPurpose::WorkflowRecovery
+        );
+
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanReview);
+        assert_eq!(
+            model_invocation_purpose(&request, &tools, None, &completion("submit_plan_review")),
+            crate::events::ModelInvocationPurpose::WorkflowReview
+        );
     }
 
     #[test]
@@ -22468,6 +22951,67 @@ the next imagined action"#;
                 crate::workflow::ObservationRendering::ControllerBlock
             );
         }
+    }
+
+    #[test]
+    fn planning_preloads_exact_small_contract_paths_with_controller_provenance() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("game.js"), "const answer = 41;\n").unwrap();
+        git_run(&["add", "game.js"], repo.path()).unwrap();
+        git_run(
+            &["commit", "-m", "test: add planning observation fixture"],
+            repo.path(),
+        )
+        .unwrap();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Planning);
+        request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
+        let mut contract = normalized_test_contract("true");
+        contract.allowed_paths.push("missing.js".to_string());
+        request.contract = Some(contract);
+
+        let candidates = build_controller_planning_observations(
+            &request,
+            repo.path(),
+            &RefCell::new(GateState::default()),
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.receipt.path, "game.js");
+        assert_eq!(
+            candidate.receipt.stage,
+            crate::workflow::WorkflowStage::Planning
+        );
+        assert_eq!(
+            candidate.receipt.actual_origin,
+            crate::workflow::ControllerObservationOrigin::Controller
+        );
+        assert_eq!(
+            candidate.receipt.coverage,
+            crate::workflow::ObservationCoverage::Full
+        );
+        assert!(candidate.receipt.permits_read_before_write());
+        assert_eq!(
+            candidate.stage_entry.as_ref().unwrap().content,
+            "const answer = 41;\n"
+        );
+        assert!(
+            candidate.prompt_messages[0]
+                .content
+                .contains("actual_origin=controller")
+        );
+
+        request.observation_rendering = crate::workflow::ObservationRendering::Native;
+        assert!(
+            build_controller_planning_observations(
+                &request,
+                repo.path(),
+                &RefCell::new(GateState::default()),
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]
@@ -23938,6 +24482,21 @@ the next imagined action"#;
         assert_eq!(outcome.checkpoint.run.counters.plan_cycles, 1);
         assert_eq!(outcome.checkpoint.run.plan.as_ref().unwrap().id, "plan-2");
         assert_eq!(generator.generation_tool_names.len(), 4);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::LlmInvocation { purpose, .. } => Some(*purpose),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                crate::events::ModelInvocationPurpose::WorkflowPlanning,
+                crate::events::ModelInvocationPurpose::WorkflowReview,
+                crate::events::ModelInvocationPurpose::WorkflowPlanning,
+                crate::events::ModelInvocationPurpose::WorkflowReview,
+            ]
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::WorkflowChallengeRaised { challenge_id, .. }
@@ -31969,6 +32528,7 @@ the next imagined action"#;
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
+            workflow_plan_identity: None,
             workflow_action_first_turn: false,
             workflow_creation_path_order: Vec::new(),
             workflow_work_units: None,
@@ -32052,6 +32612,7 @@ the next imagined action"#;
             workflow_policy: None,
             workflow_stage: None,
             workflow_expected_content_fingerprint: None,
+            workflow_plan_identity: None,
             workflow_action_first_turn: false,
             workflow_creation_path_order: Vec::new(),
             workflow_work_units: None,

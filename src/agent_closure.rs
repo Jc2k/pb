@@ -9,6 +9,10 @@ const MAX_PRECONDITION_CHARS: usize = 140;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolExposureState {
     Authorized,
+    ReviewReady {
+        stage: WorkflowStage,
+        terminal_tool: &'static str,
+    },
     Closing {
         stage: WorkflowStage,
         terminal_tool: &'static str,
@@ -29,6 +33,15 @@ impl ToolExposureState {
         let (Some(stage), Some(terminal_tool)) = (stage, terminal_tool) else {
             return Self::Authorized;
         };
+        if terminal_ready
+            && matches!(stage, WorkflowStage::PlanReview | WorkflowStage::CodeReview)
+            && ordinary_steps_remaining > 1
+        {
+            return Self::ReviewReady {
+                stage,
+                terminal_tool,
+            };
+        }
         if ordinary_steps_remaining > 2 {
             return Self::Authorized;
         }
@@ -65,6 +78,17 @@ impl ToolExposureState {
     pub(crate) fn allows(self, tool: &str) -> bool {
         match self {
             Self::Authorized => true,
+            Self::ReviewReady {
+                stage,
+                terminal_tool,
+            } => {
+                tool == terminal_tool
+                    || match stage {
+                        WorkflowStage::PlanReview => is_plan_review_evidence_tool(tool),
+                        WorkflowStage::CodeReview => is_code_review_evidence_tool(tool),
+                        _ => false,
+                    }
+            }
             Self::TerminalOnly { terminal_tool } => tool == terminal_tool,
             Self::Closing {
                 stage,
@@ -85,7 +109,7 @@ impl ToolExposureState {
     }
 
     pub(crate) const fn is_closing(self) -> bool {
-        !matches!(self, Self::Authorized)
+        matches!(self, Self::Closing { .. } | Self::TerminalOnly { .. })
     }
 }
 
@@ -232,6 +256,34 @@ mod tests {
         assert!(review.allows("ripgrep"));
         assert!(!review.allows("submit_code_review"));
         assert!(!review.allows("web_fetch"));
+    }
+
+    #[test]
+    fn ready_reviews_start_with_only_focused_evidence_and_the_terminal() {
+        let plan_review = ToolExposureState::for_turn(
+            Some(WorkflowStage::PlanReview),
+            8,
+            Some("submit_plan_review"),
+            true,
+        );
+        assert!(plan_review.allows("submit_plan_review"));
+        assert!(plan_review.allows("read_file"));
+        assert!(plan_review.allows("ripgrep"));
+        assert!(!plan_review.allows("web_search"));
+        assert!(!plan_review.allows("sub_agent"));
+        assert!(!plan_review.is_closing());
+
+        let code_review = ToolExposureState::for_turn(
+            Some(WorkflowStage::CodeReview),
+            8,
+            Some("submit_code_review"),
+            true,
+        );
+        assert!(code_review.allows("submit_code_review"));
+        assert!(code_review.allows("inspect_change"));
+        assert!(code_review.allows("read_file"));
+        assert!(!code_review.allows("git_log"));
+        assert!(!code_review.allows("web_fetch"));
     }
 
     #[test]

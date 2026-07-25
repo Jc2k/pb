@@ -262,6 +262,31 @@ fn behavior_evidence_clauses(objective: &str) -> Vec<String> {
     }
 }
 
+/// Return a deterministic reason when the request already fits one controller-owned Build Task.
+///
+/// A generated Task may own at most `MAX_BUILD_TASK_BEHAVIOR_CLAUSES` source clauses. When the
+/// request fits that bound and does not explicitly request decomposition or ordering, a model call
+/// cannot establish additional authority or required coordination. Keeping the exact request as one
+/// Build avoids paying for a partition that pb would immediately discard.
+pub fn single_build_partition_bypass_reason(objective: &str) -> Option<String> {
+    let clauses = request_evidence_clauses(objective);
+    let explicitly_requests_partitioning = clauses.iter().any(|clause| {
+        is_decomposition_constraint(clause)
+            || clause.to_ascii_lowercase().contains("separate task")
+            || clause.to_ascii_lowercase().contains("separate build")
+    });
+    let behavior_count = behavior_evidence_clauses(objective).len();
+    if explicitly_requests_partitioning
+        || !explicit_source_order_pairs(objective).is_empty()
+        || behavior_count > MAX_BUILD_TASK_BEHAVIOR_CLAUSES
+    {
+        return None;
+    }
+    Some(format!(
+        "The exact Build request fits one controller-owned Task ({behavior_count} behavior clause(s), maximum {MAX_BUILD_TASK_BEHAVIOR_CLAUSES}); model partitioning was skipped"
+    ))
+}
+
 fn model_efforts_fit(tasks: &[TaskProposal], policy: &CompiledTaskPolicy) -> bool {
     let Some((first, remaining)) = tasks.split_first() else {
         return false;
@@ -327,6 +352,7 @@ pub struct TaskPlanAttemptFailure {
 #[serde(rename_all = "snake_case")]
 pub enum TaskPlanningDecision {
     MultiTask,
+    OneBuildSimpleRequest,
     OneBuildSingleTask,
     OneBuildPlannerFallback,
     OneBuildBudgetFallback,
@@ -1344,6 +1370,31 @@ mod compact_tests {
                 "Export addItem(items,text), toggleItem(items,id), and removeItem(items,id) from app.js",
                 "Add app.test.mjs with tests",
             ]
+        );
+    }
+
+    #[test]
+    fn bounded_requests_skip_model_partitioning_but_explicit_or_large_requests_do_not() {
+        let bounded = "Fix TTLCache expiration. An entry is expired at its expiry timestamp, expired entries are removed on access, and missing entries return None.";
+        let reason = single_build_partition_bypass_reason(bounded)
+            .expect("three behavior clauses fit one controller-owned Task");
+        assert!(reason.contains("behavior clause(s)"));
+
+        assert!(
+            single_build_partition_bypass_reason(
+                "Add storage. Expose health. Add cancellation. Add retention."
+            )
+            .is_none()
+        );
+        assert!(
+            single_build_partition_bypass_reason(
+                "Add storage before exposing health, with tests owned by each behavior change."
+            )
+            .is_none()
+        );
+        assert!(
+            single_build_partition_bypass_reason("Create separate tasks for the API and UI.")
+                .is_none()
         );
     }
 

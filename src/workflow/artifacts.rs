@@ -308,6 +308,7 @@ pub struct PlanAssessment {
     pub status: AssessmentStatus,
     #[serde(default)]
     pub evidence: Vec<EvidenceReference>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub explanation: String,
 }
 
@@ -381,7 +382,9 @@ impl PlanReviewArtifact {
             self.challenges.iter().map(|item| item.id.as_str()),
         )?;
         for assessment in &self.assessments {
-            non_empty("plan assessment explanation", &assessment.explanation)?;
+            if assessment.status != AssessmentStatus::Pass || !assessment.explanation.is_empty() {
+                non_empty("plan assessment explanation", &assessment.explanation)?;
+            }
             validate_evidence(&assessment.evidence)?;
         }
         for challenge in &self.challenges {
@@ -548,6 +551,7 @@ pub struct CodeAssessment {
     pub status: AssessmentStatus,
     #[serde(default)]
     pub evidence: Vec<EvidenceReference>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub explanation: String,
 }
 
@@ -584,7 +588,9 @@ impl CodeReviewArtifact {
             self.findings.iter().map(|item| item.id.as_str()),
         )?;
         for assessment in &self.assessments {
-            non_empty("code assessment explanation", &assessment.explanation)?;
+            if assessment.status != AssessmentStatus::Pass || !assessment.explanation.is_empty() {
+                non_empty("code assessment explanation", &assessment.explanation)?;
+            }
             validate_evidence(&assessment.evidence)?;
         }
         for finding in &self.findings {
@@ -938,6 +944,59 @@ mod tests {
         review.validate(&envelope).unwrap();
         review.plan_sha256 = "wrong".to_string();
         assert!(review.validate(&envelope).is_err());
+    }
+
+    #[test]
+    fn passing_review_assessments_are_sparse_but_non_pass_explanations_remain_required() {
+        let envelope = ArtifactEnvelope::new("plan-1", plan()).unwrap();
+        let mut plan_review = PlanReviewArtifact {
+            plan_id: envelope.id.clone(),
+            plan_sha256: envelope.sha256.clone(),
+            assessments: REQUIRED_PLAN_ASSESSMENTS
+                .into_iter()
+                .map(|kind| PlanAssessment {
+                    kind,
+                    status: AssessmentStatus::Pass,
+                    evidence: Vec::new(),
+                    explanation: String::new(),
+                })
+                .collect(),
+            challenges: Vec::new(),
+            verdict: ReviewVerdict::Pass,
+        };
+        plan_review.validate(&envelope).unwrap();
+        plan_review.assessments[0].status = AssessmentStatus::Concern;
+        assert!(
+            plan_review
+                .validate(&envelope)
+                .unwrap_err()
+                .to_string()
+                .contains("explanation")
+        );
+
+        let mut code_review = CodeReviewArtifact {
+            content_fingerprint: "content".to_string(),
+            assessments: REQUIRED_CODE_ASSESSMENTS
+                .into_iter()
+                .map(|kind| CodeAssessment {
+                    kind,
+                    status: AssessmentStatus::Pass,
+                    evidence: Vec::new(),
+                    explanation: String::new(),
+                })
+                .collect(),
+            findings: Vec::new(),
+            verdict: ReviewVerdict::Pass,
+        };
+        code_review.validate("content").unwrap();
+        code_review.assessments[0].status = AssessmentStatus::Fail;
+        assert!(
+            code_review
+                .validate("content")
+                .unwrap_err()
+                .to_string()
+                .contains("explanation")
+        );
     }
 
     #[test]

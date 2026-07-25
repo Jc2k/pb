@@ -41,11 +41,22 @@ Build stages use the accepted plan and checkpoint for progress instead of exposi
 protocol. Independent tool calls can share one model response, while dependent same-path or
 mutation/check batches are rejected before any call runs.
 
+When a trusted contract names existing small text files as allowed paths, pb can place their exact
+current contents into the first planning turn automatically. The transcript labels these as
+automatic controller observations. If a file or the bounded context is unsuitable, pb simply leaves
+the normal read tool available.
+
 During implementation, pb exposes one accepted-plan file operation at a time and inserts that
 controller-owned target into the action before validation. Consecutive new files do not share one
 model output budget. If constrained generation reaches a file-payload boundary well before its token
 ceiling, pb retries once with more string room at the same token limit; real token exhaustion instead
 gets one smaller complete-file retry. Neither case writes a partial file.
+
+For the last remaining file operation, the local model returns the implementation summary with the
+mutation. pb validates that summary only after the edit succeeds, so a valid edit can finish the
+implementation stage without a separate bookkeeping turn. Review pass records are similarly
+compact: pb supplies controller-owned plan identity and does not require empty explanations, while
+concerns and failures still need specific reasons and fresh evidence.
 
 You may see pb pause for a planning question when a missing choice would materially change the
 work. Answering that question updates the user-owned contract; it does not hand the model a general
@@ -99,8 +110,11 @@ recoverable from Git.
 
 ## Tasks
 
-**Shipped and on by default for new Builds.** pb first asks the selected local model whether a Build
-request is usefully divided into outcome-shaped **Tasks**. This sits above ordinary Build planning:
+**Shipped and on by default for new Builds.** pb first decides whether a Build request could benefit
+from outcome-shaped **Tasks**. A bounded request with at most three behavior clauses stays one exact
+Build without calling the model unless it explicitly requests separate work or ordering. Larger or
+explicitly coordinated requests ask the selected local model for a partition. This sits above
+ordinary Build planning:
 after the previous Task commits, each Build Task starts a fresh normal plan against the repository it
 received and decides its actual changes, checks, documentation, review, and commit boundary.
 
@@ -118,6 +132,7 @@ deterministic rejection.
 
 The number of accepted Tasks determines the experience:
 
+- A bounded simple request records a zero-attempt single-Build decision and starts normal planning.
 - One Task is discarded and the exact original request continues as the existing Build workflow.
 - Invalid planning also continues with that unchanged Build request.
 - Two or more accepted Tasks show a **Tasks** panel with ordered state, Build kind, active Task, budget
@@ -130,9 +145,10 @@ state, and only then queues the next Task. Stopping or exhausting a Task preserv
 commits and prevents dependent Tasks from starting. A restart restores the exact active request and
 remaining allowance, paused at a safe boundary.
 
-The expandable **Task planning details** record explains every route. It preserves the local prompt,
-schema, raw constrained JSON, normalized artifact, failure, token/runtime usage, and controller
-decision; it is model I/O, not hidden reasoning. Before a multi-Task run becomes Ready, pb also
+The expandable **Task planning details** record explains every route. A simple-request bypass has a
+reason and zero attempts. An attempted partition also preserves the local prompt, schema, raw
+constrained JSON, normalized artifact, failure, token/runtime usage, and controller decision; it is
+model I/O, not hidden reasoning. Before a multi-Task run becomes Ready, pb also
 checks every original requirement against successful Task evidence, acceptance IDs, commits, and
 the exact terminal repository.
 

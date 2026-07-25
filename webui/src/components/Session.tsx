@@ -993,7 +993,10 @@ export function MessageBubble({
           aria-label={`Model inference step ${e.step}`}
         >
           <span>
-            Model inference {e.step} · {formatHumanDurationMs(e.duration_ms)} ·
+            Model inference {e.step}
+            {e.purpose
+              ? ` (${e.purpose.replaceAll("_", " ")})`
+              : ""} · {formatHumanDurationMs(e.duration_ms)} ·
             {" "}
             {formatNumber(e.prompt_tokens + e.generated_tokens)} tokens
             {e.prompt_cache

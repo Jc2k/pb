@@ -461,6 +461,37 @@ fn add_optional(target: &mut Option<f64>, value: Option<f64>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelInvocationPurpose {
+    #[default]
+    Unclassified,
+    Conversation,
+    TaskPartitioning,
+    WorkflowPlanning,
+    WorkflowReview,
+    WorkflowEvidence,
+    WorkflowMutation,
+    WorkflowClosure,
+    WorkflowRecovery,
+}
+
+impl ModelInvocationPurpose {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::Conversation => "conversation",
+            Self::TaskPartitioning => "task partitioning",
+            Self::WorkflowPlanning => "workflow planning",
+            Self::WorkflowReview => "workflow review",
+            Self::WorkflowEvidence => "workflow evidence",
+            Self::WorkflowMutation => "workflow mutation",
+            Self::WorkflowClosure => "workflow closure",
+            Self::WorkflowRecovery => "workflow recovery",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -977,6 +1008,12 @@ pub enum AgentEvent {
     },
     LlmInvocation {
         step: usize,
+        #[serde(default)]
+        purpose: ModelInvocationPurpose,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_stage: Option<crate::workflow::WorkflowStage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<AgentProfile>,
         duration_ms: u64,
         prompt_tokens: usize,
         generated_tokens: usize,
@@ -1914,6 +1951,9 @@ impl EventEnvelope {
             },
             AgentEvent::LlmInvocation {
                 step,
+                purpose,
+                workflow_stage,
+                profile,
                 duration_ms,
                 prompt_tokens,
                 generated_tokens,
@@ -1929,6 +1969,9 @@ impl EventEnvelope {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 event: AgentEvent::LlmInvocation {
                     step,
+                    purpose,
+                    workflow_stage,
+                    profile,
                     duration_ms,
                     prompt_tokens,
                     generated_tokens,
@@ -2400,6 +2443,9 @@ mod tests {
         };
         let envelope = EventEnvelope::new(AgentEvent::LlmInvocation {
             step: 2,
+            purpose: ModelInvocationPurpose::WorkflowReview,
+            workflow_stage: Some(crate::workflow::WorkflowStage::CodeReview),
+            profile: Some(AgentProfile::Review),
             duration_ms: 10,
             prompt_tokens: 4960,
             generated_tokens: 3,

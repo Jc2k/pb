@@ -368,6 +368,7 @@ pub fn render_event(event: &AgentEvent) {
         }
         AgentEvent::LlmInvocation {
             step,
+            purpose,
             duration_ms,
             prompt_tokens,
             generated_tokens,
@@ -386,7 +387,8 @@ pub fn render_event(event: &AgentEvent) {
             print_header(
                 "llm",
                 &format!(
-                    "step {step}: {duration_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens{energy}"
+                    "{} step {step}: {duration_ms} ms, {prompt_tokens} prompt tokens, {generated_tokens} generated tokens{energy}",
+                    purpose.as_str()
                 ),
             );
         }

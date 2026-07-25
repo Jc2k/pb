@@ -478,6 +478,18 @@ export type AgentEvent =
   | {
     type: "llm_invocation";
     step: number;
+    purpose?:
+      | "unclassified"
+      | "conversation"
+      | "task_partitioning"
+      | "workflow_planning"
+      | "workflow_review"
+      | "workflow_evidence"
+      | "workflow_mutation"
+      | "workflow_closure"
+      | "workflow_recovery";
+    workflow_stage?: string;
+    profile?: string;
     duration_ms: number;
     prompt_tokens: number;
     generated_tokens: number;

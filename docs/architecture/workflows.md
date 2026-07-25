@@ -61,9 +61,14 @@ deterministic harness stages and do not run a model.
 
 ### High-level Tasks
 
-**Shipped and on by default for new Builds.** Before an eligible explicit Build starts, pb asks the
-selected local model for a compact high-level partition. This is separate from the existing Build
-`PlanArtifact`. Its complete model-facing artifact is `{"tasks":["request one","request two"]}`:
+**Shipped and on by default for new Builds.** Before an eligible explicit Build starts, pb decides
+whether high-level partitioning can add useful coordination. A request containing at most three
+behavior clauses stays one exact controller-owned Build when it does not explicitly request
+decomposition or source ordering. pb records a `one_build_simple_request` decision with zero model
+attempts. Larger requests, explicit separate-Task requests, and requests with `before`, `after`, or
+`then` dependencies ask the selected local model for a compact high-level partition. This is
+separate from the existing Build `PlanArtifact`. Its complete model-facing artifact is
+`{"tasks":["request one","request two"]}`:
 an ordered list of self-contained requests that will later enter normal Build planning one at a
 time. The model preserves every controller source clause in exactly one request and may add only
 boundary context. Sentence boundaries retain dotted paths and comma-delimited code or behavior
@@ -82,13 +87,14 @@ full workspace graph. Rust owns source coverage, disjoint ownership, explicit
 `before`/`after`/`then` order, IDs, dependency construction, budgets, and authority. There is no
 model critic in default routing and at most one planner revision for a deterministic rejection.
 
-If the constrained proposal contains one Task, pb discards it immediately and runs the exact
-original Build request. It does not summarize or project that generated request. Invocation,
+If an attempted constrained proposal contains one Task, pb discards it immediately and runs the
+exact original Build request. It does not summarize or project that generated request. Invocation,
 schema, parse, source-coverage, ordering, and coordination-budget failures also fail soft to that
-same original Build after the bounded attempts. Cancellation remains terminal. The full local prompt, schema,
-raw constrained output, normalized artifact, typed failure, token/runtime counters, and final
-controller decision are persisted as an expandable Task-planning transcript. This evidence explains
-fallbacks without exposing or requesting hidden chain-of-thought.
+same original Build after the bounded attempts. Cancellation remains terminal. Every route has an
+expandable Task-planning transcript. A bypass records its deterministic reason and no attempts; an
+attempted partition also preserves the full local prompt, schema, raw constrained output, normalized
+artifact, typed failure, token/runtime counters, and final controller decision. This evidence
+explains routing without exposing or requesting hidden chain-of-thought.
 
 Two or more accepted Tasks create a digest-bound `MultiTaskRun` and an ordered Tasks panel. The
 controller activates only one dependency-ready Task. A Build Task is projected into the existing
@@ -127,6 +133,14 @@ The planning profile reads the repository and submits a structured plan with sco
 steps, and checks. If a user-owned choice is missing, planning can ask a question. The stage cannot
 edit files or run a shell.
 
+For a trusted contract, pb may place the exact current contents of existing small UTF-8
+`allowed_paths` directly into the planning context. Each automatic read is bound to the workspace,
+path, and content hashes; it is admitted only when the complete set survives prompt preflight below
+the conservative context target, and it is revalidated immediately before use. Missing, changed,
+partial, binary, symlinked, oversized, or budget-displaced paths retain the ordinary model-driven
+read path. Accepted observations enter the same read-before-write and complete-file evidence ledgers
+as an equivalent successful built-in read, with explicit controller provenance.
+
 When a trusted harness contract requires named checks, pb owns that immutable acceptance skeleton.
 The planner may omit those check IDs; after submission, pb unions the missing required IDs into the
 first acceptance fact and recomputes the plan digest before validation and fresh plan review. The
@@ -140,6 +154,13 @@ A review profile receives focused evidence in a fresh context and either accepts
 returns actionable findings. Rejection returns the workflow to bounded plan revision. The reviewer
 does not inherit mutation authority.
 
+pb projects the accepted plan ID and digest into the submitted review rather than asking the local
+model to transcribe controller-owned identity. Every required assessment kind remains mandatory.
+A passing assessment may omit repetitive evidence and explanation fields; a concern or failure
+still requires a non-empty explanation, and cited repository evidence remains freshness-validated.
+Once the deterministic submission precondition is current, the turn exposes only the plan-review
+terminal and focused repository evidence tools.
+
 The workflow checkpoint carries a byte-bounded bundle of complete small-file reads between stages.
 pb records the exact bytes, path/content hashes, source stage and normalized read arguments; it
 revalidates every path before injecting the bundle or seeding the new stage's observed-read ledger.
@@ -151,6 +172,13 @@ TODO prose are never promoted as evidence.
 The build profile receives the accepted plan and mutation capabilities. It can use built-in edits,
 configured tasks and checks, or a journaled command escape hatch. It submits an implementation
 artifact that identifies what changed and the evidence it produced. It never receives `git_commit`.
+
+On the final unfinished controller-owned work unit, every mutation schema requires an inline
+implementation-completion object. pb executes and records the mutation first, then independently
+validates the completion against the resulting repository fingerprint and ordinary implementation
+gate. A valid object closes implementation without a bookkeeping-only model turn. An invalid object
+does not roll back or misreport the successful mutation; the ordinary bounded submission path stays
+available on the next turn.
 
 When a configured language server supports a changed accepted task path, pb proactively requests
 diagnostics without waiting for the model to choose an LSP tool. While implementation is still in
@@ -187,6 +215,12 @@ and does not claim that unnamed paths are irrelevant.
 A fresh read-only reviewer inspects the delivered change and current focused evidence. An accepted
 review is bound to the content fingerprint it saw. Findings enter a bounded repair cycle; repair
 then refreshes checks and review.
+
+Every required code-assessment kind remains mandatory, while passing assessments may omit empty
+evidence and explanation fields. Concerns and failures still require an explanation, findings retain
+their typed evidence requirements, and review acceptance remains bound to the checked content
+fingerprint. Once all fresh-review evidence is current, only focused inspection/read/search tools
+and the code-review terminal remain exposed.
 
 ### 6. Managed commit
 
@@ -607,6 +641,11 @@ as a second system message. The first system message and its authorized native-t
 form a stable checkpoint without weakening tool authority. A changed token never reuses later state.
 If compaction or a stage/tool-schema transition diverges before the newest checkpoint, pb falls back
 to a matching stable prefix when one exists and evaluates the remaining suffix normally.
+
+Every `llm_invocation` event attributes the call to conversation, Task partitioning, workflow
+planning, review, evidence gathering, mutation, closure, or recovery, and records the active stage
+and profile when present. Duration, prompt/generated tokens, prompt-cache usage, and energy estimates
+therefore remain attributable even for constrained Task-planning calls outside the stage loop.
 
 Each `llm_invocation` records total prompt tokens, cached tokens, actually-prefilled tokens, cache
 source, and disk-restore time. These counts distinguish context size from work performed and make a

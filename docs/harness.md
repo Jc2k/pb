@@ -254,6 +254,11 @@ tokens, usable capacity, safety margin, schema tokens, compacted messages, and o
 content. Runtime parity checks reject any disagreement between preflight and the backend-reported
 prompt count.
 
+Each `llm_invocation` also records a controller-classified purpose, plus the active workflow stage
+and profile when present. The purpose distinguishes conversation, Task partitioning, planning,
+review, evidence, mutation, closure, and recovery calls. Constrained high-level Task-planning calls
+use the same event and runtime/token/energy accounting as stage-loop calls.
+
 Built-in `read_file` results are whole-line bounded against the active context and generation
 reserve. An omitted or oversized range ends with a machine-generated continuation containing the
 exact next line and `next_call` JSON, plus a targeted `ripgrep` suggestion. Other oversized prompt
@@ -271,6 +276,13 @@ bounded project-instruction excerpts, top-level paths, and task-dirty paths. It 
 SHA-256 of the complete normalized graph and explicit omitted counts. The complete graph—not the
 brief—continues to validate component and check IDs in submitted plans. Repository instructions in
 the brief are labeled evidence-only and cannot add user authority.
+
+When a trusted contract names `allowed_paths`, planning may additionally receive complete existing
+small UTF-8 files as controller observations. The complete candidate set must fit below 55% of usable
+prompt capacity and survive a second workspace/path hash check. Each accepted observation records
+controller origin, exact byte coverage and hashes, seeds the read-before-write gate, and persists a
+complete stage-evidence entry. Missing, symlinked, binary, partial, changed, oversized, or displaced
+files are skipped so the model can use the ordinary read tool.
 
 Fresh code review receives a changed-path manifest capped at 16,000 characters, selected check IDs, and bounded check
 evidence instead of a complete diff followed by duplicate complete current files. Each manifest
@@ -351,6 +363,11 @@ modify/delete targets require a current complete read; adopted task-owned deltas
 structurally complete without false model authorship. Exact-path diagnostic failures invalidate
 older reads and reopen only that path as a repair; they do not repeat the original create operation.
 
+For the last unfinished controller-rendered work unit, mutation schemas require the typed
+implementation completion beside the mutation payload. The executor applies the mutation before
+validating that completion against the new fingerprint. Acceptance advances immediately; rejection
+reports `mutation_succeeded=true` and keeps the bounded implementation-submission fallback.
+
 Creation units execute one controller-bound path per model action, so an unknown multi-file payload
 cannot consume the turn before the first accepted-plan path is complete. One real content/evidence
 transition can earn one extra turn per unit, at most four per stage. No failed, rejected, cached,
@@ -372,7 +389,7 @@ pb-harness-.../
 ├── run-index.jsonl  # append-only started/finished run records
 └── runs/<run-id>/
     ├── events.jsonl # immutable event stream for this invocation
-    ├── task-planning-transcript.json # constrained attempts and route, when attempted
+    ├── task-planning-transcript.json # deterministic bypass or constrained attempts and route
     └── journal.md   # final journal, or running recovery journal if interrupted
 ```
 
@@ -381,9 +398,10 @@ initializes it as a new scratch root. A non-empty existing directory is treated 
 candidate and is rejected unless it contains the expected Git workspace, so unrelated contents
 are never adopted or overwritten.
 
-The optional `task-planning-transcript.json` preserves every compact planner prompt, schema, raw and
-normalized artifact, typed failure, usage record, and final controller decision. Historical
-transcripts can also contain the retired advisory-critic role. The
+The optional `task-planning-transcript.json` records the final controller decision. A bounded
+single-Build bypass has a deterministic reason and no attempts. An attempted partition additionally
+preserves every compact planner prompt, schema, raw and normalized artifact, typed failure, and usage
+record. Historical transcripts can also contain the retired advisory-critic role. The
 optional `multi-task-checkpoint.json` mirrors the latest accepted multi-Task parent checkpoint
 for qualification and recovery inspection. It contains the accepted plan, controller-owned
 budgets, active child checkpoint, usage watermarks, repository boundary, and terminal reason. It is
@@ -705,6 +723,11 @@ targeted reads/search. If the final turn has no missing precondition, only the e
 is exposed. Missing path reads, stale fingerprints, or a direct request allowlist keep the terminal
 hidden, and the execution boundary repeats the same deterministic check if a model hallucinates the
 call anyway. Implementation and repair schemas are not pruned by this policy.
+
+Review stages narrow earlier than the final-two-turn closure checkpoint. As soon as the deterministic
+plan-review or code-review terminal precondition is current, ordinary turns expose only that terminal
+plus the stage's focused evidence tools. This removes unrelated discovery, network, memory, and
+delegation schemas without granting terminal eligibility or weakening the executor-side check.
 
 Direct bounded runs now derive every instruction from the actual allowlist. A restricted prompt
 never orders an unexposed setup, command, review, or commit tool. When those general discovery
