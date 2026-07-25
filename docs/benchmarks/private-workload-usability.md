@@ -192,7 +192,8 @@ sample.
 1. **Improve stable-prefix availability.** The call count is now bounded by useful stage work in the
    successful cases, but cold starts and stage-schema divergence still account for most fresh
    prefill. Use the typed miss reasons to improve prefix stability without weakening per-stage tool
-   authority.
+   authority. Implementation and production qualification are tracked by the
+   [stable prompt roots and FlashMoe refill plan](../stable-prompt-cache-and-refill-plan.md).
 2. **Keep repair quality observable.** The React run proves the controller can contain weak local
    edits without replanning, but two repair cycles for a one-line JSX change remain a model-quality
    cost. Track repair cycles separately from controller overhead.
