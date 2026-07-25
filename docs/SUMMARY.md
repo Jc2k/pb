@@ -59,6 +59,7 @@
   - [Device-resident prefill graph](qwen3-coder-next-device-resident-prefill-plan.md)
 - [Harness reliability](harness-improvement-plan.md)
   - [Open-weight workflow evaluation](harness-workflow-model-evaluation.md)
+  - [Private-workload usability corpus](benchmarks/private-workload-usability.md)
 - [External publication follow-on](external-publication-workflow-follow-on.md)
 - [FlashMoe architecture parity](flashmoe-architecture-parity-plan.md)
   - [Resource baseline](benchmarks/harness-r0-baseline.md)

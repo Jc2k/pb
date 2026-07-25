@@ -1,0 +1,167 @@
+import {
+  aggregateAudits,
+  classifyAudit,
+  UsabilityAudit,
+} from "./audit-harness-usability.ts";
+import { validatedUsabilityCorpus } from "./check-harness-usability-corpus.ts";
+import { prepareCorpusCase } from "./run-harness-task-corpus.ts";
+
+function assert(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(message);
+}
+
+Deno.test("usability corpus is balanced, sourced, bounded, and unguided", () => {
+  const corpus = validatedUsabilityCorpus();
+  assert(corpus.cases.length === 24, "case count");
+  assert(
+    new Set(corpus.cases.map((item) => item.source?.family)).size === 4,
+    "source family coverage",
+  );
+  for (const corpusCase of corpus.cases) {
+    assert(corpusCase.limits.max_steps <= 7, `${corpusCase.id}: max steps`);
+    assert(corpusCase.limits.max_tokens <= 1792, `${corpusCase.id}: tokens`);
+    assert(
+      corpusCase.resume_files.length === 0,
+      `${corpusCase.id}: fresh repository`,
+    );
+  }
+});
+
+Deno.test("checked-in typed corpus materializes without reference leakage", async () => {
+  const corpus = validatedUsabilityCorpus();
+  assert(corpus.cases.length === 24, "loaded cases");
+  const parent = await Deno.makeTempDir();
+  try {
+    const corpusCase = corpus.cases.find((item) =>
+      item.id === "react_accessible_alert"
+    );
+    assert(corpusCase, "React fixture");
+    await prepareCorpusCase(corpusCase, `${parent}/case`);
+    const metadata = JSON.parse(
+      await Deno.readTextFile(`${parent}/case/corpus-case.json`),
+    );
+    assert(metadata.language === "react_typescript", "language metadata");
+    assert(metadata.source.family === "react-bench", "source metadata");
+    const implementation = await Deno.readTextFile(
+      `${parent}/case/workspace/src/Component.tsx`,
+    );
+    const seed = corpusCase.seed_files.find((item) =>
+      item.path === "src/Component.tsx"
+    );
+    const reference = corpusCase.reference_files.find((item) =>
+      item.path === "src/Component.tsx"
+    );
+    assert(
+      implementation === seed?.content,
+      "seed implementation materialized",
+    );
+    assert(
+      implementation !== reference?.content,
+      "reference solution stays outside model workspace",
+    );
+  } finally {
+    await Deno.remove(parent, { recursive: true });
+  }
+});
+
+Deno.test("audit classification treats false verification as a pb defect", () => {
+  assert(
+    classifyAudit(true, true) === "positive_evidence",
+    "verified correct completion",
+  );
+  assert(
+    classifyAudit(false, true) === "pb_defect_false_verification",
+    "incorrect verified completion",
+  );
+  assert(
+    classifyAudit(true, false) === "model_or_control_limit",
+    "correct but unverified work",
+  );
+  assert(
+    classifyAudit(false, false, false) === "experiment_error",
+    "invalid experiment",
+  );
+  assert(
+    classifyAudit(true, true, true, false) ===
+      "pb_defect_false_verification",
+    "dirty or unsafe verified completion",
+  );
+});
+
+function fakeAudit(
+  language: string,
+  officialPassed: boolean,
+  verifiedClean: boolean,
+  falseVerified: boolean,
+): UsabilityAudit {
+  return {
+    version: "usability-audit-v1",
+    scratch_root: "/private/tmp/fake",
+    case_id: `${language}_case`,
+    language,
+    source_family: "synthetic",
+    official: {
+      behavior_passed: officialPassed,
+      immutable_fixture_passed: true,
+      task_passed: officialPassed,
+      check_exit_code: officialPassed ? 0 : 1,
+      check_output: "",
+    },
+    pb: {
+      status: verifiedClean || falseVerified ? "completed" : "failed",
+      contract_status: verifiedClean || falseVerified
+        ? "satisfied"
+        : "unsatisfied",
+      verified_completed: verifiedClean || falseVerified,
+      head_oid: "abc",
+      commit_oid_matches: verifiedClean,
+      semantic_commit: verifiedClean,
+    },
+    safety: {
+      workspace_clean: verifiedClean,
+      changed_paths: ["app"],
+      changed_paths_allowed: verifiedClean,
+      false_verified_completion: falseVerified,
+      verified_clean_completion: verifiedClean,
+    },
+    efficiency: {
+      wall_runtime_ms: 10,
+      llm_invocations: 1,
+      workflow_stages: ["Planning"],
+      workflow_stage_steps: { Planning: 1 },
+      rejected_workflow_actions: 0,
+      repair_cycles: 0,
+      rendered_prompt_tokens: 30,
+      cached_prefix_tokens: 5,
+      fresh_prefill_tokens: 25,
+      generated_tokens: 20,
+      tool_calls: 2,
+      total_energy_kwh: 0.001,
+      energy_complete: true,
+    },
+    classification: falseVerified
+      ? "pb_defect_false_verification"
+      : verifiedClean
+      ? "positive_evidence"
+      : "model_or_control_limit",
+  };
+}
+
+Deno.test("aggregate keeps correctness, verified completion, and efficiency separate", () => {
+  const aggregate = aggregateAudits([
+    fakeAudit("rust", true, true, false),
+    fakeAudit("python", true, false, false),
+    fakeAudit("react_typescript", false, false, true),
+  ]);
+  assert(aggregate.runs === 3, "runs");
+  assert(aggregate.official_passed === 2, "official passes");
+  assert(aggregate.pb_verified_completed === 2, "pb verified");
+  assert(aggregate.verified_clean_completion === 1, "verified clean");
+  assert(aggregate.false_verified_completion === 1, "false verified");
+  assert(aggregate.total_generated_tokens === 60, "tokens");
+  assert(aggregate.total_llm_invocations === 3, "invocations");
+  assert(aggregate.total_rendered_prompt_tokens === 90, "prompt tokens");
+  assert(aggregate.total_fresh_prefill_tokens === 75, "fresh prefill");
+  assert(aggregate.total_tool_calls === 6, "tools");
+  assert(aggregate.energy_complete, "energy completeness");
+});

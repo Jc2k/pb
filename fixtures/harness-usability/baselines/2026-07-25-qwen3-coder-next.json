@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "status": "qualification_sample",
+  "date": "2026-07-25",
+  "pb_revision": "03f1ddccdfb2368f27e9ebba912fd8c52c54982a",
+  "model": "hf://mlx-community/Qwen3-Coder-Next-4bit",
+  "backend": "flashmoe-v2-mlxq4",
+  "parameters": {
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0
+  },
+  "fixture_qualification": {
+    "cases": 24,
+    "languages": {
+      "rust": 8,
+      "python": 8,
+      "react_typescript": 8
+    },
+    "initial_failures": 24,
+    "reference_passes": 24,
+    "side_effect_clean_checks": 24
+  },
+  "scratch_root": "/private/tmp/pb-usability-qualification-20260725-c",
+  "audits": [
+    {
+      "case_id": "rust_registry_removal",
+      "language": "rust",
+      "classification": "positive_evidence",
+      "official_task_passed": true,
+      "pb_verified_completed": true,
+      "verified_clean_completion": true,
+      "false_verified_completion": false,
+      "termination_reason": "final",
+      "wall_runtime_ms": 500395,
+      "llm_invocations": 7,
+      "rendered_prompt_tokens": 31728,
+      "cached_prefix_tokens": 5225,
+      "fresh_prefill_tokens": 26503,
+      "generated_tokens": 1260,
+      "tool_calls": 7,
+      "total_energy_kwh": 0.006485053277192888
+    },
+    {
+      "case_id": "python_ttl_cache_boundary",
+      "language": "python",
+      "classification": "positive_evidence",
+      "official_task_passed": true,
+      "pb_verified_completed": true,
+      "verified_clean_completion": true,
+      "false_verified_completion": false,
+      "termination_reason": "final",
+      "wall_runtime_ms": 428839,
+      "llm_invocations": 8,
+      "rendered_prompt_tokens": 38785,
+      "cached_prefix_tokens": 22614,
+      "fresh_prefill_tokens": 16171,
+      "generated_tokens": 1541,
+      "tool_calls": 7,
+      "total_energy_kwh": 0.003774161731250738
+    },
+    {
+      "case_id": "react_accessible_alert",
+      "language": "react_typescript",
+      "classification": "model_or_control_limit",
+      "official_task_passed": false,
+      "pb_verified_completed": false,
+      "verified_clean_completion": false,
+      "false_verified_completion": false,
+      "termination_reason": "step_limit",
+      "wall_runtime_ms": 1442841,
+      "llm_invocations": 20,
+      "rendered_prompt_tokens": 91695,
+      "cached_prefix_tokens": 34120,
+      "fresh_prefill_tokens": 57575,
+      "generated_tokens": 5675,
+      "tool_calls": 18,
+      "total_energy_kwh": 0.015388041574727503,
+      "workflow_stage_steps": {
+        "planning": 7,
+        "plan_review": 6,
+        "implementing": 6
+      }
+    }
+  ],
+  "aggregate": {
+    "sample_runs": 3,
+    "official_passed": 2,
+    "pb_verified_completed": 2,
+    "verified_clean_completion": 2,
+    "false_verified_completion": 0,
+    "total_wall_runtime_ms": 2372075,
+    "total_llm_invocations": 35,
+    "total_rendered_prompt_tokens": 162208,
+    "total_cached_prefix_tokens": 61959,
+    "total_fresh_prefill_tokens": 100249,
+    "total_generated_tokens": 8476,
+    "total_tool_calls": 32,
+    "total_energy_kwh": 0.02564725658317113,
+    "energy_complete": true
+  }
+}

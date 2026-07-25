@@ -8,12 +8,24 @@ export interface CorpusLimits {
   max_tokens: number;
 }
 
+export type CorpusLanguage = "rust" | "python" | "react_typescript";
+
+export interface CorpusSource {
+  family: string;
+  reference: string;
+  adaptation: "shape_derived" | "behavior_derived";
+  upstream_id?: string;
+}
+
 export interface CorpusCase {
   id: string;
   category: string;
+  language?: CorpusLanguage;
+  source?: CorpusSource;
   task: string;
   seed_files: CorpusSeedFile[];
   resume_files: CorpusSeedFile[];
+  reference_files: CorpusSeedFile[];
   contract: Record<string, unknown>;
   limits: CorpusLimits;
 }
@@ -98,8 +110,8 @@ export function validateCorpus(value: unknown): TaskCorpus {
   if (!Array.isArray(root.cases)) {
     throw new Error("corpus cases must be an array");
   }
-  if (root.cases.length < 10 || root.cases.length > 20) {
-    throw new Error("corpus must contain 10 to 20 cases");
+  if (root.cases.length < 10 || root.cases.length > 64) {
+    throw new Error("corpus must contain 10 to 64 cases");
   }
 
   const ids = new Set<string>();
@@ -115,6 +127,54 @@ export function validateCorpus(value: unknown): TaskCorpus {
       item.resume_files ?? [],
       `${id}.resume_files`,
     );
+    const referenceFiles = validateFiles(
+      item.reference_files ?? [],
+      `${id}.reference_files`,
+    );
+
+    let language: CorpusLanguage | undefined;
+    if (item.language !== undefined) {
+      const candidate = requireString(item.language, `${id}.language`);
+      if (!["rust", "python", "react_typescript"].includes(candidate)) {
+        throw new Error(`${id}.language is not supported: ${candidate}`);
+      }
+      language = candidate as CorpusLanguage;
+    }
+
+    let source: CorpusSource | undefined;
+    if (item.source !== undefined) {
+      const rawSource = requireObject(item.source, `${id}.source`);
+      const reference = requireString(
+        rawSource.reference,
+        `${id}.source.reference`,
+      );
+      let parsedReference: URL;
+      try {
+        parsedReference = new URL(reference);
+      } catch {
+        throw new Error(`${id}.source.reference must be an absolute URL`);
+      }
+      if (parsedReference.protocol !== "https:") {
+        throw new Error(`${id}.source.reference must use https`);
+      }
+      const adaptation = requireString(
+        rawSource.adaptation,
+        `${id}.source.adaptation`,
+      );
+      if (!["shape_derived", "behavior_derived"].includes(adaptation)) {
+        throw new Error(
+          `${id}.source.adaptation is not supported: ${adaptation}`,
+        );
+      }
+      source = {
+        family: requireString(rawSource.family, `${id}.source.family`),
+        reference,
+        adaptation: adaptation as CorpusSource["adaptation"],
+        upstream_id: rawSource.upstream_id === undefined
+          ? undefined
+          : requireString(rawSource.upstream_id, `${id}.source.upstream_id`),
+      };
+    }
 
     const contract = requireObject(item.contract, `${id}.contract`);
     if (contract.version !== 1) {
@@ -135,7 +195,9 @@ export function validateCorpus(value: unknown): TaskCorpus {
       `${id}.contract.work_unit_guidance`,
     );
     if (Object.keys(workUnitGuidance).length > 64) {
-      throw new Error(`${id}.contract.work_unit_guidance has more than 64 entries`);
+      throw new Error(
+        `${id}.contract.work_unit_guidance has more than 64 entries`,
+      );
     }
     let guidanceBytes = 0;
     for (const [rawPath, rawGuidance] of Object.entries(workUnitGuidance)) {
@@ -184,6 +246,14 @@ export function validateCorpus(value: unknown): TaskCorpus {
         check.command,
         `${id}.contract.checks[${checkIndex}].command`,
       );
+      if (check.diagnostic_eligible === true) {
+        requireInteger(
+          check.timeout_seconds,
+          `${id}.contract.checks[${checkIndex}].timeout_seconds`,
+          1,
+          60,
+        );
+      }
     }
     const review = requireObject(
       contract.review ?? {},
@@ -212,9 +282,12 @@ export function validateCorpus(value: unknown): TaskCorpus {
     return {
       id,
       category: requireString(item.category, `${id}.category`),
+      language,
+      source,
       task: requireString(item.task, `${id}.task`),
       seed_files: seedFiles,
       resume_files: resumeFiles,
+      reference_files: referenceFiles,
       contract,
       limits: {
         max_steps: requireInteger(
@@ -426,6 +499,8 @@ export async function prepareCorpusCase(
           version: 1,
           case_id: corpusCase.id,
           category: corpusCase.category,
+          language: corpusCase.language,
+          source: corpusCase.source,
           resumed: corpusCase.resume_files.length > 0,
         },
         null,

@@ -217,6 +217,24 @@ The run audit records every observed strict named check in its planned and execu
 even though strict delivery does not emit the legacy handoff summary. Harness-owned next-path work
 unit guidance is recorded as positive control evidence rather than a model limitation.
 
+### Private-workload usability qualification
+
+The checked-in `fixtures/harness-usability` corpus exercises 24 synthetic Rust, Python, and
+React/TypeScript repository repairs derived from public benchmark task shapes. It exists for local
+engineering decisions, not agent comparisons. Reference solutions never enter model workspaces.
+
+Run `deno task test:usability` to prove that every seed fails, every isolated reference repair
+passes, and every official check is side-effect-clean. React packages require the one-time
+`deno task cache:usability-react` bootstrap; actual corpus checks are cached-only and frozen.
+
+`scripts/run-harness-usability.ts` runs selected cases or the full corpus sequentially and preserves
+each scratch root. `scripts/audit-harness-usability.ts` reruns task checks and verifies immutable
+fixtures, actual changed paths, the recorded commit, worktree cleanliness, and retained event metrics
+without trusting pb's own verdict. Official correctness, pb verification, safe clean delivery, and
+efficiency remain distinct fields. See the
+[private-workload usability record](benchmarks/private-workload-usability.md) for the exact protocol,
+commands, and current internal sample.
+
 ### Prompt budget and bounded results
 
 Every model call is rendered and tokenized before it is charged to the invocation budget. The
