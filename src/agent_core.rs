@@ -5277,7 +5277,27 @@ fn set_tool_target_path(tools: &mut [BuiltInToolSchema], tool_name: &str, target
     }
 }
 
-fn scope_tools_to_work_unit(tools: &mut Vec<BuiltInToolSchema>, unit: &crate::workflow::WorkUnit) {
+fn replan_supported_for_work_unit(
+    contract_allowed_paths: Option<&[String]>,
+    unit: &crate::workflow::WorkUnit,
+) -> bool {
+    if !matches!(
+        unit.state,
+        crate::workflow::WorkUnitState::DiagnosticFailed
+            | crate::workflow::WorkUnitState::DiagnosticRepairReady
+    ) {
+        return true;
+    }
+    !contract_allowed_paths.is_some_and(|allowed_paths| {
+        allowed_paths.len() == 1 && allowed_paths.first().is_some_and(|path| path == &unit.path)
+    })
+}
+
+fn scope_tools_to_work_unit(
+    tools: &mut Vec<BuiltInToolSchema>,
+    unit: &crate::workflow::WorkUnit,
+    replan_supported: bool,
+) {
     use crate::workflow::{PlannedChange, WorkUnitState};
 
     let allowed: &[&str] = match unit.state {
@@ -5296,6 +5316,9 @@ fn scope_tools_to_work_unit(tools: &mut Vec<BuiltInToolSchema>, unit: &crate::wo
         WorkUnitState::StructurallyComplete => &[],
     };
     tools.retain(|tool| allowed.contains(&tool.name.as_str()));
+    if !replan_supported {
+        tools.retain(|tool| tool.name != "request_replan");
+    }
     for tool_name in ["read_file", "write_file", "replace_file", "edit_file", "rm"] {
         if let Some(tool) = tools.iter_mut().find(|tool| tool.name == tool_name)
             && let Some(required) = tool
@@ -6792,7 +6815,16 @@ fn run_agent_steps(
         );
         scoped_tools.retain(|tool| exposure_state.allows(&tool.name));
         if let Some(unit) = active_work_unit.as_ref() {
-            scope_tools_to_work_unit(&mut scoped_tools, unit);
+            scope_tools_to_work_unit(
+                &mut scoped_tools,
+                unit,
+                replan_supported_for_work_unit(
+                    args.contract
+                        .as_ref()
+                        .map(|contract| contract.allowed_paths.as_slice()),
+                    unit,
+                ),
+            );
             configure_inline_completion_schema(
                 &mut scoped_tools,
                 work_units
@@ -16996,7 +17028,16 @@ fn maybe_inject_controller_read_observation(
         crate::workflow::WorkUnitState::MutationReady
     };
     let mut candidate_tools = available_tools.to_vec();
-    scope_tools_to_work_unit(&mut candidate_tools, &candidate_unit);
+    scope_tools_to_work_unit(
+        &mut candidate_tools,
+        &candidate_unit,
+        replan_supported_for_work_unit(
+            args.contract
+                .as_ref()
+                .map(|contract| contract.allowed_paths.as_slice()),
+            &candidate_unit,
+        ),
+    );
     if candidate.receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
         candidate_tools.retain(|tool| matches!(tool.name.as_str(), "edit_file" | "request_replan"));
     }
@@ -22677,8 +22718,8 @@ mod tests {
         };
         let mut alpha = all_builtin_tool_specs();
         let mut beta = all_builtin_tool_specs();
-        scope_tools_to_work_unit(&mut alpha, &unit("s1:0", "alpha.txt"));
-        scope_tools_to_work_unit(&mut beta, &unit("s2:0", "nested/beta.txt"));
+        scope_tools_to_work_unit(&mut alpha, &unit("s1:0", "alpha.txt"), true);
+        scope_tools_to_work_unit(&mut beta, &unit("s2:0", "nested/beta.txt"), true);
         assert_eq!(model_tools_value(&alpha), model_tools_value(&beta));
         assert!(!model_tools_value(&alpha).to_string().contains("alpha.txt"));
         assert!(
@@ -22686,6 +22727,50 @@ mod tests {
                 .to_string()
                 .contains("nested/beta.txt")
         );
+    }
+
+    #[test]
+    fn single_path_diagnostic_repair_hides_replan_but_real_plan_blockers_keep_it() {
+        let mut unit = crate::workflow::WorkUnit {
+            id: "s1:0".to_string(),
+            plan_step_id: "s1".to_string(),
+            contributing_step_ids: Vec::new(),
+            operation: crate::workflow::PlannedChange::Modify,
+            path: "alpha.txt".to_string(),
+            baseline_path_fingerprint: Some("before".to_string()),
+            invocation_path_fingerprint: Some("before".to_string()),
+            current_path_fingerprint: Some("broken".to_string()),
+            adopted: false,
+            state: crate::workflow::WorkUnitState::DiagnosticFailed,
+        };
+        let one_path = vec!["alpha.txt".to_string()];
+        let two_paths = vec!["alpha.txt".to_string(), "beta.txt".to_string()];
+
+        assert!(!replan_supported_for_work_unit(
+            Some(one_path.as_slice()),
+            &unit
+        ));
+        assert!(replan_supported_for_work_unit(
+            Some(two_paths.as_slice()),
+            &unit
+        ));
+        assert!(replan_supported_for_work_unit(None, &unit));
+
+        let mut tools = all_builtin_tool_specs();
+        scope_tools_to_work_unit(&mut tools, &unit, false);
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file"]
+        );
+
+        unit.state = crate::workflow::WorkUnitState::BlockedForReplan;
+        assert!(replan_supported_for_work_unit(
+            Some(one_path.as_slice()),
+            &unit
+        ));
     }
 
     #[test]
@@ -24286,6 +24371,11 @@ the next imagined action"#;
         );
         assert!(outcome.generation_tool_names[0].contains(&"read_file".to_string()));
         assert!(outcome.generation_tool_names[1].contains(&"replace_file".to_string()));
+        assert!(
+            outcome.generation_tool_names[..2]
+                .iter()
+                .all(|tools| !tools.contains(&"request_replan".to_string()))
+        );
         let bound_paths = events
             .iter()
             .filter_map(|event| match event {

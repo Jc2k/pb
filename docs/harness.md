@@ -368,6 +368,12 @@ implementation completion beside the mutation payload. The executor applies the 
 validating that completion against the new fingerprint. Acceptance advances immediately; rejection
 reports `mutation_succeeded=true` and keeps the bounded implementation-submission fallback.
 
+A diagnostic-failed work unit under a trusted one-path `allowed_paths` contract exposes only its
+focused read and then target-bound repair tools. `request_replan` is omitted because another plan
+cannot select a different authorized path and would discard current review/check state without
+changing authority. Multi-path or contract-free work, uncovered failures, and
+`blocked_for_replan` filesystem transitions retain the existing replan route.
+
 Creation units execute one controller-bound path per model action, so an unknown multi-file payload
 cannot consume the turn before the first accepted-plan path is complete. One real content/evidence
 transition can earn one extra turn per unit, at most four per stage. No failed, rejected, cached,

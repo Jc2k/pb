@@ -210,6 +210,14 @@ Paths named as complete diagnostic tokens are listed as repair focus, so a local
 the implicated files first. The hint is not evidence, does not narrow or expand mutation authority,
 and does not claim that unnamed paths are irrelevant.
 
+When the trusted contract authorizes exactly one path and that same work unit has focused failed-check
+evidence, the repair stage no longer exposes `request_replan`: another plan cannot grant a different
+path, and the accepted work unit already binds the required repository transition, so replanning
+would only repeat planning and review without changing authority. The model receives the current
+read or repair action instead. Replan remains available when the
+contract allows multiple paths, when no contract fixes the path set, when no active unit covers the
+failure, or when repository state has put the active unit in `blocked_for_replan`.
+
 ### 5. Code review
 
 A fresh read-only reviewer inspects the delivered change and current focused evidence. An accepted
