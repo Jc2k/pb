@@ -309,7 +309,7 @@ mod tests {
         )
         .expect("positive power should estimate energy");
         assert!(estimate.joules > 0.0);
-        assert_eq!(estimate.average_watts, 150.0);
+        assert!((estimate.average_watts - 150.0).abs() <= f64::EPSILON * 150.0);
         assert!(!estimate.complete);
     }
 
