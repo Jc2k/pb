@@ -1,0 +1,166 @@
+{
+  "version": 1,
+  "status": "production_qualification_sample",
+  "date": "2026-07-25",
+  "pb_revision": "a69239ce734cd8c7a23fd2ba2a0da4e2339b2540",
+  "release_binary_sha256": "9cfc827dd00f8f86d09b41c9df531393790896a6eaf03770c76f7df055d302e2",
+  "model": "hf://mlx-community/Qwen3-Coder-Next-4bit",
+  "backend": "flashmoe-v2-mlxq4",
+  "parameters": {
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0
+  },
+  "raw_smoke": {
+    "prompt": "2+2=",
+    "max_tokens": 1,
+    "output": "5",
+    "exit_code": 0
+  },
+  "scratch_roots": {
+    "rust_registry_removal": "/private/tmp/pb-usability-latency-20260725-a69239ce/rust_registry_removal",
+    "python_ttl_cache_boundary": "/private/tmp/pb-usability-latency-20260725-a69239ce/python_ttl_cache_boundary",
+    "react_accessible_alert": "/private/tmp/pb-usability-latency-20260725-d4620c47-rerun1/react_accessible_alert"
+  },
+  "fixture_qualification": {
+    "cases": 24,
+    "languages": {
+      "rust": 8,
+      "python": 8,
+      "react_typescript": 8
+    },
+    "initial_failures": 24,
+    "reference_passes": 24,
+    "side_effect_clean_checks": 24
+  },
+  "audits": [
+    {
+      "case_id": "rust_registry_removal",
+      "language": "rust",
+      "classification": "positive_evidence",
+      "official_task_passed": true,
+      "pb_verified_completed": true,
+      "verified_clean_completion": true,
+      "false_verified_completion": false,
+      "termination_reason": "final",
+      "wall_runtime_ms": 210868,
+      "llm_invocations": 4,
+      "rendered_prompt_tokens": 18529,
+      "cached_prefix_tokens": 9488,
+      "fresh_prefill_tokens": 9041,
+      "prompt_cache_miss_reasons": {},
+      "generated_tokens": 578,
+      "tool_calls": 4,
+      "repair_cycles": 0,
+      "total_energy_kwh": 0.0027761759228981586
+    },
+    {
+      "case_id": "python_ttl_cache_boundary",
+      "language": "python",
+      "classification": "positive_evidence",
+      "official_task_passed": true,
+      "pb_verified_completed": true,
+      "verified_clean_completion": true,
+      "false_verified_completion": false,
+      "termination_reason": "final",
+      "wall_runtime_ms": 278450,
+      "llm_invocations": 4,
+      "rendered_prompt_tokens": 18365,
+      "cached_prefix_tokens": 5188,
+      "fresh_prefill_tokens": 13177,
+      "prompt_cache_miss_reasons": {
+        "cold_session": 1
+      },
+      "generated_tokens": 681,
+      "tool_calls": 4,
+      "repair_cycles": 0,
+      "total_energy_kwh": 0.0029165116175506266
+    },
+    {
+      "case_id": "react_accessible_alert",
+      "language": "react_typescript",
+      "classification": "positive_evidence",
+      "official_task_passed": true,
+      "pb_verified_completed": true,
+      "verified_clean_completion": true,
+      "false_verified_completion": false,
+      "termination_reason": "final",
+      "wall_runtime_ms": 462534,
+      "llm_invocations": 6,
+      "rendered_prompt_tokens": 26545,
+      "cached_prefix_tokens": 1492,
+      "fresh_prefill_tokens": 25053,
+      "prompt_cache_miss_reasons": {
+        "cold_session": 1,
+        "prompt_diverged": 4
+      },
+      "generated_tokens": 967,
+      "tool_calls": 6,
+      "repair_cycles": 2,
+      "total_energy_kwh": 0.0042737616813123625,
+      "workflow_stage_steps": {
+        "planning": 1,
+        "plan_review": 1,
+        "implementing": 1,
+        "repairing": 2,
+        "code_review": 1
+      }
+    }
+  ],
+  "aggregate": {
+    "sample_runs": 3,
+    "official_passed": 3,
+    "pb_verified_completed": 3,
+    "verified_clean_completion": 3,
+    "false_verified_completion": 0,
+    "total_wall_runtime_ms": 951852,
+    "total_llm_invocations": 14,
+    "total_rendered_prompt_tokens": 63439,
+    "total_cached_prefix_tokens": 16168,
+    "total_fresh_prefill_tokens": 47271,
+    "prompt_cache_miss_reasons": {
+      "cold_session": 2,
+      "prompt_diverged": 4
+    },
+    "total_generated_tokens": 2226,
+    "total_tool_calls": 14,
+    "total_energy_kwh": 0.009966449221761146,
+    "energy_complete": true
+  },
+  "comparison_to_03f1ddcc": {
+    "official_passed": {
+      "before": 2,
+      "after": 3
+    },
+    "total_llm_invocations": {
+      "before": 35,
+      "after": 14,
+      "reduction_percent": 60.0
+    },
+    "total_wall_runtime_ms": {
+      "before": 2372075,
+      "after": 951852,
+      "reduction_percent": 59.9
+    },
+    "total_rendered_prompt_tokens": {
+      "before": 162208,
+      "after": 63439,
+      "reduction_percent": 60.9
+    },
+    "total_fresh_prefill_tokens": {
+      "before": 100249,
+      "after": 47271,
+      "reduction_percent": 52.8
+    },
+    "total_generated_tokens": {
+      "before": 8476,
+      "after": 2226,
+      "reduction_percent": 73.7
+    },
+    "total_energy_kwh": {
+      "before": 0.02564725658317113,
+      "after": 0.009966449221761146,
+      "reduction_percent": 61.1
+    }
+  }
+}

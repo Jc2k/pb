@@ -1,7 +1,7 @@
 # Private-workload usability corpus
 
-**Status:** Shipped corpus and tooling; 24/24 fixtures qualified; one stratified
-three-language model sample recorded on 25 July 2026.
+**Status:** Shipped corpus and tooling; 24/24 fixtures qualified; original and
+post-optimization stratified three-language samples recorded on 25 July 2026.
 
 This corpus exists to answer an internal question: is pb useful for the kinds of
 small Rust, Python, and React/TypeScript repairs that occur in private local
@@ -146,19 +146,56 @@ The release backend loaded and generated successfully, but a deterministic raw
 `2+2=` smoke emitted `5` and then `5 for very large` at four tokens. That is a
 model/runtime-quality warning; it is not counted as a corpus result.
 
+## 25 July 2026 production-candidate rerun
+
+Revision `a69239ce` repeated the same model, backend, cases, contract limits, and deterministic
+sampling after the bounded-workflow call-reduction work. The machine-readable record is
+`fixtures/harness-usability/baselines/2026-07-25-qwen3-coder-next-call-reduction.json`. Rust and
+Python were rerun from fresh workspaces on the committed revision. React used the exact source tree
+later committed as that revision; documentation-only commit metadata did not change its release
+binary. The recorded release-binary SHA-256 is
+`9cfc827dd00f8f86d09b41c9df531393790896a6eaf03770c76f7df055d302e2`; the required one-token
+FlashMoe smoke exited zero and returned `5` for `2+2=`.
+
+| Case                   | Official | pb verified clean | Calls | Fresh prefill | Generated |    Wall |  Energy |
+| ---------------------- | -------: | ----------------: | ----: | ------------: | --------: | ------: | ------: |
+| Rust registry removal  |     pass |               yes |     4 |         9,041 |       578 | 3m 31s | 2.78 Wh |
+| Python TTL boundary    |     pass |               yes |     4 |        13,177 |       681 | 4m 38s | 2.92 Wh |
+| React accessible alert |     pass |               yes |     6 |        25,053 |       967 | 7m 43s | 4.27 Wh |
+| **Sample total**       |  **3/3** |           **3/3** | **14** |    **47,271** | **2,226** | **15m 52s** | **9.97 Wh** |
+
+Against the original sample, model calls fell from 35 to 14 (60.0%), wall time from 39m 32s to
+15m 52s (59.9%), rendered prompt tokens from 162,208 to 63,439 (60.9%), fresh prefill from 100,249
+to 47,271 (52.8%), generated tokens from 8,476 to 2,226 (73.7%), and measured task energy from
+25.65 Wh to 9.97 Wh (61.1%). Correct, verified-clean completion improved from 2/3 to 3/3; neither
+sample contained a false verified completion.
+
+Rust and Python each used exactly one model call for planning, plan review, mutation with inline
+completion, and code review. React initially chose the wrong modifier class and then produced one
+malformed JSX repair. Both failures remained in the accepted one-path repair workflow; the release
+reached Ready after two focused repair calls instead of repeating planning and review. This directly
+closes the replan-thrash failure recorded in the original sample without weakening the immutable
+check, fresh code review, semantic commit, allowed-path, or clean-worktree gates.
+
+The new prompt-cache attribution reported two cold starts and four prompt divergences across the 14
+calls. It also showed 16,168 reused tokens, including a warm Rust run with a persisted-prefix hit in
+all four stages. Reuse is therefore functioning, while cold stage prefixes and stage-schema
+divergence remain the largest measured efficiency gap after redundant-call removal.
+
+One excluded orchestration attempt launched the release binary as a Deno child inside the evaluation
+sandbox and received no Metal device; direct `pb harness agent` runs used Metal normally. Those
+three setup failures remain preserved as experiment errors and are not included in the qualification
+sample.
+
 ## Engineering priorities
 
-1. **Reduce workflow cost before expanding routine coverage.** Seven or eight
-   model calls and roughly eight minutes for a one-line successful repair are
-   not acceptable for ordinary private work. Use this corpus to measure
-   controller-call elimination and prefill improvements independently of pass
-   rate.
-2. **Stop replan thrash after focused check evidence.** The React trace shows a
-   failing immutable check, a single allowed path, and an already accepted plan.
-   Reproductions should determine whether a controller-owned repair continuation
-   can retain plan authority while preventing repeated full planning/review
-   cycles. This is not yet classified as a clear pb defect because the model
-   itself repeatedly requested replanning and pb bounded it truthfully.
+1. **Improve stable-prefix availability.** The call count is now bounded by useful stage work in the
+   successful cases, but cold starts and stage-schema divergence still account for most fresh
+   prefill. Use the typed miss reasons to improve prefix stability without weakening per-stage tool
+   authority.
+2. **Keep repair quality observable.** The React run proves the controller can contain weak local
+   edits without replanning, but two repair cycles for a one-line JSX change remain a model-quality
+   cost. Track repair cycles separately from controller overhead.
 3. **Qualify inference quality separately.** Keep a tiny deterministic sanity
    set ahead of expensive agent runs so a degraded local backend is not mistaken
    for controller regression.
