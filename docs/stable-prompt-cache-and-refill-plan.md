@@ -1,8 +1,7 @@
 # Stable prompt roots and FlashMoe refill
 
-Status: **Design record; cache/refill implementation and release-candidate cache qualification are
-complete, while managed-workflow performance promotion and the production-ready designation remain
-open.**
+Status: **Production-ready. Stable roots, managed cache lifecycle, refill qualification, paired
+workflow performance, and full-corpus safety gates are complete.**
 
 This plan closes the efficiency gap left after the bounded-workflow call-reduction work. That work
 reduced the locked Rust/Python/React sample from 35 model calls and 100,249 fresh-prefill tokens to
@@ -21,11 +20,14 @@ FlashMoe graph and parity evidence remain governed by the
 [FlashMoe architecture parity plan](flashmoe-architecture-parity-plan.md) and
 [Qwen prefill qualification](benchmarks/qwen3-coder-next-prefill-qualification.md).
 
-The 26 July release-candidate result is retained in the
+The 26 July production result is retained in the
 [stable prompt-root qualification](benchmarks/stable-prompt-root-production.md). It closes the
-known stable-root, sessionless-root, retention, refill-parity, and 24-case cache-safety gaps. It does
-not close the plan: a follow-up qualifies Python's repeated call shape, but the paired
-three-language qualification still misses wall-time, energy, and strict all-trial call-shape gates.
+known stable-root, sessionless-root, retention, refill-parity, paired-performance, and 24-case
+cache-safety gaps. The final paired candidate passed all 18 independent task audits, used four model
+calls per task, restored 54,090/54,090 eligible root tokens, and reduced median wall time, fresh
+prefill, and measured energy by 31.76%, 42.31%, and 27.43%. The final corpus retains three truthful
+bounded local-model/control limits but no false completion, cache correctness failure, forbidden
+mutation, or unbounded regression.
 
 ## Outcome
 
@@ -477,8 +479,9 @@ Each phase appends a dated row rather than rewriting the original baseline:
 | Phase 2 cache lifecycle | `3ef1c449`, `bb3e89f9` | Byte-budget LRU, corruption/fingerprint/symlink/manifest/concurrency/storage-root fixtures; cold/restart Task-root pair; late corpus retention cases | Hot disk recency retained; sessionless root restores 30/30 after restart; 24/24 persistence completed | Qualified for shipped paths |
 | Phase 3 refill | `6aae3c8d` | Retained resident/streamed, scalar/layer-major, restored-suffix, 0/1/31/32/33, and resource matrix | Exact parity and balanced resources; suffix prefill dominated; existing graph already selects actual suffix, so no extra fast path was promoted | Profile complete; no behavior change justified |
 | Phase 4 lifecycle | `69f4d738`, `d3e389c3` | Managed six-arm evaluator and checked-in `fixtures/harness-usability/baselines/2026-07-26-prompt-cache-lifecycle.json` result | Cold miss, same/new-session memory hits, changed-authority rejection, restored-authority hit, and child-process disk hit; 6/6 independently verified clean | Qualified |
-| Phase 4 workflow | `bb3e89f9`, `884d4c1b`, `09a57723`, `e74aa084` | Locked Rust/Python/React reruns in [qualification record](benchmarks/stable-prompt-root-production.md), checked-in atomic-Python trial, and three-round paired evaluator | Paired 18/18 correct and clean; candidate roots 82,389/82,389; fresh median 31,792 passes; wall -0.10%, energy +7.95%, one candidate Rust run used 5 calls | **Performance promotion blocked** |
-| Phase 5 production | `bb3e89f9` | Complete 24-case audit, failure matrix, llama.cpp control, macOS release and native smoke | 21/24 verified clean, 3 truthful model/control limits, 0 false verification/cache defects/experiment errors; release gates pass | Cache candidate qualified; production-ready designation open |
+| Phase 4 workflow | `9274185c` through `16fd0e68` | Locked Rust/Python/React reruns in [qualification record](benchmarks/stable-prompt-root-production.md), checked-in paired evaluator, stable closure roots, and compact typed review assessments | Final paired candidate 18/18 correct and clean; 54,090/54,090 roots; four calls per task; wall -31.76%, fresh prefill -42.31%, energy -27.43%; every locked gate passes | Qualified and promoted |
+| Phase 5 production | `16fd0e68`, `49edee32` | Complete 24-case audit, corrected attribute-order-independent fixture rerun, failure matrix, llama.cpp control, macOS release, native smoke, and `fixtures/harness-usability/baselines/2026-07-26-stable-prompt-root-production-ready.json` | 21/24 verified clean, 3 truthful bounded model/control limits, 0 false verification/cache defects/forbidden mutations; 26/26 durable checkpoints and all release gates pass | Production-ready |
 
-Passing a unit test, a one-token smoke, or the four-call happy path does not close an open row. Only
-the named retained evidence and its acceptance gates can change this plan's status.
+Passing a unit test, a one-token smoke, or a four-call happy path did not close an open row. The
+production-ready designation follows from the named retained evidence and all of its acceptance
+gates together.

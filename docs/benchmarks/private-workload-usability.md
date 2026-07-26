@@ -1,7 +1,7 @@
 # Private-workload usability corpus
 
-**Status:** Shipped corpus and tooling; 24/24 fixtures qualified; original and
-post-optimization stratified samples plus a complete release-candidate run recorded.
+**Status:** Shipped corpus and tooling; 24/24 fixtures qualified; original,
+post-optimization, paired performance, and production-ready full-corpus runs recorded.
 
 This corpus exists to answer an internal question: is pb useful for the kinds of
 small Rust, Python, and React/TypeScript repairs that occur in private local
@@ -194,26 +194,33 @@ sample.
 
 ## 26 July 2026 complete prompt-root qualification
 
-Revision `bb3e89f9` ran all 24 cases with the release binary after stable-root canonicalization,
-shared FlashMoe prompt-root persistence, byte-budgeted retention, access-recency repair, and
-sessionless constrained-root persistence. The independent audit found 21 verified-clean passes,
-three truthful bounded model/control limits, zero false verification, 127/127 root-hit invocations,
-and 268,147/268,147 eligible root tokens reused. The three-language sample passed its fresh-prefill
-and energy targets but failed its wall-time and call-shape promotion gates, so it is not labelled
-production-ready. See the
+Revision `bb3e89f9` first ran all 24 cases after stable-root canonicalization, shared FlashMoe
+prompt-root persistence, byte-budgeted retention, access-recency repair, and sessionless constrained
+root persistence. That historical cache candidate found 21 verified-clean passes, three truthful
+bounded limits, zero false verification, and complete reuse of every eligible populated root, but
+its locked workflow-performance gates remained open.
+
+Revision `16fd0e68` closes those gates. In three interleaved paired rounds, all 18 baseline and
+candidate tasks passed independently; every candidate task used four calls and restored
+54,090/54,090 eligible root tokens. Candidate median wall time fell 31.76%, fresh prefill 42.31%,
+and energy 27.43%, with every per-case bound passing. A current full-corpus run, plus one isolated
+rerun after correcting an attribute-order-sensitive evaluator assertion in `49edee32`, produced
+21/24 verified-clean completions and three safely bounded model/control limits. It contained no
+false completion, forbidden mutation, cache correctness failure, persistence failure, or unbounded
+workflow regression. See the
 [stable prompt-root release qualification](stable-prompt-root-production.md) and its checked-in
-machine-readable baseline for the full result and exact exclusions.
+production-performance and production-ready records for the full results and exact exclusions.
 
 ## Engineering priorities
 
-1. **Improve stable-prefix availability.** The call count is now bounded by useful stage work in the
-   successful cases, but cold starts and stage-schema divergence still account for most fresh
-   prefill. Use the typed miss reasons to improve prefix stability without weakening per-stage tool
-   authority. Implementation and production qualification are tracked by the
+1. **Preserve stable-root invariants.** New instructions, schemas, models, templates, or stage
+   authority must intentionally change exact root identity; task evidence must not. Keep first-use
+   misses, root reconciliation, durable persistence, and refill phases visible without recording
+   prompt content. The completed production contract is recorded in the
    [stable prompt roots and FlashMoe refill plan](../stable-prompt-cache-and-refill-plan.md).
-2. **Keep repair quality observable.** The React run proves the controller can contain weak local
-   edits without replanning, but two repair cycles for a one-line JSX change remain a model-quality
-   cost. Track repair cycles separately from controller overhead.
+2. **Keep repair quality observable.** The current corpus still contains three bounded local-model
+   or control limits. Track repair cycles and generated-token variability separately from cache and
+   controller safety, and do not weaken checks or completion gates to improve artifact pass rate.
 3. **Qualify inference quality separately.** Keep a tiny deterministic sanity
    set ahead of expensive agent runs so a degraded local backend is not mistaken
    for controller regression.

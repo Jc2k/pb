@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "status": "production_ready",
+  "date": "2026-07-26",
+  "implementation_revision": "16fd0e68208b48aa9ecfe681a047938a5768179d",
+  "evaluator_revision": "49edee32cdff33d075c99834500f4c5d4eecfc67",
+  "release_binary_sha256": "dc320e6ceb99384d515bb246fbeb266bee2aac81c114fef7c0dbaa4241d8c2fd",
+  "model": "hf://mlx-community/Qwen3-Coder-Next-4bit",
+  "backend": "flashmoe-v2-mlxq4",
+  "sampling": {
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0
+  },
+  "performance_qualification": {
+    "artifact": "2026-07-26-stable-prompt-root-performance-promotion.json",
+    "candidate_revision": "16fd0e68208b48aa9ecfe681a047938a5768179d",
+    "baseline_revision": "a69239ce734cd8c7a23fd2ba2a0da4e2339b2540",
+    "official_passed": 18,
+    "verified_clean_completion": 18,
+    "false_verified_completion": 0,
+    "eligible_root_tokens": 54090,
+    "reused_root_tokens": 54090,
+    "wall_time_reduction_percent": 31.76398014294429,
+    "fresh_prefill_reduction_percent": 42.3065316983513,
+    "energy_reduction_percent": 27.429282257810844,
+    "all_promotion_gates_passed": true
+  },
+  "full_corpus": {
+    "primary_scratch_root": "/private/tmp/pb-prompt-root-phase5-production-16fd0e68-20260726",
+    "corrected_case_scratch_root": "/private/tmp/pb-prompt-root-phase5-field-fixture-v2-16fd0e68-20260726/react_field_error_linkage",
+    "qualified_aggregate": {
+      "runs": 24,
+      "official_passed": 21,
+      "pb_verified_completed": 21,
+      "verified_clean_completion": 21,
+      "false_verified_completion": 0,
+      "by_language": {
+        "rust": {
+          "runs": 8,
+          "official_passed": 7,
+          "verified_clean_completion": 7
+        },
+        "python": {
+          "runs": 8,
+          "official_passed": 7,
+          "verified_clean_completion": 7
+        },
+        "react_typescript": {
+          "runs": 8,
+          "official_passed": 7,
+          "verified_clean_completion": 7
+        }
+      },
+      "total_wall_runtime_ms": 6814799,
+      "total_llm_invocations": 111,
+      "total_rendered_prompt_tokens": 372362,
+      "total_cached_prefix_tokens": 171581,
+      "total_fresh_prefill_tokens": 200781,
+      "total_eligible_root_tokens": 168622,
+      "total_reused_root_tokens": 166831,
+      "total_prompt_root_hit_invocations": 109,
+      "truthful_first_use_root_misses": 2,
+      "total_prompt_cache_reconciliation_failures": 0,
+      "total_refill_cache_lookup_wall_ms": 786,
+      "total_refill_disk_read_decode_wall_ms": 18228,
+      "total_refill_cpu_state_validation_allocation_wall_ms": 1790,
+      "total_refill_state_hydration_wall_ms": 775,
+      "total_refill_fresh_suffix_prefill_wall_ms": 2557248,
+      "total_refill_snapshot_capture_wall_ms": 7103,
+      "total_refill_persistence_queue_wall_ms": 0,
+      "prefill_command_kinds": {
+        "qwen_layer_major_matrix": 111
+      },
+      "total_generated_tokens": 21921,
+      "total_tool_calls": 111,
+      "total_cache_persistence_queued_checkpoints": 26,
+      "total_cache_persistence_completed_checkpoints": 26,
+      "total_cache_persistence_wall_ms": 17775,
+      "total_cache_persistence_failures": 0,
+      "total_energy_kwh": 0.053178786100884216,
+      "energy_complete": true
+    },
+    "classifications": {
+      "positive_evidence": 21,
+      "model_or_control_limit": 3,
+      "pb_defect": 0,
+      "experiment_error_excluded": 1
+    },
+    "model_or_control_limits": [
+      "rust_safe_relative_path",
+      "python_word_frequency",
+      "react_tabs_semantics"
+    ],
+    "qualified_case_outcomes": {
+      "rust_run_length_encoding": "positive_evidence",
+      "rust_roman_numerals": "positive_evidence",
+      "rust_config_precedence": "positive_evidence",
+      "rust_bounded_backoff": "positive_evidence",
+      "rust_registry_removal": "positive_evidence",
+      "rust_quoted_csv": "positive_evidence",
+      "rust_safe_relative_path": "model_or_control_limit",
+      "rust_recent_cache_capacity": "positive_evidence",
+      "python_luhn_validation": "positive_evidence",
+      "python_word_frequency": "model_or_control_limit",
+      "python_ttl_cache_boundary": "positive_evidence",
+      "python_retry_policy": "positive_evidence",
+      "python_unique_slug_registry": "positive_evidence",
+      "python_deep_config_merge": "positive_evidence",
+      "python_half_open_window": "positive_evidence",
+      "python_atomic_balance_batch": "positive_evidence",
+      "react_accessible_alert": "positive_evidence",
+      "react_casefold_filter": "positive_evidence",
+      "react_counter_boundaries": "positive_evidence",
+      "react_field_error_linkage": "positive_evidence",
+      "react_status_badge_mapping": "positive_evidence",
+      "react_task_progress_summary": "positive_evidence",
+      "react_tabs_semantics": "model_or_control_limit",
+      "react_pagination_boundaries": "positive_evidence"
+    },
+    "excluded_runs": [
+      {
+        "scratch_root": "/private/tmp/pb-prompt-root-phase5-production-16fd0e68-20260726/react_field_error_linkage",
+        "classification": "experiment_error",
+        "reason": "The task-correct alert markup was rejected only because the evaluator required id before role in serialized HTML. Revision 49edee32 made the assertion attribute-order independent; the isolated replacement run passed independently."
+      }
+    ]
+  },
+  "gates": {
+    "phase_0_observability": true,
+    "phase_1_exact_stable_roots": true,
+    "phase_2_restart_and_retention": true,
+    "phase_3_refill_parity_and_resources": true,
+    "phase_3_additional_fast_path_justified": false,
+    "phase_4_lifecycle": true,
+    "phase_4_performance": true,
+    "phase_5_zero_false_completion": true,
+    "phase_5_zero_cache_correctness_failure": true,
+    "phase_5_zero_forbidden_mutation": true,
+    "phase_5_bounded_unsuccessful_work": true,
+    "local_only_cache_and_inference": true,
+    "production_ready": true
+  },
+  "release_gates": {
+    "web_build": true,
+    "rust_format": true,
+    "strict_clippy": true,
+    "rust_all_targets": {
+      "passed": 1436,
+      "ignored": 23,
+      "auxiliary_passed": 2
+    },
+    "web_tests_passed": 76,
+    "usability_fixture_tests_passed": 6,
+    "usability_corpus_cases_validated": 24,
+    "documentation_pages_checked": 58,
+    "documentation_rendered_files_checked": 97,
+    "macos_arm64_release_build": true,
+    "native_flashmoe_smoke": {
+      "prompt": "2+2=",
+      "max_tokens": 1,
+      "output": "5",
+      "exit_code": 0,
+      "interpretation": "native path passed; scalar answer quality warning retained"
+    }
+  }
+}

@@ -1,19 +1,23 @@
 # Stable prompt-root release qualification
 
-Status: **Release-candidate cache qualification passed; production performance promotion remains
-open.**
+Status: **Production-ready. Exact-root, lifecycle, refill, workflow-performance, and full-corpus
+gates pass.**
 
-Revision `bb3e89f9` completes the stable stage-root, shared cache-root, disk-retention, and
-sessionless constrained-root work described by the
+Revision `16fd0e68` completes the stable stage-root, shared cache-root, disk-retention,
+sessionless constrained-root, and bounded workflow-efficiency work described by the
 [stable prompt roots and FlashMoe refill plan](../stable-prompt-cache-and-refill-plan.md). The
-machine-readable record is
-`../../fixtures/harness-usability/baselines/2026-07-26-stable-prompt-root-production.json`.
+production-performance and final-corpus records are
+`../../fixtures/harness-usability/baselines/2026-07-26-stable-prompt-root-performance-promotion.json`
+and
+`../../fixtures/harness-usability/baselines/2026-07-26-stable-prompt-root-production-ready.json`.
 
-This is deliberately not labelled production-ready. Exact-root correctness, restart reuse,
-resource behavior, the 24-case safety corpus, fresh-prefill reduction, and energy reduction pass.
-The locked three-language wall-time and call-shape gates do not.
+The earlier `bb3e89f9` cache candidate and its unfavorable promotion results remain below as design
+history. The final locked paired comparison passes correctness, call-shape, exact-root,
+fresh-prefill, wall-time, energy, and per-case regression gates. The current 24-case qualification
+has 21 independently verified clean completions and three truthful bounded limits, with no false
+completion, forbidden mutation, cache correctness failure, or unbounded workflow regression.
 
-## Candidate and protocol
+## Initial cache candidate and protocol
 
 | Field | Value |
 | --- | --- |
@@ -34,7 +38,7 @@ commit and worktree, and then read pb's event stream. It did not trust pb's comp
 The required raw native smoke exited zero and returned `5` for `2+2=` at one token. This continues
 to be a model/runtime-quality warning, not a correctness claim about the answer.
 
-## Full 24-case result
+## Initial full 24-case result
 
 | Result | Value |
 | --- | ---: |
@@ -138,8 +142,8 @@ replaced that ineffective probe with a non-serializable, harness-only, subtracti
 after capability derivation and protected the typed terminal action. Neither excluded run
 contributes to the passing claim.
 
-This closes the durable lifecycle-evidence gap. It does not supersede the locked three-language
-performance result below and does not change the production-ready designation.
+This closes the durable lifecycle-evidence gap. At that point it did not supersede the locked
+three-language performance result below or change the production-ready designation.
 
 ## Sessionless constrained root
 
@@ -208,8 +212,8 @@ The strict promotion gate nevertheless fails:
 - no locked machine-level explanation proves those regressions are external noise.
 
 The extra Python call and case-specific decode trajectory show why root reuse and total agent
-performance must remain separate. The cache work is correct and materially reduces prefill, but it
-cannot be called production-ready under the plan's existing end-to-end gate.
+performance must remain separate. This candidate's cache work is correct and materially reduces
+prefill, but it could not yet be called production-ready under the plan's end-to-end gate.
 
 ## Python control follow-up
 
@@ -240,7 +244,8 @@ verification, and exact reuse of every eligible root on all 13 calls. Python mad
 change on its first mutation, passed its first check, and completed in the required four calls.
 Fresh prefill fell 32.78% and energy fell 25.10% against the locked baseline.
 
-Performance promotion remains open. Aggregate wall time increased 4.64% instead of falling 15%,
+Performance promotion remained open for this candidate. Aggregate wall time increased 4.64%
+instead of falling 15%,
 and Rust regressed 63.30% despite four complete disk-root hits. Python was within 1.53% of its
 baseline and React improved 20.22%. Refill lookup, disk decode, validation/allocation, hydration,
 snapshot, and queue time totalled only 1,103 ms for Rust; fresh-suffix prefill alone took 165,873
@@ -297,15 +302,157 @@ v2 report's ordering label says order alternated “by round and case,” while 
 show alternation by round; `e74aa084` corrects that label and applies the locked fresh-token ceiling.
 Neither correction changes a recorded trial or the non-promotion verdict.
 
-This closes the single-sample uncertainty. Production performance remains open because paired
-median wall time did not materially improve, paired energy regressed, and one successful Rust run
-missed the call floor. The exact-root implementation is qualified; the end-to-end workflow is not.
+This closes the single-sample uncertainty for that revision. Production performance remained open
+because paired median wall time did not materially improve, paired energy regressed, and one
+successful Rust run missed the call floor. The exact-root implementation was qualified; the
+end-to-end workflow was not yet.
+
+## Stable closure extension and first locked rerun
+
+Revisions `9274185c` through `8754afba` moved the successful bounded repair path onto four explicit
+controller-owned authority roots: `PlanningClosure`, `PlanReviewClosure`,
+`ImplementationMutation`, and `CodeReview`. Closure is proof-driven rather than task-name-driven:
+the controller exposes a terminal-only planning or plan-review root only after exact full-path
+observations satisfy that stage's prerequisites. Tool-enabled recovery remains available when the
+proof is absent or a review challenges the artifact. The rendered token digest, model namespace,
+and native tool schema remain the cache key and authority boundary; the stage label is diagnostic,
+not permission to reuse approximate state.
+
+The first complete paired rerun used revision `8754afba6559695088281fd54947c5178a4186b3`
+and release SHA-256
+`c20f9c9e95a56176f52c54e13d7d647f280a703e6881cd3355ab8ec0def5d528`. Its retained report is
+`/private/tmp/pb-paired-full-a692-vs-8754afba-20260726/paired-results.json`, SHA-256
+`31101803793fcb87e2cea6d8b7fe63c4fbbff7a7ad1e6c52eefe2b3fff659b6e`.
+
+All 18 tasks passed their official check and clean-delivery audit with zero false verification. The
+candidate used exactly four calls in every task and restored 55,008/55,008 eligible root tokens.
+Fresh-prefill median fell from 27,153 to 21,189 tokens and energy fell 20.28%. Aggregate wall median
+fell only 12.84%, however, below the locked 15% gate. The per-case wall changes were -22.17% Rust,
+-17.13% Python, and -3.09% React. This valid near-miss is retained rather than rounded into a pass.
+
+The remaining profile was not a FlashMoe refill defect. In the later passing candidate, exact-root
+lookup, disk decode, CPU validation/allocation, Metal hydration, and snapshot capture totalled
+11,212 ms across 36 calls, while actual fresh-suffix prefill took 844,742 ms. Every suffix selected
+the already-qualified Qwen layer-major graph. An application expert cache, Q4-only refill path,
+alternate runtime, new short-suffix command, or scheduler bypass would add production complexity
+without targeting the observed bottleneck, so none was added.
+
+The near-miss transcripts instead exposed variable review decode. On the same React task, the old
+plan review generated 310 tokens and code review generated 147 even though both passed; their
+compact equivalents generate 156 and 85 tokens. This made duplicate assessment prose the next
+bounded controller target.
+
+## Review compaction and performance promotion
+
+Revision `16fd0e68208b48aa9ecfe681a047938a5768179d` makes every new plan-review and
+code-review assessment contain only its required dimension and status. All six dimensions remain
+mandatory. A concern or failure records its explanation and current evidence once in the typed
+challenge or finding, and deterministic validation rejects a passing verdict with any non-passing
+assessment or a revision verdict without both a blocker and a non-passing assessment. Legacy
+checkpoint detail remains deserializable. The instruction change advances the explicit system-root
+version to `agent-system-v5`; exact rendered tokens, not the version label alone, still decide
+checkpoint reuse.
+
+The release binary SHA-256 was
+`dc320e6ceb99384d515bb246fbeb266bee2aac81c114fef7c0dbaa4241d8c2fd`. A single excluded
+warmup at `/private/tmp/pb-paired-warmup-16fd-react-v5-20260726` populated the intentionally changed
+review roots. The scored three-round comparison is retained at
+`/private/tmp/pb-paired-full-a692-vs-16fd0e68-retry2-20260726/paired-results.json`, SHA-256
+`19c5c45888e93e67573a420917187533d5cffab4e12353933f3b3aa86fc8e703`. Its checked-in
+summary is
+`../../fixtures/harness-usability/baselines/2026-07-26-stable-prompt-root-performance-promotion.json`.
+
+| Metric | Baseline raw rounds | Baseline median | Candidate raw rounds | Candidate median | Result |
+| --- | --- | ---: | --- | ---: | --- |
+| Wall time | 1,026,134 / 878,721 / 1,069,669 ms | 1,026,134 ms | 700,193 / 699,815 / 709,477 ms | 700,193 ms | 31.76% reduction; pass |
+| Fresh prefill | 36,453 / 30,843 / 38,387 | 36,453 | 21,020 / 21,031 / 21,036 | 21,031 | 42.31% reduction and below 35,453; pass |
+| Energy | 7.169 / 6.014 / 4.973 Wh | 6.014 Wh | 4.442 / 4.365 / 4.135 Wh | 4.365 Wh | 27.43% reduction; pass |
+| Model calls | 12 / 12 / 12 | 12 | 12 / 12 / 12 | 12 | four per task; pass |
+
+| Case | Baseline wall median | Candidate wall median | Candidate change |
+| --- | ---: | ---: | ---: |
+| Rust registry | 267,165 ms | 230,738 ms | -13.63% |
+| Python TTL | 350,131 ms | 241,238 ms | -31.10% |
+| React alert | 282,017 ms | 232,576 ms | -17.53% |
+
+All 18 trials again passed their official check and independent clean-delivery audit, with zero false
+verified completion. Candidate runs restored 54,090/54,090 eligible root tokens, recorded zero
+cache reconciliation failures, and completed 9/9 queued durable checkpoints. Every candidate task
+used exactly four model calls. The current exact root sizes are 1,317 PlanningClosure tokens, 1,073
+PlanReviewClosure tokens, 1,854 Rust/React or 1,416 Python ImplementationMutation tokens, and 1,912
+CodeReview tokens.
+
+Two attempts are excluded as experiment errors:
+
+- `/private/tmp/pb-paired-full-a692-vs-16fd0e68-20260726`
+- `/private/tmp/pb-paired-full-a692-vs-16fd0e68-retry1-20260726`
+
+Both wrappers ran inside a command sandbox whose child process could not acquire Metal; an immediate
+host-native probe succeeded. The final evaluator therefore ran on the host with the same explicit
+binaries, model, sampling, ordering, and scratch-isolation contract. Neither invalid attempt
+contributes to correctness or performance claims.
+
+This passes every locked Phase 4 performance gate without weakening exact-token reuse, stage tool
+authority, independent review, checks, semantic commits, or clean-worktree completion.
+
+## Current release-candidate full corpus
+
+The current release binary then ran all 24 cases serially from clean, independently prepared Git
+workspaces at
+`/private/tmp/pb-prompt-root-phase5-production-16fd0e68-20260726`. The same independent auditor
+reran every official check, verified immutable fixtures, derived the real Git delta, reconciled the
+recorded commit and worktree, and only then compared pb's terminal state.
+
+One raw result was excluded as an experiment error. `react_field_error_linkage` rendered a stable
+error element with both `role="alert"` and `id="name-error"`, but the fixture required those two
+attributes in one serialization order. Revision `49edee32` made that assertion order-independent
+without weakening the semantic contract. The isolated replacement run at
+`/private/tmp/pb-prompt-root-phase5-field-fixture-v2-16fd0e68-20260726/react_field_error_linkage`
+independently passed, reached a clean semantic commit, and restored the exact root on all five
+model calls. The original raw run remains preserved and excluded rather than being rewritten.
+
+| Result | Qualified value |
+| --- | ---: |
+| Official task passes | 21/24 |
+| pb verified-clean completions | 21/24 |
+| False verified completions | 0 |
+| Bounded model/control limits | 3 |
+| pb defects | 0 |
+| Model invocations | 111 |
+| Rendered prompt tokens | 372,362 |
+| Cached prefix tokens | 171,581 |
+| Fresh-prefill tokens | 200,781 |
+| Eligible stable-root tokens | 168,622 |
+| Reused stable-root tokens | 166,831 |
+| Root-hit invocations | 109/111 |
+| Cache reconciliation failures | 0 |
+| Durable checkpoints | 26 queued, 26 completed, 0 failed |
+| Wall time | 6,814,799 ms |
+| Measured energy | 53.18 Wh, complete coverage |
+
+The two non-hit invocations were truthful first uses: one newly encountered `RepairMutation` root
+and one 30-token sessionless `TaskArtifact` root. Both were persisted; unchanged populated roots did
+not miss or falsely hit. The three unsuccessful cases were `rust_safe_relative_path`,
+`python_word_frequency`, and `react_tabs_semantics`. Their official checks failed, pb kept their
+contracts unsatisfied, and no task commit or verified completion was claimed. All unsuccessful work
+remained within its bounded repair path.
+
+Every invocation used the qualified Qwen layer-major matrix for its actual fresh suffix. Across the
+qualified corpus, root lookup, disk decode, CPU validation/allocation, Metal hydration, and snapshot
+capture totalled 28,682 ms; fresh-suffix prefill took 2,557,248 ms. This independently confirms the
+paired profile: refill suffix work dominates, and the existing production graph already targets it.
+No new FlashMoe data flow, expert cache, Q4-only path, alternate runtime, or hidden control is
+justified.
 
 ## Release gates and exclusions
 
-Formatting, strict compiler/correctness lints, all Rust targets, the 76 web tests, the web build,
-documentation validation, the macOS arm64 release build, and the required native smoke pass. The
-full Rust result was 1,425 passed and 23 ignored, plus two auxiliary tests.
+Formatting, strict compiler/correctness lints, all Rust targets, the 76 web tests, usability corpus
+validation, the web build, documentation validation, the macOS arm64 release build, and the
+required native smoke pass. The final Rust result was 1,436 passed and 23 ignored, plus two
+auxiliary tests. The release binary SHA-256 remains
+`dc320e6ceb99384d515bb246fbeb266bee2aac81c114fef7c0dbaa4241d8c2fd`; the one-token native
+smoke exited zero and produced `5` for `2+2=`. That output remains a local-model quality warning,
+not a cache or workflow correctness claim.
 
 Two earlier scratch roots are explicitly excluded as experiment errors:
 
@@ -315,15 +462,15 @@ Two earlier scratch roots are explicitly excluded as experiment errors:
 Their wrapper execution could not acquire Metal. Direct release-binary runs used Metal normally;
 neither excluded root contributes to correctness or performance claims.
 
-## Remaining promotion work
+## Production status and watchpoints
 
-Do not weaken exact-token reuse, stage authority, review, checks, or completion gates to improve the
-headline. Python passed the four-call floor in all three paired trials; Rust passed it in two of
-three, so the combined floor remains open. The next
-implementation must target the paired profile rather than cache restoration: every candidate root
-already hit exactly, while fresh-suffix prefill and generated-token trajectories dominate. It must
-also prevent or safely shorten the malformed Rust action without weakening structured-action,
-review, check, or commit gates. Repeat the same interleaved protocol after any change. A candidate
-still needs 15% paired-median wall and energy reductions, the Rust/Python four-call floor, the locked
-fresh-token ceiling, and the per-case regression bound before this record may be promoted to
-production-ready.
+The plan's production gate is closed. This does not claim that a privacy-first local model solves
+every bounded task: the current corpus retains three model/control limits, and the raw arithmetic
+smoke remains poor. Production-ready here means cache and workflow control remain correct and safe
+under those limitations, while the locked successful workload materially improves.
+
+Future work should monitor generated-token and repair variability, the two truthful first-use root
+misses, and full-corpus local-model quality. Any further optimization must repeat the paired protocol
+and preserve exact-token identity, typed stage authority, independent checks and review, semantic
+commit ownership, local-only cache state, and the existing FlashMoe scheduling and expert-I/O
+invariants.
