@@ -6839,7 +6839,7 @@ fn run_agent_steps(
                     | crate::workflow::WorkflowStage::PlanReview
             )
         ) {
-            let _ = maybe_inject_controller_contract_observations(
+            let injected = maybe_inject_controller_contract_observations(
                 generator,
                 args,
                 workspace_root,
@@ -6849,6 +6849,28 @@ fn run_agent_steps(
                 nesting_depth,
                 sink,
             )?;
+            if injected
+                && controller_contract_observations_close_initial_planning(
+                    args,
+                    workspace_root,
+                    &gate_state.borrow(),
+                )?
+            {
+                terminal_submission_only = true;
+                let message = "Exact controller observations cover every existing trusted contract path for initial planning. Submit the plan now; the fresh plan-review stage retains independent repository-read tools and can require a tool-enabled revision.";
+                sink.emit(AgentEvent::Correction {
+                    message: message.to_string(),
+                    summary: "Complete contract planning evidence".to_string(),
+                    actor: crate::events::TeamActor::workflow_steward(),
+                    assisting_profile: Some(args.profile),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+                messages.push(correction_chat_message(
+                    "Complete contract planning evidence",
+                    message,
+                ));
+            }
         }
         if args.workflow_stage == Some(crate::workflow::WorkflowStage::CodeReview) {
             let _ = maybe_inject_controller_review_observations(
@@ -17075,6 +17097,50 @@ fn maybe_inject_controller_contract_observations(
     Ok(true)
 }
 
+fn controller_contract_observations_close_initial_planning(
+    args: &AgentRequest,
+    workspace_root: &Path,
+    gate_state: &GateState,
+) -> Result<bool> {
+    use crate::workflow::{ControllerObservationOrigin, ObservationCoverage, WorkflowStage};
+
+    if args.workflow_stage != Some(WorkflowStage::Planning) {
+        return Ok(false);
+    }
+    let Some(contract) = args.contract.as_ref() else {
+        return Ok(false);
+    };
+    if contract.allowed_paths.is_empty() {
+        return Ok(false);
+    }
+    let snapshot = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    for path in &contract.allowed_paths {
+        let Some(path_content) = snapshot.paths.get(path) else {
+            match std::fs::symlink_metadata(workspace_root.join(path)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                _ => return Ok(false),
+            }
+        };
+        let covered = gate_state
+            .stage_evidence
+            .controller_observations
+            .iter()
+            .any(|receipt| {
+                receipt.stage == WorkflowStage::Planning
+                    && receipt.path == *path
+                    && receipt.actual_origin == ControllerObservationOrigin::Controller
+                    && receipt.coverage == ObservationCoverage::Full
+                    && receipt.included_in_prompt
+                    && receipt.workspace_fingerprint == snapshot.fingerprint
+                    && receipt.path_fingerprint == path_content.fingerprint
+            });
+        if !covered {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn build_controller_review_observations(
     args: &AgentRequest,
     workspace_root: &Path,
@@ -23803,12 +23869,47 @@ the next imagined action"#;
                 .contains("actual_origin=controller")
         );
 
+        let planning_gate = GateState {
+            stage_evidence: crate::workflow::StageEvidenceBundle {
+                entries: vec![candidate.stage_entry.clone().unwrap()],
+                controller_observations: vec![candidate.receipt.clone()],
+                ..crate::workflow::StageEvidenceBundle::default()
+            },
+            ..GateState::default()
+        };
+        assert!(
+            controller_contract_observations_close_initial_planning(
+                &request,
+                repo.path(),
+                &planning_gate,
+            )
+            .unwrap()
+        );
+        let mut incomplete_gate = planning_gate.clone();
+        incomplete_gate.stage_evidence.controller_observations[0].included_in_prompt = false;
+        assert!(
+            !controller_contract_observations_close_initial_planning(
+                &request,
+                repo.path(),
+                &incomplete_gate,
+            )
+            .unwrap()
+        );
+
         let mut gate = GateState::default();
         gate.read_paths.insert("game.js".to_string());
         gate.stage_evidence
             .controller_observations
             .push(candidate.receipt.clone());
         request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanReview);
+        assert!(
+            !controller_contract_observations_close_initial_planning(
+                &request,
+                repo.path(),
+                &planning_gate,
+            )
+            .unwrap()
+        );
         let review_candidates = build_controller_contract_observations(
             &request,
             repo.path(),
@@ -25935,6 +26036,9 @@ the next imagined action"#;
         request.ctx_size = 32_768;
         request.repository_context = Some(repository);
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
+        let mut contract = normalized_test_contract("true");
+        contract.checks.clear();
+        request.contract = Some(contract);
         let completion = json!({
             "id": "implementation-inline",
             "steps": [{
@@ -25979,6 +26083,10 @@ the next imagined action"#;
                 .unwrap_or("no blocked reason")
         );
         assert_eq!(generator.generation_tool_names.len(), 4);
+        assert_eq!(
+            generator.generation_tool_names[0],
+            vec!["submit_plan".to_string()]
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult {
@@ -25993,7 +26101,7 @@ the next imagined action"#;
                 .iter()
                 .filter(|event| matches!(event, AgentEvent::ControllerObservation { .. }))
                 .count(),
-            2
+            3
         );
         let controller_observations = events
             .iter()
@@ -26006,7 +26114,7 @@ the next imagined action"#;
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(controller_observations.len(), 2);
+        assert_eq!(controller_observations.len(), 3);
         assert!(controller_observations.iter().all(|(actor, _)| matches!(
             actor,
             crate::events::TeamActor::Automation(crate::events::AutomationActor::Trinity)
@@ -26014,7 +26122,7 @@ the next imagined action"#;
         assert!(
             controller_observations
                 .iter()
-                .any(|(_, profile)| **profile == Some(AgentProfile::Build))
+                .any(|(_, profile)| **profile == Some(AgentProfile::Plan))
         );
         assert!(
             controller_observations

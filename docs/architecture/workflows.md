@@ -709,6 +709,14 @@ receive a compact path/content projection only after current-hash validation, wh
 review avoids even that copy when the same eligible contract bytes will follow as stage-bound
 controller blocks. This reduces fresh prompt work without weakening the structured evidence gate.
 
+Initial planning has one additional bounded authority transition. If a trusted non-empty path scope
+has fresh full controller observations for every existing allowed path, the first model generation
+uses the task-independent `PlanningClosure` root and exposes only `submit_plan`. A missing allowed
+path is already explicit in harness path-state evidence; any unsafe or unobserved existing path
+keeps planning tools exposed. Independent plan review retains repository reads, and any challenged
+plan revision is tool-enabled. The controller therefore removes only a duplicate initial read turn,
+not semantic review or recovery authority.
+
 FlashMoe native usage further separates memory lookup, disk open/read/decode, CPU validation and
 allocation, Metal state hydration, actual fresh-suffix prefill, prompt-snapshot capture, and durable
 write queueing. Session metrics report how many queued checkpoints completed, their wall time, and

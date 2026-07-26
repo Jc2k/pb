@@ -326,6 +326,15 @@ current path hash. When isolated plan review will receive eligible contract-path
 controller blocks, its initial user message does not duplicate those bytes or receipt metadata; if a
 block does not survive preflight, the reviewer's ordinary read tools remain available.
 
+For initial planning only, when fresh full controller observations cover every existing path in a
+non-empty trusted `allowed_paths` set, pb narrows that first generation to the stable
+`PlanningClosure` authority containing only `submit_plan`. Missing paths remain represented by the
+trusted planning path-state projection. Unsafe, partial, oversized, binary, symlinked, or unobserved
+existing paths keep the ordinary planning evidence tools. Fresh plan review always retains its
+independent repository-read authority; a challenged plan revision also returns to tool-enabled
+planning. This prevents a local model from spending another invocation rereading bytes pb just
+supplied without converting controller evidence into a review verdict.
+
 Fresh code review receives a changed-path manifest capped at 16,000 characters, selected check IDs, and bounded check
 evidence instead of a complete diff followed by duplicate complete current files. Each manifest
 entry states added, modified, deleted, or renamed status; prior path when applicable; text, binary,
