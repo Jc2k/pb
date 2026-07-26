@@ -211,6 +211,47 @@ The extra Python call and case-specific decode trajectory show why root reuse an
 performance must remain separate. The cache work is correct and materially reduces prefill, but it
 cannot be called production-ready under the plan's existing end-to-end gate.
 
+## Python control follow-up
+
+Revision `884d4c1b7029cba9c196839b54493f730b09bc6b` addresses the repeatable Python
+five-call cause without changing cache identity or widening tool authority. For an initial mutation
+of a fully observed small `.py` or `.pyi` file, the controller retains bounded atomic replacement
+and removes partial editing from that one request. The tool description explicitly requires all
+unrelated observed bytes to remain intact. Large or partially observed Python files, diagnostic
+repair, Rust, and React/TypeScript keep their existing tools. Focused tests cover each negative
+boundary.
+
+The clean arm64 release binary had SHA-256
+`6261d9b2dd4db7c1876183ea1f04778137f8c4222f0006145b438cb600b33981`. The retained
+three-language scratch root is `/private/tmp/pb-locked-promotion-884d4c1b-20260726`, and the
+machine-readable result is
+`../../fixtures/harness-usability/baselines/2026-07-26-atomic-python-promotion-trial.json`.
+
+| Case | Calls | Eligible / reused root | Fresh prefill | Wall | Energy |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Rust registry | 4 | 8,720 / 8,720 | 9,789 | 344,339 ms | 3.28 Wh |
+| Python TTL | 4 | 8,200 / 8,200 | 9,351 | 282,700 ms | 1.39 Wh |
+| React alert | 5 | 10,064 / 10,064 | 12,637 | 368,994 ms | 2.80 Wh |
+| **Candidate total** | **13** | **26,984 / 26,984** | **31,777** | **996,033 ms** | **7.47 Wh** |
+| Baseline total | 14 | not available | 47,271 | 951,852 ms | 9.97 Wh |
+
+The independent auditor found 3/3 official passes, 3/3 verified-clean completions, zero false
+verification, and exact reuse of every eligible root on all 13 calls. Python made the correct
+change on its first mutation, passed its first check, and completed in the required four calls.
+Fresh prefill fell 32.78% and energy fell 25.10% against the locked baseline.
+
+Performance promotion remains open. Aggregate wall time increased 4.64% instead of falling 15%,
+and Rust regressed 63.30% despite four complete disk-root hits. Python was within 1.53% of its
+baseline and React improved 20.22%. Refill lookup, disk decode, validation/allocation, hydration,
+snapshot, and queue time totalled only 1,103 ms for Rust; fresh-suffix prefill alone took 165,873
+ms. This is evidence against a cache lookup or restoration defect, but one candidate observation is
+not a machine-level explanation for the Rust outlier and cannot waive the per-case gate.
+
+Accordingly, the Python workflow change is qualified, while the end-to-end performance row is not.
+The next comparison must use repeated interleaved baseline and candidate runs on the locked machine,
+retain every raw trial, and report per-case and aggregate medians before another runtime change is
+selected.
+
 ## Release gates and exclusions
 
 Formatting, strict compiler/correctness lints, all Rust targets, the 76 web tests, the web build,
@@ -228,9 +269,9 @@ neither excluded root contributes to correctness or performance claims.
 ## Remaining promotion work
 
 Do not weaken exact-token reuse, stage authority, review, checks, or completion gates to improve the
-headline. The next qualification should first make the locked agent comparison less sensitive to a
-single repair trajectory: retain per-call prefill and decode time, use repeated paired runs on a
-locked machine, and report medians plus raw trials. Any new implementation should target the phase
-that remains dominant in those paired profiles. A change still needs 15% end-to-end wall reduction,
-the Rust/Python four-call floor, and the per-case regression bound before this record may be promoted
-to production-ready.
+headline. The Python four-call floor is now qualified; Rust retained its four-call floor. The next
+qualification must make the locked agent comparison less sensitive to a single decode trajectory:
+retain per-call prefill and decode time, use repeated interleaved paired runs on a locked machine,
+and report medians plus every raw trial. Any new implementation should target the phase that remains
+dominant in those paired profiles. A change still needs 15% end-to-end wall reduction and the
+per-case regression bound before this record may be promoted to production-ready.

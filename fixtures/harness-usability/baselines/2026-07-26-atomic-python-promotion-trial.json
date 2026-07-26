@@ -1,0 +1,172 @@
+{
+  "version": 1,
+  "status": "four_call_floor_qualified_performance_promotion_open",
+  "date": "2026-07-26",
+  "pb_revision": "884d4c1b7029cba9c196839b54493f730b09bc6b",
+  "release_binary_sha256": "6261d9b2dd4db7c1876183ea1f04778137f8c4222f0006145b438cb600b33981",
+  "machine_class": "darwin-aarch64",
+  "model": "hf://mlx-community/Qwen3-Coder-Next-4bit",
+  "backend": "flashmoe-v2-mlxq4",
+  "sampling": {
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0
+  },
+  "scratch_root": "/private/tmp/pb-locked-promotion-884d4c1b-20260726",
+  "change_under_test": {
+    "summary": "Initial mutation of a fully observed small Python file prefers bounded atomic replacement while retaining the unrelated observed bytes.",
+    "scope": [
+      "initial implementation mutation",
+      ".py and .pyi files",
+      "complete controller observation",
+      "replacement payload within the existing bounded tool limit"
+    ],
+    "unchanged_controls": [
+      "large or range-only Python files",
+      "diagnostic repair",
+      "Rust",
+      "React and TypeScript"
+    ]
+  },
+  "baseline": {
+    "pb_revision": "a69239ce734cd8c7a23fd2ba2a0da4e2339b2540",
+    "artifact": "2026-07-25-qwen3-coder-next-call-reduction.json",
+    "total_wall_runtime_ms": 951852,
+    "total_llm_invocations": 14,
+    "total_fresh_prefill_tokens": 47271,
+    "total_energy_kwh": 0.009966449221761146,
+    "cases": [
+      {
+        "case_id": "rust_registry_removal",
+        "wall_runtime_ms": 210868,
+        "llm_invocations": 4
+      },
+      {
+        "case_id": "python_ttl_cache_boundary",
+        "wall_runtime_ms": 278450,
+        "llm_invocations": 4
+      },
+      {
+        "case_id": "react_accessible_alert",
+        "wall_runtime_ms": 462534,
+        "llm_invocations": 6
+      }
+    ]
+  },
+  "candidate": {
+    "official_passed": 3,
+    "pb_verified_completed": 3,
+    "verified_clean_completion": 3,
+    "false_verified_completion": 0,
+    "total_wall_runtime_ms": 996033,
+    "total_llm_invocations": 13,
+    "total_rendered_prompt_tokens": 58761,
+    "total_cached_prefix_tokens": 26984,
+    "total_fresh_prefill_tokens": 31777,
+    "total_eligible_root_tokens": 26984,
+    "total_reused_root_tokens": 26984,
+    "total_prompt_root_hit_invocations": 13,
+    "total_prompt_cache_reconciliation_failures": 0,
+    "total_generated_tokens": 2115,
+    "total_tool_calls": 13,
+    "total_energy_kwh": 0.007465198125499563,
+    "energy_complete": true,
+    "cases": [
+      {
+        "case_id": "rust_registry_removal",
+        "language": "rust",
+        "scratch_root": "/private/tmp/pb-locked-promotion-884d4c1b-20260726/rust_registry_removal",
+        "classification": "positive_evidence",
+        "official_task_passed": true,
+        "verified_clean_completion": true,
+        "wall_runtime_ms": 344339,
+        "llm_invocations": 4,
+        "rendered_prompt_tokens": 18509,
+        "eligible_root_tokens": 8720,
+        "reused_root_tokens": 8720,
+        "fresh_prefill_tokens": 9789,
+        "generated_tokens": 702,
+        "repair_cycles": 0,
+        "total_energy_kwh": 0.003281332146536918
+      },
+      {
+        "case_id": "python_ttl_cache_boundary",
+        "language": "python",
+        "scratch_root": "/private/tmp/pb-locked-promotion-884d4c1b-20260726/python_ttl_cache_boundary",
+        "classification": "positive_evidence",
+        "official_task_passed": true,
+        "verified_clean_completion": true,
+        "wall_runtime_ms": 282700,
+        "llm_invocations": 4,
+        "rendered_prompt_tokens": 17551,
+        "eligible_root_tokens": 8200,
+        "reused_root_tokens": 8200,
+        "fresh_prefill_tokens": 9351,
+        "generated_tokens": 604,
+        "repair_cycles": 0,
+        "total_energy_kwh": 0.0013870721667578478
+      },
+      {
+        "case_id": "react_accessible_alert",
+        "language": "react_typescript",
+        "scratch_root": "/private/tmp/pb-locked-promotion-884d4c1b-20260726/react_accessible_alert",
+        "classification": "positive_evidence",
+        "official_task_passed": true,
+        "verified_clean_completion": true,
+        "wall_runtime_ms": 368994,
+        "llm_invocations": 5,
+        "rendered_prompt_tokens": 22701,
+        "eligible_root_tokens": 10064,
+        "reused_root_tokens": 10064,
+        "fresh_prefill_tokens": 12637,
+        "generated_tokens": 809,
+        "repair_cycles": 1,
+        "total_energy_kwh": 0.0027967938122047975
+      }
+    ]
+  },
+  "comparison": {
+    "fresh_prefill_reduction_percent": 32.78,
+    "energy_reduction_percent": 25.10,
+    "wall_time_change_percent": 4.64,
+    "individual_wall_time_change_percent": {
+      "rust_registry_removal": 63.30,
+      "python_ttl_cache_boundary": 1.53,
+      "react_accessible_alert": -20.22
+    }
+  },
+  "gates": {
+    "official_correctness_3_of_3": true,
+    "zero_false_verified_completion": true,
+    "rust_four_call_floor": true,
+    "python_four_call_floor": true,
+    "unchanged_roots_reused_exactly": true,
+    "fresh_prefill_reduction_at_least_25_percent": true,
+    "energy_reduction_at_least_15_percent": true,
+    "wall_time_reduction_at_least_15_percent": false,
+    "no_unexplained_successful_case_regression_above_10_percent": false,
+    "production_performance_promoted": false
+  },
+  "interpretation": {
+    "qualified": "The bounded Python control change restores the required four-call successful path on the committed clean revision without broadening authority or changing non-Python paths.",
+    "not_qualified": "A single paired sample is not evidence for the required wall-time promotion: aggregate wall time increased 4.64% and Rust regressed 63.30% despite exact root hits.",
+    "next_measurement": "Run repeated interleaved baseline and candidate trials on the locked machine, retain every raw trial, and compare per-case and aggregate medians before selecting another implementation target."
+  },
+  "excluded_runs": [
+    {
+      "scratch_root": "/private/tmp/pb-python-indent-schema-trial-20260726/python_ttl_cache_boundary",
+      "classification": "non_promoted_experiment",
+      "reason": "A wording-only tool-schema change did not prevent the malformed Python edit and was reverted."
+    },
+    {
+      "scratch_roots": [
+        "/private/tmp/pb-python-atomic-replace-cold-20260726",
+        "/private/tmp/pb-python-atomic-replace-warm-20260726",
+        "/private/tmp/pb-react-atomic-replace-warm-20260726",
+        "/private/tmp/pb-rust-atomic-replace-warm-20260726"
+      ],
+      "classification": "non_promoted_experiment",
+      "reason": "These diagnostic runs used an earlier uncommitted policy that applied atomic replacement to all small files; they informed the Python-only scope but do not qualify revision 884d4c1b."
+    }
+  ]
+}
