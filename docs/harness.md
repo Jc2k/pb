@@ -602,7 +602,10 @@ turn an incomplete artifact into a pass.
 `--cache-dir`, `--session-id`, and `--exclude-tool` on `pb harness agent` are hidden evaluator
 plumbing. They are explicit CLI arguments rather than production configuration or environment
 switches. Exclusions can name only the existing harness tool set and can narrow, never broaden, the
-active stage capability.
+active stage capability. Strict managed stages normally ignore a direct-run allowlist so it cannot
+accidentally remove their typed terminal tools. The evaluator therefore carries its exclusions in a
+separate non-serializable harness field, applies them only after deriving stage capabilities, and
+rejects any attempt to remove a required terminal action.
 
 ## Control evaluation
 

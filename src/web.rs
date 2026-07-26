@@ -5679,6 +5679,7 @@ mod workflow_tests {
             max_tokens: 1,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            workflow_tool_exclusions: Vec::new(),
             observation_rendering: crate::workflow::ObservationRendering::Native,
             accept_existing_workspace_changes: false,
             ctx_size: 128,

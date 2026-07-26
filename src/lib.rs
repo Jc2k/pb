@@ -1281,6 +1281,7 @@ async fn run_serve() -> Result<()> {
         max_tokens: user_config.effective_max_tokens(),
         turn_max_tokens_cap: None,
         tool_allowlist: None,
+        workflow_tool_exclusions: Vec::new(),
         observation_rendering: crate::workflow::ObservationRendering::ControllerBlock,
         accept_existing_workspace_changes: false,
         ctx_size: user_config.effective_ctx_size(),

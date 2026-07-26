@@ -841,6 +841,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
             .unwrap_or_else(|| user_config.effective_max_tokens()),
         turn_max_tokens_cap,
         tool_allowlist: Some(harness_tool_allowlist(&args.exclude_tools)?),
+        workflow_tool_exclusions: args.exclude_tools.clone(),
         observation_rendering: crate::workflow::ObservationRendering::ControllerBlock,
         accept_existing_workspace_changes: layout.resumed,
         ctx_size: args

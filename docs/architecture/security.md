@@ -34,9 +34,11 @@ and commands but not commit authority. Checking and committing are deterministic
 
 The hidden prompt-cache qualification harness can remove a named tool from its ordinary direct-run
 allowlist to prove that rendered authority invalidates an old cache root. It validates the name
-against that fixed allowlist and only subtracts it; stage capabilities still apply afterward, so
-the experiment cannot expose a tool or operation that the stage did not already permit. Generated
-artifact success is recorded separately and never substitutes for the exact-root cache gates.
+against that fixed allowlist and carries the exclusion in a non-serializable harness-only request
+field. Strict stage capabilities are derived first, after which the evaluator can only subtract;
+removing a stage's typed terminal action is rejected. The experiment therefore cannot expose a tool
+or operation that the stage did not already permit. Generated artifact success is recorded
+separately and never substitutes for the exact-root cache gates.
 
 ### Structured, fingerprinted transitions
 

@@ -593,6 +593,11 @@ pub struct AgentRequest {
     /// Optional native-tool allowlist for bounded direct harness runs.
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
+    /// Harness-owned strict-stage tool exclusions used only for exact authority-cache
+    /// qualification. Product and persisted requests cannot set this field. Exclusions narrow the
+    /// capability-derived schema and cannot remove the stage's typed terminal action.
+    #[serde(skip)]
+    pub(crate) workflow_tool_exclusions: Vec<String>,
     /// Internal native control versus pb's truthful controller representation. Product requests
     /// always use the controller block; the hidden evaluator owns the native comparison.
     #[serde(skip)]
@@ -6540,6 +6545,14 @@ fn run_agent_steps(
                 .retain(|tool| tool.name != "start_delivery" && tool.name != "start_goal");
         }
     }
+    if !args.workflow_tool_exclusions.is_empty() {
+        available_tools.retain(|tool| {
+            !args
+                .workflow_tool_exclusions
+                .iter()
+                .any(|excluded| excluded == &tool.name)
+        });
+    }
     if !sink.supports_user_questions() {
         available_tools.retain(|tool| tool.name != "ask_user");
     }
@@ -11276,6 +11289,14 @@ fn run_stage(
     // StageCapabilities is the authoritative allowlist. A legacy/direct-run allowlist must not
     // accidentally remove the required typed terminal action or add authority to this stage.
     args.tool_allowlist = None;
+    if let Some(terminal) = workflow_terminal_tool_name(contract.stage)
+        && args
+            .workflow_tool_exclusions
+            .iter()
+            .any(|excluded| excluded == terminal)
+    {
+        bail!("strict-stage tool exclusions cannot remove terminal tool '{terminal}'");
+    }
 
     let mutation_payload_limit = matches!(
         contract.stage,
@@ -22790,6 +22811,7 @@ mod tests {
             max_tokens,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            workflow_tool_exclusions: Vec::new(),
             observation_rendering: crate::workflow::ObservationRendering::Native,
             accept_existing_workspace_changes: false,
             ctx_size: 8192,
@@ -27140,6 +27162,41 @@ the next imagined action"#;
         assert!(!plan_tools.contains(&"run_command".to_string()));
         assert!(!plan_tools.contains(&"write_file".to_string()));
         assert!(!plan_tools.contains(&"git_commit".to_string()));
+
+        let mut narrowed_request = request.clone();
+        narrowed_request.workflow_tool_exclusions = vec!["read_file".to_string()];
+        let narrowed_plan_outcome = run_scripted_stage(
+            &narrowed_request,
+            &plan,
+            stage_context(),
+            vec![ScriptedCompletion {
+                content: plan_submission(),
+                truncated: false,
+            }],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let narrowed_tools = &narrowed_plan_outcome.generation_tool_names[0];
+        assert!(!narrowed_tools.contains(&"read_file".to_string()));
+        assert!(narrowed_tools.contains(&"submit_plan".to_string()));
+
+        let mut invalid_request = request.clone();
+        invalid_request.workflow_tool_exclusions = vec!["submit_plan".to_string()];
+        let error = run_scripted_stage(
+            &invalid_request,
+            &plan,
+            stage_context(),
+            vec![ScriptedCompletion {
+                content: plan_submission(),
+                truncated: false,
+            }],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("cannot remove terminal tool 'submit_plan'"));
 
         let implementation = crate::workflow::StageContract::strict(
             crate::workflow::WorkflowStage::Implementing,
@@ -33283,6 +33340,7 @@ the next imagined action"#;
             max_tokens: 2048,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            workflow_tool_exclusions: Vec::new(),
             observation_rendering: crate::workflow::ObservationRendering::Native,
             accept_existing_workspace_changes: false,
             ctx_size: 4096,
@@ -33367,6 +33425,7 @@ the next imagined action"#;
             max_tokens: 2048,
             turn_max_tokens_cap: None,
             tool_allowlist: None,
+            workflow_tool_exclusions: Vec::new(),
             observation_rendering: crate::workflow::ObservationRendering::Native,
             accept_existing_workspace_changes: false,
             ctx_size: 4096,
