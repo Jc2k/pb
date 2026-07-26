@@ -491,10 +491,14 @@ server/path target.
 
 At implementation submission, pb projects the accepted plan identity/digest, current content
 fingerprint, actual task-delta paths per named plan step, and no-change fact. The model still accounts
-for every step and owns status, summaries, and the proposed semantic commit subject. At code review,
-pb similarly projects the checked fingerprint while the fresh reviewer owns assessments, findings,
-and verdict. Existing artifact validators still reject missing steps, paths outside the plan, stale
-state, incomplete work, or unsupported review conclusions.
+for every step and owns status, summaries, and the proposed semantic commit subject. Implementation
+and per-step summaries are limited to 1,024 characters, and the semantic subject to 200 characters,
+in both the exposed schema and artifact validator. A final mutation's inline completion schema omits
+the controller-owned identity, fingerprint, touched-path, and no-change fields entirely; pb projects
+them only after the mutation succeeds. At code review, pb similarly projects the checked fingerprint
+while the fresh reviewer owns assessments, findings, and verdict. Existing artifact validators still
+reject missing steps, paths outside the plan, stale state, incomplete work, or unsupported review
+conclusions.
 
 ### Deterministic controller actions
 

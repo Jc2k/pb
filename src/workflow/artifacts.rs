@@ -8,6 +8,10 @@ use sha2::{Digest, Sha256};
 use crate::workspace::{ContentSnapshot, WorkspaceGraph};
 
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
+// Keep model-authored workflow strings below llama.cpp's bounded-repetition ceiling and small
+// enough for native constrained generation to close the surrounding action within one turn.
+pub(crate) const MAX_IMPLEMENTATION_SUMMARY_CHARS: usize = 1_024;
+pub(crate) const MAX_SEMANTIC_COMMIT_SUBJECT_CHARS: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactEnvelope<T> {
@@ -475,8 +479,17 @@ impl ImplementationArtifact {
         if self.plan_id != plan.id || self.plan_sha256 != plan.sha256 {
             bail!("implementation does not reference the current accepted plan");
         }
-        non_empty("implementation summary", &self.summary)?;
+        bounded_non_empty(
+            "implementation summary",
+            &self.summary,
+            MAX_IMPLEMENTATION_SUMMARY_CHARS,
+        )?;
         non_empty("content fingerprint", &self.content_fingerprint)?;
+        max_chars(
+            "semantic commit subject",
+            &self.semantic_commit_subject,
+            MAX_SEMANTIC_COMMIT_SUBJECT_CHARS,
+        )?;
         if !self.no_change {
             validate_semantic_subject(&self.semantic_commit_subject)?;
         }
@@ -501,7 +514,11 @@ impl ImplementationArtifact {
             bail!("implementation contains an incomplete plan step");
         }
         for step in &self.steps {
-            non_empty("implementation step summary", &step.summary)?;
+            bounded_non_empty(
+                "implementation step summary",
+                &step.summary,
+                MAX_IMPLEMENTATION_SUMMARY_CHARS,
+            )?;
             for path in &step.touched_paths {
                 validate_repository_path("implementation touched path", path)?;
             }
@@ -750,6 +767,19 @@ fn non_empty(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn max_chars(field: &str, value: &str, maximum: usize) -> Result<()> {
+    let characters = value.chars().count();
+    if characters > maximum {
+        bail!("{field} has {characters} characters; maximum is {maximum}");
+    }
+    Ok(())
+}
+
+fn bounded_non_empty(field: &str, value: &str, maximum: usize) -> Result<()> {
+    non_empty(field, value)?;
+    max_chars(field, value, maximum)
+}
+
 pub fn deserialize_artifact<T: DeserializeOwned>(value: serde_json::Value) -> Result<T> {
     serde_json::from_value(value).context("failed to deserialize workflow artifact")
 }
@@ -915,6 +945,57 @@ mod tests {
         let mut envelope = ArtifactEnvelope::new("plan-1", plan()).unwrap();
         envelope.artifact.summary = "tampered".to_string();
         assert!(envelope.validate_digest().is_err());
+    }
+
+    #[test]
+    fn implementation_text_bounds_match_the_model_facing_schema() {
+        let plan = ArtifactEnvelope::new("plan-1", plan()).unwrap();
+        let implementation = ImplementationArtifact {
+            plan_id: plan.id.clone(),
+            plan_sha256: plan.sha256.clone(),
+            content_fingerprint: "after".to_string(),
+            steps: vec![ImplementationStep {
+                step_id: "s1".to_string(),
+                status: ImplementationStepStatus::Completed,
+                touched_paths: vec!["src/lib.rs".to_string()],
+                summary: "Implemented the accepted change".to_string(),
+            }],
+            summary: "Implemented the accepted plan".to_string(),
+            no_change: false,
+            semantic_commit_subject: "fix: implement accepted change".to_string(),
+        };
+        implementation.validate(&plan).unwrap();
+
+        let mut oversized = implementation.clone();
+        oversized.summary = "x".repeat(MAX_IMPLEMENTATION_SUMMARY_CHARS + 1);
+        assert!(
+            oversized
+                .validate(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("implementation summary")
+        );
+
+        let mut oversized = implementation.clone();
+        oversized.steps[0].summary = "x".repeat(MAX_IMPLEMENTATION_SUMMARY_CHARS + 1);
+        assert!(
+            oversized
+                .validate(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("implementation step summary")
+        );
+
+        let mut oversized = implementation;
+        oversized.semantic_commit_subject =
+            format!("fix: {}", "x".repeat(MAX_SEMANTIC_COMMIT_SUBJECT_CHARS));
+        assert!(
+            oversized
+                .validate(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("semantic commit subject")
+        );
     }
 
     #[test]

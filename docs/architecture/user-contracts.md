@@ -207,6 +207,12 @@ A change-bearing Ready build carries evidence that is current for the managed co
 - the managed commit OID and evidence-bundle digest;
 - bounded usage and terminal outcome records.
 
+Implementation accounting remains model-authored only for step status, bounded summaries, and the
+semantic commit subject. Its model-facing summary fields are capped at 1,024 characters and its
+semantic subject at 200 characters; the artifact validator enforces the same limits. Controller-owned
+plan identity, fingerprints, touched paths, and no-change state are not exposed in an inline final
+mutation completion and are projected from current trusted state only after that mutation succeeds.
+
 Evidence becomes stale after a relevant mutation. pb refreshes it or stops; it does not silently
 reuse a receipt for earlier content. Git staging or committing does not itself change that content
 identity: tracked-deletion sentinels are excluded, so a reviewed deletion keeps the same fingerprint

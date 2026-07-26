@@ -5024,6 +5024,17 @@ fn string_array_schema(description: &'static str) -> Value {
     })
 }
 
+fn bounded_workflow_string_schema(maximum: usize, allow_empty: bool) -> Value {
+    let mut schema = json!({
+        "type": "string",
+        "maxLength": maximum,
+    });
+    if !allow_empty {
+        schema["minLength"] = json!(1);
+    }
+    schema
+}
+
 fn evidence_reference_schema() -> Value {
     json!({
         "type": "object",
@@ -5193,15 +5204,24 @@ fn implementation_submission_schema() -> Value {
                             "step_id": {"type": "string"},
                             "status": {"type": "string", "enum": ["completed", "no_change", "incomplete"]},
                             "touched_paths": string_array_schema("Optional compatibility field; pb projects trusted task-delta paths."),
-                            "summary": {"type": "string"},
+                            "summary": bounded_workflow_string_schema(
+                                crate::workflow::MAX_IMPLEMENTATION_SUMMARY_CHARS,
+                                false,
+                            ),
                         },
                         "required": ["step_id", "status", "summary"],
                         "additionalProperties": false,
                     },
                 },
-                "summary": {"type": "string"},
+                "summary": bounded_workflow_string_schema(
+                    crate::workflow::MAX_IMPLEMENTATION_SUMMARY_CHARS,
+                    false,
+                ),
                 "no_change": {"type": "boolean", "description": "Optional compatibility field; pb derives this from the task delta."},
-                "semantic_commit_subject": {"type": "string"},
+                "semantic_commit_subject": bounded_workflow_string_schema(
+                    crate::workflow::MAX_SEMANTIC_COMMIT_SUBJECT_CHARS,
+                    true,
+                ),
             },
             "required": [
                 "steps", "summary", "semantic_commit_subject"
@@ -5216,6 +5236,19 @@ fn inline_implementation_completion_schema() -> Value {
     schema["description"] = json!(
         "Optional model-authored implementation accounting. Include only when this atomic mutation completes every remaining accepted work unit. pb projects plan identity, fingerprints, actual paths, and no-change state."
     );
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("implementation schema must declare properties");
+    for controller_field in ["plan_id", "plan_sha256", "content_fingerprint", "no_change"] {
+        properties.remove(controller_field);
+    }
+    properties
+        .get_mut("steps")
+        .and_then(|steps| steps.pointer_mut("/items/properties"))
+        .and_then(Value::as_object_mut)
+        .expect("implementation steps must declare properties")
+        .remove("touched_paths");
     schema
 }
 
@@ -23038,6 +23071,43 @@ mod tests {
                 .unwrap(),
             &json!(["completed", "no_change", "incomplete"])
         );
+        assert_eq!(
+            schema("submit_implementation").pointer("/properties/summary/maxLength"),
+            Some(&json!(crate::workflow::MAX_IMPLEMENTATION_SUMMARY_CHARS))
+        );
+        assert_eq!(
+            schema("submit_implementation")
+                .pointer("/properties/steps/items/properties/summary/maxLength"),
+            Some(&json!(crate::workflow::MAX_IMPLEMENTATION_SUMMARY_CHARS))
+        );
+        assert_eq!(
+            schema("submit_implementation")
+                .pointer("/properties/semantic_commit_subject/maxLength"),
+            Some(&json!(crate::workflow::MAX_SEMANTIC_COMMIT_SUBJECT_CHARS))
+        );
+        let inline_completion = schema("edit_file")
+            .pointer("/properties/completion")
+            .unwrap();
+        for controller_field in ["plan_id", "plan_sha256", "content_fingerprint", "no_change"] {
+            assert!(
+                inline_completion
+                    .pointer(&format!("/properties/{controller_field}"))
+                    .is_none(),
+                "inline completion exposed controller-owned field {controller_field}"
+            );
+        }
+        assert!(
+            inline_completion
+                .pointer("/properties/steps/items/properties/touched_paths")
+                .is_none()
+        );
+        assert_eq!(
+            inline_completion.pointer("/properties/summary/maxLength"),
+            Some(&json!(crate::workflow::MAX_IMPLEMENTATION_SUMMARY_CHARS))
+        );
+        crate::inference::flashmoe::validate_native_tool_schema(schema("edit_file")).unwrap();
+        crate::inference::flashmoe::validate_native_tool_schema(schema("submit_implementation"))
+            .unwrap();
         assert_eq!(
             schema("submit_code_review")
                 .pointer("/properties/assessments/items/properties/kind/enum")
