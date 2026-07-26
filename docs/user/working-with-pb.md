@@ -55,8 +55,9 @@ gets one smaller complete-file retry. Neither case writes a partial file.
 For the last remaining file operation, the local model returns the implementation summary with the
 mutation. pb validates that summary only after the edit succeeds, so a valid edit can finish the
 implementation stage without a separate bookkeeping turn. Review pass records are similarly
-compact: pb supplies controller-owned plan identity and does not require empty explanations, while
-concerns and failures still need specific reasons and fresh evidence.
+compact: pb supplies controller-owned plan identity, each assessment records only its kind and
+status, and concerns or failures put their specific reasons and fresh evidence once in challenges
+or findings.
 
 If a required check fails against the only contract-allowed path, pb keeps the accepted plan and
 offers a focused read or repair rather than another identical planning cycle, including when an

@@ -1505,18 +1505,34 @@ fn execute_workflow_assertion_tail(
                 workflow_fixture_implementation(&state.plan, fingerprint.clone(), false)?;
             let code_review =
                 workflow_fixture_code_review(fingerprint, crate::workflow::ReviewVerdict::Pass)?;
+            let plan_review_submission = serde_json::json!({
+                "id": plan_review.id,
+                "assessments": plan_review.artifact.assessments.iter().map(|assessment| {
+                    serde_json::json!({
+                        "kind": assessment.kind,
+                        "status": assessment.status,
+                    })
+                }).collect::<Vec<_>>(),
+                "challenges": plan_review.artifact.challenges,
+                "verdict": plan_review.artifact.verdict,
+            });
+            let code_review_submission = serde_json::json!({
+                "id": code_review.id,
+                "assessments": code_review.artifact.assessments.iter().map(|assessment| {
+                    serde_json::json!({
+                        "kind": assessment.kind,
+                        "status": assessment.status,
+                    })
+                }).collect::<Vec<_>>(),
+                "findings": code_review.artifact.findings,
+                "verdict": code_review.artifact.verdict,
+            });
             let mut events = Vec::new();
             let outcome = run_scripted_delivery_workflow(
                 &request,
                 vec![
                     plan_submission_completion(&state.plan),
-                    workflow_tool_completion(
-                        "submit_plan_review",
-                        serde_json::json!({
-                            "id": plan_review.id,
-                            "review": plan_review.artifact,
-                        }),
-                    ),
+                    workflow_tool_completion("submit_plan_review", plan_review_submission),
                     workflow_tool_completion(
                         "read_file",
                         serde_json::json!({"path": "existing.txt"}),
@@ -1536,13 +1552,7 @@ fn execute_workflow_assertion_tail(
                         "read_file",
                         serde_json::json!({"path": "existing.txt"}),
                     ),
-                    workflow_tool_completion(
-                        "submit_code_review",
-                        serde_json::json!({
-                            "id": code_review.id,
-                            "review": code_review.artifact,
-                        }),
-                    ),
+                    workflow_tool_completion("submit_code_review", code_review_submission),
                 ],
                 state.scratch.path(),
                 &mut |event| events.push(event),

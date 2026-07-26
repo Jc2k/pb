@@ -156,8 +156,10 @@ does not inherit mutation authority.
 
 pb projects the accepted plan ID and digest into the submitted review rather than asking the local
 model to transcribe controller-owned identity. Every required assessment kind remains mandatory.
-A passing assessment may omit repetitive evidence and explanation fields; a concern or failure
-still requires a non-empty explanation, and cited repository evidence remains freshness-validated.
+Assessment entries contain only their dimension and status. A concern or failure records its
+specific explanation and evidence once in the corresponding typed challenge, and cited repository
+evidence remains freshness-validated. Older checkpoints with assessment-local detail remain
+readable, but new native submissions cannot generate that duplicate prose.
 The deterministic validator rejects internally inconsistent reviews: a passing verdict cannot
 contain a concern or failed assessment, and a revision verdict needs both a blocking challenge and
 a corresponding concern or failed assessment. A blocker must describe a defect in the proposed
@@ -248,9 +250,10 @@ A fresh read-only reviewer inspects the delivered change and current focused evi
 review is bound to the content fingerprint it saw. Findings enter a bounded repair cycle; repair
 then refreshes checks and review.
 
-Every required code-assessment kind remains mandatory, while passing assessments may omit empty
-evidence and explanation fields. Concerns and failures still require an explanation, findings retain
-their typed evidence requirements, and review acceptance remains bound to the checked content
+Every required code-assessment kind remains mandatory and contains only its dimension and status.
+Concerns and failures record their explanation and typed evidence once in findings. A passing
+verdict cannot contain a concerning assessment; a revision verdict needs both a blocking finding
+and a corresponding concern or failure. Review acceptance remains bound to the checked content
 fingerprint. Once all fresh-review evidence is current, only focused inspection/read/search tools
 and the code-review terminal remain exposed.
 
@@ -723,9 +726,9 @@ Initial planning has one additional bounded authority transition. If a trusted n
 has fresh full controller observations for every existing allowed path, the first model generation
 uses the task-independent `PlanningClosure` root and exposes only `submit_plan`. A missing allowed
 path is already explicit in harness path-state evidence; any unsafe or unobserved existing path
-keeps planning tools exposed. Independent plan review retains repository reads, and any challenged
-plan revision is tool-enabled. The controller therefore removes only a duplicate initial read turn,
-not semantic review or recovery authority.
+keeps planning tools exposed. Independent plan review keeps repository reads unless the same exact
+full observations satisfy its own fresh closure proof; any challenged plan revision is tool-enabled.
+The controller therefore removes only duplicate reads, not semantic review or recovery authority.
 
 FlashMoe native usage further separates memory lookup, disk open/read/decode, CPU validation and
 allocation, Metal state hydration, actual fresh-suffix prefill, prompt-snapshot capture, and durable

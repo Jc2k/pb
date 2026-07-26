@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const PROMPT_ROOT_DESCRIPTOR_VERSION: u32 = 1;
-pub const AGENT_SYSTEM_INSTRUCTION_VERSION: &str = "agent-system-v4";
+pub const AGENT_SYSTEM_INSTRUCTION_VERSION: &str = "agent-system-v5";
 
 pub(crate) fn rendered_token_sha256(tokens: impl IntoIterator<Item = u32>) -> String {
     let mut digest = Sha256::new();

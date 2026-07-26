@@ -386,7 +386,7 @@ impl PlanReviewArtifact {
             self.challenges.iter().map(|item| item.id.as_str()),
         )?;
         for assessment in &self.assessments {
-            if assessment.status != AssessmentStatus::Pass || !assessment.explanation.is_empty() {
+            if !assessment.explanation.is_empty() {
                 non_empty("plan assessment explanation", &assessment.explanation)?;
             }
             validate_evidence(&assessment.evidence)?;
@@ -615,7 +615,7 @@ impl CodeReviewArtifact {
             self.findings.iter().map(|item| item.id.as_str()),
         )?;
         for assessment in &self.assessments {
-            if assessment.status != AssessmentStatus::Pass || !assessment.explanation.is_empty() {
+            if !assessment.explanation.is_empty() {
                 non_empty("code assessment explanation", &assessment.explanation)?;
             }
             validate_evidence(&assessment.evidence)?;
@@ -640,12 +640,22 @@ impl CodeReviewArtifact {
             .findings
             .iter()
             .any(|finding| finding.severity.is_blocking());
+        let concerning_assessment = self
+            .assessments
+            .iter()
+            .any(|assessment| assessment.status != AssessmentStatus::Pass);
         match (self.verdict, blocking) {
             (ReviewVerdict::Pass, true) => {
                 bail!("passing code review contains a blocking finding")
             }
+            (ReviewVerdict::Pass, false) if concerning_assessment => {
+                bail!("passing code review contains a concern or failed assessment")
+            }
             (ReviewVerdict::Revise, false) => {
                 bail!("code review requests revision without a blocking finding")
+            }
+            (ReviewVerdict::Revise, true) if !concerning_assessment => {
+                bail!("code review requests revision while every assessment passes")
             }
             _ => {}
         }
@@ -1038,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn passing_review_assessments_are_sparse_but_non_pass_explanations_remain_required() {
+    fn review_assessments_are_compact_and_concerns_live_in_challenges_or_findings() {
         let envelope = ArtifactEnvelope::new("plan-1", plan()).unwrap();
         let mut plan_review = PlanReviewArtifact {
             plan_id: envelope.id.clone(),
@@ -1057,15 +1067,6 @@ mod tests {
         };
         plan_review.validate(&envelope).unwrap();
         plan_review.assessments[0].status = AssessmentStatus::Concern;
-        assert!(
-            plan_review
-                .validate(&envelope)
-                .unwrap_err()
-                .to_string()
-                .contains("explanation")
-        );
-
-        plan_review.assessments[0].explanation = "The plan omits an edge case".to_string();
         assert!(
             plan_review
                 .validate(&envelope)
@@ -1115,7 +1116,28 @@ mod tests {
                 .validate("content")
                 .unwrap_err()
                 .to_string()
-                .contains("explanation")
+                .contains("passing code review contains a concern")
+        );
+        code_review.verdict = ReviewVerdict::Revise;
+        code_review.findings.push(CodeFinding {
+            id: "finding-1".to_string(),
+            severity: ReviewSeverity::P1,
+            path: Some("src/lib.rs".to_string()),
+            line: Some(1),
+            requirement_ids: vec!["r1".to_string()],
+            plan_step_ids: vec!["s1".to_string()],
+            evidence: Vec::new(),
+            explanation: "The implementation needs repair".to_string(),
+        });
+        code_review.validate("content").unwrap();
+
+        code_review.assessments[0].status = AssessmentStatus::Pass;
+        assert!(
+            code_review
+                .validate("content")
+                .unwrap_err()
+                .to_string()
+                .contains("requests revision while every assessment passes")
         );
     }
 

@@ -163,6 +163,11 @@ that exact artifact to fresh plan review. Additional checks remain model-selecte
 implementation scope remain model-proposed and contract-validated; projection cannot turn an
 allowed path into a required mutation or add user intent.
 
+Fresh plan and code reviews still account for every required assessment dimension. Each assessment
+contains only its kind and status; a concern or failure records its reason and current evidence once
+in the corresponding typed challenge or finding. pb rejects a passing verdict with a concerning
+assessment and a revision verdict without both a blocking issue and a non-passing assessment.
+
 An optional bounded `work_unit_guidance` map may give an exact task path a concise advisory hint.
 It is trusted prompt context, not an acceptance fact: the hint cannot choose a path, authorize a
 mutation, earn progress, satisfy a check or review, or advance the workflow. pb validates guided

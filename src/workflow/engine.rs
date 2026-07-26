@@ -904,6 +904,8 @@ mod tests {
             .unwrap();
         let mut review = plan_review(&plan).artifact;
         review.verdict = ReviewVerdict::Revise;
+        review.assessments[0].status = AssessmentStatus::Concern;
+        review.assessments[0].explanation.clear();
         review.challenges.push(super::super::ReviewChallenge {
             id: "c1".to_string(),
             severity: ReviewSeverity::P1,
