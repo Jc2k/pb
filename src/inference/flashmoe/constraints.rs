@@ -723,10 +723,23 @@ fn parse_json_string(input: &str, position: usize) -> StringStatus {
         };
     }
     let mut escaped = false;
+    let mut unicode_escape_digits = 0u8;
     for (offset, character) in input[position + 1..].char_indices() {
         let absolute = position + 1 + offset;
+        if unicode_escape_digits > 0 {
+            if !character.is_ascii_hexdigit() {
+                return StringStatus::Invalid;
+            }
+            unicode_escape_digits -= 1;
+            continue;
+        }
         if escaped {
             escaped = false;
+            match character {
+                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {}
+                'u' => unicode_escape_digits = 4,
+                _ => return StringStatus::Invalid,
+            }
             continue;
         }
         match character {
@@ -740,6 +753,9 @@ fn parse_json_string(input: &str, position: usize) -> StringStatus {
             character if character.is_control() => return StringStatus::Invalid,
             _ => {}
         }
+    }
+    if escaped || unicode_escape_digits > 0 {
+        return StringStatus::Incomplete(None);
     }
     let unterminated = &input[position..];
     serde_json::from_str::<String>(&format!("{unterminated}\""))
@@ -1216,6 +1232,34 @@ mod tests {
             JsonPrefixParser::new("\"a\\nbcd").parse_string(0, &schema),
             PrefixStatus::Invalid
         );
+    }
+
+    #[test]
+    fn malformed_json_escapes_are_rejected_before_the_tool_prefix_can_run_away() {
+        assert_eq!(parse_json_string("\"summar\\\ny", 0), StringStatus::Invalid);
+        assert_eq!(parse_json_string("\"bad\\q", 0), StringStatus::Invalid);
+        assert_eq!(
+            parse_json_string("\"unfinished\\", 0),
+            StringStatus::Incomplete(None)
+        );
+        assert_eq!(
+            parse_json_string("\"unfinished\\u12", 0),
+            StringStatus::Incomplete(None)
+        );
+        assert_eq!(
+            parse_json_string("\"snowman \\u2603\"", 0),
+            StringStatus::Complete("snowman ☃".to_string(), 16)
+        );
+
+        let constraint =
+            NativeToolConstraint::compile(NativeToolConstraintMode::ToolRequired, &tools())
+                .unwrap()
+                .unwrap();
+        let malformed = concat!(
+            "<tool_call>{\"name\":\"submit_review\",\"arguments\":{",
+            "\"verdict\":\"pass\",\"notes\":[],\"detai\\\nl\":\"runaway"
+        );
+        assert!(!constraint.output_prefix_is_valid(malformed, false));
     }
 
     #[test]
