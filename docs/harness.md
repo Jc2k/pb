@@ -247,10 +247,10 @@ binary runs first, locks the explicit model and sampling settings, independently
 scratch root, checkpoints partial progress atomically, and retains raw values plus per-case and
 aggregate medians. Its result fails the production
 performance gate unless correctness, clean verification, the Rust/Python four-call floor, exact
-candidate root reuse, fresh-prefill, energy, wall-time, and per-case regression requirements all
-pass. A harness process that ends nonzero is still independently audited and retained rather than
-aborting later trials. A non-passing completed comparison exits with status 2 while preserving the
-report.
+candidate root reuse, the locked fresh-prefill ceiling, paired-median energy and wall time, and
+per-case regression requirements all pass. A harness process that ends nonzero is still
+independently audited and retained rather than aborting later trials. A non-passing completed
+comparison exits with status 2 while preserving the report.
 
 ```sh
 deno run --allow-read --allow-write --allow-run \

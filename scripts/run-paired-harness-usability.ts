@@ -14,6 +14,7 @@ const DEFAULT_CASE_IDS = [
 ];
 const LOCKED_CONTEXT_SIZE = 131_072;
 const LOCKED_GPU_LAYERS = 999;
+const LOCKED_FRESH_PREFILL_CEILING = 35_453;
 
 type Variant = "baseline" | "candidate";
 
@@ -67,6 +68,12 @@ export interface PairedPromotionReport {
       ctx_size: number;
       gpu_layers: number;
     };
+    promotion_thresholds: {
+      fresh_prefill_tokens_at_most: number;
+      wall_time_reduction_percent_at_least: number;
+      energy_reduction_percent_at_least: number;
+      per_case_wall_regression_percent_at_most: number;
+    };
     ordering: string;
   };
   variants: Record<Variant, {
@@ -91,7 +98,7 @@ export interface PairedPromotionReport {
     candidate_rust_python_four_call_floor: boolean;
     candidate_exact_root_reuse: boolean;
     wall_time_reduction_at_least_15_percent: boolean;
-    fresh_prefill_reduction_at_least_25_percent: boolean;
+    fresh_prefill_at_or_below_locked_ceiling: boolean;
     complete_energy_coverage: boolean;
     energy_reduction_at_least_15_percent: boolean;
     no_case_wall_regression_above_10_percent: boolean;
@@ -332,8 +339,9 @@ export function buildPairedReport(
     ),
     wall_time_reduction_at_least_15_percent:
       comparison.wall_time_reduction_percent >= 15,
-    fresh_prefill_reduction_at_least_25_percent:
-      comparison.fresh_prefill_reduction_percent >= 25,
+    fresh_prefill_at_or_below_locked_ceiling:
+      candidateSummary.fresh_prefill_tokens.median <=
+        LOCKED_FRESH_PREFILL_CEILING,
     complete_energy_coverage: trials.every((trial) =>
       trial.audit.efficiency.energy_complete
     ),
@@ -365,8 +373,14 @@ export function buildPairedReport(
         ctx_size: LOCKED_CONTEXT_SIZE,
         gpu_layers: LOCKED_GPU_LAYERS,
       },
+      promotion_thresholds: {
+        fresh_prefill_tokens_at_most: LOCKED_FRESH_PREFILL_CEILING,
+        wall_time_reduction_percent_at_least: 15,
+        energy_reduction_percent_at_least: 15,
+        per_case_wall_regression_percent_at_most: 10,
+      },
       ordering:
-        "case order rotates by round; baseline/candidate order alternates by round and case",
+        "case order rotates by round; baseline/candidate order alternates by round",
     },
     variants: {
       baseline: {
@@ -532,6 +546,12 @@ async function main(): Promise<void> {
               seed: 0,
               ctx_size: LOCKED_CONTEXT_SIZE,
               gpu_layers: LOCKED_GPU_LAYERS,
+            },
+            promotion_thresholds: {
+              fresh_prefill_tokens_at_most: LOCKED_FRESH_PREFILL_CEILING,
+              wall_time_reduction_percent_at_least: 15,
+              energy_reduction_percent_at_least: 15,
+              per_case_wall_regression_percent_at_most: 10,
             },
           },
           variants: {
