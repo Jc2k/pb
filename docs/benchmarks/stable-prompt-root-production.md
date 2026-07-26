@@ -92,6 +92,55 @@ fingerprint rejection, concurrent writers, byte-budget LRU eviction, dangling-ma
 partial/corrupt checkpoints, oversized checkpoints, changed storage roots, unwritable namespaces,
 and checkpoint or configured-root symlink escapes.
 
+## Managed cache lifecycle qualification
+
+Revision `d3e389c3615f9387d74a6596c256444b87ed7dee` adds one managed evaluator for the
+complete Phase 4 lifecycle rather than relying on separately assembled happy-path runs. Its
+machine-readable result is
+`../../fixtures/harness-usability/baselines/2026-07-26-prompt-cache-lifecycle.json`; the retained
+native scratch root is `/private/tmp/pb-cache-eval-d3e389c3-native-20260726`. The source worktree
+was clean and the arm64 release binary SHA-256 was
+`e5dd3e92c553ce0bcb61be12aa4432a057354164067c4642b39aa09c664d23cf`.
+
+The evaluator requires six distinct, initially absent scratch directories, an empty or absent
+cache directory, matching immutable contracts and workspace content, and a new report path. It
+runs cold, warm same-session, warm new-session, changed-authority, matching-authority, and child
+process restart arms. It releases every unleased parent FlashMoe runtime before spawning the child,
+so the restart arm cannot obtain an in-process prefix. Task outcome is recorded independently from
+the cache gates.
+
+| Arm | Planning root | Reused | Source | Calls | Independent result |
+| --- | ---: | ---: | --- | ---: | --- |
+| Cold empty storage | 3,703 | 0 | none (`cold_session`) | 4 | verified clean |
+| Warm same session | 3,703 | 3,703 | memory prefix | 4 | verified clean |
+| Warm new session | 3,703 | 3,703 | memory prefix | 4 | verified clean |
+| Changed authority | 3,516 | 0 | none (`cold_session`) | 4 | verified clean |
+| Original authority restored | 3,703 | 3,703 | memory prefix | 4 | verified clean |
+| New child process | 3,703 | 3,703 | disk prefix | 4 | verified clean |
+
+The changed arm subtracts `read_file` after normal typed Planning capabilities are derived. Its
+tool-schema and rendered-token digests both differ from the original, and it gets zero reuse. The
+terminal Planning action cannot be excluded. Restoring the original authority returns the exact
+original digests and full reuse; the child then obtains the same exact root from disk. All seven
+evaluator gates passed.
+
+The independent usability auditor reran official checks for every arm: 6/6 official passes, 6/6
+verified-clean completions, 0 false verified completions, 24 total model calls, and no forbidden
+path or semantic-commit failure. It classified all six as positive evidence. Across the matrix,
+13/13 queued checkpoints completed, no persistence or reconciliation failure occurred, and the
+restart arm reported disk read/decode separately from state hydration and suffix prefill.
+
+Two earlier runs are excluded. `/private/tmp/pb-cache-eval-69f4d738-20260726` could not see a Metal
+device inside the command sandbox, while the same release smoke succeeded on the host. The first
+native run at `/private/tmp/pb-cache-eval-69f4d738-native2-20260726` exposed an evaluator defect:
+strict stage capability derivation replaced the initial direct allowlist. Revision `d3e389c3`
+replaced that ineffective probe with a non-serializable, harness-only, subtractive exclusion applied
+after capability derivation and protected the typed terminal action. Neither excluded run
+contributes to the passing claim.
+
+This closes the durable lifecycle-evidence gap. It does not supersede the locked three-language
+performance result below and does not change the production-ready designation.
+
 ## Sessionless constrained root
 
 The final uncovered hole was the constrained Task-partitioning request. Its stable 30-token

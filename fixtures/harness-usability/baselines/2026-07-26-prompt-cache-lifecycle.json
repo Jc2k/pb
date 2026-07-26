@@ -1,0 +1,150 @@
+{
+  "version": 1,
+  "status": "cache_lifecycle_qualified_performance_promotion_open",
+  "date": "2026-07-26",
+  "pb_revision": "d3e389c3615f9387d74a6596c256444b87ed7dee",
+  "release_binary_sha256": "e5dd3e92c553ce0bcb61be12aa4432a057354164067c4642b39aa09c664d23cf",
+  "machine_class": "darwin-aarch64",
+  "model": "hf://mlx-community/Qwen3-Coder-Next-4bit",
+  "backend": "flashmoe",
+  "cache_format_version": "flashmoe-session-v1",
+  "model_namespace_sha256": "e1009aa58edefe2b15f3ad08e5e426f7a88bc47337b2f60ee75361ed7d4f97f3",
+  "sampling": {
+    "max_steps": 7,
+    "max_tokens": 1792,
+    "ctx_size": 131072,
+    "gpu_layers": 999,
+    "temperature": 0,
+    "top_k": 1,
+    "seed": 0
+  },
+  "scenario": {
+    "case_id": "rust_registry_removal",
+    "scratch_root": "/private/tmp/pb-cache-eval-d3e389c3-native-20260726",
+    "changed_authority_tool": "read_file",
+    "contract_sha256": "cf2d3a125eddc53c5be34c12a0c25b31f90e11b1373bcfcea963529e6e99f4c9",
+    "workspace_fingerprint": "fab3e5fe1f2ce2f9787aac23412b912f32aa7c7b9d7ca3b3bc939ba17f689dbd",
+    "source_worktree_clean": true,
+    "released_parent_runtimes_before_restart": 1,
+    "passed": true
+  },
+  "arms": [
+    {
+      "id": "cold_empty_storage",
+      "process": "parent",
+      "outcome": "verified_clean_completion",
+      "invocations": 4,
+      "source": "none",
+      "miss_reason": "cold_session",
+      "root_tokens": 3703,
+      "reused_tokens": 0,
+      "rendered_token_sha256": "9d53b2dca1072fa5ea0d533d81a44fb7f2229254529d84bed9cf819b873b15f8",
+      "tool_schema_sha256": "fb8f58710ee79b94f7b0a187045d389663dca5907873267934c4367de86c5728"
+    },
+    {
+      "id": "warm_same_session_same_process",
+      "process": "parent",
+      "outcome": "verified_clean_completion",
+      "invocations": 4,
+      "source": "memory_prefix",
+      "root_tokens": 3703,
+      "reused_tokens": 3703,
+      "rendered_token_sha256": "9d53b2dca1072fa5ea0d533d81a44fb7f2229254529d84bed9cf819b873b15f8",
+      "tool_schema_sha256": "fb8f58710ee79b94f7b0a187045d389663dca5907873267934c4367de86c5728"
+    },
+    {
+      "id": "warm_new_session_same_process",
+      "process": "parent",
+      "outcome": "verified_clean_completion",
+      "invocations": 4,
+      "source": "memory_prefix",
+      "root_tokens": 3703,
+      "reused_tokens": 3703,
+      "rendered_token_sha256": "9d53b2dca1072fa5ea0d533d81a44fb7f2229254529d84bed9cf819b873b15f8",
+      "tool_schema_sha256": "fb8f58710ee79b94f7b0a187045d389663dca5907873267934c4367de86c5728"
+    },
+    {
+      "id": "changed_authority_same_process",
+      "process": "parent",
+      "outcome": "verified_clean_completion",
+      "invocations": 4,
+      "source": "none",
+      "miss_reason": "cold_session",
+      "root_tokens": 3516,
+      "reused_tokens": 0,
+      "rendered_token_sha256": "cee8895f531a3f6750bdfb385961f8b566b1218b7e9674c627bcf88b18b58440",
+      "tool_schema_sha256": "80f6d85470d59818c1baa34bedb819d06cba5a0db95d488890eb5aed7e390722"
+    },
+    {
+      "id": "matching_authority_same_process",
+      "process": "parent",
+      "outcome": "verified_clean_completion",
+      "invocations": 4,
+      "source": "memory_prefix",
+      "root_tokens": 3703,
+      "reused_tokens": 3703,
+      "rendered_token_sha256": "9d53b2dca1072fa5ea0d533d81a44fb7f2229254529d84bed9cf819b873b15f8",
+      "tool_schema_sha256": "fb8f58710ee79b94f7b0a187045d389663dca5907873267934c4367de86c5728"
+    },
+    {
+      "id": "persisted_root_new_process",
+      "process": "child",
+      "outcome": "verified_clean_completion",
+      "invocations": 4,
+      "source": "disk_prefix",
+      "root_tokens": 3703,
+      "reused_tokens": 3703,
+      "rendered_token_sha256": "9d53b2dca1072fa5ea0d533d81a44fb7f2229254529d84bed9cf819b873b15f8",
+      "tool_schema_sha256": "fb8f58710ee79b94f7b0a187045d389663dca5907873267934c4367de86c5728"
+    }
+  ],
+  "gates": {
+    "all_planning_roots_observed": true,
+    "cold_root_did_not_reuse": true,
+    "same_session_reused_exact_root": true,
+    "new_session_reused_exact_root": true,
+    "changed_authority_rejected_old_root": true,
+    "matching_authority_remained_reusable": true,
+    "restart_restored_persisted_exact_root": true
+  },
+  "independent_audit": {
+    "version": "usability-aggregate-v1",
+    "runs": 6,
+    "official_passed": 6,
+    "pb_verified_completed": 6,
+    "verified_clean_completion": 6,
+    "false_verified_completion": 0,
+    "total_wall_runtime_ms": 1491563,
+    "total_llm_invocations": 24,
+    "total_rendered_prompt_tokens": 109334,
+    "total_cached_prefix_tokens": 35549,
+    "total_fresh_prefill_tokens": 73785,
+    "total_eligible_root_tokens": 50607,
+    "total_reused_root_tokens": 35549,
+    "total_prompt_root_hit_invocations": 17,
+    "total_prompt_cache_reconciliation_failures": 0,
+    "total_cache_persistence_queued_checkpoints": 13,
+    "total_cache_persistence_completed_checkpoints": 13,
+    "total_cache_persistence_failures": 0,
+    "total_energy_kwh": 0.01581483515675444,
+    "energy_complete": true,
+    "classifications": {
+      "positive_evidence": 6,
+      "model_or_control_limit": 0,
+      "pb_defect": 0,
+      "experiment_error": 0
+    }
+  },
+  "excluded_runs": [
+    {
+      "scratch_root": "/private/tmp/pb-cache-eval-69f4d738-20260726",
+      "classification": "experiment_error",
+      "reason": "sandboxed process could not acquire the host Metal device"
+    },
+    {
+      "scratch_root": "/private/tmp/pb-cache-eval-69f4d738-native2-20260726",
+      "classification": "evaluator_defect",
+      "reason": "the initial authority probe was overwritten by strict stage capability derivation; revision d3e389c3 fixed the harness-only subtractive probe"
+    }
+  ]
+}
