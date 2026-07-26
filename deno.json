@@ -5,7 +5,7 @@
     "test:web": "deno test --allow-read --allow-env --unstable-sloppy-imports webui/src",
     "test:task-decomposition": "deno test --allow-read scripts/check-task-decomposition-corpus.test.ts scripts/check-default-task-partition-corpus.test.ts && deno run --allow-read scripts/check-task-decomposition-corpus.ts",
     "cache:usability-react": "deno run --allow-read --allow-write --allow-run scripts/cache-harness-usability-react.ts",
-    "test:usability": "deno test --allow-read --allow-write --allow-run scripts/harness-usability.test.ts && deno run --allow-read --allow-write --allow-run scripts/check-harness-usability-corpus.ts",
+    "test:usability": "deno test --allow-read --allow-write --allow-run scripts/harness-usability.test.ts scripts/run-harness-cache-scenario.test.ts && deno run --allow-read --allow-write --allow-run scripts/check-harness-usability-corpus.ts",
     "build:docs": "mdbook build",
     "test:docs": "mdbook build && deno run --allow-read scripts/check-docs.ts site"
   },

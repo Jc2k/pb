@@ -32,6 +32,12 @@ outside the active stage are rejected even if the model asks for them by name.
 Read-only stages do not receive mutation or shell tools. Implementation and repair receive edits
 and commands but not commit authority. Checking and committing are deterministic harness stages.
 
+The hidden prompt-cache qualification harness can remove a named tool from its ordinary direct-run
+allowlist to prove that rendered authority invalidates an old cache root. It validates the name
+against that fixed allowlist and only subtracts it; stage capabilities still apply afterward, so
+the experiment cannot expose a tool or operation that the stage did not already permit. Generated
+artifact success is recorded separately and never substitutes for the exact-root cache gates.
+
 ### Structured, fingerprinted transitions
 
 A model advances a model-driven stage only with the expected structured submission. Accepted plans,

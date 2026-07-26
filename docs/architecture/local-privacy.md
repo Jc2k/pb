@@ -48,6 +48,16 @@ shared root.
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are
 typed user configuration rather than process environment variables.
 
+The hidden managed-cache qualification harness can point FlashMoe at an explicit experiment-only
+cache root. It accepts only an absolute empty or absent directory, keeps every inference and
+checkpoint local, and refuses to overwrite its JSON report. The report retains the explicitly
+selected scratch, cache, model, and output locations plus bounded cache sources, miss reasons,
+stage/authority labels, token counts, and digests; it does not copy repository-relative paths,
+prompt text, task text, tool arguments, or source content. Its restart arm is a new local pb process;
+it adds no hosted inference, telemetry, synchronization, or network edge. The cache itself still
+contains token ids and derived model state and therefore remains sensitive local data under the
+ordinary cache ownership and cleanup model.
+
 The DeepSeek V4 Flash extension keeps its model, resident tensors, streamed expert packs, tokenizer,
 Metal state, and prompts on the same local path. Its typed hyperconnection/compressed-attention state
 is not currently written to the FlashMoe session cache or reused across requests; the state is reset

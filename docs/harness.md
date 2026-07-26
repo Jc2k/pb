@@ -562,6 +562,48 @@ graph, or resource limit. The auditor aggregates command and reason counts.
 The usability summary and aggregate preserve each total, so a cache-policy change cannot claim a
 prefill improvement by moving work into restore, checkpoint capture, or persistence.
 
+### Managed prompt-cache lifecycle qualification
+
+`scripts/run-harness-cache-scenario.ts` prepares six clean copies of one bounded usability case and
+invokes the hidden `pb harness cache-eval` surface. The arms run in a fixed order: cold empty
+storage, warm same logical session in the same process, new session in the same process, changed
+planning-tool authority, matching original authority after that incompatible probe, and a fresh pb
+process using the persisted root. For example:
+
+```bash
+deno run --allow-read --allow-write --allow-run \
+  scripts/run-harness-cache-scenario.ts \
+  --scratch-parent /private/tmp/pb-cache-eval \
+  --binary target/aarch64-apple-darwin/release/pb \
+  --case rust_registry_removal
+```
+
+Use `--prepare-only` to print the exact binary argument vector without starting inference. The
+evaluator requires six distinct, previously unused absolute scratch roots and matching contracts,
+an absolute empty or absent cache root, and a new absolute report path. It refuses to replace an
+existing report or use a non-empty cache root. The first five arms share one loaded FlashMoe
+runtime; pb then drops its unleased pooled runtime and starts the final arm as a child process, so
+restart evidence cannot come from live Metal state.
+
+The preparer retains `cache-eval-scenario.json` with the source revision and dirty-state flag,
+binary path and SHA-256, operating-system/architecture class, exact argument vector, sampler limits,
+arm paths, timestamps, and final exit code. The evaluator report independently fingerprints the
+executable and records the resolved model, model directory, sampler settings, cache root, model
+namespace, backend/cache format, and per-arm evidence.
+
+The JSON report fails closed unless the planning root is cold initially, completely reused by the
+same and new sessions, changed by the narrower tool schema with zero old-root reuse, reusable again
+when the original schema returns, and completely restored from `disk_prefix` by the child. All
+comparisons use the backend's exact rendered-token digest and token counts. Each arm also records
+whether the agent satisfied its task contract, but generated-artifact quality is deliberately not
+a cache gate: an incomplete local-model edit must not hide a cache defect, and a cache hit must not
+turn an incomplete artifact into a pass.
+
+`--cache-dir`, `--session-id`, and `--exclude-tool` on `pb harness agent` are hidden evaluator
+plumbing. They are explicit CLI arguments rather than production configuration or environment
+switches. Exclusions can name only the existing harness tool set and can narrow, never broaden, the
+active stage capability.
+
 ## Control evaluation
 
 Run the deterministic, model-free control suite with:

@@ -2245,7 +2245,16 @@ pub fn run_agent<S: EventSink>(
     models_root: &Path,
     sink: S,
 ) -> Result<AgentRunResult> {
-    run_agent_inner(args, models_root, sink, false)
+    run_agent_inner(args, models_root, sink, false, None)
+}
+
+pub(crate) fn run_agent_with_flashmoe_settings<S: EventSink>(
+    args: AgentRequest,
+    models_root: &Path,
+    sink: S,
+    settings: crate::config::ResolvedFlashMoeConfig,
+) -> Result<AgentRunResult> {
+    run_agent_inner(args, models_root, sink, false, Some(settings))
 }
 
 pub(crate) fn run_agent_managed<S: EventSink>(
@@ -2253,7 +2262,7 @@ pub(crate) fn run_agent_managed<S: EventSink>(
     models_root: &Path,
     sink: S,
 ) -> Result<AgentRunResult> {
-    run_agent_inner(args, models_root, sink, true)
+    run_agent_inner(args, models_root, sink, true, None)
 }
 
 fn task_planner_model_sha256(
@@ -2518,6 +2527,7 @@ fn run_agent_inner<S: EventSink>(
     models_root: &Path,
     mut sink: S,
     retain_environment_after_turn: bool,
+    flashmoe_settings: Option<crate::config::ResolvedFlashMoeConfig>,
 ) -> Result<AgentRunResult> {
     let turn_energy_scope = energy::scope();
     let turn_started_at_ms = now_millis();
@@ -2686,7 +2696,11 @@ fn run_agent_inner<S: EventSink>(
 
     let mut flashmoe_runtime = None;
     if let Some(plan) = flashmoe_plan.as_ref() {
-        match crate::inference::flashmoe::load_shared(plan) {
+        let loaded = match flashmoe_settings.as_ref() {
+            Some(settings) => crate::inference::flashmoe::load_shared_with_settings(plan, settings),
+            None => crate::inference::flashmoe::load_shared(plan),
+        };
+        match loaded {
             Ok(runtime) => {
                 tracing::info!(
                     model = %plan.model,

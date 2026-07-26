@@ -468,6 +468,9 @@ pub enum HarnessCommand {
     CacheClean(FlashMoeCacheCleanArgs),
     /// Run one complete agent task directly in a persistent scratch workspace
     Agent(HarnessAgentArgs),
+    /// Run the managed-workflow prompt-cache qualification matrix
+    #[command(name = "cache-eval", hide = true)]
+    CacheEval(HarnessCacheEvalArgs),
     /// Run deterministic or explicitly selected local-model harness control evaluations
     Eval(HarnessEvalArgs),
     /// Run the immutable four-arm controller-observation continuation experiment
@@ -593,6 +596,18 @@ pub struct HarnessAgentArgs {
     #[arg(long)]
     pub scratch_dir: Option<PathBuf>,
 
+    /// Explicit local inference-cache storage root for an isolated harness experiment
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Stable logical session identity for prompt-cache experiments
+    #[arg(long, hide = true)]
+    pub session_id: Option<String>,
+
+    /// Remove a normally available harness tool from the rendered authority
+    #[arg(long = "exclude-tool", hide = true)]
+    pub exclude_tools: Vec<String>,
+
     /// Trusted JSON acceptance contract to validate before model loading
     #[arg(long, value_name = "PATH")]
     pub contract: Option<PathBuf>,
@@ -654,6 +669,80 @@ pub struct HarnessAgentArgs {
     pub images: Vec<PathBuf>,
 
     /// Top-k for sampling
+    #[arg(long)]
+    pub top_k: Option<i32>,
+
+    /// RNG seed
+    #[arg(long)]
+    pub seed: Option<u32>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HarnessCacheEvalArgs {
+    /// Task to run in every isolated workspace arm
+    pub task: String,
+
+    /// Six fresh prepared scratch roots, in documented scenario order
+    #[arg(long = "scratch-dir", value_name = "PATH")]
+    pub scratch_dirs: Vec<PathBuf>,
+
+    /// Acceptance contract corresponding to each prepared scratch root
+    #[arg(long = "contract", value_name = "PATH")]
+    pub contracts: Vec<PathBuf>,
+
+    /// Empty local storage root dedicated to this prompt-cache experiment
+    #[arg(long, value_name = "PATH")]
+    pub cache_dir: PathBuf,
+
+    /// Durable JSON report written after all scenario arms finish
+    #[arg(long, value_name = "PATH")]
+    pub output: PathBuf,
+
+    /// Tool removed only in the changed-authority arm
+    #[arg(long, default_value = "read_file")]
+    pub changed_authority_tool: String,
+
+    /// Model identifier; defaults to the configured model
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Directory containing pulled model blobs; defaults to the configured model directory
+    #[arg(long)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Maximum number of think/tool iterations per arm
+    #[arg(long)]
+    pub max_steps: Option<usize>,
+
+    /// Maximum new tokens per model turn
+    #[arg(long)]
+    pub max_tokens: Option<i32>,
+
+    /// Context size
+    #[arg(long)]
+    pub ctx_size: Option<u32>,
+
+    /// Number of CPU threads for decoding
+    #[arg(long)]
+    pub threads: Option<i32>,
+
+    /// Number of CPU threads for prompt processing
+    #[arg(long)]
+    pub threads_batch: Option<i32>,
+
+    /// Number of transformer layers to offload to GPU
+    #[arg(long)]
+    pub gpu_layers: Option<u32>,
+
+    /// Sampling temperature
+    #[arg(long)]
+    pub temperature: Option<f32>,
+
+    /// Agent profile; defaults to build
+    #[arg(long, value_enum, default_value_t = AgentProfile::Build)]
+    pub profile: AgentProfile,
+
+    /// Top-k sampling
     #[arg(long)]
     pub top_k: Option<i32>,
 
@@ -2363,6 +2452,7 @@ fn run_harness_command(command: HarnessCommand) -> Result<()> {
         HarnessCommand::Bench(args) => run_flashmoe_bench(args),
         HarnessCommand::CacheClean(args) => run_flashmoe_cache_clean(args),
         HarnessCommand::Agent(args) => harness::run_agent_task(args),
+        HarnessCommand::CacheEval(args) => harness::run_cache_eval(args),
         HarnessCommand::Eval(args) => harness_eval::run_eval_command(args),
         HarnessCommand::ActionElisionEval(args) => {
             harness_eval::run_action_elision_eval_command(args)
@@ -4956,6 +5046,58 @@ mod tests {
         assert_eq!(args.workspace_config, Some(PathBuf::from("workspace.toml")));
         assert_eq!(args.workflow_config, Some(PathBuf::from("workflow.toml")));
         assert_eq!(args.intent, crate::workflow::TurnIntent::Discuss);
+        assert_eq!(args.profile, AgentProfile::Build);
+        assert_eq!(args.cache_dir, None);
+        assert_eq!(args.session_id, None);
+        assert!(args.exclude_tools.is_empty());
+    }
+
+    #[test]
+    fn harness_cache_eval_parses_six_ordered_arms() {
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "cache-eval",
+            "Build the bounded fixture",
+            "--scratch-dir",
+            "/tmp/arm-1",
+            "--scratch-dir",
+            "/tmp/arm-2",
+            "--scratch-dir",
+            "/tmp/arm-3",
+            "--scratch-dir",
+            "/tmp/arm-4",
+            "--scratch-dir",
+            "/tmp/arm-5",
+            "--scratch-dir",
+            "/tmp/arm-6",
+            "--contract",
+            "/tmp/contract-1.json",
+            "--contract",
+            "/tmp/contract-2.json",
+            "--contract",
+            "/tmp/contract-3.json",
+            "--contract",
+            "/tmp/contract-4.json",
+            "--contract",
+            "/tmp/contract-5.json",
+            "--contract",
+            "/tmp/contract-6.json",
+            "--cache-dir",
+            "/tmp/cache-eval-cache",
+            "--output",
+            "/tmp/cache-eval-report.json",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::CacheEval(args),
+        } = parsed.command
+        else {
+            panic!("expected harness cache-eval command");
+        };
+        assert_eq!(args.scratch_dirs.len(), 6);
+        assert_eq!(args.contracts.len(), 6);
+        assert_eq!(args.changed_authority_tool, "read_file");
         assert_eq!(args.profile, AgentProfile::Build);
     }
 

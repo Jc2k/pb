@@ -1,6 +1,6 @@
 //! Direct, daemon-free harnesses for exercising pb internals.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -11,13 +11,16 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::HarnessAgentArgs;
-use crate::agent_core::{AgentRequest, AgentRunResult, EventSink, SessionAttachment, run_agent};
+use crate::agent_core::{
+    AgentRequest, AgentRunResult, EventSink, SessionAttachment, run_agent,
+    run_agent_with_flashmoe_settings,
+};
 use crate::cli_ui::render_event;
 use crate::config::UserConfig;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
 use crate::events::{AgentEvent, EventEnvelope};
 use crate::session_store::now_millis;
+use crate::{HarnessAgentArgs, HarnessCacheEvalArgs};
 
 const HARNESS_GIT_NAME: &str = "pb harness";
 const HARNESS_GIT_EMAIL: &str = "harness@pb.local";
@@ -761,6 +764,29 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         .clone()
         .or_else(|| user_config.effective_model_dir());
     let models_root = model_dir.clone().unwrap_or_else(crate::default_models_dir);
+    let model = args
+        .model
+        .clone()
+        .unwrap_or_else(|| user_config.effective_model());
+    let flashmoe_settings = args
+        .cache_dir
+        .as_ref()
+        .map(|cache_dir| {
+            if !cache_dir.is_absolute() {
+                bail!(
+                    "harness inference-cache root must be absolute: {}",
+                    cache_dir.display()
+                );
+            }
+            if crate::inference::flashmoe::plan(&model, &models_root).is_none() {
+                bail!("--cache-dir is supported only by the FlashMoe harness backend");
+            }
+            let mut settings = user_config.effective_flashmoe();
+            settings.session_cache.enabled = true;
+            settings.session_cache.root = Some(cache_dir.clone());
+            Ok(settings)
+        })
+        .transpose()?;
     let turn_max_tokens_cap = args.max_tokens;
     let repository_context = harness_repository_context(&layout)?;
     let prior_check_evidence = load_check_evidence(&layout.events)?;
@@ -803,10 +829,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         workflow_checkpoint: resumed_workflow,
         conversation_handoff: None,
         legacy_prompt_owned_delivery: false,
-        model: args
-            .model
-            .clone()
-            .unwrap_or_else(|| user_config.effective_model()),
+        model,
         model_dir,
         workdir: Some(layout.workspace.clone()),
         branch: resumed_branch,
@@ -817,12 +840,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
             .max_tokens
             .unwrap_or_else(|| user_config.effective_max_tokens()),
         turn_max_tokens_cap,
-        tool_allowlist: Some(
-            HARNESS_AGENT_TOOLS
-                .iter()
-                .map(|tool| (*tool).to_string())
-                .collect(),
-        ),
+        tool_allowlist: Some(harness_tool_allowlist(&args.exclude_tools)?),
         observation_rendering: crate::workflow::ObservationRendering::ControllerBlock,
         accept_existing_workspace_changes: layout.resumed,
         ctx_size: args
@@ -849,7 +867,10 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         workspace_graph: Some(workspace_graph),
         repository_context: Some(repository_context),
         prior_check_evidence,
-        session_id: format!("harness-{}", layout.run_id),
+        session_id: args
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("harness-{}", layout.run_id)),
         attachments: harness_attachments(&args.images)?,
         goal_context: goal_context.clone(),
         contract,
@@ -879,7 +900,12 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     if let Some(goal) = goal_context.as_ref() {
         sink.configure_goal_context(goal)?;
     }
-    let run_result = run_agent(request, &models_root, sink.clone());
+    let run_result = match flashmoe_settings {
+        Some(settings) => {
+            run_agent_with_flashmoe_settings(request, &models_root, sink.clone(), settings)
+        }
+        None => run_agent(request, &models_root, sink.clone()),
+    };
     if let Ok(result) = &run_result
         && let Some(transcript) = &result.task_planning_transcript
     {
@@ -957,6 +983,680 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
             )
         }),
     }
+}
+
+const CACHE_EVAL_ARM_IDS: [&str; 6] = [
+    "cold_empty_storage",
+    "warm_same_session_same_process",
+    "warm_new_session_same_process",
+    "changed_authority_same_process",
+    "matching_authority_same_process",
+    "persisted_root_new_process",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CacheEvalRootReport {
+    backend: String,
+    cache_format_version: String,
+    model_namespace_sha256: String,
+    source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    miss_reason: Option<crate::inference::PromptCacheMissReason>,
+    rendered_token_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_schema_sha256: Option<String>,
+    tokens: usize,
+    reused_tokens: usize,
+    workflow_stage: Option<crate::workflow::WorkflowStage>,
+    authority_class: crate::inference::StageRootAuthorityClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_constraint_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CacheEvalArmReport {
+    id: String,
+    process: String,
+    session_id: String,
+    scratch_dir: String,
+    agent_outcome_succeeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_error: Option<String>,
+    invocations: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    planning_root: Option<CacheEvalRootReport>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct CacheEvalGates {
+    all_planning_roots_observed: bool,
+    cold_root_did_not_reuse: bool,
+    same_session_reused_exact_root: bool,
+    new_session_reused_exact_root: bool,
+    changed_authority_rejected_old_root: bool,
+    matching_authority_remained_reusable: bool,
+    restart_restored_persisted_exact_root: bool,
+}
+
+impl CacheEvalGates {
+    fn passed(&self) -> bool {
+        self.all_planning_roots_observed
+            && self.cold_root_did_not_reuse
+            && self.same_session_reused_exact_root
+            && self.new_session_reused_exact_root
+            && self.changed_authority_rejected_old_root
+            && self.matching_authority_remained_reusable
+            && self.restart_restored_persisted_exact_root
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct CacheEvalReport {
+    version: u32,
+    started_at_ms: u64,
+    finished_at_ms: u64,
+    binary_sha256: String,
+    model: String,
+    model_dir: String,
+    profile: crate::agent_core::AgentProfile,
+    changed_authority_tool: String,
+    contract_sha256: String,
+    workspace_fingerprint: String,
+    sampling: CacheEvalSamplingReport,
+    cache_dir: String,
+    report_path: String,
+    released_parent_runtimes_before_restart: usize,
+    arms: Vec<CacheEvalArmReport>,
+    gates: CacheEvalGates,
+    passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct CacheEvalSamplingReport {
+    max_steps: usize,
+    max_tokens: i32,
+    ctx_size: u32,
+    threads: Option<i32>,
+    threads_batch: Option<i32>,
+    gpu_layers: u32,
+    temperature: f32,
+    top_k: i32,
+    seed: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheEvalInputIdentity {
+    contract_sha256: String,
+    workspace_fingerprint: String,
+}
+
+/// Run a durable cache-lifecycle qualification using five arms in this process and one arm in a
+/// fresh child process. Agent artifact quality is recorded, but only exact prompt-root evidence
+/// determines the cache result.
+pub fn run_cache_eval(mut args: HarnessCacheEvalArgs) -> Result<()> {
+    let started_at_ms = now_millis();
+    resolve_cache_eval_args(&mut args)?;
+    let input_identity = validate_cache_eval_args(&args)?;
+
+    let baseline_excludes = vec!["sub_agent".to_string()];
+    let changed_excludes = vec!["sub_agent".to_string(), args.changed_authority_tool.clone()];
+    harness_tool_allowlist(&baseline_excludes)?;
+    harness_tool_allowlist(&changed_excludes)?;
+
+    let shared_session = "pb-cache-eval-shared";
+    let sessions = [
+        shared_session,
+        shared_session,
+        "pb-cache-eval-new-session",
+        "pb-cache-eval-changed-authority",
+        "pb-cache-eval-matching-authority",
+        "pb-cache-eval-restart",
+    ];
+    let mut arms = Vec::with_capacity(CACHE_EVAL_ARM_IDS.len());
+    for index in 0..5 {
+        let excludes = if index == 3 {
+            &changed_excludes
+        } else {
+            &baseline_excludes
+        };
+        let result = run_agent_task(cache_eval_agent_args(
+            &args,
+            index,
+            sessions[index],
+            excludes.clone(),
+        ));
+        arms.push(cache_eval_arm_report(
+            CACHE_EVAL_ARM_IDS[index],
+            "parent",
+            sessions[index],
+            &args.scratch_dirs[index],
+            result,
+        )?);
+    }
+
+    let released_parent_runtimes_before_restart =
+        crate::inference::flashmoe::release_unleased_shared_runtimes()?;
+    let restart_status = run_cache_eval_restart_child(&args, sessions[5], &baseline_excludes);
+    arms.push(cache_eval_arm_report(
+        CACHE_EVAL_ARM_IDS[5],
+        "child",
+        sessions[5],
+        &args.scratch_dirs[5],
+        restart_status,
+    )?);
+
+    let gates = evaluate_cache_eval_gates(&arms);
+    let passed = gates.passed();
+    let executable = std::env::current_exe().context("failed to resolve current pb executable")?;
+    let binary_sha256 = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(&executable).with_context(|| format!(
+            "failed to fingerprint current pb executable {}",
+            executable.display()
+        ))?)
+    );
+    let model = args
+        .model
+        .clone()
+        .context("cache-eval model was not resolved")?;
+    let model_dir = args
+        .model_dir
+        .as_deref()
+        .context("cache-eval model directory was not resolved")?
+        .display()
+        .to_string();
+    let sampling = CacheEvalSamplingReport {
+        max_steps: args
+            .max_steps
+            .context("cache-eval max steps were not resolved")?,
+        max_tokens: args
+            .max_tokens
+            .context("cache-eval max tokens were not resolved")?,
+        ctx_size: args
+            .ctx_size
+            .context("cache-eval context size was not resolved")?,
+        threads: args.threads,
+        threads_batch: args.threads_batch,
+        gpu_layers: args
+            .gpu_layers
+            .context("cache-eval GPU layers were not resolved")?,
+        temperature: args
+            .temperature
+            .context("cache-eval temperature was not resolved")?,
+        top_k: args.top_k.context("cache-eval top-k was not resolved")?,
+        seed: args.seed.context("cache-eval seed was not resolved")?,
+    };
+    let report = CacheEvalReport {
+        version: 1,
+        started_at_ms,
+        finished_at_ms: now_millis(),
+        binary_sha256,
+        model,
+        model_dir,
+        profile: args.profile,
+        changed_authority_tool: args.changed_authority_tool.clone(),
+        contract_sha256: input_identity.contract_sha256,
+        workspace_fingerprint: input_identity.workspace_fingerprint,
+        sampling,
+        cache_dir: args.cache_dir.display().to_string(),
+        report_path: args.output.display().to_string(),
+        released_parent_runtimes_before_restart,
+        arms,
+        gates,
+        passed,
+    };
+    atomic_write(&args.output, &serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "pb harness cache eval: passed={} report={}",
+        report.passed,
+        args.output.display()
+    );
+    if !report.passed {
+        bail!(
+            "prompt-cache lifecycle qualification failed; inspect {}",
+            args.output.display()
+        );
+    }
+    Ok(())
+}
+
+fn resolve_cache_eval_args(args: &mut HarnessCacheEvalArgs) -> Result<()> {
+    let config = UserConfig::load()?;
+    args.model.get_or_insert_with(|| config.effective_model());
+    args.model_dir.get_or_insert_with(|| {
+        config
+            .effective_model_dir()
+            .unwrap_or_else(crate::default_models_dir)
+    });
+    args.max_steps
+        .get_or_insert_with(|| config.effective_max_steps());
+    args.max_tokens
+        .get_or_insert_with(|| config.effective_max_tokens());
+    args.ctx_size
+        .get_or_insert_with(|| config.effective_ctx_size());
+    if args.threads.is_none() {
+        args.threads = config.effective_threads();
+    }
+    if args.threads_batch.is_none() {
+        args.threads_batch = config.effective_threads_batch();
+    }
+    args.gpu_layers
+        .get_or_insert_with(|| config.effective_gpu_layers());
+    args.temperature
+        .get_or_insert_with(|| config.effective_temperature());
+    args.top_k.get_or_insert_with(|| config.effective_top_k());
+    args.seed.get_or_insert_with(|| config.effective_seed());
+    Ok(())
+}
+
+fn validate_cache_eval_args(args: &HarnessCacheEvalArgs) -> Result<CacheEvalInputIdentity> {
+    if args.task.trim().is_empty() {
+        bail!("harness cache-eval task must not be empty");
+    }
+    if args.scratch_dirs.len() != CACHE_EVAL_ARM_IDS.len() {
+        bail!(
+            "harness cache-eval requires exactly {} --scratch-dir values in documented scenario order",
+            CACHE_EVAL_ARM_IDS.len()
+        );
+    }
+    if args.contracts.len() != CACHE_EVAL_ARM_IDS.len() {
+        bail!(
+            "harness cache-eval requires exactly {} --contract values in scratch order",
+            CACHE_EVAL_ARM_IDS.len()
+        );
+    }
+    if !args.cache_dir.is_absolute() {
+        bail!(
+            "harness cache-eval cache root must be absolute: {}",
+            args.cache_dir.display()
+        );
+    }
+    if !args.output.is_absolute() {
+        bail!(
+            "harness cache-eval output must be absolute: {}",
+            args.output.display()
+        );
+    }
+    if args.output.exists() {
+        bail!(
+            "harness cache-eval refuses to replace existing report {}",
+            args.output.display()
+        );
+    }
+    let output_parent = args
+        .output
+        .parent()
+        .context("harness cache-eval output has no parent")?;
+    if !output_parent.is_dir() {
+        bail!(
+            "harness cache-eval output parent does not exist: {}",
+            output_parent.display()
+        );
+    }
+    if args.cache_dir.exists() {
+        let metadata = std::fs::symlink_metadata(&args.cache_dir).with_context(|| {
+            format!(
+                "failed to inspect harness cache-eval root {}",
+                args.cache_dir.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "harness cache-eval cache root must be a real directory: {}",
+                args.cache_dir.display()
+            );
+        }
+        if std::fs::read_dir(&args.cache_dir)
+            .with_context(|| {
+                format!(
+                    "failed to inspect harness cache-eval root {}",
+                    args.cache_dir.display()
+                )
+            })?
+            .next()
+            .is_some()
+        {
+            bail!(
+                "harness cache-eval cache root must be empty: {}",
+                args.cache_dir.display()
+            );
+        }
+    }
+
+    let mut distinct = BTreeSet::new();
+    let mut contract_sha256 = None;
+    let mut workspace_fingerprint = None;
+    for (index, (scratch, contract)) in args
+        .scratch_dirs
+        .iter()
+        .zip(args.contracts.iter())
+        .enumerate()
+    {
+        if !scratch.is_absolute() || !scratch.is_dir() {
+            bail!(
+                "cache-eval arm {} scratch must be an existing absolute directory: {}",
+                CACHE_EVAL_ARM_IDS[index],
+                scratch.display()
+            );
+        }
+        let scratch = scratch.canonicalize().with_context(|| {
+            format!("failed to resolve cache-eval scratch {}", scratch.display())
+        })?;
+        if !distinct.insert(scratch.clone()) {
+            bail!(
+                "cache-eval scratch roots must be distinct; duplicate {}",
+                scratch.display()
+            );
+        }
+        if scratch.join("run-index.jsonl").exists() || scratch.join("events.jsonl").exists() {
+            bail!(
+                "cache-eval arm {} scratch has prior harness state: {}",
+                CACHE_EVAL_ARM_IDS[index],
+                scratch.display()
+            );
+        }
+        if !scratch.join("workspace/.git").is_dir() {
+            bail!(
+                "cache-eval arm {} scratch has no prepared git workspace: {}",
+                CACHE_EVAL_ARM_IDS[index],
+                scratch.display()
+            );
+        }
+        if !contract.is_absolute() || !contract.is_file() {
+            bail!(
+                "cache-eval arm {} contract must be an existing absolute file: {}",
+                CACHE_EVAL_ARM_IDS[index],
+                contract.display()
+            );
+        }
+        let contract = crate::harness_contract::HarnessContractDocument::from_path(contract)?
+            .normalize()
+            .with_context(|| {
+                format!(
+                    "invalid cache-eval contract for arm {}",
+                    CACHE_EVAL_ARM_IDS[index]
+                )
+            })?;
+        let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&contract)?));
+        if contract_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &digest)
+        {
+            bail!(
+                "cache-eval arm {} contract differs from the first arm",
+                CACHE_EVAL_ARM_IDS[index]
+            );
+        }
+        contract_sha256.get_or_insert(digest);
+
+        let fingerprint =
+            crate::workspace::ContentSnapshot::capture(&scratch.join("workspace"))?.fingerprint;
+        if workspace_fingerprint
+            .as_ref()
+            .is_some_and(|expected| expected != &fingerprint)
+        {
+            bail!(
+                "cache-eval arm {} workspace content differs from the first arm",
+                CACHE_EVAL_ARM_IDS[index]
+            );
+        }
+        workspace_fingerprint.get_or_insert(fingerprint);
+    }
+    if args.changed_authority_tool == "sub_agent" {
+        bail!("--changed-authority-tool must differ from the baseline sub_agent exclusion");
+    }
+    if !HARNESS_AGENT_TOOLS.contains(&args.changed_authority_tool.as_str()) {
+        bail!(
+            "unknown changed-authority harness tool '{}'",
+            args.changed_authority_tool
+        );
+    }
+    Ok(CacheEvalInputIdentity {
+        contract_sha256: contract_sha256.context("cache-eval contract identity is missing")?,
+        workspace_fingerprint: workspace_fingerprint
+            .context("cache-eval workspace identity is missing")?,
+    })
+}
+
+fn cache_eval_agent_args(
+    args: &HarnessCacheEvalArgs,
+    index: usize,
+    session_id: &str,
+    exclude_tools: Vec<String>,
+) -> HarnessAgentArgs {
+    HarnessAgentArgs {
+        task: args.task.clone(),
+        intent: crate::workflow::TurnIntent::Deliver,
+        scratch_dir: Some(args.scratch_dirs[index].clone()),
+        cache_dir: Some(args.cache_dir.clone()),
+        session_id: Some(session_id.to_string()),
+        exclude_tools,
+        contract: Some(args.contracts[index].clone()),
+        workspace_config: None,
+        workflow_config: None,
+        goal_context: None,
+        model: args.model.clone(),
+        model_dir: args.model_dir.clone(),
+        max_steps: args.max_steps,
+        max_tokens: args.max_tokens,
+        ctx_size: args.ctx_size,
+        threads: args.threads,
+        threads_batch: args.threads_batch,
+        gpu_layers: args.gpu_layers,
+        temperature: args.temperature,
+        profile: args.profile,
+        images: Vec::new(),
+        top_k: args.top_k,
+        seed: args.seed,
+    }
+}
+
+fn run_cache_eval_restart_child(
+    args: &HarnessCacheEvalArgs,
+    session_id: &str,
+    exclude_tools: &[String],
+) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to resolve current pb executable")?;
+    let mut command = Command::new(executable);
+    command
+        .arg("harness")
+        .arg("agent")
+        .arg("--scratch-dir")
+        .arg(&args.scratch_dirs[5])
+        .arg("--contract")
+        .arg(&args.contracts[5])
+        .arg("--cache-dir")
+        .arg(&args.cache_dir)
+        .arg("--session-id")
+        .arg(session_id)
+        .arg("--profile")
+        .arg(args.profile.to_string());
+    for tool in exclude_tools {
+        command.arg("--exclude-tool").arg(tool);
+    }
+    if let Some(value) = args.model.as_deref() {
+        command.arg("--model").arg(value);
+    }
+    if let Some(value) = args.model_dir.as_deref() {
+        command.arg("--model-dir").arg(value);
+    }
+    if let Some(value) = args.max_steps {
+        command.arg("--max-steps").arg(value.to_string());
+    }
+    if let Some(value) = args.max_tokens {
+        command.arg("--max-tokens").arg(value.to_string());
+    }
+    if let Some(value) = args.ctx_size {
+        command.arg("--ctx-size").arg(value.to_string());
+    }
+    if let Some(value) = args.threads {
+        command.arg("--threads").arg(value.to_string());
+    }
+    if let Some(value) = args.threads_batch {
+        command.arg("--threads-batch").arg(value.to_string());
+    }
+    if let Some(value) = args.gpu_layers {
+        command.arg("--gpu-layers").arg(value.to_string());
+    }
+    if let Some(value) = args.temperature {
+        command.arg("--temperature").arg(value.to_string());
+    }
+    if let Some(value) = args.top_k {
+        command.arg("--top-k").arg(value.to_string());
+    }
+    if let Some(value) = args.seed {
+        command.arg("--seed").arg(value.to_string());
+    }
+    command.arg(&args.task);
+    let status = command
+        .status()
+        .context("failed to start cache-eval restart child")?;
+    if !status.success() {
+        bail!("cache-eval restart child exited with {status}");
+    }
+    Ok(())
+}
+
+fn cache_eval_arm_report(
+    id: &str,
+    process: &str,
+    session_id: &str,
+    scratch_dir: &Path,
+    result: Result<()>,
+) -> Result<CacheEvalArmReport> {
+    let (agent_outcome_succeeded, agent_error) = match result {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(compact_detail(&format!("{error:#}")))),
+    };
+    let (invocations, planning_root) =
+        read_cache_eval_planning_root(&scratch_dir.join("events.jsonl"))?;
+    Ok(CacheEvalArmReport {
+        id: id.to_string(),
+        process: process.to_string(),
+        session_id: session_id.to_string(),
+        scratch_dir: scratch_dir.display().to_string(),
+        agent_outcome_succeeded,
+        agent_error,
+        invocations,
+        planning_root,
+    })
+}
+
+fn read_cache_eval_planning_root(path: &Path) -> Result<(usize, Option<CacheEvalRootReport>)> {
+    if !path.exists() {
+        return Ok((0, None));
+    }
+    let file = File::open(path)
+        .with_context(|| format!("failed to open cache-eval events {}", path.display()))?;
+    let mut invocations = 0usize;
+    let mut planning_root = None;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| {
+            format!(
+                "failed to read cache-eval events {} line {}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let envelope: EventEnvelope = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "failed to parse cache-eval events {} line {}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        if let AgentEvent::LlmInvocation { prompt_cache, .. } = envelope.event {
+            invocations += 1;
+            if planning_root.is_none()
+                && let Some(cache) = prompt_cache
+                && let Some(root) = cache.root
+                && root.workflow_stage == Some(crate::workflow::WorkflowStage::Planning)
+            {
+                planning_root = Some(CacheEvalRootReport {
+                    backend: root.backend,
+                    cache_format_version: root.cache_format_version,
+                    model_namespace_sha256: root.model_namespace_sha256,
+                    source: cache.source,
+                    miss_reason: cache.miss_reason,
+                    rendered_token_sha256: root.rendered_token_sha256,
+                    tool_schema_sha256: root.tool_schema_sha256,
+                    tokens: root.tokens,
+                    reused_tokens: root.reused_tokens,
+                    workflow_stage: root.workflow_stage,
+                    authority_class: root.authority_class,
+                    output_constraint_mode: root.output_constraint_mode,
+                });
+            }
+        }
+    }
+    Ok((invocations, planning_root))
+}
+
+fn evaluate_cache_eval_gates(arms: &[CacheEvalArmReport]) -> CacheEvalGates {
+    let roots = arms
+        .iter()
+        .map(|arm| arm.planning_root.as_ref())
+        .collect::<Vec<_>>();
+    let Some(cold) = roots.first().copied().flatten() else {
+        return CacheEvalGates::default();
+    };
+    let exact_full_reuse = |root: Option<&CacheEvalRootReport>| {
+        root.is_some_and(|root| {
+            root.rendered_token_sha256 == cold.rendered_token_sha256
+                && root.tokens == cold.tokens
+                && root.reused_tokens == root.tokens
+        })
+    };
+    let same_session = roots.get(1).copied().flatten();
+    let new_session = roots.get(2).copied().flatten();
+    let changed = roots.get(3).copied().flatten();
+    let matching = roots.get(4).copied().flatten();
+    let restart = roots.get(5).copied().flatten();
+    CacheEvalGates {
+        all_planning_roots_observed: roots.len() == CACHE_EVAL_ARM_IDS.len()
+            && roots.iter().all(Option::is_some),
+        cold_root_did_not_reuse: cold.source == "none"
+            && cold.reused_tokens == 0
+            && cold.miss_reason.is_some(),
+        same_session_reused_exact_root: exact_full_reuse(same_session)
+            && same_session.is_some_and(|root| {
+                matches!(root.source.as_str(), "memory_session" | "memory_prefix")
+            }),
+        new_session_reused_exact_root: exact_full_reuse(new_session)
+            && new_session.is_some_and(|root| root.source != "none"),
+        changed_authority_rejected_old_root: changed.is_some_and(|root| {
+            root.rendered_token_sha256 != cold.rendered_token_sha256
+                && root.tool_schema_sha256 != cold.tool_schema_sha256
+                && root.reused_tokens == 0
+                && root.source == "none"
+        }),
+        matching_authority_remained_reusable: exact_full_reuse(matching)
+            && matching.is_some_and(|root| root.source != "none"),
+        restart_restored_persisted_exact_root: exact_full_reuse(restart)
+            && restart.is_some_and(|root| root.source == "disk_prefix"),
+    }
+}
+
+fn harness_tool_allowlist(exclude_tools: &[String]) -> Result<Vec<String>> {
+    let mut excluded = BTreeSet::new();
+    for tool in exclude_tools {
+        if !HARNESS_AGENT_TOOLS.contains(&tool.as_str()) {
+            bail!("unknown harness tool exclusion '{tool}'");
+        }
+        excluded.insert(tool.as_str());
+    }
+    let tools = HARNESS_AGENT_TOOLS
+        .iter()
+        .filter(|tool| !excluded.contains(**tool))
+        .map(|tool| (*tool).to_string())
+        .collect::<Vec<_>>();
+    if tools.is_empty() {
+        bail!("harness tool exclusions removed every available tool");
+    }
+    Ok(tools)
 }
 
 fn workspace_config_metadata(
@@ -1999,6 +2699,173 @@ mod tests {
                 "goal_request_budget"
             ]
         );
+    }
+
+    #[test]
+    fn harness_tool_exclusions_are_validated_and_order_preserving() {
+        let tools =
+            harness_tool_allowlist(&["sub_agent".to_string(), "read_file".to_string()]).unwrap();
+        assert!(!tools.iter().any(|tool| tool == "sub_agent"));
+        assert!(!tools.iter().any(|tool| tool == "read_file"));
+        assert_eq!(tools.first().map(String::as_str), Some("session_title"));
+        assert!(harness_tool_allowlist(&["not_a_pb_tool".to_string()]).is_err());
+    }
+
+    fn cache_eval_test_args(parent: &Path) -> HarnessCacheEvalArgs {
+        HarnessCacheEvalArgs {
+            task: "Build the fixture".to_string(),
+            scratch_dirs: (0..6)
+                .map(|index| parent.join(format!("arm-{index}")))
+                .collect(),
+            contracts: (0..6)
+                .map(|index| parent.join(format!("contract-{index}.json")))
+                .collect(),
+            cache_dir: parent.join("cache"),
+            output: parent.join("report.json"),
+            changed_authority_tool: "read_file".to_string(),
+            model: Some("hf://example/model".to_string()),
+            model_dir: Some(parent.join("models")),
+            max_steps: Some(4),
+            max_tokens: Some(64),
+            ctx_size: Some(4096),
+            threads: None,
+            threads_batch: None,
+            gpu_layers: Some(99),
+            temperature: Some(0.0),
+            profile: crate::agent_core::AgentProfile::Build,
+            top_k: Some(1),
+            seed: Some(0),
+        }
+    }
+
+    #[test]
+    fn cache_eval_refuses_existing_report_and_nonempty_cache_before_inference() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut args = cache_eval_test_args(parent.path());
+        std::fs::write(&args.output, b"preserve me").unwrap();
+        let error = validate_cache_eval_args(&args).unwrap_err().to_string();
+        assert!(
+            error.contains("refuses to replace existing report"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&args.output).unwrap(), b"preserve me");
+
+        std::fs::remove_file(&args.output).unwrap();
+        std::fs::create_dir(&args.cache_dir).unwrap();
+        std::fs::write(args.cache_dir.join("owned.bin"), b"preserve me").unwrap();
+        args.output = parent.path().join("new-report.json");
+        let error = validate_cache_eval_args(&args).unwrap_err().to_string();
+        assert!(error.contains("cache root must be empty"), "{error}");
+        assert_eq!(
+            std::fs::read(args.cache_dir.join("owned.bin")).unwrap(),
+            b"preserve me"
+        );
+    }
+
+    fn cache_eval_test_root(
+        digest: &str,
+        schema: &str,
+        source: &str,
+        reused_tokens: usize,
+    ) -> CacheEvalRootReport {
+        CacheEvalRootReport {
+            backend: "flashmoe".to_string(),
+            cache_format_version: "test-v1".to_string(),
+            model_namespace_sha256: "model-a".to_string(),
+            source: source.to_string(),
+            miss_reason: (source == "none")
+                .then_some(crate::inference::PromptCacheMissReason::ColdSession),
+            rendered_token_sha256: digest.to_string(),
+            tool_schema_sha256: Some(schema.to_string()),
+            tokens: 128,
+            reused_tokens,
+            workflow_stage: Some(crate::workflow::WorkflowStage::Planning),
+            authority_class: crate::inference::StageRootAuthorityClass::Planning,
+            output_constraint_mode: Some("tools_allowed".to_string()),
+        }
+    }
+
+    fn cache_eval_test_arm(id: &str, root: CacheEvalRootReport) -> CacheEvalArmReport {
+        CacheEvalArmReport {
+            id: id.to_string(),
+            process: "test".to_string(),
+            session_id: id.to_string(),
+            scratch_dir: format!("/tmp/{id}"),
+            agent_outcome_succeeded: false,
+            agent_error: Some("model artifact was incomplete".to_string()),
+            invocations: 1,
+            planning_root: Some(root),
+        }
+    }
+
+    #[test]
+    fn cache_eval_gates_exact_roots_independently_of_agent_outcomes() {
+        let arms = vec![
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[0],
+                cache_eval_test_root("root-a", "schema-a", "none", 0),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[1],
+                cache_eval_test_root("root-a", "schema-a", "memory_session", 128),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[2],
+                cache_eval_test_root("root-a", "schema-a", "memory_prefix", 128),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[3],
+                cache_eval_test_root("root-b", "schema-b", "none", 0),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[4],
+                cache_eval_test_root("root-a", "schema-a", "memory_prefix", 128),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[5],
+                cache_eval_test_root("root-a", "schema-a", "disk_prefix", 128),
+            ),
+        ];
+        let gates = evaluate_cache_eval_gates(&arms);
+        assert!(gates.passed());
+        assert!(arms.iter().all(|arm| !arm.agent_outcome_succeeded));
+    }
+
+    #[test]
+    fn cache_eval_rejects_authority_aliasing_and_partial_restart_reuse() {
+        let mut arms = vec![
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[0],
+                cache_eval_test_root("root-a", "schema-a", "none", 0),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[1],
+                cache_eval_test_root("root-a", "schema-a", "memory_session", 128),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[2],
+                cache_eval_test_root("root-a", "schema-a", "memory_prefix", 128),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[3],
+                cache_eval_test_root("root-a", "schema-a", "memory_prefix", 128),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[4],
+                cache_eval_test_root("root-a", "schema-a", "memory_prefix", 128),
+            ),
+            cache_eval_test_arm(
+                CACHE_EVAL_ARM_IDS[5],
+                cache_eval_test_root("root-a", "schema-a", "disk_prefix", 127),
+            ),
+        ];
+        let gates = evaluate_cache_eval_gates(&arms);
+        assert!(!gates.changed_authority_rejected_old_root);
+        assert!(!gates.restart_restored_persisted_exact_root);
+        assert!(!gates.passed());
+
+        arms[3].planning_root = None;
+        assert!(!evaluate_cache_eval_gates(&arms).all_planning_roots_observed);
     }
 
     #[test]

@@ -47,7 +47,7 @@ pub fn load_shared(plan: &FlashMoePlan) -> Result<FlashMoeRuntimeHandle> {
     load_shared_with_settings(plan, &settings)
 }
 
-fn load_shared_with_settings(
+pub(crate) fn load_shared_with_settings(
     plan: &FlashMoePlan,
     settings: &crate::config::ResolvedFlashMoeConfig,
 ) -> Result<FlashMoeRuntimeHandle> {
@@ -97,6 +97,21 @@ fn load_shared_with_settings(
         engine: loaded,
         reused: false,
     })
+}
+
+/// Release pooled runtimes that have no active borrower.
+///
+/// The production idle policy normally keeps these runtimes resident. The daemon-free cache
+/// evaluator uses this explicit boundary before spawning its restart arm so the child proves disk
+/// restoration without inheriting a live Metal runtime or competing with its allocations.
+pub(crate) fn release_unleased_shared_runtimes() -> Result<usize> {
+    let mut pool = global_pool()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("FlashMoe runtime pool lock is poisoned"))?;
+    let before = pool.entries.len();
+    pool.entries
+        .retain(|_, entry| Arc::strong_count(&entry.engine) > 1);
+    Ok(before.saturating_sub(pool.entries.len()))
 }
 
 pub fn reap_idle_shared_runtimes() -> Result<usize> {
