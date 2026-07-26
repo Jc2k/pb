@@ -167,6 +167,11 @@ The critic need not re-read a task path merely to confirm code that the plan pro
 the task, exact plan, bounded repository brief, and carried evidence already support every structural
 assessment. Any repository fact it does cite must still come from current carried or model-read
 evidence.
+For a trusted contract, when fresh controller observations cover every existing allowed path and
+survive the same prompt-capacity and fingerprint checks used by planning, plan review exposes only
+`submit_plan_review` for that turn. The critic can still reject the plan; a resulting plan revision
+gets ordinary read tools. If any allowed path is unobserved, partial, stale, unsafe, or displaced by
+prompt preflight, plan review keeps its ordinary evidence tools.
 Once the deterministic submission precondition is current, the turn exposes only the plan-review
 terminal and focused repository evidence tools.
 
