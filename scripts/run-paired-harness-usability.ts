@@ -33,6 +33,7 @@ interface Trial {
   order: number;
   variant: Variant;
   binary_sha256: string;
+  process_exit_code: number;
   audit: UsabilityAudit;
 }
 
@@ -423,7 +424,7 @@ async function runTrial(
   scratchRoot: string,
   binary: string,
   model: string,
-): Promise<UsabilityAudit> {
+): Promise<{ audit: UsabilityAudit; exitCode: number }> {
   const prepared = await prepareCorpusCase(corpusCase, scratchRoot);
   const status = await new Deno.Command(binary, {
     args: [
@@ -455,10 +456,8 @@ async function runTrial(
     stdout: "inherit",
     stderr: "inherit",
   }).spawn().status;
-  if (!status.success) {
-    throw new Error(`${corpusCase.id} exited ${status.code}`);
-  }
-  return await auditScratch(scratchRoot);
+  const audit = await auditScratch(scratchRoot);
+  return { audit, exitCode: status.code };
 }
 
 async function main(): Promise<void> {
@@ -491,7 +490,7 @@ async function main(): Promise<void> {
             round + 1
           }/${options.repeats} case=${corpusCase.id} variant=${variant}`,
         );
-        const audit = await runTrial(
+        const result = await runTrial(
           corpusCase,
           scratchRoot,
           binaries[variant],
@@ -502,7 +501,8 @@ async function main(): Promise<void> {
           order: position,
           variant,
           binary_sha256: binaryHashes[variant],
-          audit,
+          process_exit_code: result.exitCode,
+          audit: result.audit,
         });
         await writeJsonAtomically(reportPath, {
           version: "paired-usability-v1",

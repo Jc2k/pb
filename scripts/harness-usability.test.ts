@@ -77,6 +77,7 @@ Deno.test("paired qualification uses raw odd-sample medians and all promotion ga
           order: caseIndex,
           variant,
           binary_sha256: variant,
+          process_exit_code: 0,
           audit,
         });
       }
