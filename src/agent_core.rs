@@ -5431,6 +5431,48 @@ fn scope_tools_to_work_unit(
     }
 }
 
+fn prefer_atomic_replace_for_small_python_observation(
+    tools: &mut Vec<BuiltInToolSchema>,
+    unit: &crate::workflow::WorkUnit,
+    receipt: &crate::workflow::ControllerObservationReceipt,
+) -> bool {
+    if unit.operation != crate::workflow::PlannedChange::Modify
+        || unit.state != crate::workflow::WorkUnitState::MutationReady
+        || !matches!(
+            Path::new(&unit.path)
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("py" | "pyi")
+        )
+        || receipt.coverage != crate::workflow::ObservationCoverage::Full
+        || receipt.path != unit.path
+    {
+        return false;
+    }
+    let Some(replace_limit) = tools
+        .iter()
+        .find(|tool| tool.name == "replace_file")
+        .and_then(|tool| {
+            tool.input_schema
+                .pointer("/properties/content/maxLength")
+                .and_then(Value::as_u64)
+        })
+        .and_then(|limit| usize::try_from(limit).ok())
+    else {
+        return false;
+    };
+    if receipt.observed_bytes.saturating_mul(2) > replace_limit {
+        return false;
+    }
+    tools.retain(|tool| tool.name != "edit_file");
+    if let Some(replace) = tools.iter_mut().find(|tool| tool.name == "replace_file") {
+        replace.description.push_str(
+            " The controller observed this complete small file; preserve unrelated bytes in the complete atomic replacement.",
+        );
+    }
+    true
+}
+
 fn active_unit_can_inline_completion(
     ledger: &crate::workflow::WorkUnitLedger,
     unit: &crate::workflow::WorkUnit,
@@ -6940,15 +6982,21 @@ fn run_agent_steps(
                     .is_some_and(|ledger| active_unit_can_inline_completion(ledger, unit))
                     && args.observation_rendering.is_controller(),
             );
-            if gate_state
+            if let Some(receipt) = gate_state
                 .borrow()
                 .controller_observation_for_path(&unit.path)
-                .is_some_and(|receipt| {
-                    receipt.coverage == crate::workflow::ObservationCoverage::Ranges
-                })
             {
-                scoped_tools
-                    .retain(|tool| matches!(tool.name.as_str(), "edit_file" | "request_replan"));
+                if receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
+                    scoped_tools.retain(|tool| {
+                        matches!(tool.name.as_str(), "edit_file" | "request_replan")
+                    });
+                } else {
+                    let _ = prefer_atomic_replace_for_small_python_observation(
+                        &mut scoped_tools,
+                        unit,
+                        receipt,
+                    );
+                }
             }
         } else if work_units.is_some() {
             scoped_tools.retain(|tool| {
@@ -17472,10 +17520,16 @@ fn maybe_inject_controller_read_observation(
             &candidate_unit,
         ),
     );
+    apply_mutation_payload_limit(&mut candidate_tools, boosted_max_tokens(args));
     if candidate.receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
         candidate_tools.retain(|tool| matches!(tool.name.as_str(), "edit_file" | "request_replan"));
+    } else {
+        let _ = prefer_atomic_replace_for_small_python_observation(
+            &mut candidate_tools,
+            &candidate_unit,
+            &candidate.receipt,
+        );
     }
-    apply_mutation_payload_limit(&mut candidate_tools, boosted_max_tokens(args));
     if !controller_observation_survives_preflight(
         generator,
         args,
@@ -23490,6 +23544,77 @@ the next imagined action"#;
             ],
             fallback_reason: None,
         }
+    }
+
+    #[test]
+    fn small_fully_observed_python_modify_prefers_one_atomic_replacement() {
+        let mut unit = crate::workflow::WorkUnit {
+            id: "step:0".to_string(),
+            plan_step_id: "step".to_string(),
+            contributing_step_ids: Vec::new(),
+            operation: crate::workflow::PlannedChange::Modify,
+            path: "app.py".to_string(),
+            baseline_path_fingerprint: Some("before".to_string()),
+            invocation_path_fingerprint: Some("before".to_string()),
+            current_path_fingerprint: Some("before".to_string()),
+            adopted: false,
+            state: crate::workflow::WorkUnitState::MutationReady,
+        };
+        let mut receipt =
+            test_controller_receipt(crate::workflow::ObservationRendering::ControllerBlock);
+        receipt.path = "app.py".to_string();
+        let mut tools = all_builtin_tool_specs();
+        apply_mutation_payload_limit(&mut tools, 1_024);
+        scope_tools_to_work_unit(&mut tools, &unit, true);
+        assert!(tools.iter().any(|tool| tool.name == "edit_file"));
+        assert!(prefer_atomic_replace_for_small_python_observation(
+            &mut tools, &unit, &receipt,
+        ));
+        assert!(!tools.iter().any(|tool| tool.name == "edit_file"));
+        assert!(
+            tools
+                .iter()
+                .find(|tool| tool.name == "replace_file")
+                .unwrap()
+                .description
+                .contains("complete small file")
+        );
+
+        receipt.observed_bytes = mutation_payload_char_limit(1_024);
+        let mut large_tools = all_builtin_tool_specs();
+        apply_mutation_payload_limit(&mut large_tools, 1_024);
+        scope_tools_to_work_unit(&mut large_tools, &unit, true);
+        assert!(!prefer_atomic_replace_for_small_python_observation(
+            &mut large_tools,
+            &unit,
+            &receipt,
+        ));
+        assert!(large_tools.iter().any(|tool| tool.name == "edit_file"));
+
+        receipt.observed_bytes = 4;
+        unit.state = crate::workflow::WorkUnitState::DiagnosticRepairReady;
+        let mut repair_tools = all_builtin_tool_specs();
+        apply_mutation_payload_limit(&mut repair_tools, 1_024);
+        scope_tools_to_work_unit(&mut repair_tools, &unit, true);
+        assert!(!prefer_atomic_replace_for_small_python_observation(
+            &mut repair_tools,
+            &unit,
+            &receipt,
+        ));
+        assert!(repair_tools.iter().any(|tool| tool.name == "edit_file"));
+
+        unit.state = crate::workflow::WorkUnitState::MutationReady;
+        unit.path = "lib.rs".to_string();
+        receipt.path = "lib.rs".to_string();
+        let mut rust_tools = all_builtin_tool_specs();
+        apply_mutation_payload_limit(&mut rust_tools, 1_024);
+        scope_tools_to_work_unit(&mut rust_tools, &unit, true);
+        assert!(!prefer_atomic_replace_for_small_python_observation(
+            &mut rust_tools,
+            &unit,
+            &receipt,
+        ));
+        assert!(rust_tools.iter().any(|tool| tool.name == "edit_file"));
     }
 
     #[test]
