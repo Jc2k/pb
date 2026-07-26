@@ -5,6 +5,11 @@ import {
 } from "./audit-harness-usability.ts";
 import { validatedUsabilityCorpus } from "./check-harness-usability-corpus.ts";
 import { prepareCorpusCase } from "./run-harness-task-corpus.ts";
+import {
+  buildPairedReport,
+  median,
+  pairedVariantOrder,
+} from "./run-paired-harness-usability.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -25,6 +30,82 @@ Deno.test("usability corpus is balanced, sourced, bounded, and unguided", () => 
       `${corpusCase.id}: fresh repository`,
     );
   }
+});
+
+Deno.test("paired qualification uses raw odd-sample medians and all promotion gates", () => {
+  assert(median([900, 100, 300]) === 300, "odd median");
+  assert(
+    pairedVariantOrder(0).join(",") === "baseline,candidate" &&
+      pairedVariantOrder(1).join(",") === "candidate,baseline",
+    "pair ordering alternates by round",
+  );
+  const trials = [];
+  const caseIds = [
+    "rust_registry_removal",
+    "python_ttl_cache_boundary",
+    "react_accessible_alert",
+  ];
+  for (let round = 0; round < 3; round++) {
+    for (const [caseIndex, caseId] of caseIds.entries()) {
+      for (const variant of ["baseline", "candidate"] as const) {
+        const audit = fakeAudit(
+          caseId.startsWith("rust")
+            ? "rust"
+            : caseId.startsWith("python")
+            ? "python"
+            : "react_typescript",
+          true,
+          true,
+          false,
+        );
+        audit.case_id = caseId;
+        audit.efficiency.wall_runtime_ms = variant === "baseline"
+          ? 1000 + round
+          : 800 + round;
+        audit.efficiency.llm_invocations = 4;
+        audit.efficiency.fresh_prefill_tokens = variant === "baseline"
+          ? 1000
+          : 700;
+        audit.efficiency.total_energy_kwh = variant === "baseline" ? 1 : 0.8;
+        audit.efficiency.eligible_root_tokens = 10;
+        audit.efficiency.reused_root_tokens = variant === "candidate" ? 10 : 5;
+        audit.efficiency.prompt_root_hit_invocations = variant === "candidate"
+          ? 4
+          : 0;
+        trials.push({
+          round,
+          order: caseIndex,
+          variant,
+          binary_sha256: variant,
+          audit,
+        });
+      }
+    }
+  }
+  const report = buildPairedReport(
+    {
+      repeats: 3,
+      caseIds,
+      baselineRevision: "base",
+      candidateRevision: "candidate",
+      model: "local-model",
+    },
+    { baseline: "base-sha", candidate: "candidate-sha" },
+    trials,
+  );
+  assert(report.complete, "complete report");
+  assert(
+    report.variants.baseline.summary.wall_runtime_ms.median === 3003,
+    "median aggregate wall",
+  );
+  assert(
+    report.comparison.wall_time_reduction_percent > 19,
+    "wall reduction",
+  );
+  assert(
+    report.gates.production_performance_promoted,
+    "all gates promote",
+  );
 });
 
 Deno.test("checked-in typed corpus materializes without reference leakage", async () => {

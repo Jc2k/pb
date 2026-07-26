@@ -241,6 +241,27 @@ efficiency remain distinct fields. See the
 [private-workload usability record](benchmarks/private-workload-usability.md) for the exact protocol,
 commands, and current internal sample.
 
+`scripts/run-paired-harness-usability.ts` compares two explicit release binaries without discarding
+run variance. It requires an odd repeat count of at least three, rotates case order, alternates which
+binary runs first, locks the explicit model and sampling settings, independently audits every
+scratch root, checkpoints partial progress atomically, and retains raw values plus per-case and
+aggregate medians. Its result fails the production
+performance gate unless correctness, clean verification, the Rust/Python four-call floor, exact
+candidate root reuse, fresh-prefill, energy, wall-time, and per-case regression requirements all
+pass. A non-passing completed comparison exits with status 2 while preserving the report.
+
+```sh
+deno run --allow-read --allow-write --allow-run \
+  scripts/run-paired-harness-usability.ts \
+  --scratch-parent /private/tmp/pb-paired-qualification \
+  --baseline-binary /path/to/baseline/pb \
+  --baseline-revision BASELINE_REVISION \
+  --candidate-binary target/aarch64-apple-darwin/release/pb \
+  --candidate-revision CANDIDATE_REVISION \
+  --model hf://mlx-community/Qwen3-Coder-Next-4bit \
+  --repeats 3
+```
+
 ### Prompt budget and bounded results
 
 Every model call is rendered and tokenized before it is charged to the invocation budget. The

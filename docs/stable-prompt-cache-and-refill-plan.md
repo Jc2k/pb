@@ -378,6 +378,9 @@ data-flow change updates `docs/flashmoe-architecture-parity-plan.md` before prom
 - Run the locked Rust registry, Python TTL, and React alert cases with the same model, backend,
   sampling, contracts, and machine used by the 25 July baseline. Preserve raw events, scratch state,
   independent audits, binary digest, and a machine-readable aggregate.
+- Compare performance with the checked-in paired evaluator: use an odd repeat count of at least
+  three, rotate case order, alternate baseline/candidate order, preserve every audited scratch root,
+  and decide the aggregate and per-case gates from medians while retaining all raw values.
 - If controller changes alter a task result, classify the failure before changing inference. A model
   edit error, workflow-control defect, cache defect, runtime defect, and experiment error remain
   separate outcomes.
@@ -474,7 +477,7 @@ Each phase appends a dated row rather than rewriting the original baseline:
 | Phase 2 cache lifecycle | `3ef1c449`, `bb3e89f9` | Byte-budget LRU, corruption/fingerprint/symlink/manifest/concurrency/storage-root fixtures; cold/restart Task-root pair; late corpus retention cases | Hot disk recency retained; sessionless root restores 30/30 after restart; 24/24 persistence completed | Qualified for shipped paths |
 | Phase 3 refill | `6aae3c8d` | Retained resident/streamed, scalar/layer-major, restored-suffix, 0/1/31/32/33, and resource matrix | Exact parity and balanced resources; suffix prefill dominated; existing graph already selects actual suffix, so no extra fast path was promoted | Profile complete; no behavior change justified |
 | Phase 4 lifecycle | `69f4d738`, `d3e389c3` | Managed six-arm evaluator and checked-in `fixtures/harness-usability/baselines/2026-07-26-prompt-cache-lifecycle.json` result | Cold miss, same/new-session memory hits, changed-authority rejection, restored-authority hit, and child-process disk hit; 6/6 independently verified clean | Qualified |
-| Phase 4 workflow | `bb3e89f9`, `884d4c1b` | Locked Rust/Python/React reruns in [qualification record](benchmarks/stable-prompt-root-production.md) and checked-in atomic-Python trial | 3/3 correct; 100% roots; Python four-call floor qualified; latest fresh prefill -32.78% and energy -25.10%; wall +4.64% with unexplained Rust +63.30% | **Performance promotion blocked** |
+| Phase 4 workflow | `bb3e89f9`, `884d4c1b` | Locked Rust/Python/React reruns in [qualification record](benchmarks/stable-prompt-root-production.md), checked-in atomic-Python trial, and median-based paired evaluator | 3/3 correct; 100% roots; Python four-call floor qualified; latest fresh prefill -32.78% and energy -25.10%; wall +4.64% with unexplained Rust +63.30%; paired rerun pending | **Performance promotion blocked** |
 | Phase 5 production | `bb3e89f9` | Complete 24-case audit, failure matrix, llama.cpp control, macOS release and native smoke | 21/24 verified clean, 3 truthful model/control limits, 0 false verification/cache defects/experiment errors; release gates pass | Cache candidate qualified; production-ready designation open |
 
 Passing a unit test, a one-token smoke, or the four-call happy path does not close an open row. Only
