@@ -252,6 +252,11 @@ Strict JSON artifact generation uses a tokenizer-scoped LLGuidance factory and a
 request-scoped matcher. Hugging Face Qwen/GLM/VL tokenizers derive exact bytes from byte-level or
 byte-fallback tokenizer JSON; DeepSeek derives them from its pinned JoyAI GPT-2 byte-BPE cache and
 marks native special tokens explicitly. Schema and tokenizer failures stop during request preflight.
+For Qwen/GLM, a sessionless constrained request may restore and publish the same exact
+first-system-message KV/recurrent checkpoint used by ordinary managed stages. Only that stable base
+is shared: the LLGuidance matcher, dynamic Task evidence, sampled artifact, and generated head stay
+request-scoped. This changes prompt-state retention only; resident/streamed expert selection,
+scheduler-owned I/O, layer-major command geometry, and CPU/GPU handoff remain identical.
 The matcher produces a full-vocabulary allowed-token bitset before top-k and consumes every sampled
 token. Qwen-family sampling uploads that bitset to the resident Metal vocabulary kernel, excluding
 invalid rows before candidate selection and avoiding full-logit host readback. Both resident and

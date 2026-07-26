@@ -135,7 +135,10 @@ the safe boundary. A stable first-system-message prefix is also content-addresse
 by other sessions using the same model, tokenizer, template, tool schema, and system tokens.
 Full-attention KV, compressed MLA KV, linear-attention conv/SSM state, final hidden state, and token
 ids are stored together, so hybrid Qwen and GLM checkpoints restore the state their forward graph
-actually needs.
+actually needs. JSON-constrained Task-artifact calls have no logical session or reusable generated
+head, but they publish the same validated stable-system prefix after prefill. The JSON constraint,
+dynamic Task evidence, and generated artifact remain outside that checkpoint and are rebuilt for
+every call.
 
 Shared prompt roots use an LRU bounded by bytes rather than by a guessed stage count. The default
 in-memory prompt-root budget is 4 GiB; set `flashmoe.memory_prompt_root_max_bytes` to another

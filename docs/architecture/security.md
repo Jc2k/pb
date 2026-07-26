@@ -280,8 +280,10 @@ fingerprint changes, and incompatible state before graph mutation. Prompt-root m
 byte-bounded LRU; dirty eviction attempts atomic owner-only disk publication and reports durable
 failure rather than claiming reuse. Disk pruning refreshes recency only after a checkpoint or
 manifest has passed validation; failure to update that best-effort hint cannot convert a valid hit
-into an inference failure. `pb cache clean` is a dry run unless `--yes` is explicit and can remove
-only a selected resolved versioned namespace; it never targets the storage root itself.
+into an inference failure. Sessionless constrained generation may publish only the validated stable
+system-prefix checkpoint; dynamic evidence, constraint state, and generated artifacts are not
+included. `pb cache clean` is a dry run unless `--yes` is explicit and can remove only a selected
+resolved versioned namespace; it never targets the storage root itself.
 
 ## Important limits
 

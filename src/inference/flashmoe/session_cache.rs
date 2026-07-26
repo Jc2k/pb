@@ -988,14 +988,16 @@ impl FlashMoeSessionCache {
             }
         }
         let cache_miss_reason = cached.is_none().then(|| {
-            if session_id.is_none() {
-                PromptCacheMissReason::CacheDisabled
-            } else if cache_unreadable {
+            if cache_unreadable {
                 PromptCacheMissReason::CacheUnreadable
             } else if incompatible_checkpoint_seen {
                 PromptCacheMissReason::PromptDiverged
             } else if base_prefix_len == 0 {
-                PromptCacheMissReason::StablePrefixUnavailable
+                if session_id.is_none() {
+                    PromptCacheMissReason::CacheDisabled
+                } else {
+                    PromptCacheMissReason::StablePrefixUnavailable
+                }
             } else {
                 PromptCacheMissReason::ColdSession
             }
@@ -1133,28 +1135,31 @@ impl FlashMoeSessionCache {
         &mut self,
         generation: &mut FlashMoeGenerationState,
     ) -> Result<super::types::PromptCachePersistenceStats> {
-        let Some(session_id) = generation.session_id.as_ref() else {
-            return Ok(super::types::PromptCachePersistenceStats::default());
-        };
-        let cpu = generation
-            .prompt_cache
-            .take()
-            .context("session cache prompt snapshot is missing")?;
-        let recurrent = generation
-            .prompt_recurrent
-            .take()
-            .context("session cache recurrent snapshot is missing")?;
-        let mut checkpoints = vec![FlashMoeCachedSessionState { cpu, recurrent }];
-        if let (Some(cpu), Some(recurrent)) = (
-            generation.generated_cache.take(),
-            generation.generated_recurrent.take(),
-        ) {
-            checkpoints.push(FlashMoeCachedSessionState { cpu, recurrent });
+        let mut persistence = super::types::PromptCachePersistenceStats::default();
+        if let Some(session_id) = generation.session_id.clone() {
+            let cpu = generation
+                .prompt_cache
+                .take()
+                .context("session cache prompt snapshot is missing")?;
+            let recurrent = generation
+                .prompt_recurrent
+                .take()
+                .context("session cache recurrent snapshot is missing")?;
+            let mut checkpoints = vec![FlashMoeCachedSessionState { cpu, recurrent }];
+            if let (Some(cpu), Some(recurrent)) = (
+                generation.generated_cache.take(),
+                generation.generated_recurrent.take(),
+            ) {
+                checkpoints.push(FlashMoeCachedSessionState { cpu, recurrent });
+            }
+            self.entries.insert(session_id.clone(), checkpoints);
+            self.touch_session(&session_id);
+            self.dirty_sessions.insert(session_id);
+            add_persistence_stats(
+                &mut persistence,
+                self.evict_excess_sessions(self.memory_session_limit),
+            );
         }
-        self.entries.insert(session_id.clone(), checkpoints);
-        self.touch_session(session_id);
-        self.dirty_sessions.insert(session_id.clone());
-        let mut persistence = self.evict_excess_sessions(self.memory_session_limit);
         if let (Some(cpu), Some(recurrent)) = (
             generation.base_cache.take(),
             generation.base_recurrent.take(),
@@ -1427,6 +1432,45 @@ mod tests {
         let reused = cache.begin_generation(Some("reused"), vec![10, 20, 30], 1, 2);
         assert_eq!(reused.cache_source(), PromptCacheSource::MemorySession);
         assert_eq!(reused.cache_miss_reason(), None);
+    }
+
+    #[test]
+    fn sessionless_generation_commits_a_restartable_base_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let disk = disk_cache(root.clone());
+        let mut cache = FlashMoeSessionCache::new(
+            Some(disk),
+            2,
+            crate::config::DEFAULT_FLASHMOE_MEMORY_PROMPT_ROOT_MAX_BYTES,
+        );
+        let mut generation = cache.begin_generation_with_base(None, vec![10, 20, 30], 2, 1, 2);
+        assert_eq!(
+            generation.cache_miss_reason(),
+            Some(PromptCacheMissReason::ColdSession)
+        );
+        assert_eq!(
+            generation.cache_lookup_detail(),
+            Some(crate::inference::PromptCacheLookupDetail::ExactRootCheckpointMissing)
+        );
+        generation.capture_base_cache(vec![8.0, 9.0], fixture_state().recurrent);
+
+        cache.commit_generation(&mut generation).unwrap();
+        let persisted = cache.persist_session("prefix-flush").unwrap();
+        assert_eq!(persisted.queued_checkpoints, 1);
+        assert_eq!(persisted.completed_checkpoints, 1);
+        assert_eq!(persisted.failed_checkpoints, 0);
+        assert!(cache.entries.is_empty());
+
+        let mut restarted = FlashMoeSessionCache::new(
+            Some(disk_cache(root)),
+            2,
+            crate::config::DEFAULT_FLASHMOE_MEMORY_PROMPT_ROOT_MAX_BYTES,
+        );
+        let restored = restarted.begin_generation_with_base(None, vec![10, 20, 99], 2, 1, 2);
+        assert_eq!(restored.cache_source(), PromptCacheSource::DiskPrefix);
+        assert_eq!(restored.prefill_start(), 2);
+        assert_eq!(restored.cache_miss_reason(), None);
     }
 
     #[test]
