@@ -231,6 +231,9 @@ unit guidance is recorded as positive control evidence rather than a model limit
 The checked-in `fixtures/harness-usability` corpus exercises 24 synthetic Rust, Python, and
 React/TypeScript repository repairs derived from public benchmark task shapes. It exists for local
 engineering decisions, not agent comparisons. Reference solutions never enter model workspaces.
+Each task request states every behavior enforced by its official check; checks may be stricter about
+exact values, but they do not hide an additional product requirement behind shorthand. This keeps
+small-model failures attributable to implementation or control rather than an ambiguous stimulus.
 
 Run `deno task test:usability` to prove that every seed fails, every isolated reference repair
 passes, and every official check is side-effect-clean. React packages require the one-time

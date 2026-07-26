@@ -120,6 +120,13 @@ Deno.test("checked-in typed corpus materializes without reference leakage", asyn
       item.id === "react_accessible_alert"
     );
     assert(corpusCase, "React fixture");
+    assert(
+      corpusCase.task.includes('role="alert"') &&
+        corpusCase.task.includes('aria-live="assertive"') &&
+        corpusCase.task.includes("alert--<kind>") &&
+        corpusCase.task.includes("safe React text"),
+      "React task states every independently asserted behavior",
+    );
     await prepareCorpusCase(corpusCase, `${parent}/case`);
     const metadata = JSON.parse(
       await Deno.readTextFile(`${parent}/case/corpus-case.json`),

@@ -1067,7 +1067,7 @@ const reactCases: CorpusCase[] = [
     id: "react_accessible_alert",
     category: "accessibility_repair",
     task:
-      "Repair Alert so it exposes an assertive alert region and uses both the shared alert class and a kind modifier without changing React's safe text rendering.",
+      'Repair Alert so it renders role="alert" with aria-live="assertive", uses both the shared alert class and an alert--<kind> modifier, and keeps rendering message as safe React text.',
     initial: `
       import React from "react";
 
