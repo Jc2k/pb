@@ -410,12 +410,22 @@ impl PlanReviewArtifact {
             .challenges
             .iter()
             .any(|challenge| challenge.severity.is_blocking());
+        let concerning_assessment = self
+            .assessments
+            .iter()
+            .any(|assessment| assessment.status != AssessmentStatus::Pass);
         match (self.verdict, blocking) {
             (ReviewVerdict::Pass, true) => {
                 bail!("passing plan review contains a blocking challenge")
             }
+            (ReviewVerdict::Pass, false) if concerning_assessment => {
+                bail!("passing plan review contains a concern or failed assessment")
+            }
             (ReviewVerdict::Revise, false) => {
                 bail!("plan review requests revision without a blocking challenge")
+            }
+            (ReviewVerdict::Revise, true) if !concerning_assessment => {
+                bail!("plan review requests revision while every assessment passes")
             }
             _ => {}
         }
@@ -1053,6 +1063,35 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("explanation")
+        );
+
+        plan_review.assessments[0].explanation = "The plan omits an edge case".to_string();
+        assert!(
+            plan_review
+                .validate(&envelope)
+                .unwrap_err()
+                .to_string()
+                .contains("passing plan review contains a concern")
+        );
+
+        plan_review.verdict = ReviewVerdict::Revise;
+        plan_review.challenges.push(ReviewChallenge {
+            id: "challenge-1".to_string(),
+            severity: ReviewSeverity::P1,
+            requirement_ids: vec!["r1".to_string()],
+            description: "The plan omits the required edge case".to_string(),
+            evidence: Vec::new(),
+        });
+        plan_review.validate(&envelope).unwrap();
+
+        plan_review.assessments[0].status = AssessmentStatus::Pass;
+        plan_review.assessments[0].explanation.clear();
+        assert!(
+            plan_review
+                .validate(&envelope)
+                .unwrap_err()
+                .to_string()
+                .contains("requests revision while every assessment passes")
         );
 
         let mut code_review = CodeReviewArtifact {

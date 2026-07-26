@@ -13532,7 +13532,7 @@ fn delivery_stage_context(
                     PLAN_REVIEW_SUBMISSION_GUIDANCE,
                 ),
                 user_prompt: format!(
-                    "Task:\n{}\n\nExact proposed plan:\n{plan_json}\n\nPlanning snapshot fingerprint: {}\n\nBounded repository brief (full normalized graph SHA-256 {graph_sha256} remains the validation authority):\n{repository_brief_json}\n\n{evidence_note}{correction}",
+                    "Task:\n{}\n\nExact proposed plan:\n{plan_json}\n\nPlanning snapshot fingerprint: {}\n\nBounded repository brief (full normalized graph SHA-256 {graph_sha256} remains the validation authority):\n{repository_brief_json}\n\nReview the proposed plan, not the unchanged implementation it proposes to fix. A blocking challenge must identify an omission, contradiction, unsafe assumption, or other defect in that plan and must correspond to a concern or failed assessment. Do not challenge a current implementation defect when the exact plan already addresses it.\n\n{evidence_note}{correction}",
                     run.task,
                     run.planning_content().fingerprint,
                 ),
@@ -30435,6 +30435,16 @@ the next imagined action"#;
         let covered =
             delivery_stage_context(&run, &graph, Some(&contract), repo.path(), None, None).unwrap();
         assert!(covered.user_prompt.contains("not duplicated"));
+        assert!(
+            covered
+                .user_prompt
+                .contains("Review the proposed plan, not the unchanged implementation")
+        );
+        assert!(
+            covered
+                .user_prompt
+                .contains("must correspond to a concern or failed assessment")
+        );
         assert!(!covered.user_prompt.contains("distinctive_review_value"));
 
         let unscoped = delivery_stage_context(&run, &graph, None, repo.path(), None, None).unwrap();

@@ -158,6 +158,11 @@ pb projects the accepted plan ID and digest into the submitted review rather tha
 model to transcribe controller-owned identity. Every required assessment kind remains mandatory.
 A passing assessment may omit repetitive evidence and explanation fields; a concern or failure
 still requires a non-empty explanation, and cited repository evidence remains freshness-validated.
+The deterministic validator rejects internally inconsistent reviews: a passing verdict cannot
+contain a concern or failed assessment, and a revision verdict needs both a blocking challenge and
+a corresponding concern or failed assessment. A blocker must describe a defect in the proposed
+plan; the critic is explicitly forbidden from treating an unchanged implementation defect as a
+plan defect when the exact plan already addresses it.
 The critic need not re-read a task path merely to confirm code that the plan proposes to change when
 the task, exact plan, bounded repository brief, and carried evidence already support every structural
 assessment. Any repository fact it does cite must still come from current carried or model-read
