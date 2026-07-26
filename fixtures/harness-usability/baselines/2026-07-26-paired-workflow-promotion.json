@@ -1,0 +1,191 @@
+{
+  "version": 1,
+  "status": "correctness_qualified_performance_promotion_open",
+  "date": "2026-07-26",
+  "protocol": {
+    "report_version": "paired-usability-v1",
+    "scratch_root": "/private/tmp/pb-paired-a692-vs-884-20260726-v2",
+    "raw_report": "/private/tmp/pb-paired-a692-vs-884-20260726-v2/paired-results.json",
+    "raw_report_sha256": "d2f6ec007be1039f7fee8bf9c4f47dabb5900f97794d0d0b9319bd6076e39329",
+    "raw_report_bytes": 64762,
+    "run_evaluator_revision": "09a577232adc03c1a1f75b7d66eafcb07c20c37f",
+    "corrected_evaluator_revision": "e74aa084",
+    "repeats": 3,
+    "ordering": "case order rotated by round; baseline/candidate order alternated by round",
+    "machine_class": "darwin-aarch64",
+    "model": "hf://mlx-community/Qwen3-Coder-Next-4bit",
+    "backend": "flashmoe-v2-mlxq4",
+    "sampling": {
+      "temperature": 0,
+      "top_k": 1,
+      "seed": 0,
+      "ctx_size": 131072,
+      "gpu_layers": 999
+    },
+    "cases": [
+      "rust_registry_removal",
+      "python_ttl_cache_boundary",
+      "react_accessible_alert"
+    ]
+  },
+  "baseline": {
+    "pb_revision": "a69239ce734cd8c7a23fd2ba2a0da4e2339b2540",
+    "release_binary_sha256": "6ba1a62b5496b780dfd61b3f4c6d3eecca63d84f53169300953ce867d564921f",
+    "round_aggregates": {
+      "wall_runtime_ms": [960592, 965994, 924483],
+      "fresh_prefill_tokens": [34178, 32453, 34090],
+      "energy_kwh": [
+        0.008742017466743083,
+        0.0063890701802177315,
+        0.005963274669587939
+      ],
+      "llm_invocations": [14, 14, 14]
+    },
+    "medians": {
+      "wall_runtime_ms": 960592,
+      "fresh_prefill_tokens": 34090,
+      "energy_kwh": 0.0063890701802177315,
+      "llm_invocations": 14
+    },
+    "cases": {
+      "rust_registry_removal": {
+        "wall_runtime_ms": [317392, 262497, 273652],
+        "llm_invocations": [4, 4, 4],
+        "fresh_prefill_tokens": [8976, 9039, 10662]
+      },
+      "python_ttl_cache_boundary": {
+        "wall_runtime_ms": [256979, 308142, 274799],
+        "llm_invocations": [4, 4, 4],
+        "fresh_prefill_tokens": [9165, 9160, 9164]
+      },
+      "react_accessible_alert": {
+        "wall_runtime_ms": [386221, 395355, 376032],
+        "llm_invocations": [6, 6, 6],
+        "fresh_prefill_tokens": [16037, 14254, 14264]
+      }
+    }
+  },
+  "candidate": {
+    "pb_revision": "884d4c1b7029cba9c196839b54493f730b09bc6b",
+    "release_binary_sha256": "6261d9b2dd4db7c1876183ea1f04778137f8c4222f0006145b438cb600b33981",
+    "round_aggregates": {
+      "wall_runtime_ms": [1249901, 959601, 840385],
+      "fresh_prefill_tokens": [35526, 31786, 31792],
+      "energy_kwh": [
+        0.00839467391172783,
+        0.006896916550143556,
+        0.0066079773661061455
+      ],
+      "llm_invocations": [14, 13, 13]
+    },
+    "medians": {
+      "wall_runtime_ms": 959601,
+      "fresh_prefill_tokens": 31792,
+      "energy_kwh": 0.006896916550143556,
+      "llm_invocations": 13
+    },
+    "exact_root_reuse": {
+      "eligible_tokens": 82389,
+      "reused_tokens": 82389,
+      "reconciliation_failures": 0,
+      "all_invocations_hit": true
+    },
+    "cases": {
+      "rust_registry_removal": {
+        "wall_runtime_ms": [635325, 275005, 260616],
+        "llm_invocations": [5, 4, 4],
+        "fresh_prefill_tokens": [13547, 9791, 9797],
+        "eligible_root_tokens": [10157, 8720, 8720],
+        "reused_root_tokens": [10157, 8720, 8720],
+        "classification": [
+          "positive_evidence",
+          "positive_evidence",
+          "positive_evidence"
+        ]
+      },
+      "python_ttl_cache_boundary": {
+        "wall_runtime_ms": [249281, 313889, 251229],
+        "llm_invocations": [4, 4, 4],
+        "fresh_prefill_tokens": [9349, 9350, 9351],
+        "eligible_root_tokens": [8200, 8200, 8200],
+        "reused_root_tokens": [8200, 8200, 8200],
+        "classification": [
+          "positive_evidence",
+          "positive_evidence",
+          "positive_evidence"
+        ]
+      },
+      "react_accessible_alert": {
+        "wall_runtime_ms": [365295, 370707, 328540],
+        "llm_invocations": [5, 5, 5],
+        "fresh_prefill_tokens": [12630, 12645, 12644],
+        "eligible_root_tokens": [10064, 10064, 10064],
+        "reused_root_tokens": [10064, 10064, 10064],
+        "classification": [
+          "positive_evidence",
+          "positive_evidence",
+          "positive_evidence"
+        ]
+      }
+    }
+  },
+  "audit": {
+    "runs": 18,
+    "official_passed": 18,
+    "verified_clean_completion": 18,
+    "false_verified_completion": 0,
+    "positive_evidence": 18,
+    "model_or_control_limit": 0,
+    "pb_defect": 0,
+    "experiment_error": 0
+  },
+  "comparison": {
+    "aggregate_wall_time_reduction_percent": 0.1032,
+    "fresh_prefill_reduction_percent_against_paired_warm_baseline": 6.7410,
+    "candidate_fresh_prefill_tokens_against_locked_ceiling": {
+      "median": 31792,
+      "ceiling": 35453
+    },
+    "energy_reduction_percent": -7.9487,
+    "per_case_median_wall_change_percent": {
+      "rust_registry_removal": 0.4944,
+      "python_ttl_cache_boundary": -8.5772,
+      "react_accessible_alert": -5.4181
+    }
+  },
+  "gates": {
+    "all_official_correct": true,
+    "all_verified_clean": true,
+    "zero_false_verified_completion": true,
+    "candidate_exact_root_reuse": true,
+    "candidate_fresh_prefill_at_or_below_35453": true,
+    "no_case_wall_regression_above_10_percent": true,
+    "candidate_rust_python_four_call_floor": false,
+    "wall_time_reduction_at_least_15_percent": false,
+    "complete_energy_coverage": true,
+    "energy_reduction_at_least_15_percent": false,
+    "production_performance_promoted": false
+  },
+  "failed_gate_evidence": {
+    "call_floor": "Round-one candidate Rust emitted a malformed recursive action at the 1792-token limit. pb rejected it safely and the next mutation succeeded, producing one correct five-call run followed by two correct four-call runs.",
+    "wall_time": "Candidate median aggregate wall time was 959601 ms versus 960592 ms for the paired warm baseline, a 0.1032% reduction rather than 15%.",
+    "energy": "Candidate median energy was 0.006896916550143556 kWh versus 0.0063890701802177315 kWh, a 7.9487% regression rather than a 15% reduction."
+  },
+  "evaluator_corrections": [
+    {
+      "revision": "bd4058b3",
+      "reason": "A discarded first run showed that nonzero model/control outcomes must be audited and retained instead of aborting later trials."
+    },
+    {
+      "revision": "e74aa084",
+      "reason": "The run report's ordering label incorrectly said order alternated by round and case, although the raw trials and evaluator code show alternation by round. The same correction applies the plan's locked 35453-token ceiling instead of comparing fresh prefill to the newly warm paired baseline."
+    }
+  ],
+  "excluded_runs": [
+    {
+      "scratch_root": "/private/tmp/pb-paired-a692-vs-884-20260726",
+      "classification": "evaluator_defect",
+      "reason": "The initial paired wrapper stopped after a truthful nonzero baseline React outcome before independently auditing and retaining that trial; revision bd4058b3 corrected continuation behavior."
+    }
+  ]
+}

@@ -248,9 +248,58 @@ ms. This is evidence against a cache lookup or restoration defect, but one candi
 not a machine-level explanation for the Rust outlier and cannot waive the per-case gate.
 
 Accordingly, the Python workflow change is qualified, while the end-to-end performance row is not.
-The next comparison must use repeated interleaved baseline and candidate runs on the locked machine,
-retain every raw trial, and report per-case and aggregate medians before another runtime change is
-selected.
+The required repeated interleaved comparison is recorded below.
+
+## Paired median qualification
+
+The exact `a69239ce` baseline was rebuilt in an isolated worktree and compared with the exact
+`884d4c1b` candidate release binary. The baseline and candidate binary SHA-256 digests were
+`6ba1a62b5496b780dfd61b3f4c6d3eecca63d84f53169300953ce867d564921f` and
+`6261d9b2dd4db7c1876183ea1f04778137f8c4222f0006145b438cb600b33981`.
+Three serial rounds rotated case order and alternated which revision ran first. Every scratch root
+was independently audited. The retained raw report is
+`/private/tmp/pb-paired-a692-vs-884-20260726-v2/paired-results.json`, with SHA-256
+`d2f6ec007be1039f7fee8bf9c4f47dabb5900f97794d0d0b9319bd6076e39329`; its checked-in
+summary is
+`../../fixtures/harness-usability/baselines/2026-07-26-paired-workflow-promotion.json`.
+
+| Metric | Baseline raw rounds | Baseline median | Candidate raw rounds | Candidate median | Gate |
+| --- | --- | ---: | --- | ---: | --- |
+| Wall time | 960,592 / 965,994 / 924,483 ms | 960,592 ms | 1,249,901 / 959,601 / 840,385 ms | 959,601 ms | 0.10% reduction; **fail** |
+| Fresh prefill | 34,178 / 32,453 / 34,090 | 34,090 | 35,526 / 31,786 / 31,792 | 31,792 | at most 35,453; pass |
+| Energy | 8.742 / 6.389 / 5.963 Wh | 6.389 Wh | 8.395 / 6.897 / 6.608 Wh | 6.897 Wh | 7.95% regression; **fail** |
+| Model calls | 14 / 14 / 14 | 14 | 14 / 13 / 13 | 13 | one Rust five-call trial; **fail** |
+
+All 18 tasks passed their official check and independent clean-delivery audit; there were zero false
+verified completions. Candidate invocations reused all 82,389/82,389 eligible root tokens with no
+reconciliation failure. The old baseline was warm after the preceding retained evaluator-debug run,
+so it also restored partial disk-session prefixes. This is a stricter steady-state comparison than
+the original single baseline. The plan's absolute 35,453-token fresh-prefill ceiling remains the
+acceptance gate and passes; the warm baseline's 34,090-token median is diagnostic context, not a new
+denominator that rewrites that locked threshold.
+
+| Case | Baseline wall median | Candidate wall median | Candidate change |
+| --- | ---: | ---: | ---: |
+| Rust registry | 273,652 ms | 275,005 ms | +0.49% |
+| Python TTL | 274,799 ms | 251,229 ms | -8.58% |
+| React alert | 386,221 ms | 365,295 ms | -5.42% |
+
+The per-case 10% regression bound therefore passes. The first candidate Rust trial emitted malformed
+recursive JSON until the 1,792-token limit. pb rejected it without a repository mutation, and the
+next bounded mutation completed correctly; the other two candidate Rust trials used four calls.
+That safe five-call success is retained and fails the strict Rust/Python four-call floor. It is a
+model/control outlier, not a cache hit or restoration defect.
+
+Two evaluator corrections are explicit. The first scratch root,
+`/private/tmp/pb-paired-a692-vs-884-20260726`, is excluded because the initial wrapper aborted on a
+truthful nonzero model outcome before auditing it; `bd4058b3` makes such outcomes retained data. The
+v2 report's ordering label says order alternated “by round and case,” while its raw trials and code
+show alternation by round; `e74aa084` corrects that label and applies the locked fresh-token ceiling.
+Neither correction changes a recorded trial or the non-promotion verdict.
+
+This closes the single-sample uncertainty. Production performance remains open because paired
+median wall time did not materially improve, paired energy regressed, and one successful Rust run
+missed the call floor. The exact-root implementation is qualified; the end-to-end workflow is not.
 
 ## Release gates and exclusions
 
@@ -269,9 +318,12 @@ neither excluded root contributes to correctness or performance claims.
 ## Remaining promotion work
 
 Do not weaken exact-token reuse, stage authority, review, checks, or completion gates to improve the
-headline. The Python four-call floor is now qualified; Rust retained its four-call floor. The next
-qualification must make the locked agent comparison less sensitive to a single decode trajectory:
-retain per-call prefill and decode time, use repeated interleaved paired runs on a locked machine,
-and report medians plus every raw trial. Any new implementation should target the phase that remains
-dominant in those paired profiles. A change still needs 15% end-to-end wall reduction and the
-per-case regression bound before this record may be promoted to production-ready.
+headline. Python passed the four-call floor in all three paired trials; Rust passed it in two of
+three, so the combined floor remains open. The next
+implementation must target the paired profile rather than cache restoration: every candidate root
+already hit exactly, while fresh-suffix prefill and generated-token trajectories dominate. It must
+also prevent or safely shorten the malformed Rust action without weakening structured-action,
+review, check, or commit gates. Repeat the same interleaved protocol after any change. A candidate
+still needs 15% paired-median wall and energy reductions, the Rust/Python four-call floor, the locked
+fresh-token ceiling, and the per-case regression bound before this record may be promoted to
+production-ready.
