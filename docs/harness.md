@@ -311,11 +311,14 @@ brief—continues to validate component and check IDs in submitted plans. Reposi
 the brief are labeled evidence-only and cannot add user authority.
 
 When a trusted contract names `allowed_paths`, planning may additionally receive complete existing
-small UTF-8 files as controller observations. The complete candidate set must fit below 55% of usable
-prompt capacity and survive a second workspace/path hash check. Each accepted observation records
-controller origin, exact byte coverage and hashes, seeds the read-before-write gate, and persists a
-complete stage-evidence entry. Missing, symlinked, binary, partial, changed, oversized, or displaced
-files are skipped so the model can use the ordinary read tool.
+small UTF-8 files as controller observations. Fresh plan review receives a new stage-bound rendering
+of the same eligible exact bytes instead of relying only on the serialized carried-evidence bundle;
+ordinary read tools remain available for absent or partial evidence. The complete candidate set must
+fit below 55% of usable prompt capacity and survive a second workspace/path hash check. Each accepted
+observation records controller origin, stage, exact byte coverage and hashes, seeds the
+read-before-write gate, and persists a complete stage-evidence entry. A stage never injects the same
+path observation twice. Missing, symlinked, binary, partial, changed, oversized, or displaced files
+are skipped so the model can use the ordinary read tool.
 
 Fresh code review receives a changed-path manifest capped at 16,000 characters, selected check IDs, and bounded check
 evidence instead of a complete diff followed by duplicate complete current files. Each manifest

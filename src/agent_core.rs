@@ -6836,9 +6836,10 @@ fn run_agent_steps(
             Some(
                 crate::workflow::WorkflowStage::Planning
                     | crate::workflow::WorkflowStage::PlanRevision
+                    | crate::workflow::WorkflowStage::PlanReview
             )
         ) {
-            let _ = maybe_inject_controller_planning_observations(
+            let _ = maybe_inject_controller_contract_observations(
                 generator,
                 args,
                 workspace_root,
@@ -13493,7 +13494,7 @@ fn delivery_stage_context(
             let plan_json = serde_json::to_string_pretty(plan)?;
             Ok(StageContext {
                 system_prompt: stable_workflow_stage_system_prompt(
-                    "You are a fresh-context adversarial plan critic. You did not receive the planner transcript or conclusions. Exact complete-file evidence carried and revalidated by the harness counts as observed repository bytes in this stage; use read-only tools for anything absent or partial. Challenge requirement coverage, architecture, component impact, test strategy, failure modes, and assumptions, then end only with submit_plan_review. Passing review does not require a repository read when the task, exact plan, bounded repository brief, and carried evidence already support every assessment; do not read merely to reconfirm code that the plan proposes to change. Do not invent a blocker when the plan is sound, but a pass with a P0/P1 challenge is invalid. Every repository path cited as evidence must be present in the current carried bundle or read in this invocation.",
+                    "You are a fresh-context adversarial plan critic. You did not receive the planner transcript or conclusions. Exact complete-file evidence carried and revalidated by the harness counts as observed repository bytes in this stage; use read-only tools for anything absent or partial. Challenge requirement coverage, architecture, component impact, test strategy, failure modes, and assumptions, then end only with submit_plan_review. Do not invent a blocker when the plan is sound, but a pass with a P0/P1 challenge is invalid. Every repository path cited as evidence must be present in the current carried bundle or read in this invocation.",
                     PLAN_REVIEW_SUBMISSION_GUIDANCE,
                 ),
                 user_prompt: format!(
@@ -16862,7 +16863,7 @@ fn controller_observations_are_current(
     }))
 }
 
-fn build_controller_planning_observations(
+fn build_controller_contract_observations(
     args: &AgentRequest,
     workspace_root: &Path,
     gate_state: &RefCell<GateState>,
@@ -16878,6 +16879,7 @@ fn build_controller_planning_observations(
             Some(
                 crate::workflow::WorkflowStage::Planning
                     | crate::workflow::WorkflowStage::PlanRevision
+                    | crate::workflow::WorkflowStage::PlanReview
             )
         )
     {
@@ -16893,7 +16895,16 @@ fn build_controller_planning_observations(
     );
     let mut candidates = Vec::new();
     for path in &contract.allowed_paths {
-        if gate_state.borrow().read_paths.contains(path) {
+        let stage = args
+            .workflow_stage
+            .expect("controller contract observation requires a workflow stage");
+        let already_observed_in_stage = gate_state
+            .borrow()
+            .stage_evidence
+            .controller_observations
+            .iter()
+            .any(|receipt| receipt.stage == stage && receipt.path == *path);
+        if already_observed_in_stage {
             continue;
         }
         let Some(path_content) = snapshot.paths.get(path) else {
@@ -16915,7 +16926,7 @@ fn build_controller_planning_observations(
         let Ok(bytes) = read_bounded_file_bytes(
             &resolved,
             u64::try_from(crate::workflow::MAX_STAGE_EVIDENCE_ENTRY_BYTES).unwrap_or(u64::MAX),
-            "controller planning observation",
+            "controller contract observation",
         ) else {
             continue;
         };
@@ -16930,8 +16941,8 @@ fn build_controller_planning_observations(
         }
         let arguments = json!({"path": path});
         let action_material = format!(
-            "planning_read_file\n{:?}\n{}\n{}\n{}\n{}",
-            args.workflow_stage,
+            "contract_read_file\n{:?}\n{}\n{}\n{}\n{}",
+            stage,
             path,
             snapshot.fingerprint,
             path_content.fingerprint,
@@ -16952,9 +16963,7 @@ fn build_controller_planning_observations(
             action_id,
             actual_origin: ControllerObservationOrigin::Controller,
             prompt_representation: args.observation_rendering,
-            stage: args
-                .workflow_stage
-                .expect("controller planning observation requires a workflow stage"),
+            stage,
             work_unit_id: None,
             operation: ControllerObservationOperation::ReadFile,
             path: path.clone(),
@@ -16976,8 +16985,7 @@ fn build_controller_planning_observations(
             path.clone(),
             path_content.fingerprint.clone(),
             snapshot.fingerprint.clone(),
-            args.workflow_stage
-                .expect("controller planning observation requires a workflow stage"),
+            stage,
             "controller_contract_read_file".to_string(),
             agent_context::normalized_arguments_sha256(&arguments),
             text.to_string(),
@@ -16994,7 +17002,7 @@ fn build_controller_planning_observations(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn maybe_inject_controller_planning_observations(
+fn maybe_inject_controller_contract_observations(
     generator: &mut dyn CompletionEngine,
     args: &AgentRequest,
     workspace_root: &Path,
@@ -17004,7 +17012,7 @@ fn maybe_inject_controller_planning_observations(
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<bool> {
-    let candidates = build_controller_planning_observations(args, workspace_root, gate_state)?;
+    let candidates = build_controller_contract_observations(args, workspace_root, gate_state)?;
     if candidates.is_empty()
         || !controller_observations_survive_preflight(
             generator,
@@ -23735,7 +23743,7 @@ the next imagined action"#;
     }
 
     #[test]
-    fn planning_preloads_exact_small_contract_paths_with_controller_provenance() {
+    fn planning_and_review_preload_exact_small_contract_paths_per_stage() {
         let repo = init_contract_test_repo();
         std::fs::write(repo.path().join("game.js"), "const answer = 41;\n").unwrap();
         git_run(&["add", "game.js"], repo.path()).unwrap();
@@ -23751,7 +23759,7 @@ the next imagined action"#;
         contract.allowed_paths.push("missing.js".to_string());
         request.contract = Some(contract);
 
-        let candidates = build_controller_planning_observations(
+        let candidates = build_controller_contract_observations(
             &request,
             repo.path(),
             &RefCell::new(GateState::default()),
@@ -23783,9 +23791,45 @@ the next imagined action"#;
                 .contains("actual_origin=controller")
         );
 
+        let mut gate = GateState::default();
+        gate.read_paths.insert("game.js".to_string());
+        gate.stage_evidence
+            .controller_observations
+            .push(candidate.receipt.clone());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanReview);
+        let review_candidates = build_controller_contract_observations(
+            &request,
+            repo.path(),
+            &RefCell::new(gate.clone()),
+        )
+        .unwrap();
+        assert_eq!(review_candidates.len(), 1);
+        let review_candidate = &review_candidates[0];
+        assert_eq!(
+            review_candidate.receipt.stage,
+            crate::workflow::WorkflowStage::PlanReview
+        );
+        assert_ne!(
+            review_candidate.receipt.action_id,
+            candidate.receipt.action_id
+        );
+        assert_eq!(
+            review_candidate.stage_entry.as_ref().unwrap().content,
+            "const answer = 41;\n"
+        );
+
+        gate.stage_evidence
+            .controller_observations
+            .push(review_candidate.receipt.clone());
+        assert!(
+            build_controller_contract_observations(&request, repo.path(), &RefCell::new(gate),)
+                .unwrap()
+                .is_empty()
+        );
+
         request.observation_rendering = crate::workflow::ObservationRendering::Native;
         assert!(
-            build_controller_planning_observations(
+            build_controller_contract_observations(
                 &request,
                 repo.path(),
                 &RefCell::new(GateState::default()),
@@ -31191,7 +31235,7 @@ the next imagined action"#;
     fn immutable_workflow_protocol_is_rendered_inside_the_versioned_stage_root() {
         assert_eq!(
             crate::inference::AGENT_SYSTEM_INSTRUCTION_VERSION,
-            "agent-system-v3"
+            "agent-system-v4"
         );
         for protocol in [
             PLAN_SUBMISSION_GUIDANCE,

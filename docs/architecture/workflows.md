@@ -698,6 +698,12 @@ exact rendered-token comparison remains the reuse authority. A decode-only const
 without invalidating identical prefetched KV state, but the fresh constraint remains recorded and
 enforced.
 
+Exact small contract-path evidence remains outside that root. Planning and isolated plan review each
+receive a stage-bound controller rendering made from bytes re-read in that stage's exact workspace.
+The controller rechecks workspace and path fingerprints after prompt preflight, records full byte
+coverage, and skips unsafe or oversized candidates. Review keeps its normal repository-read tools,
+so the optimization changes evidence placement rather than review authority.
+
 FlashMoe native usage further separates memory lookup, disk open/read/decode, CPU validation and
 allocation, Metal state hydration, actual fresh-suffix prefill, prompt-snapshot capture, and durable
 write queueing. Session metrics report how many queued checkpoints completed, their wall time, and
