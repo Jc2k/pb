@@ -62,6 +62,7 @@
   - [Stable prompt roots and FlashMoe refill](stable-prompt-cache-and-refill-plan.md)
   - [Private-workload usability corpus](benchmarks/private-workload-usability.md)
   - [Prompt-root Phase 0 baseline](benchmarks/prompt-root-phase0.md)
+  - [Stable prompt-root release qualification](benchmarks/stable-prompt-root-production.md)
 - [External publication follow-on](external-publication-workflow-follow-on.md)
 - [FlashMoe architecture parity](flashmoe-architecture-parity-plan.md)
   - [Resource baseline](benchmarks/harness-r0-baseline.md)

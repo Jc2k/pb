@@ -1,7 +1,7 @@
 # Private-workload usability corpus
 
 **Status:** Shipped corpus and tooling; 24/24 fixtures qualified; original and
-post-optimization stratified three-language samples recorded on 25 July 2026.
+post-optimization stratified samples plus a complete release-candidate run recorded.
 
 This corpus exists to answer an internal question: is pb useful for the kinds of
 small Rust, Python, and React/TypeScript repairs that occur in private local
@@ -191,6 +191,18 @@ One excluded orchestration attempt launched the release binary as a Deno child i
 sandbox and received no Metal device; direct `pb harness agent` runs used Metal normally. Those
 three setup failures remain preserved as experiment errors and are not included in the qualification
 sample.
+
+## 26 July 2026 complete prompt-root qualification
+
+Revision `bb3e89f9` ran all 24 cases with the release binary after stable-root canonicalization,
+shared FlashMoe prompt-root persistence, byte-budgeted retention, access-recency repair, and
+sessionless constrained-root persistence. The independent audit found 21 verified-clean passes,
+three truthful bounded model/control limits, zero false verification, 127/127 root-hit invocations,
+and 268,147/268,147 eligible root tokens reused. The three-language sample passed its fresh-prefill
+and energy targets but failed its wall-time and call-shape promotion gates, so it is not labelled
+production-ready. See the
+[stable prompt-root release qualification](stable-prompt-root-production.md) and its checked-in
+machine-readable baseline for the full result and exact exclusions.
 
 ## Engineering priorities
 

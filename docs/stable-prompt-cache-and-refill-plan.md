@@ -1,6 +1,8 @@
 # Stable prompt roots and FlashMoe refill
 
-Status: **Design record; Phases 0–2 are in progress and production qualification is open.**
+Status: **Design record; cache/refill implementation and release-candidate cache qualification are
+complete, while managed-workflow performance promotion and the production-ready designation remain
+open.**
 
 This plan closes the efficiency gap left after the bounded-workflow call-reduction work. That work
 reduced the locked Rust/Python/React sample from 35 model calls and 100,249 fresh-prefill tokens to
@@ -18,6 +20,11 @@ The locked before-and-after evidence is retained in the
 FlashMoe graph and parity evidence remain governed by the
 [FlashMoe architecture parity plan](flashmoe-architecture-parity-plan.md) and
 [Qwen prefill qualification](benchmarks/qwen3-coder-next-prefill-qualification.md).
+
+The 26 July release-candidate result is retained in the
+[stable prompt-root qualification](benchmarks/stable-prompt-root-production.md). It closes the
+known stable-root, sessionless-root, retention, refill-parity, and 24-case cache-safety gaps. It does
+not close the plan: the locked three-language sample missed the wall-time and call-shape gates.
 
 ## Outcome
 
@@ -460,12 +467,13 @@ Each phase appends a dated row rather than rewriting the original baseline:
 | Phase | Revision | Artifact | Result | Status |
 | --- | --- | --- | --- | --- |
 | Call-reduction baseline | `a69239ce` | `benchmarks/private-workload-usability.md` and locked JSON baseline | 3/3 verified clean; 14 calls; 47,271 fresh-prefill tokens; 15m 52s; 9.97 Wh | Shipped baseline |
-| Phase 0 root baseline | `f6fd5a71` | [Single-case diagnostic](benchmarks/prompt-root-phase0.md) and `fixtures/harness-usability/baselines/2026-07-25-prompt-root-phase0-rust.json` | Rust 1/1 verified clean; 4/4 complete disk-root hits; suffix prefill dominated | Partial; three-language rerun open |
-| Phase 1 stable roots | worktree after `f6fd5a71` | Controller descriptor, canonical-tool, target-path, and fail-closed fixtures | Implementation present; cross-repository/backend/restart matrix not run | In progress |
-| Phase 2 cache lifecycle | worktree after `f6fd5a71` | Typed byte-budget LRU and corruption/symlink/manifest fixtures | Implementation present; concurrency/full-disk/live restart matrix not run | In progress |
-| Phase 3 refill | — | Scalar/layer-major restored-suffix qualification | Not run | Open |
-| Phase 4 workflow | — | Locked three-language rerun | Not run | Open |
-| Phase 5 production | — | Complete 24-case and release qualification | Not run | Open |
+| Phase 0 root baseline | `f6fd5a71` | [Single-case diagnostic](benchmarks/prompt-root-phase0.md) and `fixtures/harness-usability/baselines/2026-07-25-prompt-root-phase0-rust.json` | Rust 1/1 verified clean; 4/4 complete disk-root hits; suffix prefill dominated | Historical partial baseline; superseded below |
+| Phase 0 observability | `f6fd5a71` through `bb3e89f9` | Privacy-safe descriptors, miss detail, refill phases, auditor aggregate, and full-corpus JSON | 127/127 reconciled invocations; bounded root/namespace identity and all refill phases retained | Qualified |
+| Phase 1 stable roots | `6aae3c8d` | Controller descriptor, canonical-tool, cross-repository, backend-renderer, dynamic-evidence, and fail-closed fixtures | Exact authority variants stable; changed rendered authority invalidates; 268,147/268,147 eligible tokens reused in final corpus | Qualified |
+| Phase 2 cache lifecycle | `3ef1c449`, `bb3e89f9` | Byte-budget LRU, corruption/fingerprint/symlink/manifest/concurrency/storage-root fixtures; cold/restart Task-root pair; late corpus retention cases | Hot disk recency retained; sessionless root restores 30/30 after restart; 24/24 persistence completed | Qualified for shipped paths |
+| Phase 3 refill | `6aae3c8d` | Retained resident/streamed, scalar/layer-major, restored-suffix, 0/1/31/32/33, and resource matrix | Exact parity and balanced resources; suffix prefill dominated; existing graph already selects actual suffix, so no extra fast path was promoted | Profile complete; no behavior change justified |
+| Phase 4 workflow | `bb3e89f9` | Locked Rust/Python/React rerun in [qualification record](benchmarks/stable-prompt-root-production.md) | 3/3 correct; 100% roots; fresh prefill -25.73%; energy -24.22%; wall only -3.83%; Python 5 calls | **Promotion blocked** |
+| Phase 5 production | `bb3e89f9` | Complete 24-case audit, failure matrix, llama.cpp control, macOS release and native smoke | 21/24 verified clean, 3 truthful model/control limits, 0 false verification/cache defects/experiment errors; release gates pass | Cache candidate qualified; production-ready designation open |
 
 Passing a unit test, a one-token smoke, or the four-call happy path does not close an open row. Only
 the named retained evidence and its acceptance gates can change this plan's status.
