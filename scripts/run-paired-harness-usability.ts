@@ -23,6 +23,7 @@ interface Options {
   candidateBinary: string;
   baselineRevision: string;
   candidateRevision: string;
+  evaluatorRevision: string;
   model: string;
   repeats: number;
   caseIds: string[];
@@ -55,6 +56,8 @@ export interface PairedPromotionReport {
   protocol: {
     repeats: number;
     cases: string[];
+    scratch_parent: string;
+    evaluator_revision: string;
     machine_class: string;
     model: string;
     sampling: {
@@ -109,6 +112,7 @@ function parseOptions(args: string[]): Options {
   let candidateBinary: string | undefined;
   let baselineRevision: string | undefined;
   let candidateRevision: string | undefined;
+  let evaluatorRevision: string | undefined;
   let model: string | undefined;
   let repeats = 3;
   const caseIds: string[] = [];
@@ -130,6 +134,9 @@ function parseOptions(args: string[]): Options {
     } else if (argument === "--candidate-revision") {
       candidateRevision = requireValue(args, index, argument);
       index++;
+    } else if (argument === "--evaluator-revision") {
+      evaluatorRevision = requireValue(args, index, argument);
+      index++;
     } else if (argument === "--model") {
       model = requireValue(args, index, argument);
       index++;
@@ -146,10 +153,10 @@ function parseOptions(args: string[]): Options {
 
   if (
     !scratchParent || !baselineBinary || !candidateBinary ||
-    !baselineRevision || !candidateRevision || !model
+    !baselineRevision || !candidateRevision || !evaluatorRevision || !model
   ) {
     throw new Error(
-      "--scratch-parent, --model, both --*-binary paths, and both --*-revision values are required",
+      "--scratch-parent, --model, --evaluator-revision, both --*-binary paths, and both --*-revision values are required",
     );
   }
   if (!Number.isInteger(repeats) || repeats < 3 || repeats % 2 === 0) {
@@ -161,6 +168,7 @@ function parseOptions(args: string[]): Options {
     candidateBinary,
     baselineRevision,
     candidateRevision,
+    evaluatorRevision,
     model,
     repeats,
     caseIds: caseIds.length > 0 ? caseIds : DEFAULT_CASE_IDS,
@@ -228,6 +236,8 @@ export function buildPairedReport(
     | "caseIds"
     | "baselineRevision"
     | "candidateRevision"
+    | "evaluatorRevision"
+    | "scratchParent"
     | "model"
   >,
   binaryHashes: Record<Variant, string>,
@@ -344,6 +354,8 @@ export function buildPairedReport(
     protocol: {
       repeats: options.repeats,
       cases: options.caseIds,
+      scratch_parent: options.scratchParent,
+      evaluator_revision: options.evaluatorRevision,
       machine_class: `${Deno.build.os}-${Deno.build.arch}`,
       model: options.model,
       sampling: {
@@ -510,6 +522,8 @@ async function main(): Promise<void> {
           protocol: {
             repeats: options.repeats,
             cases: options.caseIds,
+            scratch_parent: options.scratchParent,
+            evaluator_revision: options.evaluatorRevision,
             machine_class: `${Deno.build.os}-${Deno.build.arch}`,
             model: options.model,
             sampling: {

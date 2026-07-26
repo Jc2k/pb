@@ -260,6 +260,7 @@ deno run --allow-read --allow-write --allow-run \
   --baseline-revision BASELINE_REVISION \
   --candidate-binary target/aarch64-apple-darwin/release/pb \
   --candidate-revision CANDIDATE_REVISION \
+  --evaluator-revision EVALUATOR_REVISION \
   --model hf://mlx-community/Qwen3-Coder-Next-4bit \
   --repeats 3
 ```

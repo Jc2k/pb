@@ -89,6 +89,8 @@ Deno.test("paired qualification uses raw odd-sample medians and all promotion ga
       caseIds,
       baselineRevision: "base",
       candidateRevision: "candidate",
+      evaluatorRevision: "evaluator",
+      scratchParent: "/private/tmp/paired",
       model: "local-model",
     },
     { baseline: "base-sha", candidate: "candidate-sha" },
