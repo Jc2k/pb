@@ -683,14 +683,16 @@ When a backend can identify a reusable stable root, the cache record also carrie
 rendered-token digest, model-namespace digest, eligible and reused root-token counts, and a
 controller-owned bounded authority class. Before inference, the controller binds an explicit system
 instruction version, workflow stage, authority class, canonical rendered-tool-schema digest, and
-decode-constraint mode to the request. Model-facing tools are sorted canonically; dynamic task,
-repository, branch, environment, plan, and evidence content remains after the root. Planning,
-review, implementation, repair, and closure use finite evidence/authorized/terminal authority
-classes instead of incidental readiness combinations. Any managed workflow state without a
-classified authority fails before inference. These labels are diagnostic only: the
-backend's exact rendered-token comparison remains the reuse authority. A decode-only constraint can
-change without invalidating identical prefetched KV state, but the fresh constraint remains recorded
-and enforced.
+decode-constraint mode to the request. Model-facing tools are sorted canonically. The versioned
+first-system-message root contains the immutable stage role, terminal action protocol, and handoff
+authority rule; these strings carry no task or repository material. Dynamic task, repository,
+branch, environment, contract, plan, correction, and evidence content remains after the root.
+Planning, review, implementation, repair, and closure use finite evidence/authorized/terminal
+authority classes instead of incidental readiness combinations. Any managed workflow state without
+a classified authority fails before inference. These labels are diagnostic only: the backend's
+exact rendered-token comparison remains the reuse authority. A decode-only constraint can change
+without invalidating identical prefetched KV state, but the fresh constraint remains recorded and
+enforced.
 
 FlashMoe native usage further separates memory lookup, disk open/read/decode, CPU validation and
 allocation, Metal state hydration, actual fresh-suffix prefill, prompt-snapshot capture, and durable

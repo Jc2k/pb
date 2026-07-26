@@ -42,7 +42,9 @@ runtime-layout, and token hashes prevent incompatible restoration; session filen
 directories and files are owner-only on Unix; writes use temporary files and atomic replacement.
 Sessionless JSON-constrained Task planning writes only the stable first-system-message checkpoint;
 dynamic Task evidence, the JSON constraint engine, and generated artifact are not captured in that
-shared root.
+shared root. Managed workflow stage roots likewise contain only the immutable role, terminal action
+protocol, handoff authority rule, and exact tool schema. Task text, repository data, contracts,
+plans, corrections, and evidence remain in the fresh suffix and in session-owned state.
 `inference.llamacpp_session_cache_enabled=false` and
 `inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are
