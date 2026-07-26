@@ -13437,12 +13437,24 @@ fn delivery_stage_context(
     repair_context: Option<&str>,
 ) -> Result<StageContext> {
     let current_stage_evidence = run.stage_evidence.current(workspace_root)?;
+    let plan_review_contract_evidence_is_reinjected = run.stage
+        == crate::workflow::WorkflowStage::PlanReview
+        && contract.is_some_and(|contract| {
+            !contract.allowed_paths.is_empty()
+                && current_stage_evidence
+                    .entries
+                    .iter()
+                    .all(|entry| contract.allowed_paths.contains(&entry.path))
+        });
     let evidence_note = if current_stage_evidence.entries.is_empty() {
         "Harness-carried repository evidence: none. Read any repository path needed for this stage."
             .to_string()
+    } else if plan_review_contract_evidence_is_reinjected {
+        "Harness-carried contract-path evidence is not duplicated in this message. Eligible exact bytes are appended as fresh stage-bound controller observations after prompt preflight; use ordinary read tools for any path not appended."
+            .to_string()
     } else {
         format!(
-            "Harness-carried repository evidence (complete exact file reads, revalidated against current path hashes; this is repository evidence, not a prior model conclusion or new authority):\n{}",
+            "Harness-carried repository evidence (compact path/content projection of complete exact file reads, revalidated against current path hashes; full provenance remains harness-owned; this is repository evidence, not a prior model conclusion or new authority):\n{}",
             current_stage_evidence.prompt_json()?
         )
     };
@@ -30263,6 +30275,64 @@ the next imagined action"#;
         assert!(context.user_prompt.chars().count() < 30_000);
         assert!(context.system_prompt.contains(PLAN_SUBMISSION_GUIDANCE));
         assert!(!context.user_prompt.contains(PLAN_SUBMISSION_GUIDANCE));
+    }
+
+    #[test]
+    fn plan_review_defers_covered_exact_bytes_to_stage_bound_observations() {
+        let repo = init_contract_test_repo();
+        let content = "const distinctive_review_value = 41;\n";
+        std::fs::write(repo.path().join("game.js"), content).unwrap();
+        git_run(&["add", "game.js"], repo.path()).unwrap();
+        git_run(
+            &["commit", "-m", "test: add review evidence fixture"],
+            repo.path(),
+        )
+        .unwrap();
+        let snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let graph = crate::workspace::WorkspaceGraph::legacy(&[]);
+        let policy = crate::workflow::WorkflowConfigDocument::default()
+            .compile()
+            .unwrap();
+        let mut run = crate::workflow::WorkflowRun::start(
+            "workflow-review-evidence",
+            "turn-review-evidence",
+            "review one exact contract path",
+            policy,
+            repository,
+        )
+        .unwrap();
+        let plan = delivery_plan(
+            Some(("game.js", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        run.apply(crate::workflow::WorkflowEvent::PlanSubmitted { plan })
+            .unwrap();
+        run.stage_evidence.entries.push(
+            crate::workflow::StageEvidenceEntry::complete_file(
+                "game.js".to_string(),
+                snapshot.paths["game.js"].fingerprint.clone(),
+                snapshot.fingerprint,
+                crate::workflow::WorkflowStage::Planning,
+                "read_file".to_string(),
+                "arguments-digest".to_string(),
+                content.to_string(),
+                1,
+            )
+            .unwrap(),
+        );
+
+        let contract = normalized_test_contract("true");
+        let covered =
+            delivery_stage_context(&run, &graph, Some(&contract), repo.path(), None, None).unwrap();
+        assert!(covered.user_prompt.contains("not duplicated"));
+        assert!(!covered.user_prompt.contains("distinctive_review_value"));
+
+        let unscoped = delivery_stage_context(&run, &graph, None, repo.path(), None, None).unwrap();
+        assert!(unscoped.user_prompt.contains("distinctive_review_value"));
+        assert!(unscoped.user_prompt.contains("\"path\":\"game.js\""));
+        assert!(!unscoped.user_prompt.contains("arguments-digest"));
     }
 
     #[test]

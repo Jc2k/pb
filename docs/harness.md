@@ -320,6 +320,12 @@ read-before-write gate, and persists a complete stage-evidence entry. A stage ne
 path observation twice. Missing, symlinked, binary, partial, changed, oversized, or displaced files
 are skipped so the model can use the ordinary read tool.
 
+Checkpointed evidence retains its complete controller receipts, hashes, sizes, source stage/tool,
+and ordering. Model prompts receive only a compact path/content projection after pb revalidates the
+current path hash. When isolated plan review will receive eligible contract-path bytes as fresh
+controller blocks, its initial user message does not duplicate those bytes or receipt metadata; if a
+block does not survive preflight, the reviewer's ordinary read tools remain available.
+
 Fresh code review receives a changed-path manifest capped at 16,000 characters, selected check IDs, and bounded check
 evidence instead of a complete diff followed by duplicate complete current files. Each manifest
 entry states added, modified, deleted, or renamed status; prior path when applicable; text, binary,

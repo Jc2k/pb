@@ -704,6 +704,11 @@ The controller rechecks workspace and path fingerprints after prompt preflight, 
 coverage, and skips unsafe or oversized candidates. Review keeps its normal repository-read tools,
 so the optimization changes evidence placement rather than review authority.
 
+Durable checkpoints and audit events retain the complete observation receipts. Later model stages
+receive a compact path/content projection only after current-hash validation, while isolated plan
+review avoids even that copy when the same eligible contract bytes will follow as stage-bound
+controller blocks. This reduces fresh prompt work without weakening the structured evidence gate.
+
 FlashMoe native usage further separates memory lookup, disk open/read/decode, CPU validation and
 allocation, Metal state hydration, actual fresh-suffix prefill, prompt-snapshot capture, and durable
 write queueing. Session metrics report how many queued checkpoints completed, their wall time, and

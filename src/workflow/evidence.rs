@@ -538,7 +538,21 @@ impl StageEvidenceBundle {
     }
 
     pub fn prompt_json(&self) -> Result<String> {
-        serde_json::to_string(self).context("failed to serialize carried stage evidence")
+        let entries = self
+            .entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "path": entry.path,
+                    "content": entry.content,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&serde_json::json!({
+            "version": STAGE_EVIDENCE_SCHEMA_VERSION,
+            "entries": entries,
+        }))
+        .context("failed to serialize carried stage evidence prompt projection")
     }
 }
 
@@ -701,6 +715,31 @@ mod tests {
                 .unwrap()
                 .controller_observations
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn prompt_projection_keeps_exact_bytes_without_controller_receipt_metadata() {
+        let repo = repo();
+        let bundle = StageEvidenceBundle {
+            entries: vec![entry(repo.path(), 1)],
+            controller_observations: vec![observation(repo.path())],
+            ..StageEvidenceBundle::default()
+        };
+
+        let prompt: serde_json::Value =
+            serde_json::from_str(&bundle.prompt_json().unwrap()).unwrap();
+        assert_eq!(prompt["entries"][0]["path"], "small.txt");
+        assert_eq!(prompt["entries"][0]["content"], "one\ntwo\n");
+        assert!(prompt.get("controller_observations").is_none());
+        assert!(prompt["entries"][0].get("workspace_fingerprint").is_none());
+
+        let checkpoint = serde_json::to_value(&bundle).unwrap();
+        assert!(checkpoint.get("controller_observations").is_some());
+        assert!(
+            checkpoint["entries"][0]
+                .get("workspace_fingerprint")
+                .is_some()
         );
     }
 
