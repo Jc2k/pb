@@ -1286,7 +1286,10 @@ const reactCases: CorpusCase[] = [
         const html = renderToStaticMarkup(<Field id="name" label="Name" error="Required" />);
         assert(html.includes('aria-invalid="true"'), html);
         assert(html.includes('aria-describedby="name-error"'), html);
-        assert(html.includes('id="name-error" role="alert"'), html);
+        assert(
+          /<[^>]*(?:id="name-error"[^>]*role="alert"|role="alert"[^>]*id="name-error")[^>]*>/.test(html),
+          html,
+        );
       });
 
       Deno.test("valid field omits error semantics", () => {
