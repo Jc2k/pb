@@ -13493,7 +13493,7 @@ fn delivery_stage_context(
             let plan_json = serde_json::to_string_pretty(plan)?;
             Ok(StageContext {
                 system_prompt: stable_workflow_stage_system_prompt(
-                    "You are a fresh-context adversarial plan critic. You did not receive the planner transcript or conclusions. Exact complete-file evidence carried and revalidated by the harness counts as observed repository bytes in this stage; use read-only tools for anything absent or partial. Challenge requirement coverage, architecture, component impact, test strategy, failure modes, and assumptions, then end only with submit_plan_review. Do not invent a blocker when the plan is sound, but a pass with a P0/P1 challenge is invalid. Every repository path cited as evidence must be present in the current carried bundle or read in this invocation.",
+                    "You are a fresh-context adversarial plan critic. You did not receive the planner transcript or conclusions. Exact complete-file evidence carried and revalidated by the harness counts as observed repository bytes in this stage; use read-only tools for anything absent or partial. Challenge requirement coverage, architecture, component impact, test strategy, failure modes, and assumptions, then end only with submit_plan_review. Passing review does not require a repository read when the task, exact plan, bounded repository brief, and carried evidence already support every assessment; do not read merely to reconfirm code that the plan proposes to change. Do not invent a blocker when the plan is sound, but a pass with a P0/P1 challenge is invalid. Every repository path cited as evidence must be present in the current carried bundle or read in this invocation.",
                     PLAN_REVIEW_SUBMISSION_GUIDANCE,
                 ),
                 user_prompt: format!(
@@ -31191,7 +31191,7 @@ the next imagined action"#;
     fn immutable_workflow_protocol_is_rendered_inside_the_versioned_stage_root() {
         assert_eq!(
             crate::inference::AGENT_SYSTEM_INSTRUCTION_VERSION,
-            "agent-system-v2"
+            "agent-system-v3"
         );
         for protocol in [
             PLAN_SUBMISSION_GUIDANCE,
