@@ -107,6 +107,7 @@ impl DsmlConstraint {
             calls: Vec::new(),
             mutation_calls: 0,
             saw_terminal: false,
+            completed_mutation_payload: None,
         };
         match parser.parse() {
             PrefixResult::Incomplete => DsmlProbe {
@@ -123,6 +124,35 @@ impl DsmlConstraint {
             },
             PrefixResult::Invalid => invalid_probe(None),
             PrefixResult::MutationRejected(code) => invalid_probe(Some(code)),
+        }
+    }
+
+    /// Returns the first syntactically and mutation-valid payload whose JSON string has closed,
+    /// even when the following DSML parameter/invoke delimiters are still only prefixes. This is
+    /// the last repairable sampling boundary for a semantic provider: rejecting the closing quote
+    /// lets the model continue the string, while waiting for the invoke to close does not.
+    pub fn completed_mutation_payload(&self, transcript: &[u8]) -> Option<CanonicalToolCall> {
+        let decoded = std::str::from_utf8(transcript).ok()?;
+        let start = decoded.find(CALLS_OPEN)?;
+        let mut parser = PrefixParser {
+            input: decoded,
+            position: start + CALLS_OPEN.len(),
+            schemas: &self.schemas,
+            terminal_tools: &self.terminal_tools,
+            mutation_gate: self.mutation_gate.as_ref(),
+            calls: Vec::new(),
+            mutation_calls: 0,
+            saw_terminal: false,
+            completed_mutation_payload: None,
+        };
+        let result = parser.parse();
+        if matches!(
+            result,
+            PrefixResult::Invalid | PrefixResult::MutationRejected(_)
+        ) {
+            None
+        } else {
+            parser.completed_mutation_payload
         }
     }
 
@@ -169,6 +199,7 @@ struct PrefixParser<'a> {
     calls: Vec<CanonicalToolCall>,
     mutation_calls: usize,
     saw_terminal: bool,
+    completed_mutation_payload: Option<CanonicalToolCall>,
 }
 
 impl PrefixParser<'_> {
@@ -345,7 +376,15 @@ impl PrefixParser<'_> {
 
         if mutation_payload {
             let (value, consumed) = match parse_json_string_prefix(&self.input[self.position..]) {
-                JsonStringPrefix::Incomplete => return ParameterValue::Incomplete,
+                JsonStringPrefix::Incomplete(prefix) => {
+                    if let (Some(prefix), Some(gate)) = (prefix, self.mutation_gate)
+                        && let CompletionDecision::Reject(code) =
+                            gate.evaluate_prefix(tool, prior_arguments, &prefix)
+                    {
+                        return ParameterValue::MutationRejected(code);
+                    }
+                    return ParameterValue::Incomplete;
+                }
                 JsonStringPrefix::Invalid => return ParameterValue::Invalid,
                 JsonStringPrefix::Complete(value, consumed) => (value, consumed),
             };
@@ -356,10 +395,14 @@ impl PrefixParser<'_> {
             arguments.insert(parameter.to_string(), Value::String(value.clone()));
             if let Some(gate) = self.mutation_gate
                 && let CompletionDecision::Reject(code) =
-                    gate.evaluate(tool, &Value::Object(arguments))
+                    gate.evaluate(tool, &Value::Object(arguments.clone()))
             {
                 return ParameterValue::MutationRejected(code);
             }
+            self.completed_mutation_payload = Some(CanonicalToolCall {
+                name: tool.to_string(),
+                arguments: Value::Object(arguments),
+            });
             self.position += consumed;
             match self.consume_literal(PARAMETER_CLOSE) {
                 PrefixResult::Complete => ParameterValue::Complete(Value::String(value)),
@@ -474,7 +517,7 @@ enum ParameterValue {
 
 enum JsonStringPrefix {
     Complete(String, usize),
-    Incomplete,
+    Incomplete(Option<String>),
     Invalid,
 }
 
@@ -493,7 +536,7 @@ fn json_value_before_parameter_close(input: &str) -> Option<(Value, usize)> {
 fn parse_json_string_prefix(input: &str) -> JsonStringPrefix {
     if !input.starts_with('"') {
         return if input.is_empty() {
-            JsonStringPrefix::Incomplete
+            JsonStringPrefix::Incomplete(Some(String::new()))
         } else {
             JsonStringPrefix::Invalid
         };
@@ -530,7 +573,13 @@ fn parse_json_string_prefix(input: &str) -> JsonStringPrefix {
             _ => {}
         }
     }
-    JsonStringPrefix::Incomplete
+    if escaped || unicode_digits > 0 {
+        JsonStringPrefix::Incomplete(None)
+    } else {
+        serde_json::from_str::<String>(&format!("{input}\""))
+            .map(|value| JsonStringPrefix::Incomplete(Some(value)))
+            .unwrap_or(JsonStringPrefix::Incomplete(None))
+    }
 }
 
 fn mutation_payload_field(tool: &str) -> Option<&'static str> {
@@ -982,6 +1031,35 @@ mod tests {
         let complete = format!("{valid}{PARAMETER_CLOSE}\n{INVOKE_CLOSE}\n{CALLS_CLOSE}");
         let probe = constraint.probe(complete.as_bytes(), false);
         assert!(probe.valid && probe.complete && probe.complete_terminal_call);
+    }
+
+    #[test]
+    fn completed_mutation_payload_is_visible_before_dsml_delimiters_commit() {
+        let constraint = constraint();
+        let transcript = write_prefix("\"pub fn ok() {}\\n\"");
+        let call = constraint
+            .completed_mutation_payload(transcript.as_bytes())
+            .expect("closed JSON string should expose a semantic boundary");
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.arguments["path"], "lib.rs");
+        assert_eq!(call.arguments["content"], "pub fn ok() {}\n");
+        assert!(
+            constraint
+                .completed_mutation_payload(write_prefix("\"pub fn pending() {").as_bytes())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mutation_prefix_rejects_a_definite_impossible_transition_before_quote_close() {
+        let constraint = constraint();
+        let impossible = write_prefix("\"pub fn broken() { ]");
+        assert_eq!(
+            constraint.probe(impossible.as_bytes(), false).rejection,
+            Some(RejectionCode::InvalidPrefix)
+        );
+        let repairable = write_prefix("\"pub fn pending() { let value = (");
+        assert!(constraint.probe(repairable.as_bytes(), false).valid);
     }
 
     #[test]

@@ -95,6 +95,10 @@ impl WorkspaceSnapshot {
     pub fn total_bytes(&self) -> usize {
         self.entries.values().map(|entry| entry.bytes.len()).sum()
     }
+
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = &SnapshotEntry> {
+        self.entries.values()
+    }
 }
 
 #[cfg(test)]

@@ -181,6 +181,16 @@ mint check evidence or bypass configured checks. A blocking current result can g
 exact-path repair focus after older read/stage evidence is invalidated. pb never executes LSP
 workspace edits, commands, formatting, or code actions.
 
+An opt-in semantic mutation gate gives a language server authority to veto a generated boundary or
+final publication, never authority to mutate. The controller supplies exact in-memory overlays and
+checks the complete workspace fingerprint before and after analysis. Required mode trusts only a
+digest-pinned container provider with a complete pull-diagnostic baseline/candidate pair; host
+commands, mutable tags, push-only publications, restarts, stale versions, timeouts, deletion impact,
+and unclassified diagnostics fail closed. Advisory mode cannot veto. Provider processes keep the
+same read-only workspace, declared cache, and network boundaries as ordinary LSP sidecars. Source,
+paths, diagnostic messages, and symbol contents are excluded from constraint telemetry; only
+provider/world hashes, classified outcome counts, guarantee rung, and bounded timing are durable.
+
 Marketplace LSP metadata is also untrusted input. Registry manifests, image configurations, and
 authentication responses have byte ceilings; the typed LSP package annotation has its own 64 KiB
 ceiling and rejects unknown fields, unsupported versions, invalid identifiers, and excessive list

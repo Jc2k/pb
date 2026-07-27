@@ -10,6 +10,8 @@
 //! prints a summary of what it found and what it configured.
 //! MCP tool-effect declarations such as `capabilities.read_only_tools` remain explicit operator
 //! configuration: `pb init` never infers that an external operation is read-only.
+//! LSP `semantic_enforcement` also remains explicit: project inspection cannot prove that an
+//! analyzer, toolchain, dependency cache, or diagnostic baseline is authoritative.
 
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};

@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use crate::{
     CollarError,
+    analysis::{Viability, validate_supported_prefix},
     mutation::{FileStreamMode, LogicalPath, PatchStream, VirtualFileStream, prepare_replace},
     tool::CollarManifest,
 };
@@ -17,7 +18,9 @@ pub enum RejectionCode {
     ExistingCreateTarget,
     MissingSnapshot,
     NoContentChange,
+    InvalidPrefix,
     InvalidSyntax,
+    InvalidSemantics,
     InvalidPatch,
 }
 
@@ -30,7 +33,9 @@ impl RejectionCode {
             Self::ExistingCreateTarget => "existing_create_target",
             Self::MissingSnapshot => "missing_snapshot",
             Self::NoContentChange => "no_content_change",
+            Self::InvalidPrefix => "invalid_prefix",
             Self::InvalidSyntax => "invalid_syntax",
+            Self::InvalidSemantics => "invalid_semantics",
             Self::InvalidPatch => "invalid_patch",
         }
     }
@@ -83,6 +88,110 @@ impl MutationCompletionGate {
             }
             _ => CompletionDecision::NotApplicable,
         }
+    }
+
+    /// Conservatively probes a decoded mutation payload before its enclosing string closes.
+    /// `arguments` contains only parameters that have already closed on the wire; `payload_prefix`
+    /// is the decoded logical prefix of the active mutation field.
+    pub fn evaluate_prefix(
+        &self,
+        name: &str,
+        arguments: &serde_json::Map<String, Value>,
+        payload_prefix: &str,
+    ) -> CompletionDecision {
+        if payload_prefix.len() > self.manifest.limits.max_argument_bytes {
+            return CompletionDecision::Reject(RejectionCode::ArgumentLimit);
+        }
+        match name {
+            "write_file" if self.manifest.mutation_policy.allow_write_file => {
+                self.evaluate_file_prefix(arguments, payload_prefix, false)
+            }
+            "replace_file" if self.manifest.mutation_policy.allow_replace_file => {
+                self.evaluate_file_prefix(arguments, payload_prefix, true)
+            }
+            "edit_file" if self.manifest.mutation_policy.allow_replace_file => {
+                self.evaluate_edit_prefix(arguments, payload_prefix)
+            }
+            "apply_patch" if self.manifest.mutation_policy.allow_apply_patch => {
+                let mut stream = match PatchStream::new(
+                    self.manifest.workspace.clone(),
+                    self.manifest.limits.max_argument_bytes,
+                    self.manifest.limits.max_files,
+                    self.manifest.limits.max_patch_hunks,
+                ) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        return CompletionDecision::Reject(classify_mutation_error(&error));
+                    }
+                };
+                match stream.push(payload_prefix.as_bytes()) {
+                    Ok(()) => CompletionDecision::Accept,
+                    Err(error) => CompletionDecision::Reject(classify_mutation_error(&error)),
+                }
+            }
+            _ => CompletionDecision::NotApplicable,
+        }
+    }
+
+    fn evaluate_file_prefix(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+        payload_prefix: &str,
+        replace: bool,
+    ) -> CompletionDecision {
+        let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+            return CompletionDecision::NotApplicable;
+        };
+        let path = match LogicalPath::parse(path.to_string()) {
+            Ok(path) => path,
+            Err(_) => return CompletionDecision::Reject(RejectionCode::NonCanonicalPath),
+        };
+        if (replace && !self.manifest.workspace.contains(&path))
+            || (!replace && self.manifest.workspace.contains(&path))
+        {
+            return CompletionDecision::Reject(if replace {
+                RejectionCode::MissingSnapshot
+            } else {
+                RejectionCode::ExistingCreateTarget
+            });
+        }
+        prefix_decision(&path, payload_prefix.as_bytes())
+    }
+
+    fn evaluate_edit_prefix(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+        payload_prefix: &str,
+    ) -> CompletionDecision {
+        let (Some(path), Some(old_text)) = (
+            arguments.get("path").and_then(Value::as_str),
+            arguments.get("old_text").and_then(Value::as_str),
+        ) else {
+            return CompletionDecision::NotApplicable;
+        };
+        if old_text.is_empty() {
+            return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+        }
+        let path = match LogicalPath::parse(path.to_string()) {
+            Ok(path) => path,
+            Err(_) => return CompletionDecision::Reject(RejectionCode::NonCanonicalPath),
+        };
+        let Some(base) = self.manifest.workspace.get(&path) else {
+            return CompletionDecision::Reject(RejectionCode::MissingSnapshot);
+        };
+        let Ok(base_text) = std::str::from_utf8(&base.bytes) else {
+            return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+        };
+        if base_text.matches(old_text).take(2).count() != 1 {
+            return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+        }
+        let Some(start) = base_text.find(old_text) else {
+            return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+        };
+        let mut virtual_prefix = Vec::with_capacity(start.saturating_add(payload_prefix.len()));
+        virtual_prefix.extend_from_slice(&base.bytes[..start]);
+        virtual_prefix.extend_from_slice(payload_prefix.as_bytes());
+        prefix_decision(&path, &virtual_prefix)
     }
 
     fn evaluate_write(&self, arguments: &Value, replace: bool) -> CompletionDecision {
@@ -214,6 +323,17 @@ fn classify_mutation_error(error: &CollarError) -> RejectionCode {
     }
 }
 
+fn prefix_decision(path: &LogicalPath, bytes: &[u8]) -> CompletionDecision {
+    match validate_supported_prefix(path, bytes) {
+        Ok(report) if report.viability == Viability::Impossible => {
+            CompletionDecision::Reject(RejectionCode::InvalidPrefix)
+        }
+        Ok(report) if report.profile.is_some() => CompletionDecision::Accept,
+        Ok(_) => CompletionDecision::NotApplicable,
+        Err(_) => CompletionDecision::Reject(RejectionCode::InvalidPrefix),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -270,6 +390,20 @@ mod tests {
                 "write_file",
                 &json!({"path":"src/lib.rs","content":"pub fn ok() {}\n"})
             ),
+            CompletionDecision::Accept
+        );
+    }
+
+    #[test]
+    fn write_prefix_rejects_only_a_definite_impossible_transition() {
+        let gate = gate(Vec::new());
+        let arguments = json!({"path":"src/lib.rs"}).as_object().unwrap().clone();
+        assert_eq!(
+            gate.evaluate_prefix("write_file", &arguments, "fn value() { ]"),
+            CompletionDecision::Reject(RejectionCode::InvalidPrefix)
+        );
+        assert_eq!(
+            gate.evaluate_prefix("write_file", &arguments, "fn value() { let x = ("),
             CompletionDecision::Accept
         );
     }

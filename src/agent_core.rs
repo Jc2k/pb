@@ -7168,6 +7168,7 @@ fn run_agent_steps(
             text_backend,
             args,
             workspace_root,
+            lsp_registry,
             &gate_state,
             generation_messages,
             generation_tools,
@@ -8431,37 +8432,38 @@ fn run_final_grace(
         .reserve_model_invocation(FINAL_GRACE_MAX_TOKENS)?;
     debug_assert_eq!(grace_args.max_tokens, reserved_max_tokens);
     sink.workflow_model_invocation_started(nesting_depth)?;
-    let completion = match generator.generate(&grace_args, &prepared.messages, &[], true, None) {
-        Ok(completion) => completion,
-        Err(error) => {
-            let termination_reason = termination_reason_for_runtime_error(&error);
-            sink.emit(AgentEvent::FinalGrace {
-                status: FinalGraceStatus::Rejected,
-                detail: format!("final-only generation failed: {error:#}"),
-                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                timestamp_ms: Some(now_millis()),
-            });
-            sink.emit(AgentEvent::Error {
-                message: format!("{error:#}"),
-                summary: format!("Final grace terminated: {termination_reason}"),
-                nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                timestamp_ms: Some(now_millis()),
-            });
-            return Ok(StepRunOutcome {
-                reached_final: false,
-                contract_status: if args.contract.is_some() {
-                    ContractStatus::Satisfied
-                } else {
-                    ContractStatus::Unspecified
-                },
-                verified_completed: false,
-                termination_reason,
-                final_content: None,
-                metrics,
-                gate_state,
-            });
-        }
-    };
+    let completion =
+        match generator.generate(&grace_args, &prepared.messages, &[], true, None, None) {
+            Ok(completion) => completion,
+            Err(error) => {
+                let termination_reason = termination_reason_for_runtime_error(&error);
+                sink.emit(AgentEvent::FinalGrace {
+                    status: FinalGraceStatus::Rejected,
+                    detail: format!("final-only generation failed: {error:#}"),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+                sink.emit(AgentEvent::Error {
+                    message: format!("{error:#}"),
+                    summary: format!("Final grace terminated: {termination_reason}"),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+                return Ok(StepRunOutcome {
+                    reached_final: false,
+                    contract_status: if args.contract.is_some() {
+                        ContractStatus::Satisfied
+                    } else {
+                        ContractStatus::Unspecified
+                    },
+                    verified_completed: false,
+                    termination_reason,
+                    final_content: None,
+                    metrics,
+                    gate_state,
+                });
+            }
+        };
     run_budget
         .borrow_mut()
         .record_generated_tokens(completion.generated_tokens);
@@ -11175,6 +11177,7 @@ trait CompletionEngine {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput>;
 
     fn generate_json(
@@ -14045,6 +14048,7 @@ impl CompletionEngine for ScriptedCompletionEngine {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         _mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        _semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
         self.generation_tool_counts.push(tools.len());
         self.generation_max_tokens.push(args.max_tokens);
@@ -14589,6 +14593,7 @@ impl CompletionEngine for PromptRecordingEngine<'_> {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
         let rendered =
             self.inner
@@ -14599,8 +14604,14 @@ impl CompletionEngine for PromptRecordingEngine<'_> {
             input.rendered_prompt_bytes = Some(bytes);
         }
         self.inputs.push(input);
-        self.inner
-            .generate(args, messages, tools, enable_thinking, mutation_snapshot)
+        self.inner.generate(
+            args,
+            messages,
+            tools,
+            enable_thinking,
+            mutation_snapshot,
+            semantic_boundary,
+        )
     }
 
     fn persist_session_cache(
@@ -14841,9 +14852,12 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
         _enable_thinking: bool,
-        _mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
-        let request = llama_chat_request(args, messages, tools)?;
+        let mut request = llama_chat_request(args, messages, tools)?;
+        request.mutation_snapshot = mutation_snapshot.cloned();
+        request.semantic_boundary = semantic_boundary.cloned();
         llama_completion_output(self.session.generate_chat(&request)?)
     }
 
@@ -14882,11 +14896,49 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
 fn llama_completion_output(
     mut output: crate::inference::llamacpp::Output,
 ) -> Result<CompletionOutput> {
-    let parsed_tool_calls = parse_model_tool_call_output(&mut output.content);
+    let parsed_tool_calls = if output
+        .content
+        .contains(pb_control_collar::protocol::dsml::CALLS_OPEN)
+    {
+        let parsed = pb_control_collar::protocol::parse_dsml_output(
+            &output.content,
+            output.finish_reason == llamacpp::FinishReason::MaxTokens,
+        )?;
+        output.content = parsed.text;
+        Ok(parsed
+            .calls
+            .into_iter()
+            .map(|call| AgentToolCall {
+                id: None,
+                tool: call.name,
+                arguments: call.arguments,
+            })
+            .collect())
+    } else {
+        parse_model_tool_call_output(&mut output.content)
+    };
     let (tool_calls, tool_parse_error) = match parsed_tool_calls {
         Ok(tool_calls) => (tool_calls, None),
         Err(error) => (Vec::new(), Some(format!("{error:#}"))),
     };
+    let native =
+        output
+            .tool_constraints
+            .as_ref()
+            .map(|stats| crate::events::NativeGenerationUsage {
+                tool_constraint_mode: Some(stats.mode.as_str().to_string()),
+                tool_constraint_dialect: Some(stats.dialect.clone()),
+                tool_schema_sha256: Some(stats.schema_sha256.clone()),
+                rejected_constraint_candidates: stats.rejected_candidates,
+                mutation_constraint_rejections: stats.mutation_rejections.clone(),
+                mutation_snapshot_files: stats.snapshot_files,
+                mutation_snapshot_bytes: stats.snapshot_bytes,
+                constraint_terminal_state: Some(stats.terminal_state.clone()),
+                constraint_guarantee_rung: Some(stats.guarantee_rung.clone()),
+                semantic_boundary: stats.semantic_boundary,
+                decode_recovery: stats.decode_recovery,
+                ..crate::events::NativeGenerationUsage::default()
+            });
     Ok(CompletionOutput {
         content: output.content,
         tool_calls,
@@ -14908,7 +14960,7 @@ fn llama_completion_output(
             lookup_detail: output.prompt_cache_lookup_detail,
             root: output.prompt_root.map(backend_prompt_root_usage),
         }),
-        native: None,
+        native,
         duration_ms: output.duration_ms,
         energy: output.energy,
     })
@@ -14919,16 +14971,51 @@ fn llama_chat_request(
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
 ) -> Result<LlamaCppChatRequest> {
-    let constraint_mode = if tools.is_empty() {
-        crate::inference::StageRootConstraintMode::None
+    let workflow_terminal = args
+        .workflow_stage
+        .and_then(workflow_terminal_tool_name)
+        .filter(|terminal| tools.iter().any(|tool| tool.name == *terminal));
+    let terminal_tool_names = workflow_terminal
+        .map(|terminal| vec![terminal.to_string()])
+        .unwrap_or_default();
+    let tool_constraint_mode = if args.workflow_stage.is_some()
+        && tools.len() == 1
+        && workflow_terminal.is_some_and(|terminal| tools[0].name == terminal)
+    {
+        crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
+    } else if args.workflow_stage.is_some() && !tools.is_empty() {
+        crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed
     } else {
-        crate::inference::StageRootConstraintMode::Unconstrained
+        crate::inference::flashmoe::NativeToolConstraintMode::Auto
+    };
+    let root_constraint_mode = match tool_constraint_mode {
+        crate::inference::flashmoe::NativeToolConstraintMode::Auto if tools.is_empty() => {
+            crate::inference::StageRootConstraintMode::None
+        }
+        crate::inference::flashmoe::NativeToolConstraintMode::Auto => {
+            crate::inference::StageRootConstraintMode::Unconstrained
+        }
+        crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed => {
+            crate::inference::StageRootConstraintMode::ToolsAllowed
+        }
+        crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired => {
+            crate::inference::StageRootConstraintMode::ToolRequired
+        }
     };
     Ok(LlamaCppChatRequest {
         messages: model_messages_value(messages)?,
         tools: model_tools_value(tools),
-        stage_root: Some(stage_root_descriptor(args, tools, constraint_mode, false)?),
+        stage_root: Some(stage_root_descriptor(
+            args,
+            tools,
+            root_constraint_mode,
+            false,
+        )?),
         json_schema: None,
+        tool_constraint_mode,
+        terminal_tool_names,
+        mutation_snapshot: None,
+        semantic_boundary: None,
         ctx_size: args.ctx_size,
         threads: args.threads,
         threads_batch: args.threads_batch,
@@ -14981,6 +15068,7 @@ impl CompletionEngine for FlashMoeCompletionEngine {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
         let mut engine = self.runtime.lock()?;
         generate_flashmoe_completion(
@@ -14990,6 +15078,7 @@ impl CompletionEngine for FlashMoeCompletionEngine {
             tools,
             enable_thinking,
             mutation_snapshot,
+            semantic_boundary,
         )
     }
 
@@ -15056,6 +15145,7 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
         generate_flashmoe_completion(
             self.engine,
@@ -15064,6 +15154,7 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
             tools,
             enable_thinking,
             mutation_snapshot,
+            semantic_boundary,
         )
     }
 
@@ -15096,6 +15187,7 @@ fn generate_flashmoe_completion(
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
     mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+    semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
 ) -> Result<CompletionOutput> {
     generate_flashmoe_completion_with_required_tool(
         engine,
@@ -15104,6 +15196,7 @@ fn generate_flashmoe_completion(
         tools,
         enable_thinking,
         mutation_snapshot,
+        semantic_boundary,
         None,
     )
 }
@@ -15115,6 +15208,7 @@ fn generate_flashmoe_completion_with_required_tool(
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
     mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+    semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     required_tool_name: Option<&str>,
 ) -> Result<CompletionOutput> {
     let mut request = flashmoe_structured_request_with_required_tool(
@@ -15125,6 +15219,7 @@ fn generate_flashmoe_completion_with_required_tool(
         required_tool_name,
     )?;
     request.mutation_snapshot = mutation_snapshot.cloned();
+    request.semantic_boundary = semantic_boundary.cloned();
     generate_flashmoe_completion_from_request(engine, args, request)
 }
 
@@ -15235,6 +15330,12 @@ fn generate_flashmoe_completion_from_request(
         constraint_terminal_state: tool_constraints
             .map(|stats| stats.terminal_state.clone())
             .or_else(|| json_constraints.map(|stats| stats.terminal_state.clone())),
+        constraint_guarantee_rung: tool_constraints.map(|stats| stats.guarantee_rung.clone()),
+        semantic_boundary: tool_constraints.and_then(|stats| stats.semantic_boundary),
+        decode_recovery: tool_constraints.map_or(
+            crate::inference::DecodeRecovery::CandidateProbeOnly,
+            |stats| stats.decode_recovery,
+        ),
     };
     let energy = energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
     Ok(CompletionOutput {
@@ -15378,6 +15479,7 @@ fn flashmoe_structured_request_with_required_tool(
         )?),
         json_schema: None,
         mutation_snapshot: None,
+        semantic_boundary: None,
         add_generation_prompt: true,
         enable_thinking,
         raw_prompt: false,
@@ -15448,9 +15550,10 @@ fn controller_collar_snapshot(
 
 fn generate_and_parse_action_with_retries(
     generator: &mut dyn CompletionEngine,
-    text_backend: TextBackendKind,
+    _text_backend: TextBackendKind,
     args: &AgentRequest,
     workspace_root: &Path,
+    lsp_registry: &LspToolRegistry,
     gate_state: &RefCell<GateState>,
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
@@ -15493,17 +15596,22 @@ fn generate_and_parse_action_with_retries(
         // returns an error, otherwise the stage runner replaces the actionable
         // engine/resource failure with a usage-divergence error.
         metrics.llm_invocations = metrics.llm_invocations.saturating_add(1);
-        let mutation_snapshot = if text_backend == TextBackendKind::FlashMoe {
-            controller_collar_snapshot(workspace_root, &gate_state.borrow(), attempt_tools)?
-        } else {
-            None
-        };
+        let mutation_snapshot =
+            controller_collar_snapshot(workspace_root, &gate_state.borrow(), attempt_tools)?;
+        let semantic_boundary = mutation_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                crate::semantic::semantic_boundary_control(lsp_registry, workspace_root, snapshot)
+            })
+            .transpose()?
+            .flatten();
         let completion = generator.generate(
             &request,
             &prepared.messages,
             attempt_tools,
             attempt_enable_thinking,
             mutation_snapshot.as_ref(),
+            semantic_boundary.as_ref(),
         )?;
         run_budget
             .borrow_mut()
@@ -16299,6 +16407,30 @@ struct ToolContext<'a> {
     run_budget: &'a RefCell<RunBudget>,
     gate_state: &'a RefCell<GateState>,
     workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
+}
+
+fn enforce_tool_semantic_transaction(
+    context: &ToolContext<'_>,
+    mutations: Vec<crate::semantic::SemanticOverlayMutation>,
+) -> Result<()> {
+    let Some(report) = crate::semantic::enforce_configured_transaction(
+        context.lsp_registry,
+        context.workspace_root,
+        &mutations,
+    )?
+    else {
+        return Ok(());
+    };
+    tracing::info!(
+        workspace_sha256 = %report.workspace_fingerprint,
+        providers = report.providers.len(),
+        viability = ?report.verdict.viability,
+        closure = ?report.verdict.closure,
+        definite_errors = report.verdict.definite_errors.len(),
+        unknown_reasons = report.verdict.unknown_reasons.len(),
+        "completed configured semantic mutation gate"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -18274,29 +18406,33 @@ fn run_tool(
             if resolved.exists() {
                 bail!("write_file refuses to overwrite existing file {path}");
             }
+            let logical_path = CollarLogicalPath::parse(path.to_string())
+                .context("write_file path is not canonical for constrained mutation")?;
+            let prepared = prepare_collar_create(
+                &CollarWorkspaceSnapshot::default(),
+                logical_path,
+                content.as_bytes().to_vec(),
+            )
+            .context("write_file result failed constrained syntax validation")?;
+            prepared.verify_live_base(None)?;
+            enforce_tool_semantic_transaction(
+                context,
+                vec![crate::semantic::SemanticOverlayMutation {
+                    path: path.to_string(),
+                    base: None,
+                    result: Some(content.to_string()),
+                }],
+            )?;
             if let Some(parent) = resolved.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
             }
-            if context.text_backend == TextBackendKind::FlashMoe {
-                let logical_path = CollarLogicalPath::parse(path.to_string())
-                    .context("write_file path is not canonical for constrained mutation")?;
-                let prepared = prepare_collar_create(
-                    &CollarWorkspaceSnapshot::default(),
-                    logical_path,
-                    content.as_bytes().to_vec(),
-                )
-                .context("write_file result failed constrained syntax validation")?;
-                prepared.verify_live_base(None)?;
-                atomic_create_file(
-                    &resolved,
-                    prepared
-                        .result_bytes()
-                        .context("write_file prepared mutation omitted result bytes")?,
-                )?;
-            } else {
-                atomic_create_file(&resolved, content.as_bytes())?;
-            }
+            atomic_create_file(
+                &resolved,
+                prepared
+                    .result_bytes()
+                    .context("write_file prepared mutation omitted result bytes")?,
+            )?;
             sink.emit(AgentEvent::Diff {
                 path: path.to_string(),
                 diff: bounded_tool_diff(unified_diff("", content, path)),
@@ -18340,30 +18476,30 @@ fn run_tool(
             if existing == content {
                 bail!("replace_file made no content change for {path}");
             }
-            if context.text_backend == TextBackendKind::FlashMoe {
-                let logical_path = CollarLogicalPath::parse(path.to_string())
-                    .context("replace_file path is not canonical for constrained mutation")?;
-                let snapshot = CollarWorkspaceSnapshot::new(vec![CollarSnapshotEntry::new(
-                    logical_path.clone(),
-                    existing.as_bytes().to_vec(),
-                )])?;
-                let prepared =
-                    prepare_collar_replace(&snapshot, logical_path, content.as_bytes().to_vec())
-                        .context("replace_file result failed constrained syntax validation")?;
-                atomic_replace_file(
-                    &resolved,
-                    prepared
-                        .result_bytes()
-                        .context("replace_file prepared mutation omitted result bytes")?,
-                    &crate::environment_lock::sha256(existing.as_bytes()),
-                )?;
-            } else {
-                atomic_replace_file(
-                    &resolved,
-                    content.as_bytes(),
-                    &crate::environment_lock::sha256(existing.as_bytes()),
-                )?;
-            }
+            let logical_path = CollarLogicalPath::parse(path.to_string())
+                .context("replace_file path is not canonical for constrained mutation")?;
+            let snapshot = CollarWorkspaceSnapshot::new(vec![CollarSnapshotEntry::new(
+                logical_path.clone(),
+                existing.as_bytes().to_vec(),
+            )])?;
+            let prepared =
+                prepare_collar_replace(&snapshot, logical_path, content.as_bytes().to_vec())
+                    .context("replace_file result failed constrained syntax validation")?;
+            enforce_tool_semantic_transaction(
+                context,
+                vec![crate::semantic::SemanticOverlayMutation {
+                    path: path.to_string(),
+                    base: Some(existing.clone()),
+                    result: Some(content.to_string()),
+                }],
+            )?;
+            atomic_replace_file(
+                &resolved,
+                prepared
+                    .result_bytes()
+                    .context("replace_file prepared mutation omitted result bytes")?,
+                &crate::environment_lock::sha256(existing.as_bytes()),
+            )?;
             sink.emit(AgentEvent::Diff {
                 path: path.to_string(),
                 diff: bounded_tool_diff(unified_diff(&existing, content, path)),
@@ -18420,30 +18556,30 @@ fn run_tool(
             if updated == existing {
                 bail!("edit_file made no content change for {path}");
             }
-            if context.text_backend == TextBackendKind::FlashMoe {
-                let logical_path = CollarLogicalPath::parse(path.to_string())
-                    .context("edit_file path is not canonical for constrained mutation")?;
-                let snapshot = CollarWorkspaceSnapshot::new(vec![CollarSnapshotEntry::new(
-                    logical_path.clone(),
-                    existing.as_bytes().to_vec(),
-                )])?;
-                let prepared =
-                    prepare_collar_replace(&snapshot, logical_path, updated.as_bytes().to_vec())
-                        .context("edit_file result failed constrained syntax validation")?;
-                atomic_replace_file(
-                    &resolved,
-                    prepared
-                        .result_bytes()
-                        .context("edit_file prepared mutation omitted result bytes")?,
-                    &crate::environment_lock::sha256(existing.as_bytes()),
-                )?;
-            } else {
-                atomic_replace_file(
-                    &resolved,
-                    updated.as_bytes(),
-                    &crate::environment_lock::sha256(existing.as_bytes()),
-                )?;
-            }
+            let logical_path = CollarLogicalPath::parse(path.to_string())
+                .context("edit_file path is not canonical for constrained mutation")?;
+            let snapshot = CollarWorkspaceSnapshot::new(vec![CollarSnapshotEntry::new(
+                logical_path.clone(),
+                existing.as_bytes().to_vec(),
+            )])?;
+            let prepared =
+                prepare_collar_replace(&snapshot, logical_path, updated.as_bytes().to_vec())
+                    .context("edit_file result failed constrained syntax validation")?;
+            enforce_tool_semantic_transaction(
+                context,
+                vec![crate::semantic::SemanticOverlayMutation {
+                    path: path.to_string(),
+                    base: Some(existing.clone()),
+                    result: Some(updated.clone()),
+                }],
+            )?;
+            atomic_replace_file(
+                &resolved,
+                prepared
+                    .result_bytes()
+                    .context("edit_file prepared mutation omitted result bytes")?,
+                &crate::environment_lock::sha256(existing.as_bytes()),
+            )?;
 
             let diff = bounded_tool_diff(unified_diff(&existing, &updated, path));
             sink.emit(AgentEvent::Diff {
@@ -18470,26 +18606,6 @@ fn run_tool(
                 context.request,
                 changed_paths.iter().map(String::as_str),
             )?;
-            if context.text_backend == TextBackendKind::LlamaCpp {
-                for path in &changed_paths {
-                    let resolved = resolve_workspace_path(workspace_root, path, false)?;
-                    ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
-                }
-                run_git_apply_patch_legacy(patch, workspace_root)?;
-                let diff = git_diff_paths(workspace_root, &changed_paths)?;
-                if diff.trim().is_empty() {
-                    bail!("apply_patch made no content change");
-                }
-                sink.emit(AgentEvent::Diff {
-                    path: "apply_patch".to_string(),
-                    diff,
-                    nesting_depth: (context.request.sub_agent_depth > 0)
-                        .then_some(context.request.sub_agent_depth),
-                    timestamp_ms: Some(now_millis()),
-                });
-                context.gate_state.borrow_mut().record_content_mutation();
-                return Ok(format!("applied patch to {}", changed_paths.join(", ")));
-            }
             let mut snapshot_entries = Vec::new();
             for path in &changed_paths {
                 let resolved = resolve_workspace_path(workspace_root, path, false)?;
@@ -18540,6 +18656,33 @@ fn run_tool(
                 file.verify_live_base(live.as_deref())?;
                 file.revalidate_result()?;
             }
+            let semantic_mutations = prepared
+                .files()
+                .iter()
+                .map(|file| {
+                    Ok(crate::semantic::SemanticOverlayMutation {
+                        path: file.path().as_str().to_string(),
+                        base: snapshot
+                            .get(file.path())
+                            .map(|entry| entry.bytes.as_slice())
+                            .map(|bytes| {
+                                std::str::from_utf8(bytes)
+                                    .context("semantic patch base is not UTF-8")
+                                    .map(str::to_string)
+                            })
+                            .transpose()?,
+                        result: file
+                            .result_bytes()
+                            .map(|bytes| {
+                                std::str::from_utf8(bytes)
+                                    .context("semantic patch result is not UTF-8")
+                                    .map(str::to_string)
+                            })
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            enforce_tool_semantic_transaction(context, semantic_mutations)?;
             run_git_apply_patch(patch, workspace_root)?;
             for file in prepared.files() {
                 let resolved = resolve_workspace_path(workspace_root, file.path().as_str(), false)?;
@@ -20901,25 +21044,6 @@ fn run_git_apply_patch(patch: &str, workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_git_apply_patch_legacy(patch: &str, workspace_root: &Path) -> Result<()> {
-    let normalized;
-    let patch = if patch.ends_with('\n') {
-        patch
-    } else {
-        normalized = format!("{patch}\n");
-        normalized.as_str()
-    };
-    git_apply_stdin(
-        &["apply", "--check", "--recount", "-"],
-        patch,
-        workspace_root,
-    )
-    .context("patch validation failed")?;
-    git_apply_stdin(&["apply", "--recount", "-"], patch, workspace_root)
-        .context("patch application failed")?;
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 struct PatchHunkDiagnostic {
     path: String,
@@ -23217,6 +23341,7 @@ mod tests {
             _tools: &[BuiltInToolSchema],
             _enable_thinking: bool,
             _mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+            _semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
         ) -> Result<CompletionOutput> {
             bail!("unconstrained generation must not serve Task artifacts")
         }

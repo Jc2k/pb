@@ -508,6 +508,12 @@ pub struct NativeGenerationUsage {
     pub mutation_snapshot_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint_terminal_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_guarantee_rung: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_boundary: Option<crate::inference::SemanticBoundaryStats>,
+    #[serde(default)]
+    pub decode_recovery: crate::inference::DecodeRecovery,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2605,6 +2611,9 @@ mod tests {
                 mutation_snapshot_files: 1,
                 mutation_snapshot_bytes: 128,
                 constraint_terminal_state: Some("complete_tool_call".to_string()),
+                constraint_guarantee_rung: Some("prefix_syntax".to_string()),
+                semantic_boundary: None,
+                decode_recovery: crate::inference::DecodeRecovery::CandidateProbeOnly,
             }),
             energy_joules: None,
             energy_kwh: None,
@@ -2624,6 +2633,10 @@ mod tests {
         assert_eq!(native.tool_constraint_dialect.as_deref(), Some("qwen_json"));
         assert_eq!(native.mutation_snapshot_files, 1);
         assert_eq!(native.mutation_snapshot_bytes, 128);
+        assert_eq!(
+            native.constraint_guarantee_rung.as_deref(),
+            Some("prefix_syntax")
+        );
         assert_eq!(
             native.mutation_constraint_rejections.get("invalid_syntax"),
             Some(&2)
@@ -2669,6 +2682,9 @@ mod tests {
         native.remove("mutation_constraint_rejections");
         native.remove("mutation_snapshot_files");
         native.remove("mutation_snapshot_bytes");
+        native.remove("constraint_guarantee_rung");
+        native.remove("semantic_boundary");
+        native.remove("decode_recovery");
         let legacy: EventEnvelope = serde_json::from_value(legacy).unwrap();
         let AgentEvent::LlmInvocation {
             native: Some(legacy_native),
@@ -2688,6 +2704,9 @@ mod tests {
                     tool_constraint_dialect: None,
                     mutation_snapshot_files: 0,
                     mutation_snapshot_bytes: 0,
+                    constraint_guarantee_rung: None,
+                    semantic_boundary: None,
+                    decode_recovery: crate::inference::DecodeRecovery::CandidateProbeOnly,
                     ..
                 }),
                 ..

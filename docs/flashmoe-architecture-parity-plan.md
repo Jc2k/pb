@@ -278,10 +278,14 @@ requests compile their dialect during request setup. Constrained Qwen sampling w
 LM-head frontier. DeepSeek uses its existing full-logit output, probes candidates against exact
 ordinary/control token surfaces, and widens before final top-k truncation when the frontier contains
 no valid token. Diagnostics retain the dialect, mode, schema hash, content-free mutation-rejection
-counts, snapshot file/byte counts, rejected-candidate count, and terminal state without argument or
-path content. Strict JSON artifacts use the shared LLGuidance contract. llama.cpp keeps its existing
-LLGuidance sampler and broader Git-compatible mutation path; it does not yet adapt native mutations
-to the collar.
+counts, snapshot file/byte counts, rejected-candidate count, terminal state, strongest active
+guarantee rung, semantic outcome/timing counts, and decode-recovery capability without argument or
+path content. Strict JSON artifacts use the shared LLGuidance contract. llama.cpp now builds an
+exact ordinary/control/EOG vocabulary surface, applies the same Qwen or DeepSeek collar over its
+full candidate array before top-k/temperature/distribution sampling, accepts the selected token into
+stateful samplers exactly once, and uses the same prepared mutation/executor path. Live
+model/tokenizer/template qualification remains profile-specific; unsupported profiles must not be
+described as parity-qualified.
 Constraint-valid non-EOS candidates must increase the visible decoded prefix. When an open
 `write_file` or `replace_file` string reaches its schema limit, generation stops before a synthetic
 close can turn a cut-off payload into an executable mutation. Structural whitespace outside JSON
@@ -298,7 +302,7 @@ spending tokens on the closing Qwen envelope, while ordinary tool-call batches r
 executor path. The constraint sampler sits after the shared output head, so these rules apply
 identically to resident and streamed experts and change neither graph preparation nor expert
 scheduling.
-Before a FlashMoe mutation request decodes, the agent controller supplies at most 32 MiB of exact,
+Before a FlashMoe or llama.cpp mutation request decodes, the agent controller supplies at most 32 MiB of exact,
 fresh, previously read file bytes as an immutable snapshot; exposing a mutation without that
 snapshot fails closed. Qwen JSON and DeepSeek DSML allow at most one mutation per generated batch.
 At a mutation-payload close, the collar constructs the exact create, replacement, edit, or canonical
@@ -307,6 +311,13 @@ complete-file syntax profiles. The executor independently repeats snapshot/hash,
 syntax, path, policy, and schema validation; canonical patches also require exact Git check/apply
 parity without `--recount`. The control layer is downstream of the shared scheduled model graph and
 changes neither expert placement, scheduler I/O, nor CPU/GPU handoff.
+An opt-in LSP semantic boundary can additionally probe the exact completed payload overlay for Qwen
+JSON and DeepSeek DSML. A required authoritative `Reject` masks the closing payload candidate; an
+advisory or unknown result defers to the syntax rung. The executor captures and revalidates the
+current workspace during a fresh semantic transaction immediately before publication. Both
+backends currently advertise
+`candidate_probe_only`; no recurrent-state or KV replay guarantee is inferred from ordinary session
+caching.
 Persistent stage evidence is workflow-checkpoint data keyed by content fingerprints and path hashes,
 not model memory or expert state. None of these follow-ons changes the resident/streamed decision,
 adds a hidden environment toggle, enables unsupported thinking, or permits native load failure to

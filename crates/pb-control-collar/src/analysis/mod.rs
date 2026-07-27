@@ -2,8 +2,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CollarResult, mutation::LogicalPath};
 
+mod prefix;
+mod semantic;
 mod syntax;
-pub use syntax::{SyntaxProfile, SyntaxReport, validate_supported_syntax};
+pub use prefix::{
+    PrefixCheckpoint, PrefixReport, PrefixRule, SourcePrefixOracle, validate_supported_prefix,
+};
+pub use semantic::{
+    BaselineCompleteness, DiagnosticDelta, DiagnosticIdentity, SEMANTIC_WORLD_CONTRACT_VERSION,
+    SemanticDiagnosticSnapshot, SemanticEnforcement, SemanticFileBinding, SemanticWorldSnapshot,
+    diagnostic_delta,
+};
+pub use syntax::{
+    IncrementalSyntaxCheckpoint, IncrementalSyntaxReport, IncrementalSyntaxTree, SyntaxProfile,
+    SyntaxReport, validate_supported_syntax,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -45,6 +58,88 @@ pub enum AnalysisBoundary {
     File,
     ToolArgument,
     ToolCall,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuaranteeRung {
+    CompleteSyntax,
+    ConservativePrefix,
+    ScopedSymbols,
+    ScopedTypes,
+    BackendParity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyzerCapability {
+    PrefixLexical,
+    PrefixStructural,
+    SyntaxBoundary,
+    SymbolResolution,
+    TypeChecking,
+    OwnershipChecking,
+    DependencyResolution,
+    FinalWorkspaceGate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SemanticWorldId {
+    pub provider: String,
+    pub provider_version: String,
+    pub world_sha256: String,
+    pub configuration_sha256: String,
+    pub dependency_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefiniteErrorClass {
+    UnresolvedName,
+    UnresolvedImport,
+    MissingField,
+    MissingMethod,
+    Privacy,
+    TypeMismatch,
+    InvalidCall,
+    Mutability,
+    Ownership,
+    Configuration,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownReason {
+    IncompleteBaseline,
+    UnsupportedConstruct,
+    DynamicType,
+    MissingDependency,
+    ProviderUnavailable,
+    ProviderRestarted,
+    StaleDocument,
+    Timeout,
+    BudgetExceeded,
+    ConfigurationChanged,
+    UnclassifiedDiagnostic,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundaryProbe {
+    pub world: SemanticWorldId,
+    pub path: LogicalPath,
+    pub content_sha256: String,
+    pub boundary: AnalysisBoundary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderVerdict {
+    pub viability: Viability,
+    pub closure: ClosureVerdict,
+    pub definite_errors: Vec<DefiniteErrorClass>,
+    pub unknown_reasons: Vec<UnknownReason>,
+    pub obligations: Vec<SemanticObligation>,
+    pub biases: Vec<RepairIntent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

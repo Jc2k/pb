@@ -24,6 +24,7 @@ use llama_cpp_2::mtmd::{
 };
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -59,6 +60,13 @@ pub struct LlamaCppChatRequest {
     pub stage_root: Option<crate::inference::StageRootDescriptor>,
     /// Optional JSON schema enforced token-by-token during generation.
     pub json_schema: Option<Value>,
+    /// Native tool protocol mode. When tools are present, llama.cpp applies the same protocol and
+    /// mutation completion gate as FlashMoe before sampling truncation.
+    pub tool_constraint_mode: crate::inference::flashmoe::NativeToolConstraintMode,
+    pub terminal_tool_names: Vec<String>,
+    /// Immutable controller-authorized bytes for generation-time mutation validation.
+    pub mutation_snapshot: Option<pb_control_collar::mutation::WorkspaceSnapshot>,
+    pub semantic_boundary: Option<crate::inference::SemanticBoundaryControl>,
     pub ctx_size: u32,
     pub threads: Option<i32>,
     pub threads_batch: Option<i32>,
@@ -92,6 +100,7 @@ pub struct Output {
     pub prompt_root: Option<crate::inference::BackendPromptRoot>,
     pub duration_ms: u64,
     pub energy: Option<EnergyEstimate>,
+    pub tool_constraints: Option<crate::inference::flashmoe::NativeToolConstraintStats>,
 }
 
 /// A loaded llama.cpp backend + model, ready for inference.
@@ -102,6 +111,7 @@ pub struct LlamaCppBackend {
     /// Path to the primary model GGUF file.
     pub model_path: PathBuf,
     session_cache: crate::config::ResolvedSessionCacheConfig,
+    collar_vocabulary: OnceLock<std::result::Result<LlamaCollarVocabulary, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +127,36 @@ struct CachedLlamaContext<'a> {
     settings: LlamaSessionSettings,
     restored_from_disk: bool,
     restore_ms: u64,
+}
+
+#[derive(Debug)]
+struct LlamaCollarVocabulary {
+    visible_bytes: Vec<Vec<u8>>,
+    eos: Vec<bool>,
+}
+
+enum LlamaToolConstraint {
+    Qwen(crate::inference::flashmoe::constraints::NativeToolConstraint),
+    DeepSeek {
+        constraint: pb_control_collar::protocol::DsmlConstraint,
+        semantic_provider: Option<crate::inference::SemanticBoundaryControl>,
+        mode: crate::inference::flashmoe::NativeToolConstraintMode,
+        schema_sha256: String,
+        mutation_enabled: bool,
+        snapshot_files: usize,
+        snapshot_bytes: usize,
+        rejected_candidates: usize,
+        mutation_rejections: std::collections::BTreeMap<pb_control_collar::RejectionCode, usize>,
+    },
+}
+
+impl std::fmt::Debug for LlamaToolConstraint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LlamaToolConstraint")
+            .field(&self.dialect())
+            .finish()
+    }
 }
 
 /// One logical chat session with a live llama.cpp context and a crash-safe disk snapshot.
@@ -164,6 +204,7 @@ fn load_from_file_with_cache(
         chat_template,
         model_path: path.to_owned(),
         session_cache,
+        collar_vocabulary: OnceLock::new(),
     })
 }
 
@@ -239,12 +280,14 @@ impl LlamaCppBackend {
             request.temperature,
             request.seed,
             None,
+            None,
         )
     }
 
     /// Run text generation for a structured chat request.
     pub fn generate_chat(&self, request: &LlamaCppChatRequest) -> Result<Output> {
         let (prompt, add_bos) = self.render_chat_prompt(&request.messages, &request.tools)?;
+        let tool_constraint = LlamaToolConstraint::compile(&prompt, request)?;
         self.generate_rendered(
             &prompt,
             add_bos,
@@ -256,6 +299,7 @@ impl LlamaCppBackend {
             request.temperature,
             request.seed,
             request.json_schema.as_ref(),
+            tool_constraint,
         )
     }
 
@@ -290,6 +334,7 @@ impl LlamaCppBackend {
         temperature: f32,
         seed: u32,
         json_schema: Option<&Value>,
+        mut tool_constraint: Option<LlamaToolConstraint>,
     ) -> Result<Output> {
         let energy_start = energy::sample();
         let started = std::time::Instant::now();
@@ -333,13 +378,25 @@ impl LlamaCppBackend {
 
         let mut decoder = UTF_8.new_decoder();
         let mut output = String::new();
+        let mut constrained_transcript = Vec::new();
         let mut n_cur =
             i32::try_from(tokens.len()).context("prompt token count exceeds i32::MAX")?;
         let mut generated_tokens: usize = 0;
         let mut finish_reason = FinishReason::MaxTokens;
 
         while generated_tokens < usize::try_from(max_tokens).unwrap_or(0) {
-            let token = sample_and_accept_token(&mut sampler, &ctx, batch.n_tokens() - 1);
+            let token = if let Some(constraint) = tool_constraint.as_mut() {
+                constrained_sample_and_accept_token(
+                    &mut sampler,
+                    &ctx,
+                    batch.n_tokens() - 1,
+                    constraint,
+                    self.collar_vocabulary()?,
+                    &constrained_transcript,
+                )?
+            } else {
+                sample_and_accept_token(&mut sampler, &ctx, batch.n_tokens() - 1)
+            };
             if self.model.is_eog_token(token) {
                 finish_reason = FinishReason::EndOfGeneration;
                 break;
@@ -349,6 +406,12 @@ impl LlamaCppBackend {
                 .token_to_piece(token, &mut decoder, true, None)
                 .context("failed to decode output token")?;
             output.push_str(&piece);
+            if tool_constraint.is_some() {
+                let id =
+                    usize::try_from(token.0).context("llama.cpp selected a negative token id")?;
+                constrained_transcript
+                    .extend_from_slice(&self.collar_vocabulary()?.visible_bytes[id]);
+            }
             batch.clear();
             batch
                 .add(token, n_cur, &[0], true)
@@ -357,6 +420,12 @@ impl LlamaCppBackend {
                 .context("failed to decode generated token")?;
             n_cur += 1;
             generated_tokens += 1;
+            if tool_constraint.as_ref().is_some_and(|constraint| {
+                constraint.complete_terminal_call(&constrained_transcript)
+            }) {
+                finish_reason = FinishReason::EndOfGeneration;
+                break;
+            }
             if json_schema.is_some()
                 && let Some(end) = complete_json_value_end(&output)
             {
@@ -368,6 +437,9 @@ impl LlamaCppBackend {
 
         let energy =
             energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
+        let tool_constraints = tool_constraint
+            .as_ref()
+            .map(|constraint| constraint.stats(&constrained_transcript));
         Ok(Output {
             content: output,
             finish_reason,
@@ -382,6 +454,7 @@ impl LlamaCppBackend {
             prompt_root: None,
             duration_ms: duration_millis(started),
             energy,
+            tool_constraints,
         })
     }
 
@@ -430,6 +503,15 @@ impl LlamaCppBackend {
             LlamaSampler::dist(seed),
         ]);
         Ok(LlamaSampler::chain_simple(samplers))
+    }
+
+    fn collar_vocabulary(&self) -> Result<&LlamaCollarVocabulary> {
+        self.collar_vocabulary
+            .get_or_init(|| {
+                build_llama_collar_vocabulary(&self.model).map_err(|error| format!("{error:#}"))
+            })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!(error.clone()))
     }
 
     /// Run vision (multimodal) generation for the given request and image path.
@@ -550,6 +632,7 @@ impl LlamaCppBackend {
             prompt_root: None,
             duration_ms: duration_millis(started),
             energy,
+            tool_constraints: None,
         })
     }
 }
@@ -575,6 +658,7 @@ impl LlamaCppChatSession<'_> {
         };
         // Compile the constraint before changing a reusable KV cache. A schema/grammar error must
         // leave the session prefix untouched so a bounded retry cannot double-prefill the context.
+        let mut tool_constraint = LlamaToolConstraint::compile(&prompt, request)?;
         let mut sampler = self.backend.sampler(
             request.top_k,
             request.temperature,
@@ -698,6 +782,7 @@ impl LlamaCppChatSession<'_> {
         let mut evaluated_tokens = tokens;
         let mut decoder = UTF_8.new_decoder();
         let mut output = String::new();
+        let mut constrained_transcript = Vec::new();
         let mut n_cur =
             i32::try_from(evaluated_tokens.len()).context("prompt token count exceeds i32::MAX")?;
         let mut generated_tokens: usize = 0;
@@ -709,7 +794,18 @@ impl LlamaCppChatSession<'_> {
         };
 
         while generated_tokens < usize::try_from(request.max_tokens).unwrap_or(0) {
-            let token = sample_and_accept_token(&mut sampler, &cached.context, sample_index);
+            let token = if let Some(constraint) = tool_constraint.as_mut() {
+                constrained_sample_and_accept_token(
+                    &mut sampler,
+                    &cached.context,
+                    sample_index,
+                    constraint,
+                    self.backend.collar_vocabulary()?,
+                    &constrained_transcript,
+                )?
+            } else {
+                sample_and_accept_token(&mut sampler, &cached.context, sample_index)
+            };
             if self.backend.model.is_eog_token(token) {
                 finish_reason = FinishReason::EndOfGeneration;
                 break;
@@ -720,6 +816,12 @@ impl LlamaCppChatSession<'_> {
                 .token_to_piece(token, &mut decoder, true, None)
                 .context("failed to decode output token")?;
             output.push_str(&piece);
+            if tool_constraint.is_some() {
+                let id =
+                    usize::try_from(token.0).context("llama.cpp selected a negative token id")?;
+                constrained_transcript
+                    .extend_from_slice(&self.backend.collar_vocabulary()?.visible_bytes[id]);
+            }
             batch.clear();
             batch
                 .add(token, n_cur, &[0], true)
@@ -732,6 +834,12 @@ impl LlamaCppChatSession<'_> {
             n_cur += 1;
             generated_tokens += 1;
             sample_index = batch.n_tokens() - 1;
+            if tool_constraint.as_ref().is_some_and(|constraint| {
+                constraint.complete_terminal_call(&constrained_transcript)
+            }) {
+                finish_reason = FinishReason::EndOfGeneration;
+                break;
+            }
             if request.json_schema.is_some()
                 && let Some(end) = complete_json_value_end(&output)
             {
@@ -753,6 +861,9 @@ impl LlamaCppChatSession<'_> {
 
         let energy =
             energy_start.and_then(|sample| sample.estimate_since(energy::sample(), started));
+        let tool_constraints = tool_constraint
+            .as_ref()
+            .map(|constraint| constraint.stats(&constrained_transcript));
         Ok(Output {
             content: output,
             finish_reason,
@@ -767,6 +878,7 @@ impl LlamaCppChatSession<'_> {
             prompt_root,
             duration_ms: duration_millis(started),
             energy,
+            tool_constraints,
         })
     }
 
@@ -1068,6 +1180,336 @@ fn sample_and_accept_token(
     sampler.sample(context, logits_index)
 }
 
+fn build_llama_collar_vocabulary(model: &LlamaModel) -> Result<LlamaCollarVocabulary> {
+    let size = usize::try_from(model.n_vocab()).context("llama.cpp vocabulary size is invalid")?;
+    let mut visible_bytes = Vec::with_capacity(size);
+    let mut eos = Vec::with_capacity(size);
+    for id in 0..model.n_vocab() {
+        let token = LlamaToken::new(id);
+        let bytes = token_piece_bytes(model, token, false)
+            .or_else(|_| token_piece_bytes(model, token, true))?;
+        visible_bytes.push(bytes);
+        eos.push(model.is_eog_token(token));
+    }
+    if !eos.iter().any(|is_eos| *is_eos) {
+        bail!("llama.cpp vocabulary does not expose an end-of-generation token");
+    }
+    Ok(LlamaCollarVocabulary { visible_bytes, eos })
+}
+
+fn token_piece_bytes(model: &LlamaModel, token: LlamaToken, special: bool) -> Result<Vec<u8>> {
+    use llama_cpp_2::TokenToStringError;
+
+    match model.token_to_piece_bytes(token, 32, special, None) {
+        Ok(bytes) => Ok(bytes),
+        Err(TokenToStringError::InsufficientBufferSpace(required)) => {
+            let required = usize::try_from(required.unsigned_abs())
+                .context("llama.cpp token piece length does not fit usize")?;
+            model
+                .token_to_piece_bytes(token, required, special, None)
+                .context("failed to decode llama.cpp vocabulary token")
+        }
+        Err(TokenToStringError::UnknownTokenType) if !special => {
+            Err(anyhow::anyhow!("ordinary token surface is empty"))
+        }
+        Err(TokenToStringError::UnknownTokenType) => Ok(Vec::new()),
+        Err(error) => Err(error).context("failed to decode llama.cpp vocabulary token"),
+    }
+}
+
+impl LlamaToolConstraint {
+    fn compile(prompt: &str, request: &LlamaCppChatRequest) -> Result<Option<Self>> {
+        let tools = llama_chat_tools(&request.tools)?;
+        if tools.is_empty() {
+            return Ok(None);
+        }
+        if request.json_schema.is_some() {
+            bail!("llama.cpp JSON-schema and native-tool constraints are mutually exclusive");
+        }
+        let has_mutation = tools.iter().any(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "write_file" | "replace_file" | "edit_file" | "apply_patch"
+            )
+        });
+        if has_mutation && request.mutation_snapshot.is_none() {
+            bail!("llama.cpp constrained mutation generation requires an authorized snapshot");
+        }
+        let dialect = if prompt.contains("｜DSML｜") {
+            pb_control_collar::protocol::ToolDialect::DeepSeekDsml
+        } else {
+            pb_control_collar::protocol::ToolDialect::QwenJson
+        };
+        match dialect {
+            pb_control_collar::protocol::ToolDialect::QwenJson => {
+                let gate = crate::inference::flashmoe::constraints::mutation_completion_gate(
+                    dialect,
+                    request.tool_constraint_mode,
+                    &tools,
+                    &request.terminal_tool_names,
+                    request.mutation_snapshot.as_ref(),
+                )?;
+                let mut constraint = crate::inference::flashmoe::constraints::NativeToolConstraint::compile_with_mutation_gate(
+                    request.tool_constraint_mode,
+                    &tools,
+                    &request.terminal_tool_names,
+                    gate,
+                )?;
+                if let Some(constraint) = constraint.as_mut() {
+                    constraint.set_semantic_provider(request.semantic_boundary.clone());
+                }
+                Ok(constraint.map(Self::Qwen))
+            }
+            pb_control_collar::protocol::ToolDialect::DeepSeekDsml => {
+                let mutation_enabled = tools.iter().any(|tool| {
+                    matches!(
+                        tool.name.as_str(),
+                        "write_file" | "replace_file" | "edit_file" | "apply_patch"
+                    )
+                });
+                let snapshot_files = request
+                    .mutation_snapshot
+                    .as_ref()
+                    .map_or(0, |value| value.len());
+                let snapshot_bytes = request
+                    .mutation_snapshot
+                    .as_ref()
+                    .map_or(0, |value| value.total_bytes());
+                let schema_sha256 = format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(
+                        &tools
+                            .iter()
+                            .map(|tool| (&tool.name, &tool.input_schema))
+                            .collect::<std::collections::BTreeMap<_, _>>()
+                    )?)
+                );
+                let manifest = crate::inference::flashmoe::constraints::collar_manifest(
+                    dialect,
+                    request.tool_constraint_mode,
+                    &tools,
+                    &request.terminal_tool_names,
+                    request.mutation_snapshot.clone().unwrap_or_default(),
+                )?;
+                Ok(Some(Self::DeepSeek {
+                    constraint: pb_control_collar::protocol::DsmlConstraint::compile(manifest)?,
+                    semantic_provider: request.semantic_boundary.clone(),
+                    mode: match request.tool_constraint_mode {
+                        crate::inference::flashmoe::NativeToolConstraintMode::Auto => {
+                            crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed
+                        }
+                        mode => mode,
+                    },
+                    schema_sha256,
+                    mutation_enabled,
+                    snapshot_files,
+                    snapshot_bytes,
+                    rejected_candidates: 0,
+                    mutation_rejections: std::collections::BTreeMap::new(),
+                }))
+            }
+        }
+    }
+
+    fn dialect(&self) -> &'static str {
+        match self {
+            Self::Qwen(_) => "qwen_json",
+            Self::DeepSeek { .. } => "deepseek_dsml",
+        }
+    }
+
+    fn probe(&mut self, transcript: &[u8], at_eos: bool) -> bool {
+        match self {
+            Self::Qwen(constraint) => match std::str::from_utf8(transcript) {
+                Ok(decoded) => constraint.probe_transcript(decoded, at_eos),
+                Err(error) if error.error_len().is_none() && !at_eos => true,
+                Err(_) => false,
+            },
+            Self::DeepSeek {
+                constraint,
+                semantic_provider,
+                rejected_candidates,
+                mutation_rejections,
+                ..
+            } => {
+                let probe = constraint.probe(transcript, at_eos);
+                let semantic_allowed = semantic_provider.as_ref().is_none_or(|provider| {
+                    constraint
+                        .completed_mutation_payload(transcript)
+                        .is_none_or(|call| {
+                            provider.probe(&call.name, &call.arguments).closure
+                                != pb_control_collar::analysis::ClosureVerdict::Reject
+                        })
+                });
+                let valid = probe.valid && semantic_allowed;
+                if !valid {
+                    *rejected_candidates = (*rejected_candidates).saturating_add(1);
+                    if let Some(code) = probe.rejection {
+                        *mutation_rejections.entry(code).or_default() += 1;
+                    } else if probe.valid && !semantic_allowed {
+                        *mutation_rejections
+                            .entry(pb_control_collar::RejectionCode::InvalidSemantics)
+                            .or_default() += 1;
+                    }
+                }
+                valid
+            }
+        }
+    }
+
+    fn complete_terminal_call(&self, transcript: &[u8]) -> bool {
+        match self {
+            Self::Qwen(constraint) => std::str::from_utf8(transcript)
+                .is_ok_and(|decoded| constraint.transcript_has_complete_terminal_call(decoded)),
+            Self::DeepSeek { constraint, .. } => {
+                constraint.probe(transcript, false).complete_terminal_call
+            }
+        }
+    }
+
+    fn stats(&self, transcript: &[u8]) -> crate::inference::flashmoe::NativeToolConstraintStats {
+        match self {
+            Self::Qwen(constraint) => constraint
+                .stats(std::str::from_utf8(transcript).unwrap_or("<invalid-utf8-transcript>")),
+            Self::DeepSeek {
+                constraint,
+                semantic_provider,
+                mode,
+                schema_sha256,
+                mutation_enabled,
+                snapshot_files,
+                snapshot_bytes,
+                rejected_candidates,
+                mutation_rejections,
+            } => crate::inference::flashmoe::NativeToolConstraintStats {
+                mode: *mode,
+                dialect: "deepseek_dsml".to_string(),
+                schema_sha256: schema_sha256.clone(),
+                rejected_candidates: *rejected_candidates,
+                mutation_rejections: mutation_rejections
+                    .iter()
+                    .map(|(code, count)| (code.as_str().to_string(), *count))
+                    .collect(),
+                snapshot_files: *snapshot_files,
+                snapshot_bytes: *snapshot_bytes,
+                terminal_state: constraint.terminal_state(transcript).to_string(),
+                guarantee_rung: if semantic_provider.as_ref().is_some_and(|provider| {
+                    constraint.probe(transcript, false).complete
+                        && constraint
+                            .completed_mutation_payload(transcript)
+                            .is_some_and(|call| {
+                                provider.probe(&call.name, &call.arguments).closure
+                                    == pb_control_collar::analysis::ClosureVerdict::Allow
+                            })
+                }) {
+                    "semantic_boundary"
+                } else if *mutation_enabled {
+                    "prefix_syntax"
+                } else {
+                    "protocol_schema"
+                }
+                .to_string(),
+                semantic_boundary: semantic_provider
+                    .as_ref()
+                    .map(crate::inference::SemanticBoundaryControl::stats),
+                decode_recovery: crate::inference::DecodeRecovery::CandidateProbeOnly,
+            },
+        }
+    }
+}
+
+fn llama_chat_tools(tools: &Value) -> Result<Vec<crate::inference::flashmoe::ChatTool>> {
+    let tools = tools
+        .as_array()
+        .context("llama.cpp tools must be a JSON array")?;
+    tools
+        .iter()
+        .map(|tool| {
+            let function = tool.get("function").unwrap_or(tool);
+            Ok(crate::inference::flashmoe::ChatTool {
+                name: function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("llama.cpp tool omits its function name")?
+                    .to_string(),
+                description: function
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                input_schema: function
+                    .get("parameters")
+                    .or_else(|| function.get("input_schema"))
+                    .cloned()
+                    .context("llama.cpp tool omits its parameter schema")?,
+            })
+        })
+        .collect()
+}
+
+fn constrained_sample_and_accept_token(
+    sampler: &mut LlamaSampler,
+    context: &LlamaContext<'_>,
+    logits_index: i32,
+    constraint: &mut LlamaToolConstraint,
+    vocabulary: &LlamaCollarVocabulary,
+    transcript: &[u8],
+) -> Result<LlamaToken> {
+    let mut candidates = if logits_index < 0 {
+        context.token_data_array()
+    } else {
+        context.token_data_array_ith(logits_index)
+    };
+    apply_llama_collar_mask(&mut candidates, constraint, vocabulary, transcript)?;
+    sampler.apply(&mut candidates);
+    let token = candidates
+        .selected_token()
+        .context("llama.cpp sampler did not select a token after collar masking")?;
+    sampler.try_accept(token).map_err(|error| {
+        anyhow::anyhow!("llama.cpp sampler rejected its selected token: {error}")
+    })?;
+    Ok(token)
+}
+
+fn apply_llama_collar_mask(
+    candidates: &mut LlamaTokenDataArray,
+    constraint: &mut LlamaToolConstraint,
+    vocabulary: &LlamaCollarVocabulary,
+    transcript: &[u8],
+) -> Result<()> {
+    let mut allowed = 0usize;
+    for candidate in &mut candidates.data {
+        let id = usize::try_from(candidate.id().0)
+            .context("llama.cpp candidate token id is negative")?;
+        let bytes = vocabulary
+            .visible_bytes
+            .get(id)
+            .context("llama.cpp candidate token is outside the collar vocabulary")?;
+        let at_eos = *vocabulary
+            .eos
+            .get(id)
+            .context("llama.cpp EOS table does not match its vocabulary")?;
+        let valid = if bytes.is_empty() && !at_eos {
+            false
+        } else {
+            let mut trial = Vec::with_capacity(transcript.len().saturating_add(bytes.len()));
+            trial.extend_from_slice(transcript);
+            trial.extend_from_slice(bytes);
+            constraint.probe(&trial, at_eos)
+        };
+        if valid {
+            allowed = allowed.saturating_add(1);
+        } else {
+            candidate.set_logit(f32::NEG_INFINITY);
+        }
+    }
+    if allowed == 0 {
+        bail!("llama.cpp control collar produced an empty full-vocabulary mask");
+    }
+    candidates.sorted = false;
+    candidates.selected = None;
+    Ok(())
+}
+
 fn prompt_batch_ranges(token_count: usize, batch_size: usize) -> Vec<Range<usize>> {
     prompt_batch_ranges_from(0, token_count, batch_size)
 }
@@ -1240,6 +1682,26 @@ fn duration_millis(started: std::time::Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llama_cpp_2::token::data::LlamaTokenData;
+    use pb_control_collar::analysis::{ClosureVerdict, ProviderVerdict, Viability};
+    use serde_json::json;
+
+    struct RejectSemanticBoundary;
+
+    impl crate::inference::SemanticBoundaryProvider for RejectSemanticBoundary {
+        fn probe(&self, _tool: &str, _arguments: &Value) -> ProviderVerdict {
+            ProviderVerdict {
+                viability: Viability::Impossible,
+                closure: ClosureVerdict::Reject,
+                definite_errors: vec![
+                    pb_control_collar::analysis::DefiniteErrorClass::TypeMismatch,
+                ],
+                unknown_reasons: Vec::new(),
+                obligations: Vec::new(),
+                biases: Vec::new(),
+            }
+        }
+    }
 
     #[test]
     fn cpu_only_model_params_exclude_accelerator_devices() {
@@ -1377,5 +1839,125 @@ mod tests {
         std::fs::write(&projector, b"GGUF projector").unwrap();
 
         assert_eq!(find_multimodal_projector(&model).unwrap(), projector);
+    }
+
+    #[test]
+    fn llama_full_vocabulary_mask_rejects_invalid_mutation_prefixes_before_top_k() {
+        let request = LlamaCppChatRequest {
+            messages: json!([]),
+            tools: json!([{
+                "type":"function",
+                "function":{
+                    "name":"write_file",
+                    "description":"write",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{
+                            "path":{"type":"string"},
+                            "content":{"type":"string"}
+                        },
+                        "required":["path","content"],
+                        "additionalProperties":false
+                    }
+                }
+            }]),
+            stage_root: None,
+            json_schema: None,
+            tool_constraint_mode:
+                crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed,
+            terminal_tool_names: Vec::new(),
+            mutation_snapshot: Some(pb_control_collar::mutation::WorkspaceSnapshot::default()),
+            semantic_boundary: None,
+            ctx_size: 128,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            max_tokens: 16,
+            top_k: 2,
+            temperature: 0.0,
+            seed: 1,
+        };
+        let mut constraint = LlamaToolConstraint::compile("<tool_call>", &request)
+            .unwrap()
+            .unwrap();
+        let transcript =
+            br#"<tool_call>{"name":"write_file","arguments":{"path":"lib.rs","content":"fn f() { "#;
+        let vocabulary = LlamaCollarVocabulary {
+            visible_bytes: vec![b"]".to_vec(), b"}".to_vec(), Vec::new()],
+            eos: vec![false, false, true],
+        };
+        let mut candidates = LlamaTokenDataArray::new(
+            vec![
+                LlamaTokenData::new(LlamaToken::new(0), 10.0, 0.0),
+                LlamaTokenData::new(LlamaToken::new(1), 9.0, 0.0),
+                LlamaTokenData::new(LlamaToken::new(2), 8.0, 0.0),
+            ],
+            false,
+        );
+
+        apply_llama_collar_mask(&mut candidates, &mut constraint, &vocabulary, transcript).unwrap();
+
+        assert_eq!(candidates.data[0].logit(), f32::NEG_INFINITY);
+        assert_eq!(candidates.data[1].logit(), 9.0);
+        assert_eq!(candidates.data[2].logit(), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn llama_full_vocabulary_mask_rejects_semantic_closure_before_top_k() {
+        let request = LlamaCppChatRequest {
+            messages: json!([]),
+            tools: json!([{
+                "type":"function",
+                "function":{
+                    "name":"write_file",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{
+                            "path":{"type":"string"},
+                            "content":{"type":"string"}
+                        },
+                        "required":["path","content"],
+                        "additionalProperties":false
+                    }
+                }
+            }]),
+            stage_root: None,
+            json_schema: None,
+            tool_constraint_mode:
+                crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed,
+            terminal_tool_names: Vec::new(),
+            mutation_snapshot: Some(pb_control_collar::mutation::WorkspaceSnapshot::default()),
+            semantic_boundary: Some(crate::inference::SemanticBoundaryControl::new(
+                RejectSemanticBoundary,
+            )),
+            ctx_size: 128,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            max_tokens: 16,
+            top_k: 1,
+            temperature: 0.0,
+            seed: 1,
+        };
+        let mut constraint = LlamaToolConstraint::compile("<tool_call>", &request)
+            .unwrap()
+            .unwrap();
+        let transcript = br#"<tool_call>{"name":"write_file","arguments":{"path":"lib.rs","content":"pub fn value() -> i32 { 1 }"#;
+        let vocabulary = LlamaCollarVocabulary {
+            visible_bytes: vec![b"\"".to_vec(), b" ".to_vec()],
+            eos: vec![false, false],
+        };
+        let mut candidates = LlamaTokenDataArray::new(
+            vec![
+                LlamaTokenData::new(LlamaToken::new(0), 10.0, 0.0),
+                LlamaTokenData::new(LlamaToken::new(1), 9.0, 0.0),
+            ],
+            false,
+        );
+
+        apply_llama_collar_mask(&mut candidates, &mut constraint, &vocabulary, transcript).unwrap();
+
+        assert_eq!(candidates.data[0].logit(), f32::NEG_INFINITY);
+        assert_eq!(candidates.data[1].logit(), 9.0);
     }
 }

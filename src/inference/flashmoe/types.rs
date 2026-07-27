@@ -274,6 +274,9 @@ pub struct StructuredGenerationRequest {
     /// Immutable controller-authorized bytes for generation-time mutation validation. Sampling
     /// code must never consult the live workspace.
     pub mutation_snapshot: Option<pb_control_collar::mutation::WorkspaceSnapshot>,
+    /// Optional controller-owned semantic boundary probe. It performs no analyzer I/O inside the
+    /// collar crate and is invoked only for completed mutation payload candidates.
+    pub semantic_boundary: Option<crate::inference::SemanticBoundaryControl>,
     pub add_generation_prompt: bool,
     /// Whether the tokenizer chat template should permit emitted reasoning.
     /// Structured harness recovery turns disable this so their bounded budget
@@ -314,6 +317,7 @@ impl StructuredGenerationRequest {
             stage_root: None,
             json_schema: None,
             mutation_snapshot: None,
+            semantic_boundary: None,
             add_generation_prompt: true,
             enable_thinking: true,
             raw_prompt: false,
@@ -383,6 +387,11 @@ pub struct NativeToolConstraintStats {
     pub snapshot_files: usize,
     pub snapshot_bytes: usize,
     pub terminal_state: String,
+    /// Strongest guarantee actually active for this invocation.
+    pub guarantee_rung: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_boundary: Option<crate::inference::SemanticBoundaryStats>,
+    pub decode_recovery: crate::inference::DecodeRecovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

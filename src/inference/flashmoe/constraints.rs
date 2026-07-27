@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result, bail};
+use pb_control_collar::analysis::ClosureVerdict;
 use pb_control_collar::protocol::ToolDialect;
 use pb_control_collar::tool::{
     CollarLimits, CollarManifest, ExposedTool, MutationPolicy, ToolConstraintMode,
@@ -21,7 +22,7 @@ const MAX_COLLAR_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_COLLAR_FILES: usize = 32;
 const MAX_COLLAR_PATCH_HUNKS: usize = 256;
 
-pub(super) fn mutation_completion_gate(
+pub(crate) fn mutation_completion_gate(
     dialect: ToolDialect,
     mode: NativeToolConstraintMode,
     tools: &[ChatTool],
@@ -51,7 +52,7 @@ pub(super) fn mutation_completion_gate(
     )?)?))
 }
 
-pub(super) fn collar_manifest(
+pub(crate) fn collar_manifest(
     dialect: ToolDialect,
     mode: NativeToolConstraintMode,
     tools: &[ChatTool],
@@ -92,10 +93,11 @@ pub(super) fn collar_manifest(
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct NativeToolConstraint {
+pub(crate) struct NativeToolConstraint {
     mode: NativeToolConstraintMode,
     schemas: BTreeMap<String, Value>,
     mutation_gate: Option<MutationCompletionGate>,
+    semantic_provider: Option<crate::inference::SemanticBoundaryControl>,
     terminal_tool_names: BTreeSet<String>,
     forced_tokens: VecDeque<u32>,
     payload_limit_stop: Option<String>,
@@ -123,7 +125,7 @@ impl NativeToolConstraint {
         Self::compile_with_mutation_gate(mode, tools, terminal_tool_names, None)
     }
 
-    pub(super) fn compile_with_mutation_gate(
+    pub(crate) fn compile_with_mutation_gate(
         mode: NativeToolConstraintMode,
         tools: &[ChatTool],
         terminal_tool_names: &[String],
@@ -167,6 +169,7 @@ impl NativeToolConstraint {
             mode: active_mode,
             schemas,
             mutation_gate,
+            semantic_provider: None,
             terminal_tool_names,
             forced_tokens: VecDeque::new(),
             payload_limit_stop: None,
@@ -181,12 +184,100 @@ impl NativeToolConstraint {
         self.mode
     }
 
+    pub(crate) fn set_semantic_provider(
+        &mut self,
+        provider: Option<crate::inference::SemanticBoundaryControl>,
+    ) {
+        self.semantic_provider = provider;
+    }
+
     pub(super) fn schema_sha256(&self) -> &str {
         &self.schema_sha256
     }
 
     pub(super) fn rejected_candidates(&self) -> usize {
         self.rejected_candidates
+    }
+
+    /// Backend-neutral transcript probe used by llama.cpp's native full-vocabulary adapter. The
+    /// Qwen tokenizer path retains its faster candidate batching, while both backends share this
+    /// exact protocol and mutation policy.
+    pub(crate) fn probe_transcript(&mut self, decoded: &str, at_eos: bool) -> bool {
+        if self.output_prefix_is_valid(decoded, at_eos) {
+            true
+        } else {
+            self.rejected_candidates = self.rejected_candidates.saturating_add(1);
+            if let Some(code) = self.output_mutation_rejection(decoded) {
+                *self.mutation_rejections.entry(code).or_default() += 1;
+            }
+            false
+        }
+    }
+
+    pub(crate) fn transcript_has_complete_terminal_call(&self, decoded: &str) -> bool {
+        self.output_has_complete_terminal_call(decoded)
+    }
+
+    pub(crate) fn stats(
+        &self,
+        decoded: &str,
+    ) -> crate::inference::flashmoe::NativeToolConstraintStats {
+        let (snapshot_files, snapshot_bytes) = self.mutation_gate.as_ref().map_or((0, 0), |gate| {
+            let workspace = &gate.manifest().workspace;
+            (workspace.len(), workspace.total_bytes())
+        });
+        let semantic_authorized = self.semantic_closure_authorized(decoded);
+        let semantic_boundary = self
+            .semantic_provider
+            .as_ref()
+            .map(crate::inference::SemanticBoundaryControl::stats);
+        crate::inference::flashmoe::NativeToolConstraintStats {
+            mode: self.mode,
+            dialect: "qwen_json".to_string(),
+            schema_sha256: self.schema_sha256.clone(),
+            rejected_candidates: self.rejected_candidates,
+            mutation_rejections: self
+                .mutation_rejections
+                .iter()
+                .map(|(code, count)| (code.as_str().to_string(), *count))
+                .collect(),
+            snapshot_files,
+            snapshot_bytes,
+            terminal_state: self.terminal_state(decoded).to_string(),
+            guarantee_rung: if semantic_authorized {
+                "semantic_boundary"
+            } else if self.mutation_gate.is_some() {
+                "prefix_syntax"
+            } else {
+                "protocol_schema"
+            }
+            .to_string(),
+            semantic_boundary,
+            decode_recovery: crate::inference::DecodeRecovery::CandidateProbeOnly,
+        }
+    }
+
+    fn semantic_closure_authorized(&self, decoded: &str) -> bool {
+        let (Some(provider), Some(open)) = (
+            self.semantic_provider.as_ref(),
+            decoded.rfind(TOOL_CALL_OPEN),
+        ) else {
+            return false;
+        };
+        let body = &decoded[open + TOOL_CALL_OPEN.len()..];
+        let Some(close) = body.find(TOOL_CALL_CLOSE) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(body[..close].trim()) else {
+            return false;
+        };
+        let (Some(name), Some(arguments)) = (
+            value.get("name").and_then(Value::as_str),
+            value.get("arguments"),
+        ) else {
+            return false;
+        };
+        provider.probe(name, arguments).closure == ClosureVerdict::Allow
     }
 
     pub(super) fn terminal_state(&self, decoded: &str) -> &'static str {
@@ -470,10 +561,15 @@ impl NativeToolConstraint {
 
     fn tool_body_prefix_is_valid(&self, body: &str) -> bool {
         match self.parse_tool_body(body) {
-            PrefixStatus::Incomplete => !matches!(
-                self.mutation_payload_completion_decision(body),
-                CompletionDecision::Reject(_)
-            ),
+            PrefixStatus::Incomplete => {
+                !matches!(
+                    self.mutation_payload_prefix_decision(body),
+                    CompletionDecision::Reject(_)
+                ) && !matches!(
+                    self.mutation_payload_completion_decision(body),
+                    CompletionDecision::Reject(_)
+                )
+            }
             PrefixStatus::Complete(position) => {
                 self.close_suffix_is_valid(&body[position..])
                     && self.completed_tool_body_is_allowed(&body[..position])
@@ -507,7 +603,8 @@ impl NativeToolConstraint {
         let Some(arguments) = value.get("arguments") else {
             return CompletionDecision::Reject(RejectionCode::InvalidArguments);
         };
-        gate.evaluate(name, arguments)
+        let decision = gate.evaluate(name, arguments);
+        self.semantic_decision(name, arguments, decision)
     }
 
     fn completed_tool_body_rejection(&self, body: &str) -> Option<RejectionCode> {
@@ -523,11 +620,27 @@ impl NativeToolConstraint {
         if let Some(close) = body.find(TOOL_CALL_CLOSE) {
             self.completed_tool_body_rejection(&body[..close])
         } else {
-            match self.mutation_payload_completion_decision(body) {
+            let prefix = self.mutation_payload_prefix_decision(body);
+            let decision = if matches!(prefix, CompletionDecision::Reject(_)) {
+                prefix
+            } else {
+                self.mutation_payload_completion_decision(body)
+            };
+            match decision {
                 CompletionDecision::Reject(code) => Some(code),
                 CompletionDecision::Accept | CompletionDecision::NotApplicable => None,
             }
         }
+    }
+
+    fn mutation_payload_prefix_decision(&self, body: &str) -> CompletionDecision {
+        let Some(gate) = self.mutation_gate.as_ref() else {
+            return CompletionDecision::NotApplicable;
+        };
+        let Some((name, arguments, prefix)) = self.mutation_payload_prefix(body) else {
+            return CompletionDecision::NotApplicable;
+        };
+        gate.evaluate_prefix(&name, &arguments, &prefix)
     }
 
     /// Evaluate a mutation as soon as its payload string closes. Waiting for the outer JSON object
@@ -540,7 +653,30 @@ impl NativeToolConstraint {
         let Some((name, arguments)) = self.closed_mutation_payload(body) else {
             return CompletionDecision::NotApplicable;
         };
-        gate.evaluate(&name, &Value::Object(arguments))
+        let arguments = Value::Object(arguments);
+        let decision = gate.evaluate(&name, &arguments);
+        self.semantic_decision(&name, &arguments, decision)
+    }
+
+    fn semantic_decision(
+        &self,
+        name: &str,
+        arguments: &Value,
+        structural: CompletionDecision,
+    ) -> CompletionDecision {
+        if structural != CompletionDecision::Accept {
+            return structural;
+        }
+        match self
+            .semantic_provider
+            .as_ref()
+            .map(|provider| provider.probe(name, arguments).closure)
+        {
+            Some(ClosureVerdict::Reject) => {
+                CompletionDecision::Reject(RejectionCode::InvalidSemantics)
+            }
+            Some(ClosureVerdict::Allow | ClosureVerdict::Defer) | None => structural,
+        }
     }
 
     fn closed_mutation_payload(
@@ -596,6 +732,70 @@ impl NativeToolConstraint {
             }
             position = skip_ws(body, next);
             position = complete_position(consume_byte(body, position, b','))?;
+        }
+        None
+    }
+
+    fn mutation_payload_prefix(
+        &self,
+        body: &str,
+    ) -> Option<(String, serde_json::Map<String, Value>, String)> {
+        let mut position = skip_ws(body, 0);
+        position = complete_position(consume_byte(body, position, b'{'))?;
+        position = skip_ws(body, position);
+        let (name_key, next) = complete_string(parse_fixed_string(body, position, &["name"]))?;
+        if name_key != "name" {
+            return None;
+        }
+        position = skip_ws(body, next);
+        position = complete_position(consume_byte(body, position, b':'))?;
+        position = skip_ws(body, position);
+        let names = self.schemas.keys().map(String::as_str).collect::<Vec<_>>();
+        let (name, next) = complete_string(parse_fixed_string(body, position, &names))?;
+        let payload_name = match name.as_str() {
+            "write_file" | "replace_file" => "content",
+            "edit_file" => "new_text",
+            "apply_patch" => "patch",
+            _ => return None,
+        };
+        position = skip_ws(body, next);
+        position = complete_position(consume_byte(body, position, b','))?;
+        position = skip_ws(body, position);
+        let (arguments_key, next) =
+            complete_string(parse_fixed_string(body, position, &["arguments"]))?;
+        if arguments_key != "arguments" {
+            return None;
+        }
+        position = skip_ws(body, next);
+        position = complete_position(consume_byte(body, position, b':'))?;
+        position = skip_ws(body, position);
+        position = complete_position(consume_byte(body, position, b'{'))?;
+
+        let order = mutation_argument_order(&name)?;
+        let mut values = serde_json::Map::new();
+        for expected in order {
+            position = skip_ws(body, position);
+            let (key, next) = complete_string(parse_json_string(body, position))?;
+            if key != *expected {
+                return None;
+            }
+            position = skip_ws(body, next);
+            position = complete_position(consume_byte(body, position, b':'))?;
+            position = skip_ws(body, position);
+            match parse_json_string(body, position) {
+                StringStatus::Complete(value, next) => {
+                    values.insert(key.clone(), Value::String(value));
+                    if key == payload_name {
+                        return None;
+                    }
+                    position = skip_ws(body, next);
+                    position = complete_position(consume_byte(body, position, b','))?;
+                }
+                StringStatus::Incomplete(Some(prefix)) if key == payload_name => {
+                    return Some((name, values, prefix));
+                }
+                StringStatus::Incomplete(_) | StringStatus::Invalid => return None,
+            }
         }
         None
     }
@@ -680,6 +880,8 @@ pub(super) struct DeepSeekToolConstraint {
     mutation_rejections: BTreeMap<RejectionCode, usize>,
     snapshot_files: usize,
     snapshot_bytes: usize,
+    mutation_enabled: bool,
+    semantic_provider: Option<crate::inference::SemanticBoundaryControl>,
 }
 
 impl DeepSeekToolConstraint {
@@ -733,7 +935,19 @@ impl DeepSeekToolConstraint {
             mutation_rejections: BTreeMap::new(),
             snapshot_files,
             snapshot_bytes,
+            mutation_enabled: has_mutation,
+            semantic_provider: None,
         }))
+    }
+
+    fn semantic_payload_is_allowed(&self, transcript: &[u8]) -> bool {
+        let (Some(provider), Some(call)) = (
+            self.semantic_provider.as_ref(),
+            self.collar.completed_mutation_payload(transcript),
+        ) else {
+            return true;
+        };
+        provider.probe(&call.name, &call.arguments).closure != ClosureVerdict::Reject
     }
 
     fn transcript_bytes(tokenizer: &QwenTokenizer, tokens: &[u32]) -> Result<(Vec<u8>, usize)> {
@@ -808,7 +1022,9 @@ impl DeepSeekToolConstraint {
             }
             let probe = self.collar.probe(&trial, tokenizer.is_eos(token_u32));
             let advances_visible_output = tokenizer.is_eos(token_u32) || trial.len() > prefix.len();
-            if advances_visible_output && Self::identity_is_valid(&trial, controls) && probe.valid {
+            let identity_valid = Self::identity_is_valid(&trial, controls);
+            let semantic_allowed = probe.valid && self.semantic_payload_is_allowed(&trial);
+            if advances_visible_output && identity_valid && semantic_allowed {
                 accepted.push((token, score));
                 if accepted.len() >= keep {
                     break;
@@ -817,6 +1033,11 @@ impl DeepSeekToolConstraint {
                 self.rejected_candidates = self.rejected_candidates.saturating_add(1);
                 if let Some(code) = probe.rejection {
                     *self.mutation_rejections.entry(code).or_default() += 1;
+                } else if probe.valid && identity_valid && !semantic_allowed {
+                    *self
+                        .mutation_rejections
+                        .entry(RejectionCode::InvalidSemantics)
+                        .or_default() += 1;
                 }
             }
         }
@@ -881,6 +1102,16 @@ impl RuntimeToolConstraint {
         }
     }
 
+    pub(super) fn set_semantic_provider(
+        &mut self,
+        provider: Option<crate::inference::SemanticBoundaryControl>,
+    ) {
+        match self {
+            Self::Qwen(constraint) => constraint.set_semantic_provider(provider),
+            Self::DeepSeek(constraint) => constraint.semantic_provider = provider,
+        }
+    }
+
     pub(super) fn schema_sha256(&self) -> &str {
         match self {
             Self::Qwen(constraint) => constraint.schema_sha256(),
@@ -920,6 +1151,47 @@ impl RuntimeToolConstraint {
                 (workspace.len(), workspace.total_bytes())
             }),
             Self::DeepSeek(constraint) => (constraint.snapshot_files, constraint.snapshot_bytes),
+        }
+    }
+
+    pub(super) fn guarantee_rung(&self, decoded: &str) -> &'static str {
+        match self {
+            Self::Qwen(constraint) if constraint.semantic_closure_authorized(decoded) => {
+                "semantic_boundary"
+            }
+            Self::DeepSeek(constraint)
+                if constraint
+                    .semantic_provider
+                    .as_ref()
+                    .is_some_and(|provider| {
+                        constraint.collar.probe(decoded.as_bytes(), false).complete
+                            && constraint
+                                .collar
+                                .completed_mutation_payload(decoded.as_bytes())
+                                .is_some_and(|call| {
+                                    provider.probe(&call.name, &call.arguments).closure
+                                        == ClosureVerdict::Allow
+                                })
+                    }) =>
+            {
+                "semantic_boundary"
+            }
+            Self::Qwen(constraint) if constraint.mutation_gate.is_some() => "prefix_syntax",
+            Self::DeepSeek(constraint) if constraint.mutation_enabled => "prefix_syntax",
+            _ => "protocol_schema",
+        }
+    }
+
+    pub(super) fn semantic_stats(&self) -> Option<crate::inference::SemanticBoundaryStats> {
+        match self {
+            Self::Qwen(constraint) => constraint
+                .semantic_provider
+                .as_ref()
+                .map(crate::inference::SemanticBoundaryControl::stats),
+            Self::DeepSeek(constraint) => constraint
+                .semantic_provider
+                .as_ref()
+                .map(crate::inference::SemanticBoundaryControl::stats),
         }
     }
 
@@ -1704,7 +1976,25 @@ fn numeric_bounds_accept(schema: &Value, value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pb_control_collar::analysis::{ProviderVerdict, Viability};
     use serde_json::json;
+
+    struct RejectSemantics;
+
+    impl crate::inference::SemanticBoundaryProvider for RejectSemantics {
+        fn probe(&self, _tool: &str, _arguments: &Value) -> ProviderVerdict {
+            ProviderVerdict {
+                viability: Viability::Impossible,
+                closure: ClosureVerdict::Reject,
+                definite_errors: vec![
+                    pb_control_collar::analysis::DefiniteErrorClass::TypeMismatch,
+                ],
+                unknown_reasons: Vec::new(),
+                obligations: Vec::new(),
+                biases: Vec::new(),
+            }
+        }
+    }
 
     fn tools() -> Vec<ChatTool> {
         vec![ChatTool {
@@ -2025,6 +2315,12 @@ mod tests {
         );
         assert!(constraint.output_prefix_is_valid(invalid_open, false));
         assert!(!constraint.output_prefix_is_valid(&format!("{invalid_open}\""), false));
+        let impossible_open = invalid_open.replace("pub fn broken( {", "pub fn broken() { ]");
+        assert!(!constraint.output_prefix_is_valid(&impossible_open, false));
+        assert_eq!(
+            constraint.output_mutation_rejection(&impossible_open),
+            Some(RejectionCode::InvalidPrefix)
+        );
 
         let valid_open = invalid_open.replace("pub fn broken( {", "pub fn ok() {}");
         assert!(constraint.output_prefix_is_valid(&format!("{valid_open}\""), false));
@@ -2035,6 +2331,71 @@ mod tests {
             "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"content\"",
             false
         ));
+    }
+
+    #[test]
+    fn semantic_provider_rejects_the_payload_quote_while_the_prefix_remains_repairable() {
+        let mut mutation_tools = mutation_tools();
+        mutation_tools[0].input_schema["properties"]["content"]["maxLength"] = json!(256);
+        let snapshot = pb_control_collar::mutation::WorkspaceSnapshot::default();
+        let gate = mutation_completion_gate(
+            ToolDialect::QwenJson,
+            NativeToolConstraintMode::ToolsAllowed,
+            &mutation_tools,
+            &[],
+            Some(&snapshot),
+        )
+        .unwrap();
+        let mut constraint = NativeToolConstraint::compile_with_mutation_gate(
+            NativeToolConstraintMode::ToolsAllowed,
+            &mutation_tools,
+            &[],
+            gate,
+        )
+        .unwrap()
+        .unwrap();
+        constraint.set_semantic_provider(Some(crate::inference::SemanticBoundaryControl::new(
+            RejectSemantics,
+        )));
+        let open = concat!(
+            "<tool_call>{\"name\":\"write_file\",\"arguments\":{",
+            "\"path\":\"lib.rs\",\"content\":\"pub fn value() -> i32 { 1 }"
+        );
+        assert!(constraint.output_prefix_is_valid(open, false));
+        let closed = format!("{open}\"");
+        assert!(!constraint.output_prefix_is_valid(&closed, false));
+        assert_eq!(
+            constraint.output_mutation_rejection(&closed),
+            Some(RejectionCode::InvalidSemantics)
+        );
+    }
+
+    #[test]
+    fn deepseek_semantic_provider_observes_the_same_payload_quote_boundary() {
+        let mut mutation_tools = mutation_tools();
+        mutation_tools[0].input_schema["properties"]["content"]["maxLength"] = json!(256);
+        let snapshot = pb_control_collar::mutation::WorkspaceSnapshot::default();
+        let mut constraint = DeepSeekToolConstraint::compile(
+            NativeToolConstraintMode::ToolsAllowed,
+            &mutation_tools,
+            &[],
+            Some(&snapshot),
+        )
+        .unwrap()
+        .unwrap();
+        constraint.semantic_provider = Some(crate::inference::SemanticBoundaryControl::new(
+            RejectSemantics,
+        ));
+        let transcript = format!(
+            "{}{}write_file\">{}path\" string=\"true\">lib.rs{}{}content\" string=\"false\">\"pub fn value() -> i32 {{ 1 }}\"",
+            pb_control_collar::protocol::dsml::CALLS_OPEN,
+            pb_control_collar::protocol::dsml::INVOKE_OPEN,
+            pb_control_collar::protocol::dsml::PARAMETER_OPEN,
+            pb_control_collar::protocol::dsml::PARAMETER_CLOSE,
+            pb_control_collar::protocol::dsml::PARAMETER_OPEN,
+        );
+        assert!(constraint.collar.probe(transcript.as_bytes(), false).valid);
+        assert!(!constraint.semantic_payload_is_allowed(transcript.as_bytes()));
     }
 
     #[test]

@@ -54,7 +54,19 @@ pub struct LspServerConfig {
     #[serde(default)]
     pub network_access: crate::session_environment::ServiceNetworkAccess,
     pub cache_ids: Vec<String>,
+    /// Optional generation/executor semantic analysis. Required mode fails closed on an incomplete,
+    /// stale, unpinned, timed-out, or error-producing provider result.
+    pub semantic_enforcement: LspSemanticEnforcement,
     pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspSemanticEnforcement {
+    #[default]
+    Disabled,
+    Advisory,
+    Required,
 }
 
 impl Default for LspServerConfig {
@@ -73,6 +85,7 @@ impl Default for LspServerConfig {
             workspace_access: default_lsp_workspace_access(),
             network_access: crate::session_environment::ServiceNetworkAccess::None,
             cache_ids: Vec::new(),
+            semantic_enforcement: LspSemanticEnforcement::Disabled,
             disabled: false,
         }
     }
@@ -995,6 +1008,227 @@ pub fn proactive_supported_paths(
     }
 }
 
+/// Analyze controller-provided document bytes without rereading those documents from disk. Every
+/// authoritative target requires a full pull-diagnostic response for the exact monotonically
+/// versioned overlay and an unchanged repository snapshot before and after the pass. Push-only,
+/// stale, timed-out, or failed providers are reported as unknown and can never authorize a semantic
+/// closure.
+pub fn overlay_diagnostics(
+    registry: &LspToolRegistry,
+    workspace_root: &Path,
+    documents: &[LspOverlayDocument],
+    expected_workspace_fingerprint: &str,
+    timeout: Duration,
+) -> Result<LspOverlayDiagnosticReport> {
+    if documents.is_empty() {
+        bail!("semantic LSP overlay requires at least one document");
+    }
+    if documents.len() > MAX_PROACTIVE_LSP_PATHS {
+        bail!(
+            "semantic LSP overlay exceeds the {}-document bound",
+            MAX_PROACTIVE_LSP_PATHS
+        );
+    }
+    let mut paths = BTreeSet::new();
+    let mut total_bytes = 0usize;
+    for document in documents {
+        pb_control_collar::mutation::LogicalPath::parse(document.path.clone())
+            .context("semantic LSP overlay path is not canonical")?;
+        if !paths.insert(document.path.as_str()) {
+            bail!("semantic LSP overlay repeats path {}", document.path);
+        }
+        total_bytes = total_bytes
+            .checked_add(document.text.len())
+            .context("semantic LSP overlay byte count overflowed")?;
+        if total_bytes as u64 > MAX_PROACTIVE_LSP_SNAPSHOT_BYTES {
+            bail!(
+                "semantic LSP overlay exceeds the {}-byte bound",
+                MAX_PROACTIVE_LSP_SNAPSHOT_BYTES
+            );
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    let before = proactive_workspace_snapshot(workspace_root, deadline)?;
+    let mut report = LspOverlayDiagnosticReport {
+        targets: Vec::new(),
+        requested_targets: Vec::new(),
+        unknown_reasons: BTreeSet::new(),
+        complete: false,
+    };
+    if before.fingerprint != expected_workspace_fingerprint {
+        report
+            .unknown_reasons
+            .insert(pb_control_collar::analysis::UnknownReason::ConfigurationChanged);
+        return Ok(report);
+    }
+
+    let mut server_documents = BTreeMap::<String, Vec<&LspOverlayDocument>>::new();
+    for document in documents {
+        let Some(language_id) = inferred_language_id(Path::new(&document.path)) else {
+            report
+                .unknown_reasons
+                .insert(pb_control_collar::analysis::UnknownReason::UnsupportedConstruct);
+            continue;
+        };
+        let mut matched = false;
+        for (server, config) in &registry.servers {
+            if config.disabled || config.semantic_enforcement == LspSemanticEnforcement::Disabled {
+                continue;
+            }
+            if config
+                .language_ids
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(language_id))
+            {
+                matched = true;
+                server_documents
+                    .entry(server.clone())
+                    .or_default()
+                    .push(document);
+                report.requested_targets.push(ProactiveLspTarget {
+                    server: server.clone(),
+                    path: document.path.clone(),
+                });
+            }
+        }
+        if !matched {
+            report
+                .unknown_reasons
+                .insert(pb_control_collar::analysis::UnknownReason::ProviderUnavailable);
+        }
+    }
+
+    for (server, documents) in server_documents {
+        if Instant::now() >= deadline {
+            report
+                .unknown_reasons
+                .insert(pb_control_collar::analysis::UnknownReason::Timeout);
+            break;
+        }
+        let Some(session) = registry.sessions.get(&server) else {
+            report
+                .unknown_reasons
+                .insert(pb_control_collar::analysis::UnknownReason::ProviderUnavailable);
+            continue;
+        };
+        let mut slot = match session.lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                report
+                    .unknown_reasons
+                    .insert(pb_control_collar::analysis::UnknownReason::ProviderUnavailable);
+                continue;
+            }
+        };
+        if slot.is_none() {
+            let Some(config) = registry.servers.get(&server) else {
+                report
+                    .unknown_reasons
+                    .insert(pb_control_collar::analysis::UnknownReason::ProviderUnavailable);
+                continue;
+            };
+            let initialize_timeout = deadline.saturating_duration_since(Instant::now());
+            if initialize_timeout.is_zero() {
+                report
+                    .unknown_reasons
+                    .insert(pb_control_collar::analysis::UnknownReason::Timeout);
+                break;
+            }
+            match LspClient::connect(
+                &server,
+                config,
+                workspace_root,
+                registry.lease.as_ref(),
+                initialize_timeout,
+            ) {
+                Ok(client) => *slot = Some(client),
+                Err(_) => {
+                    report
+                        .unknown_reasons
+                        .insert(pb_control_collar::analysis::UnknownReason::ProviderUnavailable);
+                    continue;
+                }
+            }
+        }
+        let Some(client) = slot.as_mut() else {
+            continue;
+        };
+        if !client.supports_pull_diagnostics {
+            report
+                .unknown_reasons
+                .insert(pb_control_collar::analysis::UnknownReason::UnsupportedConstruct);
+            continue;
+        }
+        let previous_deadline = client.active_deadline.replace(deadline);
+        let result = (|| -> Result<Vec<LspOverlayDiagnosticTarget>> {
+            let mut opened = Vec::with_capacity(documents.len());
+            for document in &documents {
+                opened.push((
+                    document.path.clone(),
+                    client.open_overlay_document(workspace_root, document, true)?,
+                    pb_control_collar::receipt::Digest::of(document.text.as_bytes()),
+                ));
+            }
+            let mut targets = Vec::with_capacity(opened.len());
+            for (path, document, text_sha256) in opened {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    bail!("semantic LSP overlay timed out before diagnostics");
+                }
+                let diagnostics = client.pull_diagnostics(&document, remaining)?;
+                targets.push(LspOverlayDiagnosticTarget {
+                    server: server.clone(),
+                    path,
+                    version: document.version,
+                    text_sha256,
+                    diagnostics,
+                });
+            }
+            Ok(targets)
+        })();
+        client.active_deadline = previous_deadline;
+        match result {
+            Ok(targets) => report.targets.extend(targets),
+            Err(_) if Instant::now() >= deadline => {
+                report
+                    .unknown_reasons
+                    .insert(pb_control_collar::analysis::UnknownReason::Timeout);
+            }
+            Err(_) => {
+                report
+                    .unknown_reasons
+                    .insert(pb_control_collar::analysis::UnknownReason::ProviderUnavailable);
+            }
+        }
+    }
+
+    match proactive_workspace_snapshot(workspace_root, deadline) {
+        Ok(after) if after.fingerprint == before.fingerprint => {}
+        Ok(_) => {
+            report.targets.clear();
+            report
+                .unknown_reasons
+                .insert(pb_control_collar::analysis::UnknownReason::StaleDocument);
+        }
+        Err(_) => {
+            report.targets.clear();
+            report
+                .unknown_reasons
+                .insert(pb_control_collar::analysis::UnknownReason::Timeout);
+        }
+    }
+    report.requested_targets.sort();
+    report.requested_targets.dedup();
+    report.targets.sort_by(|left, right| {
+        left.server
+            .cmp(&right.server)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    report.complete =
+        report.unknown_reasons.is_empty() && report.targets.len() == report.requested_targets.len();
+    Ok(report)
+}
+
 fn normalize_proactive_diagnostic(
     server: &str,
     path: &str,
@@ -1227,6 +1461,29 @@ struct DiagnosticSnapshot {
 struct OpenDocumentState {
     uri: String,
     version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspOverlayDocument {
+    pub path: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LspOverlayDiagnosticTarget {
+    pub server: String,
+    pub path: String,
+    pub version: u64,
+    pub text_sha256: pb_control_collar::receipt::Digest,
+    pub diagnostics: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LspOverlayDiagnosticReport {
+    pub targets: Vec<LspOverlayDiagnosticTarget>,
+    pub requested_targets: Vec<ProactiveLspTarget>,
+    pub unknown_reasons: BTreeSet<pb_control_collar::analysis::UnknownReason>,
+    pub complete: bool,
 }
 
 enum LspProcess {
@@ -1466,7 +1723,35 @@ impl LspClient {
             "LSP document",
             self.effective_deadline(LSP_READ_TIMEOUT),
         )?;
-        let uri = path_to_uri(&full)?;
+        self.open_document_text(&full, text, force_refresh)
+    }
+
+    fn open_overlay_document(
+        &mut self,
+        workspace_root: &Path,
+        document: &LspOverlayDocument,
+        force_refresh: bool,
+    ) -> Result<OpenDocumentState> {
+        if document.text.len() as u64 > MAX_LSP_DOCUMENT_BYTES {
+            bail!(
+                "LSP overlay document {} exceeds the {}-byte bound",
+                document.path,
+                MAX_LSP_DOCUMENT_BYTES
+            );
+        }
+        let path = pb_control_collar::mutation::LogicalPath::parse(document.path.clone())
+            .context("LSP overlay path is not canonical")?;
+        let full = resolve_overlay_workspace_path(workspace_root, &path)?;
+        self.open_document_text(&full, document.text.clone(), force_refresh)
+    }
+
+    fn open_document_text(
+        &mut self,
+        full: &Path,
+        text: String,
+        force_refresh: bool,
+    ) -> Result<OpenDocumentState> {
+        let uri = path_to_overlay_uri(full)?;
         let content_sha256 = crate::environment_lock::sha256(text.as_bytes());
         if let Some(document) = self.open_documents.get(&uri) {
             if document.content_sha256 != content_sha256 || force_refresh {
@@ -2026,6 +2311,62 @@ fn path_to_uri(path: &Path) -> Result<String> {
         .map(|url| url.to_string())
         .map_err(|()| anyhow!("failed to encode LSP file URI for {}", canonical.display()))
 }
+
+fn path_to_overlay_uri(path: &Path) -> Result<String> {
+    if path.exists() {
+        return path_to_uri(path);
+    }
+    if !path.is_absolute() {
+        bail!("LSP overlay URI path must be absolute: {}", path.display());
+    }
+    url::Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .map_err(|()| anyhow!("failed to encode LSP overlay URI for {}", path.display()))
+}
+
+fn resolve_overlay_workspace_path(
+    workspace_root: &Path,
+    path: &pb_control_collar::mutation::LogicalPath,
+) -> Result<PathBuf> {
+    let root = workspace_root.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve LSP workspace {}",
+            workspace_root.display()
+        )
+    })?;
+    let full = root.join(path.as_str());
+    let mut existing = full.as_path();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().with_context(|| {
+                    format!(
+                        "LSP overlay path has no existing ancestor: {}",
+                        full.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", existing.display()));
+            }
+        }
+    }
+    let canonical = existing
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", existing.display()))?;
+    if !canonical.starts_with(&root) {
+        bail!("LSP overlay path escapes workspace: {}", path.as_str());
+    }
+    if existing != full && !canonical.is_dir() {
+        bail!(
+            "LSP overlay path has a non-directory ancestor: {}",
+            existing.display()
+        );
+    }
+    Ok(full)
+}
 fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
     args.get(name)
         .and_then(Value::as_str)
@@ -2055,7 +2396,7 @@ fn inferred_language_id(path: &Path) -> Option<&'static str> {
         Some("tsx") => Some("typescriptreact"),
         Some("js") | Some("mjs") | Some("cjs") => Some("javascript"),
         Some("jsx") => Some("javascriptreact"),
-        Some("py") => Some("python"),
+        Some("py") | Some("pyi") => Some("python"),
         Some("go") => Some("go"),
         Some("java") => Some("java"),
         Some("kt") | Some("kts") => Some("kotlin"),
@@ -2106,6 +2447,7 @@ mod tests {
                     container_image: Some("example/rust-analyzer:locked".to_string()),
                     initialization_options: Some(json!({"cargo":{"allFeatures":true}})),
                     cache_ids: vec!["rust-analyzer-index".to_string()],
+                    semantic_enforcement: LspSemanticEnforcement::Required,
                     ..Default::default()
                 },
             )]),
@@ -2131,6 +2473,120 @@ mod tests {
 
         assert!(registry.tool("lsp_rust_diagnostics").is_some());
         assert!(registry.sessions["rust"].lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn semantic_overlay_sends_exact_bytes_and_monotonic_versions_to_pull_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        let log_directory = tempfile::tempdir().unwrap();
+        let log = log_directory.path().join("fake-lsp.jsonl");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_lsp.py");
+        let registry = discover_tools(
+            BTreeMap::from([(
+                "rust-analyzer".to_string(),
+                LspServerConfig {
+                    command: Some("python3".to_string()),
+                    args: vec![
+                        fixture.to_string_lossy().into_owned(),
+                        log.to_string_lossy().into_owned(),
+                    ],
+                    language_ids: vec!["rust".to_string()],
+                    semantic_enforcement: LspSemanticEnforcement::Advisory,
+                    ..Default::default()
+                },
+            )]),
+            directory.path(),
+        );
+        let expected = crate::workspace::ContentSnapshot::capture(directory.path())
+            .unwrap()
+            .fingerprint;
+        let baseline_text = "pub fn value() -> i32 { 1 }\n";
+        let baseline = overlay_diagnostics(
+            &registry,
+            directory.path(),
+            &[LspOverlayDocument {
+                path: "src/lib.rs".to_string(),
+                text: baseline_text.to_string(),
+            }],
+            &expected,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(baseline.complete, "{baseline:?}");
+        assert_eq!(baseline.targets[0].version, 1);
+        assert_eq!(
+            baseline.targets[0].text_sha256,
+            pb_control_collar::receipt::Digest::of(baseline_text.as_bytes())
+        );
+        assert!(
+            baseline.targets[0]
+                .diagnostics
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let candidate_text = "pub fn value() -> i32 { TYPE_ERROR }\n";
+        let candidate = overlay_diagnostics(
+            &registry,
+            directory.path(),
+            &[LspOverlayDocument {
+                path: "src/lib.rs".to_string(),
+                text: candidate_text.to_string(),
+            }],
+            &expected,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(candidate.complete, "{candidate:?}");
+        assert_eq!(candidate.targets[0].version, 2);
+        assert_eq!(candidate.targets[0].diagnostics[0]["code"], "E0308");
+        assert_eq!(
+            candidate.targets[0].text_sha256,
+            pb_control_collar::receipt::Digest::of(candidate_text.as_bytes())
+        );
+
+        let records = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(records.iter().any(|record| {
+            record["event"] == "open" && record["version"] == 1 && record["text"] == baseline_text
+        }));
+        assert!(records.iter().any(|record| {
+            record["event"] == "change"
+                && record["version"] == 2
+                && record["text"] == candidate_text
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_overlay_rejects_a_missing_file_beneath_an_outward_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), workspace.path().join("outside")).unwrap();
+        let path = pb_control_collar::mutation::LogicalPath::parse("outside/new.rs").unwrap();
+        assert!(resolve_overlay_workspace_path(workspace.path(), &path).is_err());
+
+        std::fs::create_dir(workspace.path().join("inside")).unwrap();
+        let path = pb_control_collar::mutation::LogicalPath::parse("inside/new.rs").unwrap();
+        assert_eq!(
+            resolve_overlay_workspace_path(workspace.path(), &path).unwrap(),
+            workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("inside/new.rs")
+        );
     }
 
     #[test]

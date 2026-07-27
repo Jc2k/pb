@@ -6,7 +6,7 @@
 mod artifact;
 mod cache;
 mod capabilities;
-mod constraints;
+pub(crate) mod constraints;
 mod json_constraints;
 #[cfg(test)]
 pub(crate) use constraints::{terminal_tool_output_is_complete, validate_native_tool_schema};

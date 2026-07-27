@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::{
     CollarError, CollarResult,
+    analysis::{Viability, validate_supported_prefix},
     mutation::{LogicalPath, MutationKind, PreparedFileMutation, WorkspaceSnapshot},
     receipt::Digest,
 };
@@ -13,14 +14,16 @@ pub struct PreparedPatch {
     hunk_count: usize,
 }
 
-/// Chunk-boundary-independent logical patch stream. Wire adapters feed decoded argument bytes into
-/// this owner; `finish` performs the same exact virtual transaction used by executor revalidation.
-/// The buffered first implementation deliberately makes no unsound prefix claims, leaving room for
-/// future hunk-boundary checkpoints without changing the protocol or executor interface.
+/// Chunk-boundary-independent logical patch stream. Completed patch lines are validated as soon as
+/// they arrive, including canonical metadata, exact offsets/counts, context/deletion bytes, and
+/// file/hunk bounds. `finish` still performs the authoritative batch transaction used by executor
+/// revalidation, and tests require streaming/batch agreement.
 #[derive(Clone, Debug)]
 pub struct PatchStream {
     snapshot: WorkspaceSnapshot,
     bytes: Vec<u8>,
+    processed_bytes: usize,
+    prefix: PatchPrefixValidator,
     max_bytes: usize,
     max_files: usize,
     max_hunks: usize,
@@ -41,6 +44,8 @@ impl PatchStream {
         Ok(Self {
             snapshot,
             bytes: Vec::new(),
+            processed_bytes: 0,
+            prefix: PatchPrefixValidator::default(),
             max_bytes,
             max_files,
             max_hunks,
@@ -70,6 +75,22 @@ impl PatchStream {
             ));
         }
         self.bytes.extend_from_slice(bytes);
+        while let Some(relative_end) = self.bytes[self.processed_bytes..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let end = self.processed_bytes + relative_end;
+            let line =
+                std::str::from_utf8(&self.bytes[self.processed_bytes..end]).map_err(|error| {
+                    CollarError::Mutation(format!(
+                        "canonical patch line is not UTF-8 at byte {}",
+                        self.processed_bytes.saturating_add(error.valid_up_to())
+                    ))
+                })?;
+            self.prefix
+                .push_line(&self.snapshot, line, self.max_files, self.max_hunks)?;
+            self.processed_bytes = end + 1;
+        }
         Ok(())
     }
 
@@ -89,6 +110,411 @@ impl PatchStream {
             ))
         })?;
         prepare_patch(&self.snapshot, patch, self.max_files, self.max_hunks)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PatchPrefixValidator {
+    phase: PatchPrefixPhase,
+    paths: BTreeSet<LogicalPath>,
+    files: usize,
+    hunks: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+enum PatchPrefixPhase {
+    #[default]
+    Start,
+    Metadata(PrefixMetadata),
+    NewHeader {
+        metadata: PrefixMetadata,
+        old_path: Option<LogicalPath>,
+    },
+    File(PrefixFile),
+}
+
+#[derive(Clone, Debug, Default)]
+struct PrefixMetadata {
+    diff_paths: Option<(LogicalPath, LogicalPath)>,
+    creation_mode: bool,
+    deletion_mode: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PrefixFile {
+    path: LogicalPath,
+    kind: MutationKind,
+    base_lines: Vec<Vec<u8>>,
+    base_cursor: usize,
+    result_lines: usize,
+    result_prefix: Vec<u8>,
+    file_hunks: usize,
+    hunk: Option<PrefixHunk>,
+}
+
+#[derive(Clone, Debug)]
+struct PrefixHunk {
+    header: HunkHeader,
+    old_seen: usize,
+    new_seen: usize,
+    pending: Option<(HunkLineKind, Vec<u8>)>,
+}
+
+impl PatchPrefixValidator {
+    fn push_line(
+        &mut self,
+        snapshot: &WorkspaceSnapshot,
+        line: &str,
+        max_files: usize,
+        max_hunks: usize,
+    ) -> CollarResult<()> {
+        let phase = std::mem::take(&mut self.phase);
+        self.phase = match phase {
+            PatchPrefixPhase::Start => self.start_file(line, max_files)?,
+            PatchPrefixPhase::Metadata(metadata) => {
+                self.consume_metadata(metadata, line, max_files)?
+            }
+            PatchPrefixPhase::NewHeader { metadata, old_path } => {
+                self.consume_new_header(snapshot, metadata, old_path, line)?
+            }
+            PatchPrefixPhase::File(mut file) => {
+                if file.consume_line(line, &mut self.hunks, max_hunks)? {
+                    PatchPrefixPhase::File(file)
+                } else {
+                    if file.file_hunks == 0 {
+                        return Err(CollarError::Mutation(format!(
+                            "file diff for {:?} has no hunks",
+                            file.path.as_str()
+                        )));
+                    }
+                    self.phase = self.start_file(line, max_files)?;
+                    return Ok(());
+                }
+            }
+        };
+        Ok(())
+    }
+
+    fn start_file(&mut self, line: &str, max_files: usize) -> CollarResult<PatchPrefixPhase> {
+        if self.files >= max_files {
+            return Err(CollarError::Mutation(format!(
+                "patch exceeds the {max_files}-file limit"
+            )));
+        }
+        let mut metadata = PrefixMetadata::default();
+        if line.starts_with("diff --git ") {
+            metadata.diff_paths = Some(parse_diff_header_line(line)?);
+            return Ok(PatchPrefixPhase::Metadata(metadata));
+        }
+        self.consume_metadata(metadata, line, max_files)
+    }
+
+    fn consume_metadata(
+        &mut self,
+        mut metadata: PrefixMetadata,
+        line: &str,
+        _max_files: usize,
+    ) -> CollarResult<PatchPrefixPhase> {
+        if line == "new file mode 100644" && !metadata.creation_mode && !metadata.deletion_mode {
+            metadata.creation_mode = true;
+            return Ok(PatchPrefixPhase::Metadata(metadata));
+        }
+        if line == "deleted file mode 100644" && !metadata.deletion_mode {
+            metadata.deletion_mode = true;
+            if metadata.creation_mode {
+                return Err(CollarError::Mutation(
+                    "one file diff cannot be both created and deleted".to_string(),
+                ));
+            }
+            return Ok(PatchPrefixPhase::Metadata(metadata));
+        }
+        reject_unsupported_metadata(line)?;
+        let old_path = parse_file_header(line, "--- ", 'a')?;
+        Ok(PatchPrefixPhase::NewHeader { metadata, old_path })
+    }
+
+    fn consume_new_header(
+        &mut self,
+        snapshot: &WorkspaceSnapshot,
+        metadata: PrefixMetadata,
+        old_path: Option<LogicalPath>,
+        line: &str,
+    ) -> CollarResult<PatchPrefixPhase> {
+        let new_path = parse_file_header(line, "+++ ", 'b')?;
+        let (path, kind) = patch_path_kind(old_path.as_ref(), new_path.as_ref())?;
+        if metadata.creation_mode != (kind == MutationKind::Create)
+            || metadata.deletion_mode != (kind == MutationKind::Delete)
+        {
+            return Err(CollarError::Mutation(format!(
+                "patch metadata does not match {kind:?} headers for {:?}",
+                path.as_str()
+            )));
+        }
+        if let Some((diff_old, diff_new)) = metadata.diff_paths {
+            let expected_old = old_path.as_ref().unwrap_or(&path);
+            let expected_new = new_path.as_ref().unwrap_or(&path);
+            if diff_old != *expected_old || diff_new != *expected_new {
+                return Err(CollarError::Mutation(
+                    "diff --git paths do not match file headers".to_string(),
+                ));
+            }
+        }
+        if !self.paths.insert(path.clone()) {
+            return Err(CollarError::Mutation(format!(
+                "patch repeats file {:?}",
+                path.as_str()
+            )));
+        }
+        let base = match kind {
+            MutationKind::Create => {
+                if snapshot.contains(&path) {
+                    return Err(CollarError::Mutation(format!(
+                        "patch create target {:?} already exists",
+                        path.as_str()
+                    )));
+                }
+                Vec::new()
+            }
+            MutationKind::Modify | MutationKind::Delete => split_lines(
+                &snapshot
+                    .get(&path)
+                    .ok_or_else(|| {
+                        CollarError::Mutation(format!(
+                            "patch target {:?} is missing from the snapshot",
+                            path.as_str()
+                        ))
+                    })?
+                    .bytes,
+            ),
+        };
+        self.files = self.files.saturating_add(1);
+        Ok(PatchPrefixPhase::File(PrefixFile {
+            path,
+            kind,
+            base_lines: base,
+            base_cursor: 0,
+            result_lines: 0,
+            result_prefix: Vec::new(),
+            file_hunks: 0,
+            hunk: None,
+        }))
+    }
+}
+
+impl PrefixFile {
+    /// Returns false when `line` starts the next file diff and must be replayed by the outer state.
+    fn consume_line(
+        &mut self,
+        line: &str,
+        total_hunks: &mut usize,
+        max_hunks: usize,
+    ) -> CollarResult<bool> {
+        if let Some(mut hunk) = self.hunk.take() {
+            if let Some((kind, bytes)) = hunk.pending.take() {
+                if line == "\\ No newline at end of file" {
+                    self.commit_hunk_line(&mut hunk, kind, bytes)?;
+                    self.hunk = Some(hunk);
+                    return Ok(true);
+                }
+                let mut bytes = bytes;
+                bytes.push(b'\n');
+                self.commit_hunk_line(&mut hunk, kind, bytes)?;
+            }
+            if hunk.old_seen < hunk.header.old_count || hunk.new_seen < hunk.header.new_count {
+                let (kind, text) = parse_hunk_line(line)?;
+                let next_old = hunk.old_seen.saturating_add(usize::from(matches!(
+                    kind,
+                    HunkLineKind::Context | HunkLineKind::Deletion
+                )));
+                let next_new = hunk.new_seen.saturating_add(usize::from(matches!(
+                    kind,
+                    HunkLineKind::Context | HunkLineKind::Addition
+                )));
+                if next_old > hunk.header.old_count || next_new > hunk.header.new_count {
+                    return Err(CollarError::Mutation(format!(
+                        "hunk body exceeds declared counts for {:?}",
+                        self.path.as_str()
+                    )));
+                }
+                hunk.pending = Some((kind, text.as_bytes().to_vec()));
+                self.hunk = Some(hunk);
+                return Ok(true);
+            }
+            self.hunk = None;
+        }
+
+        if line.starts_with("@@ ") {
+            if *total_hunks >= max_hunks {
+                return Err(CollarError::Mutation(format!(
+                    "patch exceeds the {max_hunks}-hunk limit"
+                )));
+            }
+            let header = parse_hunk_header(line)?;
+            let old_index = hunk_index(header.old_start, header.old_count)?;
+            if old_index < self.base_cursor || old_index > self.base_lines.len() {
+                return Err(CollarError::Mutation(format!(
+                    "hunk old offset {} is out of order or outside {:?}",
+                    header.old_start,
+                    self.path.as_str()
+                )));
+            }
+            self.append_untouched_base(old_index)?;
+            self.result_lines = self
+                .result_lines
+                .saturating_add(old_index.saturating_sub(self.base_cursor));
+            self.base_cursor = old_index;
+            let expected_new_start = if header.new_count == 0 {
+                self.result_lines
+            } else {
+                self.result_lines.saturating_add(1)
+            };
+            if header.new_start != expected_new_start {
+                return Err(CollarError::Mutation(format!(
+                    "hunk new offset {} does not match virtual result line {} for {:?}",
+                    header.new_start,
+                    expected_new_start,
+                    self.path.as_str()
+                )));
+            }
+            *total_hunks = total_hunks.saturating_add(1);
+            self.file_hunks = self.file_hunks.saturating_add(1);
+            self.hunk = Some(PrefixHunk {
+                header,
+                old_seen: 0,
+                new_seen: 0,
+                pending: None,
+            });
+            return Ok(true);
+        }
+        if line.starts_with("diff --git ")
+            || line.starts_with("--- ")
+            || line == "new file mode 100644"
+            || line == "deleted file mode 100644"
+        {
+            self.append_untouched_base(self.base_lines.len())?;
+            return Ok(false);
+        }
+        Err(CollarError::Mutation(format!(
+            "expected a canonical hunk header for {:?}, found {line:?}",
+            self.path.as_str()
+        )))
+    }
+
+    fn commit_hunk_line(
+        &mut self,
+        hunk: &mut PrefixHunk,
+        kind: HunkLineKind,
+        bytes: Vec<u8>,
+    ) -> CollarResult<()> {
+        match kind {
+            HunkLineKind::Context => {
+                match_base_line(&self.path, &self.base_lines, self.base_cursor, &bytes)?;
+                self.append_result_bytes(&bytes)?;
+                self.base_cursor = self.base_cursor.saturating_add(1);
+                self.result_lines = self.result_lines.saturating_add(1);
+                hunk.old_seen = hunk.old_seen.saturating_add(1);
+                hunk.new_seen = hunk.new_seen.saturating_add(1);
+            }
+            HunkLineKind::Deletion => {
+                match_base_line(&self.path, &self.base_lines, self.base_cursor, &bytes)?;
+                self.base_cursor = self.base_cursor.saturating_add(1);
+                hunk.old_seen = hunk.old_seen.saturating_add(1);
+            }
+            HunkLineKind::Addition => {
+                self.append_result_bytes(&bytes)?;
+                self.result_lines = self.result_lines.saturating_add(1);
+                hunk.new_seen = hunk.new_seen.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn append_untouched_base(&mut self, end: usize) -> CollarResult<()> {
+        if end < self.base_cursor || end > self.base_lines.len() {
+            return Err(CollarError::Mutation(format!(
+                "virtual prefix range is invalid for {:?}",
+                self.path.as_str()
+            )));
+        }
+        if self.kind != MutationKind::Delete {
+            for index in self.base_cursor..end {
+                self.result_prefix
+                    .extend_from_slice(&self.base_lines[index]);
+            }
+            self.validate_result_prefix()?;
+        }
+        Ok(())
+    }
+
+    fn append_result_bytes(&mut self, bytes: &[u8]) -> CollarResult<()> {
+        if self.kind != MutationKind::Delete {
+            self.result_prefix.extend_from_slice(bytes);
+            self.validate_result_prefix()?;
+        }
+        Ok(())
+    }
+
+    fn validate_result_prefix(&self) -> CollarResult<()> {
+        let report = validate_supported_prefix(&self.path, &self.result_prefix)?;
+        if report.viability == Viability::Impossible {
+            return Err(CollarError::Mutation(format!(
+                "canonical patch makes the committed virtual prefix impossible for {:?} ({:?})",
+                self.path.as_str(),
+                report.rule
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn parse_diff_header_line(line: &str) -> CollarResult<(LogicalPath, LogicalPath)> {
+    let parts = line.split_ascii_whitespace().collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "diff" || parts[1] != "--git" {
+        return Err(CollarError::Mutation(format!(
+            "invalid canonical diff header {line:?}"
+        )));
+    }
+    Ok((
+        parse_prefixed_path(parts[2], 'a')?,
+        parse_prefixed_path(parts[3], 'b')?,
+    ))
+}
+
+fn reject_unsupported_metadata(line: &str) -> CollarResult<()> {
+    if line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+        || line.starts_with("copy from ")
+        || line.starts_with("copy to ")
+        || line.starts_with("GIT binary patch")
+        || line.starts_with("Binary files ")
+        || line.starts_with("index ")
+    {
+        return Err(CollarError::Mutation(format!(
+            "unsupported canonical patch metadata {line:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn patch_path_kind(
+    old_path: Option<&LogicalPath>,
+    new_path: Option<&LogicalPath>,
+) -> CollarResult<(LogicalPath, MutationKind)> {
+    match (old_path, new_path) {
+        (None, Some(path)) => Ok((path.clone(), MutationKind::Create)),
+        (Some(path), None) => Ok((path.clone(), MutationKind::Delete)),
+        (Some(old), Some(new)) if old == new => Ok((old.clone(), MutationKind::Modify)),
+        (Some(old), Some(new)) => Err(CollarError::Mutation(format!(
+            "canonical patch rename from {:?} to {:?} is unsupported",
+            old.as_str(),
+            new.as_str()
+        ))),
+        (None, None) => Err(CollarError::Mutation(
+            "patch file headers cannot both be /dev/null".to_string(),
+        )),
     }
 }
 
@@ -500,7 +926,7 @@ impl<'input> PatchParser<'input> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct HunkHeader {
     old_start: usize,
     old_count: usize,
@@ -559,7 +985,7 @@ fn hunk_index(start: usize, count: usize) -> CollarResult<usize> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum HunkLineKind {
     Context,
     Deletion,
@@ -661,6 +1087,25 @@ mod tests {
         WorkspaceSnapshot::new(vec![SnapshotEntry::new(path, bytes.to_vec())]).unwrap()
     }
 
+    fn assert_stream_equivalent(
+        snapshot: &WorkspaceSnapshot,
+        patch: &str,
+        max_files: usize,
+        max_hunks: usize,
+    ) {
+        let expected = prepare_patch(snapshot, patch, max_files, max_hunks).unwrap();
+        for width in 1..=patch.len() {
+            let mut stream =
+                PatchStream::new(snapshot.clone(), patch.len(), max_files, max_hunks).unwrap();
+            for chunk in patch.as_bytes().chunks(width) {
+                stream
+                    .push(chunk)
+                    .unwrap_or_else(|error| panic!("chunk width {width}: {error}"));
+            }
+            assert_eq!(stream.finish().unwrap(), expected, "chunk width {width}");
+        }
+    }
+
     #[test]
     fn applies_exact_multi_hunk_modification_in_memory() {
         let base = b"one\ntwo\nthree\nfour\nfive\n";
@@ -744,13 +1189,105 @@ mod tests {
             "-two = 2\n",
             "+two = 3\n",
         );
-        let expected = prepare_patch(&snapshot, patch, 4, 8).unwrap();
-        for width in 1..=patch.len() {
-            let mut stream = PatchStream::new(snapshot.clone(), patch.len(), 4, 8).unwrap();
-            for chunk in patch.as_bytes().chunks(width) {
-                stream.push(chunk).unwrap();
-            }
-            assert_eq!(stream.finish().unwrap(), expected, "chunk width {width}");
-        }
+        assert_stream_equivalent(&snapshot, patch, 4, 8);
+    }
+
+    #[test]
+    fn patch_stream_accepts_every_complete_canonical_dialect_shape() {
+        let base = b"one\ntwo\nthree\nfour\nfive\n";
+        let notes_snapshot = snapshot("notes.txt", base);
+        let multi_hunk = concat!(
+            "diff --git a/notes.txt b/notes.txt\n",
+            "--- a/notes.txt\n",
+            "+++ b/notes.txt\n",
+            "@@ -1,2 +1,2 @@\n",
+            " one\n",
+            "-two\n",
+            "+TWO\n",
+            "@@ -4,2 +4,2 @@\n",
+            " four\n",
+            "-five\n",
+            "+FIVE\n",
+        );
+        assert_stream_equivalent(&notes_snapshot, multi_hunk, 1, 2);
+
+        let create_delete_snapshot = snapshot("old.txt", b"old\n");
+        let create_delete = concat!(
+            "diff --git a/new.py b/new.py\n",
+            "new file mode 100644\n",
+            "--- /dev/null\n",
+            "+++ b/new.py\n",
+            "@@ -0,0 +1,1 @@\n",
+            "+value = 1\n",
+            "diff --git a/old.txt b/old.txt\n",
+            "deleted file mode 100644\n",
+            "--- a/old.txt\n",
+            "+++ /dev/null\n",
+            "@@ -1,1 +0,0 @@\n",
+            "-old\n",
+        );
+        assert_stream_equivalent(&create_delete_snapshot, create_delete, 2, 2);
+
+        let no_newline_snapshot = snapshot("a.txt", b"old");
+        let no_newline = concat!(
+            "--- a/a.txt\n",
+            "+++ b/a.txt\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-old\n",
+            "\\ No newline at end of file\n",
+            "+new\n",
+            "\\ No newline at end of file\n",
+        );
+        assert_stream_equivalent(&no_newline_snapshot, no_newline, 1, 1);
+    }
+
+    #[test]
+    fn patch_stream_rejects_offsets_and_context_before_payload_closure() {
+        let snapshot = snapshot("main.py", b"value = 1\nnext = 2\n");
+        let mut bad_offset = PatchStream::new(snapshot.clone(), 4096, 4, 8).unwrap();
+        assert!(
+            bad_offset
+                .push(b"--- a/main.py\n+++ b/main.py\n@@ -3,1 +1,1 @@\n")
+                .is_err()
+        );
+
+        let mut bad_context = PatchStream::new(snapshot, 4096, 4, 8).unwrap();
+        bad_context
+            .push(b"--- a/main.py\n+++ b/main.py\n@@ -1,1 +1,1 @@\n wrong\n")
+            .unwrap();
+        assert!(bad_context.push(b"--- a/next.py\n").is_err());
+    }
+
+    #[test]
+    fn patch_stream_validates_the_committed_virtual_source_between_hunks() {
+        let impossible_snapshot = snapshot("main.py", b"value = 1\nnext_value = 2\n");
+        let mut impossible = PatchStream::new(impossible_snapshot, 4096, 1, 2).unwrap();
+        let error = impossible
+            .push(
+                concat!(
+                    "--- a/main.py\n",
+                    "+++ b/main.py\n",
+                    "@@ -1,1 +1,2 @@\n",
+                    " value = 1\n",
+                    "+)\n",
+                    "@@ -2,1 +3,1 @@\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("virtual prefix impossible"));
+
+        // A generated closer is viable when untouched source before the hunk supplied its opener.
+        let snapshot = snapshot("main.py", b"values = [\nnext_value = 2\n");
+        let patch = concat!(
+            "--- a/main.py\n",
+            "+++ b/main.py\n",
+            "@@ -1,1 +1,2 @@\n",
+            " values = [\n",
+            "+]\n",
+            "@@ -2,1 +3,1 @@\n",
+            " next_value = 2\n",
+        );
+        assert_stream_equivalent(&snapshot, patch, 1, 2);
     }
 }

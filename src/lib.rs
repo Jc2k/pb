@@ -53,6 +53,7 @@ pub mod memory;
 pub mod policy;
 pub mod projects;
 mod public_network;
+pub mod semantic;
 pub mod service;
 pub mod session_environment;
 pub mod session_power;

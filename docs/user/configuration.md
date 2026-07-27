@@ -479,6 +479,47 @@ reload, and leaves settled-state compilation and tests to pb's checks. Its packa
 is a stable baseline, not a promise that projects pinned to another compiler receive exact semantic
 parity.
 
+Semantic mutation analysis is separately opt-in per server. The field is accepted in global
+`[lsp.servers.<name>]` entries and project `.pb/lsp.toml` entries:
+
+```toml
+[servers.rust-analyzer]
+container_image = "ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:<digest>"
+language_ids = ["rust"]
+semantic_enforcement = "advisory" # disabled | advisory | required
+```
+
+`disabled` is the default and preserves ordinary syntax-only mutation constraints. `advisory`
+opens exact controller-provided base/candidate overlays and records semantic outcomes, but an error,
+timeout, stale workspace, unpinned host command, incomplete baseline, or unsupported construct does
+not block generation or publication. `required` permits a mutation-payload close and entry into the
+final publication step only after a digest-pinned provider returns a complete full pull-diagnostic
+result for
+the exact document versions and introduces no classified error. Required mode fails closed on
+provider loss, timeout, stale content, push-only diagnostics, unclassified errors, deletions whose
+dependants cannot be proven, and other `Unknown` outcomes. A host-command LSP is never treated as a
+pinned semantic authority even if its configuration contains a digest-shaped string.
+
+The shipped semantic classifier covers scoped unresolved name/import/field/method, call, type,
+privacy, ownership, and mutability errors reported by rust-analyzer, the TypeScript language
+service, and Pyright. The guarantee is diagnostic- and project-profile-relative: JavaScript needs
+configured type checking, and Python `Any`, dynamic imports, monkey-patching, descriptors, or other
+runtime-only behavior can remain unknown. HTML and CSS retain syntax-only guarantees. Existing
+baseline diagnostics are compared with candidate diagnostics so repairs remain possible; only an
+exact complete baseline can authorize a required clean result. Provider dependency resolution uses
+the sidecar's offline read-only sysroot/package/stub caches, so public symbols from out-of-repository
+dependencies can resolve without disclosing source to the model or enabling network access.
+
+At generation time, Qwen JSON and DeepSeek DSML reject a provider-confirmed bad closing payload
+token before it commits, leaving further source tokens reachable. The same full-vocabulary ordering
+is used by FlashMoe and llama.cpp. The executor then rebuilds the exact virtual mutation, verifies
+the live base, captures and revalidates the current workspace, reruns the configured provider, and
+publishes only after that final gate. Invocation telemetry contains the active guarantee rung,
+provider outcome counts and elapsed milliseconds, recovery capability, schema hashes, and
+counts—not source, paths,
+diagnostic messages, or generated payload text. Speculative multi-token rewind is not enabled;
+receipts report `candidate_probe_only`.
+
 After configuration, pb uses the server automatically for changed Rust task paths. During partial
 implementation it surfaces only syntax/parser errors; at a settled work boundary and before
 handoff it surfaces current error diagnostics. The web transcript shows this as Trinity inspecting

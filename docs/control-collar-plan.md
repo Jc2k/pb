@@ -1,9 +1,32 @@
 # Streaming tool-output control collar
 
-Status: **Phases 0–5 implemented and production-qualified.** This is the durable design
-record, migration history, and evidence ledger for generation-time mutation validation. The shipped
-boundary is described in the curated architecture documentation; Phases 6–8 below remain design
-record work and are not implied by the syntax-valid production milestone.
+Status: **Phases 0–5 are implemented and production-qualified. Phase 6 and the Phase 7/8
+foundations are implemented but still completing their production qualification matrix.** This is
+the durable design record, migration history, and evidence ledger for generation-time mutation
+validation. Current curated behavior is described in the architecture documentation. Phase 7
+native compiler profiles, portable dependency fact packs/name biasing, and Phase 9 speculation are
+still design-record work and are not implied by the syntax-valid production milestone.
+
+Current implementation ledger:
+
+- **Phase 6 implemented:** conservative UTF-8/lexical/delimiter/Python-indentation prefix rules,
+  incremental Tree-sitter edits/checkpoints, and chunk-independent canonical streaming patch
+  validation are shared by Qwen JSON and DeepSeek DSML. The claim is conservative prefix safety,
+  not exact grammar extendability; live-tokenizer corpus, fuzz, and latency qualification remain.
+- **Phase 7 foundation configurable:** immutable semantic-world/document identities, exact
+  full-content LSP overlays with monotonic versions, full pull-diagnostic baselines, diagnostic-debt
+  deltas, required/advisory policy, repairable payload-close steering, and final executor
+  revalidation are implemented for classified rust-analyzer, TypeScript, and Pyright errors.
+  Enforcement defaults to `disabled`. Digest-pinned provider/project matrices, native Rust compiler
+  parity, strict Python/JavaScript profiles, boundary latency, multi-project overlays, and portable
+  dependency fact packs remain promotion gates.
+- **Phase 8 adapter implemented:** llama.cpp now masks the full vocabulary before sampling
+  truncation, accepts sampler state once, reuses both tool dialects and the shared executor, and
+  reports the same guarantee/rejection fields. Pinned live model/tokenizer/template differential
+  qualification remains before any broad backend-parity claim.
+- **Phase 9 capability only:** both backends explicitly report `candidate_probe_only`. The replay
+  and snapshot variants exist as typed future capability names but are not implemented or inferred
+  from session caches.
 
 ## Decision
 
@@ -40,22 +63,23 @@ grant authority.
 
 ## Outcome
 
-For supported FlashMoe mutation tools and language profiles, pb provides this guarantee:
+For supported constrained mutation tools and language profiles, pb provides this guarantee:
 
 > A completed model-generated mutation cannot execute unless the exact virtual result authorized by
 > the controller is structurally valid, the mutation still applies to the same base snapshot, and
 > the executor independently accepts the prepared result.
 
-The first production guarantee is deliberately syntax-scoped. Future semantic analyzers may reject
-definite name, type, ownership, and API errors, but must state their guarantees relative to a pinned
-language analyzer and configuration. Python runtime behavior cannot generally be proven by a static
-streaming analyzer.
+The default production guarantee remains deliberately syntax-scoped. Opt-in semantic providers can
+reject definite name, type, ownership, and API errors at repairable payload closure and immediately
+before publication, but state that stronger rung relative to a pinned language analyzer,
+configuration, workspace, dependency identity, and complete baseline. Python runtime behavior
+cannot generally be proven by a static streaming analyzer.
 
 The priority language profiles are Rust, Python, TypeScript, JavaScript, HTML, and CSS. The initial
 tool order is `write_file`, then the shared replacement/edit path, then a canonical subset of
 `apply_patch`. Qwen/GLM FlashMoe is the first sampling integration. DeepSeek DSML is the second wire
-dialect and is an architectural gate, not an afterthought. llama.cpp remains a later adapter to the
-same collar contracts.
+dialect and is an architectural gate, not an afterthought. llama.cpp is now an adapter to the same
+collar contracts, with profile qualification tracked separately from implementation.
 
 ## Why a crate boundary is warranted
 
@@ -123,6 +147,8 @@ crates/pb-control-collar/
             patch.rs
         analysis/
             mod.rs
+            prefix.rs
+            semantic.rs
             syntax.rs
         gate.rs
         receipt.rs
@@ -164,7 +190,8 @@ The implementation started from these shipped boundaries:
 
 That baseline proved the tokenizer and sampling hooks existed. Phases 0–5 added the shared DSML
 dialect, logical mutation boundary, virtual patch transaction, and complete-file syntax close gate.
-Semantic candidate steering remains outside the shipped boundary.
+The Phase 7 work described below was outside that original shipped boundary; its current opt-in
+foundation is recorded separately from that historical baseline.
 
 ## Implemented production slice
 
@@ -187,13 +214,24 @@ The current implementation has these concrete boundaries:
   supported HTML script/style/JSON content;
 - constrained patches are bounded to 32 files and 256 hunks, require exact counts, offsets, context,
   deletion bytes, and paths, and produce all virtual results before execution; and
+- conservative UTF-8, delimiter, and Python-dedent prefix rules now reject only promoted local
+  impossibilities; canonical patch lines additionally stream untouched base bytes and generated
+  result bytes through the same prefix oracle between hunks;
+- configured semantic providers can receive exact full-content overlays, compare baseline and
+  candidate diagnostic debt, reject definite classified errors at mutation-payload closure, and
+  repeat the transaction gate before publication. This is opt-in and defaults to disabled;
+- llama.cpp has a full-vocabulary pre-truncation adapter for both supported dialects and shares the
+  constrained mutation/executor path, but pinned live model/tokenizer/template qualification is
+  still outstanding; and
 - the executor independently reconstructs the mutation, verifies live bases and syntax, publishes
   file writes atomically, and requires exact `git apply --check`/`git apply` parity for constrained
-  patches. llama.cpp retains the explicitly separate broader `--recount` compatibility path.
+  patches without `--recount`.
 
-This implementation prevents an invalid supported complete file from closing and executing. It does
-not yet hard-mask every locally impossible source prefix, resolve symbols, prove types, invoke an LSP
-overlay, or recover through model-state rollback. Those are Phases 6–8.
+This implementation prevents an invalid supported complete file from closing and executing, and it
+hard-masks a deliberately small set of proven-impossible prefixes. It does not claim exact grammar
+extendability, expression-level type steering, complete project-wide symbol/type correctness, a
+pinned production semantic profile, live-model llama.cpp parity, or model-state rollback. Those
+remain independently promoted gates in Phases 6–9.
 
 ## Authority and correctness invariants
 
@@ -530,6 +568,94 @@ No full compiler should run once per vocabulary token. The fast path uses gramma
 classes, cached analyzer checkpoints, and boundary detection. Expensive analysis happens at a small
 number of structural boundaries or on speculative spans.
 
+### Guarantee ladder for later phases
+
+The phrase "incremental validity" must not collapse several materially different claims. Later
+phases promote capabilities one rung at a time and report the highest rung actually active for each
+language, analyzer profile, backend, and request:
+
+| Rung | Production claim |
+| --- | --- |
+| Complete syntax | Shipped: the exact completed virtual file passes the pinned complete-file syntax profile before execution. |
+| Conservative prefix safety | No committed token violates any promoted lexical, delimiter, indentation, patch, or grammar rule that can prove the prefix has no valid continuation in its declared language subset. Unknown prefixes remain open. |
+| Scoped symbol resolution | Against one immutable semantic world, the final mutation introduces no provider-classified definite unresolved-name, import, field, method, or module errors in the enforced scope. |
+| Scoped type correctness | Against a pinned analyzer, project configuration, target, and dependency graph, the final mutation introduces no provider-classified definite type/ownership errors in the enforced scope. This is not a proof of runtime behavior. |
+| Backend parity | Every qualified backend applies the same manifest, token mask/bias ordering, mutation replay, final analyzer gate, and executor revalidation contract for the same dialect. |
+
+Exact extendability is a valid claim only where an LLGuidance-compatible or equivalent source
+grammar describes the accepted subset and differential tests prove that the source grammar and the
+complete-file parser agree. Tree-sitter's incremental edit support is valuable for caching trees and
+finding structural boundaries, but its error recovery is not by itself an impossibility oracle. A
+language can therefore ship conservative prefix rules before it ships an exact grammar-backed
+prefix subset, without overstating the guarantee.
+
+### Semantic-world and provider boundary
+
+Semantic analysis needs a second, separately bounded snapshot. The existing mutation snapshot is
+optimized for exact file publication and is intentionally too small and narrow to stand in for a
+project graph. Before constrained decoding, `pb` should prepare a content-addressed
+`SemanticWorldSnapshot` containing:
+
+- exact bytes for open/changed files plus immutable content bindings and digests for every other
+  in-repository file admitted to the analysis scope;
+- the target language/toolchain and analyzer identity/version;
+- project configuration, feature/`cfg`, compiler-option, Python-environment, and target-platform
+  digests;
+- manifest and lockfile digests plus an offline dependency-graph identity; and
+- a baseline diagnostic snapshot and its completeness state.
+
+The analyzer runs against an immutable shadow workspace or document overlay derived from that
+snapshot, never against a mixture of live and virtual bytes. Dependency source, declarations,
+typeshed data, sysroots, package metadata, and build artifacts may be mounted read-only from
+controller-owned caches. Network access is disabled. The provider may inspect repository and
+dependency data authorized for analysis without exposing that source to the model or durable
+telemetry.
+
+`pb-control-collar` remains synchronous and I/O-free. It owns portable value types such as
+`AnalyzerCapability`, `SemanticWorldId`, `BoundaryProbe`, `ProviderVerdict`, `DefiniteErrorClass`,
+and `UnknownReason`. A controller-owned `SemanticProviderBroker` owns LSP/native analyzer processes,
+deadlines, overlays, and cache leases. The broker produces immutable verdicts that a collar session
+can consume. The current blocking boundary pauses decode and uses a one-way lock order from the
+request-local model runtime to an individual LSP session; analyzer code must never call back into the
+model runtime. A future worker/queue implementation must preserve that acyclic order while removing
+the LSP wait from the runtime critical section.
+
+The existing LSP client should be extended with an overlay API that accepts controller-provided
+bytes and monotonically versioned full-content `didOpen`/`didChange` updates. Generation-time
+analysis must require either a complete pull-diagnostic response or a fresh version-matched push
+publication. Stale, partial, quiet-period-only, timed-out, restarted, or configuration-divergent
+results are `Unknown`, never clean evidence.
+
+### Boundary steering policy
+
+Semantic checks compose with sampling in two tiers:
+
+1. Apply the wire grammar and cheap full-vocabulary prefix mask before any sampling truncation.
+2. Detect candidate tokens that close an expression, statement, item, file, tool argument, or tool
+   call. Probe only the bounded ranked frontier, widen until enough valid candidates exist or the
+   vocabulary is exhausted, and perform final top-k/temperature sampling only after those probes.
+
+A definite error may hard-reject the boundary candidate that makes it observable. A repairable or
+unknown result may create an obligation and sparse bias, but cannot remove the candidate. Symbol
+completion, hover, signature help, and public API indexes are steering inputs, not hard-mask
+authority: macros, dynamic dispatch, ambient declarations, forward items, and generated sources can
+make a finite completion list incomplete.
+
+This policy handles the motivating type mismatch without making the earlier counterexample unsound.
+For example, a Rust expression with incompatible operands remains extendable until the model tries
+to close the expression or statement; a provider-confirmed `type-mismatch` can reject that close and
+leave conversion/method-call tokens reachable. An unresolved item that can be declared or imported
+later remains an obligation until file/tool closure. If the already committed prefix can be repaired
+only by changing earlier tokens, correctness still fails closed at closure; Phase 9 recovery is the
+optional mechanism for rewinding and steering earlier.
+
+Blocking boundary probes are the first production implementation. External analysis is not run for
+every vocabulary token, and speculative decode is not a prerequisite for semantic correctness. A
+required semantic profile that times out, loses its process, exceeds its snapshot/boundary budget,
+or cannot establish a complete baseline prevents semantic closure. An advisory profile may return
+`Unknown` and retain the shipped syntax-only behavior, but receipts and user-visible status must not
+describe that request as semantically constrained.
+
 ## Checkpoint and rollback model
 
 There are three distinct checkpoints and they must not be conflated:
@@ -691,12 +817,22 @@ Most correctness evidence belongs in the new crate and must run without a model.
 
 - Inject cancellation and errors between probe, sample, commit, analyzer update, model forward, and
   receipt publication; all state machines must remain aligned or the request must abort.
+- Drive a fake LSP through stale document versions, partial pull results, delayed/missing push
+  publications, restart, cancellation, response limits, and configuration changes; none may be
+  mistaken for a clean semantic result.
+- Run pinned rust-analyzer/Rust, TypeScript Language Service, and Pyright qualification suites
+  against immutable shadow workspaces with offline dependency caches. Include dependency changes,
+  lockfile/config invalidation, missing stubs/sources, and intentionally hostile Rust build scripts
+  or proc macros to prove the sandbox boundary.
 - Verify deterministic replay with greedy sampling and stable sampler-state restoration for any
   backend that advertises rollback.
 - For DeepSeek snapshot-and-restore, require complete hidden/logit parity across nonzero prefixes and
   semantic-boundary rollback before enabling speculation.
+- For llama.cpp, compare manual full-vocabulary mask/bias/apply/accept sampling with the existing
+  sampler chain when the collar admits every token, and prove stateful samplers see one acceptance.
 - Run the narrow FlashMoe release smoke after backend integration, plus focused Qwen and DeepSeek
-  `write_file`/`apply_patch` harness cases whose output is independently parsed from disk.
+  `write_file`/`apply_patch` harness cases whose output is independently parsed from disk. Add the
+  same cases for every qualified llama.cpp model/template profile.
 
 Property tests and fuzz targets should use deterministic seeds in ordinary CI, with longer corpora in
 scheduled or explicit qualification runs. Crashes, panics, timeouts, and allocation-limit failures
@@ -708,7 +844,9 @@ Invocation evidence may record:
 
 - collar, dialect, patch, and language-profile versions;
 - schema, manifest, transcript, base, and result digests;
-- constraint mode and backend recovery capability;
+- constraint mode, promoted guarantee rung, backend recovery capability, and provider capability;
+- analyzer/toolchain version, semantic-world/config/dependency digests, baseline completeness, and
+  content-free unknown-reason/error-class counts;
 - counts of protocol and semantic candidate rejections;
 - boundary probes, rollbacks/replays, affected files, hunks, and generated/known bytes;
 - terminal state and analyzer result class; and
@@ -823,49 +961,157 @@ workspace, not an earlier phase branch.
 
 | Evidence | Status | Current result |
 | --- | --- | --- |
-| Collar unit and chunk-boundary corpus | Passed | 30 deterministic tests, including all six language families plus TSX/JSX, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches, malformed patch corpus, Qwen/DSML payload closure, all DSML closers nested inside JSON, and marker-only control-token identity |
+| Collar unit and chunk-boundary corpus | Passed | 44 deterministic tests, including all six language families plus TSX/JSX, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches, streaming virtual-result prefixes, malformed patch corpus, Qwen/DSML payload closure, all DSML closers nested inside JSON, immutable semantic identities/debt, and marker-only control-token identity |
 | Qwen native constraint corpus | Passed | 13 focused tests, including closure rejection for invalid syntax and the one-mutation batch bound |
 | DeepSeek DSML renderer/parser corpus | Passed | 3 focused root tests plus 2 collar DSML tests for typed parameters, ordered JSON-string mutation history, and closure boundaries |
 | Workspace format/check/Clippy | Passed | `cargo fmt --all -- --check`, `cargo check --workspace --all-targets -j 1`, and the repository warning/correctness Clippy gate |
 | Executor and event focused tests | Passed | Snapshot freshness, exact patch/Git differential result, inexact hunk rejection, and additive/backward-compatible event round trip |
-| Workspace all-target tests | Passed | 1,438 root tests passed with 23 device/environment tests ignored, 2 environment-contract tests passed, and all 30 collar tests passed |
+| Workspace all-target tests | Passed | On 2026-07-27, 1,450 root tests passed with 23 device/environment tests ignored, 2 environment-contract tests passed, and all 44 collar tests passed |
 | Web and documentation tests | Passed | 76 web tests passed; mdBook and link validation checked 59 pages and 98 rendered files |
-| Production asset/release build | Passed | Web assets and the optimized macOS arm64 release binary rebuilt successfully |
-| Required FlashMoe one-token smoke | Passed | The current release binary exited zero and printed the existing raw Qwen baseline `5` for `2+2=` |
+| Production asset/release build | Passed | On 2026-07-27, web assets and the optimized macOS arm64 release binary rebuilt successfully |
+| Required FlashMoe one-token smoke | Passed | On 2026-07-27, the current release binary exited zero and printed the existing raw Qwen baseline `5` for `2+2=` |
+| Phase 6–8 foundation integration | Passed | Conservative prefix and patch-stream tests, Qwen and DeepSeek payload-close semantic rejection, exact monotonic fake-LSP overlays and diagnostic debt, llama.cpp full-vocabulary pre-top-k masking, shared event compatibility, workspace check, and strict Clippy all pass |
+| Phase 6 promotion corpus/performance | Pending | Real-tokenizer valid/repairable splits, fuzz/rollback differential coverage, p95 cheap-probe latency, and pinned end-to-end throughput still gate promotion beyond the implemented conservative rules |
+| Phase 7 pinned semantic profiles | Pending | Real digest-pinned rust-analyzer/TypeScript/Pyright project matrices, compiler/profile parity, multi-file/dependant scope, cancellation/latency, and offline dependency resolution still gate any default semantic guarantee |
+| Phase 8 live llama.cpp profiles | Pending | Pinned model/tokenizer/template write/patch/malformed/truncation and FlashMoe differential runs still gate a backend-parity claim |
 | Pinned DeepSeek direct mutation qualification | Passed | The checked-in `fixtures/control-collar/` inputs produced syntax-valid `answer.py` after 2 candidate rejections and an exact snapshot-bound one-line patch after 8, reporting 1 file and 16 snapshot bytes; an alternate capped patch attempt reported 7 `invalid_patch` closure rejections and executed no call |
 | Pinned DeepSeek strict workflow | Passed | An 11-invocation delivery crossed tool-schema narrowing, reused unchanged exact roots, cold-started changed roots, executed constrained `write_file`, passed review, and ended `contract_status=satisfied`, `verified_completed=true` |
 | DeepSeek candidate-probe budget | Passed | On the same patch prompt and pinned checkpoint, current-release constrained decode sustained 7.678 tokens/s versus 9.358 tokens/s unconstrained, a 18.0% reduction within the accepted 25% qualification ceiling |
 
 ### Phase 6 — Stronger prefix syntax constraints
 
-- Add conservative language-specific impossible-prefix checks and cached analyzer probes.
-- Keep repairable prefixes open and enforce validity at expression/statement/item/file closure.
-- Promote each language independently based on extension-property tests and decode measurements.
+- **6A — Freeze the prefix contract.** Add versioned rule provenance, capability, boundary, verdict,
+  obligation, checkpoint, and unknown-reason types. Distinguish exact grammar-backed extendability
+  from conservative local rules in receipts and telemetry. Add replay fixtures before changing masks.
+- **6B — Add the cheap local oracle.** Incrementally decode candidate logical bytes and track UTF-8,
+  strings/raw strings/templates, escapes, comments, delimiter stacks, Python indentation/newline
+  state, HTML tag/raw-text state, and CSS/JS nesting. Probe from cheap copy-on-write checkpoints and
+  hard-reject only impossible transitions such as an invalid closer, impossible escape, illegal
+  indentation transition, or final-byte sequence that cannot be completed within the remaining
+  argument budget.
+- **6C — Cache syntax trees and discover boundaries.** Apply exact Tree-sitter edits and reuse the
+  previous tree for the virtual document. Use changed ranges and language-specific queries to find
+  expression, statement, item, function, embedded-language, and file boundaries. Parser error nodes
+  create repair obligations; they do not prove impossibility unless a separate promoted rule does.
+- **6D — Make patch streaming real.** Replace closure-only buffering with a line/chunk state machine
+  that commits canonical headers and hunk lines as soon as complete, verifies counts/context/base
+  cursors immediately, and emits `Known`/`Generated` source events into the same analyzer used by
+  writes. Checkpoint at file and hunk boundaries. A provisional syntax error cannot reject a hunk
+  close when an ordered later hunk could still repair it.
+- **6E — Promote languages independently.** Start with Rust and TypeScript/JavaScript delimiter and
+  lexical rules, then Python indentation, then HTML/CSS and embedded-language transitions. Add an
+  exact LLGuidance-compatible source-grammar subset only where grammar/final-parser differential
+  tests justify the stronger extendability claim; do not block broader valid language syntax merely
+  to make the grammar easier.
 
-Gate: no valid corpus completion is masked, every completed result remains valid, and failure/empty-
-mask behavior is deterministic and bounded.
+Gate: every valid real-tokenizer corpus program remains reachable under every token split; every
+hard-rejected rule has a positive proof fixture and repairable counterexample; streaming and batch
+mutation results are identical; random chunking and rollback are deterministic; no supported
+completed result bypasses the shipped final syntax gate; p95 cheap-probe CPU time is below 1 ms; and
+the pinned end-to-end decode-throughput reduction remains within the existing 25% ceiling.
 
 ### Phase 7 — Semantic steering and final semantic gates
 
-- Add expected-type, symbol, import, scope, and obligation snapshots.
-- Introduce sparse logit biases and boundary-aware hard rejection.
-- Integrate Rust analysis first, then TypeScript/JavaScript project analysis, then an explicitly
-  configured Python static-analysis profile.
-- Add overlay workspace and multi-file transaction analysis without allowing the analyzer to read
-  unauthorized live files.
+- **7A — Build the semantic provider contract and shadow world.** Add the controller-owned broker,
+  immutable shadow workspace, exact overlay versions, baseline diagnostics, provider health, bounded
+  request queue, cancellation, and content-addressed world cache. Extend the existing LSP client to
+  accept overlay bytes rather than rereading the target from disk. Keep analyzer I/O and Tokio out of
+  `pb-control-collar`.
+- **7B — Establish diagnostic-delta semantics.** Initially enforce only a clean, complete baseline
+  for the affected project targets. Then add a diagnostic-debt ledger that allows a mutation to fix
+  existing errors while rejecting new definite errors, using in-memory code/range/source mapping and
+  persisting only content-free hashes and counts. An incomplete baseline can steer softly but cannot
+  establish a semantic guarantee.
+- **7C — Promote Rust first.** Pin rust-analyzer, Rust toolchain, target, Cargo metadata/lockfile,
+  feature/`cfg`, proc-macro, and build-script policy. Use native rust-analyzer diagnostics such as
+  type mismatch, unresolved field/method/item, privacy, mutability, and ownership classes for bounded
+  boundary probes. Run a final compiler-compatible check in a sandboxed shadow workspace for the
+  stronger profile. Because rust-analyzer flycheck, Cargo build scripts, and proc macros can execute
+  code, they require explicit no-network/read-only-workspace/ephemeral-output authority; disabled or
+  unavailable expansion is `Unknown`, not success.
+- **7D — Promote TypeScript, then configured JavaScript.** Prefer a pinned TypeScript Language
+  Service sidecar with `ScriptSnapshot`/versioned virtual files, exact `tsconfig` options, module
+  resolution, JSX mode, ambient declarations, and project references. Use syntactic and semantic
+  diagnostic APIs for boundary and final checks. JavaScript receives a type guarantee only when
+  `checkJs`, JSDoc, or another explicit project profile makes the relevant values known; otherwise
+  dynamic results remain `Unknown`.
+- **7E — Promote Python under an explicit profile.** Pin Pyright plus Python version/platform,
+  execution environment, strictness, typeshed/stub paths, and project configuration. Start with
+  annotated or inferred-known code under standard/strict diagnostics. `Any`, `Unknown`, dynamic
+  imports, monkey-patching, descriptors, and runtime-only dispatch cannot support a hard type claim.
+- **7F — Resolve dependency APIs and steer names.** First let each pinned provider resolve offline
+  dependency sources/declarations/stubs directly from read-only caches. Later materialize portable
+  public-symbol/type fact packs keyed by provider version, target, configuration, and lockfile so
+  common completions do not require repeated process queries. Bias tokenizer sequences for visible
+  symbols, qualified names, imports, fields, and methods; never hard-exclude an identifier merely
+  because it is absent from a completion list.
+- **7G — Revalidate at execution.** Reconstruct the exact prepared virtual workspace, verify live
+  base and semantic-world identities, rerun the authoritative final provider, and only then publish
+  atomically. A generation-time receipt never substitutes for final executor validation.
+- **7H — Make semantic evidence durable and auditable.** Emit separate generation-boundary and
+  final-executor receipts containing only contract/provider/world/config/dependency/document
+  digests, versions, completeness, verdict classes, reason/count fields, budgets, and timings.
+  Receipts must identify their scope (document, affected target set, or complete project) and must
+  never contain paths, source, patches, diagnostic messages, prompts, or symbol names. Generation
+  telemetry cannot be promoted into final publication evidence.
 
-Gate: each promoted rule has a named soundness contract, repairable counterexamples, analyzer-version
-pin, project-config digest, false-rejection corpus, performance budget, and authoritative final gate.
+Gate for each language/profile: a pinned analyzer/toolchain and project-config digest; a complete
+baseline policy; explicit definite/repairable/unknown diagnostic classes; string-plus-integer,
+wrong-call, missing-field/method, import, forward-declaration, shadowing, macro/dynamic, ambient-type,
+and multi-file fixtures; no new definite semantic errors across write/replace/edit/patch; no false
+hard rejection in the valid/repairable corpus; offline dependency resolution; bounded cancellation
+and process failure; final executor parity; and separately accepted boundary latency plus end-to-end
+throughput budgets. Rust, TypeScript/JavaScript, and Python ship independently. HTML and CSS retain
+their syntax claim until a separately scoped semantic provider is justified.
 
-### Phase 8 — Optional speculative recovery and llama.cpp parity
+### Phase 8 — llama.cpp control-collar parity
 
-- Add bounded replay/snapshot recovery only for backends that qualify exact restoration.
-- Keep DeepSeek ephemeral checkpoints separate from cross-turn session retention.
-- Adapt llama.cpp to the same manifest/events/receipt contract rather than reimplementing mutation
-  validation inside its sampler.
+- **8A — Add a native vocabulary adapter.** Build the collar vocabulary from exact llama.cpp token
+  bytes, marker-only special-token identities, and every end-of-generation token. Bind dialect and
+  chat-template qualification to the model/tokenizer/template identity rather than assuming every
+  llama.cpp model speaks Qwen JSON or DeepSeek DSML.
+- **8B — Put the collar before truncation.** For constrained tool generation, obtain the full
+  `LlamaTokenDataArray`, set denied logits to negative infinity, apply sparse biases, perform bounded
+  semantic frontier probing/widening, then run top-k/temperature/distribution sampling. Refactor away
+  from `LlamaSampler::sample`, whose combined sample-and-accept operation is too late for a dynamic
+  external mask; commit the collar and accept the selected token into stateful llama samplers exactly
+  once before decoding it into the context.
+- **8C — Share the production mutation path.** Construct the same manifest/snapshots, reuse Qwen and
+  DSML dialect implementations, stop semantically on complete calls, and execute prepared writes and
+  canonical patches through the same revalidation path. Once a model/template profile is qualified,
+  remove its access to the broader `--recount` compatibility behavior and never fall back after a
+  collar rejection.
+- **8D — Differentially qualify profiles.** Replay identical vocabulary surfaces and transcripts
+  through FlashMoe and llama.cpp adapters, compare hard masks, biases, events, receipts, parser
+  results, and executor decisions, then run pinned live write/patch and malformed/truncation cases.
 
-Gate: restored logits and sampled continuations are exact under deterministic settings, budgets are
-bounded, cancellation is atomic, and no backend silently weakens an unavailable constraint.
+Gate: masks are applied over the full vocabulary before sampling truncation; sampler RNG/penalty/
+grammar state is accepted exactly once; every qualified dialect passes tokenizer-split and replay
+parity; mutation and semantic guarantees match FlashMoe; session-prefix reuse remains exact; decode
+overhead is measured against the same model/prompt; and unsupported model/template profiles fail
+preflight or retain an explicitly reported unconstrained compatibility mode.
+
+### Phase 9 — Optional speculative recovery
+
+Semantic correctness ships first with blocking candidate-before-commit probes. Speculation is a
+latency optimization for cases where an external analyzer is slower than decode or where repair
+requires changing earlier committed tokens.
+
+- Add one bounded in-flight speculative branch from the last structural boundary. Snapshot collar,
+  grammar, mutation, analyzer-overlay version, sampler, generated-token, and decode state together.
+- For DeepSeek, add ephemeral complete-state snapshots with a separate memory budget and eviction
+  policy from cross-turn session checkpoints. For llama.cpp, qualify deterministic replay from a KV
+  boundary first; add in-memory state copies only if wrapper/upstream support proves cheaper and exact.
+- If the provider accepts, publish the speculative branch into the main session. If it rejects,
+  atomically restore every layer, hard-mask the rejected boundary/branch decision, and resample. A
+  timeout under a required profile discards the branch and fails closed.
+- Bound branch depth, speculative tokens, memory, analyzer requests, replay work, and cancellation
+  time. Never persist speculative source or symbol content in events.
+
+Gate: restored logits and sampler outputs are bit-for-bit equal under deterministic settings;
+accepted and rejected branches leave identical collar/mutation/LSP version state to non-speculative
+execution; memory and latency bounds survive cancellation and analyzer death; and disabling
+speculation changes performance only, never the accepted output language or executor guarantee.
 
 ## Owner decisions
 
@@ -916,8 +1162,13 @@ their named phase produces evidence:
 | Additional final parser beyond Tree-sitter | Resolved for Phase 3 | Error/missing nodes and UTF-8 are rejected; HTML adds explicit element closure plus supported embedded-language parsing. Compiler/type/project validity is explicitly outside the claim. |
 | Ordered atomic multi-mutation batches versus one mutation per generated batch | Phase 4 | Executor rollback design and virtual/executor differential tests |
 | Canonical patch path and EOF syntax | Resolved in Phase 4 | LF text, unquoted exact `a/`/`b/` paths, `/dev/null`, exact hunk ranges and context, Git's no-final-newline marker, optional matching `diff --git`, and only exact `100644` create/delete metadata |
-| DeepSeek candidate-probe latency budget | Resolved in Phase 5 | The default production ceiling is at most 25% decode-throughput loss on the same prompt/checkpoint; the pinned patch qualification measured 14.5% |
-| Whether DeepSeek ephemeral complete-state snapshots beat deterministic replay | Phase 8 | Snapshot copy cost, memory peak, restore parity, branch depth, and end-to-end energy |
+| DeepSeek candidate-probe latency budget | Resolved in Phase 5 | The default production ceiling is at most 25% decode-throughput loss on the same prompt/checkpoint; the pinned patch qualification measured 18.0% |
+| Prefix guarantee scope | Phase 6 | Per-rule extension-property corpus, valid-program tokenizer splits, grammar/final-parser differential results, and named conservative versus exact capability receipts |
+| Semantic baseline policy and rollout mode | Phase 7 | Clean-world and diagnostic-debt corpora, incomplete-baseline behavior, typed project configuration, and user-visible guarantee wording |
+| Rust native-analysis versus compiler-check boundary | Phase 7 | Diagnostic-class parity, macro/build-script sandbox evidence, target/feature/`cfg` matrix, and final executor cost |
+| Dependency public-symbol fact packs | Phase 7 | Provider/direct-resolution parity, lockfile/config invalidation, cache size/privacy, and completion steering benefit |
+| llama.cpp model/template qualification | Phase 8 | Token/special/EOG identity, dialect rendering, full-vocabulary mask ordering, stateful-sampler acceptance, and live mutation corpus |
+| Whether DeepSeek ephemeral complete-state snapshots beat deterministic replay | Phase 9 | Snapshot copy cost, memory peak, restore parity, branch depth, and end-to-end energy |
 | Rust semantic provider boundary | Phase 7 | rust-analyzer/compiler parity corpus including macros, traits, `cfg`, and workspace edits |
 | TypeScript/JavaScript project overlay provider | Phase 7 | Module-resolution, ambient-type, JSX, and multi-file corpus |
 | Python strict profile and `Unknown` policy | Phase 7 | Annotated/unannotated corpus, false-rejection audit, and pinned analyzer configuration |
@@ -974,4 +1225,10 @@ The project is complete only when:
 - [LLGuidance grammar syntax](https://github.com/guidance-ai/llguidance/blob/main/docs/syntax.md)
 - [Tree-sitter advanced parsing](https://tree-sitter.github.io/tree-sitter/using-parsers/3-advanced-parsing.html)
 - [Tree-sitter syntax nodes](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/1-syntax.html)
+- [Language Server Protocol 3.18](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/)
+- [rust-analyzer diagnostics](https://rust-analyzer.github.io/book/diagnostics.html)
+- [rust-analyzer configuration](https://rust-analyzer.github.io/book/configuration)
+- [TypeScript Compiler and Language Service APIs](https://github.com/microsoft/TypeScript/wiki/Using-the-Compiler-API)
+- [Pyright configuration and diagnostic profiles](https://github.com/microsoft/pyright/blob/main/docs/configuration.md)
+- [llama.cpp sampling and grammar surface](https://github.com/ggml-org/llama.cpp/blob/master/tools/completion/README.md)
 - [`git apply`](https://git-scm.com/docs/git-apply)

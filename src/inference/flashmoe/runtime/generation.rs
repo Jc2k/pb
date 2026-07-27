@@ -510,6 +510,9 @@ impl FlashMoeEngine {
                 mutation_gate,
             )?
         };
+        if let Some(constraint) = tool_constraint.as_mut() {
+            constraint.set_semantic_provider(request.semantic_boundary.clone());
+        }
         let deepseek_stable_prefix_len = if deepseek_v4 {
             self.deepseek_stable_prompt_prefix_len(request, &prompt_tokens)?
         } else {
@@ -1164,6 +1167,9 @@ impl FlashMoeEngine {
                 snapshot_files,
                 snapshot_bytes,
                 terminal_state: constraint.terminal_state(&decoded).to_string(),
+                guarantee_rung: constraint.guarantee_rung(&decoded).to_string(),
+                semantic_boundary: constraint.semantic_stats(),
+                decode_recovery: crate::inference::DecodeRecovery::CandidateProbeOnly,
             }
         });
         let json_constraints = json_constraint

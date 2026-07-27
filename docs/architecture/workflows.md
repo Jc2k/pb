@@ -215,6 +215,25 @@ server/path target. A path is settled only when every matching target completed 
 workspace epoch; path, call, end-to-end pass time, startup, transport, push-only, and
 stale-workspace limits are explicit incomplete outcomes.
 
+Configured LSP servers can also participate in the mutation control collar through the typed
+`semantic_enforcement` mode. This path is distinct from proactive repair hints. The controller
+captures an immutable workspace identity and exact mutation snapshot, sends full-content base and
+candidate overlays with monotonic LSP document versions, requires explicit full pull diagnostics,
+and binds each diagnostic snapshot to provider/configuration/dependency/workspace and exact overlay
+content digests. The diagnostic-debt comparison rejects newly introduced classified errors while
+allowing an existing error to be repaired. Incomplete, stale, push-only, unpinned, timed-out, or
+unclassified results are `Unknown` and cannot authorize required mode.
+
+At a Qwen JSON or DeepSeek DSML payload-string close, FlashMoe and llama.cpp apply the same portable
+mutation gate and may synchronously probe the controller-owned semantic provider before committing
+that candidate. `Reject` masks only the candidate boundary; `Defer` keeps it reachable. The final
+executor independently reconstructs the prepared write/edit/patch against the authorized base,
+captures and revalidates the current workspace during a fresh semantic transaction, and only then
+enters the existing publication step. Invocation events name
+the strongest active rung (`protocol_schema`, `prefix_syntax`, or `semantic_boundary`) and report
+content-free rejection/provider/recovery counters. Current backends report
+`candidate_probe_only`; replay and complete-state restore remain explicitly unimplemented.
+
 ### 4. Checks
 
 The harness selects affected configured checks and records their current results. Named acceptance

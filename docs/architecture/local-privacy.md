@@ -148,6 +148,15 @@ event stream. No prompt, source, or diagnostic is sent to the package registry o
 service. The read-only workspace mount, offline Cargo configuration, and no-egress service network
 remain in force; pb does not apply server-proposed edits or commands.
 
+Opt-in semantic mutation analysis uses that same local stdio sidecar path with controller-provided
+base and candidate overlays. It may read repository content plus offline dependency sources,
+declarations, sysroots, typeshed/stubs, and package metadata already mounted into the session, but
+does not add egress and does not expose those inputs to the model. Durable constraint telemetry is
+content-free: exact content is represented only by hashes and document versions, and diagnostic
+messages or symbol indexes are not persisted. A future portable public-symbol fact pack must remain
+content-addressed, local, lockfile/configuration scoped, and opt-in before it can change this data
+boundary.
+
 ### Public research
 
 Planning, review, discussion, implementation, and repair may expose public research tools. A query

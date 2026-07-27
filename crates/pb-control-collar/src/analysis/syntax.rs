@@ -1,7 +1,7 @@
 use std::str;
 
 use serde::{Deserialize, Serialize};
-use tree_sitter::{Language, Node, Parser, Point, Tree};
+use tree_sitter::{InputEdit, Language, Node, Parser, Point, Tree};
 
 use crate::{CollarError, CollarResult, mutation::LogicalPath};
 
@@ -61,6 +61,181 @@ impl SyntaxProfile {
 pub enum SyntaxReport {
     Valid { profile: SyntaxProfile },
     Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IncrementalSyntaxCheckpoint {
+    revision: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncrementalSyntaxReport {
+    pub profile: Option<SyntaxProfile>,
+    pub changed_ranges: Vec<(usize, usize)>,
+    pub has_error: bool,
+}
+
+struct SyntaxRevision {
+    source_len: usize,
+    tree: Option<Tree>,
+}
+
+/// Append-oriented Tree-sitter state for one virtual source stream. Tree edits and old-tree reuse
+/// make committed-token updates incremental; revision checkpoints make candidate branches
+/// deterministic without exposing Tree-sitter types across the collar boundary.
+pub struct IncrementalSyntaxTree {
+    path: LogicalPath,
+    profile: Option<SyntaxProfile>,
+    parser: Option<Parser>,
+    source: Vec<u8>,
+    tree: Option<Tree>,
+    revisions: Vec<SyntaxRevision>,
+    revision: usize,
+    max_bytes: usize,
+}
+
+impl IncrementalSyntaxTree {
+    pub fn new(path: LogicalPath, initial: &[u8], max_bytes: usize) -> CollarResult<Self> {
+        if max_bytes == 0 || initial.len() > max_bytes {
+            return Err(CollarError::Analysis(
+                "incremental syntax source exceeds its non-zero byte limit".to_string(),
+            ));
+        }
+        let profile = SyntaxProfile::for_path(&path);
+        let (parser, tree) = match profile {
+            Some(profile) => {
+                str::from_utf8(initial).map_err(|error| {
+                    CollarError::Analysis(format!(
+                        "incremental {} source is not UTF-8 at byte {}",
+                        profile.name(),
+                        error.valid_up_to()
+                    ))
+                })?;
+                let mut parser = Parser::new();
+                parser.set_language(&profile.language()).map_err(|error| {
+                    CollarError::Analysis(format!(
+                        "failed to load pinned {} grammar: {error}",
+                        profile.name()
+                    ))
+                })?;
+                let tree = parser.parse(initial, None).ok_or_else(|| {
+                    CollarError::Analysis(format!(
+                        "pinned {} parser returned no incremental syntax tree",
+                        profile.name()
+                    ))
+                })?;
+                (Some(parser), Some(tree))
+            }
+            None => (None, None),
+        };
+        Ok(Self {
+            path,
+            profile,
+            parser,
+            source: initial.to_vec(),
+            revisions: vec![SyntaxRevision {
+                source_len: initial.len(),
+                tree: tree.clone(),
+            }],
+            tree,
+            revision: 0,
+            max_bytes,
+        })
+    }
+
+    pub fn checkpoint(&self) -> IncrementalSyntaxCheckpoint {
+        IncrementalSyntaxCheckpoint {
+            revision: self.revision,
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> CollarResult<IncrementalSyntaxReport> {
+        let old_len = self.source.len();
+        let new_len = old_len.checked_add(bytes.len()).ok_or_else(|| {
+            CollarError::Analysis("incremental syntax length overflow".to_string())
+        })?;
+        if new_len > self.max_bytes {
+            return Err(CollarError::Analysis(format!(
+                "incremental syntax source exceeds the {}-byte limit",
+                self.max_bytes
+            )));
+        }
+        self.source.extend_from_slice(bytes);
+        let mut changed_ranges = Vec::new();
+        if let (Some(profile), Some(parser), Some(previous)) =
+            (self.profile, self.parser.as_mut(), self.tree.as_ref())
+        {
+            str::from_utf8(&self.source).map_err(|error| {
+                CollarError::Analysis(format!(
+                    "incremental {} source is not UTF-8 at byte {}",
+                    profile.name(),
+                    error.valid_up_to()
+                ))
+            })?;
+            let mut edited = previous.clone();
+            let old_point = end_point(&self.source[..old_len]);
+            let new_point = end_point(&self.source);
+            edited.edit(&InputEdit {
+                start_byte: old_len,
+                old_end_byte: old_len,
+                new_end_byte: new_len,
+                start_position: old_point,
+                old_end_position: old_point,
+                new_end_position: new_point,
+            });
+            let next = parser.parse(&self.source, Some(&edited)).ok_or_else(|| {
+                CollarError::Analysis(format!(
+                    "pinned {} parser returned no incremental syntax tree",
+                    profile.name()
+                ))
+            })?;
+            changed_ranges.extend(
+                edited
+                    .changed_ranges(&next)
+                    .map(|range| (range.start_byte, range.end_byte)),
+            );
+            self.tree = Some(next);
+        }
+        self.revisions.truncate(self.revision.saturating_add(1));
+        self.revisions.push(SyntaxRevision {
+            source_len: self.source.len(),
+            tree: self.tree.clone(),
+        });
+        self.revision = self.revisions.len().saturating_sub(1);
+        Ok(IncrementalSyntaxReport {
+            profile: self.profile,
+            changed_ranges,
+            has_error: self
+                .tree
+                .as_ref()
+                .is_some_and(|tree| tree.root_node().has_error()),
+        })
+    }
+
+    pub fn rollback(&mut self, checkpoint: IncrementalSyntaxCheckpoint) -> CollarResult<()> {
+        let Some(revision) = self.revisions.get(checkpoint.revision) else {
+            return Err(CollarError::Analysis(
+                "incremental syntax checkpoint is not part of this stream".to_string(),
+            ));
+        };
+        self.source.truncate(revision.source_len);
+        self.tree = revision.tree.clone();
+        self.revision = checkpoint.revision;
+        Ok(())
+    }
+
+    pub fn finalize(&self) -> CollarResult<SyntaxReport> {
+        validate_supported_syntax(&self.path, &self.source)
+    }
+}
+
+fn end_point(source: &[u8]) -> Point {
+    let row = source.iter().filter(|byte| **byte == b'\n').count();
+    let column = source
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(source.len(), |last| source.len().saturating_sub(last + 1));
+    Point::new(row, column)
 }
 
 pub fn validate_supported_syntax(path: &LogicalPath, source: &[u8]) -> CollarResult<SyntaxReport> {
@@ -403,5 +578,18 @@ mod tests {
             validate("README.md", "# valid").unwrap(),
             SyntaxReport::Unsupported
         );
+    }
+
+    #[test]
+    fn incremental_tree_reuses_edits_and_rolls_back_candidate_branches() {
+        let path = LogicalPath::parse("src/lib.rs").unwrap();
+        let mut syntax = IncrementalSyntaxTree::new(path, b"pub fn value() ", 4096).unwrap();
+        let checkpoint = syntax.checkpoint();
+        let invalid = syntax.push(b"{ ]").unwrap();
+        assert!(invalid.has_error);
+        syntax.rollback(checkpoint).unwrap();
+        let valid = syntax.push(b"-> i32 { 1 }\n").unwrap();
+        assert!(!valid.changed_ranges.is_empty());
+        assert!(syntax.finalize().is_ok());
     }
 }

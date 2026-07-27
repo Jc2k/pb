@@ -3,11 +3,107 @@ pub mod chat_template;
 pub mod flashmoe;
 pub mod llamacpp;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const PROMPT_ROOT_DESCRIPTOR_VERSION: u32 = 1;
 pub const AGENT_SYSTEM_INSTRUCTION_VERSION: &str = "agent-system-v5";
+
+/// Controller-owned blocking semantic probe. Backends call it only when a candidate closes a
+/// mutation payload or another promoted semantic boundary. Implementations must be deterministic
+/// for identical tool arguments and bind their result to an immutable semantic world.
+pub trait SemanticBoundaryProvider: Send + Sync {
+    fn probe(
+        &self,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> pb_control_collar::analysis::ProviderVerdict;
+}
+
+struct SemanticBoundaryInner {
+    provider: Box<dyn SemanticBoundaryProvider>,
+    probes: AtomicU64,
+    allows: AtomicU64,
+    rejects: AtomicU64,
+    defers: AtomicU64,
+    wall_nanos: AtomicU64,
+}
+
+#[derive(Clone)]
+pub struct SemanticBoundaryControl(Arc<SemanticBoundaryInner>);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticBoundaryStats {
+    pub probes: u64,
+    pub allows: u64,
+    pub rejects: u64,
+    pub defers: u64,
+    pub wall_millis: u64,
+}
+
+/// Strongest decode-state recovery contract implemented and qualified by a backend. Candidate
+/// probing is sufficient for the current blocking semantic boundary; the stronger variants are
+/// reserved for bounded speculative decoding and must never be inferred from a KV cache alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodeRecovery {
+    #[default]
+    CandidateProbeOnly,
+    ReplayFromBoundary,
+    SnapshotAndRestore,
+}
+
+impl SemanticBoundaryControl {
+    pub fn new(provider: impl SemanticBoundaryProvider + 'static) -> Self {
+        Self(Arc::new(SemanticBoundaryInner {
+            provider: Box::new(provider),
+            probes: AtomicU64::new(0),
+            allows: AtomicU64::new(0),
+            rejects: AtomicU64::new(0),
+            defers: AtomicU64::new(0),
+            wall_nanos: AtomicU64::new(0),
+        }))
+    }
+
+    pub fn probe(
+        &self,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> pb_control_collar::analysis::ProviderVerdict {
+        let started = Instant::now();
+        let verdict = self.0.provider.probe(tool, arguments);
+        self.0.probes.fetch_add(1, Ordering::Relaxed);
+        match verdict.closure {
+            pb_control_collar::analysis::ClosureVerdict::Allow => &self.0.allows,
+            pb_control_collar::analysis::ClosureVerdict::Reject => &self.0.rejects,
+            pb_control_collar::analysis::ClosureVerdict::Defer => &self.0.defers,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.0.wall_nanos.fetch_add(nanos, Ordering::Relaxed);
+        verdict
+    }
+
+    pub fn stats(&self) -> SemanticBoundaryStats {
+        SemanticBoundaryStats {
+            probes: self.0.probes.load(Ordering::Relaxed),
+            allows: self.0.allows.load(Ordering::Relaxed),
+            rejects: self.0.rejects.load(Ordering::Relaxed),
+            defers: self.0.defers.load(Ordering::Relaxed),
+            wall_millis: self.0.wall_nanos.load(Ordering::Relaxed) / 1_000_000,
+        }
+    }
+}
+
+impl std::fmt::Debug for SemanticBoundaryControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SemanticBoundaryControl(..)")
+    }
+}
 
 pub(crate) fn rendered_token_sha256(tokens: impl IntoIterator<Item = u32>) -> String {
     let mut digest = Sha256::new();
@@ -128,7 +224,23 @@ impl PromptCacheMissReason {
 
 #[cfg(test)]
 mod tests {
-    use super::rendered_token_sha256;
+    use super::{SemanticBoundaryControl, SemanticBoundaryProvider, rendered_token_sha256};
+    use pb_control_collar::analysis::{ClosureVerdict, ProviderVerdict, Viability};
+
+    struct AllowBoundary;
+
+    impl SemanticBoundaryProvider for AllowBoundary {
+        fn probe(&self, _tool: &str, _arguments: &serde_json::Value) -> ProviderVerdict {
+            ProviderVerdict {
+                viability: Viability::Valid,
+                closure: ClosureVerdict::Allow,
+                definite_errors: Vec::new(),
+                unknown_reasons: Vec::new(),
+                obligations: Vec::new(),
+                biases: Vec::new(),
+            }
+        }
+    }
 
     #[test]
     fn rendered_root_identity_is_exact_at_one_token() {
@@ -140,6 +252,19 @@ mod tests {
             rendered_token_sha256([1, 2, 3]),
             rendered_token_sha256([1, 2, 4])
         );
+    }
+
+    #[test]
+    fn semantic_boundary_records_content_free_outcome_counts() {
+        let boundary = SemanticBoundaryControl::new(AllowBoundary);
+        assert_eq!(
+            boundary.probe("write_file", &serde_json::json!({})).closure,
+            ClosureVerdict::Allow
+        );
+        let stats = boundary.stats();
+        assert_eq!(stats.probes, 1);
+        assert_eq!(stats.allows, 1);
+        assert_eq!(stats.rejects, 0);
     }
 }
 
