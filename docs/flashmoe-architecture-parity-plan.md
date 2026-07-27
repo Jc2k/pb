@@ -271,12 +271,17 @@ LLGuidance sampler.
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by
 the deterministic agent controller; executor capability and schema validation remain authoritative.
-Qwen requests compile that subset during prompt preflight. Constrained sampling widens the resident
-LM-head frontier, validates decoded token prefixes against the native envelope and schema, and scans
-farther only when the normal frontier has no valid token. Diagnostics retain the mode, schema hash,
-rejected-candidate count, and terminal state without argument content. DeepSeek keeps its separate
-DSML parser for ordinary tool actions; strict JSON artifacts use the shared LLGuidance contract.
-llama.cpp keeps its existing LLGuidance sampler integration.
+The workspace-internal `pb-control-collar` owns tokenizer surfaces, shared LLGuidance JSON sessions,
+DeepSeek DSML parsing, immutable virtual mutations, canonical patch application, and pinned final-
+syntax gates. It has no graph, filesystem, Git, process, or capability authority. Qwen and DeepSeek
+requests compile their dialect during request setup. Constrained Qwen sampling widens the resident
+LM-head frontier. DeepSeek uses its existing full-logit output, probes candidates against exact
+ordinary/control token surfaces, and widens before final top-k truncation when the frontier contains
+no valid token. Diagnostics retain the dialect, mode, schema hash, content-free mutation-rejection
+counts, snapshot file/byte counts, rejected-candidate count, and terminal state without argument or
+path content. Strict JSON artifacts use the shared LLGuidance contract. llama.cpp keeps its existing
+LLGuidance sampler and broader Git-compatible mutation path; it does not yet adapt native mutations
+to the collar.
 Constraint-valid non-EOS candidates must increase the visible decoded prefix. When an open
 `write_file` or `replace_file` string reaches its schema limit, generation stops before a synthetic
 close can turn a cut-off payload into an executable mutation. Structural whitespace outside JSON
@@ -293,6 +298,15 @@ spending tokens on the closing Qwen envelope, while ordinary tool-call batches r
 executor path. The constraint sampler sits after the shared output head, so these rules apply
 identically to resident and streamed experts and change neither graph preparation nor expert
 scheduling.
+Before a FlashMoe mutation request decodes, the agent controller supplies at most 32 MiB of exact,
+fresh, previously read file bytes as an immutable snapshot; exposing a mutation without that
+snapshot fails closed. Qwen JSON and DeepSeek DSML allow at most one mutation per generated batch.
+At a mutation-payload close, the collar constructs the exact create, replacement, edit, or canonical
+patch result. Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, and CSS must pass their pinned
+complete-file syntax profiles. The executor independently repeats snapshot/hash, virtual-result,
+syntax, path, policy, and schema validation; canonical patches also require exact Git check/apply
+parity without `--recount`. The control layer is downstream of the shared scheduled model graph and
+changes neither expert placement, scheduler I/O, nor CPU/GPU handoff.
 Persistent stage evidence is workflow-checkpoint data keyed by content fingerprints and path hashes,
 not model memory or expert state. None of these follow-ons changes the resident/streamed decision,
 adds a hidden environment toggle, enables unsupported thinking, or permits native load failure to
@@ -1853,7 +1867,10 @@ Required ownership slices, in order:
    bound, explicit mismatch errors, prompt-cache telemetry, A/B switching tests, official-vector
    parity below/above 32 tokens and across ratio-4/ratio-128/top-512 frontiers, cumulative TTFT
    evidence, and unchanged Qwen/GLM/vision behavior. No expert cache or disk session format is part
-   of this slice.
+   of this slice. Structured sessions scope those snapshots to the exact rendered stable-root token
+   digest so controller tool-schema narrowing starts cold instead of colliding with an incompatible
+   stage-local checkpoint; unchanged roots retain measured exact-prefix reuse and raw qualification
+   keeps its explicit prefix-extension identity.
 
 Exit criteria:
 

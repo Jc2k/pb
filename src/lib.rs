@@ -839,6 +839,10 @@ pub struct FlashMoeInferArgs {
     #[arg(long, value_name = "PATH")]
     pub json_schema: Option<PathBuf>,
 
+    /// Constrain native tool generation with a versioned harness fixture
+    #[arg(long, value_name = "PATH")]
+    pub tool_fixture: Option<PathBuf>,
+
     /// Select automatic Qwen prefill, the scalar reference, or forced layer-major qualification
     #[arg(long, value_enum, default_value_t = FlashMoePrefillModeArg::Auto)]
     pub prefill_mode: FlashMoePrefillModeArg,
@@ -886,6 +890,24 @@ pub struct FlashMoeInferArgs {
     /// Repeat the same request in one loaded runtime (for prompt-cache verification)
     #[arg(long, default_value_t = 1)]
     pub repeat: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlashMoeToolFixture {
+    version: u32,
+    tools: Vec<inference::flashmoe::ChatTool>,
+    #[serde(default)]
+    terminal_tool_names: Vec<String>,
+    #[serde(default)]
+    files: Vec<FlashMoeToolFixtureFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlashMoeToolFixtureFile {
+    path: String,
+    content: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2531,6 +2553,71 @@ fn format_cache_bytes(bytes: u64) -> String {
     }
 }
 
+fn load_flashmoe_tool_fixture(
+    path: &Path,
+) -> Result<(
+    Vec<inference::flashmoe::ChatTool>,
+    Vec<String>,
+    pb_control_collar::mutation::WorkspaceSnapshot,
+)> {
+    const MAX_FIXTURE_FILES: usize = 32;
+    const MAX_FIXTURE_BYTES: usize = 32 * 1024 * 1024;
+
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read tool fixture {}", path.display()))?;
+    let fixture = serde_json::from_slice::<FlashMoeToolFixture>(&bytes)
+        .with_context(|| format!("failed to parse tool fixture {}", path.display()))?;
+    if fixture.version != 1 {
+        bail!("tool fixture version must be 1");
+    }
+    if fixture.tools.is_empty() {
+        bail!("tool fixture must expose at least one tool");
+    }
+    if fixture.files.len() > MAX_FIXTURE_FILES {
+        bail!("tool fixture exceeds the {MAX_FIXTURE_FILES}-file snapshot limit");
+    }
+
+    let mut total_bytes = 0usize;
+    let entries = fixture
+        .files
+        .into_iter()
+        .map(|file| {
+            total_bytes = total_bytes
+                .checked_add(file.content.len())
+                .context("tool fixture byte count overflowed the platform address space")?;
+            if total_bytes > MAX_FIXTURE_BYTES {
+                bail!("tool fixture exceeds the {MAX_FIXTURE_BYTES}-byte snapshot limit");
+            }
+            let path = pb_control_collar::mutation::LogicalPath::parse(file.path)?;
+            Ok(pb_control_collar::mutation::SnapshotEntry::new(
+                path,
+                file.content.into_bytes(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let snapshot = pb_control_collar::mutation::WorkspaceSnapshot::new(entries)?;
+
+    let names = fixture
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if names.len() != fixture.tools.len() {
+        bail!("tool fixture repeats a tool name");
+    }
+    let mut terminal_names = std::collections::BTreeSet::new();
+    for terminal in &fixture.terminal_tool_names {
+        if !names.contains(terminal.as_str()) {
+            bail!("tool fixture terminal {terminal:?} is not exposed");
+        }
+        if !terminal_names.insert(terminal.as_str()) {
+            bail!("tool fixture repeats terminal {terminal:?}");
+        }
+    }
+
+    Ok((fixture.tools, fixture.terminal_tool_names, snapshot))
+}
+
 fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     if args.prompt.trim().is_empty() {
         bail!("prompt cannot be empty");
@@ -2552,6 +2639,18 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     }
     if args.prefill_parity && args.json_schema.is_some() {
         bail!("--prefill-parity cannot be combined with --json-schema");
+    }
+    if args.tool_fixture.is_some()
+        && (args.json_schema.is_some()
+            || args.raw
+            || !args.images.is_empty()
+            || args.prefill_parity
+            || args.session_id.is_some()
+            || args.repeat != 1)
+    {
+        bail!(
+            "--tool-fixture requires chat text inference with no --json-schema, --raw, --image, --prefill-parity, --session-id, or --repeat"
+        );
     }
     if let Some(prefix_tokens) = args.prefill_parity_prefix_tokens {
         if !args.raw {
@@ -2591,6 +2690,11 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
             serde_json::from_slice::<serde_json::Value>(&bytes)
                 .with_context(|| format!("failed to parse JSON Schema {}", path.display()))
         })
+        .transpose()?;
+    let tool_fixture = args
+        .tool_fixture
+        .as_deref()
+        .map(load_flashmoe_tool_fixture)
         .transpose()?;
 
     let user_config = UserConfig::load()?;
@@ -2696,8 +2800,18 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     let mut structured_request =
         inference::flashmoe::StructuredGenerationRequest::from_prompt(&request);
     structured_request.trace_candidates = args.trace_candidates;
-    structured_request.enable_thinking = !args.no_thinking && json_schema.is_none();
+    structured_request.enable_thinking =
+        !args.no_thinking && json_schema.is_none() && tool_fixture.is_none();
     structured_request.json_schema = json_schema;
+    if let Some((tools, terminal_tool_names, snapshot)) = tool_fixture.as_ref() {
+        structured_request.tools.clone_from(tools);
+        structured_request
+            .terminal_tool_names
+            .clone_from(terminal_tool_names);
+        structured_request.mutation_snapshot = Some(snapshot.clone());
+        structured_request.tool_constraint_mode =
+            inference::flashmoe::NativeToolConstraintMode::ToolRequired;
+    }
     structured_request.prefill_mode = args.prefill_mode.into();
     structured_request.prefill_state_summary = args.prefill_state_summary || prefill_parity;
     structured_request.prefill_chunk_tokens = args.prefill_chunk_tokens;
@@ -2892,12 +3006,23 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
         eprintln!("flashmoe infer: failed to persist session cache: {error:#}");
     }
     let timed = last_timed.context("FlashMoe inference repeat loop produced no output")?;
-    let content = timed.output.content.trim();
-    if content.is_empty() {
-        bail!("FlashMoe inference returned an empty response");
-    }
     print_flashmoe_resource_summary("infer", None, args.resource_summary, &engine)?;
-    println!("{content}");
+    if tool_fixture.is_some() {
+        if timed.output.tool_calls.is_empty() {
+            bail!("FlashMoe tool-fixture inference returned no tool call");
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&timed.output.tool_calls)
+                .context("failed to encode generated tool calls")?
+        );
+    } else {
+        let content = timed.output.content.trim();
+        if content.is_empty() {
+            bail!("FlashMoe inference returned an empty response");
+        }
+        println!("{content}");
+    }
     Ok(())
 }
 
@@ -4838,6 +4963,26 @@ mod tests {
         };
         assert_eq!(constrained.json_schema, Some(PathBuf::from("schema.json")));
 
+        let tool_constrained = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "infer",
+            "Create answer.py",
+            "--tool-fixture",
+            "tools.json",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::Infer(tool_constrained),
+        } = tool_constrained.command
+        else {
+            panic!("expected harness infer command");
+        };
+        assert_eq!(
+            tool_constrained.tool_fixture,
+            Some(PathBuf::from("tools.json"))
+        );
+
         let no_thinking =
             Cli::try_parse_from(["pb", "harness", "infer", "What is 2+2?", "--no-thinking"])
                 .unwrap();
@@ -5155,6 +5300,23 @@ mod tests {
             run_flashmoe_bench(bench).unwrap_err().to_string(),
             "--status must be kept or discarded"
         );
+    }
+
+    #[test]
+    fn harness_tool_fixture_builds_a_bounded_immutable_snapshot() {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/control-collar");
+        let (tools, terminals, snapshot) =
+            load_flashmoe_tool_fixture(&fixture_root.join("write-python-v1.json")).unwrap();
+        assert_eq!(tools[0].name, "write_file");
+        assert_eq!(terminals, ["write_file"]);
+        assert!(snapshot.is_empty());
+
+        let (tools, terminals, snapshot) =
+            load_flashmoe_tool_fixture(&fixture_root.join("patch-python-v1.json")).unwrap();
+        assert_eq!(tools[0].name, "apply_patch");
+        assert_eq!(terminals, ["apply_patch"]);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.total_bytes(), 16);
     }
 
     #[test]

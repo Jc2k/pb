@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use pb_control_collar::vocabulary::{TokenSurface, Vocabulary};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -89,6 +90,7 @@ pub(super) struct QwenTokenizer {
     im_start: Option<u32>,
     im_end: Option<u32>,
     vocab_size: usize,
+    constraint_vocabulary: Option<Arc<Vocabulary>>,
     #[cfg(test)]
     candidate_ids: Vec<u32>,
 }
@@ -157,13 +159,25 @@ impl QwenTokenizer {
             }
             let eos = tokenizer.eos_id();
             let vocab_size = tokenizer.vocab_size();
-            let json_constraints = tokenizer
+            let constraint_vocabulary = tokenizer
                 .constraint_token_bytes()
                 .and_then(|token_bytes| {
-                    JsonConstraintFactory::from_token_bytes(token_bytes, &[eos])
+                    Ok(Arc::new(Vocabulary::from_llguidance_token_bytes(
+                        token_bytes,
+                        &[eos],
+                        llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER,
+                    )?))
                 })
-                .context("failed to prepare DeepSeek tokenizer for constrained JSON generation")
-                .map_err(|error| Arc::<str>::from(format!("{error:#}")));
+                .context(
+                    "failed to preserve DeepSeek token identities for constrained generation",
+                )?;
+            let json_constraints = JsonConstraintFactory::from_token_bytes(
+                constraint_vocabulary
+                    .llguidance_token_bytes(llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER),
+                &[eos],
+            )
+            .context("failed to prepare DeepSeek tokenizer for constrained JSON generation")
+            .map_err(|error| Arc::<str>::from(format!("{error:#}")));
             #[cfg(test)]
             let candidate_ids = (0..u32::try_from(vocab_size)
                 .context("DeepSeek tokenizer vocabulary exceeds u32")?)
@@ -177,6 +191,7 @@ impl QwenTokenizer {
                 im_start: None,
                 im_end: None,
                 vocab_size,
+                constraint_vocabulary: Some(constraint_vocabulary),
                 #[cfg(test)]
                 candidate_ids,
             });
@@ -347,6 +362,7 @@ impl QwenTokenizer {
             im_start,
             im_end,
             vocab_size,
+            constraint_vocabulary: None,
             #[cfg(test)]
             candidate_ids,
         })
@@ -512,7 +528,7 @@ impl QwenTokenizer {
 
     pub(super) fn compile_json_constraint(&self, schema: &Value) -> Result<JsonConstraintSession> {
         match &self.json_constraints {
-            Ok(factory) => factory.compile(schema),
+            Ok(factory) => Ok(factory.compile(schema)?),
             Err(error) => {
                 bail!("constrained JSON generation is unavailable for this tokenizer: {error}")
             }
@@ -529,6 +545,10 @@ impl QwenTokenizer {
 
     pub(super) fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+
+    pub(super) fn constraint_token_surface(&self, token: u32) -> Option<&TokenSurface> {
+        self.constraint_vocabulary.as_ref()?.surface(token)
     }
 
     #[cfg(test)]
@@ -792,7 +812,7 @@ fn render_deepseek_tool_instructions(tools: &[ChatTool]) -> Result<String> {
         return Ok(String::new());
     }
     let mut out = String::from(
-        "## Tools\n\nYou have access to a set of tools to help answer the user question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as raw text and set `string=\"true\"`. Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. Only if a string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n",
+        "## Tools\n\nYou have access to a set of tools to help answer the user question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should normally be specified as raw text and set `string=\"true\"`. Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. Only if a raw string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. The mutation payload fields write_file.content, replace_file.content, edit_file.new_text, and apply_patch.patch are the exception: set `string=\"false\"` and emit one valid JSON string, including its quotes and JSON escapes. Emit mutation parameters in this exact order: write_file/replace_file path then content then optional completion; edit_file path then old_text then new_text then optional completion; apply_patch patch. For all other non-string types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n",
     );
     for tool in tools {
         let mut schema = serde_json::Map::new();
@@ -841,15 +861,27 @@ fn render_deepseek_dsml_calls(out: &mut String, calls: &[ChatToolCall]) -> Resul
                 }),
             other => serde_json::Map::from_iter([("arguments".to_string(), other.clone())]),
         };
+        let mut arguments = arguments.into_iter().collect::<Vec<_>>();
+        arguments.sort_by(|(left, _), (right, _)| {
+            deepseek_parameter_rank(&call.name, left)
+                .cmp(&deepseek_parameter_rank(&call.name, right))
+                .then_with(|| left.cmp(right))
+        });
         for (name, value) in arguments {
             out.push_str("<｜DSML｜parameter name=\"");
             out.push_str(&escape_dsml_attribute(&name));
             match value {
                 Value::String(value) => {
-                    out.push_str("\" string=\"true\">");
-                    out.push_str(
-                        &value.replace(DEEPSEEK_DSML_PARAMETER_CLOSE, "&lt;/｜DSML｜parameter>"),
-                    );
+                    if deepseek_mutation_json_string_parameter(&call.name, &name) {
+                        out.push_str("\" string=\"false\">");
+                        out.push_str(&serde_json::to_string(&value)?);
+                    } else {
+                        out.push_str("\" string=\"true\">");
+                        out.push_str(
+                            &value
+                                .replace(DEEPSEEK_DSML_PARAMETER_CLOSE, "&lt;/｜DSML｜parameter>"),
+                        );
+                    }
                 }
                 value => {
                     out.push_str("\" string=\"false\">");
@@ -864,6 +896,26 @@ fn render_deepseek_dsml_calls(out: &mut String, calls: &[ChatToolCall]) -> Resul
     }
     out.push_str(DEEPSEEK_DSML_CALLS_CLOSE);
     Ok(())
+}
+
+fn deepseek_mutation_json_string_parameter(tool: &str, parameter: &str) -> bool {
+    matches!(
+        (tool, parameter),
+        ("write_file" | "replace_file", "content")
+            | ("edit_file", "new_text")
+            | ("apply_patch", "patch")
+    )
+}
+
+fn deepseek_parameter_rank(tool: &str, parameter: &str) -> usize {
+    match (tool, parameter) {
+        ("write_file" | "replace_file", "path") | ("edit_file", "path") => 0,
+        ("write_file" | "replace_file", "content") | ("edit_file", "old_text") => 1,
+        ("edit_file", "new_text") => 2,
+        ("write_file" | "replace_file", "completion") | ("edit_file", "completion") => 3,
+        ("apply_patch", "patch") => 0,
+        _ => usize::MAX,
+    }
 }
 
 fn escape_dsml_attribute(value: &str) -> String {
@@ -1180,124 +1232,19 @@ pub(super) fn parse_deepseek_tool_call_output_with_incomplete(
     content: &str,
     allow_incomplete: bool,
 ) -> Result<(String, Vec<ChatToolCall>)> {
-    let mut remaining = content;
-    let mut text = String::new();
-    let mut calls = Vec::new();
-    while let Some(start) = remaining.find(DEEPSEEK_DSML_CALLS_OPEN) {
-        text.push_str(&remaining[..start]);
-        let block_start = start + DEEPSEEK_DSML_CALLS_OPEN.len();
-        let Some(relative_end) = remaining[block_start..].find(DEEPSEEK_DSML_CALLS_CLOSE) else {
-            if allow_incomplete {
-                text.push_str(&remaining[start..]);
-                return Ok((text.trim().to_string(), calls));
-            }
-            bail!("DeepSeek DSML tool call is missing {DEEPSEEK_DSML_CALLS_CLOSE}");
-        };
-        let block_end = block_start + relative_end;
-        calls.extend(parse_deepseek_dsml_block(
-            &remaining[block_start..block_end],
-        )?);
-        remaining = &remaining[block_end + DEEPSEEK_DSML_CALLS_CLOSE.len()..];
-    }
-    text.push_str(remaining);
-    Ok((text.trim().to_string(), calls))
-}
-
-fn parse_deepseek_dsml_block(mut block: &str) -> Result<Vec<ChatToolCall>> {
-    const INVOKE_OPEN: &str = "<｜DSML｜invoke";
-    const PARAMETER_OPEN: &str = "<｜DSML｜parameter";
-    let mut calls = Vec::new();
-    loop {
-        let Some(start) = block.find(INVOKE_OPEN) else {
-            if !block.trim().is_empty() {
-                bail!("DeepSeek DSML tool_calls contains text outside an invoke block");
-            }
-            break;
-        };
-        if !block[..start].trim().is_empty() {
-            bail!("DeepSeek DSML tool_calls contains text before an invoke block");
-        }
-        let header_start = start + INVOKE_OPEN.len();
-        let header_end = block[header_start..]
-            .find('>')
-            .map(|offset| header_start + offset)
-            .context("DeepSeek DSML invoke opening tag is incomplete")?;
-        let name = parse_dsml_attribute(&block[header_start..header_end], "name")
-            .context("DeepSeek DSML invoke is missing name")?;
-        let body_start = header_end + 1;
-        let body_end = block[body_start..]
-            .find(DEEPSEEK_DSML_INVOKE_CLOSE)
-            .map(|offset| body_start + offset)
-            .context("DeepSeek DSML invoke is missing its closing tag")?;
-        let mut body = &block[body_start..body_end];
-        let mut arguments = serde_json::Map::new();
-        loop {
-            let Some(parameter_start) = body.find(PARAMETER_OPEN) else {
-                if !body.trim().is_empty() {
-                    bail!("DeepSeek DSML invoke contains text outside a parameter block");
-                }
-                break;
-            };
-            if !body[..parameter_start].trim().is_empty() {
-                bail!("DeepSeek DSML invoke contains text before a parameter block");
-            }
-            let parameter_header_start = parameter_start + PARAMETER_OPEN.len();
-            let parameter_header_end = body[parameter_header_start..]
-                .find('>')
-                .map(|offset| parameter_header_start + offset)
-                .context("DeepSeek DSML parameter opening tag is incomplete")?;
-            let header = &body[parameter_header_start..parameter_header_end];
-            let parameter_name = parse_dsml_attribute(header, "name")
-                .context("DeepSeek DSML parameter is missing name")?;
-            let string_value = parse_dsml_attribute(header, "string")
-                .context("DeepSeek DSML parameter is missing string=true|false")?;
-            let value_start = parameter_header_end + 1;
-            let value_end = body[value_start..]
-                .find(DEEPSEEK_DSML_PARAMETER_CLOSE)
-                .map(|offset| value_start + offset)
-                .context("DeepSeek DSML parameter is missing its closing tag")?;
-            let raw = &body[value_start..value_end];
-            let value = match string_value.as_str() {
-                "true" => Value::String(
-                    raw.replace("&lt;/｜DSML｜parameter>", DEEPSEEK_DSML_PARAMETER_CLOSE),
-                ),
-                "false" => serde_json::from_str(raw).with_context(|| {
-                    format!(
-                        "DeepSeek DSML non-string parameter {parameter_name:?} is not valid JSON"
-                    )
-                })?,
-                other => bail!(
-                    "DeepSeek DSML parameter {parameter_name:?} has invalid string attribute {other:?}"
-                ),
-            };
-            if arguments.insert(parameter_name.clone(), value).is_some() {
-                bail!("DeepSeek DSML invoke repeats parameter {parameter_name:?}");
-            }
-            body = &body[value_end + DEEPSEEK_DSML_PARAMETER_CLOSE.len()..];
-        }
-        calls.push(ChatToolCall {
-            id: None,
-            name: unescape_dsml_attribute(&name),
-            arguments: Value::Object(arguments),
-        });
-        block = &block[body_end + DEEPSEEK_DSML_INVOKE_CLOSE.len()..];
-    }
-    Ok(calls)
-}
-
-fn parse_dsml_attribute(header: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=\"");
-    let start = header.find(&needle)? + needle.len();
-    let end = header[start..].find('"')? + start;
-    Some(header[start..end].to_string())
-}
-
-fn unescape_dsml_attribute(value: &str) -> String {
-    value
-        .replace("&quot;", "\"")
-        .replace("&gt;", ">")
-        .replace("&lt;", "<")
-        .replace("&amp;", "&")
+    let parsed = pb_control_collar::protocol::parse_dsml_output(content, allow_incomplete)?;
+    Ok((
+        parsed.text,
+        parsed
+            .calls
+            .into_iter()
+            .map(|call| ChatToolCall {
+                id: None,
+                name: call.name,
+                arguments: call.arguments,
+            })
+            .collect(),
+    ))
 }
 
 fn parse_qwen_tool_call_block(block: &str) -> Result<ChatToolCall> {
@@ -1719,5 +1666,34 @@ mod tests {
         assert_eq!(calls[0].name, "weather");
         assert_eq!(calls[0].arguments["city"], "London");
         assert_eq!(calls[0].arguments["days"], 2);
+    }
+
+    #[test]
+    fn deepseek_mutation_history_uses_ordered_json_payload_strings() {
+        let mut rendered = String::new();
+        render_deepseek_dsml_calls(
+            &mut rendered,
+            &[ChatToolCall {
+                id: None,
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "content": "pub fn main() {\n    println!(\"ok\");\n}\n",
+                    "path": "main.rs"
+                }),
+            }],
+        )
+        .unwrap();
+        let path = rendered.find("name=\"path\"").unwrap();
+        let content = rendered.find("name=\"content\"").unwrap();
+        assert!(path < content);
+        assert!(rendered[content..].contains("string=\"false\">\"pub fn main()"));
+        let (_, calls) = parse_deepseek_tool_call_output_with_incomplete(&rendered, false).unwrap();
+        assert_eq!(calls[0].arguments["path"], "main.rs");
+        assert!(
+            calls[0].arguments["content"]
+                .as_str()
+                .unwrap()
+                .contains("println!")
+        );
     }
 }

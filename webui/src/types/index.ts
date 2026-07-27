@@ -598,8 +598,12 @@ export type AgentEvent =
         persistence_queue_wall_ms: number;
       };
       tool_constraint_mode?: string;
+      tool_constraint_dialect?: string;
       tool_schema_sha256?: string;
       rejected_constraint_candidates: number;
+      mutation_constraint_rejections?: Record<string, number>;
+      mutation_snapshot_files?: number;
+      mutation_snapshot_bytes?: number;
       constraint_terminal_state?: string;
     };
     energy_joules?: number;

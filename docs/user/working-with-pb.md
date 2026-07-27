@@ -52,6 +52,15 @@ model output budget. If constrained generation reaches a file-payload boundary w
 ceiling, pb retries once with more string room at the same token limit; real token exhaustion instead
 gets one smaller complete-file retry. Neither case writes a partial file.
 
+With FlashMoe, supported source files also have a generation-time completion gate. Rust, Python,
+TypeScript/TSX, JavaScript/JSX, HTML, and CSS mutations cannot finish or execute unless the exact
+virtual file is valid under pb's pinned syntax parser. Existing files still need a current full-file
+read. `apply_patch` uses exact hunk offsets, counts, and context and accepts only pb's canonical text
+patch form; stale, recount-dependent, rename/copy, mode-changing, timestamped, quoted-path, binary,
+or syntax-breaking patches fail without falling back to a looser parser. This catches malformed
+files, not type errors, unresolved names, failing builds, or bad runtime behavior; configured checks
+and review still decide those claims.
+
 For the last remaining file operation, the local model returns the implementation summary with the
 mutation. pb validates that summary only after the edit succeeds, so a valid edit can finish the
 implementation stage without a separate bookkeeping turn. Review pass records are similarly

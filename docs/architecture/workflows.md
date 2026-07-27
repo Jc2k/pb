@@ -360,8 +360,8 @@ The runtime applies these boundaries before a result can become evidence:
 | Surface | Enforced behavior |
 | --- | --- |
 | File reads and discovery | `read_file` accepts bounded UTF-8 files; glob, regex, and skill discovery have time/input ceilings; results are prompt-bounded with explicit continuation or failure rather than silent partial authority. |
-| File mutation | Existing files require an exact content fingerprint from the bytes actually read. Create and replace use synced temporary files and atomic no-clobber/replace operations; stale concurrent edits fail. `edit_file` requires one unique match. For an initial Python or Python-stub modify whose complete controller-observed file consumes at most half the bounded replacement allowance, pb exposes only atomic `replace_file`; this avoids indentation-fragment errors while requiring the model to preserve unrelated bytes. Other languages, larger or range-only observations, and diagnostic repair retain exact-edit behavior. Diff events are bounded and identify truncation. |
-| Patch, move, and remove | `apply_patch` validates every path, checks the patch before applying it, and uses a bounded process. `mv` moves only a file or symlink and cannot overwrite. `rm` operates on the final filesystem entry and removes only a file, symlink, or empty directory; recursive directory mutation is not an agent capability. |
+| File mutation | Existing files require an exact content fingerprint from the bytes actually read. Create and replace use synced temporary files and atomic no-clobber/replace operations; stale concurrent edits fail. `edit_file` requires one unique match. FlashMoe also prepares the exact virtual result through the control collar and refuses to close or execute a supported Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, or CSS mutation unless the pinned complete-file parser accepts it. Unsupported extensions retain the ordinary executor checks and are not reported as syntax constrained. For an initial Python or Python-stub modify whose complete controller-observed file consumes at most half the bounded replacement allowance, pb exposes only atomic `replace_file`; this avoids indentation-fragment errors while requiring the model to preserve unrelated bytes. Other languages, larger or range-only observations, and diagnostic repair retain exact-edit behavior. Diff events are bounded and identify truncation. |
+| Patch, move, and remove | FlashMoe `apply_patch` accepts a bounded canonical text-only unified-diff subset: exact offsets, counts, context and deletion bytes; LF; unquoted `a/` and `b/` paths; optional matching `diff --git`; and exact `100644` create/delete metadata. It rejects recount-dependent hunks, mode changes, renames, copies, timestamps, index metadata, and binary patches, applies the patch to an immutable controller snapshot in memory, validates every supported resulting file, rechecks live base hashes, and then requires exact `git apply --check` parity before publication. The llama.cpp compatibility path retains its broader Git/recount behavior and is never a fallback after collar rejection. `mv` moves only a file or symlink and cannot overwrite. `rm` operates on the final filesystem entry and removes only a file, symlink, or empty directory; recursive directory mutation is not an agent capability. |
 | Configured tasks | `run_task` executes against an isolated snapshot, rejects Git-control or undeclared-path changes, bounds promoted path/file totals, validates symlinks, stages every output, and rolls back the destination set if promotion fails. It never earns named-check credit. |
 | Commands and checks | Host and managed commands drain stdout/stderr concurrently, cap combined output, have explicit timeouts, observe user cancellation, and stop the owned process group or managed exec. `run_command` defaults to 120 seconds and is capped at 600; configured checks/tasks use their validated timeout. |
 | Public research | Every URL and redirect is restricted to HTTP(S), resolved before connection, rejected if any answer is private/special-use, and pinned to the validated public address. Proxies are bypassed. Bodies are capped and oversized chunked responses fail instead of being returned as complete. |
@@ -432,8 +432,9 @@ returned before the next model pass; a batch containing same-path read/write dep
 mixed with a mutation, or opaque `run_command` dependencies is rejected atomically, and a workflow
 or delivery transition must be the only call in its batch. The prompt explicitly encourages
 batching independent discovery reads and lookups so local inference is not spent on unnecessary
-round trips. Batch events record call, parallel-safe, useful, bookkeeping-only, and dependency-
-rejection counts.
+round trips. The FlashMoe control collar additionally permits at most one generated mutation call in
+a batch; non-mutation batching is unchanged. Batch events record call, parallel-safe, useful,
+bookkeeping-only, and dependency-rejection counts.
 If a max-token native completion contains complete early calls followed by an incomplete call, pb
 rejects the entire batch before execution and invokes the bounded truncation recovery. A complete
 administrative call therefore cannot mask or partially commit an oversized file mutation.
@@ -605,10 +606,12 @@ exact compatibility action shape for model runtimes that cannot emit them.
 The preferred terminal wire form is flat (`id` beside the artifact fields) and omits fields with
 safe empty defaults. pb reconstructs and validates the same durable `ArtifactEnvelope`; the older
 nested artifact object remains a bounded compatibility form and produces the same artifact digest.
-For native Qwen FlashMoe stages, generation-time constraints compile the actually exposed tool
-names and supported JSON-schema subset before inference. Terminal-only turns require their single
-terminal tool. Candidate filtering cannot grant authority or replace executor validation, and an
-unsupported schema fails preflight rather than silently disabling constraints.
+For native Qwen/GLM and DeepSeek FlashMoe stages, generation-time constraints compile the actually
+exposed tool names and supported JSON-schema subset before inference. Qwen/GLM uses its JSON tool
+envelope; DeepSeek uses its DSML control-token identity and ordered parameter dialect. Terminal-only
+turns require their single terminal tool. Candidate filtering cannot grant authority or replace
+executor validation, and an unsupported schema fails preflight rather than silently disabling
+constraints.
 The controller also identifies an exposed stage-submission tool as terminal. Once its constrained
 JSON body is complete, native generation stops semantically; pb supplies a missing Qwen envelope
 close only to the structured parser. Ordinary tools remain batchable, so this is not a one-call-per-
@@ -620,6 +623,28 @@ than force-closing and executing a cut-off file. Escaped string prefixes are mea
 decoding, so schema `maxLength`
 remains authoritative. These guards only select output accepted by the compiled schema; the normal
 parser, capability checks, and executor validation still run afterward.
+
+**Shipped.** FlashMoe mutation generation also uses the workspace-internal `pb-control-collar`
+library. Immediately before each generated attempt, the controller copies only current,
+fingerprint-matching complete-file reads into a bounded immutable snapshot. The collar has no live
+filesystem, Git, process, model, or capability access. It parses Qwen JSON or DeepSeek DSML, binds
+mutation payload closure to the virtual result, and rejects an invalid supported complete file or
+canonical patch while a repair token can still be sampled. Qwen retains full-vocabulary widening;
+DeepSeek probes candidates from its full-logit output and widens the candidate frontier before
+top-k truncation. A request that exposes a FlashMoe mutation tool without the required snapshot
+fails closed before decode.
+DeepSeek complete-state checkpoints for structured generation are namespaced by the exact rendered
+stable-root token digest. Repeated turns with the same root reuse the exact prefix; a changed tool
+schema or authority shape starts cold rather than restoring incompatible Metal state. Raw harness
+prefix-extension sessions retain their explicit session identity.
+
+The syntax profiles are pinned Tree-sitter grammars for Rust, Python, TypeScript/TSX,
+JavaScript/JSX, HTML, and CSS. They require UTF-8 and reject error or missing nodes; HTML additionally
+checks explicit element closure and supported embedded JavaScript, TypeScript, JSON, and CSS. This
+is a syntax guarantee, not a name-resolution, type, borrow, module-resolution, CSS-semantics, or
+Python runtime guarantee. Type-aware and project-overlay analysis uses the collar's versioned
+boundary/checkpoint interface only after a future analyzer has its own soundness corpus and fail-
+closed qualification.
 
 Strict JSON artifacts use a separate tokenizer-neutral constraint session and cannot be combined with
 native tools in one request. FlashMoe computes the LLGuidance allowed-token set before top-k. On

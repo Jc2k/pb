@@ -94,6 +94,21 @@ Existing files can be changed only after a read of the exact current bytes, reco
 fingerprint. Writes use synced temporary files and atomic no-clobber or replace operations, with a
 final stale-content check immediately before replacement. Recursive deletion is not exposed.
 
+FlashMoe mutation generation receives a bounded immutable snapshot containing only complete files
+whose controller read fingerprints are still current. The `pb-control-collar` crate is pure and
+unpublished: it cannot read the live workspace, follow a path, run Git or an analyzer process,
+publish bytes, grant a tool, or choose a backend. Its token filtering narrows a call already exposed
+by the controller. Missing snapshots, unsupported schemas, unavailable pinned parsers, incomplete
+envelopes, invalid virtual results, and empty candidate frontiers fail closed. Durable rejection
+telemetry contains only dialect, reason codes, counts, digests, terminal states, and snapshot byte/
+file counts—never source, patch, argument, symbol, or path content.
+
+The executor does not trust generation-time acceptance. It repeats path/capability/schema/read gates,
+reconstructs the virtual mutation, verifies current base hashes and syntax, and publishes through
+the existing atomic file operations. Constrained patches additionally require exact in-memory hunk
+application and `git apply --check` without recount. The broader recount-compatible Git path is
+limited to the unconstrained llama.cpp compatibility backend and is not a fallback.
+
 Strict implementation and repair additionally bind mutation to the active checkpointed work unit.
 The model does not need to supply its target path; pb resolves it from the accepted-plan ledger and
 records the resolved path in the tool event. Bounded multi-create batches validate every member
@@ -305,6 +320,7 @@ resolved versioned namespace; it never targets the storage root itself.
 | Container runtime | Isolation depends on the selected runtime and host configuration. Persistent images/caches remain outside the ephemeral resource lifecycle. |
 | Publication | Local Ready evidence does not authorize a push, pull request, merge, or provider-side mutation. |
 | Goal automatic continuation | Explicit per-Goal user authority inside snapshotted totals. It does not approve new paths, integrations, network access, policy prompts, or publication. |
+| Syntax-constrained mutation | Prevents a supported file from completing with parser-invalid syntax. It does not prove type correctness, name resolution, compilation, test success, runtime behavior, or security. Unsupported extensions retain ordinary executor checks. |
 
 ## Credentials
 

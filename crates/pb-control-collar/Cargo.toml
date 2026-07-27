@@ -1,0 +1,19 @@
+[package]
+name = "pb-control-collar"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+llguidance = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tree-sitter = "=0.25.10"
+tree-sitter-css = "=0.25.0"
+tree-sitter-html = "=0.23.2"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-python = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-typescript = "=0.23.2"

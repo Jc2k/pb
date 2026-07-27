@@ -192,6 +192,7 @@ impl InferenceBackend for crate::inference::flashmoe::FlashMoeEngine {
             tools: request.tools.clone(),
             stage_root: None,
             json_schema: None,
+            mutation_snapshot: None,
             add_generation_prompt: request.add_generation_prompt,
             enable_thinking: true,
             raw_prompt: false,

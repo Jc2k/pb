@@ -175,10 +175,18 @@ impl FlashMoeEngine {
         if !self.executor.is_deepseek_v4() {
             // Compile during preflight as well as generation so unsupported schema features
             // fail before any model work or durable invocation accounting begins.
-            let _ = NativeToolConstraint::compile_with_terminal_tools(
+            let mutation_gate = mutation_completion_gate(
+                pb_control_collar::protocol::ToolDialect::QwenJson,
                 request.tool_constraint_mode,
                 &request.tools,
                 &request.terminal_tool_names,
+                request.mutation_snapshot.as_ref(),
+            )?;
+            let _ = NativeToolConstraint::compile_with_mutation_gate(
+                request.tool_constraint_mode,
+                &request.tools,
+                &request.terminal_tool_names,
+                mutation_gate,
             )?;
         }
         if !request.raw_prompt {
@@ -463,18 +471,43 @@ impl FlashMoeEngine {
         let encode_elapsed = encode_started.elapsed();
         let deepseek_v4 = self.executor.is_deepseek_v4();
         validate_structured_constraint_request(request)?;
+        if request.mutation_snapshot.is_none()
+            && request.tools.iter().any(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "write_file" | "replace_file" | "edit_file" | "apply_patch"
+                )
+            })
+        {
+            bail!(
+                "FlashMoe mutation generation requires a controller-authorized immutable snapshot"
+            );
+        }
         let mut json_constraint = request
             .json_schema
             .as_ref()
             .map(|schema| self.tokenizer.compile_json_constraint(schema))
             .transpose()?;
         let mut tool_constraint = if deepseek_v4 {
-            None
-        } else {
-            NativeToolConstraint::compile_with_terminal_tools(
+            RuntimeToolConstraint::compile_deepseek(
                 request.tool_constraint_mode,
                 &request.tools,
                 &request.terminal_tool_names,
+                request.mutation_snapshot.as_ref(),
+            )?
+        } else {
+            let mutation_gate = mutation_completion_gate(
+                pb_control_collar::protocol::ToolDialect::QwenJson,
+                request.tool_constraint_mode,
+                &request.tools,
+                &request.terminal_tool_names,
+                request.mutation_snapshot.as_ref(),
+            )?;
+            RuntimeToolConstraint::compile_qwen(
+                request.tool_constraint_mode,
+                &request.tools,
+                &request.terminal_tool_names,
+                mutation_gate,
             )?
         };
         let deepseek_stable_prefix_len = if deepseek_v4 {
@@ -505,6 +538,26 @@ impl FlashMoeEngine {
             tokens: stable_root_len,
             stage: request.stage_root.clone(),
         });
+        // DeepSeek keeps complete Metal state and therefore requires an exact token prefix. Native
+        // tool schemas are rendered before the first chat message and can legitimately narrow
+        // between turns in one workflow stage. Scope structured checkpoints to the exact rendered
+        // stable root so a changed authority/schema shape starts cold instead of colliding with an
+        // incompatible checkpoint. Raw-prefix harness sessions intentionally retain their base ID
+        // because they qualify extension of one raw prompt by another.
+        let deepseek_structured_session_id =
+            if deepseek_v4 && !request.raw_prompt && request.add_generation_prompt {
+                session_id
+                    .zip(prompt_root.as_ref())
+                    .map(|(session_id, root)| {
+                        crate::inference::flashmoe::deepseek_session::scoped_structured_session_id(
+                            session_id,
+                            &root.rendered_token_sha256,
+                        )
+                    })
+            } else {
+                None
+            };
+        let session_id = deepseek_structured_session_id.as_deref().or(session_id);
         let max_tokens = request.max_tokens.max(0) as usize;
         validate_context_capacity(prompt_tokens.len(), max_tokens, request.context_size)?;
         if let Some(graph) = self.executor.deepseek_v4_graph() {
@@ -1091,7 +1144,7 @@ impl FlashMoeEngine {
         } else {
             generation_finish_reason(generated.len(), max_tokens)
         };
-        let parseable_decoded = if stopped_by_terminal_tool_call {
+        let parseable_decoded = if stopped_by_terminal_tool_call && !deepseek_v4 {
             close_unclosed_qwen_terminal_tool_call(&decoded)
         } else {
             Cow::Borrowed(decoded.as_str())
@@ -1100,15 +1153,19 @@ impl FlashMoeEngine {
             &parseable_decoded,
             finish_reason == GenerationFinishReason::MaxTokens,
         )?;
-        let tool_constraints =
-            tool_constraint
-                .as_ref()
-                .map(|constraint| NativeToolConstraintStats {
-                    mode: constraint.mode(),
-                    schema_sha256: constraint.schema_sha256().to_string(),
-                    rejected_candidates: constraint.rejected_candidates(),
-                    terminal_state: constraint.terminal_state(&decoded).to_string(),
-                });
+        let tool_constraints = tool_constraint.as_ref().map(|constraint| {
+            let (snapshot_files, snapshot_bytes) = constraint.snapshot_stats();
+            NativeToolConstraintStats {
+                mode: constraint.mode(),
+                dialect: constraint.dialect().to_string(),
+                schema_sha256: constraint.schema_sha256().to_string(),
+                rejected_candidates: constraint.rejected_candidates(),
+                mutation_rejections: constraint.mutation_rejections(),
+                snapshot_files,
+                snapshot_bytes,
+                terminal_state: constraint.terminal_state(&decoded).to_string(),
+            }
+        });
         let json_constraints = json_constraint
             .as_mut()
             .map(|constraint| -> Result<NativeJsonConstraintStats> {
@@ -1828,7 +1885,7 @@ impl FlashMoeEngine {
         timing: Option<&mut FlashMoeGenerationTiming>,
         trace_candidates: bool,
         progress: GenerationProgress<'_>,
-        tool_constraint: Option<&mut NativeToolConstraint>,
+        tool_constraint: Option<&mut RuntimeToolConstraint>,
         json_constraint: Option<&mut JsonConstraintSession>,
     ) -> Result<SampledDecode> {
         let previous = generated
@@ -1883,7 +1940,7 @@ impl FlashMoeEngine {
         generated: &[u32],
         trace_candidates: bool,
         progress: &GenerationProgress<'_>,
-        tool_constraint: Option<&mut NativeToolConstraint>,
+        tool_constraint: Option<&mut RuntimeToolConstraint>,
         json_constraint: Option<&mut JsonConstraintSession>,
     ) -> Result<u32> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1922,7 +1979,7 @@ impl FlashMoeEngine {
         generated: &[u32],
         trace_candidates: bool,
         progress: &GenerationProgress<'_>,
-        mut tool_constraint: Option<&mut NativeToolConstraint>,
+        mut tool_constraint: Option<&mut RuntimeToolConstraint>,
         json_constraint: Option<&mut JsonConstraintSession>,
     ) -> Result<u32> {
         if let Some(constraint) = tool_constraint.as_deref_mut()
@@ -1997,7 +2054,35 @@ impl FlashMoeEngine {
         }
         if let Some(graph) = self.executor.deepseek_v4_graph() {
             let logits = self.metal.deepseek_v4_logits(graph, hidden)?;
-            let candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+            let mut candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+            if let Some(constraint) = tool_constraint.as_deref_mut() {
+                loop {
+                    let filtered = constraint.filter_candidates(
+                        &self.tokenizer,
+                        generated,
+                        candidates,
+                        sampler.top_k,
+                    )?;
+                    if !filtered.is_empty() {
+                        candidates = filtered;
+                        break;
+                    }
+                    if sampler.candidate_limit() >= logits.len() {
+                        bail!(
+                            "DeepSeek DSML constraint rejected every vocabulary candidate at generated token {}",
+                            generated.len()
+                        );
+                    }
+                    sampler.widen_candidates(
+                        sampler
+                            .candidate_limit()
+                            .saturating_mul(4)
+                            .min(logits.len()),
+                    );
+                    candidates = sampler.top_candidates(&logits, prompt_tokens, generated);
+                }
+            }
+            sampler.truncate_for_sampling(&mut candidates);
             trace_sampling_candidates(
                 progress,
                 &self.tokenizer,

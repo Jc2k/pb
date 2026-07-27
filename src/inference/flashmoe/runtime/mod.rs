@@ -14,7 +14,7 @@ use super::capabilities::{
     FlashMoeAttentionMathCapability, FlashMoeCapabilityPlan, FlashMoeExpertAccessCapability,
     QwenPrefillGraphCapability,
 };
-use super::constraints::NativeToolConstraint;
+use super::constraints::{NativeToolConstraint, RuntimeToolConstraint, mutation_completion_gate};
 use super::deepseek::{DeepSeekV4Config, DeepSeekV4ExecutionGraph, is_deepseek_v4_flash};
 use super::deepseek_session::{
     DeepSeekV4CheckpointKind, DeepSeekV4SessionCheckpoint, DeepSeekV4SessionStore,

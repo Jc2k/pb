@@ -7,6 +7,10 @@ use super::state::reusable_session_prefix_len;
 const DEEPSEEK_MEMORY_SESSION_LIMIT: usize = 2;
 const DEEPSEEK_CHECKPOINTS_PER_SESSION: usize = 2;
 
+pub(super) fn scoped_structured_session_id(session_id: &str, stable_prompt_sha256: &str) -> String {
+    format!("{session_id}:root:{stable_prompt_sha256}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeepSeekV4CheckpointKind {
     StablePrompt,
@@ -210,6 +214,18 @@ mod tests {
                 .reusable_checkpoint("agent", &[1, 2, 3])
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn structured_session_ids_are_scoped_to_the_exact_stable_prompt() {
+        assert_eq!(
+            scoped_structured_session_id("agent:workflow:Planning", "abc123"),
+            "agent:workflow:Planning:root:abc123"
+        );
+        assert_ne!(
+            scoped_structured_session_id("agent:workflow:Planning", "schema-a"),
+            scoped_structured_session_id("agent:workflow:Planning", "schema-b")
         );
     }
 

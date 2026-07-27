@@ -48,6 +48,12 @@ plans, corrections, and evidence remain in the fresh suffix and in session-owned
 Carried exact-file evidence is projected to model prompts as path and content only; controller
 receipts and their workspace/path hashes remain in local checkpoint and audit state rather than
 being duplicated into later prompt suffixes.
+FlashMoe mutation constraints reuse those current local reads as a request-scoped immutable virtual
+workspace. Source and patch bytes stay inside the pb process, are not persisted as a control-collar
+cache, and are discarded with the request. The collar never opens a repository file or starts an
+external analyzer. Its durable inference fields are limited to a dialect name, schema digest,
+content-free rejection counts, snapshot file/byte counts, and terminal state; paths, source, patch
+bodies, argument values, symbols, prompts, and logits are excluded.
 `inference.llamacpp_session_cache_enabled=false` and
 `inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are
@@ -77,7 +83,8 @@ inspections, typed receipts, prompt blocks, and evaluator artifacts remain on th
 controller, local model, session, and explicitly selected scratch/output roots. The intrinsic
 behavior adds no telemetry, hosted inference fallback, remote persistence, or network authority.
 Local inference events may retain versioned model-namespace, rendered-token-root, and tool-schema
-digests plus an instruction version, bounded workflow stage/authority labels, token counts, and
+digests plus an instruction version, bounded workflow stage/authority labels, token counts,
+control-collar dialect/reason/count fields, and
 local refill/persistence timings. Those values make cache reuse
 auditable without copying prompt, task, path, tool-argument, or source content into diagnostic
 fields. Bounded lookup details identify only cache lifecycle outcomes such as session divergence or

@@ -1,6 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result, bail};
+use pb_control_collar::protocol::ToolDialect;
+use pb_control_collar::tool::{
+    CollarLimits, CollarManifest, ExposedTool, MutationPolicy, ToolConstraintMode,
+};
+use pb_control_collar::{CompletionDecision, MutationCompletionGate, RejectionCode};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -11,17 +16,93 @@ const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 const CONSTRAINED_NO_REPEAT_NGRAM: usize = 32;
 const MAX_STRUCTURAL_WHITESPACE_BYTES: usize = 32;
+const MAX_COLLAR_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_COLLAR_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_COLLAR_FILES: usize = 32;
+const MAX_COLLAR_PATCH_HUNKS: usize = 256;
+
+pub(super) fn mutation_completion_gate(
+    dialect: ToolDialect,
+    mode: NativeToolConstraintMode,
+    tools: &[ChatTool],
+    terminal_tool_names: &[String],
+    snapshot: Option<&pb_control_collar::mutation::WorkspaceSnapshot>,
+) -> Result<Option<MutationCompletionGate>> {
+    let has_mutation = tools.iter().any(|tool| {
+        matches!(
+            tool.name.as_str(),
+            "write_file" | "replace_file" | "edit_file" | "apply_patch"
+        )
+    });
+    if !has_mutation {
+        return Ok(None);
+    }
+    let Some(snapshot) = snapshot else {
+        // Prompt measurement and identity calculation are deliberately workspace-data-free. The
+        // generation entry point separately requires the snapshot before any model work begins.
+        return Ok(None);
+    };
+    Ok(Some(MutationCompletionGate::new(collar_manifest(
+        dialect,
+        mode,
+        tools,
+        terminal_tool_names,
+        snapshot.clone(),
+    )?)?))
+}
+
+pub(super) fn collar_manifest(
+    dialect: ToolDialect,
+    mode: NativeToolConstraintMode,
+    tools: &[ChatTool],
+    terminal_tool_names: &[String],
+    workspace: pb_control_collar::mutation::WorkspaceSnapshot,
+) -> Result<CollarManifest> {
+    let exposed = |name: &str| tools.iter().any(|tool| tool.name == name);
+    Ok(CollarManifest {
+        contract_version: 1,
+        dialect,
+        mode: match mode {
+            NativeToolConstraintMode::Auto => ToolConstraintMode::Auto,
+            NativeToolConstraintMode::ToolsAllowed => ToolConstraintMode::ToolsAllowed,
+            NativeToolConstraintMode::ToolRequired => ToolConstraintMode::ToolRequired,
+        },
+        tools: tools
+            .iter()
+            .map(|tool| ExposedTool {
+                name: tool.name.clone(),
+                input_schema: tool.input_schema.clone(),
+            })
+            .collect(),
+        terminal_tools: terminal_tool_names.to_vec(),
+        mutation_policy: MutationPolicy {
+            allow_write_file: exposed("write_file"),
+            allow_replace_file: exposed("replace_file") || exposed("edit_file"),
+            allow_apply_patch: exposed("apply_patch"),
+            max_mutation_calls_per_batch: 1,
+        },
+        workspace,
+        limits: CollarLimits {
+            max_argument_bytes: MAX_COLLAR_ARGUMENT_BYTES,
+            max_snapshot_bytes: MAX_COLLAR_SNAPSHOT_BYTES,
+            max_files: MAX_COLLAR_FILES,
+            max_patch_hunks: MAX_COLLAR_PATCH_HUNKS,
+        },
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct NativeToolConstraint {
     mode: NativeToolConstraintMode,
     schemas: BTreeMap<String, Value>,
+    mutation_gate: Option<MutationCompletionGate>,
     terminal_tool_names: BTreeSet<String>,
     forced_tokens: VecDeque<u32>,
     payload_limit_stop: Option<String>,
     stopped_at_payload_limit: bool,
     schema_sha256: String,
     rejected_candidates: usize,
+    mutation_rejections: BTreeMap<pb_control_collar::RejectionCode, usize>,
 }
 
 impl NativeToolConstraint {
@@ -33,10 +114,20 @@ impl NativeToolConstraint {
         Self::compile_with_terminal_tools(mode, tools, &[])
     }
 
+    #[cfg(test)]
     pub(super) fn compile_with_terminal_tools(
         mode: NativeToolConstraintMode,
         tools: &[ChatTool],
         terminal_tool_names: &[String],
+    ) -> Result<Option<Self>> {
+        Self::compile_with_mutation_gate(mode, tools, terminal_tool_names, None)
+    }
+
+    pub(super) fn compile_with_mutation_gate(
+        mode: NativeToolConstraintMode,
+        tools: &[ChatTool],
+        terminal_tool_names: &[String],
+        mutation_gate: Option<MutationCompletionGate>,
     ) -> Result<Option<Self>> {
         let active_mode = match mode {
             NativeToolConstraintMode::Auto if tools.is_empty() => return Ok(None),
@@ -75,12 +166,14 @@ impl NativeToolConstraint {
         Ok(Some(Self {
             mode: active_mode,
             schemas,
+            mutation_gate,
             terminal_tool_names,
             forced_tokens: VecDeque::new(),
             payload_limit_stop: None,
             stopped_at_payload_limit: false,
             schema_sha256: format!("{:x}", Sha256::digest(schema_bytes)),
             rejected_candidates: 0,
+            mutation_rejections: BTreeMap::new(),
         }))
     }
 
@@ -304,6 +397,9 @@ impl NativeToolConstraint {
                 }
             } else {
                 self.rejected_candidates = self.rejected_candidates.saturating_add(1);
+                if let Some(code) = self.output_mutation_rejection(&decoded) {
+                    *self.mutation_rejections.entry(code).or_default() += 1;
+                }
             }
         }
         Ok(accepted)
@@ -334,17 +430,36 @@ impl NativeToolConstraint {
         }
 
         let mut remaining = &decoded[start..];
+        let mut mutation_calls = 0usize;
+        let mutation_limit = self.mutation_gate.as_ref().map_or(usize::MAX, |gate| {
+            gate.manifest().mutation_policy.max_mutation_calls_per_batch
+        });
         loop {
             if !remaining.starts_with(TOOL_CALL_OPEN) {
                 return !at_eos && TOOL_CALL_OPEN.starts_with(remaining.trim_start());
             }
             remaining = &remaining[TOOL_CALL_OPEN.len()..];
             let Some(close) = remaining.find(TOOL_CALL_CLOSE) else {
-                return !at_eos && self.tool_body_prefix_is_valid(remaining);
+                if at_eos || !self.tool_body_prefix_is_valid(remaining) {
+                    return false;
+                }
+                return !matches!(
+                    self.mutation_payload_completion_decision(remaining),
+                    CompletionDecision::Accept if mutation_calls >= mutation_limit
+                );
             };
             let body = &remaining[..close];
             if !self.tool_body_is_complete(body) {
                 return false;
+            }
+            if matches!(
+                self.completed_tool_body_decision(body),
+                CompletionDecision::Accept
+            ) {
+                mutation_calls = mutation_calls.saturating_add(1);
+                if mutation_calls > mutation_limit {
+                    return false;
+                }
             }
             remaining = remaining[close + TOOL_CALL_CLOSE.len()..].trim_start();
             if remaining.is_empty() {
@@ -355,14 +470,134 @@ impl NativeToolConstraint {
 
     fn tool_body_prefix_is_valid(&self, body: &str) -> bool {
         match self.parse_tool_body(body) {
-            PrefixStatus::Incomplete => true,
-            PrefixStatus::Complete(position) => self.close_suffix_is_valid(&body[position..]),
+            PrefixStatus::Incomplete => !matches!(
+                self.mutation_payload_completion_decision(body),
+                CompletionDecision::Reject(_)
+            ),
+            PrefixStatus::Complete(position) => {
+                self.close_suffix_is_valid(&body[position..])
+                    && self.completed_tool_body_is_allowed(&body[..position])
+            }
             PrefixStatus::Invalid => false,
         }
     }
 
     fn tool_body_is_complete(&self, body: &str) -> bool {
         matches!(self.parse_tool_body(body), PrefixStatus::Complete(position) if skip_ws(body, position) == body.len())
+            && self.completed_tool_body_is_allowed(body)
+    }
+
+    fn completed_tool_body_is_allowed(&self, body: &str) -> bool {
+        !matches!(
+            self.completed_tool_body_decision(body),
+            CompletionDecision::Reject(_)
+        )
+    }
+
+    fn completed_tool_body_decision(&self, body: &str) -> CompletionDecision {
+        let Some(gate) = self.mutation_gate.as_ref() else {
+            return CompletionDecision::NotApplicable;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(body.trim()) else {
+            return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+        };
+        let Some(name) = value.get("name").and_then(Value::as_str) else {
+            return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+        };
+        let Some(arguments) = value.get("arguments") else {
+            return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+        };
+        gate.evaluate(name, arguments)
+    }
+
+    fn completed_tool_body_rejection(&self, body: &str) -> Option<RejectionCode> {
+        match self.completed_tool_body_decision(body) {
+            CompletionDecision::Reject(code) => Some(code),
+            CompletionDecision::Accept | CompletionDecision::NotApplicable => None,
+        }
+    }
+
+    fn output_mutation_rejection(&self, decoded: &str) -> Option<RejectionCode> {
+        let open = decoded.rfind(TOOL_CALL_OPEN)?;
+        let body = &decoded[open + TOOL_CALL_OPEN.len()..];
+        if let Some(close) = body.find(TOOL_CALL_CLOSE) {
+            self.completed_tool_body_rejection(&body[..close])
+        } else {
+            match self.mutation_payload_completion_decision(body) {
+                CompletionDecision::Reject(code) => Some(code),
+                CompletionDecision::Accept | CompletionDecision::NotApplicable => None,
+            }
+        }
+    }
+
+    /// Evaluate a mutation as soon as its payload string closes. Waiting for the outer JSON object
+    /// would commit an irreversible closing quote and leave the sampler no continuation that can
+    /// repair invalid source or a stale patch.
+    fn mutation_payload_completion_decision(&self, body: &str) -> CompletionDecision {
+        let Some(gate) = self.mutation_gate.as_ref() else {
+            return CompletionDecision::NotApplicable;
+        };
+        let Some((name, arguments)) = self.closed_mutation_payload(body) else {
+            return CompletionDecision::NotApplicable;
+        };
+        gate.evaluate(&name, &Value::Object(arguments))
+    }
+
+    fn closed_mutation_payload(
+        &self,
+        body: &str,
+    ) -> Option<(String, serde_json::Map<String, Value>)> {
+        let mut position = skip_ws(body, 0);
+        position = complete_position(consume_byte(body, position, b'{'))?;
+        position = skip_ws(body, position);
+        let (name_key, next) = complete_string(parse_fixed_string(body, position, &["name"]))?;
+        if name_key != "name" {
+            return None;
+        }
+        position = skip_ws(body, next);
+        position = complete_position(consume_byte(body, position, b':'))?;
+        position = skip_ws(body, position);
+        let names = self.schemas.keys().map(String::as_str).collect::<Vec<_>>();
+        let (name, next) = complete_string(parse_fixed_string(body, position, &names))?;
+        let payload_name = match name.as_str() {
+            "write_file" | "replace_file" => "content",
+            "edit_file" => "new_text",
+            "apply_patch" => "patch",
+            _ => return None,
+        };
+        position = skip_ws(body, next);
+        position = complete_position(consume_byte(body, position, b','))?;
+        position = skip_ws(body, position);
+        let (arguments_key, next) =
+            complete_string(parse_fixed_string(body, position, &["arguments"]))?;
+        if arguments_key != "arguments" {
+            return None;
+        }
+        position = skip_ws(body, next);
+        position = complete_position(consume_byte(body, position, b':'))?;
+        position = skip_ws(body, position);
+        position = complete_position(consume_byte(body, position, b'{'))?;
+
+        let order = mutation_argument_order(&name)?;
+        let mut values = serde_json::Map::new();
+        for expected in order {
+            position = skip_ws(body, position);
+            let (key, next) = complete_string(parse_json_string(body, position))?;
+            if key != *expected {
+                return None;
+            }
+            position = skip_ws(body, next);
+            position = complete_position(consume_byte(body, position, b':'))?;
+            position = skip_ws(body, position);
+            let (value, next) = complete_string(parse_json_string(body, position))?;
+            values.insert(key.clone(), Value::String(value));
+            if key == payload_name {
+                return Some((name, values));
+            }
+            position = skip_ws(body, next);
+            position = complete_position(consume_byte(body, position, b','))?;
+        }
+        None
     }
 
     fn parse_tool_body(&self, body: &str) -> PrefixStatus {
@@ -422,12 +657,328 @@ impl NativeToolConstraint {
         let Some(schema) = self.schemas.get(&name) else {
             return PrefixStatus::Invalid;
         };
-        position = match JsonPrefixParser::new(body).parse_value(position, schema) {
+        let parser = JsonPrefixParser::new(body);
+        let arguments = match mutation_argument_order(&name) {
+            Some(order) => parser.parse_ordered_object(position, schema, order),
+            None => parser.parse_value(position, schema),
+        };
+        position = match arguments {
             PrefixStatus::Complete(position) => position,
             status => return status,
         };
         position = skip_ws(body, position);
         consume_byte(body, position, b'}')
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DeepSeekToolConstraint {
+    mode: NativeToolConstraintMode,
+    collar: pb_control_collar::protocol::DsmlConstraint,
+    schema_sha256: String,
+    rejected_candidates: usize,
+    mutation_rejections: BTreeMap<RejectionCode, usize>,
+    snapshot_files: usize,
+    snapshot_bytes: usize,
+}
+
+impl DeepSeekToolConstraint {
+    fn compile(
+        mode: NativeToolConstraintMode,
+        tools: &[ChatTool],
+        terminal_tool_names: &[String],
+        snapshot: Option<&pb_control_collar::mutation::WorkspaceSnapshot>,
+    ) -> Result<Option<Self>> {
+        let active_mode = match mode {
+            NativeToolConstraintMode::Auto if tools.is_empty() => return Ok(None),
+            NativeToolConstraintMode::Auto => NativeToolConstraintMode::ToolsAllowed,
+            mode => mode,
+        };
+        if tools.is_empty() {
+            bail!("native DeepSeek tool constraint mode requires at least one tool");
+        }
+        let has_mutation = tools.iter().any(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "write_file" | "replace_file" | "edit_file" | "apply_patch"
+            )
+        });
+        let workspace = match (has_mutation, snapshot) {
+            (true, None) => {
+                bail!("DeepSeek mutation constraints require a controller-authorized snapshot")
+            }
+            (_, Some(snapshot)) => snapshot.clone(),
+            (false, None) => pb_control_collar::mutation::WorkspaceSnapshot::default(),
+        };
+        let snapshot_files = workspace.len();
+        let snapshot_bytes = workspace.total_bytes();
+        let manifest = collar_manifest(
+            ToolDialect::DeepSeekDsml,
+            active_mode,
+            tools,
+            terminal_tool_names,
+            workspace,
+        )?;
+        let schema_bytes = serde_json::to_vec(
+            &tools
+                .iter()
+                .map(|tool| (&tool.name, &tool.input_schema))
+                .collect::<BTreeMap<_, _>>(),
+        )?;
+        Ok(Some(Self {
+            mode: active_mode,
+            collar: pb_control_collar::protocol::DsmlConstraint::compile(manifest)?,
+            schema_sha256: format!("{:x}", Sha256::digest(schema_bytes)),
+            rejected_candidates: 0,
+            mutation_rejections: BTreeMap::new(),
+            snapshot_files,
+            snapshot_bytes,
+        }))
+    }
+
+    fn transcript_bytes(tokenizer: &QwenTokenizer, tokens: &[u32]) -> Result<(Vec<u8>, usize)> {
+        let mut bytes = Vec::new();
+        let mut dsml_controls = 0usize;
+        for token in tokens {
+            if tokenizer.is_eos(*token) {
+                continue;
+            }
+            let surface = tokenizer
+                .constraint_token_surface(*token)
+                .with_context(|| {
+                    format!("DeepSeek token {token} has no constraint vocabulary surface")
+                })?;
+            match surface {
+                pb_control_collar::vocabulary::TokenSurface::Bytes(visible) => {
+                    bytes.extend_from_slice(visible)
+                }
+                pb_control_collar::vocabulary::TokenSurface::Control {
+                    identity,
+                    visible_bytes,
+                } => {
+                    if identity.0 == "｜DSML｜" {
+                        dsml_controls = dsml_controls.saturating_add(1);
+                    }
+                    bytes.extend_from_slice(visible_bytes);
+                }
+            }
+        }
+        Ok((bytes, dsml_controls))
+    }
+
+    fn identity_is_valid(bytes: &[u8], dsml_controls: usize) -> bool {
+        bytes
+            .windows("｜DSML｜".len())
+            .filter(|window| *window == "｜DSML｜".as_bytes())
+            .count()
+            == dsml_controls
+    }
+
+    fn filter_candidates(
+        &mut self,
+        tokenizer: &QwenTokenizer,
+        generated: &[u32],
+        candidates: Vec<(usize, f32)>,
+        keep: usize,
+    ) -> Result<Vec<(usize, f32)>> {
+        let (prefix, prefix_controls) = Self::transcript_bytes(tokenizer, generated)?;
+        let mut accepted = Vec::with_capacity(keep.min(candidates.len()));
+        for (token, score) in candidates {
+            let token_u32 = u32::try_from(token).context("candidate token id exceeds u32")?;
+            let mut trial = prefix.clone();
+            let mut controls = prefix_controls;
+            if !tokenizer.is_eos(token_u32) {
+                match tokenizer
+                    .constraint_token_surface(token_u32)
+                    .context("DeepSeek candidate has no constraint surface")?
+                {
+                    pb_control_collar::vocabulary::TokenSurface::Bytes(bytes) => {
+                        trial.extend_from_slice(bytes)
+                    }
+                    pb_control_collar::vocabulary::TokenSurface::Control {
+                        identity,
+                        visible_bytes,
+                    } => {
+                        if identity.0 == "｜DSML｜" {
+                            controls = controls.saturating_add(1);
+                        }
+                        trial.extend_from_slice(visible_bytes);
+                    }
+                }
+            }
+            let probe = self.collar.probe(&trial, tokenizer.is_eos(token_u32));
+            let advances_visible_output = tokenizer.is_eos(token_u32) || trial.len() > prefix.len();
+            if advances_visible_output && Self::identity_is_valid(&trial, controls) && probe.valid {
+                accepted.push((token, score));
+                if accepted.len() >= keep {
+                    break;
+                }
+            } else {
+                self.rejected_candidates = self.rejected_candidates.saturating_add(1);
+                if let Some(code) = probe.rejection {
+                    *self.mutation_rejections.entry(code).or_default() += 1;
+                }
+            }
+        }
+        Ok(accepted)
+    }
+
+    fn should_stop_after_token(
+        &self,
+        tokenizer: &QwenTokenizer,
+        generated: &[u32],
+        token: u32,
+    ) -> Result<bool> {
+        let mut trial = generated.to_vec();
+        trial.push(token);
+        let (bytes, controls) = Self::transcript_bytes(tokenizer, &trial)?;
+        Ok(Self::identity_is_valid(&bytes, controls) && self.collar.probe(&bytes, false).complete)
+    }
+
+    fn terminal_state(&self, decoded: &str) -> &'static str {
+        self.collar.terminal_state(decoded.as_bytes())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum RuntimeToolConstraint {
+    Qwen(NativeToolConstraint),
+    DeepSeek(DeepSeekToolConstraint),
+}
+
+impl RuntimeToolConstraint {
+    pub(super) fn compile_qwen(
+        mode: NativeToolConstraintMode,
+        tools: &[ChatTool],
+        terminal_tool_names: &[String],
+        mutation_gate: Option<MutationCompletionGate>,
+    ) -> Result<Option<Self>> {
+        Ok(NativeToolConstraint::compile_with_mutation_gate(
+            mode,
+            tools,
+            terminal_tool_names,
+            mutation_gate,
+        )?
+        .map(Self::Qwen))
+    }
+
+    pub(super) fn compile_deepseek(
+        mode: NativeToolConstraintMode,
+        tools: &[ChatTool],
+        terminal_tool_names: &[String],
+        snapshot: Option<&pb_control_collar::mutation::WorkspaceSnapshot>,
+    ) -> Result<Option<Self>> {
+        Ok(
+            DeepSeekToolConstraint::compile(mode, tools, terminal_tool_names, snapshot)?
+                .map(Self::DeepSeek),
+        )
+    }
+
+    pub(super) fn mode(&self) -> NativeToolConstraintMode {
+        match self {
+            Self::Qwen(constraint) => constraint.mode(),
+            Self::DeepSeek(constraint) => constraint.mode,
+        }
+    }
+
+    pub(super) fn schema_sha256(&self) -> &str {
+        match self {
+            Self::Qwen(constraint) => constraint.schema_sha256(),
+            Self::DeepSeek(constraint) => &constraint.schema_sha256,
+        }
+    }
+
+    pub(super) fn rejected_candidates(&self) -> usize {
+        match self {
+            Self::Qwen(constraint) => constraint.rejected_candidates(),
+            Self::DeepSeek(constraint) => constraint.rejected_candidates,
+        }
+    }
+
+    pub(super) fn dialect(&self) -> &'static str {
+        match self {
+            Self::Qwen(_) => "qwen_json",
+            Self::DeepSeek(_) => "deepseek_dsml",
+        }
+    }
+
+    pub(super) fn mutation_rejections(&self) -> BTreeMap<String, usize> {
+        let source = match self {
+            Self::Qwen(constraint) => &constraint.mutation_rejections,
+            Self::DeepSeek(constraint) => &constraint.mutation_rejections,
+        };
+        source
+            .iter()
+            .map(|(code, count)| (code.as_str().to_string(), *count))
+            .collect()
+    }
+
+    pub(super) fn snapshot_stats(&self) -> (usize, usize) {
+        match self {
+            Self::Qwen(constraint) => constraint.mutation_gate.as_ref().map_or((0, 0), |gate| {
+                let workspace = &gate.manifest().workspace;
+                (workspace.len(), workspace.total_bytes())
+            }),
+            Self::DeepSeek(constraint) => (constraint.snapshot_files, constraint.snapshot_bytes),
+        }
+    }
+
+    pub(super) fn terminal_state(&self, decoded: &str) -> &'static str {
+        match self {
+            Self::Qwen(constraint) => constraint.terminal_state(decoded),
+            Self::DeepSeek(constraint) => constraint.terminal_state(decoded),
+        }
+    }
+
+    pub(super) fn forced_next_token(
+        &mut self,
+        tokenizer: &QwenTokenizer,
+        generated: &[u32],
+    ) -> Result<Option<u32>> {
+        match self {
+            Self::Qwen(constraint) => constraint.forced_next_token(tokenizer, generated),
+            Self::DeepSeek(_) => Ok(None),
+        }
+    }
+
+    pub(super) fn take_payload_limit_stop(&mut self) -> Option<String> {
+        match self {
+            Self::Qwen(constraint) => constraint.take_payload_limit_stop(),
+            Self::DeepSeek(_) => None,
+        }
+    }
+
+    pub(super) fn should_stop_after_token(
+        &self,
+        tokenizer: &QwenTokenizer,
+        generated: &[u32],
+        token: u32,
+    ) -> Result<bool> {
+        match self {
+            Self::Qwen(constraint) => {
+                constraint.should_stop_after_token(tokenizer, generated, token)
+            }
+            Self::DeepSeek(constraint) => {
+                constraint.should_stop_after_token(tokenizer, generated, token)
+            }
+        }
+    }
+
+    pub(super) fn filter_candidates(
+        &mut self,
+        tokenizer: &QwenTokenizer,
+        generated: &[u32],
+        candidates: Vec<(usize, f32)>,
+        keep: usize,
+    ) -> Result<Vec<(usize, f32)>> {
+        match self {
+            Self::Qwen(constraint) => {
+                constraint.filter_candidates(tokenizer, generated, candidates, keep)
+            }
+            Self::DeepSeek(constraint) => {
+                constraint.filter_candidates(tokenizer, generated, candidates, keep)
+            }
+        }
     }
 }
 
@@ -680,6 +1231,29 @@ enum StringStatus {
     Invalid,
 }
 
+fn complete_position(status: PrefixStatus) -> Option<usize> {
+    match status {
+        PrefixStatus::Complete(position) => Some(position),
+        PrefixStatus::Incomplete | PrefixStatus::Invalid => None,
+    }
+}
+
+fn complete_string(status: StringStatus) -> Option<(String, usize)> {
+    match status {
+        StringStatus::Complete(value, position) => Some((value, position)),
+        StringStatus::Incomplete(_) | StringStatus::Invalid => None,
+    }
+}
+
+fn mutation_argument_order(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "write_file" | "replace_file" => Some(&["path", "content", "completion"]),
+        "edit_file" => Some(&["path", "old_text", "new_text", "completion"]),
+        "apply_patch" => Some(&["patch"]),
+        _ => None,
+    }
+}
+
 fn skip_ws(input: &str, mut position: usize) -> usize {
     while input
         .as_bytes()
@@ -830,6 +1404,106 @@ impl<'a> JsonPrefixParser<'a> {
                 StringStatus::Incomplete(_) => return PrefixStatus::Incomplete,
                 StringStatus::Invalid => return PrefixStatus::Invalid,
             };
+            if !seen.insert(key.clone()) {
+                return PrefixStatus::Invalid;
+            }
+            position = skip_ws(self.input, next);
+            position = match consume_byte(self.input, position, b':') {
+                PrefixStatus::Complete(position) => position,
+                status => return status,
+            };
+            let Some(property_schema) = properties.get(&key) else {
+                return PrefixStatus::Invalid;
+            };
+            position = match self.parse_value(position, property_schema) {
+                PrefixStatus::Complete(position) => position,
+                status => return status,
+            };
+            position = skip_ws(self.input, position);
+            match self.input.as_bytes().get(position) {
+                Some(b',') => {
+                    position += 1;
+                    can_close = false;
+                }
+                Some(b'}') => {
+                    return if required.iter().all(|field| seen.contains(*field)) {
+                        PrefixStatus::Complete(position + 1)
+                    } else {
+                        PrefixStatus::Invalid
+                    };
+                }
+                None => return PrefixStatus::Incomplete,
+                _ => return PrefixStatus::Invalid,
+            }
+        }
+    }
+
+    fn parse_ordered_object(
+        &self,
+        position: usize,
+        schema: &Value,
+        order: &[&str],
+    ) -> PrefixStatus {
+        let mut position = match consume_byte(self.input, position, b'{') {
+            PrefixStatus::Complete(position) => position,
+            status => return status,
+        };
+        let properties = match schema.get("properties").and_then(Value::as_object) {
+            Some(properties) => properties,
+            None => return PrefixStatus::Invalid,
+        };
+        if properties
+            .keys()
+            .any(|property| !order.contains(&property.as_str()))
+        {
+            return PrefixStatus::Invalid;
+        }
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        let mut last_order_index = None;
+        let mut can_close = true;
+        loop {
+            position = skip_ws(self.input, position);
+            match self.input.as_bytes().get(position) {
+                None => return PrefixStatus::Incomplete,
+                Some(b'}') => {
+                    return if can_close && required.iter().all(|field| seen.contains(*field)) {
+                        PrefixStatus::Complete(position + 1)
+                    } else {
+                        PrefixStatus::Invalid
+                    };
+                }
+                _ => {}
+            }
+            let available = order
+                .iter()
+                .enumerate()
+                .filter(|(index, name)| {
+                    properties.contains_key(**name)
+                        && !seen.contains(**name)
+                        && last_order_index.is_none_or(|last| *index > last)
+                        && order[..*index]
+                            .iter()
+                            .filter(|earlier| required.contains(**earlier))
+                            .all(|earlier| seen.contains(*earlier))
+                })
+                .map(|(_, name)| *name)
+                .collect::<Vec<_>>();
+            let (key, next) = match parse_fixed_string(self.input, position, &available) {
+                StringStatus::Complete(key, next) => (key, next),
+                StringStatus::Incomplete(_) => return PrefixStatus::Incomplete,
+                StringStatus::Invalid => return PrefixStatus::Invalid,
+            };
+            let Some(order_index) = order.iter().position(|name| *name == key) else {
+                return PrefixStatus::Invalid;
+            };
+            last_order_index = Some(order_index);
             if !seen.insert(key.clone()) {
                 return PrefixStatus::Invalid;
             }
@@ -1322,6 +1996,45 @@ mod tests {
             constraint.bounded_mutation_string_limit_tool(&body.replace("12345678", "1234")),
             None
         );
+    }
+
+    #[test]
+    fn mutation_constraint_rejects_the_invalid_payload_closing_quote() {
+        let mut mutation_tools = mutation_tools();
+        mutation_tools[0].input_schema["properties"]["content"]["maxLength"] = json!(256);
+        let snapshot = pb_control_collar::mutation::WorkspaceSnapshot::default();
+        let gate = mutation_completion_gate(
+            ToolDialect::QwenJson,
+            NativeToolConstraintMode::ToolsAllowed,
+            &mutation_tools,
+            &[],
+            Some(&snapshot),
+        )
+        .unwrap();
+        let constraint = NativeToolConstraint::compile_with_mutation_gate(
+            NativeToolConstraintMode::ToolsAllowed,
+            &mutation_tools,
+            &[],
+            gate,
+        )
+        .unwrap()
+        .unwrap();
+        let invalid_open = concat!(
+            "<tool_call>{\"name\":\"write_file\",\"arguments\":{",
+            "\"path\":\"lib.rs\",\"content\":\"pub fn broken( {"
+        );
+        assert!(constraint.output_prefix_is_valid(invalid_open, false));
+        assert!(!constraint.output_prefix_is_valid(&format!("{invalid_open}\""), false));
+
+        let valid_open = invalid_open.replace("pub fn broken( {", "pub fn ok() {}");
+        assert!(constraint.output_prefix_is_valid(&format!("{valid_open}\""), false));
+        let valid_call = format!("{valid_open}\"}}}}{TOOL_CALL_CLOSE}");
+        assert!(constraint.output_prefix_is_valid(&valid_call, false));
+        assert!(!constraint.output_prefix_is_valid(&format!("{valid_call}{valid_call}"), false));
+        assert!(!constraint.output_prefix_is_valid(
+            "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"content\"",
+            false
+        ));
     }
 
     #[test]

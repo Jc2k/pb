@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "apply_patch",
+      "description": "Apply one canonical unified diff to the immutable snapshot.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "patch": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "patch"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "terminal_tool_names": [
+    "apply_patch"
+  ],
+  "files": [
+    {
+      "path": "answer.py",
+      "content": "answer: int = 3\n"
+    }
+  ]
+}

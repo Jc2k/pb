@@ -92,6 +92,14 @@ destinations if promotion fails. The agent cannot request recursive directory de
 Structural moves are likewise limited to files and symlinks, so a single allowed path cannot hide
 a recursive subtree move.
 
+For FlashMoe-generated `write_file`, `replace_file`, `edit_file`, and canonical `apply_patch`, pb
+also validates the exact virtual result before the model can finish the mutation and repeats that
+validation at execution. Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, and CSS results must be
+valid under pb's pinned complete-file syntax profile. Existing-file and patch validation is bound to
+the exact controller-observed base; stale bytes fail rather than being patched approximately. This
+does not promise that names resolve, types agree, code compiles, tests pass, or Python behavior is
+safe. Those remain later checks and review evidence.
+
 A broad task command is treated as broad authority, not described as a sandbox. The user remains
 responsible for how much authority project configuration grants.
 
@@ -276,6 +284,10 @@ cross its schema limit, and the same-step compact retry carries the reduced limi
 schema as well as its prompt. Repeated or collapsing decoded prefixes cannot masquerade as output
 progress. File mutation tools report success and earn progress only when repository bytes actually
 change; an identical replacement is a typed tool failure rather than fresh evidence.
+FlashMoe also refuses EOS or tool-envelope closure for an invalid supported complete-file result.
+Qwen JSON and DeepSeek DSML use the same virtual mutation and syntax gate, and constrained batches
+can contain at most one mutation call. A rejected canonical patch is not retried through the broader
+llama.cpp/Git compatibility parser.
 
 Goal budgets apply across all child workflows and do not reset between milestones, pause/resume, or
 amendments. A project ceiling may narrow a user's request. A model can request budget review but

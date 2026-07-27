@@ -495,9 +495,17 @@ pub struct NativeGenerationUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_constraint_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_constraint_dialect: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_schema_sha256: Option<String>,
     #[serde(default)]
     pub rejected_constraint_candidates: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mutation_constraint_rejections: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub mutation_snapshot_files: usize,
+    #[serde(default)]
+    pub mutation_snapshot_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint_terminal_state: Option<String>,
 }
@@ -2590,8 +2598,12 @@ mod tests {
                     persistence_queue_wall_ms: 6,
                 }),
                 tool_constraint_mode: Some("tool_required".to_string()),
+                tool_constraint_dialect: Some("qwen_json".to_string()),
                 tool_schema_sha256: Some("abc".to_string()),
                 rejected_constraint_candidates: 4,
+                mutation_constraint_rejections: BTreeMap::from([("invalid_syntax".to_string(), 2)]),
+                mutation_snapshot_files: 1,
+                mutation_snapshot_bytes: 128,
                 constraint_terminal_state: Some("complete_tool_call".to_string()),
             }),
             energy_joules: None,
@@ -2602,6 +2614,20 @@ mod tests {
         });
         let json = serde_json::to_string(&envelope).unwrap();
         let restored: EventEnvelope = serde_json::from_str(&json).unwrap();
+        let AgentEvent::LlmInvocation {
+            native: Some(native),
+            ..
+        } = &restored.event
+        else {
+            panic!("expected native invocation usage");
+        };
+        assert_eq!(native.tool_constraint_dialect.as_deref(), Some("qwen_json"));
+        assert_eq!(native.mutation_snapshot_files, 1);
+        assert_eq!(native.mutation_snapshot_bytes, 128);
+        assert_eq!(
+            native.mutation_constraint_rejections.get("invalid_syntax"),
+            Some(&2)
+        );
         assert!(matches!(
             restored.event,
             AgentEvent::LlmInvocation {
@@ -2639,7 +2665,19 @@ mod tests {
         native.remove("prefill_metal_commands");
         native.remove("prefill_host_upload_bytes");
         native.remove("prefill_host_readback_bytes");
+        native.remove("tool_constraint_dialect");
+        native.remove("mutation_constraint_rejections");
+        native.remove("mutation_snapshot_files");
+        native.remove("mutation_snapshot_bytes");
         let legacy: EventEnvelope = serde_json::from_value(legacy).unwrap();
+        let AgentEvent::LlmInvocation {
+            native: Some(legacy_native),
+            ..
+        } = &legacy.event
+        else {
+            panic!("expected legacy native invocation usage");
+        };
+        assert!(legacy_native.mutation_constraint_rejections.is_empty());
         assert!(matches!(
             legacy.event,
             AgentEvent::LlmInvocation {
@@ -2647,6 +2685,9 @@ mod tests {
                     prefill_metal_commands: 0,
                     prefill_host_upload_bytes: 0,
                     prefill_host_readback_bytes: 0,
+                    tool_constraint_dialect: None,
+                    mutation_snapshot_files: 0,
+                    mutation_snapshot_bytes: 0,
                     ..
                 }),
                 ..

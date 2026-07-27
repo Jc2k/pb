@@ -271,6 +271,9 @@ pub struct StructuredGenerationRequest {
     /// Optional strict JSON artifact schema. This is mutually exclusive with
     /// native tool generation and is enforced token by token.
     pub json_schema: Option<Value>,
+    /// Immutable controller-authorized bytes for generation-time mutation validation. Sampling
+    /// code must never consult the live workspace.
+    pub mutation_snapshot: Option<pb_control_collar::mutation::WorkspaceSnapshot>,
     pub add_generation_prompt: bool,
     /// Whether the tokenizer chat template should permit emitted reasoning.
     /// Structured harness recovery turns disable this so their bounded budget
@@ -310,6 +313,7 @@ impl StructuredGenerationRequest {
             tools: Vec::new(),
             stage_root: None,
             json_schema: None,
+            mutation_snapshot: None,
             add_generation_prompt: true,
             enable_thinking: true,
             raw_prompt: false,
@@ -372,8 +376,12 @@ pub struct GenerationOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeToolConstraintStats {
     pub mode: NativeToolConstraintMode,
+    pub dialect: String,
     pub schema_sha256: String,
     pub rejected_candidates: usize,
+    pub mutation_rejections: std::collections::BTreeMap<String, usize>,
+    pub snapshot_files: usize,
+    pub snapshot_bytes: usize,
     pub terminal_state: String,
 }
 

@@ -2144,14 +2144,22 @@ mod tests {
     #[test]
     fn joyai_constraint_bytes_preserve_byte_bpe_and_mark_special_tokens() {
         let tokenizer = DeepSeekV4Tokenizer {
-            tokens: vec!["a".to_string(), "Ġ".to_string(), "<｜end｜>".to_string()],
+            tokens: vec![
+                "a".to_string(),
+                "Ġ".to_string(),
+                "<｜end｜>".to_string(),
+                String::new(),
+            ],
             token_to_id: BTreeMap::from([
                 ("a".to_string(), 0),
                 ("Ġ".to_string(), 1),
                 ("<｜end｜>".to_string(), 2),
             ]),
             merge_rank: BTreeMap::new(),
-            special_tokens: BTreeMap::from([("<｜end｜>".to_string(), 2)]),
+            special_tokens: BTreeMap::from([
+                ("<｜end｜>".to_string(), 2),
+                ("reserved".to_string(), 3),
+            ]),
             eos_id: 2,
         };
 
@@ -2166,6 +2174,10 @@ mod tests {
                 "<｜end｜>".as_bytes(),
             ]
             .concat()
+        );
+        assert_eq!(
+            bytes[3],
+            vec![llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER]
         );
     }
 

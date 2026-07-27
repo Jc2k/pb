@@ -222,8 +222,10 @@ non-thinking model, so pb disables thinking for both prompt measurement and gene
 spending the output budget on unsupported reasoning markers. It can return several independent
 native tool calls in one assistant turn; pb validates the full batch and runs parallel-safe calls
 together before asking the model again. Strict native stages constrain function names and the
-supported argument-schema subset while tokens are sampled, then validate the completed call again
-at the executor boundary. A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
+supported argument-schema subset while tokens are sampled. Mutation calls additionally use a
+bounded controller snapshot and the shared syntax/canonical-patch completion gate, then validate the
+completed result again at the executor boundary. This is automatic for qualified FlashMoe profiles;
+there is no environment or configuration switch. A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
 at least 32 tokens with true layer-major Metal prefill. The live Metal working-set snapshot chooses
 a chunk of at most 8,192 rows while retaining a 512 MiB safety margin and limiting graph scratch to
 5% of the resident/session basis; shorter suffixes or insufficient headroom keep the scalar token
@@ -317,6 +319,12 @@ Metal shader compilation evidence plus a complete published-checkpoint cache bui
 Metal load/prefill/decode. A raw arithmetic smoke emitted `4`; all four continuation cases enforced
 by the pinned upstream reference match exactly, including a 3,844-token prompt that crosses the
 top-512 indexed-attention frontier; and a real two-turn DSML request executed a native tool call.
+Native DSML tool generation now preserves tokenizer control-token identity, validates ordered
+parameters and the exposed schema while sampling, and uses the same controller-snapshot mutation
+gate as Qwen. Mutation payloads are JSON strings inside DSML so their exact closing boundary is
+unambiguous. Invalid supported syntax, stale or inexact canonical patches, incomplete DSML, and EOS
+before a required tool are rejected before execution. This changes neither expert scheduling nor
+the local-session state contract.
 On the validation M4 Max, the final 3,844-token prefill measured 153.8 tok/s versus 234.3 tok/s for
 the pinned ds4 one-expert cold SSD-streaming control. The same short Italian control measured 5.36
 prefill and 8.23 decode tok/s in pb versus 3.62 and 6.72 in ds4.

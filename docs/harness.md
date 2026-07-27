@@ -559,6 +559,17 @@ and exercises the production LLGuidance constraint session. It is text-only, can
 with prefill parity, and fails closed if the active Hugging Face or DeepSeek tokenizer cannot
 compile the schema. This is the qualification surface for checking real-model structured output;
 it does not change production configuration.
+`infer --tool-fixture PATH` similarly exercises the production native-tool constraint without
+starting the multi-stage agent workflow. The version 1 JSON fixture contains `tools` in the native
+`name`/`description`/`input_schema` shape, optional `terminal_tool_names`, and up to 32 immutable
+UTF-8 snapshot entries under `files`, each with `path` and `content`. The harness forces
+`tool_required`, supplies even an empty snapshot for mutation tools, disables emitted reasoning,
+prints the accepted tool-call array as JSON, and fails if no call closes. It cannot be combined with
+JSON Schema, raw or image input, prefill parity, session reuse, or repeat generation. Snapshot paths
+are canonical repository-relative paths and the same 32 MiB production bound applies. This explicit
+fixture surface is for deterministic Qwen/DeepSeek tokenizer and mutation-gate qualification; it is
+not a configuration switch and never reads or writes the named workspace files.
+Reproducible Python create and patch examples are checked in under `fixtures/control-collar/`.
 For Qwen prefill qualification, `infer --prefill-mode auto|scalar|layer-major` selects the promoted
 policy, exact scalar reference, or an explicit layer-major request. `auto` promotes only a prepared
 Qwen3-Coder-Next affine-Q4 graph with at least 32 fresh tokens and sufficient live Metal reserve.
@@ -576,8 +587,11 @@ second model load. The pinned DeepSeek V4 profile uses bounded complete-state Me
 memory only. Structured agent stages retain an exact first-message base and current-prompt
 checkpoint under a stage identity that includes the system prompt and tool schema, allowing tool
 results and bounded correction retries to extend the base without silently resetting or crossing
-stage contracts. A second process starts fresh because DeepSeek has no partial or alternate disk
-format.
+stage contracts. Structured DeepSeek checkpoints are additionally keyed by the exact rendered
+stable-root token digest: unchanged roots reuse complete Metal state, while tool-schema or authority
+narrowing starts cold instead of colliding with an incompatible prefix. Raw prefix-extension
+qualification keeps its explicit session identity. A second process starts fresh because DeepSeek
+has no partial or alternate disk format.
 
 The agent/evaluation handoff plumbing does not apply to `pb harness infer`, `pb harness bench`, or
 `pb harness cache-clean`; they remain direct diagnostic utilities rather than workflow stages.

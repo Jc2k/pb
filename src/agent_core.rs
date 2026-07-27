@@ -13,6 +13,11 @@ use globset::GlobBuilder;
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, sinks::UTF8 as GrepUtf8};
 use ignore::WalkBuilder;
+use pb_control_collar::mutation::{
+    LogicalPath as CollarLogicalPath, SnapshotEntry as CollarSnapshotEntry,
+    WorkspaceSnapshot as CollarWorkspaceSnapshot, prepare_create as prepare_collar_create,
+    prepare_patch as prepare_collar_patch, prepare_replace as prepare_collar_replace,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -107,6 +112,9 @@ const DEFAULT_BACKEND_COMMAND_TIMEOUT_SECONDS: u64 = 300;
 const MAX_PATCH_DIAGNOSTIC_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PATCH_DIAGNOSTIC_OUTPUT_CHARS: usize = 3_500;
 const MAX_PATCH_DIAGNOSTIC_LINE_CHARS: usize = 200;
+const MAX_COLLAR_PATCH_FILES: usize = 32;
+const MAX_COLLAR_PATCH_HUNKS: usize = 256;
+const MAX_COLLAR_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_REJECTED_COMPLETION_CHARS: usize = 2_000;
 const DEFAULT_TURN_MAX_TOKENS: i32 = crate::DEFAULT_AGENT_MAX_TOKENS;
 const RESEARCH_TURN_MAX_TOKENS: i32 = 4096;
@@ -4728,7 +4736,7 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
         ),
         builtin_tool(
             "apply_patch",
-            "Apply a unified diff patch to project files.",
+            "Apply a canonical text-only unified diff. Use exact hunk counts and offsets, LF line endings, a/ and b/ paths, and exact current context. New and deleted files require the matching `new file mode 100644` or `deleted file mode 100644` line. Omit index hashes, mode changes, renames, copies, quoted paths, timestamps, binary patches, and recount-dependent hunks.",
             object_schema(
                 [string_property("patch", "Unified diff patch text.")],
                 ["patch"],
@@ -7157,8 +7165,10 @@ fn run_agent_steps(
         let progress_before_action = progress_state(workspace_root, &gate_state)?;
         let generated = match generate_and_parse_action_with_retries(
             generator,
+            text_backend,
             args,
             workspace_root,
+            &gate_state,
             generation_messages,
             generation_tools,
             enable_thinking,
@@ -8421,7 +8431,7 @@ fn run_final_grace(
         .reserve_model_invocation(FINAL_GRACE_MAX_TOKENS)?;
     debug_assert_eq!(grace_args.max_tokens, reserved_max_tokens);
     sink.workflow_model_invocation_started(nesting_depth)?;
-    let completion = match generator.generate(&grace_args, &prepared.messages, &[], true) {
+    let completion = match generator.generate(&grace_args, &prepared.messages, &[], true, None) {
         Ok(completion) => completion,
         Err(error) => {
             let termination_reason = termination_reason_for_runtime_error(&error);
@@ -10531,7 +10541,11 @@ fn truncated_native_mutation_path(output: &str) -> Option<String> {
     if let Some(path) = json_string_field(tail, "path") {
         return (!path.is_empty()).then_some(path);
     }
-    for marker in ["<parameter=path>", "<｜DSML｜parameter name=\"path\">"] {
+    for marker in [
+        "<parameter=path>",
+        "<｜DSML｜parameter name=\"path\">",
+        "<｜DSML｜parameter name=\"path\" string=\"true\">",
+    ] {
         if let Some((_, value)) = tail.rsplit_once(marker) {
             let path = value
                 .split(['\n', '\r', '<'])
@@ -11160,6 +11174,7 @@ trait CompletionEngine {
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
+        mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
     ) -> Result<CompletionOutput>;
 
     fn generate_json(
@@ -14029,6 +14044,7 @@ impl CompletionEngine for ScriptedCompletionEngine {
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
+        _mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
     ) -> Result<CompletionOutput> {
         self.generation_tool_counts.push(tools.len());
         self.generation_max_tokens.push(args.max_tokens);
@@ -14572,6 +14588,7 @@ impl CompletionEngine for PromptRecordingEngine<'_> {
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
+        mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
     ) -> Result<CompletionOutput> {
         let rendered =
             self.inner
@@ -14582,7 +14599,8 @@ impl CompletionEngine for PromptRecordingEngine<'_> {
             input.rendered_prompt_bytes = Some(bytes);
         }
         self.inputs.push(input);
-        self.inner.generate(args, messages, tools, enable_thinking)
+        self.inner
+            .generate(args, messages, tools, enable_thinking, mutation_snapshot)
     }
 
     fn persist_session_cache(
@@ -14823,6 +14841,7 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
         _enable_thinking: bool,
+        _mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
     ) -> Result<CompletionOutput> {
         let request = llama_chat_request(args, messages, tools)?;
         llama_completion_output(self.session.generate_chat(&request)?)
@@ -14961,9 +14980,17 @@ impl CompletionEngine for FlashMoeCompletionEngine {
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
+        mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
     ) -> Result<CompletionOutput> {
         let mut engine = self.runtime.lock()?;
-        generate_flashmoe_completion(&mut engine, args, messages, tools, enable_thinking)
+        generate_flashmoe_completion(
+            &mut engine,
+            args,
+            messages,
+            tools,
+            enable_thinking,
+            mutation_snapshot,
+        )
     }
 
     fn generate_json(
@@ -15028,8 +15055,16 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
         messages: &[ChatMessage],
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
+        mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
     ) -> Result<CompletionOutput> {
-        generate_flashmoe_completion(self.engine, args, messages, tools, enable_thinking)
+        generate_flashmoe_completion(
+            self.engine,
+            args,
+            messages,
+            tools,
+            enable_thinking,
+            mutation_snapshot,
+        )
     }
 
     fn generate_json(
@@ -15060,6 +15095,7 @@ fn generate_flashmoe_completion(
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
+    mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
 ) -> Result<CompletionOutput> {
     generate_flashmoe_completion_with_required_tool(
         engine,
@@ -15067,6 +15103,7 @@ fn generate_flashmoe_completion(
         messages,
         tools,
         enable_thinking,
+        mutation_snapshot,
         None,
     )
 }
@@ -15077,15 +15114,17 @@ fn generate_flashmoe_completion_with_required_tool(
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
+    mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
     required_tool_name: Option<&str>,
 ) -> Result<CompletionOutput> {
-    let request = flashmoe_structured_request_with_required_tool(
+    let mut request = flashmoe_structured_request_with_required_tool(
         args,
         messages,
         tools,
         enable_thinking,
         required_tool_name,
     )?;
+    request.mutation_snapshot = mutation_snapshot.cloned();
     generate_flashmoe_completion_from_request(engine, args, request)
 }
 
@@ -15182,11 +15221,17 @@ fn generate_flashmoe_completion_from_request(
         tool_constraint_mode: tool_constraints
             .map(|stats| stats.mode.as_str().to_string())
             .or_else(|| json_constraints.map(|_| "json_schema".to_string())),
+        tool_constraint_dialect: tool_constraints.map(|stats| stats.dialect.clone()),
         tool_schema_sha256: tool_constraints
             .map(|stats| stats.schema_sha256.clone())
             .or_else(|| json_constraints.map(|stats| stats.schema_sha256.clone())),
         rejected_constraint_candidates: tool_constraints
             .map_or(0, |stats| stats.rejected_candidates),
+        mutation_constraint_rejections: tool_constraints
+            .map(|stats| stats.mutation_rejections.clone())
+            .unwrap_or_default(),
+        mutation_snapshot_files: tool_constraints.map_or(0, |stats| stats.snapshot_files),
+        mutation_snapshot_bytes: tool_constraints.map_or(0, |stats| stats.snapshot_bytes),
         constraint_terminal_state: tool_constraints
             .map(|stats| stats.terminal_state.clone())
             .or_else(|| json_constraints.map(|stats| stats.terminal_state.clone())),
@@ -15332,6 +15377,7 @@ fn flashmoe_structured_request_with_required_tool(
             false,
         )?),
         json_schema: None,
+        mutation_snapshot: None,
         add_generation_prompt: true,
         enable_thinking,
         raw_prompt: false,
@@ -15349,10 +15395,63 @@ fn flashmoe_structured_request_with_required_tool(
     })
 }
 
+fn controller_collar_snapshot(
+    workspace_root: &Path,
+    gate_state: &GateState,
+    tools: &[BuiltInToolSchema],
+) -> Result<Option<CollarWorkspaceSnapshot>> {
+    if !tools.iter().any(|tool| {
+        matches!(
+            tool.name.as_str(),
+            "write_file" | "replace_file" | "edit_file" | "apply_patch"
+        )
+    }) {
+        return Ok(None);
+    }
+
+    let mut read_paths = gate_state.read_paths.iter().collect::<Vec<_>>();
+    read_paths.sort_unstable();
+    let mut entries = Vec::with_capacity(read_paths.len());
+    let mut total_bytes = 0usize;
+    for path in read_paths {
+        let Ok(logical_path) = CollarLogicalPath::parse(path.clone()) else {
+            continue;
+        };
+        let resolved = resolve_workspace_path(workspace_root, path, false)?;
+        if !resolved.is_file() {
+            continue;
+        }
+        let bytes = read_bounded_file_bytes(
+            &resolved,
+            MAX_READ_FILE_BYTES,
+            "control-collar snapshot source",
+        )?;
+        let fingerprint = crate::environment_lock::sha256(&bytes);
+        if gate_state.read_content_fingerprints.get(path) != Some(&fingerprint) {
+            // Stale observations grant no generation-time mutation authority. The executor's
+            // read-before-write gate will provide the user-facing re-read diagnostic.
+            continue;
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .context("control-collar snapshot byte count overflowed the platform address space")?;
+        if total_bytes > MAX_COLLAR_SNAPSHOT_BYTES {
+            bail!(
+                "controller-authorized mutation snapshot exceeds the {}-byte production limit",
+                MAX_COLLAR_SNAPSHOT_BYTES
+            );
+        }
+        entries.push(CollarSnapshotEntry::new(logical_path, bytes));
+    }
+    Ok(Some(CollarWorkspaceSnapshot::new(entries)?))
+}
+
 fn generate_and_parse_action_with_retries(
     generator: &mut dyn CompletionEngine,
+    text_backend: TextBackendKind,
     args: &AgentRequest,
     workspace_root: &Path,
+    gate_state: &RefCell<GateState>,
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
@@ -15394,11 +15493,17 @@ fn generate_and_parse_action_with_retries(
         // returns an error, otherwise the stage runner replaces the actionable
         // engine/resource failure with a usage-divergence error.
         metrics.llm_invocations = metrics.llm_invocations.saturating_add(1);
+        let mutation_snapshot = if text_backend == TextBackendKind::FlashMoe {
+            controller_collar_snapshot(workspace_root, &gate_state.borrow(), attempt_tools)?
+        } else {
+            None
+        };
         let completion = generator.generate(
             &request,
             &prepared.messages,
             attempt_tools,
             attempt_enable_thinking,
+            mutation_snapshot.as_ref(),
         )?;
         run_budget
             .borrow_mut()
@@ -18173,7 +18278,25 @@ fn run_tool(
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
             }
-            atomic_create_file(&resolved, content.as_bytes())?;
+            if context.text_backend == TextBackendKind::FlashMoe {
+                let logical_path = CollarLogicalPath::parse(path.to_string())
+                    .context("write_file path is not canonical for constrained mutation")?;
+                let prepared = prepare_collar_create(
+                    &CollarWorkspaceSnapshot::default(),
+                    logical_path,
+                    content.as_bytes().to_vec(),
+                )
+                .context("write_file result failed constrained syntax validation")?;
+                prepared.verify_live_base(None)?;
+                atomic_create_file(
+                    &resolved,
+                    prepared
+                        .result_bytes()
+                        .context("write_file prepared mutation omitted result bytes")?,
+                )?;
+            } else {
+                atomic_create_file(&resolved, content.as_bytes())?;
+            }
             sink.emit(AgentEvent::Diff {
                 path: path.to_string(),
                 diff: bounded_tool_diff(unified_diff("", content, path)),
@@ -18217,11 +18340,30 @@ fn run_tool(
             if existing == content {
                 bail!("replace_file made no content change for {path}");
             }
-            atomic_replace_file(
-                &resolved,
-                content.as_bytes(),
-                &crate::environment_lock::sha256(existing.as_bytes()),
-            )?;
+            if context.text_backend == TextBackendKind::FlashMoe {
+                let logical_path = CollarLogicalPath::parse(path.to_string())
+                    .context("replace_file path is not canonical for constrained mutation")?;
+                let snapshot = CollarWorkspaceSnapshot::new(vec![CollarSnapshotEntry::new(
+                    logical_path.clone(),
+                    existing.as_bytes().to_vec(),
+                )])?;
+                let prepared =
+                    prepare_collar_replace(&snapshot, logical_path, content.as_bytes().to_vec())
+                        .context("replace_file result failed constrained syntax validation")?;
+                atomic_replace_file(
+                    &resolved,
+                    prepared
+                        .result_bytes()
+                        .context("replace_file prepared mutation omitted result bytes")?,
+                    &crate::environment_lock::sha256(existing.as_bytes()),
+                )?;
+            } else {
+                atomic_replace_file(
+                    &resolved,
+                    content.as_bytes(),
+                    &crate::environment_lock::sha256(existing.as_bytes()),
+                )?;
+            }
             sink.emit(AgentEvent::Diff {
                 path: path.to_string(),
                 diff: bounded_tool_diff(unified_diff(&existing, content, path)),
@@ -18278,11 +18420,30 @@ fn run_tool(
             if updated == existing {
                 bail!("edit_file made no content change for {path}");
             }
-            atomic_replace_file(
-                &resolved,
-                updated.as_bytes(),
-                &crate::environment_lock::sha256(existing.as_bytes()),
-            )?;
+            if context.text_backend == TextBackendKind::FlashMoe {
+                let logical_path = CollarLogicalPath::parse(path.to_string())
+                    .context("edit_file path is not canonical for constrained mutation")?;
+                let snapshot = CollarWorkspaceSnapshot::new(vec![CollarSnapshotEntry::new(
+                    logical_path.clone(),
+                    existing.as_bytes().to_vec(),
+                )])?;
+                let prepared =
+                    prepare_collar_replace(&snapshot, logical_path, updated.as_bytes().to_vec())
+                        .context("edit_file result failed constrained syntax validation")?;
+                atomic_replace_file(
+                    &resolved,
+                    prepared
+                        .result_bytes()
+                        .context("edit_file prepared mutation omitted result bytes")?,
+                    &crate::environment_lock::sha256(existing.as_bytes()),
+                )?;
+            } else {
+                atomic_replace_file(
+                    &resolved,
+                    updated.as_bytes(),
+                    &crate::environment_lock::sha256(existing.as_bytes()),
+                )?;
+            }
 
             let diff = bounded_tool_diff(unified_diff(&existing, &updated, path));
             sink.emit(AgentEvent::Diff {
@@ -18309,11 +18470,102 @@ fn run_tool(
                 context.request,
                 changed_paths.iter().map(String::as_str),
             )?;
+            if context.text_backend == TextBackendKind::LlamaCpp {
+                for path in &changed_paths {
+                    let resolved = resolve_workspace_path(workspace_root, path, false)?;
+                    ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
+                }
+                run_git_apply_patch_legacy(patch, workspace_root)?;
+                let diff = git_diff_paths(workspace_root, &changed_paths)?;
+                if diff.trim().is_empty() {
+                    bail!("apply_patch made no content change");
+                }
+                sink.emit(AgentEvent::Diff {
+                    path: "apply_patch".to_string(),
+                    diff,
+                    nesting_depth: (context.request.sub_agent_depth > 0)
+                        .then_some(context.request.sub_agent_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+                context.gate_state.borrow_mut().record_content_mutation();
+                return Ok(format!("applied patch to {}", changed_paths.join(", ")));
+            }
+            let mut snapshot_entries = Vec::new();
             for path in &changed_paths {
                 let resolved = resolve_workspace_path(workspace_root, path, false)?;
                 ensure_file_was_read(context.gate_state, workspace_root, &resolved, path)?;
+                if resolved.exists() {
+                    let bytes = read_bounded_file_bytes(
+                        &resolved,
+                        MAX_READ_FILE_BYTES,
+                        "canonical patch target",
+                    )?;
+                    snapshot_entries.push(CollarSnapshotEntry::new(
+                        CollarLogicalPath::parse(path.clone())?,
+                        bytes,
+                    ));
+                }
+            }
+            let snapshot = CollarWorkspaceSnapshot::new(snapshot_entries)?;
+            let prepared = prepare_collar_patch(
+                &snapshot,
+                patch,
+                MAX_COLLAR_PATCH_FILES,
+                MAX_COLLAR_PATCH_HUNKS,
+            )
+            .context("apply_patch rejected non-canonical or invalid resulting content")?;
+            let prepared_paths = prepared
+                .files()
+                .iter()
+                .map(|file| file.path().as_str())
+                .collect::<BTreeSet<_>>();
+            let declared_paths = changed_paths
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if prepared_paths != declared_paths {
+                bail!("canonical patch paths disagree with the declared patch paths");
+            }
+            for file in prepared.files() {
+                let resolved = resolve_workspace_path(workspace_root, file.path().as_str(), false)?;
+                let live = if resolved.exists() {
+                    Some(read_bounded_file_bytes(
+                        &resolved,
+                        MAX_READ_FILE_BYTES,
+                        "canonical patch live base",
+                    )?)
+                } else {
+                    None
+                };
+                file.verify_live_base(live.as_deref())?;
+                file.revalidate_result()?;
             }
             run_git_apply_patch(patch, workspace_root)?;
+            for file in prepared.files() {
+                let resolved = resolve_workspace_path(workspace_root, file.path().as_str(), false)?;
+                match file.result_bytes() {
+                    Some(expected) => {
+                        let actual = read_bounded_file_bytes(
+                            &resolved,
+                            MAX_READ_FILE_BYTES,
+                            "canonical patch published result",
+                        )?;
+                        if actual != expected {
+                            bail!(
+                                "canonical patch publisher produced unexpected bytes for {}",
+                                file.path().as_str()
+                            );
+                        }
+                    }
+                    None if resolved.exists() => {
+                        bail!(
+                            "canonical patch publisher did not delete {}",
+                            file.path().as_str()
+                        );
+                    }
+                    None => {}
+                }
+            }
             let diff = git_diff_paths(workspace_root, &changed_paths)?;
             if diff.trim().is_empty() {
                 bail!("apply_patch made no content change");
@@ -20638,18 +20890,33 @@ fn run_git_apply_patch(patch: &str, workspace_root: &Path) -> Result<()> {
         normalized = format!("{patch}\n");
         normalized.as_str()
     };
-    if let Err(error) = git_apply_stdin(
-        &["apply", "--check", "--recount", "-"],
-        patch,
-        workspace_root,
-    ) {
+    if let Err(error) = git_apply_stdin(&["apply", "--check", "-"], patch, workspace_root) {
         let diagnostic = patch_mismatch_diagnostic(patch, workspace_root, &error.to_string())
             .unwrap_or_else(|diagnostic_error| {
                 format!("Patch context diagnostic was unavailable: {diagnostic_error:#}")
             });
         bail!("{error:#}\n\n{diagnostic}");
     }
-    git_apply_stdin(&["apply", "--recount", "-"], patch, workspace_root)?;
+    git_apply_stdin(&["apply", "-"], patch, workspace_root)?;
+    Ok(())
+}
+
+fn run_git_apply_patch_legacy(patch: &str, workspace_root: &Path) -> Result<()> {
+    let normalized;
+    let patch = if patch.ends_with('\n') {
+        patch
+    } else {
+        normalized = format!("{patch}\n");
+        normalized.as_str()
+    };
+    git_apply_stdin(
+        &["apply", "--check", "--recount", "-"],
+        patch,
+        workspace_root,
+    )
+    .context("patch validation failed")?;
+    git_apply_stdin(&["apply", "--recount", "-"], patch, workspace_root)
+        .context("patch application failed")?;
     Ok(())
 }
 
@@ -22949,6 +23216,7 @@ mod tests {
             _messages: &[ChatMessage],
             _tools: &[BuiltInToolSchema],
             _enable_thinking: bool,
+            _mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
         ) -> Result<CompletionOutput> {
             bail!("unconstrained generation must not serve Task artifacts")
         }
@@ -31573,6 +31841,16 @@ the next imagined action"#;
             truncated_native_mutation_path(qwen).as_deref(),
             Some("src/game.js")
         );
+        let deepseek = concat!(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write_file\">",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">src/main.rs",
+            "</｜DSML｜parameter><｜DSML｜parameter name=\"content\" string=\"false\">\"partial"
+        );
+        assert_eq!(truncated_native_tool_name(deepseek), Some("write_file"));
+        assert_eq!(
+            truncated_native_mutation_path(deepseek).as_deref(),
+            Some("src/main.rs")
+        );
         let escaped_parameter = concat!(
             "<tool_call><function=write_file><parameter=content>partial",
             "<parameter=path>app.test.mjs\\n  }\\n}"
@@ -31581,6 +31859,35 @@ the next imagined action"#;
             truncated_native_mutation_path(escaped_parameter).as_deref(),
             Some("app.test.mjs")
         );
+    }
+
+    #[test]
+    fn controller_collar_snapshot_contains_only_fresh_read_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.py"), "value = 1\n").unwrap();
+        let bytes = std::fs::read(tmp.path().join("main.py")).unwrap();
+        let mut gate = GateState::default();
+        gate.read_paths.insert("main.py".to_string());
+        gate.read_content_fingerprints.insert(
+            "main.py".to_string(),
+            crate::environment_lock::sha256(&bytes),
+        );
+        let tools = all_builtin_tool_specs()
+            .into_iter()
+            .filter(|tool| tool.name == "replace_file")
+            .collect::<Vec<_>>();
+
+        let snapshot = controller_collar_snapshot(tmp.path(), &gate, &tools)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.total_bytes(), bytes.len());
+
+        std::fs::write(tmp.path().join("main.py"), "value = 2\n").unwrap();
+        let stale = controller_collar_snapshot(tmp.path(), &gate, &tools)
+            .unwrap()
+            .unwrap();
+        assert!(stale.is_empty());
     }
 
     #[test]
@@ -34352,7 +34659,7 @@ the next imagined action"#;
     }
 
     #[test]
-    fn git_apply_recounts_model_generated_hunk_lengths() {
+    fn collar_rejects_inexact_model_generated_hunk_lengths() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let workspace = tmp.path().join("project");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -34364,12 +34671,54 @@ the next imagined action"#;
         assert!(status.success());
         let patch = "diff --git a/index.html b/index.html\nnew file mode 100644\n--- /dev/null\n+++ b/index.html\n@@ -0,0 +1 @@\n+<!doctype html>\n+<title>Typing Game</title>\n+<main>Play</main>";
 
-        run_git_apply_patch(patch, &workspace).unwrap();
+        let error = prepare_collar_patch(
+            &CollarWorkspaceSnapshot::default(),
+            patch,
+            MAX_COLLAR_PATCH_FILES,
+            MAX_COLLAR_PATCH_HUNKS,
+        )
+        .unwrap_err()
+        .to_string();
 
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("index.html")).unwrap(),
-            "<!doctype html>\n<title>Typing Game</title>\n<main>Play</main>\n"
+        assert!(!workspace.join("index.html").exists());
+        assert!(
+            error.contains("declared counts")
+                || error.contains("hunk body")
+                || error.contains("file header"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn canonical_patch_virtual_result_matches_git_publication() {
+        let tmp = init_contract_test_repo();
+        let path = CollarLogicalPath::parse("main.py").unwrap();
+        let base = b"one = 1\ntwo = 2\nthree = 3\n".to_vec();
+        std::fs::write(tmp.path().join(path.as_str()), &base).unwrap();
+        let snapshot =
+            CollarWorkspaceSnapshot::new(vec![CollarSnapshotEntry::new(path, base)]).unwrap();
+        let patch = concat!(
+            "diff --git a/main.py b/main.py\n",
+            "--- a/main.py\n",
+            "+++ b/main.py\n",
+            "@@ -1,3 +1,3 @@\n",
+            " one = 1\n",
+            "-two = 2\n",
+            "+two = 20\n",
+            " three = 3\n",
+        );
+        let prepared = prepare_collar_patch(
+            &snapshot,
+            patch,
+            MAX_COLLAR_PATCH_FILES,
+            MAX_COLLAR_PATCH_HUNKS,
+        )
+        .unwrap();
+        let expected = prepared.files()[0].result_bytes().unwrap().to_vec();
+
+        run_git_apply_patch(patch, tmp.path()).unwrap();
+
+        assert_eq!(std::fs::read(tmp.path().join("main.py")).unwrap(), expected);
     }
 
     #[test]
