@@ -5,6 +5,8 @@ use tree_sitter::{InputEdit, Language, Node, Parser, Point, Tree};
 
 use crate::{CollarError, CollarResult, mutation::LogicalPath};
 
+use super::LanguageId;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyntaxProfile {
@@ -54,6 +56,10 @@ impl SyntaxProfile {
             Self::Html => "html",
             Self::Css => "css",
         }
+    }
+
+    pub fn language_id(self) -> LanguageId {
+        LanguageId(self.name().to_string())
     }
 }
 

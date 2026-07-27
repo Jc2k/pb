@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CollarResult, mutation::LogicalPath};
 
+mod layers;
 mod prefix;
 mod semantic;
 mod syntax;
+pub use layers::{AnalyzerCheckpoint, LanguageLayerStack, LayerStackCheckpoint};
 pub use prefix::{
     PrefixCheckpoint, PrefixReport, PrefixRule, SourcePrefixOracle, validate_supported_prefix,
 };
@@ -122,6 +124,7 @@ pub enum UnknownReason {
     Timeout,
     BudgetExceeded,
     ConfigurationChanged,
+    UnqualifiedProfile,
     UnclassifiedDiagnostic,
 }
 
@@ -143,7 +146,7 @@ pub struct ProviderVerdict {
     pub biases: Vec<RepairIntent>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceEvent<'a> {
     BeginFile {
         path: &'a LogicalPath,
@@ -195,13 +198,104 @@ pub struct Analysis {
     pub biases: Vec<RepairIntent>,
 }
 
-pub trait IncrementalAnalyzer {
-    type Checkpoint: Copy;
+impl Analysis {
+    /// Compose independently owned language/syntax/policy layers. A proven impossibility or hard
+    /// closure rejection dominates; an unknown layer prevents a stronger validity claim but never
+    /// erases another layer's proof of impossibility.
+    pub fn compose(layers: impl IntoIterator<Item = Self>) -> Self {
+        let mut viability = Viability::Valid;
+        let mut closure = ClosureVerdict::Allow;
+        let mut obligations = Vec::new();
+        let mut biases = Vec::new();
+        for layer in layers {
+            viability = compose_viability(viability, layer.viability);
+            closure = compose_closure(closure, layer.closure);
+            obligations.extend(layer.obligations);
+            biases.extend(layer.biases);
+        }
+        Self {
+            viability,
+            closure,
+            obligations,
+            biases,
+        }
+    }
+}
 
+fn compose_viability(left: Viability, right: Viability) -> Viability {
+    if left == Viability::Impossible || right == Viability::Impossible {
+        Viability::Impossible
+    } else if left == Viability::Unknown || right == Viability::Unknown {
+        Viability::Unknown
+    } else if left == Viability::Repairable || right == Viability::Repairable {
+        Viability::Repairable
+    } else {
+        Viability::Valid
+    }
+}
+
+fn compose_closure(left: ClosureVerdict, right: ClosureVerdict) -> ClosureVerdict {
+    if left == ClosureVerdict::Reject || right == ClosureVerdict::Reject {
+        ClosureVerdict::Reject
+    } else if left == ClosureVerdict::Defer || right == ClosureVerdict::Defer {
+        ClosureVerdict::Defer
+    } else {
+        ClosureVerdict::Allow
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerReadiness {
+    Cold,
+    Warming,
+    Ready,
+    Stale,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessOrigin {
+    ColdBuild,
+    WarmCache,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticCompleteness {
+    Complete,
+    Partial,
+}
+
+/// Content-free evidence that a language world was established before inference. The controller
+/// may persist this receipt, but never analyzer databases, source names, or source text in events.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerReadinessReceipt {
+    pub world: SemanticWorldId,
+    pub origin: ReadinessOrigin,
+    pub completeness: SemanticCompleteness,
+    pub load_millis: u64,
+    pub prime_millis: u64,
+    pub primed_queries: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyzerLayerDescriptor {
+    pub id: String,
+    pub language: LanguageId,
+    pub world: SemanticWorldId,
+    pub capabilities: Vec<AnalyzerCapability>,
+}
+
+pub trait IncrementalAnalyzer {
+    fn descriptor(&self) -> &AnalyzerLayerDescriptor;
+    fn readiness(&self) -> LayerReadiness;
+    fn readiness_receipt(&self) -> Option<&LayerReadinessReceipt>;
     fn begin(&mut self, snapshot: ProgramSnapshot) -> CollarResult<()>;
-    fn checkpoint(&mut self) -> Self::Checkpoint;
+    fn checkpoint(&mut self) -> CollarResult<AnalyzerCheckpoint>;
     fn apply(&mut self, event: SourceEvent<'_>) -> CollarResult<Analysis>;
-    fn rollback(&mut self, checkpoint: Self::Checkpoint) -> CollarResult<()>;
+    fn rollback(&mut self, checkpoint: AnalyzerCheckpoint) -> CollarResult<()>;
     fn finalize(&mut self) -> CollarResult<Analysis>;
 }
 
@@ -211,4 +305,35 @@ pub enum DecodeRecovery {
     CandidateProbeOnly,
     ReplayFromBoundary,
     SnapshotAndRestore,
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+
+    fn analysis(viability: Viability, closure: ClosureVerdict) -> Analysis {
+        Analysis {
+            viability,
+            closure,
+            obligations: Vec::new(),
+            biases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn layer_composition_preserves_rejection_and_unknown_evidence() {
+        let rejected = Analysis::compose([
+            analysis(Viability::Unknown, ClosureVerdict::Defer),
+            analysis(Viability::Impossible, ClosureVerdict::Reject),
+        ]);
+        assert_eq!(rejected.viability, Viability::Impossible);
+        assert_eq!(rejected.closure, ClosureVerdict::Reject);
+
+        let unknown = Analysis::compose([
+            analysis(Viability::Valid, ClosureVerdict::Allow),
+            analysis(Viability::Unknown, ClosureVerdict::Allow),
+        ]);
+        assert_eq!(unknown.viability, Viability::Unknown);
+        assert_eq!(unknown.closure, ClosureVerdict::Allow);
+    }
 }

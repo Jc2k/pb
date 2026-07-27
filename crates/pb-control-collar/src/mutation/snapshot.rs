@@ -53,6 +53,10 @@ impl SnapshotEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
     entries: BTreeMap<LogicalPath, SnapshotEntry>,
+    /// Controller-owned target inserted into path-bearing mutation calls before execution. It is
+    /// deliberately out-of-band so model-visible work-unit schemas can remain byte-stable.
+    #[serde(default)]
+    bound_mutation_path: Option<LogicalPath>,
 }
 
 impl WorkspaceSnapshot {
@@ -73,7 +77,19 @@ impl WorkspaceSnapshot {
                 )));
             }
         }
-        Ok(Self { entries: indexed })
+        Ok(Self {
+            entries: indexed,
+            bound_mutation_path: None,
+        })
+    }
+
+    pub fn with_bound_mutation_path(mut self, path: LogicalPath) -> Self {
+        self.bound_mutation_path = Some(path);
+        self
+    }
+
+    pub fn bound_mutation_path(&self) -> Option<&LogicalPath> {
+        self.bound_mutation_path.as_ref()
     }
 
     pub fn get(&self, path: &LogicalPath) -> Option<&SnapshotEntry> {
@@ -124,5 +140,8 @@ mod tests {
 
         assert_eq!(snapshot.get(&path), Some(&entry));
         assert_eq!(snapshot.total_bytes(), 13);
+
+        let bound = snapshot.with_bound_mutation_path(path.clone());
+        assert_eq!(bound.bound_mutation_path(), Some(&path));
     }
 }

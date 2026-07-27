@@ -302,9 +302,18 @@ spending tokens on the closing Qwen envelope, while ordinary tool-call batches r
 executor path. The constraint sampler sits after the shared output head, so these rules apply
 identically to resident and streamed experts and change neither graph preparation nor expert
 scheduling.
-Before a FlashMoe or llama.cpp mutation request decodes, the agent controller supplies at most 32 MiB of exact,
-fresh, previously read file bytes as an immutable snapshot; exposing a mutation without that
-snapshot fails closed. Qwen JSON and DeepSeek DSML allow at most one mutation per generated batch.
+If no vocabulary token can extend a partially generated constrained mutation, generation returns a
+typed `constraint_dead_end` while preserving the partial transcript for content-free diagnosis. It
+does not execute or synthesize a closing suffix. The controller may start one fresh same-capability,
+same-target mutation attempt; recurrent/KV state and candidate checkpoints from the dead branch are
+not reused. This is controller recovery around the existing output head, not a scheduler, graph,
+expert-I/O, or model-family data-flow change.
+Before a FlashMoe or llama.cpp mutation request decodes, the agent controller supplies at most 32
+MiB of exact, fresh, previously read file bytes as an immutable snapshot; exposing a mutation
+without that snapshot fails closed. A target-scoped request also carries the accepted work-unit path
+in the snapshot, allowing its byte-stable model schema to omit `path`; prefix and completion
+validation inject exactly that controller-owned path before applying the virtual mutation. Qwen
+JSON and DeepSeek DSML allow at most one mutation per generated batch.
 At a mutation-payload close, the collar constructs the exact create, replacement, edit, or canonical
 patch result. Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, and CSS must pass their pinned
 complete-file syntax profiles. The executor independently repeats snapshot/hash, virtual-result,
@@ -1991,6 +2000,20 @@ runtimes, and experiment-led reversions are prohibited before this lock opens.
 Lock status: open. Gates 1-7 are complete, the compatibility boundary is deleted, all-target tests,
 release build, required smoke, and equivalent sustained comparison are recorded. Future
 performance work must remain on the unified graph.
+
+### Output-control lifecycle boundary
+
+The native language-layer work does not create a FlashMoe graph, scheduler, expert-I/O, cache, or
+CPU/GPU fallback. The controller prepares any expensive Rust project world before prompt
+measurement and before `StructuredGenerationRequest` enters FlashMoe. The request carries only a
+shared request-local `LanguageLayerStack`; Qwen JSON and DeepSeek DSML adapters feed the same
+decoded virtual-mutation events and candidate rollbacks into it. The Metal/full-logit masking order,
+expert scheduling, KV/recurrent state, and family graph selection remain unchanged. A fresh
+controller-side replay runs before tool execution after the runtime has returned.
+
+Therefore qualification for this boundary requires the ordinary structured-generation tests and
+the real one-token FlashMoe smoke, but it must not motivate an alternate output head, family-specific
+runtime loop, or expert fast path.
 
 ## Completed Qwen/GLM Goal Guardrail
 

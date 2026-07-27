@@ -2301,10 +2301,20 @@ fn rust_analyzer_status_has_loaded_workspace(status: &str) -> bool {
 }
 
 fn rust_analyzer_crate_graph_is_loaded(graph: &str) -> bool {
-    graph.lines().any(|line| {
-        let line = line.trim_start();
-        let digit_count = line.bytes().take_while(u8::is_ascii_digit).count();
-        digit_count > 0 && line[digit_count..].trim_start().starts_with("[label=")
+    if graph.lines().next().map(str::trim) != Some("digraph rust_analyzer_crate_graph {") {
+        return false;
+    }
+    graph.lines().skip(1).any(|line| {
+        let line = line.trim();
+        let Some((identifier, attributes)) = line.split_once('[') else {
+            return false;
+        };
+        let identifier = identifier.trim();
+        !identifier.is_empty()
+            && identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && attributes.starts_with("label=\"")
     })
 }
 
@@ -2760,6 +2770,12 @@ mod tests {
         assert!(rust_analyzer_crate_graph_is_loaded(
             "digraph rust_analyzer_crate_graph {\n0 [label=\"crate\"]\n}\n"
         ));
+        assert!(rust_analyzer_crate_graph_is_loaded(
+            "digraph rust_analyzer_crate_graph {\n    _14341[label=\"pb_semantic_qualification\"][shape=\"box\"];\n}\n"
+        ));
+        assert!(!rust_analyzer_crate_graph_is_loaded(
+            "digraph rust_analyzer_crate_graph {\n    _1 -> _2[label=\"dependency\"];\n}\n"
+        ));
         assert!(!rust_analyzer_crate_graph_is_loaded(
             "crate graph unavailable"
         ));
@@ -2771,6 +2787,9 @@ mod tests {
         ));
         assert!(rust_analyzer_status_has_document_scope(
             "Crates for file 3:\n0 pb_semantic_qualification"
+        ));
+        assert!(rust_analyzer_status_has_document_scope(
+            "Crates for file 3:\nCrate: pb_semantic_qualification(Crate(Id(3805)))\n    Edition: 2024"
         ));
     }
 

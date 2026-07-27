@@ -57,6 +57,15 @@ bodies, argument values, symbols, prompts, and logits are excluded.
 Incremental source and patch branch caches are request-local memory only. Qualification reports
 persist artifact digests, counts, and timing percentiles rather than corpus source or decoded
 payloads.
+
+Rust-edit-capable real-backend requests also build a local native semantic world before inference.
+The controller copies the exact repository snapshot to an ephemeral verified shadow;
+`pb-control-rust` runs pinned rust-analyzer internals in the pb process, invokes Cargo metadata with
+`--offline`, starts no procedural-macro server, and does not run build scripts. It may read already
+installed sysroot and dependency source caches, but it adds no network edge and sends no dependency
+or repository source to the model. Exact warmed worlds are retained only in bounded process memory;
+request snapshots and candidate branches are in-memory leases. Shadows are temporary and durable
+events contain only identities, readiness/decision classes, counts, and timings.
 `inference.llamacpp_session_cache_enabled=false` and
 `inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are
@@ -159,12 +168,11 @@ offline dependency sources, declarations, sysroots, typeshed/stubs, and package 
 mounted into the session, but does not add egress and does not expose those inputs to the model.
 Durable constraint telemetry and separate generation/final receipts are content-free: exact content
 is represented only by hashes, versions, counts, and timings; paths, source, patch bodies, diagnostic
-messages, prompts, and symbol indexes are not persisted. A future portable public-symbol fact pack
-must remain content-addressed, local, lockfile/configuration scoped, and opt-in before it can change
-this data boundary.
-Mutable external LSP cache attachments cannot currently authorize required semantic mode; provider-
-embedded offline dependencies remain bound by the image digest while portable dependency cache/fact
-pack qualification is later work.
+messages, prompts, and symbol indexes are not persisted. Any future language-specific serialized
+symbol/type index must remain content-addressed, local, lockfile/configuration scoped, and proven
+equivalent to that language's native resolver before it can change this data boundary. Mutable
+external LSP cache attachments cannot currently authorize required semantic mode; provider-embedded
+offline dependencies remain bound by the image digest.
 
 ### Public research
 

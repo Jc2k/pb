@@ -102,7 +102,16 @@ canonical hunk additions/context before their newline; it is not a claim that ev
 is grammar-extendable. Existing-file and patch validation is bound to the exact controller-observed
 base; stale bytes fail rather than being patched approximately.
 
-Symbol and type claims are separately opt-in through an LSP server's `semantic_enforcement` mode.
+For a real local backend that may edit Rust in a Cargo project, pb automatically prepares one exact
+pinned rust-analyzer world before inference. The request-local native layer can reject only its
+qualified exact import and selected literal/call-shape contradictions. Partial dependency,
+build-script, procedural-macro, generated-code, deeper type/trait/ownership, compiler, and runtime
+questions remain unknown. A fresh complete replay against the same live world runs before executor
+entry; a generation cache or receipt is not authority. This narrow claim is not general Rust symbol
+or type correctness and does not promise compilation.
+
+Settled-transaction LSP symbol/type claims are separately opt-in through a server's
+`semantic_enforcement` mode.
 Required mode accepts only a digest-pinned, complete, exact-overlay diagnostic comparison and repeats
 the transaction in a fresh exact bounded shadow workspace and isolated provider session immediately
 before publication. Rust evidence also requires a non-empty loaded crate graph and analyzer-confirmed
@@ -132,7 +141,9 @@ effect annotations cannot authorize a call. External MCP mutation has no current
 
 Implementation mutation authority is narrower than the stage capability: a checkpointed work-unit
 ledger selects one operation and path at a time. pb inserts that path into a target-bound call, so a
-model-supplied alternate path cannot widen scope. Existing-path operations still require an exact,
+model-supplied alternate path cannot widen scope. Native constrained generation receives the same
+binding out of band, so target-scoped tool schemas can omit `path` without weakening streaming
+syntax or semantic checks. Existing-path operations still require an exact,
 current complete-file read; adopted task-owned bytes retain separate provenance. A failed exact-path
 diagnostic invalidates older reads and grants repair authority only for that current path.
 

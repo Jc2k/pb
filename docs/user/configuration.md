@@ -225,7 +225,20 @@ together before asking the model again. Strict native stages constrain function 
 supported argument-schema subset while tokens are sampled. Mutation calls additionally use a
 bounded controller snapshot and the shared syntax/canonical-patch completion gate, then validate the
 completed result again at the executor boundary. This is automatic for qualified FlashMoe profiles;
-there is no environment or configuration switch. A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
+there is no environment or configuration switch.
+
+When a real local backend exposes a path that may edit Rust in a Cargo project, pb prepares a pinned
+native Rust semantic world before the model starts. The first request can therefore spend noticeable
+time loading Cargo metadata, the sysroot, dependencies, and HIR; exact later requests reuse it, and
+ordinary edits to existing `.rs` files refresh it incrementally. Cargo/configuration/dependency or
+file-topology changes rebuild before the next inference. Preparation is offline and never downloads
+dependencies. Missing local dependency sources or a workspace that changes while loading fail the
+model turn rather than silently dropping the Rust layer. This behavior is automatic and has no
+environment toggle. Its guarantee is intentionally narrow: exact qualified import and selected
+literal/call-shape contradictions can be rejected, while build-script/procedural-macro and deeper
+type/ownership facts remain unknown.
+
+A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
 at least 32 tokens with true layer-major Metal prefill. The live Metal working-set snapshot chooses
 a chunk of at most 8,192 rows while retaining a 512 MiB safety margin and limiting graph scratch to
 5% of the resident/session basis; shorter suffixes or insufficient headroom keep the scalar token
@@ -479,7 +492,9 @@ reload, and leaves settled-state compilation and tests to pb's checks. Its packa
 is a stable baseline, not a promise that projects pinned to another compiler receive exact semantic
 parity.
 
-Semantic mutation analysis is separately opt-in per server. The field is accepted in global
+Settled-transaction LSP semantic analysis is separately opt-in per server. This is distinct from the
+automatic request-local native Rust layer described above: the LSP receives complete candidate
+overlays and is not queried for token-time diagnostics on incomplete code. The field is accepted in global
 `[lsp.servers.<name>]` entries and project `.pb/lsp.toml` entries:
 
 ```toml
@@ -489,7 +504,8 @@ language_ids = ["rust"]
 semantic_enforcement = "advisory" # disabled | advisory | required
 ```
 
-`disabled` is the default and preserves ordinary syntax-only mutation constraints. `advisory`
+`disabled` is the default and disables only this LSP transaction gate; the syntax collar and any
+qualified automatic native language layer remain active. `advisory`
 opens exact controller-provided base/candidate overlays in a fresh bounded shadow workspace and
 isolated provider session, and records semantic outcomes, but an error, timeout, stale workspace,
 unpinned host command, incomplete baseline, or unsupported construct does not block generation or

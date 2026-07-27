@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "crates/pb-control-collar"]
-default-members = [".", "crates/pb-control-collar"]
+members = [".", "crates/pb-control-collar", "crates/pb-control-rust"]
+default-members = [".", "crates/pb-control-collar", "crates/pb-control-rust"]
 resolver = "3"
 
 [package]
@@ -30,6 +30,7 @@ mime_guess = "2.0.5"
 memmap2 = "0.9.10"
 minijinja = { version = "=2.12.0", default-features = false, features = ["adjacent_loop_items", "builtins", "json", "macros", "multi_template", "serde", "std_collections"] }
 pb-control-collar = { path = "crates/pb-control-collar" }
+pb-control-rust = { path = "crates/pb-control-rust" }
 regex = "1.12.4"
 reqwest = { version = "0.12.5", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rust-embed = "8.9.0"

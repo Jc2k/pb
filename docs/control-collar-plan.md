@@ -1,11 +1,10 @@
 # Streaming tool-output control collar
 
-Status: **Phases 0–5 are implemented and production-qualified. Phase 6 and the Phase 7/8
-foundations are implemented but still completing their production qualification matrix.** This is
-the durable design record, migration history, and evidence ledger for generation-time mutation
-validation. Current curated behavior is described in the architecture documentation. Phase 7
-native compiler profiles, portable dependency fact packs/name biasing, and Phase 9 speculation are
-still design-record work and are not implied by the syntax-valid production milestone.
+Status: **The syntax/canonical-patch collar is shipped. The first native Rust semantic layer,
+pre-inference lifecycle, streaming steering, and independent execution replay are implemented and
+under production qualification. Deeper Rust coverage and the Python and TypeScript/JavaScript
+language crates remain phased design-record work.** This is the durable design, migration history,
+and evidence ledger. Curated architecture documentation describes only shipped guarantees.
 
 Current implementation ledger:
 
@@ -16,16 +15,30 @@ Current implementation ledger:
   context are probed before their newline. Qwen and DeepSeek real-tokenizer split/rollback/chunk
   qualification passes the 1 ms p95 budget. The claim remains conservative prefix safety, not exact
   grammar extendability; longer fuzzing and refreshed end-to-end throughput evidence remain.
-- **Phase 7 foundation configurable:** immutable semantic-world/document identities, exact
-  full-content LSP overlays with monotonic versions, fresh immutable shadow workspaces and isolated
-  LSP sessions, full pull-diagnostic baselines, diagnostic-debt deltas, required/advisory policy,
-  repairable payload-close steering, final executor revalidation, and separate content-free
-  generation/final receipts are implemented for classified rust-analyzer, TypeScript, and Pyright
-  errors. Required Rust evidence additionally needs a loaded non-empty crate graph and per-document
-  crate membership. Enforcement defaults to `disabled`. The first digest-pinned Rust provider
-  qualification failed safely because its packaged analyzer produced no crate graph; no semantic
-  profile has been promoted. Native compiler parity, strict Python/JavaScript profiles, boundary
-  latency, multi-project overlays, and portable dependency fact packs remain promotion gates.
+- **Native Rust layer implemented:** `pb-control-rust` directly embeds pinned rust-analyzer crates.
+  It loads one project-wide Salsa/HIR world from a verified immutable shadow before an inference
+  that can edit Rust, primes local/dependency scopes, selects the exact Cargo target for existing
+  files, resolves imports and callable/type shapes through HIR, and gives the decoder only a cheap
+  request-local snapshot. It does not ask an LSP for diagnostics on incomplete source.
+- **Lifecycle implemented:** exact workspace/configuration/dependency identities key a bounded
+  process cache. Existing `.rs` edits revise the warm Salsa world only after all request leases from
+  the previous world have ended. New/deleted source files, Cargo/configuration changes, ambiguity,
+  overlapping inference, or refresh failure cause an independent cold rebuild before the next
+  model invocation. Exact controller-bound non-Rust mutations skip this cost; multi-path patches
+  conservatively prepare Rust. Workspace drift during load or between inference and execution
+  fails closed.
+- **Controller-bound targets implemented:** target-scoped workflow schemas remain byte-stable and
+  may omit `path`. The controller carries the accepted work-unit path out of band in the immutable
+  snapshot; Qwen payload extraction and the mutation gate normalize the call exactly as the
+  executor does. A model-supplied alternate path never overrides controller authority.
+- **Semantic enforcement implemented conservatively:** exact builtin/sysroot facts and local
+  literal contradictions can hard-reject. Facts affected by disabled build scripts, procedural
+  macros, generated sources, or incomplete dependency configuration remain `Unknown` and cannot
+  prune a token. Completed writes/edits/replacements/patches are reconstructed and replayed through
+  a fresh analyzer stack immediately before executor entry; sampler state is never final authority.
+- **Legacy diagnostic provider remains separate:** the configurable isolated-LSP diagnostic gate is
+  retained for settled transaction diagnostics and evidence. It is not the streaming architecture
+  and its in-progress diagnostic codes are not used as token-time truth.
 - **Phase 8 adapter implemented:** llama.cpp now masks the full vocabulary before sampling
   truncation, accepts sampler state once, reuses both tool dialects and the shared executor, and
   reports the same guarantee/rejection fields. Pinned live model/tokenizer/template differential
@@ -36,12 +49,14 @@ Current implementation ledger:
 
 ## Decision
 
-The deterministic core of output constraints is implemented in a new unpublished Rust crate named
-`pb-control-collar`. The repository is a non-virtual Cargo workspace containing the existing root
-`pb` package and that crate.
+The deterministic protocol/mutation substrate is the unpublished `pb-control-collar` crate. Native
+language semantics live in one unpublished crate per language family. The first is
+`pb-control-rust`; later qualified implementations are expected to be `pb-control-python` and
+`pb-control-typescript` rather than generic runtime "fact packs".
 
-The workspace contains exactly those two members. The crate remains an internal correctness boundary,
-not a general decomposition of pb into micro-crates.
+This is a deliberate multi-crate workspace, but not arbitrary micro-crate decomposition. A language
+crate is warranted when it owns a materially different parser, project model, dependency resolver,
+type system, lifecycle, and qualification matrix.
 
 The dependency direction is strict:
 
@@ -51,9 +66,9 @@ pb binary/library
     +-- controller authority and workspace snapshots
     +-- FlashMoe / llama.cpp sampling adapters
     +-- model-state checkpoint or replay implementation
-    +-- filesystem, Git, process, and LSP ownership
+    +-- filesystem, Git, process/LSP ownership, cache and lifecycle coordination
     |
-    `--> pb-control-collar
+    +--> pb-control-collar
              +-- tokenizer vocabulary and mask contracts
              +-- Qwen JSON and DeepSeek DSML tool-envelope state
              +-- decoded logical argument events
@@ -61,11 +76,18 @@ pb binary/library
              +-- canonical streaming patch engine
              +-- syntax and semantic analyzer interfaces
              +-- deterministic receipts and diagnostics
+    |
+    `--> pb-control-rust
+             +-- pinned rust-analyzer project/Salsa/HIR integration
+             +-- Cargo target and dependency resolution
+             +-- Rust-specific streaming parser and semantic certainty
+             `-- request snapshots, checkpoints, and rollback
 ```
 
 `pb-control-collar` must never depend on `pb`, read the live workspace, execute a tool, run Git,
 own a model graph, or decide which capability the agent has. It narrows possible output; it does not
-grant authority.
+grant authority. A language crate depends on the neutral collar contract, never on `pb`; `pb` owns
+live I/O, shadow creation, readiness ordering, cache policy, publication, and external processes.
 
 ## Outcome
 
@@ -75,10 +97,10 @@ For supported constrained mutation tools and language profiles, pb provides this
 > the controller is structurally valid, the mutation still applies to the same base snapshot, and
 > the executor independently accepts the prepared result.
 
-The default production guarantee remains deliberately syntax-scoped. Opt-in semantic providers can
-reject definite name, type, ownership, and API errors at repairable payload closure and immediately
-before publication, but state that stronger rung relative to a pinned language analyzer,
-configuration, workspace, dependency identity, and complete baseline. Python runtime behavior
+The cross-language production guarantee remains deliberately syntax-scoped. A native language layer
+may add a stronger per-request rung only for error classes its pinned implementation can prove from
+the exact ready world. Rust v1 can reject a proven-invalid exact sysroot import and selected literal
+operator/call incompatibilities; partial dependency facts remain `Unknown`. Python runtime behavior
 cannot generally be proven by a static streaming analyzer.
 
 The priority language profiles are Rust, Python, TypeScript, JavaScript, HTML, and CSS. The initial
@@ -113,7 +135,8 @@ security boundary. The mitigations are:
 - keep the crate unpublished and workspace-internal initially;
 - expose model-neutral source and tool events rather than pb controller types;
 - keep live I/O and external-process ownership in `pb`;
-- add one crate, not a speculative family of micro-crates;
+- add language crates only behind a concrete parser/project/type-system implementation and its own
+  promotion corpus;
 - require differential parity before deleting an existing implementation; and
 - version every wire, mutation, language, and receipt contract that can affect acceptance.
 
@@ -123,8 +146,8 @@ The root manifest can remain both the `pb` package and the workspace root:
 
 ```toml
 [workspace]
-members = [".", "crates/pb-control-collar"]
-default-members = [".", "crates/pb-control-collar"]
+members = [".", "crates/pb-control-collar", "crates/pb-control-rust"]
+default-members = [".", "crates/pb-control-collar", "crates/pb-control-rust"]
 resolver = "3"
 
 [package]
@@ -132,7 +155,7 @@ name = "pb"
 # existing package metadata remains here
 ```
 
-The implemented package lives at:
+The implemented packages live at:
 
 ```text
 crates/pb-control-collar/
@@ -159,6 +182,11 @@ crates/pb-control-collar/
         gate.rs
         receipt.rs
         diagnostics.rs
+crates/pb-control-rust/
+    Cargo.toml
+    src/
+        lib.rs
+        stream.rs
 ```
 
 Only dependencies used by both packages should move to `[workspace.dependencies]`, and that move
@@ -203,9 +231,9 @@ foundation is recorded separately from that historical baseline.
 
 The current implementation has these concrete boundaries:
 
-- the root package and unpublished `pb-control-collar` are explicit workspace/default members using
-  resolver 3; dependencies used by both packages are workspace-owned while exact-pinned Tree-sitter
-  dependencies remain private to the collar;
+- the root package plus unpublished `pb-control-collar` and `pb-control-rust` crates are explicit
+  workspace/default members using resolver 3; Rust language internals remain exact-pinned and
+  private to the Rust crate;
 - the collar owns tokenizer byte/control-token surfaces, full-vocabulary masks, the LLGuidance JSON
   factory/session, versioned manifests and analyzer/recovery interfaces, DSML parsing/probing,
   controller-snapshot virtual writes, canonical patches, syntax profiles, receipts, and content-free
@@ -223,6 +251,15 @@ The current implementation has these concrete boundaries:
 - conservative UTF-8, delimiter, and Python-dedent prefix rules now reject only promoted local
   impossibilities; canonical patch lines additionally stream untouched base bytes and generated
   result bytes through the same prefix oracle between hunks;
+- Rust-edit-capable real-backend requests prepare a project-wide rust-analyzer database before
+  prompt reservation or model-invocation accounting, reuse exact warm worlds, and incrementally
+  refresh existing source files only when no request lease can observe the prior Salsa revision;
+- the Rust streaming layer uses direct HIR scope/import/callable shapes plus a Rust Tree-sitter
+  structural stream. Exact negative facts may reject while partial build-script/proc-macro/
+  dependency facts stay `Unknown`;
+- writes, replacements, edits, and patches preserve known/generated origins and explicit deletion
+  events. A fresh complete replay over the authoritative virtual results runs before the executor,
+  independent of the sampler's candidate cache;
 - configured semantic providers can receive exact full-content overlays, compare baseline and
   candidate diagnostic debt, reject definite classified errors at mutation-payload closure, and
   repeat the transaction gate before publication. This is opt-in and defaults to disabled;
@@ -234,10 +271,10 @@ The current implementation has these concrete boundaries:
   patches without `--recount`.
 
 This implementation prevents an invalid supported complete file from closing and executing, and it
-hard-masks a deliberately small set of proven-impossible prefixes. It does not claim exact grammar
-extendability, expression-level type steering, complete project-wide symbol/type correctness, a
-pinned production semantic profile, live-model llama.cpp parity, or model-state rollback. Those
-remain independently promoted gates in Phases 6–9.
+hard-masks a deliberately small set of proven-impossible prefixes and Rust semantic contradictions.
+It does not claim exact grammar extendability, general Rust type/borrow correctness, build-script or
+procedural-macro completeness, Python/TypeScript semantic steering, live-model llama.cpp parity, or
+model-state rollback. Those remain independently promoted gates.
 
 ## Authority and correctness invariants
 
@@ -263,6 +300,14 @@ These invariants apply in every phase:
    timings, not source text, patch text, argument values, or repository paths.
 10. **No protocol/parser drift.** Generation constraints, the final wire parser, and the renderer's
     delimiter/escape definitions come from the same dialect implementation.
+11. **Readiness precedes inference.** A real backend cannot begin an invocation capable of editing a
+    language with a required native layer until the exact project world is loaded and primed.
+    Loading never occurs inside token sampling or after durable invocation accounting begins.
+12. **One semantic revision per request.** Request snapshots lease one immutable analyzer revision.
+    An incremental refresh waits for all leases to end; overlap, topology/configuration drift, or an
+    unsupported change uses a separate cold world rather than revising a live decoder's state.
+13. **Sampler state is not publication evidence.** Executor entry reconstructs the complete virtual
+    mutation and replays a fresh layer stack against the same ready world and live identity.
 
 ## Core request contract
 
@@ -283,9 +328,11 @@ pub struct CollarManifest {
 ```
 
 The manifest contains canonical schema and policy digests. A `WorkspaceSnapshot` contains normalized
-logical paths, file kinds, exact bytes where required, content hashes, and existence policy. It does
-not contain open handles or grant permission to fetch another path. Snapshot construction, symlink
-policy, ignore rules, repository boundaries, and size limits remain in `pb`.
+logical paths, file kinds, exact bytes where required, content hashes, existence policy, and an
+optional controller-bound mutation target. The target is authority already granted by the accepted
+work-unit ledger, not a model argument or a new capability. The snapshot does not contain open
+handles or grant permission to fetch another path. Snapshot construction, symlink policy, ignore
+rules, repository boundaries, and size limits remain in `pb`.
 
 The inference backend supplies a tokenizer vocabulary separately:
 
@@ -550,10 +597,28 @@ token stream.
 The first gate is complete-file validity at argument closure. Stronger rejection of impossible
 prefixes comes only after per-language extension tests prove it sound.
 
-### Future semantic steering
+### Native layered semantic steering
 
 Semantic validity is not prefix-monotonic. A currently mismatched Rust or Python expression may be
-extended with a conversion or method call before its statement closes. The collar should therefore:
+extended with a conversion or method call before its statement closes. Every language crate must
+therefore implement a stack of transactional layers rather than translate its toolchain into a
+generic diagnostic/fact-pack format:
+
+```text
+wire/token layer
+  -> virtual mutation/origin layer
+  -> language lexical and concrete-syntax layer
+  -> scope/import resolver
+  -> expression/type/ownership layers
+  -> coherent file/tool closure layer
+```
+
+Each layer consumes the neutral `SourceEvent` stream, can checkpoint across file boundaries, and
+returns `Valid`, `Repairable`, `Impossible`, or `Unknown`. A language crate may directly integrate
+native internals—rust-analyzer HIR/Salsa for Rust, Astral `ty` internals for Python, and TypeScript's
+project/type APIs for TypeScript/JavaScript—without flattening their distinct models.
+
+The stack must:
 
 - hard-mask only tokens proven to make a valid continuation impossible;
 - retain expected types, visible symbols, imports, scopes, and unresolved obligations;
@@ -563,16 +628,43 @@ extended with a conversion or method call before its statement closes. The colla
   definite error; and
 - run a final authoritative analyzer over the complete virtual workspace.
 
-Rust can eventually use rust-analyzer or compiler-compatible analysis for names, types, traits,
-ownership, `cfg`, and macro-aware checks. Python strictness must be defined relative to a pinned
-analyzer and configuration; `Any`, dynamic imports, monkey-patching, descriptors, and runtime-only
-dispatch yield `Unknown` rather than a false guarantee. TypeScript and JavaScript similarly require
-a declared project/compiler configuration rather than an isolated-file claim when module resolution
-or ambient types matter.
+Rust v1 directly uses rust-analyzer HIR for project target selection, import resolution, public
+symbol/callable shapes, and conservative literal expression checks. Deeper layers may use more
+rust-analyzer internals or compiler-compatible queries for inference, traits, ownership, `cfg`, and
+macro-aware checks. Python strictness must be defined relative to pinned `ty`/Python/project state;
+`Any`, dynamic imports, monkey-patching, descriptors, and runtime-only dispatch yield `Unknown`
+rather than a false guarantee. TypeScript and JavaScript similarly require a declared project and
+compiler configuration rather than an isolated-file claim when module resolution or ambient types
+matter.
 
 No full compiler should run once per vocabulary token. The fast path uses grammar masks, byte/token
 classes, cached analyzer checkpoints, and boundary detection. Expensive analysis happens at a small
-number of structural boundaries or on speculative spans.
+number of structural boundaries or on speculative spans. Project loading, dependency resolution,
+sysroot discovery, index construction, and cache priming finish before the model invocation.
+
+### Lifecycle and cache contract
+
+The controller owns lifecycle even though a language crate owns the analyzer implementation:
+
+1. Determine whether the exposed tool schemas can select a file for that language. A general path
+   or `apply_patch` makes the language reachable; an exact non-matching path does not.
+2. Capture an exact content snapshot and construct a verified immutable shadow. Derive separate
+   world, toolchain/configuration, and dependency identities.
+3. Look up a bounded process cache. On a miss, load and prime the native project world before prompt
+   preparation, token-budget reservation, durable invocation start, or backend entry.
+4. Revalidate the live workspace after preparation. Retry a bounded number of times; persistent
+   drift refuses inference rather than pairing a model with stale semantics.
+5. Hand decoding a cheap request snapshot and an epoch lease. Sampling performs no project I/O,
+   dependency loading, language-server RPC, or compilation.
+6. After a completed mutation, create a fresh request snapshot, replay the exact virtual result to
+   file/tool closure, and revalidate the live world identity immediately before executor entry.
+7. On the next turn, reuse an exact world. Existing indexed source edits may update Salsa or the
+   equivalent native incremental database only when no old request lease remains. New/deleted files,
+   project graph/toolchain/dependency changes, active leases, ambiguity, or refresh errors rebuild a
+   separate world before inference.
+
+Cold-build, warm-hit, incremental-refresh, priming, memory, and eviction budgets are qualified per
+language. Correctness does not depend on a cache hit.
 
 ### Guarantee ladder for later phases
 
@@ -617,22 +709,19 @@ controller-owned caches. Network access is disabled. The provider may inspect re
 dependency data authorized for analysis without exposing that source to the model or durable
 telemetry.
 
-`pb-control-collar` remains synchronous and I/O-free. It owns portable value types such as
-`AnalyzerCapability`, `SemanticWorldId`, `BoundaryProbe`, `ProviderVerdict`, `DefiniteErrorClass`,
-and `UnknownReason`. A controller-owned `SemanticProviderBroker` owns LSP/native analyzer processes,
-deadlines, overlays, and cache leases. The broker produces immutable verdicts that a collar session
-can consume. The current blocking boundary pauses decode and uses a one-way lock order from the
-request-local model runtime to an individual LSP session; analyzer code must never call back into the
-model runtime. A future worker/queue implementation must preserve that acyclic order while removing
-the LSP wait from the runtime critical section.
+`pb-control-collar` remains synchronous and I/O-free. It owns portable lifecycle/event/decision
+types such as `AnalyzerCapability`, `SemanticWorldId`, `LayerReadinessReceipt`, `SourceEvent`,
+`Analysis`, and `UnknownReason`. Language crates implement that interface using their native
+project and type models. They receive a controller-created shadow/configuration and return a warmed
+world; they do not own live-workspace authority or call back into model runtime code.
 
-The LSP client now accepts controller-provided bytes through monotonically versioned full-content
-`didOpen`/`didChange` updates. Each semantic transaction creates an exact bounded shadow copy from
-the captured content snapshot and a fresh provider session rooted at that copy; it rejects
-symlinks, special files, copy-time live-workspace drift, and any provider mutation of the shadow.
-Generation-time analysis requires a complete pull-diagnostic response. Stale, partial,
-quiet-period-only, timed-out, restarted, configuration-divergent, empty Rust crate-graph, or
-detached-document results are `Unknown`, never clean evidence.
+The existing `SemanticProviderBroker` and LSP overlay client remain a separate settled-transaction
+diagnostic facility. They accept monotonically versioned full-content overlays, isolated shadow
+roots, and complete pull diagnostics. That path can provide advisory or required final diagnostic
+evidence, but it is not queried on each candidate boundary and its error-code stream is not assumed
+sound for incomplete generated source. A future language crate may use an LSP protocol only as a
+project-index/symbol source if it can expose immutable, queryable semantic state with the same
+readiness and certainty contract; direct native integration is preferred where available.
 
 ### Boundary steering policy
 
@@ -657,12 +746,12 @@ later remains an obligation until file/tool closure. If the already committed pr
 only by changing earlier tokens, correctness still fails closed at closure; Phase 9 recovery is the
 optional mechanism for rewinding and steering earlier.
 
-Blocking boundary probes are the first production implementation. External analysis is not run for
-every vocabulary token, and speculative decode is not a prerequisite for semantic correctness. A
-required semantic profile that times out, loses its process, exceeds its snapshot/boundary budget,
-or cannot establish a complete baseline prevents semantic closure. An advisory profile may return
-`Unknown` and retain the shipped syntax-only behavior, but receipts and user-visible status must not
-describe that request as semantically constrained.
+Request-local native boundary probes are the production architecture. External analysis is not run
+for every vocabulary token, and speculative decode is not a prerequisite for semantic correctness.
+If a required native world cannot load, prime, bind the file to a project target, or preserve its
+identity, inference does not begin. Query-level incompleteness within a ready partial profile returns
+`Unknown` and retains the lower guarantee rung; receipts and user-visible status must not describe
+that error class as semantically constrained.
 
 ## Checkpoint and rollback model
 
@@ -763,6 +852,10 @@ models:
 
 - precompute tokenizer surfaces, control-token identities, schema grammar, and stable base parse
   state during request preflight;
+- load and prime native project worlds before inference, record cold-load and prime time separately,
+  and never hide that latency inside first-token or tool-execution time;
+- reuse exact worlds across turns/stages with bounded LRU ownership, then prefer native incremental
+  source invalidation over repeating Cargo/project discovery;
 - compute the complete protocol hard mask before top-k;
 - compose bitsets without materializing decoded strings for every candidate;
 - cache candidate probes by analyzer-state digest and token ID;
@@ -772,6 +865,12 @@ models:
 - record protocol-mask, dynamic-probe, analyzer, rollback/replay, and total sampling time separately;
   and
 - treat an empty valid-token set as a named failure rather than widening without a bound.
+
+Each native language profile must publish separate cold, exact-cache-hit, existing-source-refresh,
+request-snapshot, token-boundary, final-replay, resident-memory, and eviction measurements on tiny,
+representative, and large workspaces. Rust preparation runs Cargo metadata offline; missing cached
+dependency sources fail before inference rather than creating an implicit network fetch. A cache hit
+is an optimization only: identity and final replay checks are unchanged.
 
 Protocol-only constraints should establish a measured low-overhead baseline. Syntax and semantic
 qualification records should report tokens/second and energy against the same prompt, sampler, model,
@@ -947,10 +1046,11 @@ context, hashes, and unsupported features fail before mutation.
 
 ### Phase 5 — DeepSeek DSML constraints
 
-Implementation status: **complete and production-qualified.** DSML mutation
+Implementation status: **complete; current production requalification is blocked.** DSML mutation
 payloads use JSON strings inside `string="false"` parameters so their closure is unambiguous even
 when source contains DSML-looking text. Candidate probing preserves special-token identity and
-widens before sampling truncation.
+widens before sampling truncation. The implementation and pinned direct/workflow corpus pass, but
+the repository-required current FlashMoe arithmetic smoke does not yet produce a sensible answer.
 
 - Implement DSML as a collar dialect over token identities and incremental bytes.
 - Constrain tool names, ordered parameters, schemas, raw strings, nested JSON, terminal close, and
@@ -969,21 +1069,25 @@ workspace, not an earlier phase branch.
 
 | Evidence | Status | Current result |
 | --- | --- | --- |
-| Collar unit and chunk-boundary corpus | Passed | 52 deterministic tests, including all six language families plus TSX/JSX, byte/random chunk equivalence, monotonic hard rejection, constant-time deep checkpoints, branch rollback caches, partial patch-line probing, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches, malformed patch corpus, Qwen/DSML payload closure, immutable semantic identities/debt and receipts, and control-token identity |
-| Qwen native constraint corpus | Passed | 13 focused tests, including closure rejection for invalid syntax and the one-mutation batch bound |
+| Collar unit and chunk-boundary corpus | Passed | 60 deterministic tests, including all six language families plus TSX/JSX, byte/random chunk equivalence, monotonic hard rejection, source-length-only Rust branch rollback, partial patch-line probing, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches, malformed patch corpus, controller-bound Qwen/DSML payload closure, immutable semantic identities/debt and receipts, and control-token identity |
+| Qwen native constraint corpus | Passed | Focused native tests cover closure rejection for invalid syntax, the one-mutation batch bound, content-first pathless target-bound calls, and model paths that cannot override controller authority |
 | DeepSeek DSML renderer/parser corpus | Passed | 3 focused root tests plus 2 collar DSML tests for typed parameters, ordered JSON-string mutation history, and closure boundaries |
 | Workspace format/check/Clippy | Passed | `cargo fmt --all -- --check`, `cargo check --workspace --all-targets -j 1`, and the repository warning/correctness Clippy gate |
 | Executor and event focused tests | Passed | Snapshot freshness, exact patch/Git differential result, inexact hunk rejection, and additive/backward-compatible event round trip |
-| Workspace all-target tests | Passed | On 2026-07-27, 1,465 root tests passed with 23 device/environment tests ignored, 2 environment-contract tests passed, and all 52 collar tests passed |
+| Workspace all-target tests | Passed | On 2026-07-27, 1,471 root tests passed with 24 device/environment/qualification tests ignored, 2 environment-contract tests passed, all 60 collar tests passed, and all 8 native Rust tests passed |
 | Web and documentation tests | Passed | 76 web tests passed; mdBook and link validation checked 59 pages and 98 rendered files |
 | Production asset/release build | Passed | On 2026-07-27, web assets and the optimized macOS arm64 release binary rebuilt successfully |
-| Required FlashMoe one-token smoke | Passed | On 2026-07-27, the current release binary exited zero and printed the existing raw Qwen baseline `5` for `2+2=` |
+| Required FlashMoe one-token smoke | Quality gate failed | On 2026-07-27, the current release binary exited zero but printed `5` for `2+2=`. That is not a sensible answer under the repository gate and blocks production promotion even though the control-collar path itself did not crash |
 | Phase 6–8 foundation integration | Passed | Conservative prefix and patch-stream tests, Qwen and DeepSeek payload-close semantic rejection, exact monotonic fake-LSP overlays and diagnostic debt, llama.cpp full-vocabulary pre-top-k masking, shared event compatibility, workspace check, and strict Clippy all pass |
 | Phase 6 Qwen/DeepSeek tokenizer-prefix qualification | Passed | Corpus SHA-256 `1b4568f8…9215`; Qwen tokenizer `be756060…5506` ran 173 token-prefix/rollback probes and DeepSeek JoyAI tokenizer `263ab7b3…f3ba` ran 180; each replayed 704 deterministic chunkings and measured 1 µs p95 against the 1,000 µs budget |
 | Phase 6 remaining promotion evidence | Pending | Scheduled long fuzz/property runs, outer Qwen/DSML logical-prefix extraction profiling, and refreshed pinned end-to-end write/patch throughput still gate promotion beyond the implemented conservative rules |
 | Phase 7 shadow/evidence foundation | Passed | Semantic analysis uses a fresh exact bounded shadow tree and isolated LSP session for each transaction, rejects symlinks and post-copy drift, permits only an LSP-specific read-only analysis-root mount, and emits independently validated content-free generation and final-executor receipts |
-| Phase 7 pinned Rust provider attempt | Failed safely | `ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b26526…173d` (rust-analyzer 1.96.0) never produced a non-empty crate graph or document membership within the required barrier; the qualifier returned `Unknown`/provider unavailable, required mode rejected, and the profile remained disabled |
-| Phase 7 pinned semantic profiles | Pending | A provider that passes the checked-in Rust corpus, plus digest-pinned TypeScript/Pyright project matrices, compiler/profile parity, multi-file/dependant scope, cancellation/latency, and offline dependency resolution still gate any default semantic guarantee |
+| Phase 7 legacy pinned Rust LSP attempt | Failed safely (historical) | `ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b26526…173d` (rust-analyzer 1.96.0) never produced a non-empty crate graph or document membership within the required barrier; this is why incomplete-code LSP diagnostics were not adopted as the streaming architecture |
+| Phase 7 native Rust implementation | Passed focused implementation gates | Exact-pinned rust-analyzer 0.0.344 loads one offline project world; 8 crate tests cover dependency/sysroot shape certainty, invalid import/type steering, target selection, cross-file rollback, identity/staleness, active-request refresh exclusion, and zero-load source refresh. The root lifecycle test covers cold preparation, warm reuse, independent invalid/valid final replay, in-memory source refresh, cross-stage process-cache reuse, and exact non-Rust target bypass |
+| Phase 7 native Rust latency/resource qualifier | Passed current representative run | The full pb workspace measured an 81.475 s cold load, 972 ms independent execution replay, and 966 ms warm request; process maximum RSS was 2,127,577,088 bytes and measured peak footprint was 129,778,360 bytes. These are recorded baselines, not universal budgets; large-project, cancellation, and sustained-concurrency qualification remains |
+| Phase 7 live Rust workflow | Passed | Preserved run `1785188392696-10497-0` in `/private/tmp/pb-control-rust-e2e-20260727-3` accepted a pathless controller-bound `replace_file`, rejected 391 invalid candidates without executing them, passed 3 locked Cargo tests and API review, reached `Ready`, and committed `6471f2c feat: add average function with unit tests` with a clean worktree |
+| Phase 7 native Rust production qualification | Partially passed; promotion blocked | Focused implementation, strict workspace gates, representative cold/warm/replay measurement, and one current end-to-end model replacement pass. The required FlashMoe arithmetic smoke is currently nonsensical; representative large projects, cancellation, sustained concurrency/memory, longer randomized rollback corpora, and live write/edit/patch coverage still gate promotion beyond the narrow shipped v1 claim |
+| Phase 7 deeper/later language profiles | Pending | Rust macro/build-script/compiler parity, `pb-control-python`/Astral `ty`, and `pb-control-typescript` project matrices ship independently after their own soundness, lifecycle, multi-file, dependency, cancellation, latency, and final-replay evidence |
 | Phase 8 live llama.cpp profiles | Pending | Pinned model/tokenizer/template write/patch/malformed/truncation and FlashMoe differential runs still gate a backend-parity claim |
 | Pinned DeepSeek direct mutation qualification | Passed | The checked-in `fixtures/control-collar/` inputs produced syntax-valid `answer.py` after 2 candidate rejections and an exact snapshot-bound one-line patch after 8, reporting 1 file and 16 snapshot bytes; an alternate capped patch attempt reported 7 `invalid_patch` closure rejections and executed no call |
 | Pinned DeepSeek strict workflow | Passed | An 11-invocation delivery crossed tool-schema narrowing, reused unchanged exact roots, cold-started changed roots, executed constrained `write_file`, passed review, and ended `contract_status=satisfied`, `verified_completed=true` |
@@ -1023,48 +1127,44 @@ the pinned end-to-end decode-throughput reduction remains within the existing 25
 
 ### Phase 7 — Semantic steering and final semantic gates
 
-- **7A — Build the semantic provider contract and shadow world.** The controller-owned broker,
-  immutable bounded shadow workspace, isolated provider session, exact overlay versions, baseline
-  diagnostics, provider health, and cancellation are implemented. A content-addressed world cache
-  and request queue remain optional performance work after correctness qualification. Analyzer I/O
-  and Tokio stay out of `pb-control-collar`.
-- **7B — Establish diagnostic-delta semantics.** Initially enforce only a clean, complete baseline
-  for the affected project targets. Then add a diagnostic-debt ledger that allows a mutation to fix
-  existing errors while rejecting new definite errors, using in-memory code/range/source mapping and
-  persisting only content-free hashes and counts. An incomplete baseline can steer softly but cannot
-  establish a semantic guarantee.
-- **7C — Promote Rust first.** Pin rust-analyzer, Rust toolchain, target, Cargo metadata/lockfile,
-  feature/`cfg`, proc-macro, and build-script policy. Use native rust-analyzer diagnostics such as
-  type mismatch, unresolved field/method/item, privacy, mutability, and ownership classes for bounded
-  boundary probes. Run a final compiler-compatible check in a sandboxed shadow workspace for the
-  stronger profile. Because rust-analyzer flycheck, Cargo build scripts, and proc macros can execute
-  code, they require explicit no-network/read-only-workspace/ephemeral-output authority; disabled or
-  unavailable expansion is `Unknown`, not success.
-- **7D — Promote TypeScript, then configured JavaScript.** Prefer a pinned TypeScript Language
-  Service sidecar with `ScriptSnapshot`/versioned virtual files, exact `tsconfig` options, module
-  resolution, JSX mode, ambient declarations, and project references. Use syntactic and semantic
-  diagnostic APIs for boundary and final checks. JavaScript receives a type guarantee only when
-  `checkJs`, JSDoc, or another explicit project profile makes the relevant values known; otherwise
-  dynamic results remain `Unknown`.
-- **7E — Promote Python under an explicit profile.** Pin Pyright plus Python version/platform,
-  execution environment, strictness, typeshed/stub paths, and project configuration. Start with
-  annotated or inferred-known code under standard/strict diagnostics. `Any`, `Unknown`, dynamic
-  imports, monkey-patching, descriptors, and runtime-only dispatch cannot support a hard type claim.
-- **7F — Resolve dependency APIs and steer names.** First let each pinned provider resolve offline
-  dependency sources/declarations/stubs directly from read-only caches. Later materialize portable
-  public-symbol/type fact packs keyed by provider version, target, configuration, and lockfile so
-  common completions do not require repeated process queries. Bias tokenizer sequences for visible
-  symbols, qualified names, imports, fields, and methods; never hard-exclude an identifier merely
-  because it is absent from a completion list.
-- **7G — Revalidate at execution.** Reconstruct the exact prepared virtual workspace, verify live
-  base and semantic-world identities, rerun the authoritative final provider, and only then publish
-  atomically. A generation-time receipt never substitutes for final executor validation.
-- **7H — Make semantic evidence durable and auditable.** Separate generation-boundary and
-  final-executor receipts are implemented with contract/provider/world/config/dependency/document
-  digests, versions, completeness, verdict classes, reason/count fields, budgets, and timings.
-  Receipts identify their scope (document, affected target set, or complete project) and exclude
-  paths, source, patches, diagnostic messages, prompts, and symbol names. Generation telemetry
-  cannot be promoted into final publication evidence.
+- **7A — Layered native contract (implemented).** `pb-control-collar` owns object-safe synchronous
+  analyzer events, readiness receipts, composition, cross-file checkpoints, rollback, semantic
+  certainty, known/generated origins, and explicit deletion events. Analyzer I/O and async runtime
+  concerns stay outside the neutral crate.
+- **7B — Rust project lifecycle (implemented).** `pb-control-rust` pins rust-analyzer internals,
+  loads one project-wide database from a verified shadow with offline Cargo metadata, primes local
+  and dependency scopes before inference, binds request snapshots to exact identities, and keeps a
+  bounded process cache. Existing source changes use native Salsa invalidation only after the prior
+  request epoch has no leases; every other change performs a cold pre-inference rebuild.
+- **7C — Rust structural/HIR v1 (implemented, qualification in progress).** Stream Rust syntax,
+  nested imports, call/literal shapes, and exact local literal operator contradictions. Resolve Cargo
+  targets, imports, builtin/sysroot APIs, dependency public symbols, and callable signatures directly
+  through HIR. Partial scopes never supply negative hard-mask facts. Replay complete
+  write/replace/edit/patch results through a fresh stack before executor entry.
+- **7D — Complete Rust semantic profiles.** Add language-owned layers for local binding and method
+  resolution, generic inference, traits, coercions, ownership/borrows, privacy, `cfg`, target and
+  feature selection. Define separate safe-partial and sandboxed-exact profiles for build scripts,
+  procedural macros, generated files, and compiler checks. Code execution requires explicit
+  no-network/read-only-input/ephemeral-output authority; unavailable expansion remains `Unknown`.
+- **7E — Add `pb-control-python`.** Integrate pinned Astral `ty` internals where stable enough for
+  project/import/type state, with Python version/platform, virtual environment, typeshed/stubs, and
+  configuration in the world identity. Start with annotated or inferred-known expressions. `Any`,
+  dynamic imports, monkey-patching, descriptors, and runtime dispatch remain `Unknown`. Pyright/LSP
+  may remain a settled final differential oracle, not the token-time state machine.
+- **7F — Add `pb-control-typescript`.** Integrate TypeScript project/program/type-checker state with
+  versioned virtual files, exact `tsconfig`, module resolution, JSX mode, ambient declarations, and
+  project references. JavaScript receives type guarantees only under explicit `checkJs`/JSDoc or an
+  equivalent known-type profile.
+- **7G — Deepen steering without changing soundness.** Carry visible symbols, expected types and
+  unresolved obligations through language-native layers. Apply sparse positive token biases where
+  useful, but never hard-exclude a name because it is absent from a finite completion list. Prefer
+  direct native dependency resolution; add serialized indexes only as language-specific cache
+  formats proven equivalent to the native resolver, not a generic fact-pack abstraction.
+- **7H — Qualify and promote each error class independently.** Maintain positive proofs,
+  repairable counterexamples, unknown/partial cases, baseline-debt cases, multi-file transactions,
+  dependency/configuration invalidation, candidate rollback, concurrent leases, cancellation,
+  cold/warm/refresh latency, memory, and final-replay parity. Persist only content-free identities,
+  decisions, counts, and timings. A generation receipt never substitutes for execution replay.
 
 Gate for each language/profile: a pinned analyzer/toolchain and project-config digest; a complete
 baseline policy; explicit definite/repairable/unknown diagnostic classes; string-plus-integer,
@@ -1137,9 +1237,11 @@ Qwen constraints, virtual `write_file`, canonical `apply_patch`, the six pinned 
 DeepSeek DSML parity. Stronger impossible-prefix checks, type-aware steering, speculative recovery,
 and llama.cpp parity are separately qualified follow-ons.
 
-Requiring Phase 7 semantic analysis before the first production release would substantially enlarge
-the soundness, dependency, project-overlay, performance, and language-configuration contract. It
-would also delay the already valuable completed-file syntax and patch-validity guarantee.
+**Amended 2026-07-27:** semantic work uses one native crate per language family. The Rust v1 layer
+may ship once its narrow exact error classes, pre-inference lifecycle, cache invalidation, request
+leases, final replay, offline behavior, latency, and memory are qualified. It does not wait for the
+future exact macro/build-script/compiler profile or other languages, and it must not be described as
+general Rust type correctness.
 
 ### Patch and batch compatibility
 
@@ -1157,6 +1259,11 @@ release requires materially more path, mode, rename/copy, rollback, and executor
 profile is automatically enabled on a qualified FlashMoe dialect/backend. Preflight fails closed when
 a request promises an unavailable required constraint. Experiments use explicit harness arguments;
 the initial release adds no user-visible environment or configuration toggle.
+
+**Amended 2026-07-27:** language crates are also unpublished and workspace-internal. A real backend
+advertises request-local layer support; scripted/test engines that do not run the sampler do not pay
+native project-load cost. Rust reachability is derived from exposed tool schemas. Once reachable,
+readiness is mandatory and occurs before inference; there is no hidden environment downgrade.
 
 Publishing the crate or making the collar opt-in would create additional API stability, support,
 configuration, migration, and documentation commitments that are not needed to prove the production
@@ -1176,13 +1283,14 @@ their named phase produces evidence:
 | DeepSeek candidate-probe latency budget | Resolved in Phase 5 | The default production ceiling is at most 25% decode-throughput loss on the same prompt/checkpoint; the pinned patch qualification measured 18.0% |
 | Prefix guarantee scope | Phase 6 | Per-rule extension-property corpus, valid-program tokenizer splits, grammar/final-parser differential results, and named conservative versus exact capability receipts |
 | Semantic baseline policy and rollout mode | Phase 7 | Clean-world and diagnostic-debt corpora, incomplete-baseline behavior, typed project configuration, and user-visible guarantee wording |
-| Rust native-analysis versus compiler-check boundary | Phase 7 | Diagnostic-class parity, macro/build-script sandbox evidence, target/feature/`cfg` matrix, and final executor cost |
-| Dependency public-symbol fact packs | Phase 7 | Provider/direct-resolution parity, lockfile/config invalidation, cache size/privacy, and completion steering benefit |
+| Rust safe-partial versus exact compiler-compatible profile | Phase 7D | HIR/compiler parity, macro/build-script sandbox evidence, target/feature/`cfg` matrix, and final executor cost |
+| Language-specific serialized dependency indexes | Phase 7G | Native-resolver equivalence, lockfile/config invalidation, cache size/privacy, and measurable steering benefit; no generic fact-pack API is assumed |
+| Native-world lifecycle budgets | Phase 7H | Offline cold load, exact cache hit, source refresh, concurrent lease fallback, cancellation, eviction, memory, and pre-inference timing on tiny/representative/large projects |
 | llama.cpp model/template qualification | Phase 8 | Token/special/EOG identity, dialect rendering, full-vocabulary mask ordering, stateful-sampler acceptance, and live mutation corpus |
 | Whether DeepSeek ephemeral complete-state snapshots beat deterministic replay | Phase 9 | Snapshot copy cost, memory peak, restore parity, branch depth, and end-to-end energy |
-| Rust semantic provider boundary | Phase 7 | rust-analyzer/compiler parity corpus including macros, traits, `cfg`, and workspace edits |
-| TypeScript/JavaScript project overlay provider | Phase 7 | Module-resolution, ambient-type, JSX, and multi-file corpus |
-| Python strict profile and `Unknown` policy | Phase 7 | Annotated/unannotated corpus, false-rejection audit, and pinned analyzer configuration |
+| Rust deeper native boundary | Phase 7D | rust-analyzer/compiler parity corpus including macros, traits, `cfg`, ownership, and workspace edits |
+| TypeScript/JavaScript native project layer | Phase 7F | Module-resolution, ambient-type, JSX, and multi-file corpus |
+| Python `ty` profile and `Unknown` policy | Phase 7E | Annotated/unannotated corpus, false-rejection audit, environment/stub identity, and pinned analyzer configuration |
 
 Unsupported language profiles remain protocol-constrained and executor-validated; they must not be
 reported as syntax- or semantic-constrained. A supported profile whose required analyzer cannot be
@@ -1223,10 +1331,13 @@ The project is complete only when:
    positive, negative, repairable, and patch corpora.
 7. Any semantic guarantee identifies its analyzer/configuration boundary and does not present unknown
    dynamic behavior as proven safe.
-8. Backend rollback, where enabled, restores model, sampler, collar, mutation, and analyzer state
+8. Every promoted native language layer loads and primes before inference, binds one immutable
+   semantic revision to each request, invalidates/rebuilds coherently, performs no token-time I/O,
+   and independently replays the completed virtual transaction before execution.
+9. Backend rollback, where enabled, restores model, sampler, collar, mutation, and analyzer state
    atomically and exactly.
-9. Durable telemetry contains no source, patch, argument, path, prompt, or symbol content.
-10. Curated architecture, security, privacy, user, FlashMoe, harness, and release documentation match
+10. Durable telemetry contains no source, patch, argument, path, prompt, or symbol content.
+11. Curated architecture, security, privacy, user, FlashMoe, harness, and release documentation match
     the behavior actually enabled in production.
 
 ## Primary references

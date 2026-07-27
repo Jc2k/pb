@@ -1071,6 +1071,7 @@ impl FlashMoeSessionCache {
             stopped: false,
             stopped_by_terminal_tool_call: false,
             stopped_by_constraint_payload_limit: false,
+            stopped_by_constraint_dead_end: false,
         }
     }
 
@@ -1128,6 +1129,7 @@ impl FlashMoeSessionCache {
             stopped: false,
             stopped_by_terminal_tool_call: false,
             stopped_by_constraint_payload_limit: false,
+            stopped_by_constraint_dead_end: false,
         })
     }
 

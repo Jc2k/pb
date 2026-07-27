@@ -98,6 +98,11 @@ pub(crate) fn qualify(
         bail!("semantic qualification requires a read-only workspace and network_access=none");
     }
     config.semantic_enforcement = LspSemanticEnforcement::Required;
+    if !crate::semantic::qualified_semantic_profile(&config, "rust") {
+        bail!(
+            "semantic qualification requires an exact built-in Rust provider candidate profile; the image, verified digest, arguments, environment, language IDs, initialization options, workspace/network authority, and cache policy must match"
+        );
+    }
 
     let bytes = read_bounded(corpus_path, MAX_CORPUS_BYTES)?;
     let corpus_sha256 = format!("{:x}", Sha256::digest(&bytes));

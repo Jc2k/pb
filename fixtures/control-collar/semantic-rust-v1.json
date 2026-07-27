@@ -154,7 +154,7 @@
       "tool": "replace_file",
       "arguments": {
         "path": "src/lib.rs",
-        "content": "pub fn value() -> String { let value = String::from(\"ok\"); let moved = value; drop(moved); value }\n"
+        "content": "struct X;\npub fn value(value: &X) { let moved = *value; _ = moved; }\n"
       },
       "expected": {
         "closure": "reject",

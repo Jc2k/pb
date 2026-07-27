@@ -17,17 +17,29 @@ const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 const CONSTRAINED_NO_REPEAT_NGRAM: usize = 32;
 const MAX_STRUCTURAL_WHITESPACE_BYTES: usize = 32;
-const MAX_COLLAR_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_COLLAR_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_COLLAR_FILES: usize = 32;
-const MAX_COLLAR_PATCH_HUNKS: usize = 256;
+pub(crate) const MAX_COLLAR_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_COLLAR_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_COLLAR_FILES: usize = 32;
+pub(crate) const MAX_COLLAR_PATCH_HUNKS: usize = 256;
 
+#[cfg(test)]
 pub(crate) fn mutation_completion_gate(
     dialect: ToolDialect,
     mode: NativeToolConstraintMode,
     tools: &[ChatTool],
     terminal_tool_names: &[String],
     snapshot: Option<&pb_control_collar::mutation::WorkspaceSnapshot>,
+) -> Result<Option<MutationCompletionGate>> {
+    mutation_completion_gate_with_layers(dialect, mode, tools, terminal_tool_names, snapshot, None)
+}
+
+pub(crate) fn mutation_completion_gate_with_layers(
+    dialect: ToolDialect,
+    mode: NativeToolConstraintMode,
+    tools: &[ChatTool],
+    terminal_tool_names: &[String],
+    snapshot: Option<&pb_control_collar::mutation::WorkspaceSnapshot>,
+    language_layers: Option<crate::control_layers::SharedLanguageLayers>,
 ) -> Result<Option<MutationCompletionGate>> {
     let has_mutation = tools.iter().any(|tool| {
         matches!(
@@ -43,13 +55,11 @@ pub(crate) fn mutation_completion_gate(
         // generation entry point separately requires the snapshot before any model work begins.
         return Ok(None);
     };
-    Ok(Some(MutationCompletionGate::new(collar_manifest(
-        dialect,
-        mode,
-        tools,
-        terminal_tool_names,
-        snapshot.clone(),
-    )?)?))
+    let manifest = collar_manifest(dialect, mode, tools, terminal_tool_names, snapshot.clone())?;
+    Ok(Some(match language_layers {
+        Some(layers) => MutationCompletionGate::with_shared_language_layers(manifest, layers)?,
+        None => MutationCompletionGate::new(manifest)?,
+    }))
 }
 
 pub(crate) fn collar_manifest(
@@ -714,14 +724,31 @@ impl NativeToolConstraint {
         position = skip_ws(body, position);
         position = complete_position(consume_byte(body, position, b'{'))?;
 
+        let schema = self.schemas.get(&name)?;
+        let properties = schema.get("properties")?.as_object()?;
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
         let order = mutation_argument_order(&name)?;
+        let mut next_order_index = 0usize;
         let mut values = serde_json::Map::new();
-        for expected in order {
+        loop {
             position = skip_ws(body, position);
             let (key, next) = complete_string(parse_json_string(body, position))?;
-            if key != *expected {
+            let order_index = order.iter().position(|expected| *expected == key)?;
+            if order_index < next_order_index
+                || !properties.contains_key(&key)
+                || order[next_order_index..order_index]
+                    .iter()
+                    .any(|skipped| required.contains(skipped))
+            {
                 return None;
             }
+            next_order_index = order_index.saturating_add(1);
             position = skip_ws(body, next);
             position = complete_position(consume_byte(body, position, b':'))?;
             position = skip_ws(body, position);
@@ -733,7 +760,6 @@ impl NativeToolConstraint {
             position = skip_ws(body, next);
             position = complete_position(consume_byte(body, position, b','))?;
         }
-        None
     }
 
     fn mutation_payload_prefix(
@@ -771,14 +797,31 @@ impl NativeToolConstraint {
         position = skip_ws(body, position);
         position = complete_position(consume_byte(body, position, b'{'))?;
 
+        let schema = self.schemas.get(&name)?;
+        let properties = schema.get("properties")?.as_object()?;
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
         let order = mutation_argument_order(&name)?;
+        let mut next_order_index = 0usize;
         let mut values = serde_json::Map::new();
-        for expected in order {
+        loop {
             position = skip_ws(body, position);
             let (key, next) = complete_string(parse_json_string(body, position))?;
-            if key != *expected {
+            let order_index = order.iter().position(|expected| *expected == key)?;
+            if order_index < next_order_index
+                || !properties.contains_key(&key)
+                || order[next_order_index..order_index]
+                    .iter()
+                    .any(|skipped| required.contains(skipped))
+            {
                 return None;
             }
+            next_order_index = order_index.saturating_add(1);
             position = skip_ws(body, next);
             position = complete_position(consume_byte(body, position, b':'))?;
             position = skip_ws(body, position);
@@ -797,7 +840,6 @@ impl NativeToolConstraint {
                 StringStatus::Incomplete(_) | StringStatus::Invalid => return None,
             }
         }
-        None
     }
 
     fn parse_tool_body(&self, body: &str) -> PrefixStatus {
@@ -890,6 +932,7 @@ impl DeepSeekToolConstraint {
         tools: &[ChatTool],
         terminal_tool_names: &[String],
         snapshot: Option<&pb_control_collar::mutation::WorkspaceSnapshot>,
+        language_layers: Option<crate::control_layers::SharedLanguageLayers>,
     ) -> Result<Option<Self>> {
         let active_mode = match mode {
             NativeToolConstraintMode::Auto if tools.is_empty() => return Ok(None),
@@ -929,7 +972,10 @@ impl DeepSeekToolConstraint {
         )?;
         Ok(Some(Self {
             mode: active_mode,
-            collar: pb_control_collar::protocol::DsmlConstraint::compile(manifest)?,
+            collar: pb_control_collar::protocol::DsmlConstraint::compile_with_language_layers(
+                manifest,
+                language_layers,
+            )?,
             schema_sha256: format!("{:x}", Sha256::digest(schema_bytes)),
             rejected_candidates: 0,
             mutation_rejections: BTreeMap::new(),
@@ -1088,11 +1134,16 @@ impl RuntimeToolConstraint {
         tools: &[ChatTool],
         terminal_tool_names: &[String],
         snapshot: Option<&pb_control_collar::mutation::WorkspaceSnapshot>,
+        language_layers: Option<crate::control_layers::SharedLanguageLayers>,
     ) -> Result<Option<Self>> {
-        Ok(
-            DeepSeekToolConstraint::compile(mode, tools, terminal_tool_names, snapshot)?
-                .map(Self::DeepSeek),
-        )
+        Ok(DeepSeekToolConstraint::compile(
+            mode,
+            tools,
+            terminal_tool_names,
+            snapshot,
+            language_layers,
+        )?
+        .map(Self::DeepSeek))
     }
 
     pub(super) fn mode(&self) -> NativeToolConstraintMode {
@@ -2334,6 +2385,67 @@ mod tests {
     }
 
     #[test]
+    fn pathless_bound_mutation_streams_its_first_payload_field() {
+        let mut tools = mutation_tools();
+        tools[0].name = "replace_file".to_string();
+        tools[0].input_schema["properties"]["content"]["maxLength"] = json!(256);
+        tools[0].input_schema["required"] = json!(["content"]);
+        let path = pb_control_collar::mutation::LogicalPath::parse("src/lib.rs").unwrap();
+        let snapshot = pb_control_collar::mutation::WorkspaceSnapshot::new(vec![
+            pb_control_collar::mutation::SnapshotEntry::new(
+                path.clone(),
+                b"pub fn before() {}\n".to_vec(),
+            ),
+        ])
+        .unwrap()
+        .with_bound_mutation_path(path);
+        let gate = mutation_completion_gate(
+            ToolDialect::QwenJson,
+            NativeToolConstraintMode::ToolsAllowed,
+            &tools,
+            &[],
+            Some(&snapshot),
+        )
+        .unwrap();
+        let constraint = NativeToolConstraint::compile_with_mutation_gate(
+            NativeToolConstraintMode::ToolsAllowed,
+            &tools,
+            &[],
+            gate,
+        )
+        .unwrap()
+        .unwrap();
+
+        let valid_open = concat!(
+            "<tool_call>{\"name\":\"replace_file\",\"arguments\":{",
+            "\"content\":\"pub fn after() {}"
+        );
+        assert!(constraint.output_prefix_is_valid(valid_open, false));
+        assert!(
+            constraint
+                .output_prefix_is_valid(&format!("{valid_open}\"}}}}{TOOL_CALL_CLOSE}"), false)
+        );
+        let closed_body = format!("{}\"", valid_open.strip_prefix(TOOL_CALL_OPEN).unwrap());
+        let (_, closed) = constraint.closed_mutation_payload(&closed_body).unwrap();
+        assert_eq!(closed.get("path"), None);
+        assert_eq!(closed.get("content"), Some(&json!("pub fn after() {}")));
+
+        let alternate_path = concat!(
+            "<tool_call>{\"name\":\"replace_file\",\"arguments\":{",
+            "\"path\":\"model/supplied/alternate.rs\",",
+            "\"content\":\"pub fn after() {}\"}}</tool_call>"
+        );
+        assert!(constraint.output_prefix_is_valid(alternate_path, false));
+
+        let invalid_open = valid_open.replace("pub fn after() {}", "pub fn after() { ]");
+        assert!(!constraint.output_prefix_is_valid(&invalid_open, false));
+        assert_eq!(
+            constraint.output_mutation_rejection(&invalid_open),
+            Some(RejectionCode::InvalidPrefix)
+        );
+    }
+
+    #[test]
     fn semantic_provider_rejects_the_payload_quote_while_the_prefix_remains_repairable() {
         let mut mutation_tools = mutation_tools();
         mutation_tools[0].input_schema["properties"]["content"]["maxLength"] = json!(256);
@@ -2380,6 +2492,7 @@ mod tests {
             &mutation_tools,
             &[],
             Some(&snapshot),
+            None,
         )
         .unwrap()
         .unwrap();

@@ -33,6 +33,7 @@ pub(in crate::inference::flashmoe) struct FlashMoeGenerationState {
     pub(in crate::inference::flashmoe) stopped: bool,
     pub(in crate::inference::flashmoe) stopped_by_terminal_tool_call: bool,
     pub(in crate::inference::flashmoe) stopped_by_constraint_payload_limit: bool,
+    pub(in crate::inference::flashmoe) stopped_by_constraint_dead_end: bool,
 }
 
 impl FlashMoeGenerationState {
@@ -185,11 +186,13 @@ impl FlashMoeGenerationState {
             self.stopped = true;
             self.stopped_by_terminal_tool_call = false;
             self.stopped_by_constraint_payload_limit = false;
+            self.stopped_by_constraint_dead_end = false;
         } else {
             self.generated.push(token);
             self.stopped = terminal_tool_call;
             self.stopped_by_terminal_tool_call = terminal_tool_call;
             self.stopped_by_constraint_payload_limit = false;
+            self.stopped_by_constraint_dead_end = false;
         }
     }
 
@@ -201,16 +204,32 @@ impl FlashMoeGenerationState {
         self.stopped = true;
         self.stopped_by_terminal_tool_call = false;
         self.stopped_by_constraint_payload_limit = false;
+        self.stopped_by_constraint_dead_end = false;
     }
 
     pub(crate) fn stop_at_constraint_payload_limit(&mut self) {
         self.stopped = true;
         self.stopped_by_terminal_tool_call = false;
         self.stopped_by_constraint_payload_limit = true;
+        self.stopped_by_constraint_dead_end = false;
     }
 
     pub(crate) fn stopped_by_constraint_payload_limit(&self) -> bool {
         self.stopped_by_constraint_payload_limit
+    }
+
+    /// Preserve the last accepted prefix when candidate-only decoding cannot extend it. The
+    /// controller can then perform its bounded fresh-invocation mutation retry; no partial action
+    /// is parsed or executed.
+    pub(crate) fn stop_at_constraint_dead_end(&mut self) {
+        self.stopped = true;
+        self.stopped_by_terminal_tool_call = false;
+        self.stopped_by_constraint_payload_limit = false;
+        self.stopped_by_constraint_dead_end = true;
+    }
+
+    pub(crate) fn stopped_by_constraint_dead_end(&self) -> bool {
+        self.stopped_by_constraint_dead_end
     }
 
     pub(crate) fn should_decode(&self) -> bool {

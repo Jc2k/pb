@@ -21,7 +21,7 @@ use pb_control_collar::mutation::{
     WorkspaceSnapshot, prepare_create, prepare_patch, prepare_replace,
 };
 use pb_control_collar::receipt::Digest;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::lsp::{
@@ -34,13 +34,16 @@ const SEMANTIC_BOUNDARY_CACHE_ENTRIES: usize = 256;
 const SEMANTIC_SHADOW_MAX_FILES: usize = 100_000;
 const SEMANTIC_SHADOW_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
-struct SemanticShadowWorkspace {
+pub(crate) struct SemanticShadowWorkspace {
     directory: tempfile::TempDir,
     snapshot: LspOverlayTreeSnapshot,
 }
 
 impl SemanticShadowWorkspace {
-    fn capture(workspace_root: &Path, content: &crate::workspace::ContentSnapshot) -> Result<Self> {
+    pub(crate) fn capture(
+        workspace_root: &Path,
+        content: &crate::workspace::ContentSnapshot,
+    ) -> Result<Self> {
         if content.paths.len() > SEMANTIC_SHADOW_MAX_FILES {
             bail!("semantic shadow exceeds the {SEMANTIC_SHADOW_MAX_FILES}-file bound");
         }
@@ -100,7 +103,7 @@ impl SemanticShadowWorkspace {
         })
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.directory.path()
     }
 }
@@ -552,8 +555,10 @@ impl<'a> SemanticProviderBroker<'a> {
             );
             let language = provider_language(config, mutations);
             let capabilities = capabilities_for_language(&language);
+            let qualified_profile = qualified_semantic_profile(config, &language);
             let dependency_cache_is_bound = config.cache_ids.is_empty();
             let complete = pinned
+                && qualified_profile
                 && baseline_report
                     .as_ref()
                     .is_none_or(|report| report.complete)
@@ -580,6 +585,9 @@ impl<'a> SemanticProviderBroker<'a> {
             let mut provider_unknown = unknown_reasons.clone();
             if !pinned {
                 provider_unknown.insert(UnknownReason::ProviderUnavailable);
+            }
+            if !qualified_profile {
+                provider_unknown.insert(UnknownReason::UnqualifiedProfile);
             }
             if !dependency_cache_is_bound {
                 provider_unknown.insert(UnknownReason::UnsupportedConstruct);
@@ -1116,11 +1124,11 @@ fn classify_diagnostic(server: &str, code: &str) -> DefiniteErrorClass {
             }
             "e0432" | "unresolved-import" => DefiniteErrorClass::UnresolvedImport,
             "e0599" | "unresolved-method" => DefiniteErrorClass::MissingMethod,
-            "e0609" | "unresolved-field" => DefiniteErrorClass::MissingField,
-            "e0061" => DefiniteErrorClass::InvalidCall,
+            "e0559" | "e0609" | "unresolved-field" => DefiniteErrorClass::MissingField,
+            "e0061" | "e0107" | "mismatched-arg-count" => DefiniteErrorClass::InvalidCall,
             "e0603" | "private-assoc-item" | "private-field" => DefiniteErrorClass::Privacy,
             "e0382" | "e0505" | "e0507" => DefiniteErrorClass::Ownership,
-            "e0596" => DefiniteErrorClass::Mutability,
+            "e0384" | "e0596" | "need-mut" => DefiniteErrorClass::Mutability,
             _ => DefiniteErrorClass::Other,
         }
     } else if normalized_server.contains("typescript") || normalized_server.contains("tsserver") {
@@ -1170,6 +1178,44 @@ fn provider_identity(config: &crate::lsp::LspServerConfig) -> (String, bool) {
         .map(|bytes| format!("config:{:x}", Sha256::digest(bytes)))
         .unwrap_or_else(|_| "config:unavailable".to_string());
     (digest, false)
+}
+
+const RUST_ANALYZER_NATIVE_V1_IMAGE: &str = "ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b2652632b5a79bd62c26cc4154db26029d0835645a697cfee53fa7633d6173";
+const RUST_ANALYZER_NATIVE_V1_DIGEST: &str =
+    "sha256:07b2652632b5a79bd62c26cc4154db26029d0835645a697cfee53fa7633d6173";
+
+/// Return whether this is an exact built-in semantic profile that has passed the checked-in
+/// qualification corpus. A digest-pinned executable is necessary but not sufficient: provider
+/// configuration controls which diagnostics exist and therefore belongs to the authority boundary.
+pub(crate) fn qualified_semantic_profile(
+    config: &crate::lsp::LspServerConfig,
+    language: &str,
+) -> bool {
+    language == "rust"
+        && !config.disabled
+        && config.command.is_none()
+        && config.container_image.as_deref() == Some(RUST_ANALYZER_NATIVE_V1_IMAGE)
+        && config.verified_manifest_digest.as_deref() == Some(RUST_ANALYZER_NATIVE_V1_DIGEST)
+        && config.args.is_empty()
+        && config.env.is_empty()
+        && config.working_directory.is_none()
+        && config.language_ids.len() == 1
+        && config.language_ids[0].eq_ignore_ascii_case("rust")
+        && config.initialization_options.as_ref()
+            == Some(&json!({
+                "cachePriming": {"enable": false},
+                "cargo": {
+                    "autoreload": true,
+                    "buildScripts": {"enable": false},
+                    "noDeps": true
+                },
+                "checkOnSave": false,
+                "diagnostics": {"experimental": {"enable": true}},
+                "procMacro": {"enable": false}
+            }))
+        && config.workspace_access == crate::session_environment::ServiceWorkspaceAccess::ReadOnly
+        && config.network_access == crate::session_environment::ServiceNetworkAccess::None
+        && config.cache_ids.is_empty()
 }
 
 pub(crate) fn pinned_provider_version(config: &crate::lsp::LspServerConfig) -> Option<String> {
@@ -1322,6 +1368,18 @@ mod tests {
             DefiniteErrorClass::TypeMismatch
         );
         assert_eq!(
+            classify_diagnostic("rust-analyzer", "E0107"),
+            DefiniteErrorClass::InvalidCall
+        );
+        assert_eq!(
+            classify_diagnostic("rust-analyzer", "E0559"),
+            DefiniteErrorClass::MissingField
+        );
+        assert_eq!(
+            classify_diagnostic("rust-analyzer", "E0384"),
+            DefiniteErrorClass::Mutability
+        );
+        assert_eq!(
             classify_diagnostic("typescript", "2307"),
             DefiniteErrorClass::UnresolvedImport
         );
@@ -1365,6 +1423,35 @@ mod tests {
             ..Default::default()
         };
         assert!(!provider_identity(&malformed_verification).1);
+    }
+
+    #[test]
+    fn rust_semantic_authority_requires_the_exact_qualified_profile() {
+        let mut config = crate::lsp::LspServerConfig {
+            container_image: Some(RUST_ANALYZER_NATIVE_V1_IMAGE.to_string()),
+            verified_manifest_digest: Some(RUST_ANALYZER_NATIVE_V1_DIGEST.to_string()),
+            language_ids: vec!["rust".to_string()],
+            initialization_options: Some(json!({
+                "cachePriming": {"enable": false},
+                "cargo": {
+                    "autoreload": true,
+                    "buildScripts": {"enable": false},
+                    "noDeps": true
+                },
+                "checkOnSave": false,
+                "diagnostics": {"experimental": {"enable": true}},
+                "procMacro": {"enable": false}
+            })),
+            ..Default::default()
+        };
+        assert!(qualified_semantic_profile(&config, "rust"));
+
+        config.initialization_options.as_mut().unwrap()["cargo"]["autoreload"] = json!(false);
+        assert!(!qualified_semantic_profile(&config, "rust"));
+        config.initialization_options.as_mut().unwrap()["cargo"]["autoreload"] = json!(true);
+        config.initialization_options.as_mut().unwrap()["diagnostics"]["experimental"]["enable"] =
+            json!(false);
+        assert!(!qualified_semantic_profile(&config, "rust"));
     }
 
     fn unavailable_provider_registry(

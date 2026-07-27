@@ -1,9 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
 
 use serde_json::{Map, Value};
 
 use crate::{
     CollarError, CollarResult, CompletionDecision, MutationCompletionGate, RejectionCode,
+    analysis::LanguageLayerStack,
     tool::{CollarManifest, ToolConstraintMode},
 };
 
@@ -48,8 +52,20 @@ pub struct DsmlConstraint {
 
 impl DsmlConstraint {
     pub fn compile(manifest: CollarManifest) -> CollarResult<Self> {
+        Self::compile_with_language_layers(manifest, None)
+    }
+
+    pub fn compile_with_language_layers(
+        manifest: CollarManifest,
+        language_layers: Option<Arc<Mutex<LanguageLayerStack>>>,
+    ) -> CollarResult<Self> {
         manifest.validate()?;
-        let mutation_gate = Some(MutationCompletionGate::new(manifest.clone())?);
+        let mutation_gate = Some(match language_layers {
+            Some(layers) => {
+                MutationCompletionGate::with_shared_language_layers(manifest.clone(), layers)?
+            }
+            None => MutationCompletionGate::new(manifest.clone())?,
+        });
         let mut schemas = BTreeMap::new();
         for tool in &manifest.tools {
             validate_schema(&tool.input_schema, &format!("tool {}", tool.name))?;
@@ -969,7 +985,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        mutation::WorkspaceSnapshot,
+        mutation::{LogicalPath, SnapshotEntry, WorkspaceSnapshot},
         protocol::ToolDialect,
         tool::{CollarLimits, ExposedTool, MutationPolicy},
     };
@@ -1029,6 +1045,56 @@ mod tests {
         let valid = write_prefix("\"pub fn ok() {}\\n\"");
         assert!(constraint.probe(valid.as_bytes(), false).valid);
         let complete = format!("{valid}{PARAMETER_CLOSE}\n{INVOKE_CLOSE}\n{CALLS_CLOSE}");
+        let probe = constraint.probe(complete.as_bytes(), false);
+        assert!(probe.valid && probe.complete && probe.complete_terminal_call);
+    }
+
+    #[test]
+    fn controller_bound_path_allows_a_pathless_dsml_mutation() {
+        let path = LogicalPath::parse("src/lib.rs").unwrap();
+        let workspace = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            path.clone(),
+            b"pub fn before() {}\n".to_vec(),
+        )])
+        .unwrap()
+        .with_bound_mutation_path(path);
+        let constraint = DsmlConstraint::compile(CollarManifest {
+            contract_version: 1,
+            dialect: ToolDialect::DeepSeekDsml,
+            mode: ToolConstraintMode::ToolRequired,
+            tools: vec![ExposedTool {
+                name: "replace_file".to_string(),
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "path":{"type":"string"},
+                        "content":{"type":"string","maxLength":256}
+                    },
+                    "required":["content"],
+                    "additionalProperties":false
+                }),
+            }],
+            terminal_tools: vec!["replace_file".to_string()],
+            mutation_policy: MutationPolicy {
+                allow_write_file: false,
+                allow_replace_file: true,
+                allow_apply_patch: false,
+                max_mutation_calls_per_batch: 1,
+            },
+            workspace,
+            limits: CollarLimits {
+                max_argument_bytes: 4096,
+                max_snapshot_bytes: 4096,
+                max_files: 4,
+                max_patch_hunks: 16,
+            },
+        })
+        .unwrap();
+        let open = format!(
+            "{CALLS_OPEN}{INVOKE_OPEN}replace_file\">{PARAMETER_OPEN}content\" string=\"false\">\"pub fn after() {{}}\\n\""
+        );
+        assert!(constraint.probe(open.as_bytes(), false).valid);
+        let complete = format!("{open}{PARAMETER_CLOSE}{INVOKE_CLOSE}{CALLS_CLOSE}");
         let probe = constraint.probe(complete.as_bytes(), false);
         assert!(probe.valid && probe.complete && probe.complete_terminal_call);
     }

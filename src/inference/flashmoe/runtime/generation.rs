@@ -1,5 +1,27 @@
 use super::*;
 
+#[derive(Debug)]
+struct ToolConstraintDeadEnd {
+    dialect: &'static str,
+    generated_tokens: usize,
+}
+
+impl std::fmt::Display for ToolConstraintDeadEnd {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} constraint rejected every vocabulary candidate at generated token {}",
+            self.dialect, self.generated_tokens
+        )
+    }
+}
+
+impl std::error::Error for ToolConstraintDeadEnd {}
+
+fn is_tool_constraint_dead_end(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ToolConstraintDeadEnd>().is_some()
+}
+
 fn validate_structured_constraint_request(request: &StructuredGenerationRequest) -> Result<()> {
     if request.json_schema.is_some()
         && (!request.tools.is_empty()
@@ -175,12 +197,13 @@ impl FlashMoeEngine {
         if !self.executor.is_deepseek_v4() {
             // Compile during preflight as well as generation so unsupported schema features
             // fail before any model work or durable invocation accounting begins.
-            let mutation_gate = mutation_completion_gate(
+            let mutation_gate = super::super::constraints::mutation_completion_gate_with_layers(
                 pb_control_collar::protocol::ToolDialect::QwenJson,
                 request.tool_constraint_mode,
                 &request.tools,
                 &request.terminal_tool_names,
                 request.mutation_snapshot.as_ref(),
+                request.language_layers.clone(),
             )?;
             let _ = NativeToolConstraint::compile_with_mutation_gate(
                 request.tool_constraint_mode,
@@ -494,14 +517,16 @@ impl FlashMoeEngine {
                 &request.tools,
                 &request.terminal_tool_names,
                 request.mutation_snapshot.as_ref(),
+                request.language_layers.clone(),
             )?
         } else {
-            let mutation_gate = mutation_completion_gate(
+            let mutation_gate = super::super::constraints::mutation_completion_gate_with_layers(
                 pb_control_collar::protocol::ToolDialect::QwenJson,
                 request.tool_constraint_mode,
                 &request.tools,
                 &request.terminal_tool_names,
                 request.mutation_snapshot.as_ref(),
+                request.language_layers.clone(),
             )?;
             RuntimeToolConstraint::compile_qwen(
                 request.tool_constraint_mode,
@@ -947,69 +972,78 @@ impl FlashMoeEngine {
             sampler.widen_candidates(128);
         }
         if generation.should_sample_first() {
-            let sample_started = Instant::now();
-            report_generation_progress(&progress, || "first-token sampling begin".to_string());
-            debug!(target: "flashmoe::lifecycle", "flashmoe: first-token sampling begin");
-            let token = {
-                let (prompt_tokens, generated) = generation.sample_inputs();
-                self.sample_from_hidden(
-                    &mut sampler,
-                    &prefill_hidden,
-                    prompt_tokens,
-                    generated,
-                    request.trace_candidates,
-                    &progress,
-                    tool_constraint.as_mut(),
-                    json_constraint.as_mut(),
-                )?
-            };
-            report_generation_progress(&progress, || {
-                format!(
-                    "first-token sampling complete token={} elapsed_ms={}",
+            'first_sample: {
+                let sample_started = Instant::now();
+                report_generation_progress(&progress, || "first-token sampling begin".to_string());
+                debug!(target: "flashmoe::lifecycle", "flashmoe: first-token sampling begin");
+                let token = match {
+                    let (prompt_tokens, generated) = generation.sample_inputs();
+                    self.sample_from_hidden(
+                        &mut sampler,
+                        &prefill_hidden,
+                        prompt_tokens,
+                        generated,
+                        request.trace_candidates,
+                        &progress,
+                        tool_constraint.as_mut(),
+                        json_constraint.as_mut(),
+                    )
+                } {
+                    Ok(token) => token,
+                    Err(error) if is_tool_constraint_dead_end(&error) => {
+                        generation.stop_at_constraint_dead_end();
+                        break 'first_sample;
+                    }
+                    Err(error) => return Err(error),
+                };
+                report_generation_progress(&progress, || {
+                    format!(
+                        "first-token sampling complete token={} elapsed_ms={}",
+                        token,
+                        sample_started.elapsed().as_millis()
+                    )
+                });
+                debug!(
+                    target: "flashmoe::lifecycle",
+                    "flashmoe: first-token sampling complete token={} elapsed_ms={}",
                     token,
                     sample_started.elapsed().as_millis()
-                )
-            });
-            debug!(
-                target: "flashmoe::lifecycle",
-                "flashmoe: first-token sampling complete token={} elapsed_ms={}",
-                token,
-                sample_started.elapsed().as_millis()
-            );
-            if detailed_timing
-                && let Some(timing) = timing.as_deref_mut()
-                && let Some(last) = timing.tokens.last_mut()
-            {
-                let elapsed = sample_started.elapsed();
-                last.buckets.sampling += elapsed;
-                last.buckets.total_wall += elapsed;
-                last.sampled_token = Some(token);
-            }
-            let payload_limit_stop = tool_constraint
-                .as_mut()
-                .and_then(|constraint| constraint.take_payload_limit_stop())
-                .is_some();
-            if payload_limit_stop {
-                generation.stop_at_constraint_payload_limit();
-            } else {
-                let terminal_tool_call = if let Some(constraint) = tool_constraint.as_ref() {
-                    let (_, generated) = generation.sample_inputs();
-                    constraint.should_stop_after_token(&self.tokenizer, generated, token)?
-                } else {
-                    false
-                };
-                let complete_json = if let Some(constraint) = json_constraint.as_mut() {
-                    constraint.has_complete_value()?
-                } else {
-                    false
-                };
-                generation.record_sampled_token(
-                    token,
-                    self.tokenizer.is_eos(token),
-                    terminal_tool_call,
                 );
-                if complete_json {
-                    generation.stop_at_json_value();
+                if detailed_timing
+                    && let Some(timing) = timing.as_deref_mut()
+                    && let Some(last) = timing.tokens.last_mut()
+                {
+                    let elapsed = sample_started.elapsed();
+                    last.buckets.sampling += elapsed;
+                    last.buckets.total_wall += elapsed;
+                    last.sampled_token = Some(token);
+                }
+                let payload_limit_stop = tool_constraint
+                    .as_mut()
+                    .and_then(|constraint| constraint.take_payload_limit_stop())
+                    .is_some();
+                if payload_limit_stop {
+                    generation.stop_at_constraint_payload_limit();
+                } else {
+                    let terminal_tool_call = if let Some(constraint) = tool_constraint.as_ref() {
+                        let (_, generated) = generation.sample_inputs();
+                        constraint.should_stop_after_token(&self.tokenizer, generated, token)?
+                    } else {
+                        false
+                    };
+                    let complete_json = if let Some(constraint) = json_constraint.as_mut() {
+                        constraint.has_complete_value()?
+                    } else {
+                        false
+                    };
+                    generation.record_sampled_token(
+                        token,
+                        self.tokenizer.is_eos(token),
+                        terminal_tool_call,
+                    );
+                    if complete_json {
+                        generation.stop_at_json_value();
+                    }
                 }
             }
         }
@@ -1036,7 +1070,7 @@ impl FlashMoeEngine {
                 generated_len, max_tokens, position
             );
             let decode_started = OptionalInstant::now(report_decode_progress);
-            let sampled = {
+            let sampled = match {
                 let (prompt_tokens, generated, kv_cache, position) = generation.decode_inputs()?;
                 let detailed = if detailed_timing {
                     timing.as_deref_mut()
@@ -1055,7 +1089,14 @@ impl FlashMoeEngine {
                     progress.clone(),
                     tool_constraint.as_mut(),
                     json_constraint.as_mut(),
-                )?
+                )
+            } {
+                Ok(sampled) => sampled,
+                Err(error) if is_tool_constraint_dead_end(&error) => {
+                    generation.stop_at_constraint_dead_end();
+                    break;
+                }
+                Err(error) => return Err(error),
             };
             let token = sampled.token;
             evaluated_generated_tokens = generated_len;
@@ -1140,9 +1181,11 @@ impl FlashMoeEngine {
 
         let stopped_by_terminal_tool_call = generation.stopped_by_terminal_tool_call();
         let stopped_by_constraint_payload_limit = generation.stopped_by_constraint_payload_limit();
+        let stopped_by_constraint_dead_end = generation.stopped_by_constraint_dead_end();
         let generated = generation.into_generated();
         let decoded = self.tokenizer.decode(&generated)?;
-        let finish_reason = if stopped_by_constraint_payload_limit {
+        let finish_reason = if stopped_by_constraint_payload_limit || stopped_by_constraint_dead_end
+        {
             GenerationFinishReason::MaxTokens
         } else {
             generation_finish_reason(generated.len(), max_tokens)
@@ -1166,7 +1209,11 @@ impl FlashMoeEngine {
                 mutation_rejections: constraint.mutation_rejections(),
                 snapshot_files,
                 snapshot_bytes,
-                terminal_state: constraint.terminal_state(&decoded).to_string(),
+                terminal_state: if stopped_by_constraint_dead_end {
+                    "constraint_dead_end".to_string()
+                } else {
+                    constraint.terminal_state(&decoded).to_string()
+                },
                 guarantee_rung: constraint.guarantee_rung(&decoded).to_string(),
                 semantic_boundary: constraint.semantic_stats(),
                 decode_recovery: crate::inference::DecodeRecovery::CandidateProbeOnly,
@@ -2074,10 +2121,11 @@ impl FlashMoeEngine {
                         break;
                     }
                     if sampler.candidate_limit() >= logits.len() {
-                        bail!(
-                            "DeepSeek DSML constraint rejected every vocabulary candidate at generated token {}",
-                            generated.len()
-                        );
+                        return Err(ToolConstraintDeadEnd {
+                            dialect: "DeepSeek DSML",
+                            generated_tokens: generated.len(),
+                        }
+                        .into());
                     }
                     sampler.widen_candidates(
                         sampler
@@ -2119,10 +2167,11 @@ impl FlashMoeEngine {
                         break;
                     }
                     if sampler.candidate_limit() >= logits.len() {
-                        bail!(
-                            "native tool constraint rejected every vocabulary candidate at generated token {}",
-                            generated.len()
-                        );
+                        return Err(ToolConstraintDeadEnd {
+                            dialect: "native tool",
+                            generated_tokens: generated.len(),
+                        }
+                        .into());
                     }
                     sampler.widen_candidates(
                         sampler

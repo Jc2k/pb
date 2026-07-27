@@ -226,16 +226,16 @@ error to be repaired. Incomplete, stale, push-only, unpinned, timed-out, unclass
 project-detached results are `Unknown` and cannot authorize required mode. Rust additionally needs
 a loaded non-empty crate graph and analyzer-confirmed membership for every overlay document.
 
-At a Qwen JSON or DeepSeek DSML payload-string close, FlashMoe and llama.cpp apply the same portable
-mutation gate and may synchronously probe the controller-owned semantic provider before committing
-that candidate. `Reject` masks only the candidate boundary; `Defer` keeps it reachable. The final
-executor independently reconstructs the prepared write/edit/patch against the authorized base,
-captures and revalidates the current workspace during a fresh semantic transaction, and only then
-enters the existing publication step. Generation and final-executor decisions have separate
-content-free receipts; a generation receipt is never executor authority. Invocation events name
-the strongest active rung (`protocol_schema`, `prefix_syntax`, or `semantic_boundary`) and report
-content-free rejection/provider/recovery counters. Current backends report
-`candidate_probe_only`; replay and complete-state restore remain explicitly unimplemented.
+At a completed Qwen JSON or DeepSeek DSML payload-string close, FlashMoe and llama.cpp apply the same
+portable mutation gate and may run the separately configured settled-transaction semantic provider.
+That LSP diagnostic path does not supply token-by-token facts for incomplete code. `Reject` masks
+only the completed payload boundary; `Defer` keeps it reachable. Native streaming language layers
+instead query immutable request-local project state directly. The final executor independently
+reconstructs the prepared write/edit/patch against the authorized base and revalidates before the
+existing publication step. Generation and final-executor decisions have separate content-free
+evidence; generation state is never executor authority. Current backends report
+`candidate_probe_only`; model-state replay and complete-state restore remain explicitly
+unimplemented.
 
 ### 4. Checks
 
@@ -382,7 +382,7 @@ The runtime applies these boundaries before a result can become evidence:
 | Surface | Enforced behavior |
 | --- | --- |
 | File reads and discovery | `read_file` accepts bounded UTF-8 files; glob, regex, and skill discovery have time/input ceilings; results are prompt-bounded with explicit continuation or failure rather than silent partial authority. |
-| File mutation | Existing files require an exact content fingerprint from the bytes actually read. Create and replace use synced temporary files and atomic no-clobber/replace operations; stale concurrent edits fail. `edit_file` requires one unique match. FlashMoe also prepares the exact virtual result through the control collar and refuses to close or execute a supported Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, or CSS mutation unless the pinned complete-file parser accepts it. Unsupported extensions retain the ordinary executor checks and are not reported as syntax constrained. For an initial Python or Python-stub modify whose complete controller-observed file consumes at most half the bounded replacement allowance, pb exposes only atomic `replace_file`; this avoids indentation-fragment errors while requiring the model to preserve unrelated bytes. Other languages, larger or range-only observations, and diagnostic repair retain exact-edit behavior. Diff events are bounded and identify truncation. |
+| File mutation | Existing files require an exact content fingerprint from the bytes actually read. Create and replace use synced temporary files and atomic no-clobber/replace operations; stale concurrent edits fail. `edit_file` requires one unique match. Real local backends prepare the exact virtual result through the control collar and refuse to close or execute a supported Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, or CSS mutation unless the pinned complete-file parser accepts it. Rust-edit-capable requests additionally require a ready exact native Rust world before inference and an independent final replay; only promoted exact Rust contradictions can veto, while partial facts remain unknown. Unsupported extensions retain the ordinary executor checks and are not reported as syntax constrained. For an initial Python or Python-stub modify whose complete controller-observed file consumes at most half the bounded replacement allowance, pb exposes only atomic `replace_file`; this avoids indentation-fragment errors while requiring the model to preserve unrelated bytes. Other languages, larger or range-only observations, and diagnostic repair retain exact-edit behavior. Diff events are bounded and identify truncation. |
 | Patch, move, and remove | FlashMoe `apply_patch` accepts a bounded canonical text-only unified-diff subset: exact offsets, counts, context and deletion bytes; LF; unquoted `a/` and `b/` paths; optional matching `diff --git`; and exact `100644` create/delete metadata. It rejects recount-dependent hunks, mode changes, renames, copies, timestamps, index metadata, and binary patches, applies the patch to an immutable controller snapshot in memory, validates every supported resulting file, rechecks live base hashes, and then requires exact `git apply --check` parity before publication. The llama.cpp compatibility path retains its broader Git/recount behavior and is never a fallback after collar rejection. `mv` moves only a file or symlink and cannot overwrite. `rm` operates on the final filesystem entry and removes only a file, symlink, or empty directory; recursive directory mutation is not an agent capability. |
 | Configured tasks | `run_task` executes against an isolated snapshot, rejects Git-control or undeclared-path changes, bounds promoted path/file totals, validates symlinks, stages every output, and rolls back the destination set if promotion fails. It never earns named-check credit. |
 | Commands and checks | Host and managed commands drain stdout/stderr concurrently, cap combined output, have explicit timeouts, observe user cancellation, and stop the owned process group or managed exec. `run_command` defaults to 120 seconds and is capped at 600; configured checks/tasks use their validated timeout. |
@@ -648,7 +648,11 @@ parser, capability checks, and executor validation still run afterward.
 
 **Shipped.** FlashMoe mutation generation also uses the workspace-internal `pb-control-collar`
 library. Immediately before each generated attempt, the controller copies only current,
-fingerprint-matching complete-file reads into a bounded immutable snapshot. The collar has no live
+fingerprint-matching complete-file reads into a bounded immutable snapshot. For a target-scoped
+work unit, that snapshot also carries the accepted path out of band. The model-visible schema can
+therefore omit `path`; the JSON prefix extractor, mutation gate, final parser, and executor all
+normalize to the same controller-owned target without making target paths part of schema identity.
+A model-supplied path cannot override that binding. The collar has no live
 filesystem, Git, process, model, or capability access. It parses Qwen JSON or DeepSeek DSML, binds
 mutation payload closure to the virtual result, and rejects an invalid supported complete file or
 canonical patch while a repair token can still be sampled. Qwen retains full-vocabulary widening;
@@ -660,17 +664,45 @@ stable-root token digest. Repeated turns with the same root reuse the exact pref
 schema or authority shape starts cold rather than restoring incompatible Metal state. Raw harness
 prefix-extension sessions retain their explicit session identity.
 
+If every vocabulary candidate is rejected after a mutation branch has already produced visible
+bytes, FlashMoe returns a typed `constraint_dead_end` with the partial transcript and executes
+nothing. The controller permits at most one fresh, same-tool, same-target mutation retry; a second
+dead end follows the ordinary incomplete-workflow path. Candidate-only state is never repaired into
+an executable call.
+
+**Shipped Rust v1 behavior.** If a real local backend exposes a tool schema that can edit a Rust
+file, pb captures the exact project, creates a verified immutable shadow, and loads/primes one
+project-wide pinned rust-analyzer HIR/Salsa world before prompt reservation, durable invocation
+accounting, or backend entry. Cargo metadata is offline. Exact worlds are reused across turns and
+workflow stages. Changes to already indexed `.rs` files use Salsa invalidation only after all
+request snapshots from the previous revision are gone; Cargo/configuration/dependency changes,
+file topology changes, overlapping requests, ambiguity, or refresh failure build an independent
+world before the next inference. An exact controller-bound non-Rust target bypasses Rust
+preparation; `apply_patch` remains conservative because one patch can touch several paths. Live
+drift during preparation refuses the invocation.
+
+The decoder receives only a request-local snapshot. The Rust layer streams known/generated bytes
+and deletions through a Rust parser, resolves target/import/public callable shapes directly through
+HIR, and can reject only promoted exact contradictions. Build scripts and procedural macros are
+disabled in this safe profile, so affected dependency facts are partial and cannot provide negative
+hard-mask evidence. Immediately before executor entry, pb reconstructs the completed virtual
+write/edit/replacement/patch—including the final hunk and untouched base tail—and replays it through
+a fresh stack bound to the same live world identity. Candidate checkpoints retain append-only
+source lengths and parser/semantic state rather than copying the virtual file for every accepted
+token.
+
 The syntax profiles are pinned Tree-sitter grammars for Rust, Python, TypeScript/TSX,
 JavaScript/JSX, HTML, and CSS. They require UTF-8 and reject error or missing nodes; HTML additionally
 checks explicit element closure and supported embedded JavaScript, TypeScript, JSON, and CSS. This
-is a syntax guarantee, not a name-resolution, type, borrow, module-resolution, CSS-semantics, or
-Python runtime guarantee. The conservative prefix layer advances only over newly decoded logical
+is the cross-language baseline, not a general name-resolution, type, borrow, module-resolution,
+CSS-semantics, or Python runtime guarantee. Rust v1 adds only its explicitly promoted import and
+literal/call-shape contradictions. The conservative prefix layer advances only over newly decoded logical
 payload bytes, keeps constant-time persistent-stack checkpoints for candidate branches, and probes
 canonical patch additions/context before line closure; final Tree-sitter validation still decides
 complete-file acceptance. The checked-in tokenizer qualifier covers both production Qwen and
-DeepSeek tokenizer boundaries without loading model weights. Type-aware and project-overlay analysis uses the collar's versioned
-boundary/checkpoint interface only after a future analyzer has its own soundness corpus and fail-
-closed qualification.
+DeepSeek tokenizer boundaries without loading model weights. Deeper Rust layers and future native
+Python and TypeScript/JavaScript crates use the same versioned event/checkpoint interface only after
+each error class has its own soundness corpus and fail-closed qualification.
 
 Strict JSON artifacts use a separate tokenizer-neutral constraint session and cannot be combined with
 native tools in one request. FlashMoe computes the LLGuidance allowed-token set before top-k. On

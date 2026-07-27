@@ -4165,11 +4165,11 @@ fn direct_repository_path_hint(workspace_root: &Path, repository_less: bool) -> 
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct BuiltInToolSchema {
-    name: String,
-    description: String,
+pub(crate) struct BuiltInToolSchema {
+    pub(crate) name: String,
+    pub(crate) description: String,
     #[serde(rename = "inputSchema")]
-    input_schema: Value,
+    pub(crate) input_schema: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5594,7 +5594,7 @@ fn bind_work_unit_target(
 }
 
 fn set_mutation_target_path(tools: &mut [BuiltInToolSchema], target_path: &str) {
-    for tool_name in ["write_file", "replace_file"] {
+    for tool_name in ["write_file", "replace_file", "edit_file"] {
         set_tool_target_path(tools, tool_name, target_path);
     }
 }
@@ -5771,7 +5771,7 @@ fn emit_context_limit_event(error: &anyhow::Error, nesting_depth: usize, sink: &
     });
 }
 
-struct ToolExecutionEnv<'a> {
+struct ToolExecutionEnv<'a, 'control> {
     text_backend: TextBackendKind,
     llamacpp: Option<&'a LlamaCppBackend>,
     args: &'a AgentRequest,
@@ -5789,6 +5789,7 @@ struct ToolExecutionEnv<'a> {
     exposed_tools: Vec<BuiltInToolSchema>,
     active_work_unit: Option<crate::workflow::WorkUnit>,
     workspace_checks: Option<&'a RefCell<WorkspaceCheckRuntime<'a>>>,
+    control_layer_lifecycle: &'control crate::control_layers::ControlLayerLifecycle,
     nesting_depth: usize,
 }
 
@@ -6577,6 +6578,7 @@ fn run_agent_steps(
         workspace_root,
         command_backend.is_some(),
     )?);
+    let mut control_layer_lifecycle = crate::control_layers::ControlLayerLifecycle::default();
     let read_cache = RefCell::new(DeterministicReadCache::default());
     let proactive_lsp = if args.repository_less || lsp_registry.servers.is_empty() {
         None
@@ -7169,6 +7171,7 @@ fn run_agent_steps(
             args,
             workspace_root,
             lsp_registry,
+            &mut control_layer_lifecycle,
             &gate_state,
             generation_messages,
             generation_tools,
@@ -7179,6 +7182,7 @@ fn run_agent_steps(
             nesting_depth,
             run_budget,
             usize::from(closure_checkpoint.is_some()),
+            active_work_unit.as_ref().map(|unit| unit.path.as_str()),
         ) {
             Ok(generated) => generated,
             Err(error) => {
@@ -7855,6 +7859,7 @@ fn run_agent_steps(
                         exposed_tools: generation_tools.to_vec(),
                         active_work_unit: active_work_unit.clone(),
                         workspace_checks: workspace_checks.as_ref(),
+                        control_layer_lifecycle: &control_layer_lifecycle,
                         nesting_depth,
                     },
                     messages,
@@ -8036,6 +8041,7 @@ fn run_agent_steps(
                         exposed_tools: generation_tools.to_vec(),
                         active_work_unit: active_work_unit.clone(),
                         workspace_checks: workspace_checks.as_ref(),
+                        control_layer_lifecycle: &control_layer_lifecycle,
                         nesting_depth,
                     },
                     messages,
@@ -8433,7 +8439,7 @@ fn run_final_grace(
     debug_assert_eq!(grace_args.max_tokens, reserved_max_tokens);
     sink.workflow_model_invocation_started(nesting_depth)?;
     let completion =
-        match generator.generate(&grace_args, &prepared.messages, &[], true, None, None) {
+        match generator.generate(&grace_args, &prepared.messages, &[], true, None, None, None) {
             Ok(completion) => completion,
             Err(error) => {
                 let termination_reason = termination_reason_for_runtime_error(&error);
@@ -9403,7 +9409,7 @@ fn semantic_tool_result_payload(result: &str) -> &str {
 }
 
 fn render_call_failure(
-    env: &ToolExecutionEnv<'_>,
+    env: &ToolExecutionEnv<'_, '_>,
     tool: &str,
     reason: ToolFailureReason,
     message: &str,
@@ -9441,7 +9447,7 @@ fn render_call_failure(
     )
 }
 
-fn tool_known_to_runtime(tool: &str, env: &ToolExecutionEnv<'_>) -> bool {
+fn tool_known_to_runtime(tool: &str, env: &ToolExecutionEnv<'_, '_>) -> bool {
     is_builtin_tool_name(tool)
         || env.mcp_registry.tool(tool).is_some()
         || env.lsp_registry.tool(tool).is_some()
@@ -9492,7 +9498,7 @@ fn dependent_tool_batch_feedback(calls: &[AgentToolCall]) -> Option<String> {
     None
 }
 
-fn tool_is_parallel_safe(tool: &str, env: &ToolExecutionEnv<'_>) -> bool {
+fn tool_is_parallel_safe(tool: &str, env: &ToolExecutionEnv<'_, '_>) -> bool {
     env.mcp_registry
         .tool(tool)
         .is_some_and(crate::mcp::McpToolSpec::parallel_safe)
@@ -9553,7 +9559,7 @@ fn execute_tool_calls(
     calls: Vec<AgentToolCall>,
     thinking: Option<String>,
     assistant_output: &str,
-    env: ToolExecutionEnv<'_>,
+    env: ToolExecutionEnv<'_, '_>,
     messages: &mut Vec<ChatMessage>,
     sink: &mut dyn EventSink,
     metrics: &mut RunMetrics,
@@ -9905,6 +9911,94 @@ fn execute_tool_calls(
             }
         }
     }
+
+    let mut independently_validated = Vec::with_capacity(runnable.len());
+    for call in runnable {
+        if matches!(
+            call.tool.as_str(),
+            "write_file" | "replace_file" | "edit_file" | "apply_patch"
+        ) {
+            let snapshot = controller_collar_snapshot(
+                env.workspace_root,
+                &env.gate_state.borrow(),
+                &env.exposed_tools,
+                env.active_work_unit.as_ref().map(|unit| unit.path.as_str()),
+            );
+            let decision = snapshot.and_then(|snapshot| {
+                snapshot
+                    .as_ref()
+                    .map(|snapshot| {
+                        env.control_layer_lifecycle.validate_completed_mutation(
+                            env.workspace_root,
+                            &env.exposed_tools,
+                            snapshot,
+                            &call.tool,
+                            &call.arguments,
+                        )
+                    })
+                    .transpose()
+            });
+            match decision {
+                Ok(Some(pb_control_collar::CompletionDecision::Reject(code))) => {
+                    let message = format!(
+                        "independent execution-time control-layer replay rejected the mutation ({})",
+                        code.as_str()
+                    );
+                    let result = render_call_failure(
+                        &env,
+                        &call.tool,
+                        ToolFailureReason::PreconditionUnmet,
+                        &message,
+                        true,
+                        "Revise the mutation so its complete virtual result satisfies the prepared language constraints, then retry.",
+                        false,
+                    );
+                    results.push(ExecutedToolResult {
+                        tool_call_id: call.id,
+                        tool: call.tool,
+                        arguments: call.arguments,
+                        result,
+                        success: false,
+                        cache_hit: false,
+                        duration_ms: 0,
+                        energy: None,
+                    });
+                    continue;
+                }
+                Ok(Some(
+                    pb_control_collar::CompletionDecision::Accept
+                    | pb_control_collar::CompletionDecision::NotApplicable,
+                ))
+                | Ok(None) => {}
+                Err(error) => {
+                    let result = render_call_failure(
+                        &env,
+                        &call.tool,
+                        ToolFailureReason::PreconditionUnmet,
+                        &format!(
+                            "independent execution-time control-layer replay failed: {error:#}"
+                        ),
+                        true,
+                        "Retry in a new model turn so pb can prepare an exact language world before inference.",
+                        false,
+                    );
+                    results.push(ExecutedToolResult {
+                        tool_call_id: call.id,
+                        tool: call.tool,
+                        arguments: call.arguments,
+                        result,
+                        success: false,
+                        cache_hit: false,
+                        duration_ms: 0,
+                        energy: None,
+                    });
+                    continue;
+                }
+            }
+        }
+        independently_validated.push(call);
+    }
+    let runnable = independently_validated;
 
     let tool_context = ToolContext {
         text_backend: env.text_backend,
@@ -11148,6 +11242,10 @@ fn rejected_completion_diagnostic(output: &str, finish_reason: CompletionFinishR
 }
 
 trait CompletionEngine {
+    fn supports_streaming_language_layers(&self) -> bool {
+        false
+    }
+
     fn supports_thinking(&self) -> Result<bool> {
         Ok(true)
     }
@@ -11177,6 +11275,7 @@ trait CompletionEngine {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        language_layers: Option<crate::control_layers::SharedLanguageLayers>,
         semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput>;
 
@@ -13997,6 +14096,8 @@ pub(crate) struct ScriptedCompletion {
 
 #[cfg(test)]
 const SCRIPTED_PAYLOAD_LIMIT_PREFIX: &str = "<pb-scripted-payload-limit>";
+#[cfg(test)]
+const SCRIPTED_CONSTRAINT_DEAD_END_PREFIX: &str = "<pb-scripted-constraint-dead-end>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScriptedAgentOutcome {
@@ -14048,6 +14149,7 @@ impl CompletionEngine for ScriptedCompletionEngine {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         _mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        _language_layers: Option<crate::control_layers::SharedLanguageLayers>,
         _semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
         self.generation_tool_counts.push(tools.len());
@@ -14063,21 +14165,24 @@ impl CompletionEngine for ScriptedCompletionEngine {
             .pop_front()
             .context("scripted harness fixture exhausted its completion transcript")?;
         #[cfg(test)]
-        let (content, native) = completion
+        let (content, constraint_terminal_state) = if let Some(content) = completion
             .content
             .strip_prefix(SCRIPTED_PAYLOAD_LIMIT_PREFIX)
-            .map_or_else(
-                || (completion.content.clone(), None),
-                |content| {
-                    (
-                        content.to_string(),
-                        Some(crate::events::NativeGenerationUsage {
-                            constraint_terminal_state: Some("mutation_payload_limit".to_string()),
-                            ..crate::events::NativeGenerationUsage::default()
-                        }),
-                    )
-                },
-            );
+        {
+            (content.to_string(), Some("mutation_payload_limit"))
+        } else if let Some(content) = completion
+            .content
+            .strip_prefix(SCRIPTED_CONSTRAINT_DEAD_END_PREFIX)
+        {
+            (content.to_string(), Some("constraint_dead_end"))
+        } else {
+            (completion.content.clone(), None)
+        };
+        #[cfg(test)]
+        let native = constraint_terminal_state.map(|state| crate::events::NativeGenerationUsage {
+            constraint_terminal_state: Some(state.to_string()),
+            ..crate::events::NativeGenerationUsage::default()
+        });
         #[cfg(not(test))]
         let (content, native) = (completion.content, None);
         Ok(CompletionOutput {
@@ -14571,6 +14676,10 @@ struct PromptRecordingEngine<'a> {
 }
 
 impl CompletionEngine for PromptRecordingEngine<'_> {
+    fn supports_streaming_language_layers(&self) -> bool {
+        self.inner.supports_streaming_language_layers()
+    }
+
     fn supports_thinking(&self) -> Result<bool> {
         self.inner.supports_thinking()
     }
@@ -14593,6 +14702,7 @@ impl CompletionEngine for PromptRecordingEngine<'_> {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        language_layers: Option<crate::control_layers::SharedLanguageLayers>,
         semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
         let rendered =
@@ -14610,6 +14720,7 @@ impl CompletionEngine for PromptRecordingEngine<'_> {
             tools,
             enable_thinking,
             mutation_snapshot,
+            language_layers,
             semantic_boundary,
         )
     }
@@ -14812,6 +14923,10 @@ impl<'a> LlamaCompletionEngine<'a> {
 }
 
 impl CompletionEngine for LlamaCompletionEngine<'_> {
+    fn supports_streaming_language_layers(&self) -> bool {
+        true
+    }
+
     fn measure_prompt(
         &mut self,
         args: &AgentRequest,
@@ -14853,10 +14968,12 @@ impl CompletionEngine for LlamaCompletionEngine<'_> {
         tools: &[BuiltInToolSchema],
         _enable_thinking: bool,
         mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        language_layers: Option<crate::control_layers::SharedLanguageLayers>,
         semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
         let mut request = llama_chat_request(args, messages, tools)?;
         request.mutation_snapshot = mutation_snapshot.cloned();
+        request.language_layers = language_layers;
         request.semantic_boundary = semantic_boundary.cloned();
         llama_completion_output(self.session.generate_chat(&request)?)
     }
@@ -15015,6 +15132,7 @@ fn llama_chat_request(
         tool_constraint_mode,
         terminal_tool_names,
         mutation_snapshot: None,
+        language_layers: None,
         semantic_boundary: None,
         ctx_size: args.ctx_size,
         threads: args.threads,
@@ -15032,6 +15150,10 @@ struct FlashMoeCompletionEngine {
 }
 
 impl CompletionEngine for FlashMoeCompletionEngine {
+    fn supports_streaming_language_layers(&self) -> bool {
+        true
+    }
+
     fn supports_thinking(&self) -> Result<bool> {
         Ok(self.runtime.lock()?.supports_thinking())
     }
@@ -15068,6 +15190,7 @@ impl CompletionEngine for FlashMoeCompletionEngine {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        language_layers: Option<crate::control_layers::SharedLanguageLayers>,
         semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
         let mut engine = self.runtime.lock()?;
@@ -15078,6 +15201,7 @@ impl CompletionEngine for FlashMoeCompletionEngine {
             tools,
             enable_thinking,
             mutation_snapshot,
+            language_layers,
             semantic_boundary,
         )
     }
@@ -15111,6 +15235,10 @@ struct BorrowedFlashMoeCompletionEngine<'a> {
 }
 
 impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
+    fn supports_streaming_language_layers(&self) -> bool {
+        true
+    }
+
     fn supports_thinking(&self) -> Result<bool> {
         Ok(self.engine.supports_thinking())
     }
@@ -15145,6 +15273,7 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
         tools: &[BuiltInToolSchema],
         enable_thinking: bool,
         mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+        language_layers: Option<crate::control_layers::SharedLanguageLayers>,
         semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     ) -> Result<CompletionOutput> {
         generate_flashmoe_completion(
@@ -15154,6 +15283,7 @@ impl CompletionEngine for BorrowedFlashMoeCompletionEngine<'_> {
             tools,
             enable_thinking,
             mutation_snapshot,
+            language_layers,
             semantic_boundary,
         )
     }
@@ -15187,6 +15317,7 @@ fn generate_flashmoe_completion(
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
     mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+    language_layers: Option<crate::control_layers::SharedLanguageLayers>,
     semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
 ) -> Result<CompletionOutput> {
     generate_flashmoe_completion_with_required_tool(
@@ -15196,6 +15327,7 @@ fn generate_flashmoe_completion(
         tools,
         enable_thinking,
         mutation_snapshot,
+        language_layers,
         semantic_boundary,
         None,
     )
@@ -15208,6 +15340,7 @@ fn generate_flashmoe_completion_with_required_tool(
     tools: &[BuiltInToolSchema],
     enable_thinking: bool,
     mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+    language_layers: Option<crate::control_layers::SharedLanguageLayers>,
     semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
     required_tool_name: Option<&str>,
 ) -> Result<CompletionOutput> {
@@ -15219,6 +15352,7 @@ fn generate_flashmoe_completion_with_required_tool(
         required_tool_name,
     )?;
     request.mutation_snapshot = mutation_snapshot.cloned();
+    request.language_layers = language_layers;
     request.semantic_boundary = semantic_boundary.cloned();
     generate_flashmoe_completion_from_request(engine, args, request)
 }
@@ -15479,6 +15613,7 @@ fn flashmoe_structured_request_with_required_tool(
         )?),
         json_schema: None,
         mutation_snapshot: None,
+        language_layers: None,
         semantic_boundary: None,
         add_generation_prompt: true,
         enable_thinking,
@@ -15501,6 +15636,7 @@ fn controller_collar_snapshot(
     workspace_root: &Path,
     gate_state: &GateState,
     tools: &[BuiltInToolSchema],
+    bound_mutation_path: Option<&str>,
 ) -> Result<Option<CollarWorkspaceSnapshot>> {
     if !tools.iter().any(|tool| {
         matches!(
@@ -15545,7 +15681,11 @@ fn controller_collar_snapshot(
         }
         entries.push(CollarSnapshotEntry::new(logical_path, bytes));
     }
-    Ok(Some(CollarWorkspaceSnapshot::new(entries)?))
+    let mut snapshot = CollarWorkspaceSnapshot::new(entries)?;
+    if let Some(path) = bound_mutation_path {
+        snapshot = snapshot.with_bound_mutation_path(CollarLogicalPath::parse(path.to_string())?);
+    }
+    Ok(Some(snapshot))
 }
 
 fn generate_and_parse_action_with_retries(
@@ -15554,6 +15694,7 @@ fn generate_and_parse_action_with_retries(
     args: &AgentRequest,
     workspace_root: &Path,
     lsp_registry: &LspToolRegistry,
+    control_layer_lifecycle: &mut crate::control_layers::ControlLayerLifecycle,
     gate_state: &RefCell<GateState>,
     messages: &[ChatMessage],
     tools: &[BuiltInToolSchema],
@@ -15564,6 +15705,7 @@ fn generate_and_parse_action_with_retries(
     nesting_depth: usize,
     run_budget: &RefCell<RunBudget>,
     closure_checkpoints: usize,
+    bound_mutation_path: Option<&str>,
 ) -> Result<std::result::Result<(String, AgentAction), ParseFailure>> {
     let mut max_tokens = boosted_max_tokens(args);
     let mut attempt_enable_thinking = enable_thinking;
@@ -15579,6 +15721,31 @@ fn generate_and_parse_action_with_retries(
         request.max_tokens = run_budget.borrow().next_model_max_tokens(max_tokens)?;
         let prompt_messages = retry_messages.as_deref().unwrap_or(messages);
         let attempt_tools = retry_tools.as_deref().unwrap_or(tools);
+        // Establish immutable semantic worlds before prompt work, budget reservation, durable
+        // invocation accounting, or backend entry. Rust project loading can be slow; it is never
+        // performed from token sampling or after the model has started this invocation.
+        let mutation_snapshot = controller_collar_snapshot(
+            workspace_root,
+            &gate_state.borrow(),
+            attempt_tools,
+            bound_mutation_path,
+        )?;
+        let language_layers = if generator.supports_streaming_language_layers() {
+            control_layer_lifecycle.prepare_for_inference(
+                workspace_root,
+                attempt_tools,
+                mutation_snapshot.as_ref(),
+            )?
+        } else {
+            None
+        };
+        let semantic_boundary = mutation_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                crate::semantic::semantic_boundary_control(lsp_registry, workspace_root, snapshot)
+            })
+            .transpose()?
+            .flatten();
         let prepared = prepare_generation_prompt(
             generator,
             &request,
@@ -15596,21 +15763,13 @@ fn generate_and_parse_action_with_retries(
         // returns an error, otherwise the stage runner replaces the actionable
         // engine/resource failure with a usage-divergence error.
         metrics.llm_invocations = metrics.llm_invocations.saturating_add(1);
-        let mutation_snapshot =
-            controller_collar_snapshot(workspace_root, &gate_state.borrow(), attempt_tools)?;
-        let semantic_boundary = mutation_snapshot
-            .as_ref()
-            .map(|snapshot| {
-                crate::semantic::semantic_boundary_control(lsp_registry, workspace_root, snapshot)
-            })
-            .transpose()?
-            .flatten();
         let completion = generator.generate(
             &request,
             &prepared.messages,
             attempt_tools,
             attempt_enable_thinking,
             mutation_snapshot.as_ref(),
+            language_layers,
             semantic_boundary.as_ref(),
         )?;
         run_budget
@@ -15804,8 +15963,13 @@ fn generate_and_parse_action_with_retries(
                     continue;
                 }
 
+                let constraint_dead_end =
+                    failure.constraint_terminal_state.as_deref() == Some("constraint_dead_end");
                 let truncated_mutation = truncated_native_tool_name(&failure.output)
-                    .filter(|tool| matches!(*tool, "write_file" | "replace_file"))
+                    .filter(|tool| {
+                        matches!(*tool, "write_file" | "replace_file")
+                            || constraint_dead_end && matches!(*tool, "edit_file" | "apply_patch")
+                    })
                     .filter(|tool| tools.iter().any(|schema| schema.name.as_str() == *tool));
                 if !mutation_retry_used && let Some(tool) = truncated_mutation {
                     mutation_retry_used = true;
@@ -15826,6 +15990,8 @@ fn generate_and_parse_action_with_retries(
                         .unwrap_or_else(|| mutation_payload_char_limit(max_tokens));
                     let target_chars = if payload_limited {
                         ordinary_chars.saturating_mul(2)
+                    } else if constraint_dead_end {
+                        ordinary_chars
                     } else {
                         (ordinary_chars / 2).max(64)
                     };
@@ -15837,6 +16003,10 @@ fn generate_and_parse_action_with_retries(
                         let recovery_description = if payload_limited {
                             format!(
                                 " Payload-bound recovery permits at most {target_chars} content characters at the same generated-token ceiling."
+                            )
+                        } else if constraint_dead_end {
+                            format!(
+                                " Constraint-dead-end recovery permits at most {target_chars} payload characters at the same generated-token ceiling."
                             )
                         } else {
                             format!(
@@ -15851,7 +16021,7 @@ fn generate_and_parse_action_with_retries(
                         }
                     }
                     retry_tools = Some(constrained_tools);
-                    if !payload_limited {
+                    if !payload_limited && !constraint_dead_end {
                         max_tokens = compact_mutation_retry_max_tokens(max_tokens, target_chars);
                     }
                     cap_growth_used = true;
@@ -15870,6 +16040,15 @@ fn generate_and_parse_action_with_retries(
                             format!(
                                 "The constrained {tool} call reached its {ordinary_chars}-character schema boundary after {} of {} available generated tokens and was not executed. Retry {tool} now with one complete, syntactically loadable payload under {target_chars} characters while retaining the same {max_tokens}-token ceiling.{target_instruction} Use the available output capacity, but still omit decoration and commentary. Do not include the rejected payload or read the missing target.",
                                 failure.generated_tokens, failure.generation_max_tokens
+                            ),
+                        )
+                    } else if constraint_dead_end {
+                        (
+                            "Retrying an irreparable constrained mutation",
+                            "Constrained mutation branch recovery",
+                            format!(
+                                "The candidate-only {tool} branch reached a point where no vocabulary token could produce a valid continuation after {} generated tokens. The incomplete call was preserved for diagnosis and was not executed. Retry {tool} once from a fresh model invocation with one complete, structurally and semantically valid payload under {target_chars} characters and within the same {max_tokens}-token ceiling.{target_instruction} Prefer the smallest direct change and avoid repeating the rejected construction.",
+                                failure.generated_tokens
                             ),
                         )
                     } else {
@@ -23374,6 +23553,7 @@ mod tests {
             _tools: &[BuiltInToolSchema],
             _enable_thinking: bool,
             _mutation_snapshot: Option<&CollarWorkspaceSnapshot>,
+            _language_layers: Option<crate::control_layers::SharedLanguageLayers>,
             _semantic_boundary: Option<&crate::inference::SemanticBoundaryControl>,
         ) -> Result<CompletionOutput> {
             bail!("unconstrained generation must not serve Task artifacts")
@@ -29971,6 +30151,72 @@ the next imagined action"#;
     }
 
     #[test]
+    fn irreparable_constraint_branch_gets_one_fresh_mutation_retry() {
+        let tmp = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 2;
+        request.turn_max_tokens_cap = Some(256);
+        request.workflow_action_first_turn = true;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                ScriptedCompletion {
+                    content: format!(
+                        "{SCRIPTED_CONSTRAINT_DEAD_END_PREFIX}<tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"recovered.txt\",\"content\":\"irreparable"
+                    ),
+                    truncated: true,
+                },
+                tool_completion(
+                    "write_file",
+                    json!({"path": "recovered.txt", "content": "recovered\n"}),
+                ),
+                scripted_final("completed after constraint branch recovery"),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(!outcome.reached_final);
+        assert_eq!(outcome.termination_reason, TerminationReason::StepLimit);
+        assert_eq!(outcome.llm_invocations, 3);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(outcome.generation_max_tokens, vec![256, 256, 256]);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("recovered.txt")).unwrap(),
+            "recovered\n"
+        );
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["write_file".to_string()]
+        );
+        let contexts = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::LlmInvocation {
+                    context: Some(context),
+                    ..
+                } => Some(context),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contexts[1].retry_reason,
+            Some(AgentRetryReason::CompactMutationAfterTruncation)
+        );
+        assert_eq!(contexts[1].mutation_payload_char_limit, Some(256));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { summary, message, .. }
+                if summary == "Retrying an irreparable constrained mutation"
+                    && message.contains("after 1 generated tokens")
+                    && message.contains("same 256-token ceiling")
+                    && message.contains("exact original target recovered.txt")
+        )));
+    }
+
+    #[test]
     fn payload_bound_mutation_gets_one_larger_retry_at_the_same_token_ceiling() {
         let tmp = init_contract_test_repo();
         let mut request = test_agent_request(AgentProfile::Build, 256);
@@ -32035,14 +32281,20 @@ the next imagined action"#;
             .filter(|tool| tool.name == "replace_file")
             .collect::<Vec<_>>();
 
-        let snapshot = controller_collar_snapshot(tmp.path(), &gate, &tools)
+        let snapshot = controller_collar_snapshot(tmp.path(), &gate, &tools, Some("main.py"))
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot.total_bytes(), bytes.len());
+        assert_eq!(
+            snapshot
+                .bound_mutation_path()
+                .map(CollarLogicalPath::as_str),
+            Some("main.py")
+        );
 
         std::fs::write(tmp.path().join("main.py"), "value = 2\n").unwrap();
-        let stale = controller_collar_snapshot(tmp.path(), &gate, &tools)
+        let stale = controller_collar_snapshot(tmp.path(), &gate, &tools, None)
             .unwrap()
             .unwrap();
         assert!(stale.is_empty());

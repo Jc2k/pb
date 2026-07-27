@@ -318,6 +318,22 @@ fn generation_lifecycle_keeps_the_token_that_completes_json() {
     assert!(!generation.should_decode());
     assert!(!generation.stopped_by_terminal_tool_call());
     assert!(!generation.stopped_by_constraint_payload_limit());
+    assert!(!generation.stopped_by_constraint_dead_end());
+    assert_eq!(generation.into_generated(), vec![30]);
+}
+
+#[test]
+fn generation_lifecycle_preserves_an_irreparable_constraint_prefix_for_retry() {
+    let mut sessions = FlashMoeSessionCache::default();
+    let mut generation = sessions.begin_generation(None, vec![10, 20], 4, 1);
+    generation.record_sampled_token(30, false, false);
+
+    generation.stop_at_constraint_dead_end();
+
+    assert!(!generation.should_decode());
+    assert!(!generation.stopped_by_terminal_tool_call());
+    assert!(!generation.stopped_by_constraint_payload_limit());
+    assert!(generation.stopped_by_constraint_dead_end());
     assert_eq!(generation.into_generated(), vec![30]);
 }
 

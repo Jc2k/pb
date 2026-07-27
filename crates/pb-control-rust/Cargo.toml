@@ -1,0 +1,21 @@
+[package]
+name = "pb-control-rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pb-control-collar = { path = "../pb-control-collar" }
+ra_ap_base_db = "=0.0.344"
+ra_ap_hir = "=0.0.344"
+ra_ap_ide_db = "=0.0.344"
+ra_ap_load-cargo = "=0.0.344"
+ra_ap_project_model = "=0.0.344"
+ra_ap_vfs = "=0.0.344"
+serde = { workspace = true }
+thiserror = { workspace = true }
+tree-sitter = "=0.25.10"
+tree-sitter-rust = "=0.24.2"
+
+[dev-dependencies]
+tempfile = "3.10.1"

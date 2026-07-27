@@ -106,10 +106,25 @@ file counts—never source, patch, argument, symbol, or path content.
 Request-local prefix and patch checkpoints retain only the bounded in-memory state needed to compare
 candidate branches. They are stream-scoped, discarded with the constraint session, grant no new
 path or tool authority, and are never accepted as executor evidence.
+The active work-unit target is carried in that immutable snapshot when a target-bound schema omits
+`path`. The collar may inject only this controller-owned value for validation; a model value cannot
+replace it or widen the accepted-plan ledger.
+
+`pb-control-rust` is likewise unpublished and has no live-workspace or publication authority. The
+controller gives it a verified immutable shadow plus content/configuration/dependency identities.
+Rust Cargo metadata runs offline, build scripts are not loaded, and no procedural-macro server is
+started in the safe profile. Missing cached dependencies fail readiness instead of fetching. The
+project world must be loaded and primed before a Rust-edit-capable model invocation; decoding uses a
+request-local Salsa snapshot and performs no filesystem, Cargo, network, process, or LSP activity.
+An epoch lease prevents the cache from revising that database while a decoder can query it. A
+concurrent request or unsupported invalidation receives another prepared world.
 
 The executor does not trust generation-time acceptance. It repeats path/capability/schema/read gates,
 reconstructs the virtual mutation, verifies current base hashes and syntax, and publishes through
-the existing atomic file operations. Constrained patches additionally require exact in-memory hunk
+the existing atomic file operations. When a native Rust world was prepared, executor entry first
+revalidates the full live-world identity and replays every complete virtual Rust result through a
+fresh analyzer stack. This includes known/generated provenance, deletion events, the last patch
+hunk, and untouched base tails. Constrained patches additionally require exact in-memory hunk
 application and `git apply --check` without recount. The broader recount-compatible Git path is
 limited to the unconstrained llama.cpp compatibility backend and is not a fallback.
 
@@ -118,6 +133,8 @@ The model does not need to supply its target path; pb resolves it from the accep
 records the resolved path in the tool event. Bounded multi-create batches validate every member
 before execution and roll back earlier members after an execution failure. Diagnostic previews
 cannot mint selected-check evidence and are rejected if they alter repository or Git control state.
+An empty constrained candidate frontier preserves only a diagnostic partial transcript, executes no
+call, and can authorize at most one fresh retry of the same mutation capability and target.
 Optional contract `work_unit_guidance` is size-bounded advisory prompt text for an exact allowed
 path; it grants no capability, scope, evidence, progress, or stage transition.
 Intrinsic deterministic controller actions preserve the same boundary and cannot be configured or
@@ -341,6 +358,7 @@ resolved versioned namespace; it never targets the storage root itself.
 | Publication | Local Ready evidence does not authorize a push, pull request, merge, or provider-side mutation. |
 | Goal automatic continuation | Explicit per-Goal user authority inside snapshotted totals. It does not approve new paths, integrations, network access, policy prompts, or publication. |
 | Syntax-constrained mutation | Prevents a supported file from completing with parser-invalid syntax. It does not prove type correctness, name resolution, compilation, test success, runtime behavior, or security. Unsupported extensions retain ordinary executor checks. |
+| Native Rust v1 constraint | Resolves project targets, imports, and selected callable/literal shapes against one exact pinned rust-analyzer world. Only qualified exact facts may veto. Disabled build scripts/procedural macros, generated APIs, partial dependency state, deeper inference, ownership, and runtime behavior remain unknown; this is not a compilation guarantee. |
 
 ## Credentials
 

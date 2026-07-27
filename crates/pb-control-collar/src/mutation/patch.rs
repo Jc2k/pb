@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
     CollarError, CollarResult,
-    analysis::{SourcePrefixOracle, Viability},
+    analysis::{SourceOrigin, SourcePrefixOracle, Viability},
     mutation::{LogicalPath, MutationKind, PreparedFileMutation, WorkspaceSnapshot},
     receipt::Digest,
 };
@@ -12,6 +12,40 @@ pub struct PreparedPatch {
     patch_sha256: Digest,
     files: Vec<PreparedFileMutation>,
     hunk_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatchVirtualSegment {
+    pub origin: SourceOrigin,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatchVirtualDeletion {
+    /// Byte offset in the virtual result at which known base bytes were removed.
+    pub result_offset: usize,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatchVirtualFile {
+    pub path: LogicalPath,
+    pub segments: Vec<PatchVirtualSegment>,
+    pub deletions: Vec<PatchVirtualDeletion>,
+    pub complete: bool,
+}
+
+impl PatchVirtualFile {
+    pub fn len(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| segment.bytes.len())
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.iter().all(|segment| segment.bytes.is_empty())
+    }
 }
 
 /// Chunk-boundary-independent logical patch stream. Completed patch lines are validated as soon as
@@ -128,6 +162,14 @@ impl PatchStream {
         }
     }
 
+    /// Virtual result prefixes for every file encountered so far. The final entry may be
+    /// tentative and includes a partial hunk line; origins distinguish immutable base/context
+    /// bytes from model-generated additions.
+    pub fn virtual_files(&self) -> CollarResult<Vec<PatchVirtualFile>> {
+        self.prefix
+            .virtual_files(&self.bytes[self.processed_bytes..])
+    }
+
     pub fn rollback(&mut self, checkpoint: PatchCheckpoint) -> CollarResult<()> {
         if checkpoint.stream_id != self.stream_id {
             return Err(CollarError::Mutation(
@@ -156,6 +198,42 @@ impl PatchStream {
         })?;
         prepare_patch(&self.snapshot, patch, self.max_files, self.max_hunks)
     }
+
+    /// Finish the authoritative patch transaction and its origin-preserving virtual result in one
+    /// operation. This is used by the execution-time semantic replay gate: unlike a prefix probe,
+    /// it commits the final unterminated patch line, completes the last hunk, and appends the
+    /// untouched base tail before returning.
+    pub fn finish_with_virtual_files(
+        mut self,
+    ) -> CollarResult<(PreparedPatch, Vec<PatchVirtualFile>)> {
+        let patch = std::str::from_utf8(&self.bytes).map_err(|error| {
+            CollarError::Mutation(format!(
+                "canonical patch is not UTF-8 at byte {}",
+                error.valid_up_to()
+            ))
+        })?;
+        let prepared = prepare_patch(&self.snapshot, patch, self.max_files, self.max_hunks)?;
+        if self.processed_bytes < self.bytes.len() {
+            let line =
+                std::str::from_utf8(&self.bytes[self.processed_bytes..]).map_err(|error| {
+                    CollarError::Mutation(format!(
+                        "canonical patch line is not UTF-8 at byte {}",
+                        self.processed_bytes.saturating_add(error.valid_up_to())
+                    ))
+                })?;
+            self.prefix.push_line(
+                &self.snapshot,
+                line,
+                self.max_bytes,
+                self.max_files,
+                self.max_hunks,
+            )?;
+            self.processed_bytes = self.bytes.len();
+        }
+        let virtual_files = self.prefix.finish_virtual_files()?;
+        verify_virtual_results(&prepared, &virtual_files)?;
+        Ok((prepared, virtual_files))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -164,6 +242,7 @@ struct PatchPrefixValidator {
     paths: BTreeSet<LogicalPath>,
     files: usize,
     hunks: usize,
+    completed_files: Vec<PatchVirtualFile>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -193,6 +272,8 @@ struct PrefixFile {
     base_cursor: usize,
     result_lines: usize,
     result_oracle: SourcePrefixOracle,
+    result_segments: Vec<PatchVirtualSegment>,
+    result_deletions: Vec<PatchVirtualDeletion>,
     file_hunks: usize,
     hunk: Option<PrefixHunk>,
 }
@@ -252,6 +333,9 @@ impl PatchPrefixValidator {
                             "file diff for {:?} has no hunks",
                             file.path.as_str()
                         )));
+                    }
+                    if file.kind != MutationKind::Delete {
+                        self.completed_files.push(file.virtual_file(true, &[])?);
                     }
                     self.phase = self.start_file(line, max_files)?;
                     return Ok(());
@@ -371,13 +455,63 @@ impl PatchPrefixValidator {
             base_cursor: 0,
             result_lines: 0,
             result_oracle,
+            result_segments: Vec::new(),
+            result_deletions: Vec::new(),
             file_hunks: 0,
             hunk: None,
         }))
     }
+
+    fn virtual_files(&self, partial_line: &[u8]) -> CollarResult<Vec<PatchVirtualFile>> {
+        let mut files = self.completed_files.clone();
+        if let PatchPrefixPhase::File(file) = &self.phase
+            && file.kind != MutationKind::Delete
+        {
+            files.push(file.virtual_file(false, partial_line)?);
+        }
+        Ok(files)
+    }
+
+    fn finish_virtual_files(mut self) -> CollarResult<Vec<PatchVirtualFile>> {
+        let phase = std::mem::take(&mut self.phase);
+        let PatchPrefixPhase::File(mut file) = phase else {
+            return Err(CollarError::Mutation(
+                "canonical patch ended before a file hunk was complete".to_string(),
+            ));
+        };
+        file.finish()?;
+        if file.kind != MutationKind::Delete {
+            self.completed_files.push(file.virtual_file(true, &[])?);
+        }
+        Ok(self.completed_files)
+    }
 }
 
 impl PrefixFile {
+    fn finish(&mut self) -> CollarResult<()> {
+        if let Some(mut hunk) = self.hunk.take() {
+            if let Some((kind, mut bytes)) = hunk.pending.take() {
+                // Unified-diff hunk lines describe newline-terminated source lines unless an
+                // explicit `\ No newline at end of file` marker committed the pending line.
+                bytes.push(b'\n');
+                self.commit_hunk_line(&mut hunk, kind, bytes)?;
+            }
+            if hunk.old_seen != hunk.header.old_count || hunk.new_seen != hunk.header.new_count {
+                return Err(CollarError::Mutation(format!(
+                    "patch ended before declared hunk counts were satisfied for {:?}",
+                    self.path.as_str()
+                )));
+            }
+        }
+        if self.file_hunks == 0 {
+            return Err(CollarError::Mutation(format!(
+                "file diff for {:?} has no hunks",
+                self.path.as_str()
+            )));
+        }
+        self.append_untouched_base(self.base_lines.len())
+    }
+
     fn probe_partial_hunk_line(&self, line: &[u8]) -> CollarResult<()> {
         let Some(hunk) = self.hunk.as_ref() else {
             return Ok(());
@@ -581,7 +715,7 @@ impl PrefixFile {
         match kind {
             HunkLineKind::Context => {
                 match_base_line(&self.path, &self.base_lines, self.base_cursor, &bytes)?;
-                self.append_result_bytes(&bytes)?;
+                self.append_result_bytes(SourceOrigin::Known, &bytes)?;
                 self.base_cursor = self.base_cursor.saturating_add(1);
                 self.result_lines = self.result_lines.saturating_add(1);
                 hunk.old_seen = hunk.old_seen.saturating_add(1);
@@ -589,11 +723,17 @@ impl PrefixFile {
             }
             HunkLineKind::Deletion => {
                 match_base_line(&self.path, &self.base_lines, self.base_cursor, &bytes)?;
+                let result_offset = self
+                    .result_segments
+                    .iter()
+                    .map(|segment| segment.bytes.len())
+                    .sum();
+                push_virtual_deletion(&mut self.result_deletions, result_offset, &bytes);
                 self.base_cursor = self.base_cursor.saturating_add(1);
                 hunk.old_seen = hunk.old_seen.saturating_add(1);
             }
             HunkLineKind::Addition => {
-                self.append_result_bytes(&bytes)?;
+                self.append_result_bytes(SourceOrigin::Generated, &bytes)?;
                 self.result_lines = self.result_lines.saturating_add(1);
                 hunk.new_seen = hunk.new_seen.saturating_add(1);
             }
@@ -611,13 +751,13 @@ impl PrefixFile {
         if self.kind != MutationKind::Delete {
             for index in self.base_cursor..end {
                 let bytes = self.base_lines[index].clone();
-                self.append_result_bytes(&bytes)?;
+                self.append_result_bytes(SourceOrigin::Known, &bytes)?;
             }
         }
         Ok(())
     }
 
-    fn append_result_bytes(&mut self, bytes: &[u8]) -> CollarResult<()> {
+    fn append_result_bytes(&mut self, origin: SourceOrigin, bytes: &[u8]) -> CollarResult<()> {
         if self.kind != MutationKind::Delete {
             let report = self.result_oracle.push(bytes)?;
             if report.viability == Viability::Impossible {
@@ -627,9 +767,135 @@ impl PrefixFile {
                     report.rule
                 )));
             }
+            push_virtual_segment(&mut self.result_segments, origin, bytes);
         }
         Ok(())
     }
+
+    fn virtual_file(&self, complete: bool, partial_line: &[u8]) -> CollarResult<PatchVirtualFile> {
+        let mut segments = self.result_segments.clone();
+        let Some(hunk) = self.hunk.as_ref() else {
+            return Ok(PatchVirtualFile {
+                path: self.path.clone(),
+                segments,
+                deletions: self.result_deletions.clone(),
+                complete,
+            });
+        };
+        let counts_complete =
+            hunk.old_seen == hunk.header.old_count && hunk.new_seen == hunk.header.new_count;
+        const NO_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file";
+        let partial_is_marker =
+            partial_line.first() == Some(&b'\\') && NO_NEWLINE_MARKER.starts_with(partial_line);
+        if let Some((kind, pending)) = &hunk.pending {
+            if matches!(kind, HunkLineKind::Context | HunkLineKind::Addition) {
+                let origin = match kind {
+                    HunkLineKind::Context => SourceOrigin::Known,
+                    HunkLineKind::Addition => SourceOrigin::Generated,
+                    HunkLineKind::Deletion => unreachable!(),
+                };
+                push_virtual_segment(&mut segments, origin, pending);
+                if !partial_line.is_empty() && !partial_is_marker {
+                    push_virtual_segment(&mut segments, origin, b"\n");
+                }
+            }
+        }
+        if !partial_line.is_empty() && !partial_is_marker && !counts_complete {
+            match partial_line.split_first() {
+                Some((b' ', content)) => {
+                    push_virtual_segment(&mut segments, SourceOrigin::Known, content)
+                }
+                Some((b'+', content)) => {
+                    push_virtual_segment(&mut segments, SourceOrigin::Generated, content)
+                }
+                Some((b'-', _)) | None => {}
+                _ => {
+                    return Err(CollarError::Mutation(format!(
+                        "invalid virtual hunk-line prefix for {:?}",
+                        self.path.as_str()
+                    )));
+                }
+            }
+        }
+        Ok(PatchVirtualFile {
+            path: self.path.clone(),
+            segments,
+            deletions: self.result_deletions.clone(),
+            complete,
+        })
+    }
+}
+
+fn verify_virtual_results(
+    prepared: &PreparedPatch,
+    virtual_files: &[PatchVirtualFile],
+) -> CollarResult<()> {
+    let expected = prepared
+        .files()
+        .iter()
+        .filter_map(|file| file.result_bytes().map(|bytes| (file.path(), bytes)))
+        .collect::<Vec<_>>();
+    if expected.len() != virtual_files.len() {
+        return Err(CollarError::Mutation(
+            "streaming patch result omitted or added a non-deleted file".to_string(),
+        ));
+    }
+    for ((expected_path, expected_bytes), virtual_file) in expected.into_iter().zip(virtual_files) {
+        let actual = virtual_file
+            .segments
+            .iter()
+            .flat_map(|segment| segment.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        if expected_path != &virtual_file.path || expected_bytes != actual {
+            return Err(CollarError::Mutation(format!(
+                "streaming patch result diverged from the authoritative transaction for {:?}",
+                virtual_file.path.as_str()
+            )));
+        }
+        if !virtual_file.complete {
+            return Err(CollarError::Mutation(format!(
+                "streaming patch result did not close {:?}",
+                virtual_file.path.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn push_virtual_segment(
+    segments: &mut Vec<PatchVirtualSegment>,
+    origin: SourceOrigin,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    if let Some(last) = segments.last_mut()
+        && last.origin == origin
+    {
+        last.bytes.extend_from_slice(bytes);
+    } else {
+        segments.push(PatchVirtualSegment {
+            origin,
+            bytes: bytes.to_vec(),
+        });
+    }
+}
+
+fn push_virtual_deletion(
+    deletions: &mut Vec<PatchVirtualDeletion>,
+    result_offset: usize,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    // Keep one event per committed hunk line. Prefix mirrors use append-only event counts; merging
+    // into the last entry would mutate an event that a language layer may already have consumed.
+    deletions.push(PatchVirtualDeletion {
+        result_offset,
+        bytes: bytes.to_vec(),
+    });
 }
 
 fn parse_diff_header_line(line: &str) -> CollarResult<(LogicalPath, LogicalPath)> {
@@ -1362,6 +1628,63 @@ mod tests {
             "+two = 3\n",
         );
         assert_stream_equivalent(&snapshot, patch, 4, 8);
+    }
+
+    #[test]
+    fn completed_virtual_patch_includes_final_line_base_tail_and_deletions() {
+        let path = LogicalPath::parse("main.py").unwrap();
+        let snapshot = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            path,
+            b"one = 1\ntwo = 2\nstale = 0\nthree = 3\n".to_vec(),
+        )])
+        .unwrap();
+        let patch = concat!(
+            "--- a/main.py\n",
+            "+++ b/main.py\n",
+            "@@ -1,3 +1,2 @@\n",
+            " one = 1\n",
+            "-two = 2\n",
+            "-stale = 0\n",
+            "+two = 4"
+        );
+        let mut stream = PatchStream::new(snapshot, 4096, 1, 1).unwrap();
+        stream.push(patch.as_bytes()).unwrap();
+        let (prepared, files) = stream.finish_with_virtual_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].complete);
+        assert_eq!(files[0].deletions.len(), 2);
+        assert_eq!(files[0].deletions[0].bytes, b"two = 2\n");
+        assert_eq!(files[0].deletions[1].bytes, b"stale = 0\n");
+        assert_eq!(
+            prepared.files()[0].result_bytes(),
+            Some(&b"one = 1\ntwo = 4\nthree = 3\n"[..])
+        );
+    }
+
+    #[test]
+    fn virtual_patch_prefix_preserves_known_and_generated_origins() {
+        let snapshot = snapshot("src/lib.rs", b"fn one() {}\nfn two() {}\n");
+        let prefix = concat!(
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -1,2 +1,2 @@\n",
+            " fn one() {}\n",
+            "-fn two() {}\n",
+            "+fn two() { let _ = \"text\" + 1; }",
+        );
+        let mut stream = PatchStream::new(snapshot, 4096, 2, 2).unwrap();
+        stream.push(prefix.as_bytes()).unwrap();
+        let files = stream.virtual_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path.as_str(), "src/lib.rs");
+        assert_eq!(files[0].segments.len(), 2);
+        assert_eq!(files[0].segments[0].origin, SourceOrigin::Known);
+        assert_eq!(files[0].segments[0].bytes, b"fn one() {}\n");
+        assert_eq!(files[0].segments[1].origin, SourceOrigin::Generated);
+        assert_eq!(
+            files[0].segments[1].bytes,
+            b"fn two() { let _ = \"text\" + 1; }"
+        );
     }
 
     #[test]

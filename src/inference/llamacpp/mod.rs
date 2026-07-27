@@ -66,6 +66,7 @@ pub struct LlamaCppChatRequest {
     pub terminal_tool_names: Vec<String>,
     /// Immutable controller-authorized bytes for generation-time mutation validation.
     pub mutation_snapshot: Option<pb_control_collar::mutation::WorkspaceSnapshot>,
+    pub language_layers: Option<crate::control_layers::SharedLanguageLayers>,
     pub semantic_boundary: Option<crate::inference::SemanticBoundaryControl>,
     pub ctx_size: u32,
     pub threads: Option<i32>,
@@ -1242,13 +1243,15 @@ impl LlamaToolConstraint {
         };
         match dialect {
             pb_control_collar::protocol::ToolDialect::QwenJson => {
-                let gate = crate::inference::flashmoe::constraints::mutation_completion_gate(
-                    dialect,
-                    request.tool_constraint_mode,
-                    &tools,
-                    &request.terminal_tool_names,
-                    request.mutation_snapshot.as_ref(),
-                )?;
+                let gate =
+                    crate::inference::flashmoe::constraints::mutation_completion_gate_with_layers(
+                        dialect,
+                        request.tool_constraint_mode,
+                        &tools,
+                        &request.terminal_tool_names,
+                        request.mutation_snapshot.as_ref(),
+                        request.language_layers.clone(),
+                    )?;
                 let mut constraint = crate::inference::flashmoe::constraints::NativeToolConstraint::compile_with_mutation_gate(
                     request.tool_constraint_mode,
                     &tools,
@@ -1292,7 +1295,11 @@ impl LlamaToolConstraint {
                     request.mutation_snapshot.clone().unwrap_or_default(),
                 )?;
                 Ok(Some(Self::DeepSeek {
-                    constraint: pb_control_collar::protocol::DsmlConstraint::compile(manifest)?,
+                    constraint:
+                        pb_control_collar::protocol::DsmlConstraint::compile_with_language_layers(
+                            manifest,
+                            request.language_layers.clone(),
+                        )?,
                     semantic_provider: request.semantic_boundary.clone(),
                     mode: match request.tool_constraint_mode {
                         crate::inference::flashmoe::NativeToolConstraintMode::Auto => {
@@ -1867,6 +1874,7 @@ mod tests {
                 crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed,
             terminal_tool_names: Vec::new(),
             mutation_snapshot: Some(pb_control_collar::mutation::WorkspaceSnapshot::default()),
+            language_layers: None,
             semantic_boundary: None,
             ctx_size: 128,
             threads: None,
@@ -1927,6 +1935,7 @@ mod tests {
                 crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed,
             terminal_tool_names: Vec::new(),
             mutation_snapshot: Some(pb_control_collar::mutation::WorkspaceSnapshot::default()),
+            language_layers: None,
             semantic_boundary: Some(crate::inference::SemanticBoundaryControl::new(
                 RejectSemanticBoundary,
             )),

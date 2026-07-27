@@ -274,6 +274,9 @@ pub struct StructuredGenerationRequest {
     /// Immutable controller-authorized bytes for generation-time mutation validation. Sampling
     /// code must never consult the live workspace.
     pub mutation_snapshot: Option<pb_control_collar::mutation::WorkspaceSnapshot>,
+    /// Request-local warmed language layers. Expensive project loading is complete before this
+    /// request exists; sampling only advances and rolls back their incremental parser state.
+    pub language_layers: Option<crate::control_layers::SharedLanguageLayers>,
     /// Optional controller-owned semantic boundary probe. It performs no analyzer I/O inside the
     /// collar crate and is invoked only for completed mutation payload candidates.
     pub semantic_boundary: Option<crate::inference::SemanticBoundaryControl>,
@@ -317,6 +320,7 @@ impl StructuredGenerationRequest {
             stage_root: None,
             json_schema: None,
             mutation_snapshot: None,
+            language_layers: None,
             semantic_boundary: None,
             add_generation_prompt: true,
             enable_thinking: true,
