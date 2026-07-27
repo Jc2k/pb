@@ -920,6 +920,13 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    SemanticGate {
+        receipt: pb_control_collar::analysis::SemanticGateReceipt,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nesting_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     ContextLimit {
         context_capacity: usize,
         reserved_generation_tokens: usize,
@@ -2199,6 +2206,18 @@ impl EventEnvelope {
                     timestamp_ms: Some(now),
                 },
             },
+            AgentEvent::SemanticGate {
+                receipt,
+                nesting_depth,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                event: AgentEvent::SemanticGate {
+                    receipt,
+                    nesting_depth,
+                    timestamp_ms: Some(now),
+                },
+            },
         }
     }
 }
@@ -2301,6 +2320,42 @@ mod tests {
                 timestamp_ms: Some(_),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn semantic_gate_receipt_round_trips_without_source_content() {
+        let receipt = pb_control_collar::analysis::SemanticGateReceipt {
+            contract_version: pb_control_collar::analysis::SEMANTIC_EVIDENCE_CONTRACT_VERSION,
+            stage: pb_control_collar::analysis::SemanticEvidenceStage::FinalExecutor,
+            scope: pb_control_collar::analysis::SemanticEvidenceScope::Document,
+            workspace_sha256: "a".repeat(64),
+            affected_documents: 1,
+            providers: Vec::new(),
+            viability: pb_control_collar::analysis::Viability::Unknown,
+            closure: pb_control_collar::analysis::ClosureVerdict::Reject,
+            definite_errors: Vec::new(),
+            unknown_reasons: vec![pb_control_collar::analysis::UnknownReason::ProviderUnavailable],
+            wall_millis: 3,
+            budget_millis: 8_000,
+        };
+        receipt.validate().unwrap();
+        let envelope = EventEnvelope::with_timestamp(AgentEvent::SemanticGate {
+            receipt: receipt.clone(),
+            nesting_depth: Some(1),
+            timestamp_ms: None,
+        });
+
+        let serialized = serde_json::to_string(&envelope).unwrap();
+        assert!(!serialized.contains("src/"));
+        let restored: EventEnvelope = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            restored.event,
+            AgentEvent::SemanticGate {
+                receipt: restored,
+                nesting_depth: Some(1),
+                timestamp_ms: Some(_),
+            } if restored == receipt
         ));
     }
 

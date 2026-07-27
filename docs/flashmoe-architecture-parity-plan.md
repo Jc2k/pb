@@ -314,10 +314,11 @@ changes neither expert placement, scheduler I/O, nor CPU/GPU handoff.
 An opt-in LSP semantic boundary can additionally probe the exact completed payload overlay for Qwen
 JSON and DeepSeek DSML. A required authoritative `Reject` masks the closing payload candidate; an
 advisory or unknown result defers to the syntax rung. The executor captures and revalidates the
-current workspace during a fresh semantic transaction immediately before publication. Both
-backends currently advertise
-`candidate_probe_only`; no recurrent-state or KV replay guarantee is inferred from ordinary session
-caching.
+current workspace in a fresh exact bounded shadow and isolated LSP session immediately before
+publication. Required Rust evidence additionally needs a loaded non-empty crate graph and document
+membership. Generation-boundary and final-executor decisions use separate content-free receipts.
+Both backends currently advertise `candidate_probe_only`; no recurrent-state or KV replay guarantee
+is inferred from ordinary session caching.
 Persistent stage evidence is workflow-checkpoint data keyed by content fingerprints and path hashes,
 not model memory or expert state. None of these follow-ons changes the resident/streamed decision,
 adds a hidden environment toggle, enables unsupported thinking, or permits native load failure to

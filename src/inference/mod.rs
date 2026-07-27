@@ -22,6 +22,10 @@ pub trait SemanticBoundaryProvider: Send + Sync {
         tool: &str,
         arguments: &serde_json::Value,
     ) -> pb_control_collar::analysis::ProviderVerdict;
+
+    fn evidence(&self) -> Option<pb_control_collar::analysis::SemanticGateReceipt> {
+        None
+    }
 }
 
 struct SemanticBoundaryInner {
@@ -36,13 +40,15 @@ struct SemanticBoundaryInner {
 #[derive(Clone)]
 pub struct SemanticBoundaryControl(Arc<SemanticBoundaryInner>);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticBoundaryStats {
     pub probes: u64,
     pub allows: u64,
     pub rejects: u64,
     pub defers: u64,
     pub wall_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<pb_control_collar::analysis::SemanticGateReceipt>,
 }
 
 /// Strongest decode-state recovery contract implemented and qualified by a backend. Candidate
@@ -95,6 +101,7 @@ impl SemanticBoundaryControl {
             rejects: self.0.rejects.load(Ordering::Relaxed),
             defers: self.0.defers.load(Ordering::Relaxed),
             wall_millis: self.0.wall_nanos.load(Ordering::Relaxed) / 1_000_000,
+            receipt: self.0.provider.evidence(),
         }
     }
 }

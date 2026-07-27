@@ -407,6 +407,22 @@ pub fn discover_tools_with_lease(
     discover_tools_inner(servers, workspace_root, Some(lease))
 }
 
+/// Create fresh provider sessions for an immutable semantic shadow workspace while preserving the
+/// controller-owned service lease and exact server configuration. Sessions connected to the live
+/// workspace are deliberately not reused across this trust boundary.
+pub(crate) fn isolated_registry_for_servers(
+    registry: &LspToolRegistry,
+    servers: &BTreeSet<String>,
+) -> LspToolRegistry {
+    let selected = registry
+        .servers
+        .iter()
+        .filter(|(name, _)| servers.contains(*name))
+        .map(|(name, config)| (name.clone(), config.clone()))
+        .collect();
+    discover_tools_inner(selected, Path::new("."), registry.lease.clone())
+}
+
 struct CachedLspRegistry {
     fingerprint: String,
     registry: LspToolRegistry,
@@ -1020,6 +1036,145 @@ pub fn overlay_diagnostics(
     expected_workspace_fingerprint: &str,
     timeout: Duration,
 ) -> Result<LspOverlayDiagnosticReport> {
+    overlay_diagnostics_inner(
+        registry,
+        workspace_root,
+        documents,
+        OverlayWorkspaceGuard::Git(expected_workspace_fingerprint),
+        timeout,
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LspOverlayTreeSnapshot {
+    fingerprint: String,
+}
+
+impl LspOverlayTreeSnapshot {
+    pub(crate) fn capture(workspace_root: &Path) -> Result<Self> {
+        let mut paths = Vec::new();
+        let mut total_bytes = 0u64;
+        for entry in walkdir::WalkDir::new(workspace_root).follow_links(false) {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to inspect semantic shadow {}",
+                    workspace_root.display()
+                )
+            })?;
+            if entry.path() == workspace_root {
+                continue;
+            }
+            if paths.len() >= 100_000 {
+                bail!("semantic shadow exceeds the 100000-path bound");
+            }
+            if !entry.file_type().is_file() && !entry.file_type().is_dir() {
+                bail!(
+                    "semantic shadow contains a non-regular entry at {}",
+                    entry.path().display()
+                );
+            }
+            let relative = entry.path().strip_prefix(workspace_root).with_context(|| {
+                format!(
+                    "semantic shadow entry {} escapes its root",
+                    entry.path().display()
+                )
+            })?;
+            let normalized = relative
+                .to_str()
+                .context("semantic shadow contains a non-UTF-8 path")?
+                .replace('\\', "/");
+            pb_control_collar::mutation::LogicalPath::parse(normalized.clone())?;
+            let bytes = if entry.file_type().is_file() {
+                let bytes = std::fs::read(entry.path()).with_context(|| {
+                    format!("failed to read semantic shadow entry {normalized}")
+                })?;
+                total_bytes = total_bytes
+                    .checked_add(bytes.len() as u64)
+                    .context("semantic shadow byte count overflowed")?;
+                if total_bytes > MAX_PROACTIVE_LSP_SNAPSHOT_BYTES {
+                    bail!(
+                        "semantic shadow exceeds the {}-byte bound",
+                        MAX_PROACTIVE_LSP_SNAPSHOT_BYTES
+                    );
+                }
+                Some(bytes)
+            } else {
+                None
+            };
+            paths.push((normalized, bytes));
+        }
+        paths.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut digest = sha2::Sha256::new();
+        for (path, bytes) in paths {
+            use sha2::Digest as _;
+            digest.update((path.len() as u64).to_le_bytes());
+            digest.update(path.as_bytes());
+            match bytes {
+                Some(bytes) => {
+                    digest.update(b"file");
+                    digest.update((bytes.len() as u64).to_le_bytes());
+                    digest.update(bytes);
+                }
+                None => digest.update(b"directory"),
+            }
+        }
+        use sha2::Digest as _;
+        Ok(Self {
+            fingerprint: format!("{:x}", digest.finalize()),
+        })
+    }
+}
+
+pub(crate) fn overlay_diagnostics_in_shadow(
+    registry: &LspToolRegistry,
+    workspace_root: &Path,
+    documents: &[LspOverlayDocument],
+    expected_workspace: &LspOverlayTreeSnapshot,
+    timeout: Duration,
+) -> Result<LspOverlayDiagnosticReport> {
+    overlay_diagnostics_inner(
+        registry,
+        workspace_root,
+        documents,
+        OverlayWorkspaceGuard::Tree(expected_workspace),
+        timeout,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum OverlayWorkspaceGuard<'a> {
+    Git(&'a str),
+    Tree(&'a LspOverlayTreeSnapshot),
+}
+
+impl<'a> OverlayWorkspaceGuard<'a> {
+    fn expected_fingerprint(self) -> &'a str {
+        match self {
+            Self::Git(fingerprint) => fingerprint,
+            Self::Tree(snapshot) => &snapshot.fingerprint,
+        }
+    }
+
+    fn capture(self, workspace_root: &Path, deadline: Instant) -> Result<String> {
+        match self {
+            Self::Git(_) => Ok(proactive_workspace_snapshot(workspace_root, deadline)?.fingerprint),
+            Self::Tree(_) => {
+                if Instant::now() >= deadline {
+                    bail!("semantic shadow snapshot timed out");
+                }
+                Ok(LspOverlayTreeSnapshot::capture(workspace_root)?.fingerprint)
+            }
+        }
+    }
+}
+
+fn overlay_diagnostics_inner(
+    registry: &LspToolRegistry,
+    workspace_root: &Path,
+    documents: &[LspOverlayDocument],
+    workspace_guard: OverlayWorkspaceGuard<'_>,
+    timeout: Duration,
+) -> Result<LspOverlayDiagnosticReport> {
     if documents.is_empty() {
         bail!("semantic LSP overlay requires at least one document");
     }
@@ -1048,14 +1203,14 @@ pub fn overlay_diagnostics(
         }
     }
     let deadline = Instant::now() + timeout;
-    let before = proactive_workspace_snapshot(workspace_root, deadline)?;
+    let before = workspace_guard.capture(workspace_root, deadline)?;
     let mut report = LspOverlayDiagnosticReport {
         targets: Vec::new(),
         requested_targets: Vec::new(),
         unknown_reasons: BTreeSet::new(),
         complete: false,
     };
-    if before.fingerprint != expected_workspace_fingerprint {
+    if before != workspace_guard.expected_fingerprint() {
         report
             .unknown_reasons
             .insert(pb_control_collar::analysis::UnknownReason::ConfigurationChanged);
@@ -1161,6 +1316,7 @@ pub fn overlay_diagnostics(
         }
         let previous_deadline = client.active_deadline.replace(deadline);
         let result = (|| -> Result<Vec<LspOverlayDiagnosticTarget>> {
+            client.ensure_diagnostic_ready(deadline.saturating_duration_since(Instant::now()))?;
             let mut opened = Vec::with_capacity(documents.len());
             for document in &documents {
                 opened.push((
@@ -1168,6 +1324,13 @@ pub fn overlay_diagnostics(
                     client.open_overlay_document(workspace_root, document, true)?,
                     pb_control_collar::receipt::Digest::of(document.text.as_bytes()),
                 ));
+            }
+            client.ensure_diagnostic_ready(deadline.saturating_duration_since(Instant::now()))?;
+            for (_, document, _) in &opened {
+                client.ensure_document_semantic_scope(
+                    &document.uri,
+                    deadline.saturating_duration_since(Instant::now()),
+                )?;
             }
             let mut targets = Vec::with_capacity(opened.len());
             for (path, document, text_sha256) in opened {
@@ -1202,8 +1365,8 @@ pub fn overlay_diagnostics(
         }
     }
 
-    match proactive_workspace_snapshot(workspace_root, deadline) {
-        Ok(after) if after.fingerprint == before.fingerprint => {}
+    match workspace_guard.capture(workspace_root, deadline) {
+        Ok(after) if after == before => {}
         Ok(_) => {
             report.targets.clear();
             report
@@ -1358,6 +1521,9 @@ struct LspClient {
     diagnostic_serial: u64,
     diagnostics: BTreeMap<String, DiagnosticSnapshot>,
     supports_pull_diagnostics: bool,
+    requires_diagnostic_barrier: bool,
+    diagnostic_ready: bool,
+    diagnostic_unhealthy: bool,
     language_ids: Vec<String>,
     root_uri: String,
     root_name: String,
@@ -1562,6 +1728,14 @@ impl LspClient {
             .and_then(|name| name.to_str())
             .unwrap_or("workspace")
             .to_string();
+        let requires_diagnostic_barrier = config
+            .container_image
+            .as_deref()
+            .is_some_and(|image| !image.trim().is_empty())
+            && config
+                .language_ids
+                .iter()
+                .any(|language| language.eq_ignore_ascii_case("rust"));
         let mut client = Self {
             process,
             stdin_writer: LspStdinWriter::spawn(stdin),
@@ -1570,6 +1744,9 @@ impl LspClient {
             diagnostic_serial: 0,
             diagnostics: BTreeMap::new(),
             supports_pull_diagnostics: false,
+            requires_diagnostic_barrier,
+            diagnostic_ready: !requires_diagnostic_barrier,
+            diagnostic_unhealthy: false,
             language_ids: config.language_ids.clone(),
             root_uri: root_uri.clone(),
             root_name: root_name.clone(),
@@ -1580,7 +1757,7 @@ impl LspClient {
             transport_shutdown: false,
             active_deadline: Some(initialize_deadline),
         };
-        let mut initialize_params = json!({"processId": std::process::id(), "rootUri": root_uri, "workspaceFolders": [{"uri": root_uri, "name": root_name}], "capabilities": {"textDocument":{"synchronization":{"didSave":true,"dynamicRegistration":false},"hover":{},"definition":{},"references":{},"documentSymbol":{},"publishDiagnostics":{},"diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false}},"workspace":{"symbol":{},"workspaceFolders":true,"configuration":true,"diagnostics":{"refreshSupport":false}}}});
+        let mut initialize_params = json!({"processId": std::process::id(), "rootUri": root_uri, "workspaceFolders": [{"uri": root_uri, "name": root_name}], "capabilities": {"window":{"workDoneProgress":true},"textDocument":{"synchronization":{"didSave":true,"dynamicRegistration":false},"hover":{},"definition":{},"references":{},"documentSymbol":{},"publishDiagnostics":{},"diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false}},"workspace":{"symbol":{},"workspaceFolders":true,"configuration":true,"diagnostics":{"refreshSupport":true}}}});
         if let Some(options) = config.initialization_options.clone()
             && let Some(params) = initialize_params.as_object_mut()
         {
@@ -1593,6 +1770,77 @@ impl LspClient {
         client.active_deadline = None;
         client.shutdown_timeout = Duration::from_secs(2);
         Ok(client)
+    }
+
+    fn ensure_diagnostic_ready(&mut self, timeout: Duration) -> Result<()> {
+        if self.diagnostic_ready {
+            return Ok(());
+        }
+        let deadline = self.effective_deadline(timeout);
+        while !self.diagnostic_ready {
+            if self.diagnostic_unhealthy {
+                bail!("language server reported an unhealthy diagnostic world");
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for the language server diagnostic readiness barrier");
+            }
+            if self.requires_diagnostic_barrier {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let status = self.request_with_timeout(
+                    "rust-analyzer/analyzerStatus",
+                    json!({"textDocument": null}),
+                    remaining,
+                )?;
+                let workspace_loaded = status
+                    .as_str()
+                    .is_some_and(rust_analyzer_status_has_loaded_workspace);
+                let crate_graph_loaded = if workspace_loaded {
+                    self.request_with_timeout(
+                        "rust-analyzer/viewCrateGraph",
+                        json!({"full": false}),
+                        deadline.saturating_duration_since(Instant::now()),
+                    )?
+                    .as_str()
+                    .is_some_and(rust_analyzer_crate_graph_is_loaded)
+                } else {
+                    false
+                };
+                if crate_graph_loaded {
+                    self.diagnostic_ready = true;
+                    break;
+                }
+                std::thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            } else {
+                let message = self.read_message(deadline)?;
+                self.handle_incoming_message(message)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_document_semantic_scope(
+        &mut self,
+        document_uri: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        if !self.requires_diagnostic_barrier {
+            return Ok(());
+        }
+        let status = self.request_with_timeout(
+            "rust-analyzer/analyzerStatus",
+            json!({"textDocument": {"uri": document_uri}}),
+            timeout,
+        )?;
+        let status = status
+            .as_str()
+            .context("rust-analyzer returned a non-string analyzer status")?;
+        if !rust_analyzer_status_has_document_scope(status) {
+            bail!("rust-analyzer overlay document does not belong to the loaded crate graph");
+        }
+        Ok(())
     }
 
     fn call_with_diagnostic_timeout(
@@ -1761,6 +2009,10 @@ impl LspClient {
                     "textDocument/didChange",
                     json!({"textDocument":{"uri":uri,"version":version},"contentChanges":[{"text":text}]}),
                 )?;
+                if self.requires_diagnostic_barrier {
+                    self.diagnostic_ready = false;
+                    self.diagnostic_unhealthy = false;
+                }
                 self.open_documents.insert(
                     uri.clone(),
                     OpenDocument {
@@ -1781,6 +2033,10 @@ impl LspClient {
                 "textDocument/didOpen",
                 json!({"textDocument":{"uri":uri,"languageId":language_id,"version":1,"text":text}}),
             )?;
+            if self.requires_diagnostic_barrier {
+                self.diagnostic_ready = false;
+                self.diagnostic_unhealthy = false;
+            }
             self.open_documents.insert(
                 uri.clone(),
                 OpenDocument {
@@ -1966,6 +2222,16 @@ impl LspClient {
             .unwrap_or_default()
     }
     fn handle_notification(&mut self, method: &str, params: Value) {
+        if method == "experimental/serverStatus"
+            && params
+                .get("quiescent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            let healthy = params.get("health").and_then(Value::as_str) == Some("ok");
+            self.diagnostic_ready = healthy;
+            self.diagnostic_unhealthy = !healthy;
+        }
         if method == "textDocument/publishDiagnostics"
             && let Some(uri) = params.get("uri").and_then(Value::as_str)
             && self.open_documents.contains_key(uri)
@@ -1986,6 +2252,9 @@ impl LspClient {
     }
 
     fn handle_server_request(&mut self, id: Value, method: &str, params: Value) -> Result<()> {
+        if method == "workspace/diagnostic/refresh" {
+            self.diagnostic_ready = true;
+        }
         let result = match method {
             "workspace/configuration" => {
                 let count = params
@@ -1999,7 +2268,8 @@ impl LspClient {
             }
             "client/registerCapability"
             | "client/unregisterCapability"
-            | "window/workDoneProgress/create" => Value::Null,
+            | "window/workDoneProgress/create"
+            | "workspace/diagnostic/refresh" => Value::Null,
             _ => Value::Null,
         };
         self.write(&json!({"jsonrpc":"2.0","id":id,"result":result}))
@@ -2009,6 +2279,40 @@ impl LspClient {
                 ))
             })
     }
+}
+
+fn rust_analyzer_status_has_loaded_workspace(status: &str) -> bool {
+    let words = status.split_whitespace().collect::<Vec<_>>();
+    let loaded = words.windows(2).any(|window| {
+        window[0] == "Loaded"
+            && window[1]
+                .trim_matches(|character: char| !character.is_ascii_digit())
+                .parse::<usize>()
+                .is_ok_and(|count| count > 0)
+    });
+    let workspace = words.windows(2).any(|window| {
+        window[0]
+            .trim_matches(|character: char| !character.is_ascii_digit())
+            .parse::<usize>()
+            .is_ok_and(|count| count > 0)
+            && window[1].starts_with("workspace")
+    });
+    loaded && workspace
+}
+
+fn rust_analyzer_crate_graph_is_loaded(graph: &str) -> bool {
+    graph.lines().any(|line| {
+        let line = line.trim_start();
+        let digit_count = line.bytes().take_while(u8::is_ascii_digit).count();
+        digit_count > 0 && line[digit_count..].trim_start().starts_with("[label=")
+    })
+}
+
+fn rust_analyzer_status_has_document_scope(status: &str) -> bool {
+    status.contains("Crates for file")
+        && !status.contains("Does not belong to any crate")
+        && !status.contains("No crates")
+        && !status.contains("0 crates")
 }
 
 fn spawn_lsp_transport_until(
@@ -2087,6 +2391,8 @@ fn spawn_lsp_transport(
                         config,
                     )?),
                     workspace_access: config.workspace_access,
+                    analysis_workspace_root: (workspace_root != lease.record()?.workspace_root)
+                        .then(|| workspace_root.to_path_buf()),
                     network_access: config.network_access,
                     cache_ids: config.cache_ids.clone(),
                 })?;
@@ -2436,6 +2742,37 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_semantic_readiness_requires_workspace_graph_and_document_membership() {
+        assert!(!rust_analyzer_status_has_loaded_workspace(
+            "No workspaces\n"
+        ));
+        assert!(!rust_analyzer_status_has_loaded_workspace(
+            "Loaded 0 packages across 0 workspaces.\n"
+        ));
+        assert!(rust_analyzer_status_has_loaded_workspace(
+            "Loaded 1 packages across 1 workspace.\n"
+        ));
+        assert!(!rust_analyzer_crate_graph_is_loaded(
+            "digraph rust_analyzer_crate_graph {\n}\n"
+        ));
+        assert!(rust_analyzer_crate_graph_is_loaded(
+            "digraph rust_analyzer_crate_graph {\n0 [label=\"crate\"]\n}\n"
+        ));
+        assert!(!rust_analyzer_crate_graph_is_loaded(
+            "crate graph unavailable"
+        ));
+        assert!(!rust_analyzer_status_has_document_scope(
+            "Crates for file 3:\nDoes not belong to any crate"
+        ));
+        assert!(!rust_analyzer_status_has_document_scope(
+            "Crates for file 3:\nNo crates"
+        ));
+        assert!(rust_analyzer_status_has_document_scope(
+            "Crates for file 3:\n0 pb_semantic_qualification"
+        ));
+    }
 
     #[test]
     fn project_config_round_trips_initialization_and_sidecar_capabilities() {

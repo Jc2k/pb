@@ -4,14 +4,16 @@
 //! identities, diagnostic debt, and verdict types remain in `pb-control-collar`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use pb_control_collar::analysis::{
     AnalyzerCapability, BaselineCompleteness, ClosureVerdict, DefiniteErrorClass, DiagnosticDelta,
-    DiagnosticIdentity, ProviderVerdict, SemanticDiagnosticSnapshot, SemanticFileBinding,
+    DiagnosticIdentity, ProviderVerdict, SemanticDiagnosticSnapshot, SemanticEvidenceScope,
+    SemanticEvidenceStage, SemanticFileBinding, SemanticGateReceipt, SemanticProviderEvidence,
     SemanticWorldSnapshot, UnknownReason, Viability, diagnostic_delta,
 };
 use pb_control_collar::mutation::LogicalPath;
@@ -23,11 +25,107 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::lsp::{
-    LspOverlayDiagnosticReport, LspOverlayDiagnosticTarget, LspOverlayDocument, LspToolRegistry,
+    LspOverlayDiagnosticReport, LspOverlayDiagnosticTarget, LspOverlayDocument,
+    LspOverlayTreeSnapshot, LspToolRegistry,
 };
 
 const SEMANTIC_PROVIDER_TIMEOUT: Duration = Duration::from_secs(8);
 const SEMANTIC_BOUNDARY_CACHE_ENTRIES: usize = 256;
+const SEMANTIC_SHADOW_MAX_FILES: usize = 100_000;
+const SEMANTIC_SHADOW_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+struct SemanticShadowWorkspace {
+    directory: tempfile::TempDir,
+    snapshot: LspOverlayTreeSnapshot,
+}
+
+impl SemanticShadowWorkspace {
+    fn capture(workspace_root: &Path, content: &crate::workspace::ContentSnapshot) -> Result<Self> {
+        if content.paths.len() > SEMANTIC_SHADOW_MAX_FILES {
+            bail!("semantic shadow exceeds the {SEMANTIC_SHADOW_MAX_FILES}-file bound");
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("pb-semantic-shadow-")
+            .tempdir()
+            .context("failed to create semantic shadow workspace")?;
+        let mut total_bytes = 0u64;
+        for (relative, recorded) in &content.paths {
+            if recorded.kind != "file" {
+                bail!(
+                    "semantic shadow cannot authoritatively copy workspace entry kind {}",
+                    recorded.kind
+                );
+            }
+            let logical = LogicalPath::parse(relative.clone())?;
+            let source = workspace_root.join(logical.as_str());
+            let metadata = std::fs::symlink_metadata(&source)
+                .with_context(|| format!("failed to inspect semantic shadow source {relative}"))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!("semantic shadow source changed kind for {relative}");
+            }
+            let remaining = SEMANTIC_SHADOW_MAX_BYTES.saturating_sub(total_bytes);
+            let bytes = read_semantic_shadow_source(&source, remaining)
+                .with_context(|| format!("failed to read semantic shadow source {relative}"))?;
+            total_bytes = total_bytes
+                .checked_add(bytes.len() as u64)
+                .context("semantic shadow byte count overflowed")?;
+            let mut recorded_digest = Sha256::new();
+            recorded_digest.update(b"file");
+            recorded_digest.update(&bytes);
+            if format!("{:x}", recorded_digest.finalize()) != recorded.fingerprint {
+                bail!("semantic shadow source changed content before copying {relative}");
+            }
+            let destination = directory.path().join(logical.as_str());
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create semantic shadow parent for {relative}")
+                })?;
+            }
+            std::fs::write(&destination, &bytes)
+                .with_context(|| format!("failed to write semantic shadow entry {relative}"))?;
+            let copied = std::fs::read(&destination)
+                .with_context(|| format!("failed to verify semantic shadow entry {relative}"))?;
+            if Digest::of(&copied) != Digest::of(&bytes) {
+                bail!("semantic shadow copy verification failed for {relative}");
+            }
+        }
+        let after = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+        if after.fingerprint != content.fingerprint {
+            bail!("workspace changed while creating the semantic shadow");
+        }
+        let snapshot = LspOverlayTreeSnapshot::capture(directory.path())?;
+        Ok(Self {
+            directory,
+            snapshot,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+fn read_semantic_shadow_source(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        bail!("semantic shadow source is not a bounded regular file");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes || bytes.len() as u64 != metadata.len() {
+        bail!("semantic shadow source changed size while reading");
+    }
+    Ok(bytes)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticOverlayMutation {
@@ -49,6 +147,86 @@ pub struct SemanticGateReport {
     pub workspace_fingerprint: String,
     pub providers: Vec<ProviderSemanticResult>,
     pub verdict: ProviderVerdict,
+    pub affected_documents: usize,
+    pub wall_millis: u64,
+}
+
+impl SemanticGateReport {
+    fn failure(
+        workspace_fingerprint: String,
+        affected_documents: usize,
+        reason: UnknownReason,
+        required: bool,
+        wall_millis: u64,
+    ) -> Self {
+        Self {
+            workspace_fingerprint,
+            providers: Vec::new(),
+            verdict: semantic_unknown(reason, required),
+            affected_documents,
+            wall_millis,
+        }
+    }
+
+    pub fn receipt(
+        &self,
+        stage: SemanticEvidenceStage,
+        budget: Duration,
+    ) -> Result<SemanticGateReceipt> {
+        let providers = self
+            .providers
+            .iter()
+            .map(|provider| {
+                let definite_errors = provider
+                    .delta
+                    .introduced
+                    .iter()
+                    .map(|diagnostic| diagnostic.class)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                SemanticProviderEvidence {
+                    provider: provider.world.id.provider.clone(),
+                    provider_version: provider.world.id.provider_version.clone(),
+                    world_sha256: provider.world.id.world_sha256.clone(),
+                    configuration_sha256: provider.world.id.configuration_sha256.clone(),
+                    dependency_sha256: provider.world.id.dependency_sha256.clone(),
+                    baseline: provider.world.baseline,
+                    document_count: provider
+                        .baseline
+                        .document_versions
+                        .len()
+                        .max(provider.candidate.document_versions.len()),
+                    introduced_diagnostics: provider.delta.introduced.len(),
+                    resolved_diagnostics: provider.delta.resolved.len(),
+                    unchanged_diagnostics: provider.delta.unchanged.len(),
+                    authoritative: provider.delta.authoritative,
+                    definite_errors,
+                    unknown_reasons: provider.delta.unknown_reasons.iter().copied().collect(),
+                }
+            })
+            .collect();
+        let receipt = SemanticGateReceipt {
+            contract_version: pb_control_collar::analysis::SEMANTIC_EVIDENCE_CONTRACT_VERSION,
+            stage,
+            scope: if self.affected_documents == 1 {
+                SemanticEvidenceScope::Document
+            } else {
+                SemanticEvidenceScope::AffectedTargets
+            },
+            workspace_sha256: self.workspace_fingerprint.clone(),
+            affected_documents: self.affected_documents,
+            providers,
+            viability: self.verdict.viability,
+            closure: self.verdict.closure,
+            definite_errors: self.verdict.definite_errors.clone(),
+            unknown_reasons: self.verdict.unknown_reasons.clone(),
+            wall_millis: self.wall_millis,
+            budget_millis: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
 }
 
 pub struct SemanticProviderBroker<'a> {
@@ -65,7 +243,30 @@ struct LspSemanticBoundaryProvider {
     workspace_root: PathBuf,
     workspace: WorkspaceSnapshot,
     expected_workspace_fingerprint: String,
-    cache: Mutex<BTreeMap<String, ProviderVerdict>>,
+    cache: Mutex<BTreeMap<String, (ProviderVerdict, Option<SemanticGateReceipt>)>>,
+    latest_receipt: Mutex<Option<SemanticGateReceipt>>,
+}
+
+impl LspSemanticBoundaryProvider {
+    fn record_probe(
+        &self,
+        key: String,
+        verdict: ProviderVerdict,
+        receipt: Option<SemanticGateReceipt>,
+    ) -> ProviderVerdict {
+        if let Ok(mut latest) = self.latest_receipt.lock() {
+            *latest = receipt.clone();
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            if cache.len() >= SEMANTIC_BOUNDARY_CACHE_ENTRIES
+                && let Some(oldest) = cache.keys().next().cloned()
+            {
+                cache.remove(&oldest);
+            }
+            cache.insert(key, (verdict.clone(), receipt));
+        }
+        verdict
+    }
 }
 
 pub fn semantic_boundary_control(
@@ -106,46 +307,123 @@ pub fn semantic_boundary_control(
             workspace: workspace.clone(),
             expected_workspace_fingerprint: after.fingerprint,
             cache: Mutex::new(BTreeMap::new()),
+            latest_receipt: Mutex::new(None),
         },
     )))
 }
 
 impl crate::inference::SemanticBoundaryProvider for LspSemanticBoundaryProvider {
     fn probe(&self, tool: &str, arguments: &Value) -> ProviderVerdict {
+        let started = Instant::now();
         let key = semantic_probe_identity(tool, arguments);
-        if let Ok(cache) = self.cache.lock()
-            && let Some(verdict) = cache.get(&key)
-        {
-            return verdict.clone();
+        let required_for_call =
+            semantic_call_has_required_provider(&self.registry, tool, arguments);
+        let cached = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key).cloned());
+        if let Some((verdict, receipt)) = cached {
+            if let Ok(mut latest) = self.latest_receipt.lock() {
+                *latest = receipt;
+            }
+            return verdict;
         }
         let mutations = match semantic_mutations_from_call(&self.workspace, tool, arguments) {
             Ok(mutations) => mutations,
             Err(_) => {
-                return semantic_unknown(UnknownReason::UnsupportedConstruct, true);
+                let report = SemanticGateReport::failure(
+                    self.expected_workspace_fingerprint.clone(),
+                    1,
+                    UnknownReason::UnsupportedConstruct,
+                    required_for_call,
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                let receipt = report
+                    .receipt(
+                        SemanticEvidenceStage::GenerationBoundary,
+                        SEMANTIC_PROVIDER_TIMEOUT,
+                    )
+                    .ok();
+                return self.record_probe(key, report.verdict, receipt);
             }
         };
         let required = transaction_has_required_provider(&self.registry, &mutations);
-        let verdict = match crate::workspace::ContentSnapshot::capture(&self.workspace_root) {
-            Ok(current) if current.fingerprint == self.expected_workspace_fingerprint => {
-                match SemanticProviderBroker::new(&self.registry, &self.workspace_root)
-                    .analyze_transaction(&mutations)
-                {
-                    Ok(report) => boundary_enforcement_verdict(report.verdict, required),
-                    Err(_) => semantic_unknown(UnknownReason::ProviderUnavailable, required),
+        let (verdict, receipt) =
+            match crate::workspace::ContentSnapshot::capture(&self.workspace_root) {
+                Ok(current) if current.fingerprint == self.expected_workspace_fingerprint => {
+                    match SemanticProviderBroker::new(&self.registry, &self.workspace_root)
+                        .analyze_transaction(&mutations)
+                    {
+                        Ok(mut report) => {
+                            report.verdict = boundary_enforcement_verdict(report.verdict, required);
+                            let receipt = report
+                                .receipt(
+                                    SemanticEvidenceStage::GenerationBoundary,
+                                    SEMANTIC_PROVIDER_TIMEOUT,
+                                )
+                                .ok();
+                            (report.verdict, receipt)
+                        }
+                        Err(_) => {
+                            let report = SemanticGateReport::failure(
+                                self.expected_workspace_fingerprint.clone(),
+                                mutations.len(),
+                                UnknownReason::ProviderUnavailable,
+                                required,
+                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            );
+                            let receipt = report
+                                .receipt(
+                                    SemanticEvidenceStage::GenerationBoundary,
+                                    SEMANTIC_PROVIDER_TIMEOUT,
+                                )
+                                .ok();
+                            (report.verdict, receipt)
+                        }
+                    }
                 }
-            }
-            Ok(_) => semantic_unknown(UnknownReason::ConfigurationChanged, required),
-            Err(_) => semantic_unknown(UnknownReason::ProviderUnavailable, required),
-        };
-        if let Ok(mut cache) = self.cache.lock() {
-            if cache.len() >= SEMANTIC_BOUNDARY_CACHE_ENTRIES
-                && let Some(oldest) = cache.keys().next().cloned()
-            {
-                cache.remove(&oldest);
-            }
-            cache.insert(key, verdict.clone());
-        }
-        verdict
+                Ok(_) => {
+                    let report = SemanticGateReport::failure(
+                        self.expected_workspace_fingerprint.clone(),
+                        mutations.len(),
+                        UnknownReason::ConfigurationChanged,
+                        required,
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    );
+                    let receipt = report
+                        .receipt(
+                            SemanticEvidenceStage::GenerationBoundary,
+                            SEMANTIC_PROVIDER_TIMEOUT,
+                        )
+                        .ok();
+                    (report.verdict, receipt)
+                }
+                Err(_) => {
+                    let report = SemanticGateReport::failure(
+                        self.expected_workspace_fingerprint.clone(),
+                        mutations.len(),
+                        UnknownReason::ProviderUnavailable,
+                        required,
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    );
+                    let receipt = report
+                        .receipt(
+                            SemanticEvidenceStage::GenerationBoundary,
+                            SEMANTIC_PROVIDER_TIMEOUT,
+                        )
+                        .ok();
+                    (report.verdict, receipt)
+                }
+            };
+        self.record_probe(key, verdict, receipt)
+    }
+
+    fn evidence(&self) -> Option<SemanticGateReceipt> {
+        self.latest_receipt
+            .lock()
+            .ok()
+            .and_then(|receipt| receipt.clone())
     }
 }
 
@@ -177,10 +455,16 @@ impl<'a> SemanticProviderBroker<'a> {
         &self,
         mutations: &[SemanticOverlayMutation],
     ) -> Result<SemanticGateReport> {
+        let started = Instant::now();
         if mutations.is_empty() {
             bail!("semantic transaction requires at least one mutation");
         }
         let content = crate::workspace::ContentSnapshot::capture(self.workspace_root)?;
+        let shadow = SemanticShadowWorkspace::capture(self.workspace_root, &content)?;
+        let required = transaction_has_required_provider(self.registry, mutations);
+        let selected_servers = semantic_server_names(self.registry, mutations, required);
+        let shadow_registry =
+            crate::lsp::isolated_registry_for_servers(self.registry, &selected_servers);
         let mut paths = BTreeSet::new();
         let mut base_documents = Vec::new();
         let mut result_documents = Vec::new();
@@ -214,25 +498,29 @@ impl<'a> SemanticProviderBroker<'a> {
         let baseline_report = if base_documents.is_empty() {
             None
         } else {
-            Some(crate::lsp::overlay_diagnostics(
-                self.registry,
-                self.workspace_root,
+            Some(crate::lsp::overlay_diagnostics_in_shadow(
+                &shadow_registry,
+                shadow.path(),
                 &base_documents,
-                &content.fingerprint,
+                &shadow.snapshot,
                 self.timeout,
             )?)
         };
         let candidate_report = if result_documents.is_empty() {
             None
         } else {
-            Some(crate::lsp::overlay_diagnostics(
-                self.registry,
-                self.workspace_root,
+            Some(crate::lsp::overlay_diagnostics_in_shadow(
+                &shadow_registry,
+                shadow.path(),
                 &result_documents,
-                &content.fingerprint,
+                &shadow.snapshot,
                 self.timeout,
             )?)
         };
+        let current = crate::workspace::ContentSnapshot::capture(self.workspace_root)?;
+        if current.fingerprint != content.fingerprint {
+            bail!("workspace changed while the semantic shadow was being analyzed");
+        }
 
         let mut unknown_reasons = BTreeSet::new();
         if let Some(report) = &baseline_report {
@@ -248,7 +536,7 @@ impl<'a> SemanticProviderBroker<'a> {
 
         let dependency_sha256 = dependency_identity(&content);
         let mut providers = Vec::new();
-        for (server, config) in &self.registry.servers {
+        for (server, config) in &shadow_registry.servers {
             let baseline_targets = targets_for_server(baseline_report.as_ref(), server);
             let candidate_targets = targets_for_server(candidate_report.as_ref(), server);
             if baseline_targets.is_empty() && candidate_targets.is_empty() {
@@ -264,6 +552,7 @@ impl<'a> SemanticProviderBroker<'a> {
             );
             let language = provider_language(config, mutations);
             let capabilities = capabilities_for_language(&language);
+            let dependency_cache_is_bound = config.cache_ids.is_empty();
             let complete = pinned
                 && baseline_report
                     .as_ref()
@@ -271,7 +560,8 @@ impl<'a> SemanticProviderBroker<'a> {
                 && candidate_report
                     .as_ref()
                     .is_none_or(|report| report.complete)
-                && !deleted;
+                && !deleted
+                && dependency_cache_is_bound;
             let world = SemanticWorldSnapshot::new(
                 server,
                 provider_version,
@@ -290,6 +580,9 @@ impl<'a> SemanticProviderBroker<'a> {
             let mut provider_unknown = unknown_reasons.clone();
             if !pinned {
                 provider_unknown.insert(UnknownReason::ProviderUnavailable);
+            }
+            if !dependency_cache_is_bound {
+                provider_unknown.insert(UnknownReason::UnsupportedConstruct);
             }
             let baseline = semantic_snapshot(
                 &world,
@@ -376,6 +669,8 @@ impl<'a> SemanticProviderBroker<'a> {
             workspace_fingerprint: content.fingerprint,
             providers,
             verdict,
+            affected_documents: mutations.len(),
+            wall_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
     }
 }
@@ -388,13 +683,11 @@ pub fn enforce_configured_transaction(
     workspace_root: &Path,
     mutations: &[SemanticOverlayMutation],
 ) -> Result<Option<SemanticGateReport>> {
-    let has_configured_provider = transaction_has_configured_provider(registry, mutations);
-    if !has_configured_provider {
+    let Some((report, required)) =
+        configured_transaction_report(registry, workspace_root, mutations)?
+    else {
         return Ok(None);
-    }
-    let report =
-        SemanticProviderBroker::new(registry, workspace_root).analyze_transaction(mutations)?;
-    let required = transaction_has_required_provider(registry, mutations);
+    };
     if required && report.verdict.closure != ClosureVerdict::Allow {
         let errors = report
             .verdict
@@ -415,6 +708,54 @@ pub fn enforce_configured_transaction(
         );
     }
     Ok(Some(report))
+}
+
+pub fn configured_transaction_report(
+    registry: &LspToolRegistry,
+    workspace_root: &Path,
+    mutations: &[SemanticOverlayMutation],
+) -> Result<Option<(SemanticGateReport, bool)>> {
+    if !transaction_has_configured_provider(registry, mutations) {
+        return Ok(None);
+    }
+    let required = transaction_has_required_provider(registry, mutations);
+    let started = Instant::now();
+    let mut report = match SemanticProviderBroker::new(registry, workspace_root)
+        .analyze_transaction(mutations)
+    {
+        Ok(report) => report,
+        Err(error) => match crate::workspace::ContentSnapshot::capture(workspace_root) {
+            Ok(content) => {
+                tracing::warn!(
+                    required,
+                    error = %error,
+                    "semantic provider transaction failed before producing provider evidence"
+                );
+                SemanticGateReport::failure(
+                    content.fingerprint,
+                    mutations.len(),
+                    UnknownReason::ProviderUnavailable,
+                    required,
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                )
+            }
+            Err(snapshot_error) if required => {
+                return Err(error).context(format!(
+                    "required semantic gate also failed to capture its evidence world: {snapshot_error:#}"
+                ));
+            }
+            Err(snapshot_error) => {
+                tracing::warn!(
+                    error = %error,
+                    snapshot_error = %snapshot_error,
+                    "advisory semantic provider failed without a bindable evidence world"
+                );
+                return Ok(None);
+            }
+        },
+    };
+    report.verdict = boundary_enforcement_verdict(report.verdict, required);
+    Ok(Some((report, required)))
 }
 
 fn transaction_has_configured_provider(
@@ -447,17 +788,45 @@ fn transaction_has_provider(
         registry.servers.values().any(|config| {
             !config.disabled
                 && accepts(config.semantic_enforcement)
-                && extension.is_some_and(|extension| {
-                    config
-                        .language_ids
-                        .iter()
-                        .any(|language| language_extension_matches(language, extension))
-                })
+                && extension.is_some_and(|extension| provider_matches_extension(config, extension))
         })
     })
 }
 
-fn semantic_mutations_from_call(
+fn semantic_server_names(
+    registry: &LspToolRegistry,
+    mutations: &[SemanticOverlayMutation],
+    required_only: bool,
+) -> BTreeSet<String> {
+    registry
+        .servers
+        .iter()
+        .filter(|(_, config)| {
+            !config.disabled
+                && (if required_only {
+                    config.semantic_enforcement == crate::lsp::LspSemanticEnforcement::Required
+                } else {
+                    config.semantic_enforcement == crate::lsp::LspSemanticEnforcement::Advisory
+                })
+                && mutations.iter().any(|mutation| {
+                    Path::new(&mutation.path)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| provider_matches_extension(config, extension))
+                })
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+fn provider_matches_extension(config: &crate::lsp::LspServerConfig, extension: &str) -> bool {
+    config
+        .language_ids
+        .iter()
+        .any(|language| language_extension_matches(language, extension))
+}
+
+pub(crate) fn semantic_mutations_from_call(
     workspace: &WorkspaceSnapshot,
     tool: &str,
     arguments: &Value,
@@ -569,6 +938,30 @@ fn semantic_probe_identity(tool: &str, arguments: &Value) -> String {
         digest.update(bytes);
     }
     format!("{:x}", digest.finalize())
+}
+
+fn semantic_call_has_required_provider(
+    registry: &LspToolRegistry,
+    tool: &str,
+    arguments: &Value,
+) -> bool {
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .and_then(|path| Path::new(path).extension())
+        .and_then(|extension| extension.to_str());
+    if let Some(extension) = path {
+        return registry.servers.values().any(|config| {
+            !config.disabled
+                && config.semantic_enforcement == crate::lsp::LspSemanticEnforcement::Required
+                && provider_matches_extension(config, extension)
+        });
+    }
+    tool == "apply_patch"
+        && registry.servers.values().any(|config| {
+            !config.disabled
+                && config.semantic_enforcement == crate::lsp::LspSemanticEnforcement::Required
+        })
 }
 
 fn semantic_unknown(reason: UnknownReason, reject: bool) -> ProviderVerdict {
@@ -724,6 +1117,7 @@ fn classify_diagnostic(server: &str, code: &str) -> DefiniteErrorClass {
             "e0432" | "unresolved-import" => DefiniteErrorClass::UnresolvedImport,
             "e0599" | "unresolved-method" => DefiniteErrorClass::MissingMethod,
             "e0609" | "unresolved-field" => DefiniteErrorClass::MissingField,
+            "e0061" => DefiniteErrorClass::InvalidCall,
             "e0603" | "private-assoc-item" | "private-field" => DefiniteErrorClass::Privacy,
             "e0382" | "e0505" | "e0507" => DefiniteErrorClass::Ownership,
             "e0596" => DefiniteErrorClass::Mutability,
@@ -759,16 +1153,15 @@ fn classify_diagnostic(server: &str, code: &str) -> DefiniteErrorClass {
 
 fn provider_identity(config: &crate::lsp::LspServerConfig) -> (String, bool) {
     if let Some(image) = config.container_image.as_deref() {
-        if let Some(digest) = config
-            .verified_manifest_digest
-            .as_deref()
-            .filter(|digest| digest.starts_with("sha256:") && digest.len() == 71)
-        {
-            return (digest.to_string(), true);
-        }
-        if let Some((_, digest)) = image.rsplit_once('@')
-            && digest.starts_with("sha256:")
-            && digest.len() == 71
+        let embedded = image
+            .rsplit_once('@')
+            .map(|(_, digest)| digest)
+            .filter(|digest| is_sha256_image_digest(digest));
+        if let Some(digest) = embedded
+            && config
+                .verified_manifest_digest
+                .as_deref()
+                .is_none_or(|verified| is_sha256_image_digest(verified) && verified == digest)
         {
             return (digest.to_string(), true);
         }
@@ -777,6 +1170,20 @@ fn provider_identity(config: &crate::lsp::LspServerConfig) -> (String, bool) {
         .map(|bytes| format!("config:{:x}", Sha256::digest(bytes)))
         .unwrap_or_else(|_| "config:unavailable".to_string());
     (digest, false)
+}
+
+pub(crate) fn pinned_provider_version(config: &crate::lsp::LspServerConfig) -> Option<String> {
+    let (version, pinned) = provider_identity(config);
+    pinned.then_some(version)
+}
+
+fn is_sha256_image_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.strip_prefix("sha256:").is_some_and(|digest| {
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 fn provider_language(
@@ -873,6 +1280,42 @@ mod tests {
     }
 
     #[test]
+    fn required_semantic_providers_are_not_poisoned_by_advisory_peers() {
+        let config = |language: &str, enforcement| crate::lsp::LspServerConfig {
+            command: Some("provider".to_string()),
+            language_ids: vec![language.to_string()],
+            semantic_enforcement: enforcement,
+            ..Default::default()
+        };
+        let registry = crate::lsp::discover_tools(
+            BTreeMap::from([
+                (
+                    "required-rust".to_string(),
+                    config("rust", crate::lsp::LspSemanticEnforcement::Required),
+                ),
+                (
+                    "advisory-rust".to_string(),
+                    config("rust", crate::lsp::LspSemanticEnforcement::Advisory),
+                ),
+                (
+                    "required-python".to_string(),
+                    config("python", crate::lsp::LspSemanticEnforcement::Required),
+                ),
+            ]),
+            Path::new("."),
+        );
+        let mutations = [SemanticOverlayMutation {
+            path: "src/lib.rs".to_string(),
+            base: Some(String::new()),
+            result: Some("fn value() {}\n".to_string()),
+        }];
+        assert_eq!(
+            semantic_server_names(&registry, &mutations, true),
+            BTreeSet::from(["required-rust".to_string()])
+        );
+    }
+
+    #[test]
     fn diagnostic_codes_map_without_inspecting_provider_messages() {
         assert_eq!(
             classify_diagnostic("rust-analyzer", "E0308"),
@@ -900,6 +1343,170 @@ mod tests {
         };
         let (_, pinned) = provider_identity(&config);
         assert!(!pinned);
+
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let pinned_config = crate::lsp::LspServerConfig {
+            container_image: Some(format!("example/provider@{digest}")),
+            verified_manifest_digest: Some(digest.clone()),
+            ..Default::default()
+        };
+        assert_eq!(provider_identity(&pinned_config), (digest, true));
+
+        let mismatched = crate::lsp::LspServerConfig {
+            container_image: Some(format!("example/provider@sha256:{}", "b".repeat(64))),
+            verified_manifest_digest: Some(format!("sha256:{}", "c".repeat(64))),
+            ..Default::default()
+        };
+        assert!(!provider_identity(&mismatched).1);
+
+        let malformed_verification = crate::lsp::LspServerConfig {
+            container_image: Some(format!("example/provider@sha256:{}", "b".repeat(64))),
+            verified_manifest_digest: Some("sha256:not-a-digest".to_string()),
+            ..Default::default()
+        };
+        assert!(!provider_identity(&malformed_verification).1);
+    }
+
+    fn unavailable_provider_registry(
+        root: &Path,
+        enforcement: crate::lsp::LspSemanticEnforcement,
+    ) -> LspToolRegistry {
+        crate::lsp::discover_tools(
+            BTreeMap::from([(
+                "rust-analyzer".to_string(),
+                crate::lsp::LspServerConfig {
+                    command: Some("pb-definitely-missing-lsp-command".to_string()),
+                    language_ids: vec!["rust".to_string()],
+                    semantic_enforcement: enforcement,
+                    ..Default::default()
+                },
+            )]),
+            root,
+        )
+    }
+
+    #[test]
+    fn configured_advisory_provider_failure_defers_with_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        let registry = unavailable_provider_registry(
+            directory.path(),
+            crate::lsp::LspSemanticEnforcement::Advisory,
+        );
+        let mutation = SemanticOverlayMutation {
+            path: "src/lib.rs".to_string(),
+            base: None,
+            result: Some("pub fn value() {}\n".to_string()),
+        };
+
+        let (report, required) =
+            configured_transaction_report(&registry, directory.path(), &[mutation])
+                .unwrap()
+                .unwrap();
+
+        assert!(!required);
+        assert_eq!(report.verdict.closure, ClosureVerdict::Defer);
+        assert_eq!(
+            report.verdict.unknown_reasons,
+            vec![UnknownReason::ProviderUnavailable]
+        );
+        report
+            .receipt(SemanticEvidenceStage::FinalExecutor, Duration::from_secs(8))
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn configured_required_provider_failure_rejects_with_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        let registry = unavailable_provider_registry(
+            directory.path(),
+            crate::lsp::LspSemanticEnforcement::Required,
+        );
+        let mutation = SemanticOverlayMutation {
+            path: "src/lib.rs".to_string(),
+            base: None,
+            result: Some("pub fn value() {}\n".to_string()),
+        };
+
+        let (report, required) =
+            configured_transaction_report(&registry, directory.path(), &[mutation])
+                .unwrap()
+                .unwrap();
+
+        assert!(required);
+        assert_eq!(report.verdict.closure, ClosureVerdict::Reject);
+        report
+            .receipt(SemanticEvidenceStage::FinalExecutor, Duration::from_secs(8))
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn generation_boundary_failure_receipt_is_restored_on_cache_hit() {
+        let directory = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        let registry = unavailable_provider_registry(
+            directory.path(),
+            crate::lsp::LspSemanticEnforcement::Required,
+        );
+        let boundary =
+            semantic_boundary_control(&registry, directory.path(), &WorkspaceSnapshot::default())
+                .unwrap()
+                .unwrap();
+        let arguments = serde_json::json!({
+            "path": "src/lib.rs",
+            "content": "pub fn value() {}\n"
+        });
+
+        assert_eq!(
+            boundary.probe("write_file", &arguments).closure,
+            ClosureVerdict::Reject
+        );
+        let first = boundary.stats().receipt.unwrap();
+        assert_eq!(first.stage, SemanticEvidenceStage::GenerationBoundary);
+        first.validate().unwrap();
+        assert_eq!(
+            boundary.probe("write_file", &arguments).closure,
+            ClosureVerdict::Reject
+        );
+        assert_eq!(boundary.stats().receipt, Some(first));
+    }
+
+    #[test]
+    fn advisory_generation_preparation_failure_does_not_veto() {
+        let directory = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        let registry = unavailable_provider_registry(
+            directory.path(),
+            crate::lsp::LspSemanticEnforcement::Advisory,
+        );
+        let boundary =
+            semantic_boundary_control(&registry, directory.path(), &WorkspaceSnapshot::default())
+                .unwrap()
+                .unwrap();
+        let verdict = boundary.probe("write_file", &serde_json::json!({"path": "src/lib.rs"}));
+        assert_eq!(verdict.closure, ClosureVerdict::Defer);
+        boundary.stats().receipt.unwrap().validate().unwrap();
     }
 
     #[test]
@@ -941,6 +1548,7 @@ mod tests {
         let base = "pub fn value() -> i32 { 1 }\n";
         std::fs::write(directory.path().join("src/lib.rs"), base).unwrap();
         let log_directory = tempfile::tempdir().unwrap();
+        let log = log_directory.path().join("semantic.jsonl");
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_lsp.py");
         let registry = crate::lsp::discover_tools(
             BTreeMap::from([(
@@ -949,11 +1557,7 @@ mod tests {
                     command: Some("python3".to_string()),
                     args: vec![
                         fixture.to_string_lossy().into_owned(),
-                        log_directory
-                            .path()
-                            .join("semantic.jsonl")
-                            .to_string_lossy()
-                            .into_owned(),
+                        log.to_string_lossy().into_owned(),
                     ],
                     language_ids: vec!["rust".to_string()],
                     semantic_enforcement: crate::lsp::LspSemanticEnforcement::Required,
@@ -989,5 +1593,106 @@ mod tests {
             provider.candidate.document_sha256[&LogicalPath::parse("src/lib.rs").unwrap()],
             Digest::of(candidate.as_bytes())
         );
+        let receipt = report
+            .receipt(SemanticEvidenceStage::FinalExecutor, Duration::from_secs(8))
+            .unwrap();
+        receipt.validate().unwrap();
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        assert!(!serialized.contains("src/lib.rs"));
+        assert!(!serialized.contains("TYPE_ERROR"));
+
+        let live_root = directory.path().canonicalize().unwrap();
+        let records = std::fs::read_to_string(log).unwrap();
+        assert!(records.lines().all(|line| {
+            let record: Value = serde_json::from_str(line).unwrap();
+            let uri = record["uri"].as_str().unwrap();
+            uri.contains("pb-semantic-shadow-")
+                && !uri.contains(live_root.to_string_lossy().as_ref())
+        }));
+    }
+
+    #[test]
+    fn semantic_transaction_rejects_live_workspace_drift_during_shadow_analysis() {
+        let directory = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        let source = directory.path().join("src/lib.rs");
+        let base = "pub fn value() -> i32 { 1 }\n";
+        std::fs::write(&source, base).unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_lsp.py");
+        let registry = crate::lsp::discover_tools(
+            BTreeMap::from([(
+                "rust-analyzer".to_string(),
+                crate::lsp::LspServerConfig {
+                    command: Some("python3".to_string()),
+                    args: vec![
+                        fixture.to_string_lossy().into_owned(),
+                        control
+                            .path()
+                            .join("semantic.jsonl")
+                            .to_string_lossy()
+                            .into_owned(),
+                        control.path().to_string_lossy().into_owned(),
+                    ],
+                    language_ids: vec!["rust".to_string()],
+                    semantic_enforcement: crate::lsp::LspSemanticEnforcement::Advisory,
+                    ..Default::default()
+                },
+            )]),
+            directory.path(),
+        );
+        let ready = control.path().join("ready");
+        let proceed = control.path().join("continue");
+        let source_for_worker = source.clone();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                ready.exists(),
+                "fake LSP did not reach its diagnostic barrier"
+            );
+            std::fs::write(source_for_worker, "pub fn value() -> i32 { 2 }\n").unwrap();
+            std::fs::write(proceed, "continue").unwrap();
+        });
+
+        let result =
+            SemanticProviderBroker::new(&registry, directory.path()).analyze_transaction(&[
+                SemanticOverlayMutation {
+                    path: "src/lib.rs".to_string(),
+                    base: Some(base.to_string()),
+                    result: Some("pub fn value() -> i32 { 3 }\n".to_string()),
+                },
+            ]);
+        worker.join().unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("workspace changed while the semantic shadow was being analyzed")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authoritative_shadow_rejects_workspace_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        std::fs::write(directory.path().join("target.rs"), "fn value() {}\n").unwrap();
+        symlink("target.rs", directory.path().join("alias.rs")).unwrap();
+        let content = crate::workspace::ContentSnapshot::capture(directory.path()).unwrap();
+        assert!(SemanticShadowWorkspace::capture(directory.path(), &content).is_err());
     }
 }

@@ -570,6 +570,24 @@ are canonical repository-relative paths and the same 32 MiB production bound app
 fixture surface is for deterministic Qwen/DeepSeek tokenizer and mutation-gate qualification; it is
 not a configuration switch and never reads or writes the named workspace files.
 Reproducible Python create and patch examples are checked in under `fixtures/control-collar/`.
+`pb harness collar-qualify` is the model-free promotion surface for the source-prefix layer. It
+loads the exact tokenizer and tokenizer-configuration artifacts selected by `--model`, replays the
+versioned `fixtures/control-collar/prefix-language-v1.json` corpus at every real token boundary,
+checks prefix-monotonic decoding, rollback equivalence, 64 deterministic random chunkings per case,
+and the final expected validity/rule. It prints only artifact digests, counts, and p50/p95/p99/max
+probe timings, and fails when p95 exceeds `--latency-budget-micros` (1,000 microseconds by default).
+The command does not load model weights, read a workspace, enable a production feature, or persist
+source. Run it separately for every tokenizer profile being promoted; live `infer --tool-fixture`
+runs remain the end-to-end model/template/throughput gate.
+`pb harness semantic-qualify --server <name>` is the provider-profile promotion surface. It creates
+an ephemeral Git workspace from the versioned corpus, runs the configured digest-pinned no-network
+provider against a fresh exact read-only semantic shadow for every generation and final-executor
+case, and requires complete authoritative receipts plus exact allow/reject and diagnostic-class
+matches. The report contains only corpus/provider/configuration digests, counts, and latency
+percentiles. Provider unavailability, an incomplete project graph, detached documents, an unknown
+result, or a latency-budget breach fails qualification and does not enable semantic enforcement.
+The checked-in Rust corpus covers valid standard-library and forward references, type/call/name/
+field/method/mutability/ownership failures, and a canonical multi-file patch.
 For Qwen prefill qualification, `infer --prefill-mode auto|scalar|layer-major` selects the promoted
 policy, exact scalar reference, or an explicit layer-major request. `auto` promotes only a prepared
 Qwen3-Coder-Next affine-Q4 graph with at least 32 fresh tokens and sufficient live Metal reserve.

@@ -23,6 +23,7 @@ mod metal;
 mod model_family;
 mod planning;
 mod pool;
+mod qualification;
 mod runtime;
 mod safetensors;
 mod scheduler;
@@ -52,6 +53,7 @@ pub use model_family::*;
 pub use planning::*;
 pub use pool::{FlashMoeRuntimeHandle, load_shared, reap_idle_shared_runtimes};
 pub(crate) use pool::{load_shared_with_settings, release_unleased_shared_runtimes};
+pub(crate) use qualification::qualify_prefix_tokenizer;
 pub use runtime::{
     FlashMoeEngine, FlashMoeLoadOptions, load, load_with_options, load_with_options_and_progress,
     load_with_progress,

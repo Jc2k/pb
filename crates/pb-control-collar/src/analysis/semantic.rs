@@ -5,9 +5,124 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{CollarError, CollarResult, mutation::LogicalPath, receipt::Digest};
 
-use super::{AnalyzerCapability, DefiniteErrorClass, SemanticWorldId, UnknownReason};
+use super::{
+    AnalyzerCapability, ClosureVerdict, DefiniteErrorClass, SemanticWorldId, UnknownReason,
+    Viability,
+};
 
 pub const SEMANTIC_WORLD_CONTRACT_VERSION: u32 = 1;
+pub const SEMANTIC_EVIDENCE_CONTRACT_VERSION: u32 = 1;
+const MAX_SEMANTIC_EVIDENCE_PROVIDERS: usize = 64;
+const MAX_SEMANTIC_EVIDENCE_DOCUMENTS: usize = 1_024;
+const MAX_SEMANTIC_EVIDENCE_CLASSES: usize = 64;
+const MAX_SEMANTIC_PROVIDER_NAME_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticEvidenceStage {
+    GenerationBoundary,
+    FinalExecutor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticEvidenceScope {
+    Document,
+    AffectedTargets,
+    CompleteProject,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticProviderEvidence {
+    pub provider: String,
+    pub provider_version: String,
+    pub world_sha256: String,
+    pub configuration_sha256: String,
+    pub dependency_sha256: String,
+    pub baseline: BaselineCompleteness,
+    pub document_count: usize,
+    pub introduced_diagnostics: usize,
+    pub resolved_diagnostics: usize,
+    pub unchanged_diagnostics: usize,
+    pub authoritative: bool,
+    pub definite_errors: Vec<DefiniteErrorClass>,
+    pub unknown_reasons: Vec<UnknownReason>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticGateReceipt {
+    pub contract_version: u32,
+    pub stage: SemanticEvidenceStage,
+    pub scope: SemanticEvidenceScope,
+    pub workspace_sha256: String,
+    pub affected_documents: usize,
+    pub providers: Vec<SemanticProviderEvidence>,
+    pub viability: Viability,
+    pub closure: ClosureVerdict,
+    pub definite_errors: Vec<DefiniteErrorClass>,
+    pub unknown_reasons: Vec<UnknownReason>,
+    pub wall_millis: u64,
+    pub budget_millis: u64,
+}
+
+impl SemanticGateReceipt {
+    pub fn validate(&self) -> CollarResult<()> {
+        let provider_names = self
+            .providers
+            .iter()
+            .map(|provider| provider.provider.as_str())
+            .collect::<BTreeSet<_>>();
+        if self.contract_version != SEMANTIC_EVIDENCE_CONTRACT_VERSION
+            || !is_lower_hex_digest(&self.workspace_sha256)
+            || self.affected_documents == 0
+            || self.affected_documents > MAX_SEMANTIC_EVIDENCE_DOCUMENTS
+            || self.providers.len() > MAX_SEMANTIC_EVIDENCE_PROVIDERS
+            || provider_names.len() != self.providers.len()
+            || self.definite_errors.len() > MAX_SEMANTIC_EVIDENCE_CLASSES
+            || self.unknown_reasons.len() > MAX_SEMANTIC_EVIDENCE_CLASSES
+            || self.providers.iter().any(|provider| {
+                provider.provider.trim().is_empty()
+                    || provider.provider.len() > MAX_SEMANTIC_PROVIDER_NAME_BYTES
+                    || provider.provider_version.trim().is_empty()
+                    || provider.provider_version.len() > MAX_SEMANTIC_PROVIDER_NAME_BYTES
+                    || !is_lower_hex_digest(&provider.world_sha256)
+                    || !is_lower_hex_digest(&provider.configuration_sha256)
+                    || !is_lower_hex_digest(&provider.dependency_sha256)
+                    || provider.document_count == 0
+                    || provider.document_count > MAX_SEMANTIC_EVIDENCE_DOCUMENTS
+                    || provider.definite_errors.len() > MAX_SEMANTIC_EVIDENCE_CLASSES
+                    || provider.unknown_reasons.len() > MAX_SEMANTIC_EVIDENCE_CLASSES
+            })
+        {
+            return Err(CollarError::Analysis(
+                "semantic gate receipt is structurally invalid".to_string(),
+            ));
+        }
+        if self.closure == ClosureVerdict::Allow
+            && (self.viability != Viability::Valid
+                || !self.definite_errors.is_empty()
+                || !self.unknown_reasons.is_empty()
+                || self.providers.is_empty()
+                || self.providers.iter().any(|provider| {
+                    !provider.authoritative
+                        || provider.baseline != BaselineCompleteness::Complete
+                        || provider.introduced_diagnostics != 0
+                        || !provider.definite_errors.is_empty()
+                        || !provider.unknown_reasons.is_empty()
+                }))
+        {
+            return Err(CollarError::Analysis(
+                "semantic allow receipt is not authoritative".to_string(),
+            ));
+        }
+        if self.closure != ClosureVerdict::Allow && self.viability == Viability::Valid {
+            return Err(CollarError::Analysis(
+                "semantic non-allow receipt cannot claim valid viability".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -404,5 +519,53 @@ mod tests {
                 .unwrap()
                 .authoritative
         );
+    }
+
+    #[test]
+    fn semantic_receipts_require_content_free_authoritative_allow_evidence() {
+        let world = world();
+        let receipt = SemanticGateReceipt {
+            contract_version: SEMANTIC_EVIDENCE_CONTRACT_VERSION,
+            stage: SemanticEvidenceStage::FinalExecutor,
+            scope: SemanticEvidenceScope::Document,
+            workspace_sha256: world.workspace_sha256.clone(),
+            affected_documents: 1,
+            providers: vec![SemanticProviderEvidence {
+                provider: world.id.provider.clone(),
+                provider_version: world.id.provider_version.clone(),
+                world_sha256: world.id.world_sha256.clone(),
+                configuration_sha256: world.id.configuration_sha256.clone(),
+                dependency_sha256: world.id.dependency_sha256.clone(),
+                baseline: BaselineCompleteness::Complete,
+                document_count: 1,
+                introduced_diagnostics: 0,
+                resolved_diagnostics: 0,
+                unchanged_diagnostics: 0,
+                authoritative: true,
+                definite_errors: Vec::new(),
+                unknown_reasons: Vec::new(),
+            }],
+            viability: Viability::Valid,
+            closure: ClosureVerdict::Allow,
+            definite_errors: Vec::new(),
+            unknown_reasons: Vec::new(),
+            wall_millis: 12,
+            budget_millis: 8_000,
+        };
+        receipt.validate().unwrap();
+
+        let mut unpinned = receipt;
+        unpinned.providers[0].authoritative = false;
+        assert!(unpinned.validate().is_err());
+
+        let mut incomplete = unpinned.clone();
+        incomplete.providers[0].authoritative = true;
+        incomplete.providers[0].baseline = BaselineCompleteness::Incomplete;
+        assert!(incomplete.validate().is_err());
+
+        let mut inconsistent = unpinned;
+        inconsistent.providers[0].authoritative = true;
+        inconsistent.viability = Viability::Unknown;
+        assert!(inconsistent.validate().is_err());
     }
 }

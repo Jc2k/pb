@@ -218,18 +218,21 @@ stale-workspace limits are explicit incomplete outcomes.
 Configured LSP servers can also participate in the mutation control collar through the typed
 `semantic_enforcement` mode. This path is distinct from proactive repair hints. The controller
 captures an immutable workspace identity and exact mutation snapshot, sends full-content base and
-candidate overlays with monotonic LSP document versions, requires explicit full pull diagnostics,
-and binds each diagnostic snapshot to provider/configuration/dependency/workspace and exact overlay
-content digests. The diagnostic-debt comparison rejects newly introduced classified errors while
-allowing an existing error to be repaired. Incomplete, stale, push-only, unpinned, timed-out, or
-unclassified results are `Unknown` and cannot authorize required mode.
+candidate overlays with monotonic LSP document versions to a fresh provider session rooted at an
+exact bounded shadow workspace, requires explicit full pull diagnostics, and binds each diagnostic
+snapshot to provider/configuration/dependency/workspace and exact overlay content digests. The
+diagnostic-debt comparison rejects newly introduced classified errors while allowing an existing
+error to be repaired. Incomplete, stale, push-only, unpinned, timed-out, unclassified, or
+project-detached results are `Unknown` and cannot authorize required mode. Rust additionally needs
+a loaded non-empty crate graph and analyzer-confirmed membership for every overlay document.
 
 At a Qwen JSON or DeepSeek DSML payload-string close, FlashMoe and llama.cpp apply the same portable
 mutation gate and may synchronously probe the controller-owned semantic provider before committing
 that candidate. `Reject` masks only the candidate boundary; `Defer` keeps it reachable. The final
 executor independently reconstructs the prepared write/edit/patch against the authorized base,
 captures and revalidates the current workspace during a fresh semantic transaction, and only then
-enters the existing publication step. Invocation events name
+enters the existing publication step. Generation and final-executor decisions have separate
+content-free receipts; a generation receipt is never executor authority. Invocation events name
 the strongest active rung (`protocol_schema`, `prefix_syntax`, or `semantic_boundary`) and report
 content-free rejection/provider/recovery counters. Current backends report
 `candidate_probe_only`; replay and complete-state restore remain explicitly unimplemented.
@@ -661,7 +664,11 @@ The syntax profiles are pinned Tree-sitter grammars for Rust, Python, TypeScript
 JavaScript/JSX, HTML, and CSS. They require UTF-8 and reject error or missing nodes; HTML additionally
 checks explicit element closure and supported embedded JavaScript, TypeScript, JSON, and CSS. This
 is a syntax guarantee, not a name-resolution, type, borrow, module-resolution, CSS-semantics, or
-Python runtime guarantee. Type-aware and project-overlay analysis uses the collar's versioned
+Python runtime guarantee. The conservative prefix layer advances only over newly decoded logical
+payload bytes, keeps constant-time persistent-stack checkpoints for candidate branches, and probes
+canonical patch additions/context before line closure; final Tree-sitter validation still decides
+complete-file acceptance. The checked-in tokenizer qualifier covers both production Qwen and
+DeepSeek tokenizer boundaries without loading model weights. Type-aware and project-overlay analysis uses the collar's versioned
 boundary/checkpoint interface only after a future analyzer has its own soundness corpus and fail-
 closed qualification.
 

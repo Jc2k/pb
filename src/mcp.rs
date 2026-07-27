@@ -789,6 +789,7 @@ impl StdioMcpClient {
                             config,
                         )?),
                         workspace_access: config.capabilities.workspace,
+                        analysis_workspace_root: None,
                         network_access: config.capabilities.network,
                         cache_ids: config.capabilities.cache_ids.clone(),
                     })?;

@@ -543,6 +543,19 @@ pub fn render_event(event: &AgentEvent) {
                 print_block("diff from main", diff);
             }
         }
+        AgentEvent::SemanticGate { receipt, .. } => print_header(
+            "semantic gate",
+            &format!(
+                "stage={:?}; scope={:?}; providers={}; closure={:?}; definite_errors={}; unknown_reasons={}; wall={} ms",
+                receipt.stage,
+                receipt.scope,
+                receipt.providers.len(),
+                receipt.closure,
+                receipt.definite_errors.len(),
+                receipt.unknown_reasons.len(),
+                receipt.wall_millis
+            ),
+        ),
         AgentEvent::Error { message, .. } => eprintln!("error: {message}"),
     }
 }

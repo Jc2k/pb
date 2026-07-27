@@ -96,18 +96,22 @@ For constrained FlashMoe and llama.cpp `write_file`, `replace_file`, `edit_file`
 `apply_patch` output, pb validates the exact virtual result before the model can finish the mutation
 and repeats that validation at execution. Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, and CSS
 results must be valid under pb's pinned complete-file syntax profile. A conservative prefix oracle
-also rejects promoted local impossibilities such as an unmatched closer; it is not a claim that
-every accepted prefix is grammar-extendable. Existing-file and patch validation is bound to the
-exact controller-observed base; stale bytes fail rather than being patched approximately.
+also rejects promoted local impossibilities such as an unmatched closer. It incrementally advances
+new logical payload bytes, rolls candidate branches back to bounded checkpoints, and checks partial
+canonical hunk additions/context before their newline; it is not a claim that every accepted prefix
+is grammar-extendable. Existing-file and patch validation is bound to the exact controller-observed
+base; stale bytes fail rather than being patched approximately.
 
 Symbol and type claims are separately opt-in through an LSP server's `semantic_enforcement` mode.
 Required mode accepts only a digest-pinned, complete, exact-overlay diagnostic comparison and repeats
-the transaction against a freshly captured workspace immediately before publication. The claim is
-limited to the provider-classified document/target scope and immutable provider, configuration, and
-dependency identities; it is not proof that code compiles, tests pass, all dependants were checked,
-or dynamic Python/JavaScript behavior is safe. Disabled remains the default, advisory results do not
-veto, and unqualified llama.cpp model/template profiles must not be described as backend-parity
-qualified.
+the transaction in a fresh exact bounded shadow workspace and isolated provider session immediately
+before publication. Rust evidence also requires a non-empty loaded crate graph and analyzer-confirmed
+membership for every affected document. Generation and final-executor receipts are separate and
+content-free. The claim is limited to the provider-classified document/target scope and immutable
+provider, configuration, and dependency identities; it is not proof that code compiles, tests pass,
+all dependants were checked, or dynamic Python/JavaScript behavior is safe. Disabled remains the
+default, advisory results do not veto, and unqualified llama.cpp model/template profiles must not be
+described as backend-parity qualified.
 
 A broad task command is treated as broad authority, not described as a sandbox. The user remains
 responsible for how much authority project configuration grants.

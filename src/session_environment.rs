@@ -108,6 +108,9 @@ pub struct SessionServiceSpec {
     pub working_directory: Option<PathBuf>,
     pub cache_scope_sha256: String,
     pub workspace_access: ServiceWorkspaceAccess,
+    /// Controller-owned immutable analysis root. Only LSP services with read-only workspace
+    /// authority may replace the task workspace mount with this exact directory.
+    pub analysis_workspace_root: Option<PathBuf>,
     pub network_access: ServiceNetworkAccess,
     pub cache_ids: Vec<String>,
 }
@@ -217,12 +220,14 @@ impl SessionEnvironmentLease {
         }
         let image_metadata = runtime.image_fingerprint(&spec.image)?;
         let image_lock = crate::environment_lock::sha256(image_metadata.as_bytes());
-        let identity = format!(
-            "{}\0{}\0{}\0{}",
-            snapshot.session_id, spec.role, spec.service_name, image_lock
+        let container_name = service_container_name(
+            &snapshot.session_id,
+            &spec.role,
+            &spec.service_name,
+            &image_lock,
+            spec.analysis_workspace_root.is_some(),
         );
-        let suffix = &crate::environment_lock::sha256(identity.as_bytes())[..12];
-        let container_name = format!("pb-svc-{suffix}");
+        let suffix = container_name.trim_start_matches("pb-svc-");
         let network = match spec.network_access {
             ServiceNetworkAccess::Egress => None,
             ServiceNetworkAccess::Session => resource_name(&snapshot, LeaseResourceKind::Network),
@@ -270,6 +275,12 @@ impl SessionEnvironmentLease {
         if spec.network_access == ServiceNetworkAccess::Session && network.is_none() {
             bail!("service requested session network access but the task has no session network");
         }
+        let service_workspace_root = resolve_service_workspace_root(
+            &snapshot.workspace_root,
+            spec.kind,
+            spec.workspace_access,
+            spec.analysis_workspace_root.as_deref(),
+        )?;
         let mut mounts = Vec::new();
         let (workdir, workspace_mount) = match spec.workspace_access {
             ServiceWorkspaceAccess::None => {
@@ -280,23 +291,23 @@ impl SessionEnvironmentLease {
             }
             ServiceWorkspaceAccess::ReadOnly => (
                 resolve_service_workdir(
-                    &snapshot.workspace_root,
+                    &service_workspace_root,
                     spec.working_directory.as_deref(),
                 )?,
                 Some(ContainerMount::bind(
-                    &snapshot.workspace_root,
-                    snapshot.workspace_root.to_string_lossy(),
+                    &service_workspace_root,
+                    service_workspace_root.to_string_lossy(),
                     true,
                 )),
             ),
             ServiceWorkspaceAccess::ReadWrite => (
                 resolve_service_workdir(
-                    &snapshot.workspace_root,
+                    &service_workspace_root,
                     spec.working_directory.as_deref(),
                 )?,
                 Some(ContainerMount::bind(
-                    &snapshot.workspace_root,
-                    snapshot.workspace_root.to_string_lossy(),
+                    &service_workspace_root,
+                    service_workspace_root.to_string_lossy(),
                     false,
                 )),
             ),
@@ -1299,6 +1310,55 @@ fn resolve_service_workdir(workspace_root: &Path, configured: Option<&Path>) -> 
     Ok(candidate.to_string_lossy().into_owned())
 }
 
+fn resolve_service_workspace_root(
+    task_workspace_root: &Path,
+    kind: LeaseResourceKind,
+    access: ServiceWorkspaceAccess,
+    analysis_workspace_root: Option<&Path>,
+) -> Result<PathBuf> {
+    let selected = match analysis_workspace_root {
+        None => task_workspace_root,
+        Some(root)
+            if kind == LeaseResourceKind::LspProcess
+                && access == ServiceWorkspaceAccess::ReadOnly =>
+        {
+            root
+        }
+        Some(_) => {
+            bail!(
+                "only a read-only LSP service may replace its task workspace with an analysis workspace"
+            )
+        }
+    };
+    let canonical = selected
+        .canonicalize()
+        .with_context(|| format!("failed to resolve service workspace {}", selected.display()))?;
+    if !canonical.is_dir() {
+        bail!(
+            "service workspace {} is not a directory",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn service_container_name(
+    session_id: &str,
+    role: &str,
+    service_name: &str,
+    image_lock: &str,
+    isolated_analysis: bool,
+) -> String {
+    let authority = if isolated_analysis {
+        "semantic-shadow"
+    } else {
+        "task-workspace"
+    };
+    let identity = format!("{session_id}\0{role}\0{service_name}\0{image_lock}\0{authority}");
+    let digest = crate::environment_lock::sha256(identity.as_bytes());
+    format!("pb-svc-{}", &digest[..12])
+}
+
 fn service_cache_provenance(
     base_provenance: &str,
     image_lock: &str,
@@ -2173,6 +2233,47 @@ mod tests {
             ("dev.pb.project".to_string(), "project-a".to_string()),
             ("dev.pb.session".to_string(), "session-a".to_string()),
         ])));
+    }
+
+    #[test]
+    fn analysis_workspace_override_is_read_only_lsp_authority() {
+        let task = TempDir::new().unwrap();
+        let shadow = TempDir::new().unwrap();
+        let selected = resolve_service_workspace_root(
+            task.path(),
+            LeaseResourceKind::LspProcess,
+            ServiceWorkspaceAccess::ReadOnly,
+            Some(shadow.path()),
+        )
+        .unwrap();
+        assert_eq!(selected, shadow.path().canonicalize().unwrap());
+
+        for (kind, access) in [
+            (
+                LeaseResourceKind::McpService,
+                ServiceWorkspaceAccess::ReadOnly,
+            ),
+            (
+                LeaseResourceKind::LspProcess,
+                ServiceWorkspaceAccess::ReadWrite,
+            ),
+            (LeaseResourceKind::LspProcess, ServiceWorkspaceAccess::None),
+        ] {
+            assert!(
+                resolve_service_workspace_root(task.path(), kind, access, Some(shadow.path()))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn analysis_workspace_uses_a_distinct_stable_service_identity() {
+        let image = crate::environment_lock::sha256(b"image");
+        let ordinary = service_container_name("session", "lsp:rust", "rust", &image, false);
+        let first_shadow = service_container_name("session", "lsp:rust", "rust", &image, true);
+        let second_shadow = service_container_name("session", "lsp:rust", "rust", &image, true);
+        assert_ne!(ordinary, first_shadow);
+        assert_eq!(first_shadow, second_shadow);
     }
 
     #[test]

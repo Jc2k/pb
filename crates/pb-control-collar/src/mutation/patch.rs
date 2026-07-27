@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
     CollarError, CollarResult,
-    analysis::{Viability, validate_supported_prefix},
+    analysis::{SourcePrefixOracle, Viability},
     mutation::{LogicalPath, MutationKind, PreparedFileMutation, WorkspaceSnapshot},
     receipt::Digest,
 };
@@ -27,6 +27,15 @@ pub struct PatchStream {
     max_bytes: usize,
     max_files: usize,
     max_hunks: usize,
+    stream_id: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PatchCheckpoint {
+    stream_id: u64,
+    bytes_len: usize,
+    processed_bytes: usize,
+    prefix: PatchPrefixValidator,
 }
 
 impl PatchStream {
@@ -49,6 +58,7 @@ impl PatchStream {
             max_bytes,
             max_files,
             max_hunks,
+            stream_id: next_patch_stream_id(),
         })
     }
 
@@ -87,10 +97,17 @@ impl PatchStream {
                         self.processed_bytes.saturating_add(error.valid_up_to())
                     ))
                 })?;
-            self.prefix
-                .push_line(&self.snapshot, line, self.max_files, self.max_hunks)?;
+            self.prefix.push_line(
+                &self.snapshot,
+                line,
+                self.max_bytes,
+                self.max_files,
+                self.max_hunks,
+            )?;
             self.processed_bytes = end + 1;
         }
+        self.prefix
+            .probe_partial_line(&self.bytes[self.processed_bytes..])?;
         Ok(())
     }
 
@@ -100,6 +117,34 @@ impl PatchStream {
 
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+
+    pub fn checkpoint(&self) -> PatchCheckpoint {
+        PatchCheckpoint {
+            stream_id: self.stream_id,
+            bytes_len: self.bytes.len(),
+            processed_bytes: self.processed_bytes,
+            prefix: self.prefix.clone(),
+        }
+    }
+
+    pub fn rollback(&mut self, checkpoint: PatchCheckpoint) -> CollarResult<()> {
+        if checkpoint.stream_id != self.stream_id {
+            return Err(CollarError::Mutation(
+                "patch checkpoint belongs to another stream".to_string(),
+            ));
+        }
+        if checkpoint.bytes_len > self.bytes.len()
+            || checkpoint.processed_bytes > checkpoint.bytes_len
+        {
+            return Err(CollarError::Mutation(
+                "patch checkpoint is ahead of the current stream".to_string(),
+            ));
+        }
+        self.bytes.truncate(checkpoint.bytes_len);
+        self.processed_bytes = checkpoint.processed_bytes;
+        self.prefix = checkpoint.prefix;
+        Ok(())
     }
 
     pub fn finish(self) -> CollarResult<PreparedPatch> {
@@ -144,10 +189,10 @@ struct PrefixMetadata {
 struct PrefixFile {
     path: LogicalPath,
     kind: MutationKind,
-    base_lines: Vec<Vec<u8>>,
+    base_lines: Arc<Vec<Vec<u8>>>,
     base_cursor: usize,
     result_lines: usize,
-    result_prefix: Vec<u8>,
+    result_oracle: SourcePrefixOracle,
     file_hunks: usize,
     hunk: Option<PrefixHunk>,
 }
@@ -161,10 +206,31 @@ struct PrefixHunk {
 }
 
 impl PatchPrefixValidator {
+    fn probe_partial_line(&self, bytes: &[u8]) -> CollarResult<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(_) => {}
+            Err(error) if error.error_len().is_none() => return Ok(()),
+            Err(error) => {
+                return Err(CollarError::Mutation(format!(
+                    "canonical patch line prefix is not UTF-8 at byte {}",
+                    error.valid_up_to()
+                )));
+            }
+        }
+        let PatchPrefixPhase::File(file) = &self.phase else {
+            return Ok(());
+        };
+        file.probe_partial_hunk_line(bytes)
+    }
+
     fn push_line(
         &mut self,
         snapshot: &WorkspaceSnapshot,
         line: &str,
+        max_patch_bytes: usize,
         max_files: usize,
         max_hunks: usize,
     ) -> CollarResult<()> {
@@ -175,7 +241,7 @@ impl PatchPrefixValidator {
                 self.consume_metadata(metadata, line, max_files)?
             }
             PatchPrefixPhase::NewHeader { metadata, old_path } => {
-                self.consume_new_header(snapshot, metadata, old_path, line)?
+                self.consume_new_header(snapshot, metadata, old_path, line, max_patch_bytes)?
             }
             PatchPrefixPhase::File(mut file) => {
                 if file.consume_line(line, &mut self.hunks, max_hunks)? {
@@ -239,6 +305,7 @@ impl PatchPrefixValidator {
         metadata: PrefixMetadata,
         old_path: Option<LogicalPath>,
         line: &str,
+        max_patch_bytes: usize,
     ) -> CollarResult<PatchPrefixPhase> {
         let new_path = parse_file_header(line, "+++ ", 'b')?;
         let (path, kind) = patch_path_kind(old_path.as_ref(), new_path.as_ref())?;
@@ -287,14 +354,23 @@ impl PatchPrefixValidator {
                     .bytes,
             ),
         };
+        let base_bytes = base.iter().try_fold(0usize, |total, line| {
+            total
+                .checked_add(line.len())
+                .ok_or_else(|| CollarError::Mutation("virtual file length overflow".to_string()))
+        })?;
+        let result_limit = base_bytes.checked_add(max_patch_bytes).ok_or_else(|| {
+            CollarError::Mutation("virtual result byte limit overflow".to_string())
+        })?;
+        let result_oracle = SourcePrefixOracle::new(path.clone(), result_limit.max(1))?;
         self.files = self.files.saturating_add(1);
         Ok(PatchPrefixPhase::File(PrefixFile {
             path,
             kind,
-            base_lines: base,
+            base_lines: Arc::new(base),
             base_cursor: 0,
             result_lines: 0,
-            result_prefix: Vec::new(),
+            result_oracle,
             file_hunks: 0,
             hunk: None,
         }))
@@ -302,6 +378,102 @@ impl PatchPrefixValidator {
 }
 
 impl PrefixFile {
+    fn probe_partial_hunk_line(&self, line: &[u8]) -> CollarResult<()> {
+        let Some(hunk) = self.hunk.as_ref() else {
+            return Ok(());
+        };
+        const NO_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file";
+        if line.first() == Some(&b'\\') {
+            if hunk.pending.is_some() && NO_NEWLINE_MARKER.starts_with(line) {
+                return Ok(());
+            }
+            return Err(CollarError::Mutation(format!(
+                "invalid no-final-newline marker prefix for {:?}",
+                self.path.as_str()
+            )));
+        }
+
+        let mut old_seen = hunk.old_seen;
+        let mut new_seen = hunk.new_seen;
+        let mut base_cursor = self.base_cursor;
+        let mut oracle = self.result_oracle.clone();
+        if let Some((kind, bytes)) = &hunk.pending {
+            match kind {
+                HunkLineKind::Context => {
+                    let mut bytes = bytes.clone();
+                    bytes.push(b'\n');
+                    oracle.push(&bytes)?;
+                    base_cursor = base_cursor.saturating_add(1);
+                    old_seen = old_seen.saturating_add(1);
+                    new_seen = new_seen.saturating_add(1);
+                }
+                HunkLineKind::Deletion => {
+                    base_cursor = base_cursor.saturating_add(1);
+                    old_seen = old_seen.saturating_add(1);
+                }
+                HunkLineKind::Addition => {
+                    let mut bytes = bytes.clone();
+                    bytes.push(b'\n');
+                    oracle.push(&bytes)?;
+                    new_seen = new_seen.saturating_add(1);
+                }
+            }
+        }
+        if old_seen == hunk.header.old_count && new_seen == hunk.header.new_count {
+            return Ok(());
+        }
+        let (kind, content) = match line.split_first() {
+            Some((b' ', content)) => (HunkLineKind::Context, content),
+            Some((b'-', content)) => (HunkLineKind::Deletion, content),
+            Some((b'+', content)) => (HunkLineKind::Addition, content),
+            _ => {
+                return Err(CollarError::Mutation(format!(
+                    "invalid canonical hunk-line prefix for {:?}",
+                    self.path.as_str()
+                )));
+            }
+        };
+        let next_old = old_seen.saturating_add(usize::from(matches!(
+            kind,
+            HunkLineKind::Context | HunkLineKind::Deletion
+        )));
+        let next_new = new_seen.saturating_add(usize::from(matches!(
+            kind,
+            HunkLineKind::Context | HunkLineKind::Addition
+        )));
+        if next_old > hunk.header.old_count || next_new > hunk.header.new_count {
+            return Err(CollarError::Mutation(format!(
+                "hunk-line prefix exceeds declared counts for {:?}",
+                self.path.as_str()
+            )));
+        }
+        if matches!(kind, HunkLineKind::Context | HunkLineKind::Deletion) {
+            let base = self.base_lines.get(base_cursor).ok_or_else(|| {
+                CollarError::Mutation(format!(
+                    "hunk-line prefix is outside base {:?}",
+                    self.path.as_str()
+                ))
+            })?;
+            if !base.starts_with(content) {
+                return Err(CollarError::Mutation(format!(
+                    "hunk-line prefix does not match context in {:?}",
+                    self.path.as_str()
+                )));
+            }
+        }
+        if matches!(kind, HunkLineKind::Context | HunkLineKind::Addition) {
+            let report = oracle.push(content)?;
+            if report.viability == Viability::Impossible {
+                return Err(CollarError::Mutation(format!(
+                    "canonical patch makes the generated virtual prefix impossible for {:?} ({:?})",
+                    self.path.as_str(),
+                    report.rule
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns false when `line` starts the next file diff and must be replayed by the outer state.
     fn consume_line(
         &mut self,
@@ -438,30 +610,23 @@ impl PrefixFile {
         }
         if self.kind != MutationKind::Delete {
             for index in self.base_cursor..end {
-                self.result_prefix
-                    .extend_from_slice(&self.base_lines[index]);
+                let bytes = self.base_lines[index].clone();
+                self.append_result_bytes(&bytes)?;
             }
-            self.validate_result_prefix()?;
         }
         Ok(())
     }
 
     fn append_result_bytes(&mut self, bytes: &[u8]) -> CollarResult<()> {
         if self.kind != MutationKind::Delete {
-            self.result_prefix.extend_from_slice(bytes);
-            self.validate_result_prefix()?;
-        }
-        Ok(())
-    }
-
-    fn validate_result_prefix(&self) -> CollarResult<()> {
-        let report = validate_supported_prefix(&self.path, &self.result_prefix)?;
-        if report.viability == Viability::Impossible {
-            return Err(CollarError::Mutation(format!(
-                "canonical patch makes the committed virtual prefix impossible for {:?} ({:?})",
-                self.path.as_str(),
-                report.rule
-            )));
+            let report = self.result_oracle.push(bytes)?;
+            if report.viability == Viability::Impossible {
+                return Err(CollarError::Mutation(format!(
+                    "canonical patch makes the committed virtual prefix impossible for {:?} ({:?})",
+                    self.path.as_str(),
+                    report.rule
+                )));
+            }
         }
         Ok(())
     }
@@ -478,6 +643,13 @@ fn parse_diff_header_line(line: &str) -> CollarResult<(LogicalPath, LogicalPath)
         parse_prefixed_path(parts[2], 'a')?,
         parse_prefixed_path(parts[3], 'b')?,
     ))
+}
+
+fn next_patch_stream_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 fn reject_unsupported_metadata(line: &str) -> CollarResult<()> {
@@ -1289,5 +1461,64 @@ mod tests {
             " next_value = 2\n",
         );
         assert_stream_equivalent(&snapshot, patch, 1, 2);
+    }
+
+    #[test]
+    fn patch_stream_probes_partial_hunk_lines_before_their_newline() {
+        let snapshot = snapshot("main.py", b"value = (1)\n");
+        let header = concat!(
+            "--- a/main.py\n",
+            "+++ b/main.py\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-value = (1)\n",
+        );
+
+        let mut impossible = PatchStream::new(snapshot.clone(), 4096, 1, 1).unwrap();
+        impossible.push(header.as_bytes()).unwrap();
+        let error = impossible.push(b"+value = ]").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generated virtual prefix impossible")
+        );
+
+        let mut stale = PatchStream::new(snapshot.clone(), 4096, 1, 1).unwrap();
+        stale
+            .push(concat!("--- a/main.py\n", "+++ b/main.py\n", "@@ -1,1 +1,1 @@\n",).as_bytes())
+            .unwrap();
+        assert!(stale.push(b" wrong").is_err());
+
+        let mut valid = PatchStream::new(snapshot, 4096, 1, 1).unwrap();
+        valid.push(header.as_bytes()).unwrap();
+        valid.push(b"+value = [").unwrap();
+        valid.push(b"1, 2]\n").unwrap();
+        assert_eq!(
+            valid.finish().unwrap().files()[0].result_bytes(),
+            Some(&b"value = [1, 2]\n"[..])
+        );
+    }
+
+    #[test]
+    fn patch_checkpoints_restore_exact_partial_line_and_stream_state() {
+        let snapshot = snapshot("main.py", b"value = (1)\n");
+        let header = concat!(
+            "--- a/main.py\n",
+            "+++ b/main.py\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-value = (1)\n",
+        );
+        let mut stream = PatchStream::new(snapshot.clone(), 4096, 1, 1).unwrap();
+        stream.push(header.as_bytes()).unwrap();
+        let checkpoint = stream.checkpoint();
+        assert!(stream.push(b"+value = ]").is_err());
+        stream.rollback(checkpoint.clone()).unwrap();
+        stream.push(b"+value = [1, 2]\n").unwrap();
+        assert_eq!(
+            stream.finish().unwrap().files()[0].result_bytes(),
+            Some(&b"value = [1, 2]\n"[..])
+        );
+
+        let mut other = PatchStream::new(snapshot, 4096, 1, 1).unwrap();
+        assert!(other.rollback(checkpoint).is_err());
     }
 }

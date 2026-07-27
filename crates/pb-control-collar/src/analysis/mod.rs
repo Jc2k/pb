@@ -9,9 +9,10 @@ pub use prefix::{
     PrefixCheckpoint, PrefixReport, PrefixRule, SourcePrefixOracle, validate_supported_prefix,
 };
 pub use semantic::{
-    BaselineCompleteness, DiagnosticDelta, DiagnosticIdentity, SEMANTIC_WORLD_CONTRACT_VERSION,
-    SemanticDiagnosticSnapshot, SemanticEnforcement, SemanticFileBinding, SemanticWorldSnapshot,
-    diagnostic_delta,
+    BaselineCompleteness, DiagnosticDelta, DiagnosticIdentity, SEMANTIC_EVIDENCE_CONTRACT_VERSION,
+    SEMANTIC_WORLD_CONTRACT_VERSION, SemanticDiagnosticSnapshot, SemanticEnforcement,
+    SemanticEvidenceScope, SemanticEvidenceStage, SemanticFileBinding, SemanticGateReceipt,
+    SemanticProviderEvidence, SemanticWorldSnapshot, diagnostic_delta,
 };
 pub use syntax::{
     IncrementalSyntaxCheckpoint, IncrementalSyntaxReport, IncrementalSyntaxTree, SyntaxProfile,

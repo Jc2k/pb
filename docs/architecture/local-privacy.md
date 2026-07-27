@@ -54,6 +54,9 @@ cache, and are discarded with the request. The collar never opens a repository f
 external analyzer. Its durable inference fields are limited to a dialect name, schema digest,
 content-free rejection counts, snapshot file/byte counts, and terminal state; paths, source, patch
 bodies, argument values, symbols, prompts, and logits are excluded.
+Incremental source and patch branch caches are request-local memory only. Qualification reports
+persist artifact digests, counts, and timing percentiles rather than corpus source or decoded
+payloads.
 `inference.llamacpp_session_cache_enabled=false` and
 `inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are
@@ -149,13 +152,19 @@ service. The read-only workspace mount, offline Cargo configuration, and no-egre
 remain in force; pb does not apply server-proposed edits or commands.
 
 Opt-in semantic mutation analysis uses that same local stdio sidecar path with controller-provided
-base and candidate overlays. It may read repository content plus offline dependency sources,
-declarations, sysroots, typeshed/stubs, and package metadata already mounted into the session, but
-does not add egress and does not expose those inputs to the model. Durable constraint telemetry is
-content-free: exact content is represented only by hashes and document versions, and diagnostic
-messages or symbol indexes are not persisted. A future portable public-symbol fact pack must remain
-content-addressed, local, lockfile/configuration scoped, and opt-in before it can change this data
-boundary.
+base and candidate overlays. Each transaction copies only the exact captured in-scope regular files
+to an ephemeral shadow directory, mounts that shadow read-only into a fresh isolated LSP session,
+checks it for drift, and deletes it when the transaction ends. It may read repository content plus
+offline dependency sources, declarations, sysroots, typeshed/stubs, and package metadata already
+mounted into the session, but does not add egress and does not expose those inputs to the model.
+Durable constraint telemetry and separate generation/final receipts are content-free: exact content
+is represented only by hashes, versions, counts, and timings; paths, source, patch bodies, diagnostic
+messages, prompts, and symbol indexes are not persisted. A future portable public-symbol fact pack
+must remain content-addressed, local, lockfile/configuration scoped, and opt-in before it can change
+this data boundary.
+Mutable external LSP cache attachments cannot currently authorize required semantic mode; provider-
+embedded offline dependencies remain bound by the image digest while portable dependency cache/fact
+pack qualification is later work.
 
 ### Public research
 

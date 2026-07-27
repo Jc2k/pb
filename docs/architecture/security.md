@@ -103,6 +103,10 @@ envelopes, invalid virtual results, and empty candidate frontiers fail closed. D
 telemetry contains only dialect, reason codes, counts, digests, terminal states, and snapshot byte/
 file counts—never source, patch, argument, symbol, or path content.
 
+Request-local prefix and patch checkpoints retain only the bounded in-memory state needed to compare
+candidate branches. They are stream-scoped, discarded with the constraint session, grant no new
+path or tool authority, and are never accepted as executor evidence.
+
 The executor does not trust generation-time acceptance. It repeats path/capability/schema/read gates,
 reconstructs the virtual mutation, verifies current base hashes and syntax, and publishes through
 the existing atomic file operations. Constrained patches additionally require exact in-memory hunk
@@ -183,13 +187,19 @@ workspace edits, commands, formatting, or code actions.
 
 An opt-in semantic mutation gate gives a language server authority to veto a generated boundary or
 final publication, never authority to mutate. The controller supplies exact in-memory overlays and
-checks the complete workspace fingerprint before and after analysis. Required mode trusts only a
-digest-pinned container provider with a complete pull-diagnostic baseline/candidate pair; host
-commands, mutable tags, push-only publications, restarts, stale versions, timeouts, deletion impact,
-and unclassified diagnostics fail closed. Advisory mode cannot veto. Provider processes keep the
-same read-only workspace, declared cache, and network boundaries as ordinary LSP sidecars. Source,
-paths, diagnostic messages, and symbol contents are excluded from constraint telemetry; only
+creates a fresh exact bounded shadow tree and isolated provider session for each transaction, and
+checks that tree before and after analysis. Shadow creation rejects symlinks and non-regular files,
+copy-time live-workspace drift, excess path/byte counts, and provider mutations. Only an LSP process
+with read-only workspace authority may substitute this controller-owned analysis root; MCP,
+writable, and undeclared services cannot. Required mode trusts only a digest-pinned container
+provider with a complete pull-diagnostic baseline/candidate pair; host commands, mutable tags,
+push-only publications, restarts, stale versions, timeouts, deletion impact, empty/detached project
+graphs, and unclassified diagnostics fail closed. Advisory mode cannot veto. Source, paths,
+diagnostic messages, and symbol contents are excluded from constraint telemetry and receipts; only
 provider/world hashes, classified outcome counts, guarantee rung, and bounded timing are durable.
+Digest-pinned provider images bind embedded toolchains, sysroots, and declarations. A declared
+external LSP cache is not yet an authoritative semantic input: until a profile binds its exact
+content and mounts it read-only, its presence makes the semantic result unknown.
 
 Marketplace LSP metadata is also untrusted input. Registry manifests, image configurations, and
 authentication responses have byte ceilings; the typed LSP package annotation has its own 64 KiB

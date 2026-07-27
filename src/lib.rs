@@ -54,6 +54,7 @@ pub mod policy;
 pub mod projects;
 mod public_network;
 pub mod semantic;
+mod semantic_qualification;
 pub mod service;
 pub mod session_environment;
 pub mod session_power;
@@ -477,6 +478,58 @@ pub enum HarnessCommand {
     /// Run the immutable four-arm controller-observation continuation experiment
     #[command(hide = true)]
     ActionElisionEval(HarnessActionElisionEvalArgs),
+    /// Qualify real-tokenizer source-prefix reachability, rollback, and latency
+    #[command(name = "collar-qualify", hide = true)]
+    CollarQualify(HarnessCollarQualifyArgs),
+    /// Qualify a digest-pinned semantic provider against a versioned mutation corpus
+    #[command(name = "semantic-qualify", hide = true)]
+    SemanticQualify(HarnessSemanticQualifyArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HarnessCollarQualifyArgs {
+    /// FlashMoe model identity whose exact tokenizer artifacts are qualified
+    #[arg(long, default_value = inference::flashmoe::QWEN3_CODER_NEXT_MODEL)]
+    pub model: String,
+
+    /// Directory containing pulled model blobs; defaults to the configured model dir
+    #[arg(long)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Versioned source-prefix qualification corpus
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "fixtures/control-collar/prefix-language-v1.json"
+    )]
+    pub corpus: PathBuf,
+
+    /// Maximum accepted p95 CPU time for one real-token logical-prefix probe
+    #[arg(long, default_value_t = 1_000)]
+    pub latency_budget_micros: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HarnessSemanticQualifyArgs {
+    /// Project whose effective LSP configuration supplies the pinned provider profile
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
+
+    /// Exact configured LSP server name to qualify
+    #[arg(long, default_value = "rust-analyzer")]
+    pub server: String,
+
+    /// Versioned semantic mutation corpus
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "fixtures/control-collar/semantic-rust-v1.json"
+    )]
+    pub corpus: PathBuf,
+
+    /// Maximum accepted p95 time for one generation or final semantic transaction
+    #[arg(long, default_value_t = 8_000)]
+    pub latency_budget_millis: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1697,7 +1750,11 @@ async fn run_integrations_command(command: IntegrationsCommand) -> Result<()> {
             };
             let response = match kind {
                 IntegrationKind::Mcp => integrations::install_project(&root, request),
-                IntegrationKind::Lsp => integrations::install_global_lsp(request),
+                IntegrationKind::Lsp => {
+                    tokio::task::spawn_blocking(move || integrations::install_global_lsp(request))
+                        .await
+                        .context("LSP integration installer task failed")?
+                }
             }?;
             println!(
                 "installed {} integration '{}' from {} in {}",
@@ -2481,7 +2538,47 @@ fn run_harness_command(command: HarnessCommand) -> Result<()> {
         HarnessCommand::ActionElisionEval(args) => {
             harness_eval::run_action_elision_eval_command(args)
         }
+        HarnessCommand::CollarQualify(args) => run_collar_qualification(args),
+        HarnessCommand::SemanticQualify(args) => run_semantic_qualification(args),
     }
+}
+
+fn run_collar_qualification(args: HarnessCollarQualifyArgs) -> Result<()> {
+    let user_config = UserConfig::load()?;
+    let models_root = args
+        .model_dir
+        .or_else(|| user_config.effective_model_dir())
+        .unwrap_or_else(default_models_dir);
+    let plan = inference::flashmoe::plan_unchecked(&args.model, &models_root);
+    let report = inference::flashmoe::qualify_prefix_tokenizer(
+        &plan,
+        &args.corpus,
+        args.latency_budget_micros,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn run_semantic_qualification(args: HarnessSemanticQualifyArgs) -> Result<()> {
+    let root = resolve_env_root(args.workdir)?;
+    let user_config = UserConfig::load()?;
+    let project = lsp::ProjectLspConfig::load(&root)?;
+    let servers = lsp::effective_servers(&user_config.lsp, project.as_ref());
+    let config = servers.get(&args.server).cloned().with_context(|| {
+        format!(
+            "semantic qualification provider {:?} is not configured for {}",
+            args.server,
+            root.display()
+        )
+    })?;
+    let report = semantic_qualification::qualify(
+        &args.server,
+        config,
+        &args.corpus,
+        args.latency_budget_millis,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn run_flashmoe_cache_clean(args: FlashMoeCacheCleanArgs) -> Result<()> {
@@ -5318,6 +5415,62 @@ mod tests {
         assert_eq!(terminals, ["apply_patch"]);
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot.total_bytes(), 16);
+    }
+
+    #[test]
+    fn collar_qualification_has_explicit_reproducible_inputs_and_budget() {
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "collar-qualify",
+            "--model",
+            "model-id",
+            "--model-dir",
+            "/models",
+            "--corpus",
+            "corpus.json",
+            "--latency-budget-micros",
+            "750",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::CollarQualify(args),
+        } = parsed.command
+        else {
+            panic!("expected collar qualification command");
+        };
+        assert_eq!(args.model, "model-id");
+        assert_eq!(args.model_dir, Some(PathBuf::from("/models")));
+        assert_eq!(args.corpus, PathBuf::from("corpus.json"));
+        assert_eq!(args.latency_budget_micros, 750);
+    }
+
+    #[test]
+    fn semantic_qualification_has_explicit_provider_corpus_and_budget() {
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "semantic-qualify",
+            "--workdir",
+            "/repo",
+            "--server",
+            "typescript",
+            "--corpus",
+            "semantic.json",
+            "--latency-budget-millis",
+            "5000",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::SemanticQualify(args),
+        } = parsed.command
+        else {
+            panic!("expected semantic qualification command");
+        };
+        assert_eq!(args.workdir, Some(PathBuf::from("/repo")));
+        assert_eq!(args.server, "typescript");
+        assert_eq!(args.corpus, PathBuf::from("semantic.json"));
+        assert_eq!(args.latency_budget_millis, 5000);
     }
 
     #[test]

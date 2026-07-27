@@ -14935,7 +14935,7 @@ fn llama_completion_output(
                 mutation_snapshot_bytes: stats.snapshot_bytes,
                 constraint_terminal_state: Some(stats.terminal_state.clone()),
                 constraint_guarantee_rung: Some(stats.guarantee_rung.clone()),
-                semantic_boundary: stats.semantic_boundary,
+                semantic_boundary: stats.semantic_boundary.clone(),
                 decode_recovery: stats.decode_recovery,
                 ..crate::events::NativeGenerationUsage::default()
             });
@@ -15331,7 +15331,7 @@ fn generate_flashmoe_completion_from_request(
             .map(|stats| stats.terminal_state.clone())
             .or_else(|| json_constraints.map(|stats| stats.terminal_state.clone())),
         constraint_guarantee_rung: tool_constraints.map(|stats| stats.guarantee_rung.clone()),
-        semantic_boundary: tool_constraints.and_then(|stats| stats.semantic_boundary),
+        semantic_boundary: tool_constraints.and_then(|stats| stats.semantic_boundary.clone()),
         decode_recovery: tool_constraints.map_or(
             crate::inference::DecodeRecovery::CandidateProbeOnly,
             |stats| stats.decode_recovery,
@@ -16412,8 +16412,9 @@ struct ToolContext<'a> {
 fn enforce_tool_semantic_transaction(
     context: &ToolContext<'_>,
     mutations: Vec<crate::semantic::SemanticOverlayMutation>,
+    sink: &mut dyn EventSink,
 ) -> Result<()> {
-    let Some(report) = crate::semantic::enforce_configured_transaction(
+    let Some((report, required)) = crate::semantic::configured_transaction_report(
         context.lsp_registry,
         context.workspace_root,
         &mutations,
@@ -16421,6 +16422,16 @@ fn enforce_tool_semantic_transaction(
     else {
         return Ok(());
     };
+    let receipt = report.receipt(
+        pb_control_collar::analysis::SemanticEvidenceStage::FinalExecutor,
+        Duration::from_secs(8),
+    )?;
+    sink.emit(AgentEvent::SemanticGate {
+        receipt,
+        nesting_depth: (context.request.sub_agent_depth > 0)
+            .then_some(context.request.sub_agent_depth),
+        timestamp_ms: Some(now_millis()),
+    });
     tracing::info!(
         workspace_sha256 = %report.workspace_fingerprint,
         providers = report.providers.len(),
@@ -16430,6 +16441,25 @@ fn enforce_tool_semantic_transaction(
         unknown_reasons = report.verdict.unknown_reasons.len(),
         "completed configured semantic mutation gate"
     );
+    if required && report.verdict.closure != pb_control_collar::analysis::ClosureVerdict::Allow {
+        let errors = report
+            .verdict
+            .definite_errors
+            .iter()
+            .map(|error| format!("{error:?}").to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let unknown = report
+            .verdict
+            .unknown_reasons
+            .iter()
+            .map(|reason| format!("{reason:?}").to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        bail!(
+            "required semantic gate did not authorize publication (definite_errors=[{}], unknown_reasons=[{}])",
+            errors.join(","),
+            unknown.join(",")
+        );
+    }
     Ok(())
 }
 
@@ -18422,6 +18452,7 @@ fn run_tool(
                     base: None,
                     result: Some(content.to_string()),
                 }],
+                sink,
             )?;
             if let Some(parent) = resolved.parent() {
                 std::fs::create_dir_all(parent)
@@ -18492,6 +18523,7 @@ fn run_tool(
                     base: Some(existing.clone()),
                     result: Some(content.to_string()),
                 }],
+                sink,
             )?;
             atomic_replace_file(
                 &resolved,
@@ -18572,6 +18604,7 @@ fn run_tool(
                     base: Some(existing.clone()),
                     result: Some(updated.clone()),
                 }],
+                sink,
             )?;
             atomic_replace_file(
                 &resolved,
@@ -18682,7 +18715,7 @@ fn run_tool(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            enforce_tool_semantic_transaction(context, semantic_mutations)?;
+            enforce_tool_semantic_transaction(context, semantic_mutations, sink)?;
             run_git_apply_patch(patch, workspace_root)?;
             for file in prepared.files() {
                 let resolved = resolve_workspace_path(workspace_root, file.path().as_str(), false)?;

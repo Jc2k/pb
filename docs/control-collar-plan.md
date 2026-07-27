@@ -9,17 +9,23 @@ still design-record work and are not implied by the syntax-valid production mile
 
 Current implementation ledger:
 
-- **Phase 6 implemented:** conservative UTF-8/lexical/delimiter/Python-indentation prefix rules,
-  incremental Tree-sitter edits/checkpoints, and chunk-independent canonical streaming patch
-  validation are shared by Qwen JSON and DeepSeek DSML. The claim is conservative prefix safety,
-  not exact grammar extendability; live-tokenizer corpus, fuzz, and latency qualification remain.
+- **Phase 6 implemented:** conservative UTF-8/lexical/delimiter/Python-indentation prefix rules now
+  advance only over newly committed logical bytes, use constant-time persistent-stack checkpoints,
+  and retain bounded candidate-branch checkpoints. Incremental Tree-sitter edits/checkpoints and
+  chunk-independent canonical patch validation share the same oracle; partial hunk additions and
+  context are probed before their newline. Qwen and DeepSeek real-tokenizer split/rollback/chunk
+  qualification passes the 1 ms p95 budget. The claim remains conservative prefix safety, not exact
+  grammar extendability; longer fuzzing and refreshed end-to-end throughput evidence remain.
 - **Phase 7 foundation configurable:** immutable semantic-world/document identities, exact
-  full-content LSP overlays with monotonic versions, full pull-diagnostic baselines, diagnostic-debt
-  deltas, required/advisory policy, repairable payload-close steering, and final executor
-  revalidation are implemented for classified rust-analyzer, TypeScript, and Pyright errors.
-  Enforcement defaults to `disabled`. Digest-pinned provider/project matrices, native Rust compiler
-  parity, strict Python/JavaScript profiles, boundary latency, multi-project overlays, and portable
-  dependency fact packs remain promotion gates.
+  full-content LSP overlays with monotonic versions, fresh immutable shadow workspaces and isolated
+  LSP sessions, full pull-diagnostic baselines, diagnostic-debt deltas, required/advisory policy,
+  repairable payload-close steering, final executor revalidation, and separate content-free
+  generation/final receipts are implemented for classified rust-analyzer, TypeScript, and Pyright
+  errors. Required Rust evidence additionally needs a loaded non-empty crate graph and per-document
+  crate membership. Enforcement defaults to `disabled`. The first digest-pinned Rust provider
+  qualification failed safely because its packaged analyzer produced no crate graph; no semantic
+  profile has been promoted. Native compiler parity, strict Python/JavaScript profiles, boundary
+  latency, multi-project overlays, and portable dependency fact packs remain promotion gates.
 - **Phase 8 adapter implemented:** llama.cpp now masks the full vocabulary before sampling
   truncation, accepts sampler state once, reuses both tool dialects and the shared executor, and
   reports the same guarantee/rejection fields. Pinned live model/tokenizer/template differential
@@ -620,11 +626,13 @@ request-local model runtime to an individual LSP session; analyzer code must nev
 model runtime. A future worker/queue implementation must preserve that acyclic order while removing
 the LSP wait from the runtime critical section.
 
-The existing LSP client should be extended with an overlay API that accepts controller-provided
-bytes and monotonically versioned full-content `didOpen`/`didChange` updates. Generation-time
-analysis must require either a complete pull-diagnostic response or a fresh version-matched push
-publication. Stale, partial, quiet-period-only, timed-out, restarted, or configuration-divergent
-results are `Unknown`, never clean evidence.
+The LSP client now accepts controller-provided bytes through monotonically versioned full-content
+`didOpen`/`didChange` updates. Each semantic transaction creates an exact bounded shadow copy from
+the captured content snapshot and a fresh provider session rooted at that copy; it rejects
+symlinks, special files, copy-time live-workspace drift, and any provider mutation of the shadow.
+Generation-time analysis requires a complete pull-diagnostic response. Stale, partial,
+quiet-period-only, timed-out, restarted, configuration-divergent, empty Rust crate-graph, or
+detached-document results are `Unknown`, never clean evidence.
 
 ### Boundary steering policy
 
@@ -961,18 +969,21 @@ workspace, not an earlier phase branch.
 
 | Evidence | Status | Current result |
 | --- | --- | --- |
-| Collar unit and chunk-boundary corpus | Passed | 44 deterministic tests, including all six language families plus TSX/JSX, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches, streaming virtual-result prefixes, malformed patch corpus, Qwen/DSML payload closure, all DSML closers nested inside JSON, immutable semantic identities/debt, and marker-only control-token identity |
+| Collar unit and chunk-boundary corpus | Passed | 52 deterministic tests, including all six language families plus TSX/JSX, byte/random chunk equivalence, monotonic hard rejection, constant-time deep checkpoints, branch rollback caches, partial patch-line probing, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches, malformed patch corpus, Qwen/DSML payload closure, immutable semantic identities/debt and receipts, and control-token identity |
 | Qwen native constraint corpus | Passed | 13 focused tests, including closure rejection for invalid syntax and the one-mutation batch bound |
 | DeepSeek DSML renderer/parser corpus | Passed | 3 focused root tests plus 2 collar DSML tests for typed parameters, ordered JSON-string mutation history, and closure boundaries |
 | Workspace format/check/Clippy | Passed | `cargo fmt --all -- --check`, `cargo check --workspace --all-targets -j 1`, and the repository warning/correctness Clippy gate |
 | Executor and event focused tests | Passed | Snapshot freshness, exact patch/Git differential result, inexact hunk rejection, and additive/backward-compatible event round trip |
-| Workspace all-target tests | Passed | On 2026-07-27, 1,450 root tests passed with 23 device/environment tests ignored, 2 environment-contract tests passed, and all 44 collar tests passed |
+| Workspace all-target tests | Passed | On 2026-07-27, 1,465 root tests passed with 23 device/environment tests ignored, 2 environment-contract tests passed, and all 52 collar tests passed |
 | Web and documentation tests | Passed | 76 web tests passed; mdBook and link validation checked 59 pages and 98 rendered files |
 | Production asset/release build | Passed | On 2026-07-27, web assets and the optimized macOS arm64 release binary rebuilt successfully |
 | Required FlashMoe one-token smoke | Passed | On 2026-07-27, the current release binary exited zero and printed the existing raw Qwen baseline `5` for `2+2=` |
 | Phase 6–8 foundation integration | Passed | Conservative prefix and patch-stream tests, Qwen and DeepSeek payload-close semantic rejection, exact monotonic fake-LSP overlays and diagnostic debt, llama.cpp full-vocabulary pre-top-k masking, shared event compatibility, workspace check, and strict Clippy all pass |
-| Phase 6 promotion corpus/performance | Pending | Real-tokenizer valid/repairable splits, fuzz/rollback differential coverage, p95 cheap-probe latency, and pinned end-to-end throughput still gate promotion beyond the implemented conservative rules |
-| Phase 7 pinned semantic profiles | Pending | Real digest-pinned rust-analyzer/TypeScript/Pyright project matrices, compiler/profile parity, multi-file/dependant scope, cancellation/latency, and offline dependency resolution still gate any default semantic guarantee |
+| Phase 6 Qwen/DeepSeek tokenizer-prefix qualification | Passed | Corpus SHA-256 `1b4568f8…9215`; Qwen tokenizer `be756060…5506` ran 173 token-prefix/rollback probes and DeepSeek JoyAI tokenizer `263ab7b3…f3ba` ran 180; each replayed 704 deterministic chunkings and measured 1 µs p95 against the 1,000 µs budget |
+| Phase 6 remaining promotion evidence | Pending | Scheduled long fuzz/property runs, outer Qwen/DSML logical-prefix extraction profiling, and refreshed pinned end-to-end write/patch throughput still gate promotion beyond the implemented conservative rules |
+| Phase 7 shadow/evidence foundation | Passed | Semantic analysis uses a fresh exact bounded shadow tree and isolated LSP session for each transaction, rejects symlinks and post-copy drift, permits only an LSP-specific read-only analysis-root mount, and emits independently validated content-free generation and final-executor receipts |
+| Phase 7 pinned Rust provider attempt | Failed safely | `ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b26526…173d` (rust-analyzer 1.96.0) never produced a non-empty crate graph or document membership within the required barrier; the qualifier returned `Unknown`/provider unavailable, required mode rejected, and the profile remained disabled |
+| Phase 7 pinned semantic profiles | Pending | A provider that passes the checked-in Rust corpus, plus digest-pinned TypeScript/Pyright project matrices, compiler/profile parity, multi-file/dependant scope, cancellation/latency, and offline dependency resolution still gate any default semantic guarantee |
 | Phase 8 live llama.cpp profiles | Pending | Pinned model/tokenizer/template write/patch/malformed/truncation and FlashMoe differential runs still gate a backend-parity claim |
 | Pinned DeepSeek direct mutation qualification | Passed | The checked-in `fixtures/control-collar/` inputs produced syntax-valid `answer.py` after 2 candidate rejections and an exact snapshot-bound one-line patch after 8, reporting 1 file and 16 snapshot bytes; an alternate capped patch attempt reported 7 `invalid_patch` closure rejections and executed no call |
 | Pinned DeepSeek strict workflow | Passed | An 11-invocation delivery crossed tool-schema narrowing, reused unchanged exact roots, cold-started changed roots, executed constrained `write_file`, passed review, and ended `contract_status=satisfied`, `verified_completed=true` |
@@ -1012,11 +1023,11 @@ the pinned end-to-end decode-throughput reduction remains within the existing 25
 
 ### Phase 7 — Semantic steering and final semantic gates
 
-- **7A — Build the semantic provider contract and shadow world.** Add the controller-owned broker,
-  immutable shadow workspace, exact overlay versions, baseline diagnostics, provider health, bounded
-  request queue, cancellation, and content-addressed world cache. Extend the existing LSP client to
-  accept overlay bytes rather than rereading the target from disk. Keep analyzer I/O and Tokio out of
-  `pb-control-collar`.
+- **7A — Build the semantic provider contract and shadow world.** The controller-owned broker,
+  immutable bounded shadow workspace, isolated provider session, exact overlay versions, baseline
+  diagnostics, provider health, and cancellation are implemented. A content-addressed world cache
+  and request queue remain optional performance work after correctness qualification. Analyzer I/O
+  and Tokio stay out of `pb-control-collar`.
 - **7B — Establish diagnostic-delta semantics.** Initially enforce only a clean, complete baseline
   for the affected project targets. Then add a diagnostic-debt ledger that allows a mutation to fix
   existing errors while rejecting new definite errors, using in-memory code/range/source mapping and
@@ -1048,12 +1059,12 @@ the pinned end-to-end decode-throughput reduction remains within the existing 25
 - **7G — Revalidate at execution.** Reconstruct the exact prepared virtual workspace, verify live
   base and semantic-world identities, rerun the authoritative final provider, and only then publish
   atomically. A generation-time receipt never substitutes for final executor validation.
-- **7H — Make semantic evidence durable and auditable.** Emit separate generation-boundary and
-  final-executor receipts containing only contract/provider/world/config/dependency/document
+- **7H — Make semantic evidence durable and auditable.** Separate generation-boundary and
+  final-executor receipts are implemented with contract/provider/world/config/dependency/document
   digests, versions, completeness, verdict classes, reason/count fields, budgets, and timings.
-  Receipts must identify their scope (document, affected target set, or complete project) and must
-  never contain paths, source, patches, diagnostic messages, prompts, or symbol names. Generation
-  telemetry cannot be promoted into final publication evidence.
+  Receipts identify their scope (document, affected target set, or complete project) and exclude
+  paths, source, patches, diagnostic messages, prompts, and symbol names. Generation telemetry
+  cannot be promoted into final publication evidence.
 
 Gate for each language/profile: a pinned analyzer/toolchain and project-config digest; a complete
 baseline policy; explicit definite/repairable/unknown diagnostic classes; string-plus-integer,

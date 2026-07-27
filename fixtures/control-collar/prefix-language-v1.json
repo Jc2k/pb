@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "path": "src/main.rs",
+      "source": "fn main() { let text = r##\"]\"##; println!(\"{text}\"); }\n",
+      "expected": "valid_complete"
+    },
+    {
+      "path": "main.py",
+      "source": "def render(value: int) -> str:\n    text = \"\"\"[ok]\"\"\"\n    return f\"{text}: {value}\"\n",
+      "expected": "valid_complete"
+    },
+    {
+      "path": "main.ts",
+      "source": "export const values: Array<number> = [1, 2, 3];\n",
+      "expected": "valid_complete"
+    },
+    {
+      "path": "view.tsx",
+      "source": "export const View = () => <main>{['ok'].map(String)}</main>;\n",
+      "expected": "valid_complete"
+    },
+    {
+      "path": "main.js",
+      "source": "export const matches = /[\\]})]/u.test(']');\n",
+      "expected": "valid_complete"
+    },
+    {
+      "path": "index.html",
+      "source": "<!doctype html><html><body><main>valid</main></body></html>\n",
+      "expected": "valid_complete"
+    },
+    {
+      "path": "style.css",
+      "source": ":root { --accent: rgb(1 2 3); }\nmain { color: var(--accent); }\n",
+      "expected": "valid_complete"
+    },
+    {
+      "path": "open.rs",
+      "source": "fn open() { let values = [1, 2",
+      "expected": "repairable"
+    },
+    {
+      "path": "regex.js",
+      "source": "const value = /[]/; ]",
+      "expected": "repairable"
+    },
+    {
+      "path": "broken.rs",
+      "source": "fn broken() { ]",
+      "expected": "impossible",
+      "rule": "unmatched_closing_delimiter"
+    },
+    {
+      "path": "broken.py",
+      "source": "if ready:\n    if nested:\n        run()\n  nope()\n",
+      "expected": "impossible",
+      "rule": "invalid_python_dedent"
+    }
+  ]
+}

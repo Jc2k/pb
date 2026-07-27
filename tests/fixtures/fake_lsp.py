@@ -4,9 +4,11 @@
 import json
 import pathlib
 import sys
+import time
 
 
 LOG_PATH = pathlib.Path(sys.argv[1])
+CONTROL_PATH = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else None
 DOCUMENTS = {}
 
 
@@ -77,6 +79,14 @@ while True:
         uri = params["textDocument"]["uri"]
         version, text = DOCUMENTS[uri]
         record("diagnostic", uri, version, text)
+        if CONTROL_PATH is not None:
+            (CONTROL_PATH / "ready").write_text("ready", encoding="utf-8")
+            deadline = time.monotonic() + 5
+            while not (CONTROL_PATH / "continue").exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("fake LSP control barrier timed out")
+                time.sleep(0.01)
+            CONTROL_PATH = None
         items = []
         if "TYPE_ERROR" in text:
             items.append(

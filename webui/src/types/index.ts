@@ -1,5 +1,11 @@
 export type AgentEvent =
   | {
+    type: "semantic_gate";
+    receipt: SemanticGateReceipt;
+    nesting_depth?: number;
+    timestamp_ms?: number;
+  }
+  | {
     type: "harness_experiment_configured";
     observation_rendering: "native" | "controller_block";
     timestamp_ms?: number;
@@ -740,6 +746,37 @@ export interface SessionMetricsSnapshot {
 export interface EventEnvelope {
   version: string;
   event: AgentEvent;
+}
+
+export interface SemanticGateReceipt {
+  contract_version: number;
+  stage: "generation_boundary" | "final_executor";
+  scope: "document" | "affected_targets" | "complete_project";
+  workspace_sha256: string;
+  affected_documents: number;
+  providers: SemanticProviderEvidence[];
+  viability: "valid" | "repairable" | "impossible" | "unknown";
+  closure: "allow" | "reject" | "defer";
+  definite_errors: string[];
+  unknown_reasons: string[];
+  wall_millis: number;
+  budget_millis: number;
+}
+
+export interface SemanticProviderEvidence {
+  provider: string;
+  provider_version: string;
+  world_sha256: string;
+  configuration_sha256: string;
+  dependency_sha256: string;
+  baseline: "complete" | "incomplete";
+  document_count: number;
+  introduced_diagnostics: number;
+  resolved_diagnostics: number;
+  unchanged_diagnostics: number;
+  authoritative: boolean;
+  definite_errors: string[];
+  unknown_reasons: string[];
 }
 
 export type SessionStatus =
