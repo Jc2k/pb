@@ -759,6 +759,17 @@ identities, counts, byte totals, and timings. The matrix establishes a reproduci
 baseline; it is not a universal latency or memory guarantee for projects with different syntax,
 plugins, dynamic environment behavior, or dependency shapes.
 
+The separate Python semantic qualifier keeps this lifecycle outside inference while exercising
+language behavior. Its checked-in corpus freezes first-party files and a typed third-party package
+surface, then compares the production generation closure, independent executor replay, and the
+language crate's content-free promoted diagnostic-code delta for every case. Annotated,
+unannotated, baseline-debt, dynamic-unknown, dependency, and multi-file cases all use the same
+native `ty` resolver and request overlays as production; no live LSP or incomplete-document
+diagnostic stream participates. Corpus validation requires both valid and invalid examples for the
+three primary profiles, every promoted diagnostic class, and write/replace/edit/patch coverage.
+This is differential evidence for the existing profile, not authority for an additional
+token-time rule or a universal Python soundness claim.
+
 The syntax profiles are pinned Tree-sitter grammars for Rust, Python, TypeScript/TSX,
 JavaScript/JSX, HTML, and CSS. They require UTF-8 and reject error or missing nodes; HTML additionally
 checks explicit element closure and supported embedded JavaScript, TypeScript, JSON, and CSS. This

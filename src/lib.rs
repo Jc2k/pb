@@ -56,6 +56,7 @@ mod native_qualification;
 pub mod policy;
 pub mod projects;
 mod public_network;
+mod python_semantic_qualification;
 pub mod semantic;
 mod semantic_qualification;
 pub mod service;
@@ -493,6 +494,9 @@ pub enum HarnessCommand {
     /// Qualify native project-world lifecycle, scaling, and resource bounds without a model
     #[command(name = "native-world-qualify", hide = true)]
     NativeWorldQualify(native_qualification::HarnessNativeWorldQualifyArgs),
+    /// Qualify native Python semantic classes through generation and execution replay
+    #[command(name = "python-semantic-qualify", hide = true)]
+    PythonSemanticQualify(python_semantic_qualification::HarnessPythonSemanticQualifyArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2603,6 +2607,7 @@ fn run_harness_command(command: HarnessCommand) -> Result<()> {
         HarnessCommand::LlamaInfer(args) => run_llama_tool_fixture(args),
         HarnessCommand::SemanticQualify(args) => run_semantic_qualification(args),
         HarnessCommand::NativeWorldQualify(args) => native_qualification::run(args),
+        HarnessCommand::PythonSemanticQualify(args) => python_semantic_qualification::run(args),
     }
 }
 
@@ -5802,6 +5807,31 @@ mod tests {
         assert_eq!(args.max_replay_millis, 12_000);
         assert_eq!(args.max_peak_resident_bytes, 2_147_483_648);
         assert!(args.case.is_none());
+    }
+
+    #[test]
+    fn python_semantic_qualification_has_explicit_corpus_and_budgets() {
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "python-semantic-qualify",
+            "--corpus",
+            "semantic-python.json",
+            "--max-cold-millis",
+            "90000",
+            "--max-case-millis",
+            "12000",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::PythonSemanticQualify(args),
+        } = parsed.command
+        else {
+            panic!("expected Python semantic qualification command");
+        };
+        assert_eq!(args.corpus, PathBuf::from("semantic-python.json"));
+        assert_eq!(args.max_cold_millis, 90_000);
+        assert_eq!(args.max_case_millis, 12_000);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! it never loads Cargo metadata, starts a language server, or reads the live workspace.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io::Read,
     path::{Path, PathBuf},
     sync::{
@@ -104,6 +104,28 @@ pub(crate) struct PythonWorldQualificationObservation {
     pub(crate) process_cache_hit_millis: u64,
     pub(crate) invalid_replay_millis: u64,
     pub(crate) valid_replay_millis: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PythonSemanticQualificationObservation {
+    pub(crate) generation: CompletionDecision,
+    pub(crate) final_replay: CompletionDecision,
+    pub(crate) diagnostic_codes: BTreeSet<String>,
+    pub(crate) warm_millis: u64,
+    pub(crate) generation_millis: u64,
+    pub(crate) final_replay_millis: u64,
+    pub(crate) diagnostic_millis: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PythonSemanticWorldObservation {
+    pub(crate) world_sha256: String,
+    pub(crate) configuration_sha256: String,
+    pub(crate) dependency_sha256: String,
+    pub(crate) provider_version: String,
+    pub(crate) load_millis: u64,
+    pub(crate) prime_millis: u64,
+    pub(crate) primed_queries: u64,
 }
 
 impl Default for ControlLayerLifecycle {
@@ -1772,6 +1794,140 @@ pub(crate) fn qualify_python_world_fixture(
         process_cache_hit_millis,
         invalid_replay_millis,
         valid_replay_millis,
+    })
+}
+
+/// Qualify one complete Python mutation against the ordinary generation and execution gates, then
+/// independently ask the language-owned layer for only its promoted diagnostic-code delta. The
+/// caller supplies a frozen corpus workspace and never exposes the returned codes to inference.
+pub(crate) fn qualify_python_semantic_case(
+    lifecycle: &mut ControlLayerLifecycle,
+    workspace_root: &Path,
+    tool: &BuiltInToolSchema,
+    snapshot: &WorkspaceSnapshot,
+    name: &str,
+    arguments: &Value,
+) -> Result<PythonSemanticQualificationObservation> {
+    let warm_started = std::time::Instant::now();
+    let layers = lifecycle
+        .prepare_for_inference_cancellable(
+            workspace_root,
+            std::slice::from_ref(tool),
+            Some(snapshot),
+            &|| Ok(()),
+        )?
+        .context("Python semantic qualification did not prepare a native layer")?;
+    let warm_millis = elapsed_millis(warm_started);
+
+    let gate = MutationCompletionGate::with_shared_language_layers(
+        execution_manifest(std::slice::from_ref(tool), snapshot.clone()),
+        layers,
+    )
+    .context("failed to create the Python semantic generation gate")?;
+    let generation_started = std::time::Instant::now();
+    let (closed_arguments, payload) = semantic_qualification_payload(name, arguments)?;
+    let prefix = gate.evaluate_prefix(name, &closed_arguments, payload);
+    let generation = match prefix {
+        CompletionDecision::Reject(_) => prefix,
+        CompletionDecision::Accept | CompletionDecision::NotApplicable => {
+            gate.evaluate(name, arguments)
+        }
+    };
+    let generation_millis = elapsed_millis(generation_started);
+
+    let final_started = std::time::Instant::now();
+    let final_replay = lifecycle.validate_completed_mutation(
+        workspace_root,
+        std::slice::from_ref(tool),
+        snapshot,
+        name,
+        arguments,
+    )?;
+    let final_replay_millis = elapsed_millis(final_started);
+
+    let diagnostic_started = std::time::Instant::now();
+    let mutations = crate::semantic::semantic_mutations_from_call(snapshot, name, arguments)?;
+    let candidates = mutations
+        .into_iter()
+        .map(|mutation| {
+            Ok((
+                pb_control_collar::mutation::LogicalPath::parse(mutation.path)?,
+                mutation.result,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let prepared = lifecycle
+        .python
+        .as_ref()
+        .context("Python semantic qualification lifecycle lost its prepared world")?;
+    let prepared = prepared
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Python semantic qualification world lock is poisoned"))?;
+    let expected = &prepared.world.descriptor().world;
+    let mut request = prepared
+        .world
+        .snapshot_for_request(expected)
+        .context("Python semantic qualification could not snapshot the prepared world")?;
+    let diagnostic_codes = request
+        .qualification_introduced_codes(candidates)
+        .context("Python semantic qualification diagnostic replay failed")?;
+    let diagnostic_millis = elapsed_millis(diagnostic_started);
+
+    Ok(PythonSemanticQualificationObservation {
+        generation,
+        final_replay,
+        diagnostic_codes,
+        warm_millis,
+        generation_millis,
+        final_replay_millis,
+        diagnostic_millis,
+    })
+}
+
+fn semantic_qualification_payload<'a>(
+    name: &str,
+    arguments: &'a Value,
+) -> Result<(serde_json::Map<String, Value>, &'a str)> {
+    let mut closed = arguments
+        .as_object()
+        .cloned()
+        .context("Python semantic qualification arguments must be an object")?;
+    let payload_name = match name {
+        "write_file" | "replace_file" => "content",
+        "edit_file" => "new_text",
+        "apply_patch" => "patch",
+        _ => bail!("Python semantic qualification does not cover tool {name}"),
+    };
+    let payload = arguments
+        .get(payload_name)
+        .and_then(Value::as_str)
+        .with_context(|| {
+            format!("Python semantic qualification tool {name} requires {payload_name}")
+        })?;
+    closed.remove(payload_name);
+    Ok((closed, payload))
+}
+
+pub(crate) fn python_semantic_world_observation(
+    lifecycle: &ControlLayerLifecycle,
+) -> Result<PythonSemanticWorldObservation> {
+    let prepared = lifecycle
+        .python
+        .as_ref()
+        .context("Python semantic qualification lifecycle has no prepared world")?;
+    let prepared = prepared
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Python semantic qualification world lock is poisoned"))?;
+    let world = &prepared.world.descriptor().world;
+    let receipt = prepared.world.readiness_receipt();
+    Ok(PythonSemanticWorldObservation {
+        world_sha256: world.world_sha256.clone(),
+        configuration_sha256: world.configuration_sha256.clone(),
+        dependency_sha256: world.dependency_sha256.clone(),
+        provider_version: world.provider_version.clone(),
+        load_millis: receipt.load_millis,
+        prime_millis: receipt.prime_millis,
+        primed_queries: receipt.primed_queries,
     })
 }
 

@@ -615,6 +615,19 @@ latency promises for arbitrary user projects, and may be overridden only on this
 command. Process peak measurement currently requires a Unix host. The qualifier never loads a
 model, and passing it does not substitute for live backend fixtures or semantic false-rejection
 corpora.
+`pb harness python-semantic-qualify --corpus
+fixtures/control-collar/semantic-python-v1.json` is the language-owned Python semantic promotion
+surface. It materializes the digest-locked first-party files and static dependency image in an
+ephemeral Git workspace, prepares and primes the ordinary native `ty` world before any case, and
+runs every complete mutation through the production generation gate, an independent
+execution-time replay, and a separate promoted-diagnostic delta. The checked-in version 1 corpus
+requires allow and reject cases for annotated, unannotated, and frozen third-party code; all six
+promoted diagnostic classes; baseline debt, dynamic unknowns, and multi-file transactions; and all
+four write/replace/edit/patch tools. The report contains only corpus/world/configuration/dependency
+digests, category and diagnostic counts, parity counts, and timings. It never invokes an LSP,
+network, package installer, or model. Frozen dependency imports and symbol shapes are resolved
+directly by the language crate before inference. Passing this corpus does not promote another
+diagnostic to token-time hard rejection: that still requires a separately named monotonic proof.
 For Qwen prefill qualification, `infer --prefill-mode auto|scalar|layer-major` selects the promoted
 policy, exact scalar reference, or an explicit layer-major request. `auto` promotes only a prepared
 Qwen3-Coder-Next affine-Q4 graph with at least 32 fresh tokens and sufficient live Metal reserve.

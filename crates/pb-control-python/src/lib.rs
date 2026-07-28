@@ -361,6 +361,35 @@ impl PythonProjectRequestWorld {
         self.check_mutations_in_scope(candidates, PythonCheckScope::FrozenProject)
     }
 
+    /// Return only the content-free promoted diagnostic codes introduced by a complete candidate
+    /// transaction. This is the language-owned differential-qualification surface: production
+    /// still authorizes execution through the ordinary streaming/final gates, while the harness
+    /// can prove which exact promoted class caused that decision without persisting source,
+    /// excerpts, messages, paths, or symbols.
+    pub fn qualification_introduced_codes(
+        &mut self,
+        candidates: BTreeMap<LogicalPath, Option<String>>,
+    ) -> Result<BTreeSet<String>, PythonLayerError> {
+        let candidates = candidates
+            .into_iter()
+            .map(|(path, source)| {
+                (
+                    path,
+                    source.map_or(
+                        PythonCandidateMutation::Delete,
+                        PythonCandidateMutation::Upsert,
+                    ),
+                )
+            })
+            .collect();
+        Ok(self
+            .check_project_mutations(&candidates)?
+            .into_values()
+            .flat_map(|report| report.introduced)
+            .map(|diagnostic| diagnostic.code)
+            .collect())
+    }
+
     fn check_mutations_in_scope(
         &mut self,
         candidates: &BTreeMap<LogicalPath, PythonCandidateMutation>,

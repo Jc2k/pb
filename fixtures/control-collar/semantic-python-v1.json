@@ -1,0 +1,359 @@
+{
+  "version": 1,
+  "python_version": "3.12",
+  "files": [
+    {
+      "path": "annotated.py",
+      "content": "def consume(value: int) -> None:\n    pass\n\nvalue: int = 1\n"
+    },
+    {
+      "path": "unannotated.py",
+      "content": "value = 1\n"
+    },
+    {
+      "path": "third_party.py",
+      "content": "import httpx\n\nresponse = httpx.get(\"https://example.invalid\")\nstatus: int = response.status_code\n"
+    },
+    {
+      "path": "returns.py",
+      "content": "def produce() -> int:\n    return 1\n"
+    },
+    {
+      "path": "attributes.py",
+      "content": "class Item:\n    label: str = \"ok\"\n\nvalue = Item().label\n"
+    },
+    {
+      "path": "baseline_debt.py",
+      "content": "old: int = \"legacy\"\nmarker = 1\n"
+    },
+    {
+      "path": "api.py",
+      "content": "def render(value: str) -> str:\n    return value\n"
+    },
+    {
+      "path": "consumer.py",
+      "content": "from api import render\n\nresult: str = render(\"ok\")\n"
+    },
+    {
+      "path": "uses_future.py",
+      "content": "value = 1\n"
+    }
+  ],
+  "dependencies": [
+    {
+      "path": "httpx/__init__.pyi",
+      "content": "from typing import Any\n\nclass Response:\n    status_code: int\n    text: str\n    def json(self) -> Any: ...\n\ndef get(url: str, *, timeout: float | None = ...) -> Response: ...\n"
+    },
+    {
+      "path": "httpx/py.typed",
+      "content": ""
+    },
+    {
+      "path": "httpx-0.28.1.dist-info/METADATA",
+      "content": "Metadata-Version: 2.1\nName: httpx\nVersion: 0.28.1\n"
+    }
+  ],
+  "cases": [
+    {
+      "id": "annotated_valid_call",
+      "category": "annotated",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "annotated.py",
+        "content": "def consume(value: int) -> None:\n    pass\n\nconsume(2)\n"
+      },
+      "expected": {
+        "outcome": "allow"
+      }
+    },
+    {
+      "id": "annotated_invalid_argument",
+      "category": "annotated",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "annotated.py",
+        "content": "def consume(value: int) -> None:\n    pass\n\nconsume(\"bad\")\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["invalid-argument-type"]
+      }
+    },
+    {
+      "id": "annotated_invalid_assignment",
+      "category": "annotated",
+      "tool": "edit_file",
+      "arguments": {
+        "path": "annotated.py",
+        "old_text": "value: int = 1",
+        "new_text": "value: int = \"bad\""
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["invalid-assignment"]
+      }
+    },
+    {
+      "id": "annotated_valid_edit",
+      "category": "annotated",
+      "tool": "edit_file",
+      "arguments": {
+        "path": "annotated.py",
+        "old_text": "value: int = 1",
+        "new_text": "value: int = 2"
+      },
+      "expected": {
+        "outcome": "allow"
+      }
+    },
+    {
+      "id": "annotated_invalid_return",
+      "category": "annotated",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "returns.py",
+        "content": "def produce() -> int:\n    return \"bad\"\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["invalid-return-type"]
+      }
+    },
+    {
+      "id": "annotated_missing_attribute",
+      "category": "annotated",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "attributes.py",
+        "content": "class Item:\n    label: str = \"ok\"\n\nvalue = Item().missing\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["unresolved-attribute"]
+      }
+    },
+    {
+      "id": "annotated_missing_import",
+      "category": "annotated",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "uses_future.py",
+        "content": "from package_absent_from_complete_world import answer\nvalue: int = answer()\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["unresolved-import"]
+      }
+    },
+    {
+      "id": "annotated_invalid_operator",
+      "category": "annotated",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "unannotated.py",
+        "content": "value: str = \"bad\" + 1\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["unsupported-operator"]
+      }
+    },
+    {
+      "id": "unannotated_inferred_valid",
+      "category": "unannotated",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "unannotated.py",
+        "content": "value = 1\nresult = value + 2\n"
+      },
+      "expected": {
+        "outcome": "allow"
+      }
+    },
+    {
+      "id": "unannotated_literal_contradiction",
+      "category": "unannotated",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "unannotated.py",
+        "content": "value = \"bad\" + 1\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["unsupported-operator"]
+      }
+    },
+    {
+      "id": "unannotated_dynamic_parameter",
+      "category": "dynamic_unknown",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "unannotated.py",
+        "content": "def identity(value):\n    return value\n\nresult = identity(1) + \"runtime\"\n"
+      },
+      "expected": {
+        "outcome": "allow"
+      }
+    },
+    {
+      "id": "unannotated_class_attribute",
+      "category": "unannotated",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "attributes.py",
+        "content": "class Item:\n    pass\n\nvalue = Item().missing\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["unresolved-attribute"]
+      }
+    },
+    {
+      "id": "third_party_valid_call",
+      "category": "third_party",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "third_party.py",
+        "content": "import httpx\n\nresponse = httpx.get(\"https://example.invalid\", timeout=2.0)\nstatus: int = response.status_code\n"
+      },
+      "expected": {
+        "outcome": "allow"
+      }
+    },
+    {
+      "id": "third_party_invalid_argument",
+      "category": "third_party",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "third_party.py",
+        "content": "import httpx\n\nresponse = httpx.get(1)\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["invalid-argument-type"]
+      }
+    },
+    {
+      "id": "third_party_missing_attribute",
+      "category": "third_party",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "third_party.py",
+        "content": "import httpx\n\nresponse = httpx.get(\"https://example.invalid\")\nvalue = response.missing\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["unresolved-attribute"]
+      }
+    },
+    {
+      "id": "third_party_invalid_operator",
+      "category": "third_party",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "third_party.py",
+        "content": "import httpx\n\nresponse = httpx.get(\"https://example.invalid\")\nvalue = response.status_code + \"bad\"\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["unsupported-operator"]
+      }
+    },
+    {
+      "id": "baseline_debt_preserved",
+      "category": "baseline_debt",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "baseline_debt.py",
+        "content": "old: int = \"legacy\"\nmarker = 2\n"
+      },
+      "expected": {
+        "outcome": "allow"
+      }
+    },
+    {
+      "id": "baseline_debt_new_error",
+      "category": "baseline_debt",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "baseline_debt.py",
+        "content": "old: int = \"legacy\"\nnew: int = \"bad\"\nmarker = 2\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["invalid-assignment"]
+      }
+    },
+    {
+      "id": "valid_new_module",
+      "category": "annotated",
+      "tool": "write_file",
+      "arguments": {
+        "path": "created_valid.py",
+        "content": "def created(value: int) -> int:\n    return value + 1\n"
+      },
+      "expected": {
+        "outcome": "allow"
+      }
+    },
+    {
+      "id": "invalid_new_module",
+      "category": "annotated",
+      "tool": "write_file",
+      "arguments": {
+        "path": "created_invalid.py",
+        "content": "def created() -> int:\n    return \"bad\"\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["invalid-return-type"]
+      }
+    },
+    {
+      "id": "coherent_signature_transaction",
+      "category": "transaction",
+      "tool": "apply_patch",
+      "arguments": {
+        "patch": "diff --git a/api.py b/api.py\n--- a/api.py\n+++ b/api.py\n@@ -1,2 +1,2 @@\n-def render(value: str) -> str:\n+def render(value: int) -> int:\n     return value\ndiff --git a/consumer.py b/consumer.py\n--- a/consumer.py\n+++ b/consumer.py\n@@ -1,3 +1,3 @@\n from api import render\n \n-result: str = render(\"ok\")\n+result: int = render(1)\n"
+      },
+      "expected": {
+        "outcome": "allow"
+      }
+    },
+    {
+      "id": "incoherent_signature_transaction",
+      "category": "transaction",
+      "tool": "apply_patch",
+      "arguments": {
+        "patch": "diff --git a/api.py b/api.py\n--- a/api.py\n+++ b/api.py\n@@ -1,2 +1,2 @@\n-def render(value: str) -> str:\n+def render(value: int) -> int:\n     return value\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["invalid-argument-type", "invalid-assignment"]
+      }
+    },
+    {
+      "id": "create_and_import_transaction",
+      "category": "transaction",
+      "tool": "apply_patch",
+      "arguments": {
+        "patch": "diff --git a/future_helper.py b/future_helper.py\nnew file mode 100644\n--- /dev/null\n+++ b/future_helper.py\n@@ -0,0 +1,2 @@\n+def answer() -> int:\n+    return 42\ndiff --git a/uses_future.py b/uses_future.py\n--- a/uses_future.py\n+++ b/uses_future.py\n@@ -1 +1,2 @@\n-value = 1\n+from future_helper import answer\n+value: int = answer()\n"
+      },
+      "expected": {
+        "outcome": "allow"
+      }
+    },
+    {
+      "id": "missing_import_transaction",
+      "category": "transaction",
+      "tool": "apply_patch",
+      "arguments": {
+        "patch": "diff --git a/uses_future.py b/uses_future.py\n--- a/uses_future.py\n+++ b/uses_future.py\n@@ -1 +1,2 @@\n-value = 1\n+from future_helper import answer\n+value: int = answer()\n"
+      },
+      "expected": {
+        "outcome": "reject",
+        "diagnostic_codes": ["unresolved-import"]
+      }
+    }
+  ]
+}

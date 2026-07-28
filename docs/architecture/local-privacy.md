@@ -86,6 +86,9 @@ request databases, and an exact-flight result awaiting its registered local wait
 bounded process caches retain only local analyzer worlds and durable events remain content-free. A
 cancelled request may leave its one already-started local Python preparation worker finishing into
 that bounded cache or handoff, but adds no network or durable source persistence.
+The hidden Python semantic qualifier materializes its checked-in first-party and dependency corpus
+only in an ephemeral local workspace. It starts no model, LSP, package installer, or network
+request, and emits only content-free digests, counts, parity results, and timings.
 `inference.llamacpp_session_cache_enabled=false` and
 `inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are
