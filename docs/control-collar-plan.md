@@ -1,10 +1,11 @@
 # Streaming tool-output control collar
 
-Status: **The syntax/canonical-patch collar is shipped. The first native Rust semantic layer,
-pre-inference lifecycle, streaming steering, and independent execution replay are implemented and
-under production qualification. Deeper Rust coverage and the Python and TypeScript/JavaScript
-language crates remain phased design-record work.** This is the durable design, migration history,
-and evidence ledger. Curated architecture documentation describes only shipped guarantees.
+Status: **The syntax/canonical-patch collar is shipped. The first native Rust and Python semantic
+layers, pre-inference lifecycle, streaming steering, and independent execution replay are
+implemented and under production qualification. Deeper Rust/Python coverage, Python environment
+capture, and the TypeScript/JavaScript language crate remain phased design-record work.** This is
+the durable design, migration history, and evidence ledger. Curated architecture documentation
+describes only shipped guarantees.
 
 Current implementation ledger:
 
@@ -21,18 +22,32 @@ Current implementation ledger:
   that can edit Rust, primes local/dependency scopes, selects the exact Cargo target for existing
   files, resolves imports and callable/type shapes through HIR, and gives the decoder only a cheap
   request-local snapshot. It does not ask an LSP for diagnostics on incomplete source.
+- **Native Python layer implemented:** `pb-control-python` directly embeds exact-pinned Astral `ty`
+  internals. It copies the controller shadow into a frozen in-memory filesystem, binds Python 3.12,
+  the host target platform, first-party imports, and bundled typeshed into one semantic identity,
+  and primes an independently writable Salsa database before each inference request. Request-local
+  copy-on-write overlays resolve created, modified, and deleted cross-file imports and callable
+  shapes as one transaction. A complete generated string-plus-integer literal can be rejected at a proven
+  statement boundary; completed transactions reject only newly introduced promoted `ty`
+  diagnostics. `Any` and unpromoted/dynamic cases remain open. Generated `ty: ignore`/`type:
+  ignore` directives cannot suppress the gate, while preserved baseline directives are not
+  reclassified as generated.
 - **Lifecycle implemented:** exact workspace/configuration/dependency identities key a bounded
   process cache. Concurrent requests for one exact identity use a process-wide single flight and
   reuse its result. A cold load runs in a request-independent in-process worker under that flight;
   both its initiating request and later waiters poll cancellation every 100 ms. At most one cold
-  Rust world is built at a time, so cancelled requests cannot accumulate concurrent rust-analyzer
-  loads. Cancellation abandons the request, not the exact local build, which may finish into the
-  bounded cache. Existing `.rs` edits revise the warm Salsa world only after all request leases from
+  Rust world and at most one Python world are built at a time, so cancelled requests cannot
+  accumulate native analyzer loads. Cancellation abandons the request, not the exact local build,
+  which may finish into its bounded cache. Existing `.rs` edits revise the warm Salsa world only
+  after all request leases from
   the previous world have ended. New/deleted source files, Cargo/configuration changes, ambiguity,
   overlapping inference, or refresh failure cause an independent cold rebuild before the next
   model invocation. Exact controller-bound non-Rust mutations skip this cost; multi-path patches
   conservatively prepare Rust. Workspace drift during load aborts rather than silently rebasing an
   already captured mutation snapshot; drift between inference and execution also fails closed.
+  When both languages are reachable, Rust preparation deliberately completes first, Python second,
+  and inference receives no stack until both readiness receipts exist. Mixed-language patches
+  finalize every participating layer rather than only the layer for the last streamed file.
 - **Controller-bound targets implemented:** target-scoped workflow schemas remain byte-stable and
   may omit `path`. The controller carries the accepted work-unit path out of band in the immutable
   snapshot; Qwen payload extraction and the mutation gate normalize the call exactly as the
@@ -61,9 +76,9 @@ Current implementation ledger:
 ## Decision
 
 The deterministic protocol/mutation substrate is the unpublished `pb-control-collar` crate. Native
-language semantics live in one unpublished crate per language family. The first is
-`pb-control-rust`; later qualified implementations are expected to be `pb-control-python` and
-`pb-control-typescript` rather than generic runtime "fact packs".
+language semantics live in one unpublished crate per language family. The implemented crates are
+`pb-control-rust` and `pb-control-python`; a later qualified implementation is expected to be
+`pb-control-typescript` rather than a generic runtime "fact pack".
 
 This is a deliberate multi-crate workspace, but not arbitrary micro-crate decomposition. A language
 crate is warranted when it owns a materially different parser, project model, dependency resolver,
@@ -88,11 +103,17 @@ pb binary/library
              +-- syntax and semantic analyzer interfaces
              +-- deterministic receipts and diagnostics
     |
-    `--> pb-control-rust
+    +--> pb-control-rust
              +-- pinned rust-analyzer project/Salsa/HIR integration
              +-- Cargo target and dependency resolution
              +-- Rust-specific streaming parser and semantic certainty
              `-- request snapshots, checkpoints, and rollback
+
+    `--> pb-control-python
+             +-- pinned Astral ty project/Salsa/type integration
+             +-- frozen project/typeshed and request-local overlay resolution
+             +-- Python-specific streaming boundary certainty
+             `-- baseline-debt and final transaction validation
 ```
 
 `pb-control-collar` must never depend on `pb`, read the live workspace, execute a tool, run Git,
@@ -111,8 +132,11 @@ For supported constrained mutation tools and language profiles, pb provides this
 The cross-language production guarantee remains deliberately syntax-scoped. A native language layer
 may add a stronger per-request rung only for error classes its pinned implementation can prove from
 the exact ready world. Rust v1 can reject a proven-invalid exact sysroot import and selected literal
-operator/call incompatibilities; partial dependency facts remain `Unknown`. Python runtime behavior
-cannot generally be proven by a static streaming analyzer.
+operator/call incompatibilities; partial dependency facts remain `Unknown`. Python v1 can reject a
+complete generated string-plus-integer literal operation and selected newly introduced `ty`
+import/type diagnostics at transaction closure. `Any`, dynamic imports, monkey-patching,
+descriptors, runtime dispatch, and unqualified environment dependencies remain unknown; Python
+runtime behavior cannot generally be proven by a static streaming analyzer.
 
 The priority language profiles are Rust, Python, TypeScript, JavaScript, HTML, and CSS. The initial
 tool order is `write_file`, then the shared replacement/edit path, then a canonical subset of
@@ -157,8 +181,8 @@ The root manifest can remain both the `pb` package and the workspace root:
 
 ```toml
 [workspace]
-members = [".", "crates/pb-control-collar", "crates/pb-control-rust"]
-default-members = [".", "crates/pb-control-collar", "crates/pb-control-rust"]
+members = [".", "crates/pb-control-collar", "crates/pb-control-python", "crates/pb-control-rust"]
+default-members = [".", "crates/pb-control-collar", "crates/pb-control-python", "crates/pb-control-rust"]
 resolver = "3"
 
 [package]
@@ -198,6 +222,11 @@ crates/pb-control-rust/
     src/
         lib.rs
         stream.rs
+crates/pb-control-python/
+    Cargo.toml
+    src/
+        lib.rs
+        system.rs
 ```
 
 Only dependencies used by both packages should move to `[workspace.dependencies]`, and that move
@@ -242,9 +271,9 @@ foundation is recorded separately from that historical baseline.
 
 The current implementation has these concrete boundaries:
 
-- the root package plus unpublished `pb-control-collar` and `pb-control-rust` crates are explicit
-  workspace/default members using resolver 3; Rust language internals remain exact-pinned and
-  private to the Rust crate;
+- the root package plus unpublished `pb-control-collar`, `pb-control-rust`, and
+  `pb-control-python` crates are explicit workspace/default members using resolver 3; language
+  internals remain exact-pinned and private to their owning crates;
 - the collar owns tokenizer byte/control-token surfaces, full-vocabulary masks, the LLGuidance JSON
   factory/session, versioned manifests and analyzer/recovery interfaces, DSML parsing/probing,
   controller-snapshot virtual writes, canonical patches, syntax profiles, receipts, and content-free
@@ -268,6 +297,13 @@ The current implementation has these concrete boundaries:
 - the Rust streaming layer uses direct HIR scope/import/callable shapes plus a Rust Tree-sitter
   structural stream. Exact negative facts may reject while partial build-script/proc-macro/
   dependency facts stay `Unknown`;
+- Python-edit-capable real-backend requests prepare exact-pinned Astral `ty` state before
+  inference. The initial enforced profile resolves first-party and newly generated cross-file
+  imports against bundled typeshed, rejects generated suppression directives, promotes a narrow
+  diagnostic set in non-deleted transaction files at closure, and hard-rejects only complete generated
+  string-plus-integer literal operations at statement boundaries. Python `Any`, dynamic imports,
+  monkey-patching, descriptors, runtime dispatch, unqualified site packages, and unpromoted
+  diagnostics and untouched dependants remain outside the claim;
 - writes, replacements, edits, and patches preserve known/generated origins and explicit deletion
   events. A fresh complete replay over the authoritative virtual results runs before the executor,
   independent of the sampler's candidate cache;
@@ -283,9 +319,10 @@ The current implementation has these concrete boundaries:
   patches without `--recount`.
 
 This implementation prevents an invalid supported complete file from closing and executing, and it
-hard-masks a deliberately small set of proven-impossible prefixes and Rust semantic contradictions.
-It does not claim exact grammar extendability, general Rust type/borrow correctness, build-script or
-procedural-macro completeness, Python/TypeScript semantic steering, live-model llama.cpp parity, or
+hard-masks a deliberately small set of proven-impossible prefixes and Rust/Python semantic
+contradictions. It does not claim exact grammar extendability, general Rust type/borrow correctness,
+build-script or procedural-macro completeness, general Python type/runtime correctness, configured
+virtual-environment completeness, TypeScript semantic steering, live-model llama.cpp parity, or
 model-state rollback. Those remain independently promoted gates.
 
 ## Authority and correctness invariants
@@ -664,8 +701,9 @@ The controller owns lifecycle even though a language crate owns the analyzer imp
    world, toolchain/configuration, and dependency identities.
 3. Look up a bounded process cache. On a miss, load and prime the native project world before prompt
    preparation, token-budget reservation, durable invocation start, or backend entry.
-4. Revalidate the live workspace after preparation. Retry a bounded number of times; persistent
-   drift refuses inference rather than pairing a model with stale semantics.
+4. Revalidate the live workspace after preparation. Drift aborts the current invocation and asks
+   the controller to capture a fresh mutation/semantic snapshot; the lifecycle never silently
+   rebases the already authorized snapshot.
 5. Hand decoding a cheap request snapshot and an epoch lease. Sampling performs no project I/O,
    dependency loading, language-server RPC, or compilation.
 6. After a completed mutation, create a fresh request snapshot, replay the exact virtual result to
@@ -683,11 +721,20 @@ while a read-only stage continues, but the edit-capable invocation must still aw
 repeat the exact live identity check. A speculative prewarm can never reserve model budget, emit an
 invocation event, grant mutation authority, or make a stale world usable.
 
+"Rust preparation" in the shipped safe-partial profile means offline Cargo metadata,
+rust-analyzer VFS/project loading, dependency/sysroot scope construction, and HIR/Salsa priming; it
+does not run `cargo check`, build scripts, or procedural macros and is not a compilation guarantee.
+If a later sandboxed-exact profile adds compiler work, its `cargo check`/macro/build-script phase and
+artifact-cache lookup must run behind the same pre-inference readiness barrier, keyed by the exact
+source/toolchain/configuration/dependency world. Compilation may prewarm during an earlier read-only
+stage, but an edit-capable model invocation must await its exact receipt; compilation is never
+started lazily from token sampling or final mutation closure.
+
 Cancellation has two distinct guarantees. Shipped v1 rechecks cancellation before and after native
 preparation, so a cancellation is never followed by prompt work or model inference. Cold project
-loading and HIR priming run in a request-independent in-process thread under the exact-world
-single-flight lease; the initiating request and queued requests poll cancellation every 100 ms, and
-only one cold Rust load runs process-wide. A cancelled request therefore stops waiting promptly
+loading and native query priming run in request-independent in-process threads under per-language
+exact-world single-flight leases; initiating and queued requests poll cancellation every 100 ms,
+and only one cold Rust plus one cold Python load can run process-wide. A cancelled request therefore stops waiting promptly
 without abandoning a partially constructed analyzer database or allowing repeated cancellations to
 multiply resident loaders. The local worker may continue after the request ends and publish its
 exact successful result to the bounded process cache.
@@ -1106,13 +1153,13 @@ workspace, not an earlier phase branch.
 
 | Evidence | Status | Current result |
 | --- | --- | --- |
-| Collar unit and chunk-boundary corpus | Passed | 65 deterministic tests, including all six language families plus TSX/JSX, byte/random chunk equivalence, monotonic hard rejection, source-length-only Rust branch rollback, transactional sibling-candidate restoration, viable split-UTF-8 Qwen/DSML boundaries, partial patch-line probing, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches, malformed patch corpus, controller-bound and scalar-exact Qwen/DSML payload closure, immutable semantic identities/debt and receipts, and control-token identity |
+| Collar unit and chunk-boundary corpus | Passed | 66 deterministic tests, including all six language families plus TSX/JSX, byte/random chunk equivalence, monotonic hard rejection, source-length-only Rust branch rollback, transactional sibling-candidate restoration, mixed-language finalization, viable split-UTF-8 Qwen/DSML boundaries, partial patch-line probing, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches including deletion events, malformed patch corpus, controller-bound and scalar-exact Qwen/DSML payload closure, immutable semantic identities/debt and receipts, and control-token identity |
 | Qwen native constraint corpus | Passed | Focused native tests cover closure rejection for invalid syntax, the one-mutation batch bound, content-first pathless target-bound calls, and model paths that cannot override controller authority |
 | Scalar exact-schema constraints | Passed | Qwen JSON and DeepSeek DSML both enforce scalar `const`; completed alternate values are rejected, incomplete string prefixes remain open only while they can reach the exact value, contradictory `const`/`enum` schemas fail preflight, and object/array `const` remain unsupported |
 | DeepSeek DSML renderer/parser corpus | Passed | 3 focused root tests plus 3 collar DSML tests for typed parameters, ordered JSON-string mutation history, closure boundaries, and exact scalar paths |
 | Workspace format/check/Clippy | Passed | `cargo fmt --all -- --check`, `cargo check --workspace --all-targets -j 1`, and the repository warning/correctness Clippy gate |
 | Executor and event focused tests | Passed | Snapshot freshness, exact patch/Git differential result, inexact hunk rejection, and additive/backward-compatible event round trip |
-| Workspace all-target tests | Passed | On 2026-07-28, 1,482 root tests passed with 24 device/environment/qualification tests ignored, 2 environment-contract tests passed, all 65 collar tests passed, and all 8 native Rust tests passed |
+| Workspace all-target tests | Passed | On 2026-07-28, 1,487 root tests passed with 24 device/environment/qualification tests ignored, 2 environment-contract tests passed, all 66 collar tests passed, all 8 native Python tests passed, and all 8 native Rust tests passed |
 | Web and documentation tests | Passed | 76 web tests passed; mdBook and link validation checked 59 pages and 98 rendered files |
 | Production asset/release build | Passed | On 2026-07-28, web assets and the optimized macOS arm64 release binary rebuilt successfully |
 | Required FlashMoe one-token smoke | Quality gate failed | On 2026-07-28, the rebuilt release binary again exited zero but printed `5` for `2+2=`; token `4` was second by 0.320473 logit. The repository gate requires a sensible answer, so promotion remains blocked. Existing upstream-parity evidence classifies this as checkpoint/model quality rather than a collar failure, and no output correction is permitted |
@@ -1122,12 +1169,13 @@ workspace, not an earlier phase branch.
 | Phase 7 shadow/evidence foundation | Passed | Semantic analysis uses a fresh exact bounded shadow tree and isolated LSP session for each transaction, rejects symlinks and post-copy drift, permits only an LSP-specific read-only analysis-root mount, and emits independently validated content-free generation and final-executor receipts |
 | Phase 7 legacy pinned Rust LSP attempt | Failed safely (historical) | `ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b26526…173d` (rust-analyzer 1.96.0) never produced a non-empty crate graph or document membership within the required barrier; this is why incomplete-code LSP diagnostics were not adopted as the streaming architecture |
 | Phase 7 native Rust implementation | Passed focused implementation gates | Exact-pinned rust-analyzer 0.0.344 loads one offline project world; 8 crate tests cover dependency/sysroot shape certainty, invalid import/type steering, target selection, cross-file rollback, identity/staleness, active-request refresh exclusion, and zero-load source refresh. The root lifecycle test covers cold preparation, warm reuse, independent invalid/valid final replay, in-memory source refresh, cross-stage process-cache reuse, and exact non-Rust target bypass |
+| Phase 7 native Python implementation | Passed initial focused gates; broader qualification pending | Exact-pinned Astral `ty` 0.0.6 loads and primes a frozen Python 3.12 project/typeshed world before inference. Eight crate tests cover string-plus-integer rejection, `Any` remaining open, new cross-file import and callable-shape overlays, transactional deletion-as-absence, speculative-branch isolation, diagnostic debt, statement-boundary steering, and generated-versus-preserved suppressions. Root lifecycle tests cover cold preparation for an existing or first-created Python file, warm reuse, process-cache reuse, irrelevant stale-world isolation, independent invalid/valid execution replay, and deletion-aware multi-file patch replay. Mixed-language layer finalization is separately regression-tested. Virtual-environment/site-package capture, untouched-dependant expansion, promoted-code differential corpora, cancellation/concurrency/resource qualification, and live-model Python semantic fixtures remain pending. |
 | Phase 7 lifecycle overlap/cancellation boundary | Passed narrow shipped guarantee | The root lifecycle tests hold one request lease across source drift and prove the next request receives an independently cold-built world; two simultaneous exact requests produce one cold build plus one process-cache hit; and any drift during loading requires a fresh controller snapshot rather than an internal retry. Deterministic tests hold a detached cold worker open and prove that its initiating request and a different project waiting for the global one-worker capacity both observe cancellation through the 100 ms poll while the exact single-flight remains owned until worker completion. A separate agent test proves pre-inference cancellation causes zero model invocations and zero consumed completion records. The analyzer computation itself is not cooperatively interrupted. |
 | Phase 7 native Rust latency/resource qualifier | Passed current representative run | On exact commit `23754bbe`, the full pb workspace measured an 87.289 s cold load, 1.014 s independent execution replay, and 1.007 s warm request. The prior instrumented run recorded process maximum RSS of 2,127,577,088 bytes and measured peak footprint of 129,778,360 bytes. These are baselines, not universal budgets; additional large-project, detached-worker completion/reclamation, and sustained-concurrency/memory qualification remains |
 | Phase 7 live Rust workflow | Passed | Preserved run `1785221083352-60887-0` in `/private/tmp/pb-control-rust-e2e-20260727-4` crossed the strict workflow, prepared Rust before the edit-capable model invocation, accepted a controller-bound `edit_file`, rejected 14 invalid candidates without executing them, passed 3 locked Cargo tests and API review, reached `Ready`, and committed `56aca5c feat: add average function with unit tests` with a clean worktree |
 | Current live write/patch fixtures | Passed | On 2026-07-28, the rebuilt release binary compiled the checked-in Qwen fixture containing exact path `const`, generated exactly `answer.py` with valid Python after 21 rejected candidates, and generated the exact snapshot-valid canonical one-line patch after 20 rejected candidates and one invalid-argument closure rejection |
 | Phase 7 native Rust production qualification | Partially passed; promotion blocked | Focused implementation, strict workspace gates, representative cold/warm/replay measurement, deterministic detached-owner cancellation, one current end-to-end Rust edit, and current live write/patch generation pass. The required FlashMoe arithmetic smoke is currently nonsensical; representative large projects, sustained detached-worker concurrency/memory, resource reclamation, and longer randomized rollback corpora still gate promotion beyond the narrow shipped v1 claim |
-| Phase 7 deeper/later language profiles | Pending | Rust macro/build-script/compiler parity, `pb-control-python`/Astral `ty`, and `pb-control-typescript` project matrices ship independently after their own soundness, lifecycle, multi-file, dependency, cancellation, latency, and final-replay evidence |
+| Phase 7 deeper/later language profiles | Pending | Rust macro/build-script/compiler parity, deeper `pb-control-python` environment/type matrices, and `pb-control-typescript` project matrices ship independently after their own soundness, lifecycle, multi-file, dependency, cancellation, latency, and final-replay evidence |
 | Phase 8 live llama.cpp profiles | Qwen direct matrix passed; broader parity pending | On 2026-07-28, the final rebuilt binary and exact local Qwen2.5-Coder-7B Q4_K_M GGUF passed the no-execution `llama-infer` fixture matrix through the production CPU-fallback adapter. A valid Python write closed in 41 tokens/11.840 s after 5,587,481 rejected candidates. The exact immutable-snapshot patch closed in 72 tokens/25.506 s after 11,426,985 rejected candidates and returned the canonical hunk byte-for-byte. An exact invalid Python constant and an exact stale-context patch each reached an empty full-vocabulary frontier and exited nonzero without a call; a one-token cap likewise returned no call. These runs exposed and fixed structural-whitespace, partial-hunk, returned-byte/validated-byte, incomplete UTF-8/JSON escape, canonical scalar-wire, and speculative candidate-state defects. The earlier workflow envelope-close fix remains covered. Live DeepSeek-dialect GGUF, FlashMoe/llama mask differential, repeated throughput/resource, and unsupported-profile preflight runs still gate a backend-parity claim. |
 | Pinned DeepSeek direct mutation qualification | Passed | The checked-in `fixtures/control-collar/` inputs produced syntax-valid `answer.py` after 2 candidate rejections and an exact snapshot-bound one-line patch after 8, reporting 1 file and 16 snapshot bytes; an alternate capped patch attempt reported 7 `invalid_patch` closure rejections and executed no call |
 | Pinned DeepSeek strict workflow | Passed | An 11-invocation delivery crossed tool-schema narrowing, reused unchanged exact roots, cold-started changed roots, executed constrained `write_file`, passed review, and ended `contract_status=satisfied`, `verified_completed=true` |
@@ -1186,11 +1234,20 @@ the pinned end-to-end decode-throughput reduction remains within the existing 25
   feature selection. Define separate safe-partial and sandboxed-exact profiles for build scripts,
   procedural macros, generated files, and compiler checks. Code execution requires explicit
   no-network/read-only-input/ephemeral-output authority; unavailable expansion remains `Unknown`.
-- **7E — Add `pb-control-python`.** Integrate pinned Astral `ty` internals where stable enough for
-  project/import/type state, with Python version/platform, virtual environment, typeshed/stubs, and
-  configuration in the world identity. Start with annotated or inferred-known expressions. `Any`,
-  dynamic imports, monkey-patching, descriptors, and runtime dispatch remain `Unknown`. Pyright/LSP
-  may remain a settled final differential oracle, not the token-time state machine.
+- **7E — Add `pb-control-python` (initial profile implemented; qualification in progress).** The
+  crate embeds exact-pinned Astral `ty` internals, a frozen in-memory project filesystem,
+  independently writable pre-inference request databases, request-local create/modify/delete overlays,
+  baseline diagnostic debt, generated-suppression rejection, and final transaction replay. Python
+  3.12, the host target platform, first-party sources, bundled typeshed, configuration digests, and
+  dependency-manifest digests are in the current world contract. The promoted set starts with
+  selected import/attribute/operator/argument/assignment/return diagnostics and a streaming proof
+  for complete generated string-plus-integer literal addition. `Any`, dynamic imports,
+  monkey-patching, descriptors, runtime dispatch, unpromoted diagnostics, and dependencies outside
+  the frozen project remain `Unknown`. Next, add typed virtual-environment/site-package discovery,
+  snapshot its stubs/package metadata into the dependency identity, add cancellation/concurrency/
+  memory and large-project matrices, expand closure checks to untouched dependants, and qualify each
+  promoted code against repairable prefixes.
+  Pyright/LSP may remain a settled final differential oracle, not the token-time state machine.
 - **7F — Add `pb-control-typescript`.** Integrate TypeScript project/program/type-checker state with
   versioned virtual files, exact `tsconfig`, module resolution, JSX mode, ambient declarations, and
   project references. JavaScript receives type guarantees only under explicit `checkJs`/JSDoc or an
@@ -1291,6 +1348,12 @@ leases, final replay, offline behavior, latency, and memory are qualified. It do
 future exact macro/build-script/compiler profile or other languages, and it must not be described as
 general Rust type correctness.
 
+**Amended 2026-07-28:** the Python v1 layer follows the same independent promotion rule. Its native
+`ty` project/type state is the token-time resolver; an LSP is not run over incomplete source. The
+initial first-party/typeshed profile can ship only with narrow per-code evidence and must remain
+explicitly distinct from future virtual-environment/site-package completeness and from dynamic
+Python runtime correctness.
+
 ### Patch and batch compatibility
 
 **Decided:** constrained generation uses the documented canonical text-only patch subset and
@@ -1338,7 +1401,7 @@ their named phase produces evidence:
 | Whether DeepSeek ephemeral complete-state snapshots beat deterministic replay | Phase 9 | Snapshot copy cost, memory peak, restore parity, branch depth, and end-to-end energy |
 | Rust deeper native boundary | Phase 7D | rust-analyzer/compiler parity corpus including macros, traits, `cfg`, ownership, and workspace edits |
 | TypeScript/JavaScript native project layer | Phase 7F | Module-resolution, ambient-type, JSX, and multi-file corpus |
-| Python `ty` profile and `Unknown` policy | Phase 7E | Annotated/unannotated corpus, false-rejection audit, environment/stub identity, and pinned analyzer configuration |
+| Python `ty` deeper profile and `Unknown` policy | Phase 7E | Initial first-party/typeshed profile implemented; annotated/unannotated differential corpus, virtual-environment/stub/package identity, false-rejection audit, and broader promoted-code qualification remain |
 
 Unsupported language profiles remain protocol-constrained and executor-validated; they must not be
 reported as syntax- or semantic-constrained. A supported profile whose required analyzer cannot be

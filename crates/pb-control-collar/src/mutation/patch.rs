@@ -30,6 +30,7 @@ pub struct PatchVirtualDeletion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PatchVirtualFile {
     pub path: LogicalPath,
+    pub kind: MutationKind,
     pub segments: Vec<PatchVirtualSegment>,
     pub deletions: Vec<PatchVirtualDeletion>,
     pub complete: bool,
@@ -231,7 +232,7 @@ impl PatchStream {
             self.processed_bytes = self.bytes.len();
         }
         let virtual_files = self.prefix.finish_virtual_files()?;
-        verify_virtual_results(&prepared, &virtual_files)?;
+        verify_virtual_results(&self.snapshot, &prepared, &virtual_files)?;
         Ok((prepared, virtual_files))
     }
 }
@@ -351,9 +352,7 @@ impl PatchPrefixValidator {
                             file.path.as_str()
                         )));
                     }
-                    if file.kind != MutationKind::Delete {
-                        self.completed_files.push(file.virtual_file(true, &[])?);
-                    }
+                    self.completed_files.push(file.virtual_file(true, &[])?);
                     self.phase = self.start_file(line, max_files)?;
                     return Ok(());
                 }
@@ -481,9 +480,7 @@ impl PatchPrefixValidator {
 
     fn virtual_files(&self, partial_line: &[u8]) -> CollarResult<Vec<PatchVirtualFile>> {
         let mut files = self.completed_files.clone();
-        if let PatchPrefixPhase::File(file) = &self.phase
-            && file.kind != MutationKind::Delete
-        {
+        if let PatchPrefixPhase::File(file) = &self.phase {
             files.push(file.virtual_file(false, partial_line)?);
         }
         Ok(files)
@@ -497,9 +494,7 @@ impl PatchPrefixValidator {
             ));
         };
         file.finish()?;
-        if file.kind != MutationKind::Delete {
-            self.completed_files.push(file.virtual_file(true, &[])?);
-        }
+        self.completed_files.push(file.virtual_file(true, &[])?);
         Ok(self.completed_files)
     }
 }
@@ -815,6 +810,7 @@ impl PrefixFile {
         let Some(hunk) = self.hunk.as_ref() else {
             return Ok(PatchVirtualFile {
                 path: self.path.clone(),
+                kind: self.kind,
                 segments,
                 deletions: self.result_deletions.clone(),
                 complete,
@@ -857,6 +853,7 @@ impl PrefixFile {
         }
         Ok(PatchVirtualFile {
             path: self.path.clone(),
+            kind: self.kind,
             segments,
             deletions: self.result_deletions.clone(),
             complete,
@@ -881,26 +878,26 @@ fn require_partial_patch_line(
 }
 
 fn verify_virtual_results(
+    snapshot: &WorkspaceSnapshot,
     prepared: &PreparedPatch,
     virtual_files: &[PatchVirtualFile],
 ) -> CollarResult<()> {
-    let expected = prepared
-        .files()
-        .iter()
-        .filter_map(|file| file.result_bytes().map(|bytes| (file.path(), bytes)))
-        .collect::<Vec<_>>();
-    if expected.len() != virtual_files.len() {
+    if prepared.files().len() != virtual_files.len() {
         return Err(CollarError::Mutation(
-            "streaming patch result omitted or added a non-deleted file".to_string(),
+            "streaming patch result omitted or added a file".to_string(),
         ));
     }
-    for ((expected_path, expected_bytes), virtual_file) in expected.into_iter().zip(virtual_files) {
+    for (expected, virtual_file) in prepared.files().iter().zip(virtual_files) {
         let actual = virtual_file
             .segments
             .iter()
             .flat_map(|segment| segment.bytes.iter().copied())
             .collect::<Vec<_>>();
-        if expected_path != &virtual_file.path || expected_bytes != actual {
+        let expected_bytes = expected.result_bytes().unwrap_or_default();
+        if expected.path() != &virtual_file.path
+            || expected.kind() != virtual_file.kind
+            || expected_bytes != actual
+        {
             return Err(CollarError::Mutation(format!(
                 "streaming patch result diverged from the authoritative transaction for {:?}",
                 virtual_file.path.as_str()
@@ -912,8 +909,59 @@ fn verify_virtual_results(
                 virtual_file.path.as_str()
             )));
         }
+        let reconstructed_base = reconstruct_virtual_base(virtual_file)?;
+        let expected_base = snapshot
+            .get(expected.path())
+            .map(|entry| entry.bytes.as_slice())
+            .unwrap_or_default();
+        if expected_base != reconstructed_base {
+            return Err(CollarError::Mutation(format!(
+                "streaming patch origins/deletions do not reconstruct the authorized base for {:?}",
+                virtual_file.path.as_str()
+            )));
+        }
     }
     Ok(())
+}
+
+fn reconstruct_virtual_base(virtual_file: &PatchVirtualFile) -> CollarResult<Vec<u8>> {
+    let mut base = Vec::new();
+    let mut result_offset = 0usize;
+    let mut deletion_index = 0usize;
+    for segment in &virtual_file.segments {
+        let segment_end = result_offset
+            .checked_add(segment.bytes.len())
+            .ok_or_else(|| CollarError::Mutation("virtual result offset overflowed".to_string()))?;
+        let mut local_offset = 0usize;
+        while let Some(deletion) = virtual_file.deletions.get(deletion_index) {
+            if deletion.result_offset < result_offset || deletion.result_offset > segment_end {
+                break;
+            }
+            let deletion_local = deletion.result_offset.saturating_sub(result_offset);
+            if segment.origin == SourceOrigin::Known {
+                base.extend_from_slice(&segment.bytes[local_offset..deletion_local]);
+            }
+            base.extend_from_slice(&deletion.bytes);
+            local_offset = deletion_local;
+            deletion_index = deletion_index.saturating_add(1);
+        }
+        if segment.origin == SourceOrigin::Known {
+            base.extend_from_slice(&segment.bytes[local_offset..]);
+        }
+        result_offset = segment_end;
+    }
+    while let Some(deletion) = virtual_file.deletions.get(deletion_index) {
+        if deletion.result_offset != result_offset {
+            return Err(CollarError::Mutation(format!(
+                "virtual deletion offset {} is outside the result for {:?}",
+                deletion.result_offset,
+                virtual_file.path.as_str()
+            )));
+        }
+        base.extend_from_slice(&deletion.bytes);
+        deletion_index = deletion_index.saturating_add(1);
+    }
+    Ok(base)
 }
 
 fn push_virtual_segment(
@@ -1627,6 +1675,14 @@ mod tests {
         );
         assert_eq!(prepared.files()[1].kind(), MutationKind::Delete);
         assert_eq!(prepared.files()[1].result_bytes(), None);
+
+        let mut stream = PatchStream::new(snapshot.clone(), patch.len(), 2, 2).unwrap();
+        stream.push(patch.as_bytes()).unwrap();
+        let (_, mut virtual_files) = stream.finish_with_virtual_files().unwrap();
+        assert_eq!(virtual_files[0].kind, MutationKind::Create);
+        assert_eq!(virtual_files[1].kind, MutationKind::Delete);
+        virtual_files[1].deletions.clear();
+        assert!(verify_virtual_results(&snapshot, &prepared, &virtual_files).is_err());
     }
 
     #[test]

@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{CollarResult, mutation::LogicalPath};
+use crate::{
+    CollarResult,
+    mutation::{LogicalPath, MutationKind},
+};
 
 mod layers;
 mod prefix;
@@ -151,6 +154,7 @@ pub enum SourceEvent<'a> {
     BeginFile {
         path: &'a LogicalPath,
         language: &'a LanguageId,
+        mutation: MutationKind,
     },
     Bytes {
         origin: SourceOrigin,

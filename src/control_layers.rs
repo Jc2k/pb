@@ -18,11 +18,14 @@ use std::{
 use anyhow::{Context, Result, bail};
 use pb_control_collar::{
     CompletionDecision, MutationCompletionGate,
-    analysis::{LanguageLayerStack, ProgramFile, ProgramSnapshot, SyntaxProfile},
+    analysis::{
+        IncrementalAnalyzer, LanguageLayerStack, ProgramFile, ProgramSnapshot, SyntaxProfile,
+    },
     mutation::WorkspaceSnapshot,
     protocol::ToolDialect,
     tool::{CollarLimits, CollarManifest, ExposedTool, MutationPolicy, ToolConstraintMode},
 };
+use pb_control_python::{PYTHON_LAYER_CONTRACT_VERSION, PythonProjectConfig, PythonProjectWorld};
 use pb_control_rust::{RUST_LAYER_CONTRACT_VERSION, RustProjectConfig, RustProjectWorld};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -31,19 +34,29 @@ use crate::{agent_core::BuiltInToolSchema, semantic::SemanticShadowWorkspace};
 
 const RUST_LAYER_MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const RUST_LAYER_MAX_CHECKPOINTS: usize = 4_096;
+const PYTHON_LAYER_MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+const PYTHON_LAYER_MAX_CHECKPOINTS: usize = 4_096;
+const PYTHON_LAYER_MAX_PROJECT_FILES: usize = 100_000;
+const PYTHON_LAYER_MAX_PROJECT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PROCESS_RUST_WORLDS: usize = 2;
+const MAX_PROCESS_PYTHON_WORLDS: usize = 2;
 // A cold rust-analyzer world can consume substantial memory. Detached cancellation must not let
 // abandoned requests accumulate concurrent loaders for different workspaces.
 const MAX_CONCURRENT_RUST_WORLD_PREPARATIONS: usize = 1;
+const MAX_CONCURRENT_PYTHON_WORLD_PREPARATIONS: usize = 1;
 const PREPARATION_WAIT_POLL: Duration = Duration::from_millis(100);
 
 pub(crate) type SharedLanguageLayers = Arc<Mutex<LanguageLayerStack>>;
 
 pub(crate) struct ControlLayerLifecycle {
     rust: Option<PreparedRustHandle>,
+    python: Option<PreparedPythonHandle>,
     cold_builds: u64,
     warm_requests: u64,
     process_cache_hits: u64,
+    python_cold_builds: u64,
+    python_warm_requests: u64,
+    python_process_cache_hits: u64,
 }
 
 struct PreparedRustWorld {
@@ -54,23 +67,42 @@ struct PreparedRustWorld {
     world: RustProjectWorld,
 }
 
+struct PreparedPythonWorld {
+    workspace_root: PathBuf,
+    source_sha256: String,
+    _shadow: Arc<SemanticShadowWorkspace>,
+    world: PythonProjectWorld,
+}
+
 impl Default for ControlLayerLifecycle {
     fn default() -> Self {
         Self {
             rust: None,
+            python: None,
             cold_builds: 0,
             warm_requests: 0,
             process_cache_hits: 0,
+            python_cold_builds: 0,
+            python_warm_requests: 0,
+            python_process_cache_hits: 0,
         }
     }
 }
 
 type PreparedRustHandle = Arc<Mutex<PreparedRustWorld>>;
+type PreparedPythonHandle = Arc<Mutex<PreparedPythonWorld>>;
 
 static RUST_WORLD_CACHE: OnceLock<Mutex<VecDeque<PreparedRustHandle>>> = OnceLock::new();
+static PYTHON_WORLD_CACHE: OnceLock<Mutex<VecDeque<PreparedPythonHandle>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RustWorldKey {
+    workspace_root: PathBuf,
+    source_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PythonWorldKey {
     workspace_root: PathBuf,
     source_sha256: String,
 }
@@ -87,6 +119,19 @@ struct RustWorldPreparationGuard {
 }
 
 static RUST_WORLD_PREPARATIONS: OnceLock<RustWorldPreparationCoordinator> = OnceLock::new();
+
+#[derive(Default)]
+struct PythonWorldPreparationCoordinator {
+    active: Mutex<HashSet<PythonWorldKey>>,
+    ready: Condvar,
+}
+
+struct PythonWorldPreparationGuard {
+    coordinator: &'static PythonWorldPreparationCoordinator,
+    key: PythonWorldKey,
+}
+
+static PYTHON_WORLD_PREPARATIONS: OnceLock<PythonWorldPreparationCoordinator> = OnceLock::new();
 
 impl ControlLayerLifecycle {
     /// Establish all expensive state before the caller reserves or records a model invocation.
@@ -109,19 +154,53 @@ impl ControlLayerLifecycle {
         mutation_snapshot: Option<&WorkspaceSnapshot>,
         cancellation: &dyn Fn() -> Result<()>,
     ) -> Result<Option<SharedLanguageLayers>> {
-        if !tools_may_mutate_rust(
-            tools,
-            mutation_snapshot.and_then(WorkspaceSnapshot::bound_mutation_path),
-        ) {
+        let bound_path = mutation_snapshot.and_then(WorkspaceSnapshot::bound_mutation_path);
+        let prepare_rust = tools_may_mutate_rust(tools, bound_path);
+        let prepare_python = tools_may_mutate_python(tools, bound_path);
+        if !prepare_rust && !prepare_python {
             return Ok(None);
         }
         cancellation()?;
         let snapshot = mutation_snapshot.context(
-            "Rust-edit-capable inference requires a controller-authorized mutation snapshot",
+            "native-language-edit-capable inference requires a controller-authorized mutation snapshot",
         )?;
-
         let live = crate::workspace::ContentSnapshot::capture(workspace_root)
-            .context("failed to identify the Rust semantic world before inference")?;
+            .context("failed to identify the native semantic world before inference")?;
+        let canonical_root = workspace_root
+            .canonicalize()
+            .context("failed to canonicalize the native semantic project root")?;
+
+        // Rust is intentionally first: Cargo/rust-analyzer preparation is the slowest supported
+        // lifecycle stage. No model reservation or inference begins until every requested layer
+        // below has returned a readiness receipt for this exact workspace identity.
+        let mut layers: Vec<Box<dyn IncrementalAnalyzer + Send>> = Vec::new();
+        if prepare_rust
+            && let Some(layer) = self.prepare_rust_layer(&canonical_root, &live, cancellation)?
+        {
+            layers.push(layer);
+            self.warm_requests = self.warm_requests.saturating_add(1);
+        }
+        cancellation()?;
+        if prepare_python
+            && let Some(layer) = self.prepare_python_layer(&canonical_root, &live, cancellation)?
+        {
+            layers.push(layer);
+            self.python_warm_requests = self.python_warm_requests.saturating_add(1);
+        }
+        if layers.is_empty() {
+            return Ok(None);
+        }
+        let stack = LanguageLayerStack::new(layers, program_snapshot(snapshot)?)
+            .context("failed to start the request-local native language-layer stack")?;
+        Ok(Some(Arc::new(Mutex::new(stack))))
+    }
+
+    fn prepare_rust_layer(
+        &mut self,
+        canonical_root: &Path,
+        live: &crate::workspace::ContentSnapshot,
+        cancellation: &dyn Fn() -> Result<()>,
+    ) -> Result<Option<Box<dyn IncrementalAnalyzer + Send>>> {
         if !live.paths.contains_key("Cargo.toml")
             && !live.paths.keys().any(|path| path.ends_with("/Cargo.toml"))
         {
@@ -129,11 +208,6 @@ impl ControlLayerLifecycle {
             // Cargo project whose dependencies can be loaded and resolved.
             return Ok(None);
         }
-
-        let canonical_root = workspace_root
-            .canonicalize()
-            .context("failed to canonicalize the Rust project root")?;
-
         let current_matches = self
             .rust
             .as_ref()
@@ -149,41 +223,33 @@ impl ControlLayerLifecycle {
             .transpose()?
             == Some(true);
         if !current_matches {
-            if let Some(cached) = process_cached_world(&canonical_root, &live.fingerprint)? {
+            if let Some(cached) = process_cached_world(canonical_root, &live.fingerprint)? {
                 self.rust = Some(cached);
                 self.process_cache_hits = self.process_cache_hits.saturating_add(1);
             } else {
-                // Project loading can be much slower than inference setup. Serialize preparation
-                // for one exact world so simultaneous edit-capable tasks do not each run Cargo and
-                // construct an identical rust-analyzer database. The cache is checked again after
-                // acquiring the flight because another request may have populated it while this
-                // request waited.
                 let preparation = begin_rust_world_preparation(
                     RustWorldKey {
-                        workspace_root: canonical_root.clone(),
+                        workspace_root: canonical_root.to_path_buf(),
                         source_sha256: live.fingerprint.clone(),
                     },
                     cancellation,
                 )?;
-                if let Some(cached) = process_cached_world(&canonical_root, &live.fingerprint)? {
+                if let Some(cached) = process_cached_world(canonical_root, &live.fingerprint)? {
                     self.rust = Some(cached);
                     self.process_cache_hits = self.process_cache_hits.saturating_add(1);
                 } else if let Some(refreshed) =
-                    self.try_incremental_refresh(&canonical_root, &live)?
+                    self.try_incremental_refresh(canonical_root, live)?
                 {
                     insert_process_world(Arc::clone(&refreshed))?;
                     self.rust = Some(refreshed);
                 } else {
-                    // The request that discovers a cold miss must not own the uninterruptible
-                    // rust-analyzer load. Transfer the single-flight lease and exact immutable
-                    // inputs to an in-process worker, then wait through the same cancellable polling
-                    // boundary as every other request. Cancellation abandons only this wait: the
-                    // worker finishes the exact world and may populate the bounded process cache.
-                    let receiver =
-                        spawn_rust_world_build(preparation, canonical_root.clone(), live)?;
+                    let receiver = spawn_rust_world_build(
+                        preparation,
+                        canonical_root.to_path_buf(),
+                        live.clone(),
+                    )?;
                     self.cold_builds = self.cold_builds.saturating_add(1);
-                    let prepared = wait_for_rust_preparation(&receiver, cancellation)?;
-                    self.rust = Some(prepared);
+                    self.rust = Some(wait_for_rust_preparation(&receiver, cancellation)?);
                 }
             }
         }
@@ -202,11 +268,74 @@ impl ControlLayerLifecycle {
         let layer = request
             .into_streaming_layer(RUST_LAYER_MAX_SOURCE_BYTES, RUST_LAYER_MAX_CHECKPOINTS)
             .context("failed to create the request-local Rust streaming layer")?;
-        let program = program_snapshot(snapshot)?;
-        let stack = LanguageLayerStack::new(vec![Box::new(layer)], program)
-            .context("failed to start the request-local language-layer stack")?;
-        self.warm_requests = self.warm_requests.saturating_add(1);
-        Ok(Some(Arc::new(Mutex::new(stack))))
+        Ok(Some(Box::new(layer)))
+    }
+
+    fn prepare_python_layer(
+        &mut self,
+        canonical_root: &Path,
+        live: &crate::workspace::ContentSnapshot,
+        cancellation: &dyn Fn() -> Result<()>,
+    ) -> Result<Option<Box<dyn IncrementalAnalyzer + Send>>> {
+        let current_matches = self
+            .python
+            .as_ref()
+            .map(|prepared| {
+                prepared
+                    .lock()
+                    .map(|prepared| {
+                        prepared.workspace_root == canonical_root
+                            && prepared.source_sha256 == live.fingerprint
+                    })
+                    .map_err(|_| anyhow::anyhow!("Python semantic world lock is poisoned"))
+            })
+            .transpose()?
+            == Some(true);
+        if !current_matches {
+            if let Some(cached) = process_cached_python_world(canonical_root, &live.fingerprint)? {
+                self.python = Some(cached);
+                self.python_process_cache_hits = self.python_process_cache_hits.saturating_add(1);
+            } else {
+                let preparation = begin_python_world_preparation(
+                    PythonWorldKey {
+                        workspace_root: canonical_root.to_path_buf(),
+                        source_sha256: live.fingerprint.clone(),
+                    },
+                    cancellation,
+                )?;
+                if let Some(cached) =
+                    process_cached_python_world(canonical_root, &live.fingerprint)?
+                {
+                    self.python = Some(cached);
+                    self.python_process_cache_hits =
+                        self.python_process_cache_hits.saturating_add(1);
+                } else {
+                    let receiver = spawn_python_world_build(
+                        preparation,
+                        canonical_root.to_path_buf(),
+                        live.clone(),
+                    )?;
+                    self.python_cold_builds = self.python_cold_builds.saturating_add(1);
+                    self.python = Some(wait_for_python_preparation(&receiver, cancellation)?);
+                }
+            }
+        }
+        let prepared = self
+            .python
+            .as_ref()
+            .context("Python control-layer lifecycle lost its prepared world")?;
+        let prepared = prepared
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Python semantic world lock is poisoned"))?;
+        let expected = &prepared.world.descriptor().world;
+        let request = prepared
+            .world
+            .snapshot_for_request(expected)
+            .context("prepared Python semantic world was not ready before inference")?;
+        let layer = request
+            .into_streaming_layer(PYTHON_LAYER_MAX_SOURCE_BYTES, PYTHON_LAYER_MAX_CHECKPOINTS)
+            .context("failed to create the request-local Python streaming layer")?;
+        Ok(Some(Box::new(layer)))
     }
 
     /// Independently replay a completed mutation immediately before executor entry. This never
@@ -221,9 +350,6 @@ impl ControlLayerLifecycle {
         name: &str,
         arguments: &Value,
     ) -> Result<CompletionDecision> {
-        let Some(prepared) = self.rust.as_ref() else {
-            return Ok(CompletionDecision::NotApplicable);
-        };
         if !matches!(
             name,
             "write_file" | "replace_file" | "edit_file" | "apply_patch"
@@ -232,27 +358,65 @@ impl ControlLayerLifecycle {
         }
         let canonical_root = workspace_root
             .canonicalize()
-            .context("failed to canonicalize the Rust project before mutation execution")?;
+            .context("failed to canonicalize the semantic project before mutation execution")?;
         let live = crate::workspace::ContentSnapshot::capture(workspace_root)
-            .context("failed to revalidate the Rust semantic world before mutation execution")?;
-        let prepared = prepared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Rust semantic world lock is poisoned"))?;
-        if prepared.workspace_root != canonical_root || prepared.source_sha256 != live.fingerprint {
-            bail!(
-                "workspace changed after Rust semantic preparation; refusing to execute a mutation against a stale world"
-            );
+            .context("failed to revalidate the semantic world before mutation execution")?;
+        let bound_path = snapshot.bound_mutation_path();
+        let validate_rust = tools_may_mutate_rust(tools, bound_path);
+        let validate_python = tools_may_mutate_python(tools, bound_path);
+        let mut layers: Vec<Box<dyn IncrementalAnalyzer + Send>> = Vec::new();
+        if validate_rust && let Some(prepared) = self.rust.as_ref() {
+            let prepared = prepared
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Rust semantic world lock is poisoned"))?;
+            if prepared.workspace_root != canonical_root
+                || prepared.source_sha256 != live.fingerprint
+            {
+                bail!(
+                    "workspace changed after Rust semantic preparation; refusing to execute a mutation against a stale world"
+                );
+            }
+            let expected = &prepared.world.descriptor().world;
+            let request = prepared
+                .world
+                .snapshot_for_request(expected)
+                .context("prepared Rust semantic world was not ready for execution replay")?;
+            layers.push(Box::new(
+                request
+                    .into_streaming_layer(RUST_LAYER_MAX_SOURCE_BYTES, RUST_LAYER_MAX_CHECKPOINTS)
+                    .context("failed to create the execution-time Rust replay layer")?,
+            ));
         }
-        let expected = &prepared.world.descriptor().world;
-        let request = prepared
-            .world
-            .snapshot_for_request(expected)
-            .context("prepared Rust semantic world was not ready for execution replay")?;
-        let layer = request
-            .into_streaming_layer(RUST_LAYER_MAX_SOURCE_BYTES, RUST_LAYER_MAX_CHECKPOINTS)
-            .context("failed to create the execution-time Rust replay layer")?;
-        let stack = LanguageLayerStack::new(vec![Box::new(layer)], program_snapshot(snapshot)?)
-            .context("failed to start the execution-time language-layer stack")?;
+        if validate_python && let Some(prepared) = self.python.as_ref() {
+            let prepared = prepared
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Python semantic world lock is poisoned"))?;
+            if prepared.workspace_root != canonical_root
+                || prepared.source_sha256 != live.fingerprint
+            {
+                bail!(
+                    "workspace changed after Python semantic preparation; refusing to execute a mutation against a stale world"
+                );
+            }
+            let expected = &prepared.world.descriptor().world;
+            let request = prepared
+                .world
+                .snapshot_for_request(expected)
+                .context("prepared Python semantic world was not ready for execution replay")?;
+            layers.push(Box::new(
+                request
+                    .into_streaming_layer(
+                        PYTHON_LAYER_MAX_SOURCE_BYTES,
+                        PYTHON_LAYER_MAX_CHECKPOINTS,
+                    )
+                    .context("failed to create the execution-time Python replay layer")?,
+            ));
+        }
+        if layers.is_empty() {
+            return Ok(CompletionDecision::NotApplicable);
+        }
+        let stack = LanguageLayerStack::new(layers, program_snapshot(snapshot)?)
+            .context("failed to start the execution-time native language-layer stack")?;
         let manifest = execution_manifest(tools, snapshot.clone());
         let gate = MutationCompletionGate::with_language_layers(manifest, stack)
             .context("failed to create the independent mutation replay gate")?;
@@ -290,6 +454,48 @@ impl ControlLayerLifecycle {
             workspace_root: workspace_root.to_path_buf(),
             source_sha256: expected.fingerprint.clone(),
             content: expected,
+            _shadow: Arc::new(shadow),
+            world,
+        })
+    }
+
+    fn build_current_python_world(
+        workspace_root: &Path,
+        expected: crate::workspace::ContentSnapshot,
+    ) -> Result<PreparedPythonWorld> {
+        let shadow = SemanticShadowWorkspace::capture(workspace_root, &expected)
+            .context("failed to capture an immutable Python semantic shadow")?;
+        let config = PythonProjectConfig {
+            contract_version: PYTHON_LAYER_CONTRACT_VERSION,
+            shadow_root: shadow.path().to_path_buf(),
+            first_party_roots: Vec::new(),
+            // Dependency snapshots are deliberately explicit. The shipped default resolves the
+            // project plus bundled typeshed; configured virtual-environment capture is a later
+            // lifecycle phase and must become part of dependency_sha256 before being enabled.
+            site_packages_roots: Vec::new(),
+            python_version: "3.12".to_string(),
+            python_platform: host_python_platform().to_string(),
+            world_sha256: expected.fingerprint.clone(),
+            configuration_sha256: subset_identity(&expected, is_python_configuration_input),
+            dependency_sha256: subset_identity(&expected, is_python_dependency_input),
+            max_files: PYTHON_LAYER_MAX_PROJECT_FILES,
+            max_bytes: PYTHON_LAYER_MAX_PROJECT_BYTES,
+        };
+        let world = PythonProjectWorld::load_and_prime(config)
+            .context("failed to load and prime Astral ty before inference")?;
+        let after = crate::workspace::ContentSnapshot::capture(workspace_root)
+            .context("failed to revalidate the Python semantic world after priming")?;
+        ensure_unchanged_during_python_preparation(&expected, &after)?;
+        tracing::info!(
+            world_sha256 = %expected.fingerprint,
+            load_millis = world.readiness_receipt().load_millis,
+            prime_millis = world.readiness_receipt().prime_millis,
+            primed_queries = world.readiness_receipt().primed_queries,
+            "Python streaming semantic world is ready before inference"
+        );
+        Ok(PreparedPythonWorld {
+            workspace_root: workspace_root.to_path_buf(),
+            source_sha256: expected.fingerprint,
             _shadow: Arc::new(shadow),
             world,
         })
@@ -374,9 +580,30 @@ impl ControlLayerLifecycle {
             self.process_cache_hits,
         )
     }
+
+    #[cfg(test)]
+    fn python_stats(&self) -> (u64, u64, u64) {
+        (
+            self.python_cold_builds,
+            self.python_warm_requests,
+            self.python_process_cache_hits,
+        )
+    }
 }
 
 impl Drop for RustWorldPreparationGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .coordinator
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.remove(&self.key);
+        self.coordinator.ready.notify_all();
+    }
+}
+
+impl Drop for PythonWorldPreparationGuard {
     fn drop(&mut self) {
         let mut active = self
             .coordinator
@@ -410,6 +637,28 @@ fn begin_rust_world_preparation(
     Ok(RustWorldPreparationGuard { coordinator, key })
 }
 
+fn begin_python_world_preparation(
+    key: PythonWorldKey,
+    cancellation: &dyn Fn() -> Result<()>,
+) -> Result<PythonWorldPreparationGuard> {
+    cancellation()?;
+    let coordinator = PYTHON_WORLD_PREPARATIONS.get_or_init(Default::default);
+    let mut active = coordinator
+        .active
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Python semantic preparation coordinator is poisoned"))?;
+    while active.contains(&key) || active.len() >= MAX_CONCURRENT_PYTHON_WORLD_PREPARATIONS {
+        let (next, _) = coordinator
+            .ready
+            .wait_timeout(active, PREPARATION_WAIT_POLL)
+            .map_err(|_| anyhow::anyhow!("Python semantic preparation coordinator is poisoned"))?;
+        active = next;
+        cancellation()?;
+    }
+    active.insert(key.clone());
+    Ok(PythonWorldPreparationGuard { coordinator, key })
+}
+
 fn spawn_rust_world_build(
     preparation: RustWorldPreparationGuard,
     workspace_root: PathBuf,
@@ -421,6 +670,20 @@ fn spawn_rust_world_build(
             expected,
         )?));
         insert_process_world(Arc::clone(&prepared))?;
+        Ok(prepared)
+    })
+}
+
+fn spawn_python_world_build(
+    preparation: PythonWorldPreparationGuard,
+    workspace_root: PathBuf,
+    expected: crate::workspace::ContentSnapshot,
+) -> Result<Receiver<Result<PreparedPythonHandle>>> {
+    spawn_python_preparation_worker(preparation, move || {
+        let prepared = Arc::new(Mutex::new(
+            ControlLayerLifecycle::build_current_python_world(&workspace_root, expected)?,
+        ));
+        insert_process_python_world(Arc::clone(&prepared))?;
         Ok(prepared)
     })
 }
@@ -453,6 +716,32 @@ where
     Ok(receiver)
 }
 
+fn spawn_python_preparation_worker<T>(
+    preparation: PythonWorldPreparationGuard,
+    prepare: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<Receiver<Result<T>>>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = sync_channel(1);
+    thread::Builder::new()
+        .name("pb-python-world-preparation".to_string())
+        .spawn(move || {
+            let result = prepare();
+            drop(preparation);
+            if let Err(disconnected) = sender.send(result)
+                && let Err(error) = disconnected.0
+            {
+                tracing::warn!(
+                    %error,
+                    "detached Python semantic preparation failed after its request stopped waiting"
+                );
+            }
+        })
+        .context("failed to start the Python semantic preparation worker")?;
+    Ok(receiver)
+}
+
 fn wait_for_rust_preparation<T>(
     receiver: &Receiver<Result<T>>,
     cancellation: &dyn Fn() -> Result<()>,
@@ -472,6 +761,25 @@ fn wait_for_rust_preparation<T>(
     }
 }
 
+fn wait_for_python_preparation<T>(
+    receiver: &Receiver<Result<T>>,
+    cancellation: &dyn Fn() -> Result<()>,
+) -> Result<T> {
+    loop {
+        cancellation()?;
+        match receiver.recv_timeout(PREPARATION_WAIT_POLL) {
+            Ok(result) => {
+                cancellation()?;
+                return result;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("Python semantic preparation worker stopped without a result")
+            }
+        }
+    }
+}
+
 fn ensure_unchanged_during_rust_preparation(
     expected: &crate::workspace::ContentSnapshot,
     after: &crate::workspace::ContentSnapshot,
@@ -479,6 +787,18 @@ fn ensure_unchanged_during_rust_preparation(
     if after.fingerprint != expected.fingerprint {
         bail!(
             "workspace changed while rust-analyzer was loading; refusing Rust-edit-capable inference until the controller recaptures one exact mutation and semantic snapshot"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_unchanged_during_python_preparation(
+    expected: &crate::workspace::ContentSnapshot,
+    after: &crate::workspace::ContentSnapshot,
+) -> Result<()> {
+    if after.fingerprint != expected.fingerprint {
+        bail!(
+            "workspace changed while Astral ty was loading; refusing Python-edit-capable inference until the controller recaptures one exact mutation and semantic snapshot"
         );
     }
     Ok(())
@@ -573,6 +893,65 @@ fn insert_process_world(world: PreparedRustHandle) -> Result<()> {
     Ok(())
 }
 
+fn process_cached_python_world(
+    workspace_root: &Path,
+    source_sha256: &str,
+) -> Result<Option<PreparedPythonHandle>> {
+    let mut cache = PYTHON_WORLD_CACHE
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Python semantic world cache lock is poisoned"))?;
+    let mut found = None;
+    for (index, entry) in cache.iter().enumerate() {
+        let entry = entry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Python semantic world lock is poisoned"))?;
+        if entry.workspace_root == workspace_root && entry.source_sha256 == source_sha256 {
+            found = Some(index);
+            break;
+        }
+    }
+    let Some(index) = found else {
+        return Ok(None);
+    };
+    let entry = cache
+        .remove(index)
+        .context("Python semantic world cache entry disappeared")?;
+    cache.push_back(Arc::clone(&entry));
+    Ok(Some(entry))
+}
+
+fn insert_process_python_world(world: PreparedPythonHandle) -> Result<()> {
+    let mut cache = PYTHON_WORLD_CACHE
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Python semantic world cache lock is poisoned"))?;
+    let identity = {
+        let world = world
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Python semantic world lock is poisoned"))?;
+        (world.workspace_root.clone(), world.source_sha256.clone())
+    };
+    let mut retained = VecDeque::with_capacity(cache.len());
+    while let Some(entry) = cache.pop_front() {
+        let duplicate = {
+            let entry = entry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Python semantic world lock is poisoned"))?;
+            entry.workspace_root == identity.0 && entry.source_sha256 == identity.1
+        };
+        if !duplicate {
+            retained.push_back(entry);
+        }
+    }
+    *cache = retained;
+    while cache.len() >= MAX_PROCESS_PYTHON_WORLDS {
+        cache.pop_front();
+    }
+    cache.push_back(world);
+    Ok(())
+}
+
 fn program_snapshot(snapshot: &WorkspaceSnapshot) -> Result<ProgramSnapshot> {
     let files = snapshot
         .entries()
@@ -601,6 +980,27 @@ fn tools_may_mutate_rust(
                 })
             },
             |path| path.as_str().ends_with(".rs"),
+        ),
+        _ => false,
+    })
+}
+
+fn tools_may_mutate_python(
+    tools: &[BuiltInToolSchema],
+    bound_mutation_path: Option<&pb_control_collar::mutation::LogicalPath>,
+) -> bool {
+    tools.iter().any(|tool| match tool.name.as_str() {
+        "apply_patch" => true,
+        "write_file" | "replace_file" | "edit_file" => bound_mutation_path.map_or_else(
+            || {
+                constrained_paths(&tool.input_schema).is_none_or(|paths| {
+                    paths.is_empty()
+                        || paths
+                            .iter()
+                            .any(|path| path.ends_with(".py") || path.ends_with(".pyi"))
+                })
+            },
+            |path| path.as_str().ends_with(".py") || path.as_str().ends_with(".pyi"),
         ),
         _ => false,
     })
@@ -647,6 +1047,43 @@ fn is_rust_dependency_input(path: &str) -> bool {
         || path.ends_with("/Cargo.lock")
 }
 
+fn is_python_configuration_input(path: &str) -> bool {
+    matches!(
+        path,
+        "pyproject.toml" | "ty.toml" | ".python-version" | "setup.cfg" | "tox.ini" | "mypy.ini"
+    ) || path.ends_with("/pyproject.toml")
+        || path.ends_with("/ty.toml")
+}
+
+fn is_python_dependency_input(path: &str) -> bool {
+    matches!(
+        path,
+        "pyproject.toml"
+            | "requirements.txt"
+            | "requirements-dev.txt"
+            | "uv.lock"
+            | "poetry.lock"
+            | "Pipfile"
+            | "Pipfile.lock"
+    ) || path.ends_with("/requirements.txt")
+        || path.ends_with("/uv.lock")
+        || path.ends_with("/poetry.lock")
+}
+
+const fn host_python_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else {
+        "linux"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -658,7 +1095,7 @@ mod tests {
         },
     };
 
-    use pb_control_collar::mutation::{LogicalPath, SnapshotEntry};
+    use pb_control_collar::mutation::{LogicalPath, MutationKind, PatchStream, SnapshotEntry};
     use serde_json::json;
 
     use super::*;
@@ -702,6 +1139,279 @@ mod tests {
             &[tool("apply_patch", json!({"const": "README.md"}))],
             Some(&readme),
         ));
+        assert!(!tools_may_mutate_python(
+            &[tool("write_file", json!({"const": "README.md"}))],
+            None,
+        ));
+        assert!(tools_may_mutate_python(
+            &[tool("write_file", json!({"const": "main.py"}))],
+            None,
+        ));
+        assert!(tools_may_mutate_python(
+            &[tool("apply_patch", json!({"const": "README.md"}))],
+            Some(&readme),
+        ));
+    }
+
+    #[test]
+    fn python_world_is_prepared_before_inference_and_replayed_before_execution() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("main.py"), "value: int = 1\n").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let python_tool = tool("replace_file", json!({"const": "main.py"}));
+        let snapshot = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            LogicalPath::parse("main.py").unwrap(),
+            fs::read(root.path().join("main.py")).unwrap(),
+        )])
+        .unwrap();
+        let mut lifecycle = ControlLayerLifecycle::default();
+        assert!(
+            lifecycle
+                .prepare_for_inference(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    Some(&snapshot),
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(lifecycle.stats(), (0, 0, 0));
+        assert_eq!(lifecycle.python_stats(), (1, 1, 0));
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    &snapshot,
+                    "replace_file",
+                    &json!({"path": "main.py", "content": "value = \"text\" + 1\n"}),
+                )
+                .unwrap(),
+            CompletionDecision::Reject(pb_control_collar::RejectionCode::InvalidSemantics)
+        );
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    &snapshot,
+                    "replace_file",
+                    &json!({"path": "main.py", "content": "value = 2\n"}),
+                )
+                .unwrap(),
+            CompletionDecision::Accept
+        );
+        assert!(
+            lifecycle
+                .prepare_for_inference(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    Some(&snapshot),
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(lifecycle.python_stats(), (1, 2, 0));
+
+        let mut next_stage = ControlLayerLifecycle::default();
+        assert!(
+            next_stage
+                .prepare_for_inference(root.path(), &[python_tool], Some(&snapshot))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(next_stage.python_stats(), (0, 1, 1));
+    }
+
+    #[test]
+    fn first_python_file_gets_native_semantics_before_inference() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = LogicalPath::parse("main.py").unwrap();
+        let snapshot = WorkspaceSnapshot::new(Vec::new())
+            .unwrap()
+            .with_bound_mutation_path(path);
+        let python_tool = tool("write_file", json!({"const": "main.py"}));
+        let mut lifecycle = ControlLayerLifecycle::default();
+        assert!(
+            lifecycle
+                .prepare_for_inference(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    Some(&snapshot),
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(lifecycle.python_stats(), (1, 1, 0));
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    &snapshot,
+                    "write_file",
+                    &json!({"content": "value = \"text\" + 1\n"}),
+                )
+                .unwrap(),
+            CompletionDecision::Reject(pb_control_collar::RejectionCode::InvalidSemantics)
+        );
+    }
+
+    #[test]
+    fn python_execution_replay_resolves_deletions_across_one_patch_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("helper.py"),
+            "def add(value: int) -> int:\n    return value + 1\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("main.py"),
+            "from helper import add\nvalue = add(1)\n",
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let patch_tool = tool("apply_patch", json!({"type": "string"}));
+        let snapshot = WorkspaceSnapshot::new(vec![
+            SnapshotEntry::new(
+                LogicalPath::parse("helper.py").unwrap(),
+                fs::read(root.path().join("helper.py")).unwrap(),
+            ),
+            SnapshotEntry::new(
+                LogicalPath::parse("main.py").unwrap(),
+                fs::read(root.path().join("main.py")).unwrap(),
+            ),
+        ])
+        .unwrap();
+        let mut lifecycle = ControlLayerLifecycle::default();
+        assert!(
+            lifecycle
+                .prepare_for_inference(
+                    root.path(),
+                    std::slice::from_ref(&patch_tool),
+                    Some(&snapshot),
+                )
+                .unwrap()
+                .is_some()
+        );
+        let patch = concat!(
+            "diff --git a/helper.py b/helper.py\n",
+            "deleted file mode 100644\n",
+            "--- a/helper.py\n",
+            "+++ /dev/null\n",
+            "@@ -1,2 +0,0 @@\n",
+            "-def add(value: int) -> int:\n",
+            "-    return value + 1\n",
+            "diff --git a/main.py b/main.py\n",
+            "--- a/main.py\n",
+            "+++ b/main.py\n",
+            "@@ -1,2 +1,2 @@\n",
+            " from helper import add\n",
+            "-value = add(1)\n",
+            "+value = add(2)\n",
+        );
+        let mut stream = PatchStream::new(snapshot.clone(), patch.len(), 2, 2).unwrap();
+        stream.push(patch.as_bytes()).unwrap();
+        let (_, virtual_files) = stream.finish_with_virtual_files().unwrap();
+        assert_eq!(virtual_files.len(), 2);
+        assert_eq!(virtual_files[0].kind, MutationKind::Delete);
+        assert_eq!(virtual_files[1].kind, MutationKind::Modify);
+        assert_eq!(
+            virtual_files[1]
+                .segments
+                .iter()
+                .flat_map(|segment| &segment.bytes)
+                .copied()
+                .collect::<Vec<_>>(),
+            b"from helper import add\nvalue = add(2)\n"
+        );
+
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&patch_tool),
+                    &snapshot,
+                    "apply_patch",
+                    &json!({"patch": patch}),
+                )
+                .unwrap(),
+            CompletionDecision::Reject(pb_control_collar::RejectionCode::InvalidSemantics)
+        );
+    }
+
+    #[test]
+    fn stale_irrelevant_language_world_does_not_block_an_exact_other_language_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("main.py"), "value = 1\n").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let python_tool = tool("replace_file", json!({"const": "main.py"}));
+        let python_snapshot = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            LogicalPath::parse("main.py").unwrap(),
+            fs::read(root.path().join("main.py")).unwrap(),
+        )])
+        .unwrap();
+        let mut lifecycle = ControlLayerLifecycle::default();
+        lifecycle
+            .prepare_for_inference(
+                root.path(),
+                std::slice::from_ref(&python_tool),
+                Some(&python_snapshot),
+            )
+            .unwrap()
+            .expect("the Python world should be prepared");
+        fs::write(root.path().join("main.py"), "value = 2\n").unwrap();
+
+        let javascript_path = LogicalPath::parse("new.js").unwrap();
+        let javascript_snapshot = WorkspaceSnapshot::new(Vec::new())
+            .unwrap()
+            .with_bound_mutation_path(javascript_path);
+        let javascript_tool = tool("write_file", json!({"const": "new.js"}));
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&javascript_tool),
+                    &javascript_snapshot,
+                    "write_file",
+                    &json!({"content": "const value = 1;\n"}),
+                )
+                .unwrap(),
+            CompletionDecision::NotApplicable
+        );
     }
 
     #[test]

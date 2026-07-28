@@ -70,6 +70,16 @@ request may leave its already-started cold analyzer worker running locally until
 finishes; at most one such cold worker runs process-wide, and its shadow/world is then dropped or
 retained only by the same bounded in-memory cache. Cancellation adds no network or durable source
 persistence.
+
+Python-edit-capable real-backend requests use the same local-only lifecycle. The controller creates
+an ephemeral verified shadow, and `pb-control-python` copies relevant Python/stub/package-marker
+bytes into a frozen in-memory filesystem before running exact-pinned Astral `ty` internals in the pb
+process. The current profile uses bundled typeshed and does not discover or contact a live LSP,
+interpreter, package index, or external virtual environment. Generated overlays, diagnostic debt,
+and request databases stay in memory; bounded process caches retain only local analyzer worlds and
+durable events remain content-free. A cancelled request may leave its one already-started local
+Python preparation worker finishing into that bounded cache, but adds no network or durable source
+persistence.
 `inference.llamacpp_session_cache_enabled=false` and
 `inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are

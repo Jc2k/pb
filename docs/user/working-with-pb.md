@@ -57,8 +57,14 @@ TypeScript/TSX, JavaScript/JSX, HTML, and CSS mutations cannot finish or execute
 virtual file is valid under pb's pinned syntax parser. Existing files still need a current full-file
 read. `apply_patch` uses exact hunk offsets, counts, and context and accepts only pb's canonical text
 patch form; stale, recount-dependent, rename/copy, mode-changing, timestamped, quoted-path, binary,
-or syntax-breaking patches fail without falling back to a looser parser. This catches malformed
-files, not type errors, unresolved names, failing builds, or bad runtime behavior; configured checks
+or syntax-breaking patches fail without falling back to a looser parser. For real local backends,
+Rust and Python additionally have narrow native semantic layers prepared before inference and
+replayed before execution. Rust can veto only its promoted exact import/call/literal
+contradictions. Python applies all candidate files—including deletions—as one overlay and can veto
+complete generated string-plus-integer literal additions and selected newly introduced pinned-`ty`
+diagnostics in non-deleted transaction files. Untouched dependants, `Any`, dynamic/runtime behavior,
+external environment packages, and other diagnostics remain unknown. These layers do not promise
+general type correctness, compilation, passing checks, or safe runtime behavior; configured checks
 and review still decide those claims.
 
 For the last remaining file operation, the local model returns the implementation summary with the

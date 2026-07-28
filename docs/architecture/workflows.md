@@ -382,7 +382,7 @@ The runtime applies these boundaries before a result can become evidence:
 | Surface | Enforced behavior |
 | --- | --- |
 | File reads and discovery | `read_file` accepts bounded UTF-8 files; glob, regex, and skill discovery have time/input ceilings; results are prompt-bounded with explicit continuation or failure rather than silent partial authority. |
-| File mutation | Existing files require an exact content fingerprint from the bytes actually read. Create and replace use synced temporary files and atomic no-clobber/replace operations; stale concurrent edits fail. `edit_file` requires one unique match. Real local backends prepare the exact virtual result through the control collar and refuse to close or execute a supported Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, or CSS mutation unless the pinned complete-file parser accepts it. Rust-edit-capable requests additionally require a ready exact native Rust world before inference and an independent final replay; only promoted exact Rust contradictions can veto, while partial facts remain unknown. Unsupported extensions retain the ordinary executor checks and are not reported as syntax constrained. For an initial Python or Python-stub modify whose complete controller-observed file consumes at most half the bounded replacement allowance, pb exposes only atomic `replace_file`; this avoids indentation-fragment errors while requiring the model to preserve unrelated bytes. Other languages, larger or range-only observations, and diagnostic repair retain exact-edit behavior. Diff events are bounded and identify truncation. |
+| File mutation | Existing files require an exact content fingerprint from the bytes actually read. Create and replace use synced temporary files and atomic no-clobber/replace operations; stale concurrent edits fail. `edit_file` requires one unique match. Real local backends prepare the exact virtual result through the control collar and refuse to close or execute a supported Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, or CSS mutation unless the pinned complete-file parser accepts it. Rust- and Python-edit-capable requests additionally require their ready exact native worlds before inference and independent final replay; only promoted exact contradictions can veto, while partial or dynamic facts remain unknown. Unsupported extensions retain the ordinary executor checks and are not reported as syntax constrained. For an initial Python or Python-stub modify whose complete controller-observed file consumes at most half the bounded replacement allowance, pb exposes only atomic `replace_file`; this avoids indentation-fragment errors while requiring the model to preserve unrelated bytes. Other languages, larger or range-only observations, and diagnostic repair retain exact-edit behavior. Diff events are bounded and identify truncation. |
 | Patch, move, and remove | FlashMoe `apply_patch` accepts a bounded canonical text-only unified-diff subset: exact offsets, counts, context and deletion bytes; LF; unquoted `a/` and `b/` paths; optional matching `diff --git`; and exact `100644` create/delete metadata. It rejects recount-dependent hunks, mode changes, renames, copies, timestamps, index metadata, and binary patches, applies the patch to an immutable controller snapshot in memory, validates every supported resulting file, rechecks live base hashes, and then requires exact `git apply --check` parity before publication. The llama.cpp compatibility path retains its broader Git/recount behavior and is never a fallback after collar rejection. `mv` moves only a file or symlink and cannot overwrite. `rm` operates on the final filesystem entry and removes only a file, symlink, or empty directory; recursive directory mutation is not an agent capability. |
 | Configured tasks | `run_task` executes against an isolated snapshot, rejects Git-control or undeclared-path changes, bounds promoted path/file totals, validates symlinks, stages every output, and rolls back the destination set if promotion fails. It never earns named-check credit. |
 | Commands and checks | Host and managed commands drain stdout/stderr concurrently, cap combined output, have explicit timeouts, observe user cancellation, and stop the owned process group or managed exec. `run_command` defaults to 120 seconds and is capped at 600; configured checks/tasks use their validated timeout. |
@@ -708,6 +708,29 @@ a fresh stack bound to the same live world identity. Candidate checkpoints retai
 source lengths and parser/semantic state rather than copying the virtual file for every accepted
 token.
 
+**Shipped Python v1 behavior.** If a real local backend exposes a tool schema that can edit or
+create a Python file, pb creates an exact verified shadow—even if the project has no Python file
+yet—and loads/primes exact-pinned Astral `ty` state
+before inference. Python 3.12, the host platform, first-party sources, bundled typeshed,
+configuration inputs, and dependency manifests identify the world. Each request gets an
+independently writable Salsa database over shared frozen bytes; this avoids treating a read-only
+Salsa snapshot as a mutable overlay and ensures no project/type loading is deferred until token
+generation. Exact worlds use a bounded process cache and single flight, with at most one cold
+Python loader. Cancellation is polled while initiating or queued requests wait, and no model starts
+after cancellation. When Rust and Python are both reachable, Rust preparation completes first and
+the model starts only after both readiness receipts exist.
+
+The Python stream keeps known/generated origins, verifies a complete structural boundary before
+semantic pruning, and hard-rejects only a generated string-plus-integer literal addition confirmed
+by the pinned checker. Complete create/modify/delete candidates are overlaid together, with deletion
+represented as absence, so new imports and callable signatures resolve coherently within the
+transaction. Finalization checks each non-deleted transaction file and compares promoted diagnostic
+multisets against baseline debt; it does not yet expand the check to untouched dependants.
+Preserved baseline suppressions remain baseline, while generated `ty: ignore` or `type: ignore`
+directives reject. `Any`, dynamic behavior, unpromoted diagnostics, and dependencies outside the
+frozen project remain unknown. Immediately before execution, pb reconstructs and replays the
+complete mutation through a fresh Python request database against the same live identity.
+
 The syntax profiles are pinned Tree-sitter grammars for Rust, Python, TypeScript/TSX,
 JavaScript/JSX, HTML, and CSS. They require UTF-8 and reject error or missing nodes; HTML additionally
 checks explicit element closure and supported embedded JavaScript, TypeScript, JSON, and CSS. This
@@ -724,7 +747,7 @@ tokenizer boundaries without loading model weights. A hidden no-execution llama.
 also loads an exact GGUF and reports complete calls plus content-free constraint counts; one pinned
 Qwen profile passes valid write/patch and fail-closed malformed/truncation cases. This is profile
 evidence, not a claim that every llama.cpp template or the DeepSeek llama.cpp dialect is promoted.
-Deeper Rust layers and future native Python and TypeScript/JavaScript crates use the same versioned
+Deeper Rust/Python layers and a future native TypeScript/JavaScript crate use the same versioned
 event/checkpoint interface only after each error class has its own soundness corpus and fail-closed
 qualification.
 

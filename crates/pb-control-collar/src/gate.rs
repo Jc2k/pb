@@ -12,7 +12,7 @@ use crate::{
         SourceEvent, SourceOrigin, SourcePrefixOracle, SyntaxProfile, Viability,
     },
     mutation::{
-        FileStreamMode, LogicalPath, PatchCheckpoint, PatchStream, PatchVirtualFile,
+        FileStreamMode, LogicalPath, MutationKind, PatchCheckpoint, PatchStream, PatchVirtualFile,
         VirtualFileStream, prepare_replace,
     },
     receipt::Digest,
@@ -283,7 +283,12 @@ impl MutationCompletionGate {
                     .map(|entry| entry.bytes.as_slice())
             })
             .flatten();
-        Ok(vec![replacement_virtual_file(path, base, result)])
+        Ok(vec![replacement_virtual_file(
+            path,
+            prepared.kind(),
+            base,
+            result,
+        )])
     }
 
     fn prepare_edit_replay(&self, arguments: &Value) -> Result<Vec<PatchVirtualFile>, CollarError> {
@@ -315,6 +320,7 @@ impl MutationCompletionGate {
         let prepared = prepare_replace(&self.manifest.workspace, path.clone(), result)?;
         Ok(vec![replacement_virtual_file(
             path,
+            prepared.kind(),
             Some(&base.bytes),
             prepared.result_bytes().ok_or_else(|| {
                 CollarError::Mutation("edit replay unexpectedly produced a deletion".to_string())
@@ -362,6 +368,7 @@ impl MutationCompletionGate {
             analyses.push(layers.apply(SourceEvent::BeginFile {
                 path: &file.path,
                 language: &language,
+                mutation: file.kind,
             })?);
             let mut cursor = 0usize;
             for deletion in &file.deletions {
@@ -503,7 +510,16 @@ impl MutationCompletionGate {
                 RejectionCode::ExistingCreateTarget
             });
         }
-        self.prefix_decision(&path, &[], payload_prefix.as_bytes())
+        self.prefix_decision(
+            &path,
+            if replace {
+                MutationKind::Modify
+            } else {
+                MutationKind::Create
+            },
+            &[],
+            payload_prefix.as_bytes(),
+        )
     }
 
     fn evaluate_edit_prefix(
@@ -536,7 +552,12 @@ impl MutationCompletionGate {
         let Some(start) = base_text.find(old_text) else {
             return CompletionDecision::Reject(RejectionCode::InvalidArguments);
         };
-        self.prefix_decision(&path, &base.bytes[..start], payload_prefix.as_bytes())
+        self.prefix_decision(
+            &path,
+            MutationKind::Modify,
+            &base.bytes[..start],
+            payload_prefix.as_bytes(),
+        )
     }
 
     fn evaluate_write(&self, arguments: &Value, replace: bool) -> CompletionDecision {
@@ -644,6 +665,7 @@ impl MutationCompletionGate {
     fn prefix_decision(
         &self,
         path: &LogicalPath,
+        mutation: MutationKind,
         known_prefix: &[u8],
         generated_prefix: &[u8],
     ) -> CompletionDecision {
@@ -656,6 +678,7 @@ impl MutationCompletionGate {
         };
         let identity = PrefixProbeIdentity {
             path: path.clone(),
+            mutation,
             known_prefix_sha256: Digest::of(known_prefix),
             known_prefix_len: known_prefix.len(),
             source_limit,
@@ -734,12 +757,14 @@ fn required_string<'a>(arguments: &'a Value, field: &str) -> Result<&'a str, Col
 
 fn replacement_virtual_file(
     path: LogicalPath,
+    kind: MutationKind,
     base: Option<&[u8]>,
     result: &[u8],
 ) -> PatchVirtualFile {
     let Some(base) = base else {
         return PatchVirtualFile {
             path,
+            kind,
             segments: vec![crate::mutation::PatchVirtualSegment {
                 origin: SourceOrigin::Generated,
                 bytes: result.to_vec(),
@@ -784,6 +809,7 @@ fn replacement_virtual_file(
         .collect();
     PatchVirtualFile {
         path,
+        kind,
         segments,
         deletions,
         complete: true,
@@ -868,6 +894,7 @@ fn classify_mutation_error(error: &CollarError) -> RejectionCode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PrefixProbeIdentity {
     path: LogicalPath,
+    mutation: MutationKind,
     known_prefix_sha256: Digest,
     known_prefix_len: usize,
     source_limit: usize,
@@ -976,6 +1003,7 @@ impl PrefixProbeCache {
                 layers.apply(SourceEvent::BeginFile {
                     path: &identity.path,
                     language: &language,
+                    mutation: identity.mutation,
                 })?;
                 if !known_prefix.is_empty() {
                     layers.apply(SourceEvent::Bytes {
@@ -1279,6 +1307,7 @@ fn sync_patch_language_layers(
                     layers.apply(SourceEvent::BeginFile {
                         path: &file.path,
                         language: &language,
+                        mutation: file.kind,
                     })?;
                     SourcePrefixOracle::new(file.path.clone(), source_limit)
                 })

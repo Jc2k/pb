@@ -110,6 +110,18 @@ questions remain unknown. A fresh complete replay against the same live world ru
 entry; a generation cache or receipt is not authority. This narrow claim is not general Rust symbol
 or type correctness and does not promise compilation.
 
+For a real local backend that may edit Python, pb likewise prepares exact-pinned Astral `ty` state
+before inference. The shipped v1 profile binds Python 3.12, the host target platform, first-party
+sources, bundled typeshed, and configuration/dependency-manifest identities to a frozen project
+world. Request overlays resolve newly generated files and imports together, and a deleted candidate
+is absent from that transaction's import graph. It can reject a complete
+generated string-plus-integer literal operation at a proven statement boundary and newly introduced
+promoted `ty` diagnostics in non-deleted files included in the mutation transaction at closure;
+generated type-suppression directives cannot hide those errors. Untouched dependants are not yet
+rechecked. `Any`, dynamic imports, monkey-patching, descriptors, runtime dispatch, dependencies
+outside the frozen project, and unpromoted diagnostics remain unknown. A fresh complete replay runs
+before executor entry. This is not general Python type or runtime correctness.
+
 Settled-transaction LSP symbol/type claims are separately opt-in through a server's
 `semantic_enforcement` mode.
 Required mode accepts only a digest-pinned, complete, exact-overlay diagnostic comparison and repeats

@@ -7,7 +7,7 @@ use pb_control_collar::{
         IncrementalAnalyzer, LayerReadiness, LayerReadinessReceipt, ProgramSnapshot, RepairIntent,
         SemanticObligation, SourceEvent, SourceOrigin, Viability,
     },
-    mutation::LogicalPath,
+    mutation::{LogicalPath, MutationKind},
 };
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
@@ -75,6 +75,7 @@ impl RustWorkspaceStreamingLayer {
         &mut self,
         path: &LogicalPath,
         language: &pb_control_collar::analysis::LanguageId,
+        mutation: MutationKind,
     ) -> CollarResult<Analysis> {
         let Some(target) = self.project.target_for_path(path) else {
             self.active = WorkspaceActive::Unknown;
@@ -99,7 +100,11 @@ impl RustWorkspaceStreamingLayer {
             self.layers.len().saturating_sub(1)
         };
         let layer = &mut self.layers[index].2;
-        let analysis = layer.apply(SourceEvent::BeginFile { path, language })?;
+        let analysis = layer.apply(SourceEvent::BeginFile {
+            path,
+            language,
+            mutation,
+        })?;
         self.active = WorkspaceActive::Target(index);
         self.last_analysis = analysis.clone();
         Ok(analysis)
@@ -167,13 +172,18 @@ impl IncrementalAnalyzer for RustWorkspaceStreamingLayer {
     }
 
     fn apply(&mut self, event: SourceEvent<'_>) -> CollarResult<Analysis> {
-        if let SourceEvent::BeginFile { path, language } = event {
+        if let SourceEvent::BeginFile {
+            path,
+            language,
+            mutation,
+        } = event
+        {
             if language != &self.descriptor().language {
                 return Err(CollarError::Analysis(
                     "Rust workspace layer received a non-Rust file".to_string(),
                 ));
             }
-            return self.begin_file(path, language);
+            return self.begin_file(path, language, mutation);
         }
         let analysis = match self.active {
             WorkspaceActive::Target(index) => self
@@ -487,7 +497,11 @@ impl IncrementalAnalyzer for RustStreamingLayer {
 
     fn apply(&mut self, event: SourceEvent<'_>) -> CollarResult<Analysis> {
         match event {
-            SourceEvent::BeginFile { path, language } => {
+            SourceEvent::BeginFile {
+                path,
+                language,
+                mutation: _,
+            } => {
                 if language != &self.descriptor().language {
                     return Err(CollarError::Analysis(
                         "Rust layer received a non-Rust file".to_string(),

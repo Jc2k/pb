@@ -1,0 +1,26 @@
+[package]
+name = "pb-control-python"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pb-control-collar = { path = "../pb-control-collar" }
+ruff_db = "=0.0.6"
+ruff_diagnostics = "=0.0.6"
+ruff_notebook = "=0.0.6"
+ruff_python_ast = { version = "=0.0.6", features = ["salsa"] }
+ruff_text_size = "=0.0.6"
+salsa = { version = "=0.28.1", default-features = false, features = ["compact_str", "inventory", "macros", "ordermap", "salsa_unstable"] }
+thiserror = { workspace = true }
+tree-sitter = "=0.25.10"
+tree-sitter-python = "=0.25.0"
+ty_module_resolver = "=0.0.6"
+ty_python_core = "=0.0.6"
+ty_python_semantic = "=0.0.6"
+ty_site_packages = "=0.0.6"
+ty_vendored = "=0.0.6"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.10.1"

@@ -367,6 +367,7 @@ resolved versioned namespace; it never targets the storage root itself.
 | Goal automatic continuation | Explicit per-Goal user authority inside snapshotted totals. It does not approve new paths, integrations, network access, policy prompts, or publication. |
 | Syntax-constrained mutation | Prevents a supported file from completing with parser-invalid syntax. It does not prove type correctness, name resolution, compilation, test success, runtime behavior, or security. Unsupported extensions retain ordinary executor checks. |
 | Native Rust v1 constraint | Resolves project targets, imports, and selected callable/literal shapes against one exact pinned rust-analyzer world. Only qualified exact facts may veto. Disabled build scripts/procedural macros, generated APIs, partial dependency state, deeper inference, ownership, and runtime behavior remain unknown; this is not a compilation guarantee. |
+| Native Python v1 constraint | Resolves first-party and newly generated cross-file imports plus selected promoted type shapes against one exact pinned Astral `ty`/Python 3.12/typeshed world. Create/modify/delete candidates are applied as one overlay transaction. Only complete literal contradictions and newly introduced promoted diagnostics in non-deleted transaction files may veto; generated suppressions cannot bypass the gate. Untouched dependants, `Any`, dynamic/runtime behavior, unqualified external environments, and unpromoted diagnostics remain unknown; this is not a general type-correctness guarantee. |
 
 ## Credentials
 

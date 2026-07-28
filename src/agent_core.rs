@@ -15750,8 +15750,9 @@ fn generate_and_parse_action_with_retries(
         let prompt_messages = retry_messages.as_deref().unwrap_or(messages);
         let attempt_tools = retry_tools.as_deref().unwrap_or(tools);
         // Establish immutable semantic worlds before prompt work, budget reservation, durable
-        // invocation accounting, or backend entry. Rust project loading can be slow; it is never
-        // performed from token sampling or after the model has started this invocation.
+        // invocation accounting, or backend entry. Cargo/rust-analyzer and Python project loading
+        // can be slow; neither is performed from token sampling or after the model has started this
+        // invocation. When both are reachable, the lifecycle deliberately prepares Rust first.
         let mutation_snapshot = controller_collar_snapshot(
             workspace_root,
             &gate_state.borrow(),

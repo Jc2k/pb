@@ -1114,6 +1114,7 @@ mod tests {
             .apply(SourceEvent::BeginFile {
                 path: &path,
                 language: &language,
+                mutation: pb_control_collar::mutation::MutationKind::Modify,
             })
             .unwrap();
         layer
@@ -1178,6 +1179,7 @@ mod tests {
             .apply(SourceEvent::BeginFile {
                 path: &app,
                 language: &language,
+                mutation: pb_control_collar::mutation::MutationKind::Modify,
             })
             .unwrap();
         layer
@@ -1197,6 +1199,7 @@ mod tests {
             .apply(SourceEvent::BeginFile {
                 path: &dependency,
                 language: &language,
+                mutation: pb_control_collar::mutation::MutationKind::Modify,
             })
             .unwrap();
         layer
