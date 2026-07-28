@@ -155,13 +155,16 @@ impl MutationCompletionGate {
         &self,
         checkpoint: &mut MutationCandidateCheckpoint,
     ) -> Result<(), CollarError> {
-        let refreshed_layers = match (&self.language_layers, checkpoint.layers.clone()) {
+        let restored_layers = match (&self.language_layers, checkpoint.layers.clone()) {
             (Some(layers), Some(layer_checkpoint)) => {
                 let mut layers = layers.lock().map_err(|_| {
                     CollarError::Analysis("language-layer stack lock is poisoned".to_string())
                 })?;
-                layers.rollback(layer_checkpoint)?;
-                Some(layers.checkpoint()?)
+                layers.rollback(layer_checkpoint.clone())?;
+                // Analyzer checkpoints remain valid after rollback. Reusing the candidate-batch
+                // base is essential: taking a replacement checkpoint for every sibling token
+                // grows bounded analyzer arenas once per vocabulary entry.
+                Some(layer_checkpoint)
             }
             (None, None) => None,
             _ => {
@@ -173,12 +176,12 @@ impl MutationCompletionGate {
         self.prefix_cache
             .lock()
             .map_err(|_| CollarError::Analysis("prefix cache lock is poisoned".to_string()))?
-            .restore_candidate_checkpoint(checkpoint.prefix.as_ref(), refreshed_layers.clone())?;
+            .restore_candidate_checkpoint(checkpoint.prefix.as_ref(), restored_layers.clone())?;
         self.patch_cache
             .lock()
             .map_err(|_| CollarError::Mutation("patch cache lock is poisoned".to_string()))?
-            .restore_candidate_checkpoint(checkpoint.patch.as_ref(), refreshed_layers.clone())?;
-        checkpoint.layers = refreshed_layers;
+            .restore_candidate_checkpoint(checkpoint.patch.as_ref(), restored_layers.clone())?;
+        checkpoint.layers = restored_layers;
         Ok(())
     }
 
@@ -1769,6 +1772,41 @@ mod tests {
     }
 
     #[test]
+    fn candidate_checkpoint_is_reusable_across_a_full_vocabulary_batch() {
+        let layer = MockRustLayer::with_max_checkpoints(64);
+        let stack =
+            LanguageLayerStack::new(vec![Box::new(layer)], ProgramSnapshot::default()).unwrap();
+        let gate =
+            MutationCompletionGate::with_language_layers(manifest(Vec::new()), stack).unwrap();
+        let arguments = json!({"path":"src/lib.rs"}).as_object().unwrap().clone();
+        let common = "use std::collections::";
+        assert_eq!(
+            gate.evaluate_prefix("write_file", &arguments, common),
+            CompletionDecision::Accept
+        );
+        let mut checkpoint = gate.candidate_checkpoint().unwrap();
+
+        // A real sampler probes thousands of sibling tokens from one batch base. A deliberately
+        // small arena catches accidental checkpoint refreshes without making this test expensive.
+        for _ in 0..4_097 {
+            assert_eq!(
+                gate.evaluate_prefix(
+                    "write_file",
+                    &arguments,
+                    &format!("{common}DefinitelyMissing;")
+                ),
+                CompletionDecision::Reject(RejectionCode::InvalidSemantics)
+            );
+            gate.restore_candidate_checkpoint(&mut checkpoint).unwrap();
+        }
+
+        assert_eq!(
+            gate.evaluate_prefix("write_file", &arguments, &format!("{common}BTreeMap;")),
+            CompletionDecision::Accept
+        );
+    }
+
+    #[test]
     fn language_layer_rejection_composes_with_prefix_cache_rollback() {
         let layer = MockRustLayer::new();
         let stack =
@@ -2098,10 +2136,15 @@ mod tests {
         source: Vec<u8>,
         snapshots: Vec<Vec<u8>>,
         epoch: u64,
+        max_checkpoints: usize,
     }
 
     impl MockRustLayer {
         fn new() -> Self {
+            Self::with_max_checkpoints(usize::MAX)
+        }
+
+        fn with_max_checkpoints(max_checkpoints: usize) -> Self {
             let world = SemanticWorldId {
                 provider: "mock-rust".to_string(),
                 provider_version: "v1".to_string(),
@@ -2127,6 +2170,7 @@ mod tests {
                 source: Vec::new(),
                 snapshots: Vec::new(),
                 epoch: 0,
+                max_checkpoints,
             }
         }
 
@@ -2178,6 +2222,12 @@ mod tests {
         }
 
         fn checkpoint(&mut self) -> CollarResult<AnalyzerCheckpoint> {
+            if self.snapshots.len() >= self.max_checkpoints {
+                return Err(CollarError::Analysis(format!(
+                    "mock stream exceeds the {}-checkpoint limit",
+                    self.max_checkpoints
+                )));
+            }
             self.snapshots.push(self.source.clone());
             Ok(AnalyzerCheckpoint {
                 epoch: self.epoch,
