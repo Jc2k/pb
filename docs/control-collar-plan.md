@@ -13,8 +13,9 @@ Current implementation ledger:
   and retain bounded candidate-branch checkpoints. Incremental Tree-sitter edits/checkpoints and
   chunk-independent canonical patch validation share the same oracle; partial hunk additions and
   context are probed before their newline. Qwen and DeepSeek real-tokenizer split/rollback/chunk
-  qualification passes the 1 ms p95 budget. The claim remains conservative prefix safety, not exact
-  grammar extendability; longer fuzzing and refreshed end-to-end throughput evidence remain.
+  qualification passes the 1 ms p95 budget, including 4,096 deterministic chunk seeds per case.
+  The claim remains conservative prefix safety, not exact grammar extendability; outer logical-
+  prefix profiling and refreshed end-to-end throughput evidence remain.
 - **Native Rust layer implemented:** `pb-control-rust` directly embeds pinned rust-analyzer crates.
   It loads one project-wide Salsa/HIR world from a verified immutable shadow before an inference
   that can edit Rust, primes local/dependency scopes, selects the exact Cargo target for existing
@@ -1102,8 +1103,8 @@ workspace, not an earlier phase branch.
 | Production asset/release build | Passed | On 2026-07-28, web assets and the optimized macOS arm64 release binary rebuilt successfully |
 | Required FlashMoe one-token smoke | Quality gate failed | On 2026-07-28, the rebuilt release binary again exited zero but printed `5` for `2+2=`; token `4` was second by 0.320473 logit. The repository gate requires a sensible answer, so promotion remains blocked. Existing upstream-parity evidence classifies this as checkpoint/model quality rather than a collar failure, and no output correction is permitted |
 | Phase 6–8 foundation integration | Passed | Conservative prefix and patch-stream tests, Qwen and DeepSeek payload-close semantic rejection, exact monotonic fake-LSP overlays and diagnostic debt, llama.cpp full-vocabulary pre-top-k masking, shared event compatibility, workspace check, and strict Clippy all pass |
-| Phase 6 Qwen/DeepSeek tokenizer-prefix qualification | Passed | Corpus SHA-256 `1b4568f8…9215`; Qwen tokenizer `be756060…5506` ran 173 token-prefix/rollback probes and DeepSeek JoyAI tokenizer `263ab7b3…f3ba` ran 180; each replayed 704 deterministic chunkings and measured 1 µs p95 against the 1,000 µs budget |
-| Phase 6 remaining promotion evidence | Pending | Scheduled long fuzz/property runs, outer Qwen/DSML logical-prefix extraction profiling, and refreshed pinned end-to-end write/patch throughput still gate promotion beyond the implemented conservative rules |
+| Phase 6 Qwen/DeepSeek tokenizer-prefix qualification | Passed high-replay profile | Corpus SHA-256 `1b4568f8…9215`; Qwen tokenizer `be756060…5506` ran 173 token-prefix/rollback probes and DeepSeek JoyAI tokenizer `263ab7b3…f3ba` ran 180. Each replayed 4,096 deterministic chunk seeds for every one of 11 cases (45,056 replays per tokenizer). Both measured 1 µs p95 against the 1,000 µs budget; maximum probes were 3 µs for Qwen and 25 µs for DeepSeek |
+| Phase 6 remaining promotion evidence | Pending | Outer Qwen/DSML logical-prefix extraction profiling, additional property/fuzz corpora beyond deterministic chunk boundaries, and refreshed pinned end-to-end write/patch throughput still gate promotion beyond the implemented conservative rules |
 | Phase 7 shadow/evidence foundation | Passed | Semantic analysis uses a fresh exact bounded shadow tree and isolated LSP session for each transaction, rejects symlinks and post-copy drift, permits only an LSP-specific read-only analysis-root mount, and emits independently validated content-free generation and final-executor receipts |
 | Phase 7 legacy pinned Rust LSP attempt | Failed safely (historical) | `ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b26526…173d` (rust-analyzer 1.96.0) never produced a non-empty crate graph or document membership within the required barrier; this is why incomplete-code LSP diagnostics were not adopted as the streaming architecture |
 | Phase 7 native Rust implementation | Passed focused implementation gates | Exact-pinned rust-analyzer 0.0.344 loads one offline project world; 8 crate tests cover dependency/sysroot shape certainty, invalid import/type steering, target selection, cross-file rollback, identity/staleness, active-request refresh exclusion, and zero-load source refresh. The root lifecycle test covers cold preparation, warm reuse, independent invalid/valid final replay, in-memory source refresh, cross-stage process-cache reuse, and exact non-Rust target bypass |

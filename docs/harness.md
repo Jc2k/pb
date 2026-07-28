@@ -573,8 +573,10 @@ Reproducible Python create and patch examples are checked in under `fixtures/con
 `pb harness collar-qualify` is the model-free promotion surface for the source-prefix layer. It
 loads the exact tokenizer and tokenizer-configuration artifacts selected by `--model`, replays the
 versioned `fixtures/control-collar/prefix-language-v1.json` corpus at every real token boundary,
-checks prefix-monotonic decoding, rollback equivalence, 64 deterministic random chunkings per case,
-and the final expected validity/rule. It prints only artifact digests, counts, and p50/p95/p99/max
+checks prefix-monotonic decoding, rollback equivalence, deterministic random chunkings per case,
+and the final expected validity/rule. `--random-chunk-replays` defaults to 64 and is bounded to
+65,536 per case so scheduled high-replay qualification remains explicit and finite. It prints only
+artifact digests, counts, and p50/p95/p99/max
 probe timings, and fails when p95 exceeds `--latency-budget-micros` (1,000 microseconds by default).
 The command does not load model weights, read a workspace, enable a production feature, or persist
 source. Run it separately for every tokenizer profile being promoted; live `infer --tool-fixture`

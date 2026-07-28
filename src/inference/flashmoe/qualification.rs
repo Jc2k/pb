@@ -15,6 +15,7 @@ const MAX_PREFIX_CORPUS_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREFIX_CASES: usize = 512;
 const MAX_TOKENIZER_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOKENIZER_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RANDOM_CHUNK_REPLAYS_PER_CASE: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +51,7 @@ pub struct PrefixQualificationReport {
     pub tokenizer_tokens: usize,
     pub token_prefix_probes: usize,
     pub rollback_probes: usize,
+    pub random_chunk_replays_per_case: usize,
     pub random_chunk_replays: usize,
     pub probe_p50_micros: u64,
     pub probe_p95_micros: u64,
@@ -63,9 +65,15 @@ pub fn qualify_prefix_tokenizer(
     plan: &FlashMoePlan,
     corpus_path: &Path,
     latency_budget_micros: u64,
+    random_chunk_replays_per_case: usize,
 ) -> Result<PrefixQualificationReport> {
     if latency_budget_micros == 0 {
         bail!("prefix qualification latency budget must be non-zero");
+    }
+    if !(1..=MAX_RANDOM_CHUNK_REPLAYS_PER_CASE).contains(&random_chunk_replays_per_case) {
+        bail!(
+            "prefix qualification random chunk replays must be in 1..={MAX_RANDOM_CHUNK_REPLAYS_PER_CASE} per case"
+        );
     }
     let corpus_bytes = read_bounded(corpus_path, MAX_PREFIX_CORPUS_BYTES, "prefix corpus")?;
     let corpus: PrefixCorpus = serde_json::from_slice(&corpus_bytes)
@@ -191,7 +199,7 @@ pub fn qualify_prefix_tokenizer(
             _ => {}
         }
 
-        for seed in 1usize..=64 {
+        for seed in 1usize..=random_chunk_replays_per_case {
             let mut chunked = SourcePrefixOracle::new(path.clone(), source.len().max(1))?;
             let mut state = seed;
             let mut cursor = 0usize;
@@ -237,6 +245,7 @@ pub fn qualify_prefix_tokenizer(
         tokenizer_tokens,
         token_prefix_probes,
         rollback_probes,
+        random_chunk_replays_per_case,
         random_chunk_replays,
         probe_p50_micros: percentile_micros(50),
         probe_p95_micros: p95,

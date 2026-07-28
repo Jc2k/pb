@@ -508,6 +508,10 @@ pub struct HarnessCollarQualifyArgs {
     /// Maximum accepted p95 CPU time for one real-token logical-prefix probe
     #[arg(long, default_value_t = 1_000)]
     pub latency_budget_micros: u64,
+
+    /// Deterministic byte-chunk replay seeds applied independently to every corpus case
+    #[arg(long, default_value_t = 64)]
+    pub random_chunk_replays: usize,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2555,6 +2559,7 @@ fn run_collar_qualification(args: HarnessCollarQualifyArgs) -> Result<()> {
         &plan,
         &args.corpus,
         args.latency_budget_micros,
+        args.random_chunk_replays,
     )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -5432,6 +5437,8 @@ mod tests {
             "corpus.json",
             "--latency-budget-micros",
             "750",
+            "--random-chunk-replays",
+            "4096",
         ])
         .unwrap();
         let Commands::Harness {
@@ -5444,6 +5451,7 @@ mod tests {
         assert_eq!(args.model_dir, Some(PathBuf::from("/models")));
         assert_eq!(args.corpus, PathBuf::from("corpus.json"));
         assert_eq!(args.latency_budget_micros, 750);
+        assert_eq!(args.random_chunk_replays, 4096);
     }
 
     #[test]
