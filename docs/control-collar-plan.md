@@ -41,8 +41,10 @@ Current implementation ledger:
   and its in-progress diagnostic codes are not used as token-time truth.
 - **Phase 8 adapter implemented:** llama.cpp now masks the full vocabulary before sampling
   truncation, accepts sampler state once, reuses both tool dialects and the shared executor, and
-  reports the same guarantee/rejection fields. Pinned live model/tokenizer/template differential
-  qualification remains before any broad backend-parity claim.
+  reports the same guarantee/rejection fields. Fresh and cached Qwen requests also complete only a
+  missing deterministic parser-envelope suffix after semantic termination. One pinned Qwen profile
+  has crossed constrained planning and review; write/patch/malformed/truncation and differential
+  qualification remain before any broad backend-parity claim.
 - **Phase 9 capability only:** both backends explicitly report `candidate_probe_only`. The replay
   and snapshot variants exist as typed future capability names but are not implemented or inferred
   from session caches.
@@ -1093,9 +1095,9 @@ workspace, not an earlier phase branch.
 | DeepSeek DSML renderer/parser corpus | Passed | 3 focused root tests plus 3 collar DSML tests for typed parameters, ordered JSON-string mutation history, closure boundaries, and exact scalar paths |
 | Workspace format/check/Clippy | Passed | `cargo fmt --all -- --check`, `cargo check --workspace --all-targets -j 1`, and the repository warning/correctness Clippy gate |
 | Executor and event focused tests | Passed | Snapshot freshness, exact patch/Git differential result, inexact hunk rejection, and additive/backward-compatible event round trip |
-| Workspace all-target tests | Passed | On 2026-07-28, 1,473 root tests passed with 24 device/environment/qualification tests ignored, 2 environment-contract tests passed, all 61 collar tests passed, and all 8 native Rust tests passed |
+| Workspace all-target tests | Passed | On 2026-07-28, 1,474 root tests passed with 24 device/environment/qualification tests ignored, 2 environment-contract tests passed, all 61 collar tests passed, and all 8 native Rust tests passed |
 | Web and documentation tests | Passed | 76 web tests passed; mdBook and link validation checked 59 pages and 98 rendered files |
-| Production asset/release build | Passed | On 2026-07-27, web assets and the optimized macOS arm64 release binary rebuilt successfully |
+| Production asset/release build | Passed | On 2026-07-28, web assets and the optimized macOS arm64 release binary rebuilt successfully |
 | Required FlashMoe one-token smoke | Quality gate failed | On 2026-07-28, the rebuilt release binary again exited zero but printed `5` for `2+2=`; token `4` was second by 0.320473 logit. The repository gate requires a sensible answer, so promotion remains blocked. Existing upstream-parity evidence classifies this as checkpoint/model quality rather than a collar failure, and no output correction is permitted |
 | Phase 6–8 foundation integration | Passed | Conservative prefix and patch-stream tests, Qwen and DeepSeek payload-close semantic rejection, exact monotonic fake-LSP overlays and diagnostic debt, llama.cpp full-vocabulary pre-top-k masking, shared event compatibility, workspace check, and strict Clippy all pass |
 | Phase 6 Qwen/DeepSeek tokenizer-prefix qualification | Passed | Corpus SHA-256 `1b4568f8…9215`; Qwen tokenizer `be756060…5506` ran 173 token-prefix/rollback probes and DeepSeek JoyAI tokenizer `263ab7b3…f3ba` ran 180; each replayed 704 deterministic chunkings and measured 1 µs p95 against the 1,000 µs budget |
@@ -1109,7 +1111,7 @@ workspace, not an earlier phase branch.
 | Current live write/patch fixtures | Passed | On 2026-07-28, the rebuilt release binary compiled the checked-in Qwen fixture containing exact path `const`, generated exactly `answer.py` with valid Python after 21 rejected candidates, and generated the exact snapshot-valid canonical one-line patch after 20 rejected candidates and one invalid-argument closure rejection |
 | Phase 7 native Rust production qualification | Partially passed; promotion blocked | Focused implementation, strict workspace gates, representative cold/warm/replay measurement, one current end-to-end Rust edit, and current live write/patch generation pass. The required FlashMoe arithmetic smoke is currently nonsensical; representative large projects, cancellation, sustained concurrency/memory, and longer randomized rollback corpora still gate promotion beyond the narrow shipped v1 claim |
 | Phase 7 deeper/later language profiles | Pending | Rust macro/build-script/compiler parity, `pb-control-python`/Astral `ty`, and `pb-control-typescript` project matrices ship independently after their own soundness, lifecycle, multi-file, dependency, cancellation, latency, and final-replay evidence |
-| Phase 8 live llama.cpp profiles | Pending | Pinned model/tokenizer/template write/patch/malformed/truncation and FlashMoe differential runs still gate a backend-parity claim |
+| Phase 8 live llama.cpp profiles | Partially passed | Preserved Qwen2.5-Coder-7B GGUF run `1785224314409-33712-0` exposed a backend defect: the collar reported `complete_terminal_tool_call`, but llama.cpp returned the completed JSON body without the required parser envelope close, so the shared parser rejected it. After the exact-suffix fix, identical run `1785225019481-34844-0` accepted constrained `submit_plan` and `submit_plan_review` through fresh and cached sessions. It later failed safely at the step limit after the model twice omitted `write_file.completion.id`; no fixture mutation occurred. Pinned write/patch/malformed/truncation, DeepSeek-dialect, performance, and FlashMoe differential runs still gate a backend-parity claim |
 | Pinned DeepSeek direct mutation qualification | Passed | The checked-in `fixtures/control-collar/` inputs produced syntax-valid `answer.py` after 2 candidate rejections and an exact snapshot-bound one-line patch after 8, reporting 1 file and 16 snapshot bytes; an alternate capped patch attempt reported 7 `invalid_patch` closure rejections and executed no call |
 | Pinned DeepSeek strict workflow | Passed | An 11-invocation delivery crossed tool-schema narrowing, reused unchanged exact roots, cold-started changed roots, executed constrained `write_file`, passed review, and ended `contract_status=satisfied`, `verified_completed=true` |
 | DeepSeek candidate-probe budget | Passed | On the same patch prompt and pinned checkpoint, current-release constrained decode sustained 7.678 tokens/s versus 9.358 tokens/s unconstrained, a 18.0% reduction within the accepted 25% qualification ceiling |
@@ -1210,7 +1212,9 @@ their syntax claim until a separately scoped semantic provider is justified.
   once before decoding it into the context.
 - **8C — Share the production mutation path.** Construct the same manifest/snapshots, reuse Qwen and
   DSML dialect implementations, stop semantically on complete calls, and execute prepared writes and
-  canonical patches through the same revalidation path. Once a model/template profile is qualified,
+  canonical patches through the same revalidation path. If semantic termination leaves a Qwen
+  envelope close wholly or partially un-emitted, append only that deterministic suffix before the
+  shared parser; never repair JSON or tool arguments. Once a model/template profile is qualified,
   remove its access to the broader `--recount` compatibility behavior and never fall back after a
   collar rejection.
 - **8D — Differentially qualify profiles.** Replay identical vocabulary surfaces and transcripts

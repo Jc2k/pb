@@ -396,7 +396,7 @@ impl NativeToolConstraint {
         self.payload_limit_stop.take()
     }
 
-    fn unclosed_tool_call_close_remainder(&self, decoded: &str) -> Option<String> {
+    pub(crate) fn unclosed_tool_call_close_remainder(&self, decoded: &str) -> Option<String> {
         let open = decoded.rfind(TOOL_CALL_OPEN)?;
         let body = &decoded[open + TOOL_CALL_OPEN.len()..];
         if body.contains(TOOL_CALL_CLOSE) {

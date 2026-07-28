@@ -287,7 +287,10 @@ guarantee rung, semantic outcome/timing counts, and decode-recovery capability w
 path content. Strict JSON artifacts use the shared LLGuidance contract. llama.cpp now builds an
 exact ordinary/control/EOG vocabulary surface, applies the same Qwen or DeepSeek collar over its
 full candidate array before top-k/temperature/distribution sampling, accepts the selected token into
-stateful samplers exactly once, and uses the same prepared mutation/executor path. Live
+stateful samplers exactly once, and uses the same prepared mutation/executor path. When semantic
+termination occurs after a complete terminal Qwen JSON body, both fresh and cached llama.cpp paths
+append only the deterministic missing `</tool_call>` suffix before handing the transcript to the
+shared parser; malformed or incomplete JSON is never repaired. Live
 model/tokenizer/template qualification remains profile-specific; unsupported profiles must not be
 described as parity-qualified.
 Constraint-valid non-EOS candidates must increase the visible decoded prefix. When an open

@@ -441,6 +441,9 @@ impl LlamaCppBackend {
         let tool_constraints = tool_constraint
             .as_ref()
             .map(|constraint| constraint.stats(&constrained_transcript));
+        if let Some(constraint) = tool_constraint.as_ref() {
+            constraint.complete_parser_envelope(&mut output)?;
+        }
         Ok(Output {
             content: output,
             finish_reason,
@@ -865,6 +868,9 @@ impl LlamaCppChatSession<'_> {
         let tool_constraints = tool_constraint
             .as_ref()
             .map(|constraint| constraint.stats(&constrained_transcript));
+        if let Some(constraint) = tool_constraint.as_ref() {
+            constraint.complete_parser_envelope(&mut output)?;
+        }
         Ok(Output {
             content: output,
             finish_reason,
@@ -1374,6 +1380,26 @@ impl LlamaToolConstraint {
         }
     }
 
+    /// A terminal Qwen call may stop as soon as its JSON body is complete. The collar deliberately
+    /// treats a missing or partially emitted closing marker as a valid semantic stop, but the
+    /// shared action parser still consumes the canonical wire envelope. Complete only that
+    /// deterministic suffix after sampling; never repair or synthesize arguments.
+    fn complete_parser_envelope(&self, output: &mut String) -> Result<()> {
+        let Self::Qwen(constraint) = self else {
+            return Ok(());
+        };
+        if !constraint.transcript_has_complete_terminal_call(output) {
+            return Ok(());
+        }
+        if let Some(remainder) = constraint.unclosed_tool_call_close_remainder(output) {
+            output.push_str(&remainder);
+        }
+        if !output.contains("</tool_call>") {
+            bail!("llama.cpp terminal Qwen call could not be completed for the shared parser");
+        }
+        Ok(())
+    }
+
     fn stats(&self, transcript: &[u8]) -> crate::inference::flashmoe::NativeToolConstraintStats {
         match self {
             Self::Qwen(constraint) => constraint
@@ -1846,6 +1872,57 @@ mod tests {
         std::fs::write(&projector, b"GGUF projector").unwrap();
 
         assert_eq!(find_multimodal_projector(&model).unwrap(), projector);
+    }
+
+    #[test]
+    fn llama_terminal_qwen_body_receives_only_the_missing_parser_close() {
+        let request = LlamaCppChatRequest {
+            messages: json!([]),
+            tools: json!([{
+                "type":"function",
+                "function":{
+                    "name":"submit_plan",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"id":{"type":"string"}},
+                        "required":["id"],
+                        "additionalProperties":false
+                    }
+                }
+            }]),
+            stage_root: None,
+            json_schema: None,
+            tool_constraint_mode:
+                crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired,
+            terminal_tool_names: vec!["submit_plan".to_string()],
+            mutation_snapshot: None,
+            language_layers: None,
+            semantic_boundary: None,
+            ctx_size: 128,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            max_tokens: 16,
+            top_k: 1,
+            temperature: 0.0,
+            seed: 1,
+        };
+        let constraint = LlamaToolConstraint::compile("<tool_call>", &request)
+            .unwrap()
+            .unwrap();
+        let body = "<tool_call>{\"name\":\"submit_plan\",\"arguments\":{\"id\":\"plan-1\"}}";
+        assert!(constraint.complete_terminal_call(body.as_bytes()));
+
+        for (suffix, expected) in [
+            ("", "</tool_call>"),
+            ("\n", "\n</tool_call>"),
+            ("</tool", "</tool_call>"),
+            ("</tool_call>", "</tool_call>"),
+        ] {
+            let mut output = format!("{body}{suffix}");
+            constraint.complete_parser_envelope(&mut output).unwrap();
+            assert_eq!(output, format!("{body}{expected}"));
+        }
     }
 
     #[test]

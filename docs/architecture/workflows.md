@@ -637,12 +637,13 @@ constraints. The supported scalar subset includes exact `const` values as well a
 dialects reject a non-matching value while it is generated, and preflight rejects contradictory
 `const`/`enum` declarations. Object and array `const` remain unsupported by native tool constraints.
 The controller also identifies an exposed stage-submission tool as terminal. Once its constrained
-JSON body is complete, native generation stops semantically; pb supplies a missing Qwen envelope
-close only to the structured parser. Ordinary tools remain batchable, so this is not a one-call-per-
-prompt policy. At constrained structural frontiers pb deterministically emits a unique validated
-closing suffix, requires every non-EOS token to increase decoded length, and blocks a repeated
-32-token continuation. A file-content string that reaches its declared limit while still open is
-instead returned as a truncated named mutation, making it eligible for compact recovery rather
+JSON body is complete, native generation stops semantically; FlashMoe and both fresh and cached
+llama.cpp requests supply the exact missing Qwen envelope close only to the structured parser.
+They never synthesize or repair the JSON body. Ordinary tools remain batchable, so this is not a
+one-call-per-prompt policy. At constrained structural frontiers pb deterministically emits a unique
+validated closing suffix, requires every non-EOS token to increase decoded length, and blocks a
+repeated 32-token continuation. A file-content string that reaches its declared limit while still
+open is instead returned as a truncated named mutation, making it eligible for compact recovery rather
 than force-closing and executing a cut-off file. Escaped string prefixes are measured after JSON
 decoding, so schema `maxLength`
 remains authoritative. These guards only select output accepted by the compiled schema; the normal
