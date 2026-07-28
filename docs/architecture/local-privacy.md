@@ -63,9 +63,11 @@ The controller copies the exact repository snapshot to an ephemeral verified sha
 `pb-control-rust` runs pinned rust-analyzer internals in the pb process, invokes Cargo metadata with
 `--offline`, starts no procedural-macro server, and does not run build scripts. It may read already
 installed sysroot and dependency source caches, but it adds no network edge and sends no dependency
-or repository source to the model. Exact warmed worlds are retained only in bounded process memory,
-either by an active request, registered exact-flight handoff, or the small process cache; request
-snapshots and candidate branches are in-memory leases. Shadows are temporary and durable
+or repository source to the model. Exact profiles copy the already loaded graph and VFS inputs into
+a second independently writable in-process database for finished-overlay checks; no extra live or
+network read is introduced. Exact warmed worlds are retained only in bounded process memory, either
+by an active request, registered exact-flight handoff, or the small process cache; request snapshots
+and candidate branches are in-memory leases. Shadows are temporary and durable
 events contain only identities, readiness/decision classes, counts, and timings. A cancelled
 request may leave its already-started cold analyzer worker running locally until that exact build
 finishes; at most one such cold worker runs process-wide, and its shadow/world is then dropped,

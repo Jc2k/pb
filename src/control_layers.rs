@@ -3763,6 +3763,21 @@ mod tests {
                     "replace_file",
                     &json!({
                         "path": "src/lib.rs",
+                        "content": "pub fn value() -> i32 { \"wrong\" }\n"
+                    }),
+                )
+                .unwrap(),
+            CompletionDecision::Reject(pb_control_collar::RejectionCode::InvalidSemantics)
+        );
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&rust_tool),
+                    &snapshot,
+                    "replace_file",
+                    &json!({
+                        "path": "src/lib.rs",
                         "content": "use std::collections::BTreeMap;\npub fn value() -> i32 { BTreeMap::<i32, i32>::new().len() as i32 }\n"
                     }),
                 )

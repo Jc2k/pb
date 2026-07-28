@@ -27,6 +27,7 @@ pub struct RustWorkspaceStreamingLayer {
     // One append-only stream per target/path keeps rollback checkpoints source-length-only. This
     // avoids copying a large known file once per accepted token when a patch edits near its tail.
     layers: Vec<(ra_ap_hir::Crate, LogicalPath, Box<RustStreamingLayer>)>,
+    has_unknown_candidate: bool,
     snapshots: Vec<WorkspaceStateSnapshot>,
     epoch: u64,
     max_source_bytes: usize,
@@ -45,6 +46,7 @@ struct WorkspaceStateSnapshot {
     active: WorkspaceActive,
     layer_checkpoints: Vec<AnalyzerCheckpoint>,
     layer_count: usize,
+    has_unknown_candidate: bool,
     last_analysis: Analysis,
 }
 
@@ -63,6 +65,7 @@ impl RustWorkspaceStreamingLayer {
             project,
             active: WorkspaceActive::None,
             layers: Vec::new(),
+            has_unknown_candidate: false,
             snapshots: Vec::new(),
             epoch: 0,
             max_source_bytes,
@@ -79,6 +82,7 @@ impl RustWorkspaceStreamingLayer {
     ) -> CollarResult<Analysis> {
         let Some(target) = self.project.target_for_path(path) else {
             self.active = WorkspaceActive::Unknown;
+            self.has_unknown_candidate = true;
             self.last_analysis = unknown_target_analysis(AnalysisBoundary::File);
             return Ok(self.last_analysis.clone());
         };
@@ -141,6 +145,7 @@ impl IncrementalAnalyzer for RustWorkspaceStreamingLayer {
         }
         self.active = WorkspaceActive::None;
         self.layers.clear();
+        self.has_unknown_candidate = false;
         self.snapshots.clear();
         self.epoch = self.epoch.wrapping_add(1);
         self.last_analysis = repairable_analysis();
@@ -162,6 +167,7 @@ impl IncrementalAnalyzer for RustWorkspaceStreamingLayer {
         self.snapshots.push(WorkspaceStateSnapshot {
             active: self.active,
             layer_count: self.layers.len(),
+            has_unknown_candidate: self.has_unknown_candidate,
             layer_checkpoints,
             last_analysis: self.last_analysis.clone(),
         });
@@ -228,6 +234,7 @@ impl IncrementalAnalyzer for RustWorkspaceStreamingLayer {
         let layer_count = snapshot.layer_count;
         let layer_checkpoints = snapshot.layer_checkpoints.clone();
         let last_analysis = snapshot.last_analysis.clone();
+        let has_unknown_candidate = snapshot.has_unknown_candidate;
         if layer_count > self.layers.len() || layer_checkpoints.len() != layer_count {
             return Err(CollarError::Analysis(
                 "Rust workspace checkpoint has an invalid target-layer count".to_string(),
@@ -243,13 +250,14 @@ impl IncrementalAnalyzer for RustWorkspaceStreamingLayer {
         }
         self.layers.truncate(layer_count);
         self.active = active;
+        self.has_unknown_candidate = has_unknown_candidate;
         self.last_analysis = last_analysis;
         self.snapshots.truncate(revision.saturating_add(1));
         Ok(())
     }
 
     fn finalize(&mut self) -> CollarResult<Analysis> {
-        let analysis = match self.active {
+        let shallow = match self.active {
             WorkspaceActive::Target(index) => self
                 .layers
                 .get_mut(index)
@@ -261,8 +269,77 @@ impl IncrementalAnalyzer for RustWorkspaceStreamingLayer {
             WorkspaceActive::Unknown => unknown_target_analysis(AnalysisBoundary::ToolCall),
             WorkspaceActive::None => repairable_analysis(),
         };
+        let analysis = Analysis::compose([shallow, self.deep_closure_analysis()]);
         self.last_analysis = analysis.clone();
         Ok(analysis)
+    }
+}
+
+impl RustWorkspaceStreamingLayer {
+    fn deep_closure_analysis(&self) -> Analysis {
+        if self.has_unknown_candidate {
+            return deep_unknown_analysis(std::iter::once(
+                crate::RustDeepUnknownReason::SourceTopologyChanged,
+            ));
+        }
+        if let crate::RustDeepProfile::Partial(reasons) = self.project.deep_profile() {
+            return deep_unknown_analysis(reasons.iter().copied());
+        }
+        let mut candidates = Vec::with_capacity(self.layers.len());
+        for (_, _, layer) in &self.layers {
+            let Some((path, mutation, source)) = layer.completed_candidate() else {
+                return deep_unknown_analysis(std::iter::once(
+                    crate::RustDeepUnknownReason::SourceTopologyChanged,
+                ));
+            };
+            if mutation != MutationKind::Modify {
+                return deep_unknown_analysis(std::iter::once(
+                    crate::RustDeepUnknownReason::SourceTopologyChanged,
+                ));
+            }
+            candidates.push((path.clone(), source.to_vec()));
+        }
+        if candidates.is_empty() {
+            return repairable_analysis();
+        }
+        match self.project.deep_diagnostic_delta(&candidates) {
+            Ok(diagnostics) if diagnostics.is_empty() => Analysis {
+                viability: Viability::Valid,
+                closure: ClosureVerdict::Allow,
+                obligations: Vec::new(),
+                biases: Vec::new(),
+            },
+            Ok(diagnostics) => Analysis {
+                viability: Viability::Impossible,
+                closure: ClosureVerdict::Reject,
+                obligations: diagnostics
+                    .into_iter()
+                    .map(|diagnostic| SemanticObligation {
+                        kind: diagnostic.obligation().to_string(),
+                        boundary: AnalysisBoundary::ToolCall,
+                    })
+                    .collect(),
+                biases: Vec::new(),
+            },
+            Err(reason) => deep_unknown_analysis(std::iter::once(reason)),
+        }
+    }
+}
+
+fn deep_unknown_analysis(
+    reasons: impl IntoIterator<Item = crate::RustDeepUnknownReason>,
+) -> Analysis {
+    Analysis {
+        viability: Viability::Unknown,
+        closure: ClosureVerdict::Defer,
+        obligations: reasons
+            .into_iter()
+            .map(|reason| SemanticObligation {
+                kind: reason.obligation().to_string(),
+                boundary: AnalysisBoundary::ToolCall,
+            })
+            .collect(),
+        biases: Vec::new(),
     }
 }
 
@@ -308,12 +385,14 @@ impl RustStreamingLayer {
         })
     }
 
-    fn begin_file(&mut self, path: &LogicalPath) -> CollarResult<Analysis> {
+    fn begin_file(&mut self, path: &LogicalPath, mutation: MutationKind) -> CollarResult<Analysis> {
         let tree = self.parser.parse(&[] as &[u8], None).ok_or_else(|| {
             CollarError::Analysis("pinned Rust parser returned no initial tree".to_string())
         })?;
         self.active = Some(RustFileState {
             path: path.clone(),
+            mutation,
+            ended: false,
             source: Vec::new(),
             generated_ranges: Vec::new(),
             generated_points: Vec::new(),
@@ -326,6 +405,13 @@ impl RustStreamingLayer {
         });
         self.last_analysis = repairable_analysis();
         Ok(self.last_analysis.clone())
+    }
+
+    fn completed_candidate(&self) -> Option<(&LogicalPath, MutationKind, &[u8])> {
+        let state = self.active.as_ref()?;
+        state
+            .ended
+            .then_some((&state.path, state.mutation, state.source.as_slice()))
     }
 
     fn push_bytes(&mut self, origin: SourceOrigin, bytes: &[u8]) -> CollarResult<Analysis> {
@@ -500,14 +586,14 @@ impl IncrementalAnalyzer for RustStreamingLayer {
             SourceEvent::BeginFile {
                 path,
                 language,
-                mutation: _,
+                mutation,
             } => {
                 if language != &self.descriptor().language {
                     return Err(CollarError::Analysis(
                         "Rust layer received a non-Rust file".to_string(),
                     ));
                 }
-                self.begin_file(path)
+                self.begin_file(path, mutation)
             }
             SourceEvent::Bytes { origin, bytes } => self.push_bytes(origin, bytes),
             SourceEvent::DeleteKnownBytes(bytes) => {
@@ -522,7 +608,18 @@ impl IncrementalAnalyzer for RustStreamingLayer {
                 Ok(self.last_analysis.clone())
             }
             SourceEvent::Boundary(boundary) => self.analyze_boundary(boundary),
-            SourceEvent::EndFile => self.analyze_boundary(AnalysisBoundary::File),
+            SourceEvent::EndFile => {
+                let analysis = self.analyze_boundary(AnalysisBoundary::File)?;
+                self.active
+                    .as_mut()
+                    .ok_or_else(|| {
+                        CollarError::Analysis(
+                            "Rust EndFile arrived without an active file".to_string(),
+                        )
+                    })?
+                    .ended = true;
+                Ok(analysis)
+            }
         }
     }
 
@@ -560,6 +657,8 @@ impl IncrementalAnalyzer for RustStreamingLayer {
 struct RustFileState {
     #[allow(dead_code)]
     path: LogicalPath,
+    mutation: MutationKind,
+    ended: bool,
     source: Vec<u8>,
     generated_ranges: Vec<(usize, usize)>,
     generated_points: Vec<usize>,
@@ -575,6 +674,8 @@ impl RustFileState {
     fn snapshot(&self) -> RustFileSnapshot {
         RustFileSnapshot {
             path: self.path.clone(),
+            mutation: self.mutation,
+            ended: self.ended,
             source_len: self.source.len(),
             generated_ranges: self.generated_ranges.clone(),
             generated_points: self.generated_points.clone(),
@@ -588,12 +689,16 @@ impl RustFileState {
     }
 
     fn restore(&mut self, snapshot: &RustFileSnapshot) -> CollarResult<()> {
-        if self.path != snapshot.path || snapshot.source_len > self.source.len() {
+        if self.path != snapshot.path
+            || self.mutation != snapshot.mutation
+            || snapshot.source_len > self.source.len()
+        {
             return Err(CollarError::Analysis(
                 "Rust checkpoint does not match the active append-only source".to_string(),
             ));
         }
         self.source.truncate(snapshot.source_len);
+        self.ended = snapshot.ended;
         self.generated_ranges.clone_from(&snapshot.generated_ranges);
         self.generated_points.clone_from(&snapshot.generated_points);
         self.tree = snapshot.tree.clone();
@@ -648,6 +753,8 @@ impl RustFileState {
 
 struct RustFileSnapshot {
     path: LogicalPath,
+    mutation: MutationKind,
+    ended: bool,
     // Source bytes remain in the owning append-only stream. Descendant candidate branches can be
     // rolled back by truncation because the checkpoint cache discards non-ancestor branches.
     source_len: usize,
@@ -738,6 +845,28 @@ fn collect_complete_uses(
         pending.push(ParsedUse { range, paths });
     });
     pending
+}
+
+pub(crate) fn complete_use_paths(source: &[u8]) -> Result<Vec<Vec<String>>, ()> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|_| ())?;
+    let tree = parser.parse(source, None).ok_or(())?;
+    if tree.root_node().has_error() {
+        return Err(());
+    }
+    let parsed = collect_complete_uses(&tree, source, &[(0, source.len())], &[], &BTreeSet::new());
+    parsed
+        .into_iter()
+        .flat_map(|parsed| match parsed.paths {
+            Ok(paths) => paths
+                .into_iter()
+                .map(|path| Ok(path.segments))
+                .collect::<Vec<_>>(),
+            Err(()) => vec![Err(())],
+        })
+        .collect()
 }
 
 fn visit_nodes(node: Node<'_>, visit: &mut impl FnMut(Node<'_>)) {

@@ -59,8 +59,13 @@ read. `apply_patch` uses exact hunk offsets, counts, and context and accepts onl
 patch form; stale, recount-dependent, rename/copy, mode-changing, timestamped, quoted-path, binary,
 or syntax-breaking patches fail without falling back to a looser parser. For real local backends,
 Rust and Python additionally have narrow native semantic layers prepared before inference and
-replayed before execution. Rust can veto only its promoted exact import/call/literal
-contradictions. Python applies all candidate files—including deletions—as one overlay and can veto
+replayed before execution. Rust keeps project-local facts repairable while output is streaming,
+then overlays every completed modification to an already indexed `.rs` file in one independently
+writable rust-analyzer database. In projects without build scripts or procedural macros, it can
+veto newly increased debt for its promoted name/import, field/method, privacy, call/type, mutability,
+moved-from-reference, and trait-bound diagnostics. New/deleted Rust files, unsupported relative
+import contexts, and partial project profiles stay open rather than being rejected. Python applies
+all candidate files—including deletions—as one overlay and can veto
 complete generated string-plus-integer literal additions and selected newly introduced pinned-`ty`
 diagnostics across the frozen first-party project, including untouched in-project dependants of a
 changed or deleted symbol. Before inference, one unambiguous safe project-local `.venv`/`venv` is
@@ -71,7 +76,8 @@ can participate only through user-owned, canonical-workspace-bound configuration
 cannot grant that read. pb never runs the environment's interpreter. Ambiguous, undeclared,
 symlinked, native, or hook-bearing environment facts remain partial, and an unqualified missing
 external import stays open. `Any`, dynamic/runtime behavior,
-dependants outside the frozen project, and other diagnostics remain unknown. These layers do not promise
+dependants outside the frozen project, and other diagnostics remain unknown. The Rust layer is not
+rustc or a complete borrow checker, and the Python layer is not a runtime proof. Neither promises
 general type correctness, compilation, passing checks, or safe runtime behavior; configured checks
 and review still decide those claims.
 

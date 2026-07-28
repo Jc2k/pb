@@ -102,13 +102,18 @@ canonical hunk additions/context before their newline; it is not a claim that ev
 is grammar-extendable. Existing-file and patch validation is bound to the exact controller-observed
 base; stale bytes fail rather than being patched approximately.
 
-For a real local backend that may edit Rust in a Cargo project, pb automatically prepares one exact
-pinned rust-analyzer world before inference. The request-local native layer can reject only its
-qualified exact import and selected literal/call-shape contradictions. Partial dependency,
-build-script, procedural-macro, generated-code, deeper type/trait/ownership, compiler, and runtime
-questions remain unknown. A fresh complete replay against the same live world runs before executor
-entry; a generation cache or receipt is not authority. This narrow claim is not general Rust symbol
-or type correctness and does not promise compilation.
+For a real local backend that may edit Rust in a Cargo project, pb automatically prepares a pinned
+rust-analyzer world before inference. Immutable external dependency and sysroot facts can constrain
+the stream; project-local facts remain repairable until the complete transaction is known. For an
+exact no-build-script/no-procedural-macro profile, closure applies all modifications to already
+indexed `.rs` files together in an independently writable database and may reject only an increase
+in the promoted unresolved-name/supported-import, missing-field/method, privacy, selected
+call/type/trait-bound, mutability, or moved-from-reference diagnostic debt. This check includes
+untouched local modules affected by a changed API. New/deleted Rust files, unsupported relative
+import contexts, partial profiles, complete borrow checking, trait-implementation completeness,
+compiler behavior, and runtime behavior remain unknown. A fresh complete replay against the same
+live world runs before executor entry; a generation cache or receipt is not authority. This narrow
+claim is not general Rust symbol or type correctness and does not promise compilation.
 
 For a real local backend that may edit Python, pb likewise prepares exact-pinned Astral `ty` state
 before inference. The shipped v1 profile uses Python 3.12 as its fallback and binds the host target

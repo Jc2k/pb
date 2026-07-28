@@ -2,8 +2,9 @@
 
 Status: **The syntax/canonical-patch collar is shipped. The first native Rust and Python semantic
 layers, pre-inference lifecycle, streaming steering, and independent execution replay are
-implemented and under production qualification. Deeper Rust/Python coverage, Python environment
-coverage, and the TypeScript/JavaScript language crate remain phased design-record work.** This is
+implemented and under production qualification. The Rust v2 complete-transaction tranche and
+Python qualification tranche are the current focus; TypeScript/JavaScript remains frozen at its
+shipped syntax level. Deeper compiler/runtime coverage remains phased design-record work.** This is
 the durable design, migration history, and evidence ledger. Curated architecture documentation
 describes only shipped guarantees.
 
@@ -17,11 +18,16 @@ Current implementation ledger:
   qualification passes the 1 ms p95 budget, including 4,096 deterministic chunk seeds per case.
   The claim remains conservative prefix safety, not exact grammar extendability; outer logical-
   prefix profiling and refreshed end-to-end throughput evidence remain.
-- **Native Rust layer implemented:** `pb-control-rust` directly embeds pinned rust-analyzer crates.
-  It loads one project-wide Salsa/HIR world from a verified immutable shadow before an inference
-  that can edit Rust, primes local/dependency scopes, selects the exact Cargo target for existing
-  files, resolves imports and callable/type shapes through HIR, and gives the decoder only a cheap
-  request-local snapshot. It does not ask an LSP for diagnostics on incomplete source.
+- **Native Rust v2 layer implemented:** `pb-control-rust` directly embeds pinned rust-analyzer
+  crates. It loads one project-wide Salsa/HIR world from a verified immutable shadow before an
+  inference that can edit Rust, primes local/dependency scopes, selects the exact Cargo target for
+  existing files, resolves imports and callable/type shapes through HIR, and gives the decoder only
+  a cheap request-local snapshot. An exact no-build-script/no-procedural-macro profile also copies
+  the loaded graph, roots, configuration, and VFS inputs into a second independently writable Salsa
+  storage during readiness. Complete modifications to indexed sources are applied together at tool
+  closure; promoted HIR diagnostic debt is compared across all local target modules and the database
+  is restored before another request can use it. It does not ask an LSP for diagnostics on
+  incomplete source or rerun Cargo during generation.
 - **Native Python layer implemented:** `pb-control-python` directly embeds exact-pinned Astral `ty`
   internals. It copies the controller shadow into a frozen in-memory filesystem, uses Python 3.12
   as a fallback, and binds the host target platform, first-party imports, bundled typeshed, and an
@@ -57,10 +63,13 @@ Current implementation ledger:
   snapshot; Qwen payload extraction and the mutation gate normalize the call exactly as the
   executor does. A model-supplied alternate path never overrides controller authority.
 - **Semantic enforcement implemented conservatively:** exact builtin/sysroot facts and local
-  literal contradictions can hard-reject. Facts affected by disabled build scripts, procedural
-  macros, generated sources, or incomplete dependency configuration remain `Unknown` and cannot
-  prune a token. Completed writes/edits/replacements/patches are reconstructed and replayed through
-  a fresh analyzer stack immediately before executor entry; sampler state is never final authority.
+  literal contradictions can hard-reject. Rust project-local facts remain repairable until closure;
+  the exact profile can then reject increases in promoted name/supported-import, field/method,
+  privacy, selected call/type/trait-bound, mutability, and moved-from-reference diagnostic debt.
+  Facts affected by disabled build scripts, procedural macros, source-topology changes, unsupported
+  relative imports, or incomplete dependency configuration remain `Unknown`. Completed
+  writes/edits/replacements/patches are reconstructed and replayed through a fresh analyzer stack
+  immediately before executor entry; sampler state is never final authority.
 - **Legacy diagnostic provider remains separate:** the configurable isolated-LSP diagnostic gate is
   retained for settled transaction diagnostics and evidence. It is not the streaming architecture
   and its in-progress diagnostic codes are not used as token-time truth.
@@ -135,9 +144,11 @@ For supported constrained mutation tools and language profiles, pb provides this
 
 The cross-language production guarantee remains deliberately syntax-scoped. A native language layer
 may add a stronger per-request rung only for error classes its pinned implementation can prove from
-the exact ready world. Rust v1 can reject a proven-invalid exact sysroot import and selected literal
-operator/call incompatibilities; partial dependency facts remain `Unknown`. Python v1 can reject a
-complete generated string-plus-integer literal operation and selected newly introduced `ty`
+the exact ready world. Rust v2 can reject exact immutable-dependency contradictions while streaming
+and increases in its promoted complete-transaction HIR diagnostic debt after all indexed-source
+modifications are overlaid together. Build scripts, procedural macros, source-topology changes,
+unsupported relative imports, complete borrow checking, and compiler parity remain `Unknown`.
+Python v1 can reject a complete generated string-plus-integer literal operation and selected newly introduced `ty`
 import/type diagnostics at transaction closure. `Any`, dynamic imports, monkey-patching,
 descriptors, runtime dispatch, and environment facts outside a qualified static dependency image
 remain unknown; Python
@@ -296,12 +307,15 @@ The current implementation has these concrete boundaries:
 - conservative UTF-8, delimiter, and Python-dedent prefix rules now reject only promoted local
   impossibilities; canonical patch lines additionally stream untouched base bytes and generated
   result bytes through the same prefix oracle between hunks;
-- Rust-edit-capable real-backend requests prepare a project-wide rust-analyzer database before
-  prompt reservation or model-invocation accounting, reuse exact warm worlds, and incrementally
-  refresh existing source files only when no request lease can observe the prior Salsa revision;
-- the Rust streaming layer uses direct HIR scope/import/callable shapes plus a Rust Tree-sitter
-  structural stream. Exact negative facts may reject while partial build-script/proc-macro/
-  dependency facts stay `Unknown`;
+- Rust-edit-capable real-backend requests prepare a project-wide read database before prompt
+  reservation or model-invocation accounting, reuse exact warm worlds, and incrementally refresh
+  existing source files only when no request lease can observe the prior Salsa revision. Exact
+  profiles also prepare an independently writable database from the same already loaded inputs;
+- the Rust stream uses direct HIR scope/import/callable shapes plus a Rust Tree-sitter structural
+  stream. Project-local facts remain repairable until closure. Completed modifications to indexed
+  files are then overlaid together, all local target modules are queried, and only increases in the
+  promoted diagnostic categories reject. Build scripts, procedural macros, topology changes,
+  unsupported relative imports, full borrow checking, and compiler parity stay `Unknown`;
 - Python-edit-capable real-backend requests prepare exact-pinned Astral `ty` state before
   inference. The enforced profile resolves first-party and newly generated cross-file imports
   against bundled typeshed and a bounded immutable source/stub/marker/metadata image from one
@@ -690,10 +704,11 @@ The stack must:
   definite error; and
 - run a final authoritative analyzer over the complete virtual workspace.
 
-Rust v1 directly uses rust-analyzer HIR for project target selection, import resolution, public
-symbol/callable shapes, and conservative literal expression checks. Deeper layers may use more
-rust-analyzer internals or compiler-compatible queries for inference, traits, ownership, `cfg`, and
-macro-aware checks. Python strictness must be defined relative to pinned `ty`/Python/project state;
+Rust v2 directly uses rust-analyzer HIR for project target selection, import resolution, public
+symbol/callable shapes, conservative literal expression checks, and the promoted finished-overlay
+diagnostic allowlist. Later profiles may use compiler-compatible queries for complete traits,
+ownership/borrows, `cfg` matrices, and macro-aware checks. Python strictness must be defined relative
+to pinned `ty`/Python/project state;
 `Any`, dynamic imports, monkey-patching, descriptors, and runtime-only dispatch yield `Unknown`
 rather than a false guarantee. TypeScript and JavaScript similarly require a declared project and
 compiler configuration rather than an isolated-file claim when module resolution or ambient types
@@ -726,7 +741,7 @@ The controller owns lifecycle even though a language crate owns the analyzer imp
    project graph/toolchain/dependency changes, active leases, ambiguity, or refresh errors rebuild a
    separate world before inference.
 
-The shipped Rust v1 scheduler uses a synchronous readiness barrier immediately before the first
+The shipped Rust v2 scheduler uses a synchronous readiness barrier immediately before the first
 edit-capable invocation. Read-only planning and review turns do not pay this cost, and an exact
 non-Rust work-unit target does not trigger it. A future latency optimization may start one
 content-addressed, deduplicated prewarm after the controller has accepted a Rust-targeted work unit
@@ -743,7 +758,7 @@ source/toolchain/configuration/dependency world. Compilation may prewarm during 
 stage, but an edit-capable model invocation must await its exact receipt; compilation is never
 started lazily from token sampling or final mutation closure.
 
-Cancellation has two distinct guarantees. Shipped v1 rechecks cancellation before and after native
+Cancellation has two distinct guarantees. The shipped lifecycle rechecks cancellation before and after native
 preparation, so a cancellation is never followed by prompt work or model inference. Cold project
 loading and native query priming run in request-independent in-process threads under per-language
 exact-world single-flight leases; initiating and queued requests poll cancellation every 100 ms,
@@ -1185,15 +1200,15 @@ workspace, not an earlier phase branch.
 | Phase 6 remaining promotion evidence | Pending | Outer Qwen/DSML logical-prefix extraction profiling, additional property/fuzz corpora beyond deterministic chunk boundaries, and refreshed pinned end-to-end write/patch throughput still gate promotion beyond the implemented conservative rules |
 | Phase 7 shadow/evidence foundation | Passed | Semantic analysis uses a fresh exact bounded shadow tree and isolated LSP session for each transaction, rejects symlinks and post-copy drift, permits only an LSP-specific read-only analysis-root mount, and emits independently validated content-free generation and final-executor receipts |
 | Phase 7 legacy pinned Rust LSP attempt | Failed safely (historical) | `ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b26526…173d` (rust-analyzer 1.96.0) never produced a non-empty crate graph or document membership within the required barrier; this is why incomplete-code LSP diagnostics were not adopted as the streaming architecture |
-| Phase 7 native Rust implementation | Passed focused implementation gates | Exact-pinned rust-analyzer 0.0.344 loads one offline project world; 8 crate tests cover dependency/sysroot shape certainty, invalid import/type steering, target selection, cross-file rollback, identity/staleness, active-request refresh exclusion, and zero-load source refresh. The root lifecycle test covers cold preparation, warm reuse, independent invalid/valid final replay, in-memory source refresh, cross-stage process-cache reuse, and exact non-Rust target bypass |
+| Phase 7 native Rust implementation | Passed v2 focused implementation gates | Exact-pinned rust-analyzer 0.0.344 loads one offline read world and, for exact profiles, reconstructs an independently writable world from its loaded inputs before inference. All 13 crate tests pass. They cover dependency/sysroot shape certainty; invalid import/type steering; target selection; cross-file rollback; identity/staleness; active-request refresh exclusion; zero-load source refresh; build-script/procedural-macro downgrade without execution; baseline debt; the promoted name/import, field/method, privacy, call/type, mutability, moved-from-reference, and trait-bound categories; unsupported relative-import downgrade; closure rejection; and a multi-file import repair after rollback. The root lifecycle tests cover cold preparation, warm reuse, independent invalid/valid final replay, in-memory source refresh, cross-stage process-cache reuse, and exact non-Rust target bypass. |
 | Phase 7 native Python implementation | Passed expanded focused gates; broader qualification pending | Exact-pinned Astral `ty` 0.0.6 loads and primes a frozen project/typeshed world before inference. Fourteen crate tests cover all six promoted diagnostic codes, `Any`/dynamic unknowns, baseline debt, generated suppression, rollback, project closure, and the repairable-prefix rule. Five codes are explicitly closure-only; only the independently proven generated string-plus-integer literal can use `unsupported-operator` for statement-time hard rejection. A later-file import repair proves why complete-looking statements stay open until the whole patch is known. Root lifecycle tests cover safe project-local `.venv`/`venv` capture even when Git-ignored, fully observed repository-local plain-path editables, exact user-authorized external environments and editable roots, dependency callable and complete-search import rejection, pre-inference dependency-module priming, separate deterministically ordered dependency identity, post-prime/pre-execution external drift rejection, cold rebuild after dependency changes, dynamic/native/undeclared-path downgrade, repository-versus-user authority isolation, concurrent exact single flight, cancellation polling, cold/warm/process-cache reuse, and independent final replay. The checked-in 24-case Python semantic corpus differentially compares generation closure, final execution replay, and exact promoted-code deltas across annotated, unannotated, frozen third-party, baseline-debt, dynamic, and multi-file cases, with all four mutation tools and all six promoted codes represented. Broader public-project/external-oracle corpora, dynamic editable/import-hook/native environment support, and live-model Python semantic fixtures remain pending. |
 | Phase 7 native Python lifecycle/resource qualifier | Passed initial matrix | Release-arm64 profile `aeeca87b…966e` ran each case in a fresh process through the exact cold readiness, warm request, process-cache, invalid replay, and valid replay paths. Tiny 4/7 files measured 49/14/14/16/15 ms and 39.6 MB peak; representative 1,024/515 measured 337/67/67/73/74 ms and 53.7 MB; large 10,000/5,003 measured 3,106/601/602/662/660 ms and 192.4 MB. All 15,001 large-case source modules were primed before inference. The accepted ceilings are 60 s cold, 20 s warm/cache, 20 s per replay, and 1 GiB process peak. This simple annotated-module matrix is a reproducible scaling baseline, not a universal project budget |
 | Phase 7 native Python semantic qualifier | Passed initial matrix | Release-arm64 corpus `e073204a…0b40` ran 24 annotated, unannotated, frozen-third-party, baseline-debt, dynamic-unknown, and multi-file cases through production generation closure, independent final execution replay, and direct promoted-code replay. All 24 decisions matched across generation/final, with 9 allows, 15 semantic rejections, all six promoted codes, and all four mutation tools represented. Cold readiness was 52 ms; 96 case stages measured 8 ms p50, 16 ms p95/p99, and 16 ms maximum. The frozen HTTP client stub is a distilled dependency surface, not a full upstream conformance claim; broader public-project and external-oracle corpora remain |
 | Phase 7 lifecycle overlap/cancellation boundary | Passed narrow shipped guarantee | The root lifecycle tests hold one request lease across source drift and prove the next request receives an independently cold-built world; two simultaneous exact requests produce one cold build plus one process-cache hit; and any drift during loading requires a fresh controller snapshot rather than an internal retry. Deterministic tests hold a detached cold worker open and prove that its initiating request and a different project waiting for the global one-worker capacity both observe cancellation through the 100 ms poll while the exact single-flight remains owned until worker completion. A separate agent test proves pre-inference cancellation causes zero model invocations and zero consumed completion records. The analyzer computation itself is not cooperatively interrupted. |
-| Phase 7 native Rust latency/resource qualifier | Passed current representative run | On exact commit `23754bbe`, the full pb workspace measured an 87.289 s cold load, 1.014 s independent execution replay, and 1.007 s warm request. The prior instrumented run recorded process maximum RSS of 2,127,577,088 bytes and measured peak footprint of 129,778,360 bytes. These are baselines, not universal budgets; additional large-project, detached-worker completion/reclamation, and sustained-concurrency/memory qualification remains |
+| Phase 7 native Rust latency/resource qualifier | Prior v1 baseline retained; v2 rerun required | On exact commit `23754bbe`, the earlier read-only profile measured an 87.289 s full-pb cold load, 1.014 s independent execution replay, and 1.007 s warm request. The prior instrumented run recorded process maximum RSS of 2,127,577,088 bytes and measured peak footprint of 129,778,360 bytes. Rust v2 intentionally adds a second writable Salsa storage during pre-inference readiness, so those numbers cannot qualify the new profile. Release cold/warm/replay time, peak memory, reclamation, and sustained serialized-overlay concurrency must be remeasured. |
 | Phase 7 live Rust workflow | Passed | Preserved run `1785221083352-60887-0` in `/private/tmp/pb-control-rust-e2e-20260727-4` crossed the strict workflow, prepared Rust before the edit-capable model invocation, accepted a controller-bound `edit_file`, rejected 14 invalid candidates without executing them, passed 3 locked Cargo tests and API review, reached `Ready`, and committed `56aca5c feat: add average function with unit tests` with a clean worktree |
 | Current live write/patch fixtures | Passed | On 2026-07-28, the rebuilt release binary compiled the checked-in Qwen fixture containing exact path `const`, generated exactly `answer.py` with valid Python after 21 rejected candidates, and generated the exact snapshot-valid canonical one-line patch after 20 rejected candidates and one invalid-argument closure rejection |
-| Phase 7 native Rust production qualification | Partially passed; promotion blocked | Focused implementation, strict workspace gates, representative cold/warm/replay measurement, deterministic detached-owner cancellation, one current end-to-end Rust edit, and current live write/patch generation pass. The required FlashMoe arithmetic smoke is currently nonsensical; representative large projects, sustained detached-worker concurrency/memory, resource reclamation, and longer randomized rollback corpora still gate promotion beyond the narrow shipped v1 claim |
+| Phase 7 native Rust production qualification | V2 focused gates passed; promotion blocked | The 13-test language-crate matrix passes, including complete-overlay rejection, multi-file repair, rollback, baseline debt, and safe build/procedural-macro downgrade. The existing root lifecycle and live workflow evidence predates the second writable database. V2 release resource/latency measurement, root execution-replay coverage for the promoted categories, longer randomized rollback/repair corpora, sustained serialization/reclamation, and a current live backend matrix remain. The required FlashMoe arithmetic smoke is also still nonsensical. |
 | Phase 7 deeper/later language profiles | Pending | Rust macro/build-script/compiler parity, deeper `pb-control-python` environment/type matrices, and `pb-control-typescript` project matrices ship independently after their own soundness, lifecycle, multi-file, dependency, cancellation, latency, and final-replay evidence |
 | Phase 8 live llama.cpp profiles | Qwen direct matrix passed; broader parity pending | On 2026-07-28, the final rebuilt binary and exact local Qwen2.5-Coder-7B Q4_K_M GGUF passed the no-execution `llama-infer` fixture matrix through the production CPU-fallback adapter. A valid Python write closed in 41 tokens/11.840 s after 5,587,481 rejected candidates. The exact immutable-snapshot patch closed in 72 tokens/25.506 s after 11,426,985 rejected candidates and returned the canonical hunk byte-for-byte. An exact invalid Python constant and an exact stale-context patch each reached an empty full-vocabulary frontier and exited nonzero without a call; a one-token cap likewise returned no call. These runs exposed and fixed structural-whitespace, partial-hunk, returned-byte/validated-byte, incomplete UTF-8/JSON escape, canonical scalar-wire, and speculative candidate-state defects. The earlier workflow envelope-close fix remains covered. Live DeepSeek-dialect GGUF, FlashMoe/llama mask differential, repeated throughput/resource, and unsupported-profile preflight runs still gate a backend-parity claim. |
 | Pinned DeepSeek direct mutation qualification | Passed | The checked-in `fixtures/control-collar/` inputs produced syntax-valid `answer.py` after 2 candidate rejections and an exact snapshot-bound one-line patch after 8, reporting 1 file and 16 snapshot bytes; an alternate capped patch attempt reported 7 `invalid_patch` closure rejections and executed no call |
@@ -1243,16 +1258,21 @@ the pinned end-to-end decode-throughput reduction remains within the existing 25
   and dependency scopes before inference, binds request snapshots to exact identities, and keeps a
   bounded process cache. Existing source changes use native Salsa invalidation only after the prior
   request epoch has no leases; every other change performs a cold pre-inference rebuild.
-- **7C — Rust structural/HIR v1 (implemented, qualification in progress).** Stream Rust syntax,
+- **7C — Rust structural/HIR streaming (implemented).** Stream Rust syntax,
   nested imports, call/literal shapes, and exact local literal operator contradictions. Resolve Cargo
   targets, imports, builtin/sysroot APIs, dependency public symbols, and callable signatures directly
   through HIR. Partial scopes never supply negative hard-mask facts. Replay complete
   write/replace/edit/patch results through a fresh stack before executor entry.
-- **7D — Complete Rust semantic profiles.** Add language-owned layers for local binding and method
-  resolution, generic inference, traits, coercions, ownership/borrows, privacy, `cfg`, target and
-  feature selection. Define separate safe-partial and sandboxed-exact profiles for build scripts,
-  procedural macros, generated files, and compiler checks. Code execution requires explicit
-  no-network/read-only-input/ephemeral-output authority; unavailable expansion remains `Unknown`.
+- **7D — Rust complete-transaction HIR v2 (implemented; qualification in progress).** During
+  readiness, clone the already loaded graph, roots, configuration, and VFS inputs into a separate
+  writable Salsa storage rather than mutating a shared database clone. Overlay all completed
+  modifications to indexed sources together; resolve supported imports against the candidate graph;
+  query every local target module; compare promoted name, field/method, privacy, selected
+  call/type/trait-bound, mutability, and moved-from-reference categories with baseline debt; then
+  restore the baseline before unlocking. Later files can repair earlier files. Build-script and
+  procedural-macro closures, create/delete topology, unsupported relative imports, complete
+  ownership/borrow checking, trait-implementation completeness, and rustc parity remain later
+  independently qualified profiles and must return `Unknown` meanwhile.
 - **7E — Add `pb-control-python` (initial profile implemented; qualification in progress).** The
   crate embeds exact-pinned Astral `ty` internals, a frozen in-memory project filesystem,
   independently writable pre-inference request databases, request-local create/modify/delete overlays,
@@ -1381,6 +1401,13 @@ leases, final replay, offline behavior, latency, and memory are qualified. It do
 future exact macro/build-script/compiler profile or other languages, and it must not be described as
 general Rust type correctness.
 
+**Amended 2026-07-28:** Rust v2 adds a complete-transaction gate without turning an LSP diagnostic
+stream into inference authority. Exact projects prepare an independently writable rust-analyzer
+database before inference, apply all indexed-source candidates together only at tool closure, and
+promote a closed diagnostic allowlist. The runtime still never executes build scripts or procedural
+macros, and it does not claim full borrow checking, trait-implementation completeness, rustc parity,
+or semantic authority for new/deleted source topology.
+
 **Amended 2026-07-28:** the Python v1 layer follows the same independent promotion rule. Its native
 `ty` project/type state is the token-time resolver; an LSP is not run over incomplete source. The
 first-party/typeshed profile and the separately qualified project-local environment image can ship
@@ -1442,7 +1469,7 @@ their named phase produces evidence:
 | Native-world lifecycle budgets | Phase 7H | Python now has isolated tiny/representative/large cold, warm, exact-cache, final-replay, and peak-memory qualification. Rust large-project, per-language source refresh, concurrent lease fallback, eviction, sustained cancellation/reclamation, and cross-host budgets remain |
 | llama.cpp model/template qualification | Phase 8 | Token/special/EOG identity, dialect rendering, full-vocabulary mask ordering, stateful-sampler acceptance, and live mutation corpus |
 | Whether DeepSeek ephemeral complete-state snapshots beat deterministic replay | Phase 9 | Snapshot copy cost, memory peak, restore parity, branch depth, and end-to-end energy |
-| Rust deeper native boundary | Phase 7D | rust-analyzer/compiler parity corpus including macros, traits, `cfg`, ownership, and workspace edits |
+| Rust deeper native boundary | Phase 7D follow-on | The indexed-source complete-transaction HIR allowlist is implemented. Remaining promotion requires rust-analyzer/rustc parity corpora for build/procedural macros, relative module contexts, complete traits/borrows, source topology, `cfg`/target matrices, and compiler checks. |
 | TypeScript/JavaScript native project layer | Phase 7F (deferred) | Keep the shipped lexical/syntax constraint level for the current tranche. Module-resolution, ambient-type, JSX, and multi-file semantic work resumes only after an explicit scope decision. |
 | Python `ty` deeper profile and `Unknown` policy | Phase 7E | First-party/typeshed, bounded safe project-local environments, fully observed repository-local plain-path editables, and exact user-authorized external environments/editable roots are implemented with isolated dependency identity and final drift replay. The lifecycle resource matrices and initial six-code positive/unknown/repairable-prefix corpus are implemented. A checked-in 24-case annotated/unannotated/frozen-third-party matrix now requires generation/final/direct-diagnostic parity across all four mutation tools. A provider-neutral CI/research interface materializes complete states and validates corpus-bound content-free oracle artifacts without provisioning a checker. Five diagnostics remain closure-only; one literal operator has a named token proof. Broader public-project and independently provisioned comparison corpora/runs, dynamic/import-hook/native environments, a larger false-rejection audit, and any broader token-time promotion remain. Pyright is explicitly excluded from the pb binary and hidden harness. |
 

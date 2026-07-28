@@ -235,9 +235,16 @@ ordinary edits to existing `.rs` files refresh it incrementally. Cargo/configura
 file-topology changes rebuild before the next inference. Preparation is offline and never downloads
 dependencies. Missing local dependency sources or a workspace that changes while loading fail the
 model turn rather than silently dropping the Rust layer. This behavior is automatic and has no
-environment toggle. Its guarantee is intentionally narrow: exact qualified import and selected
-literal/call-shape contradictions can be rejected, while build-script/procedural-macro and deeper
-type/ownership facts remain unknown. If cancellation arrives during this preparation, pb will not
+environment toggle. Alongside the read-only request snapshot, preparation constructs a second
+independently writable analyzer database from the already loaded Cargo/VFS inputs; it never reruns
+Cargo during generation. Exact immutable dependency facts can steer individual tokens. At complete
+tool closure, all modifications to already indexed Rust sources are applied together and the
+promoted HIR diagnostic debt is compared with the frozen baseline, including errors induced in
+untouched local modules. The allowlist covers unresolved names and supported absolute imports,
+missing fields/methods, privacy, selected call/type and trait-bound errors, mutability, and moving
+out of a reference. Build scripts, procedural macros, source-topology changes, unsupported relative
+import contexts, full borrow checking, trait-implementation completeness, and compiler/runtime
+behavior remain unknown. If cancellation arrives during this preparation, pb will not
 start the model afterward. Cold loads run in a request-independent local worker; the initiating
 request and queued requests poll cancellation every 100 ms, and only one cold Rust load runs at a
 time. Cancelling stops the request wait, but the embedded analyzer cannot interrupt every

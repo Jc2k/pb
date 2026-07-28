@@ -114,9 +114,14 @@ replace it or widen the accepted-plan ledger.
 controller gives it a verified immutable shadow plus content/configuration/dependency identities.
 Rust Cargo metadata runs offline, build scripts are not loaded, and no procedural-macro server is
 started in the safe profile. Missing cached dependencies fail readiness instead of fetching. The
-project world must be loaded and primed before a Rust-edit-capable model invocation; decoding uses a
-request-local Salsa snapshot and performs no filesystem, Cargo, network, process, or LSP activity.
-An epoch lease prevents the cache from revising that database while a decoder can query it. A
+project world must be loaded and primed before a Rust-edit-capable model invocation. Exact profiles
+also copy the already loaded Cargo graph, source roots, configuration, and VFS bytes into a second
+independently writable Salsa storage during that readiness phase. This is required because a cloned
+rust-analyzer database shares Salsa storage and cannot safely be mutated beside the warm snapshot.
+Decoding and final transaction replay perform no filesystem, Cargo, network, process, or LSP
+activity. Candidate overlays are serialized, restored to the frozen baseline before releasing the
+request, and cannot mutate the read-only streaming database. An epoch lease prevents the cache from
+revising either baseline while a decoder can query it. A
 concurrent request or unsupported invalidation receives another prepared world. Cold construction
 runs in a request-independent in-process worker under the exact-world single-flight lease and a
 global one-worker limit. Cancelling the initiating request stops its wait but does not grant the
@@ -379,7 +384,7 @@ resolved versioned namespace; it never targets the storage root itself.
 | Publication | Local Ready evidence does not authorize a push, pull request, merge, or provider-side mutation. |
 | Goal automatic continuation | Explicit per-Goal user authority inside snapshotted totals. It does not approve new paths, integrations, network access, policy prompts, or publication. |
 | Syntax-constrained mutation | Prevents a supported file from completing with parser-invalid syntax. It does not prove type correctness, name resolution, compilation, test success, runtime behavior, or security. Unsupported extensions retain ordinary executor checks. |
-| Native Rust v1 constraint | Resolves project targets, imports, and selected callable/literal shapes against one exact pinned rust-analyzer world. Only qualified exact facts may veto. Disabled build scripts/procedural macros, generated APIs, partial dependency state, deeper inference, ownership, and runtime behavior remain unknown; this is not a compilation guarantee. |
+| Native Rust v2 constraint | Resolves project targets and immutable dependency shapes while streaming, then applies completed modifications to existing indexed sources together in an independently writable pinned rust-analyzer world. Only increases in the promoted name/supported-import, field/method, privacy, selected call/type/trait-bound, mutability, and moved-from-reference diagnostic debt may veto. Build scripts, procedural macros, new/deleted source topology, unsupported relative-import contexts, complete borrow checking, trait-implementation completeness, compiler parity, and runtime behavior remain unknown; this is not a compilation guarantee. |
 | Native Python v1 constraint | Resolves first-party and newly generated cross-file imports plus selected promoted type shapes against one exact pinned Astral `ty` world. The fallback is Python 3.12/typeshed; one safely qualified local or user-authorized exact external `.venv`/`venv` contributes a bounded immutable source/stub/marker/metadata image and Python version without executing an interpreter. Fully observed repository-local plain-path editables become first-party roots; exact external editable roots require a user-owned grant bound to the canonical workspace. Repository configuration cannot authorize external reads, and runtime authority is not serialized into agent requests. Dependency modules are primed before inference and the separate dependency digest is rechecked before execution. Create/modify/delete candidates are applied as one overlay transaction; closure checks every non-deleted frozen first-party file plus new Python files, including untouched in-project dependants. Only complete literal contradictions and newly introduced promoted diagnostics may veto; generated suppressions cannot bypass the gate. Missing external imports remain unknown for absent, ambiguous, undeclared, symlinked, native, or hook-bearing environments. `Any`, dynamic/runtime behavior, dependants outside the frozen project, and unpromoted diagnostics remain unknown; this is not a general type-correctness guarantee. |
 
 The external Python differential-oracle interface is development-only and has no authority row in
