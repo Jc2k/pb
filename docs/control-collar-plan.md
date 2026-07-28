@@ -1022,10 +1022,12 @@ Most correctness evidence belongs in the new crate and must run without a model.
 - Drive a fake LSP through stale document versions, partial pull results, delayed/missing push
   publications, restart, cancellation, response limits, and configuration changes; none may be
   mistaken for a clean semantic result.
-- Run pinned rust-analyzer/Rust, TypeScript Language Service, and Pyright qualification suites
-  against immutable shadow workspaces with offline dependency caches. Include dependency changes,
-  lockfile/config invalidation, missing stubs/sources, and intentionally hostile Rust build scripts
-  or proc macros to prove the sandbox boundary.
+- Run pinned rust-analyzer/Rust and TypeScript Language Service qualification suites against
+  immutable shadow workspaces with offline dependency caches. Independently provisioned CI or
+  research jobs may compare the native Python layer with an exact Pyright release, but Pyright must
+  never be linked, installed, invoked, or exposed as a dependency by the pb binary or its hidden
+  harness. Include dependency changes, lockfile/config invalidation, missing stubs/sources, and
+  intentionally hostile Rust build scripts or proc macros to prove the sandbox boundary.
 - Verify deterministic replay with greedy sampling and stable sampler-state restoration for any
   backend that advertises rollback.
 - For DeepSeek snapshot-and-restore, require complete hidden/logit parity across nonzero prefixes and
@@ -1265,10 +1267,10 @@ the pinned end-to-end decode-throughput reduction remains within the existing 25
   annotated/unannotated/frozen-dependency allow and reject behavior, baseline debt, dynamic
   unknowns, multi-file transactions, all four mutation tools, and all six promoted codes through
   generation/final/direct-diagnostic differential replay. Next, add editable/out-of-project
-  dependency authority, expand into public-project and independent external-oracle corpora, and
-  require a separately named monotonic proof before granting any new token-time hard-mask
-  authority.
-  Pyright/LSP may remain a settled final differential oracle, not the token-time state machine.
+  dependency authority, expand into public-project and independently provisioned external-oracle
+  corpora, and require a separately named monotonic proof before granting any new token-time
+  hard-mask authority. An exact Pyright release may be a CI/research differential oracle, but it is
+  not a pb runtime or hidden-harness dependency and is never the token-time state machine.
 - **7F — Add `pb-control-typescript`.** Integrate TypeScript project/program/type-checker state with
   versioned virtual files, exact `tsconfig`, module resolution, JSX mode, ambient declarations, and
   project references. JavaScript receives type guarantees only under explicit `checkJs`/JSDoc or an
@@ -1423,7 +1425,7 @@ their named phase produces evidence:
 | Whether DeepSeek ephemeral complete-state snapshots beat deterministic replay | Phase 9 | Snapshot copy cost, memory peak, restore parity, branch depth, and end-to-end energy |
 | Rust deeper native boundary | Phase 7D | rust-analyzer/compiler parity corpus including macros, traits, `cfg`, ownership, and workspace edits |
 | TypeScript/JavaScript native project layer | Phase 7F | Module-resolution, ambient-type, JSX, and multi-file corpus |
-| Python `ty` deeper profile and `Unknown` policy | Phase 7E | First-party/typeshed plus bounded safe project-local environment identity, isolated dependency-resource matrices, and the initial six-code positive/unknown/repairable-prefix corpus are implemented. A checked-in 24-case annotated/unannotated/frozen-third-party matrix now requires generation/final/direct-diagnostic parity across all four mutation tools. Five diagnostics remain closure-only; one literal operator has a named token proof. Broader public-project and independent external-oracle corpora, editable/out-of-project environments, a larger false-rejection audit, and any broader token-time promotion remain |
+| Python `ty` deeper profile and `Unknown` policy | Phase 7E | First-party/typeshed plus bounded safe project-local environment identity, isolated dependency-resource matrices, and the initial six-code positive/unknown/repairable-prefix corpus are implemented. A checked-in 24-case annotated/unannotated/frozen-third-party matrix now requires generation/final/direct-diagnostic parity across all four mutation tools. Five diagnostics remain closure-only; one literal operator has a named token proof. Broader public-project and independently provisioned CI/research external-oracle corpora, editable/out-of-project environments, a larger false-rejection audit, and any broader token-time promotion remain. Pyright is explicitly excluded from the pb binary and hidden harness. |
 
 Unsupported language profiles remain protocol-constrained and executor-validated; they must not be
 reported as syntax- or semantic-constrained. A supported profile whose required analyzer cannot be

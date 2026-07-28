@@ -88,7 +88,11 @@ cancelled request may leave its one already-started local Python preparation wor
 that bounded cache or handoff, but adds no network or durable source persistence.
 The hidden Python semantic qualifier materializes its checked-in first-party and dependency corpus
 only in an ephemeral local workspace. It starts no model, LSP, package installer, or network
-request, and emits only content-free digests, counts, parity results, and timings.
+request, and emits only content-free digests, counts, parity results, and timings. The native Python
+layer and qualifier do not bundle, install, invoke, or require Pyright;
+an independently provisioned CI/research comparison may use it outside the pb runtime. A Pyright
+provider that a user explicitly configures through the generic LSP interface remains an optional
+external sidecar and does not change the native layer's dependency or authority model.
 `inference.llamacpp_session_cache_enabled=false` and
 `inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are
