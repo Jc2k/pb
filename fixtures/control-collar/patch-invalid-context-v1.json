@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "apply_patch",
+      "description": "Apply one canonical unified diff to the immutable snapshot.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "patch": {
+            "type": "string",
+            "const": "--- a/answer.py\n+++ b/answer.py\n@@ -1,1 +1,1 @@\n-answer: int = 9\n+answer: int = 4\n"
+          }
+        },
+        "required": [
+          "patch"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "terminal_tool_names": [
+    "apply_patch"
+  ],
+  "files": [
+    {
+      "path": "answer.py",
+      "content": "answer: int = 3\n"
+    }
+  ]
+}

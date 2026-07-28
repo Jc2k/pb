@@ -115,9 +115,33 @@ pub(crate) struct NativeToolConstraint {
     schema_sha256: String,
     rejected_candidates: usize,
     mutation_rejections: BTreeMap<pb_control_collar::RejectionCode, usize>,
+    utf8_probe_chars: Vec<char>,
 }
 
 impl NativeToolConstraint {
+    pub(crate) fn candidate_checkpoint(
+        &self,
+    ) -> Result<Option<pb_control_collar::MutationCandidateCheckpoint>> {
+        self.mutation_gate
+            .as_ref()
+            .map(pb_control_collar::MutationCompletionGate::candidate_checkpoint)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn restore_candidate_checkpoint(
+        &self,
+        checkpoint: Option<&mut pb_control_collar::MutationCandidateCheckpoint>,
+    ) -> Result<()> {
+        match (self.mutation_gate.as_ref(), checkpoint) {
+            (Some(gate), Some(checkpoint)) => gate
+                .restore_candidate_checkpoint(checkpoint)
+                .map_err(Into::into),
+            (None, None) => Ok(()),
+            _ => bail!("native tool candidate checkpoint does not match its mutation gate"),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn compile(
         mode: NativeToolConstraintMode,
@@ -175,6 +199,8 @@ impl NativeToolConstraint {
             })
             .collect::<Result<BTreeSet<_>>>()?;
         let schema_bytes = serde_json::to_vec(&schemas)?;
+        let utf8_probe_chars =
+            pb_control_collar::vocabulary::schema_utf8_probe_chars(&schemas, &[]);
         Ok(Some(Self {
             mode: active_mode,
             schemas,
@@ -187,7 +213,12 @@ impl NativeToolConstraint {
             schema_sha256: format!("{:x}", Sha256::digest(schema_bytes)),
             rejected_candidates: 0,
             mutation_rejections: BTreeMap::new(),
+            utf8_probe_chars,
         }))
+    }
+
+    pub(crate) fn utf8_probe_chars(&self) -> &[char] {
+        &self.utf8_probe_chars
     }
 
     pub(super) fn mode(&self) -> NativeToolConstraintMode {
@@ -1312,7 +1343,7 @@ fn candidate_advances_visible_output(prefix: &str, candidate: &str, is_eos: bool
 fn structural_whitespace_is_bounded(input: &str) -> bool {
     let mut in_string = false;
     let mut escaped = false;
-    let mut whitespace_bytes = 0usize;
+    let mut structural_whitespace_bytes = 0usize;
     for byte in input.bytes() {
         if in_string {
             if escaped {
@@ -1326,14 +1357,11 @@ fn structural_whitespace_is_bounded(input: &str) -> bool {
         }
         if byte == b'"' {
             in_string = true;
-            whitespace_bytes = 0;
         } else if byte.is_ascii_whitespace() {
-            whitespace_bytes = whitespace_bytes.saturating_add(1);
-            if whitespace_bytes > MAX_STRUCTURAL_WHITESPACE_BYTES {
+            structural_whitespace_bytes = structural_whitespace_bytes.saturating_add(1);
+            if structural_whitespace_bytes > MAX_STRUCTURAL_WHITESPACE_BYTES {
                 return false;
             }
-        } else {
-            whitespace_bytes = 0;
         }
     }
     true
@@ -1637,6 +1665,7 @@ fn parse_json_string(input: &str, position: usize) -> StringStatus {
     }
     let mut escaped = false;
     let mut unicode_escape_digits = 0u8;
+    let mut incomplete_escape_start = None;
     for (offset, character) in input[position + 1..].char_indices() {
         let absolute = position + 1 + offset;
         if unicode_escape_digits > 0 {
@@ -1644,19 +1673,27 @@ fn parse_json_string(input: &str, position: usize) -> StringStatus {
                 return StringStatus::Invalid;
             }
             unicode_escape_digits -= 1;
+            if unicode_escape_digits == 0 {
+                incomplete_escape_start = None;
+            }
             continue;
         }
         if escaped {
             escaped = false;
             match character {
-                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {}
+                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {
+                    incomplete_escape_start = None;
+                }
                 'u' => unicode_escape_digits = 4,
                 _ => return StringStatus::Invalid,
             }
             continue;
         }
         match character {
-            '\\' => escaped = true,
+            '\\' => {
+                escaped = true;
+                incomplete_escape_start = Some(absolute);
+            }
             '"' => {
                 let end = absolute + 1;
                 return serde_json::from_str::<String>(&input[position..end])
@@ -1668,7 +1705,11 @@ fn parse_json_string(input: &str, position: usize) -> StringStatus {
         }
     }
     if escaped || unicode_escape_digits > 0 {
-        return StringStatus::Incomplete(None);
+        let end = incomplete_escape_start.unwrap_or(input.len());
+        let unterminated = &input[position..end];
+        return serde_json::from_str::<String>(&format!("{unterminated}\""))
+            .map(|value| StringStatus::Incomplete(Some(value)))
+            .unwrap_or(StringStatus::Incomplete(None));
     }
     let unterminated = &input[position..];
     serde_json::from_str::<String>(&format!("{unterminated}\""))
@@ -1927,6 +1968,26 @@ impl<'a> JsonPrefixParser<'a> {
     }
 
     fn parse_string(&self, position: usize, schema: &Value) -> PrefixStatus {
+        let constrained_values = schema
+            .get("const")
+            .and_then(Value::as_str)
+            .into_iter()
+            .chain(
+                schema
+                    .get("enum")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .collect::<Vec<_>>();
+        if !constrained_values.is_empty()
+            && !constrained_values
+                .iter()
+                .any(|expected| json_string_wire_prefix_matches(&self.input[position..], expected))
+        {
+            return PrefixStatus::Invalid;
+        }
         match parse_json_string(self.input, position) {
             StringStatus::Complete(value, end) => {
                 if schema
@@ -2022,6 +2083,13 @@ impl<'a> JsonPrefixParser<'a> {
             PrefixStatus::Invalid
         }
     }
+}
+
+fn json_string_wire_prefix_matches(input: &str, expected: &str) -> bool {
+    let Ok(canonical) = serde_json::to_string(expected) else {
+        return false;
+    };
+    canonical.starts_with(input) || input.starts_with(&canonical)
 }
 
 fn schema_accepts_value(schema: &Value, value: &Value) -> bool {
@@ -2259,6 +2327,12 @@ mod tests {
         assert!(constraint.output_prefix_is_valid(&format!("{TOOL_CALL_OPEN}{allowed}"), false));
         assert!(!constraint.output_prefix_is_valid(&format!("{TOOL_CALL_OPEN}{rejected}"), false));
 
+        let distributed = " ".repeat(MAX_STRUCTURAL_WHITESPACE_BYTES / 2 + 1);
+        assert!(!constraint.output_prefix_is_valid(
+            &format!("{TOOL_CALL_OPEN}{distributed}{{{distributed}\"name\":\"submit_review\""),
+            false
+        ));
+
         let string_payload = " ".repeat(MAX_STRUCTURAL_WHITESPACE_BYTES * 4);
         assert!(constraint.output_prefix_is_valid(
             &format!(
@@ -2321,11 +2395,42 @@ mod tests {
         assert_eq!(parse_json_string("\"bad\\q", 0), StringStatus::Invalid);
         assert_eq!(
             parse_json_string("\"unfinished\\", 0),
-            StringStatus::Incomplete(None)
+            StringStatus::Incomplete(Some("unfinished".to_string()))
         );
         assert_eq!(
             parse_json_string("\"unfinished\\u12", 0),
-            StringStatus::Incomplete(None)
+            StringStatus::Incomplete(Some("unfinished".to_string()))
+        );
+        assert_eq!(
+            JsonPrefixParser::new("\"wrong\\u00")
+                .parse_string(0, &json!({"type":"string","const":"right"})),
+            PrefixStatus::Invalid
+        );
+        let colon = json!({"type":"string","const":"answer:"});
+        assert_eq!(
+            JsonPrefixParser::new("\"answer\\u003").parse_string(0, &colon),
+            PrefixStatus::Invalid
+        );
+        assert_eq!(
+            JsonPrefixParser::new("\"answer\\u006").parse_string(0, &colon),
+            PrefixStatus::Invalid
+        );
+        assert_eq!(
+            JsonPrefixParser::new("\"answer\\u003a").parse_string(0, &colon),
+            PrefixStatus::Invalid
+        );
+        assert_eq!(
+            JsonPrefixParser::new("\"answer:").parse_string(0, &colon),
+            PrefixStatus::Incomplete
+        );
+        let emoji = json!({"type":"string","const":"💡"});
+        assert_eq!(
+            JsonPrefixParser::new("\"\\ud83d\\udca1").parse_string(0, &emoji),
+            PrefixStatus::Invalid
+        );
+        assert_eq!(
+            JsonPrefixParser::new("\"💡").parse_string(0, &emoji),
+            PrefixStatus::Incomplete
         );
         assert_eq!(
             parse_json_string("\"snowman \\u2603\"", 0),

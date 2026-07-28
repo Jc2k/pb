@@ -301,10 +301,27 @@ impl PatchPrefixValidator {
                 )));
             }
         }
-        let PatchPrefixPhase::File(file) = &self.phase else {
-            return Ok(());
-        };
-        file.probe_partial_hunk_line(bytes)
+        match &self.phase {
+            PatchPrefixPhase::Start => require_partial_patch_line(
+                bytes,
+                &[
+                    "diff --git ",
+                    "new file mode 100644",
+                    "deleted file mode 100644",
+                    "--- ",
+                ],
+                "file header",
+            ),
+            PatchPrefixPhase::Metadata(_) => require_partial_patch_line(
+                bytes,
+                &["new file mode 100644", "deleted file mode 100644", "--- "],
+                "file metadata",
+            ),
+            PatchPrefixPhase::NewHeader { .. } => {
+                require_partial_patch_line(bytes, &["+++ "], "new-file header")
+            }
+            PatchPrefixPhase::File(file) => file.probe_partial_hunk_line(bytes),
+        }
     }
 
     fn push_line(
@@ -514,7 +531,18 @@ impl PrefixFile {
 
     fn probe_partial_hunk_line(&self, line: &[u8]) -> CollarResult<()> {
         let Some(hunk) = self.hunk.as_ref() else {
-            return Ok(());
+            let candidates = if self.file_hunks == 0 {
+                &["@@ "][..]
+            } else {
+                &[
+                    "@@ ",
+                    "diff --git ",
+                    "new file mode 100644",
+                    "deleted file mode 100644",
+                    "--- ",
+                ][..]
+            };
+            return require_partial_patch_line(line, candidates, "hunk or file header");
         };
         const NO_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file";
         if line.first() == Some(&b'\\') {
@@ -554,7 +582,17 @@ impl PrefixFile {
             }
         }
         if old_seen == hunk.header.old_count && new_seen == hunk.header.new_count {
-            return Ok(());
+            return require_partial_patch_line(
+                line,
+                &[
+                    "@@ ",
+                    "diff --git ",
+                    "new file mode 100644",
+                    "deleted file mode 100644",
+                    "--- ",
+                ],
+                "hunk or file header",
+            );
         }
         let (kind, content) = match line.split_first() {
             Some((b' ', content)) => (HunkLineKind::Context, content),
@@ -824,6 +862,22 @@ impl PrefixFile {
             complete,
         })
     }
+}
+
+fn require_partial_patch_line(
+    line: &[u8],
+    candidates: &[&str],
+    expected: &str,
+) -> CollarResult<()> {
+    if candidates.iter().any(|candidate| {
+        let candidate = candidate.as_bytes();
+        candidate.starts_with(line) || line.starts_with(candidate)
+    }) {
+        return Ok(());
+    }
+    Err(CollarError::Mutation(format!(
+        "invalid canonical {expected} prefix"
+    )))
 }
 
 fn verify_virtual_results(
@@ -1784,6 +1838,36 @@ mod tests {
             " next_value = 2\n",
         );
         assert_stream_equivalent(&snapshot, patch, 1, 2);
+    }
+
+    #[test]
+    fn patch_stream_rejects_impossible_partial_structure_before_newlines() {
+        let snapshot = snapshot("main.py", b"value = 1\n");
+
+        let mut bad_start = PatchStream::new(snapshot.clone(), 4096, 1, 1).unwrap();
+        assert!(bad_start.push(b".").is_err());
+
+        let mut bad_new_header = PatchStream::new(snapshot.clone(), 4096, 1, 1).unwrap();
+        bad_new_header.push(b"--- a/main.py\n+").unwrap();
+        assert!(bad_new_header.push(b"x").is_err());
+
+        let mut bad_hunk = PatchStream::new(snapshot.clone(), 4096, 1, 1).unwrap();
+        bad_hunk
+            .push(b"--- a/main.py\n+++ b/main.py\n?")
+            .unwrap_err();
+
+        let mut valid = PatchStream::new(snapshot, 4096, 1, 1).unwrap();
+        for chunk in [
+            &b"--- a/main.py\n+"[..],
+            &b"++ b/main.py\n@"[..],
+            &b"@ -1,1 +1,1 @@\n-value = 1\n+value = 2\n"[..],
+        ] {
+            valid.push(chunk).unwrap();
+        }
+        assert_eq!(
+            valid.finish().unwrap().files()[0].result_bytes(),
+            Some(&b"value = 2\n"[..])
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
+use pb_control_collar::vocabulary::incomplete_utf8_probe_chars;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -68,6 +69,8 @@ pub struct LlamaCppChatRequest {
     pub mutation_snapshot: Option<pb_control_collar::mutation::WorkspaceSnapshot>,
     pub language_layers: Option<crate::control_layers::SharedLanguageLayers>,
     pub semantic_boundary: Option<crate::inference::SemanticBoundaryControl>,
+    /// Hidden qualification-only diagnostic; production callers keep generated source private.
+    pub debug_constrained_transcript: bool,
     pub ctx_size: u32,
     pub threads: Option<i32>,
     pub threads_batch: Option<i32>,
@@ -149,6 +152,10 @@ enum LlamaToolConstraint {
         rejected_candidates: usize,
         mutation_rejections: std::collections::BTreeMap<pb_control_collar::RejectionCode, usize>,
     },
+}
+
+struct LlamaCandidateCheckpoint {
+    mutation: Option<pb_control_collar::MutationCandidateCheckpoint>,
 }
 
 impl std::fmt::Debug for LlamaToolConstraint {
@@ -282,6 +289,7 @@ impl LlamaCppBackend {
             request.seed,
             None,
             None,
+            false,
         )
     }
 
@@ -301,6 +309,7 @@ impl LlamaCppBackend {
             request.seed,
             request.json_schema.as_ref(),
             tool_constraint,
+            request.debug_constrained_transcript,
         )
     }
 
@@ -336,6 +345,7 @@ impl LlamaCppBackend {
         seed: u32,
         json_schema: Option<&Value>,
         mut tool_constraint: Option<LlamaToolConstraint>,
+        debug_constrained_transcript: bool,
     ) -> Result<Output> {
         let energy_start = energy::sample();
         let started = std::time::Instant::now();
@@ -394,7 +404,14 @@ impl LlamaCppBackend {
                     constraint,
                     self.collar_vocabulary()?,
                     &constrained_transcript,
-                )?
+                )
+                .map_err(|error| {
+                    constrained_generation_error(
+                        error,
+                        &constrained_transcript,
+                        debug_constrained_transcript,
+                    )
+                })?
             } else {
                 sample_and_accept_token(&mut sampler, &ctx, batch.n_tokens() - 1)
             };
@@ -402,16 +419,17 @@ impl LlamaCppBackend {
                 finish_reason = FinishReason::EndOfGeneration;
                 break;
             }
-            let piece = self
-                .model
-                .token_to_piece(token, &mut decoder, true, None)
-                .context("failed to decode output token")?;
-            output.push_str(&piece);
             if tool_constraint.is_some() {
                 let id =
                     usize::try_from(token.0).context("llama.cpp selected a negative token id")?;
                 constrained_transcript
                     .extend_from_slice(&self.collar_vocabulary()?.visible_bytes[id]);
+            } else {
+                let piece = self
+                    .model
+                    .token_to_piece(token, &mut decoder, true, None)
+                    .context("failed to decode output token")?;
+                output.push_str(&piece);
             }
             batch.clear();
             batch
@@ -442,6 +460,10 @@ impl LlamaCppBackend {
             .as_ref()
             .map(|constraint| constraint.stats(&constrained_transcript));
         if let Some(constraint) = tool_constraint.as_ref() {
+            output = constrained_output(
+                &constrained_transcript,
+                finish_reason == FinishReason::MaxTokens,
+            )?;
             constraint.complete_parser_envelope(&mut output)?;
         }
         Ok(Output {
@@ -806,7 +828,14 @@ impl LlamaCppChatSession<'_> {
                     constraint,
                     self.backend.collar_vocabulary()?,
                     &constrained_transcript,
-                )?
+                )
+                .map_err(|error| {
+                    constrained_generation_error(
+                        error,
+                        &constrained_transcript,
+                        request.debug_constrained_transcript,
+                    )
+                })?
             } else {
                 sample_and_accept_token(&mut sampler, &cached.context, sample_index)
             };
@@ -814,17 +843,18 @@ impl LlamaCppChatSession<'_> {
                 finish_reason = FinishReason::EndOfGeneration;
                 break;
             }
-            let piece = self
-                .backend
-                .model
-                .token_to_piece(token, &mut decoder, true, None)
-                .context("failed to decode output token")?;
-            output.push_str(&piece);
             if tool_constraint.is_some() {
                 let id =
                     usize::try_from(token.0).context("llama.cpp selected a negative token id")?;
                 constrained_transcript
                     .extend_from_slice(&self.backend.collar_vocabulary()?.visible_bytes[id]);
+            } else {
+                let piece = self
+                    .backend
+                    .model
+                    .token_to_piece(token, &mut decoder, true, None)
+                    .context("failed to decode output token")?;
+                output.push_str(&piece);
             }
             batch.clear();
             batch
@@ -869,6 +899,10 @@ impl LlamaCppChatSession<'_> {
             .as_ref()
             .map(|constraint| constraint.stats(&constrained_transcript));
         if let Some(constraint) = tool_constraint.as_ref() {
+            output = constrained_output(
+                &constrained_transcript,
+                finish_reason == FinishReason::MaxTokens,
+            )?;
             constraint.complete_parser_envelope(&mut output)?;
         }
         Ok(Output {
@@ -1187,6 +1221,37 @@ fn sample_and_accept_token(
     sampler.sample(context, logits_index)
 }
 
+fn constrained_output(transcript: &[u8], allow_incomplete_tail: bool) -> Result<String> {
+    match std::str::from_utf8(transcript) {
+        Ok(output) => Ok(output.to_string()),
+        Err(error) if allow_incomplete_tail && error.error_len().is_none() => {
+            Ok(std::str::from_utf8(&transcript[..error.valid_up_to()])
+                .context("llama.cpp constrained transcript has invalid UTF-8 before its tail")?
+                .to_string())
+        }
+        Err(error) => Err(error).context("llama.cpp constrained transcript is not valid UTF-8"),
+    }
+}
+
+fn constrained_generation_error(
+    error: anyhow::Error,
+    transcript: &[u8],
+    show_transcript: bool,
+) -> anyhow::Error {
+    if !show_transcript {
+        return error;
+    }
+    let preview = constrained_output(transcript, true)
+        .unwrap_or_else(|_| String::from_utf8_lossy(transcript).into_owned())
+        .chars()
+        .take(2_000)
+        .collect::<String>();
+    error.context(format!(
+        "incomplete constrained transcript ({} bytes): {preview:?}",
+        transcript.len()
+    ))
+}
+
 fn build_llama_collar_vocabulary(model: &LlamaModel) -> Result<LlamaCollarVocabulary> {
     let size = usize::try_from(model.n_vocab()).context("llama.cpp vocabulary size is invalid")?;
     let mut visible_bytes = Vec::with_capacity(size);
@@ -1225,6 +1290,28 @@ fn token_piece_bytes(model: &LlamaModel, token: LlamaToken, special: bool) -> Re
 }
 
 impl LlamaToolConstraint {
+    fn candidate_checkpoint(&self) -> Result<LlamaCandidateCheckpoint> {
+        let mutation = match self {
+            Self::Qwen(constraint) => constraint.candidate_checkpoint()?,
+            Self::DeepSeek { constraint, .. } => constraint.candidate_checkpoint()?,
+        };
+        Ok(LlamaCandidateCheckpoint { mutation })
+    }
+
+    fn restore_candidate_checkpoint(
+        &self,
+        checkpoint: &mut LlamaCandidateCheckpoint,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen(constraint) => {
+                constraint.restore_candidate_checkpoint(checkpoint.mutation.as_mut())
+            }
+            Self::DeepSeek { constraint, .. } => constraint
+                .restore_candidate_checkpoint(checkpoint.mutation.as_mut())
+                .map_err(Into::into),
+        }
+    }
+
     fn compile(prompt: &str, request: &LlamaCppChatRequest) -> Result<Option<Self>> {
         let tools = llama_chat_tools(&request.tools)?;
         if tools.is_empty() {
@@ -1333,11 +1420,7 @@ impl LlamaToolConstraint {
 
     fn probe(&mut self, transcript: &[u8], at_eos: bool) -> bool {
         match self {
-            Self::Qwen(constraint) => match std::str::from_utf8(transcript) {
-                Ok(decoded) => constraint.probe_transcript(decoded, at_eos),
-                Err(error) if error.error_len().is_none() && !at_eos => true,
-                Err(_) => false,
-            },
+            Self::Qwen(constraint) => qwen_probe_constraint(constraint, transcript, at_eos),
             Self::DeepSeek {
                 constraint,
                 semantic_provider,
@@ -1451,6 +1534,48 @@ impl LlamaToolConstraint {
     }
 }
 
+fn qwen_probe_constraint(
+    constraint: &mut crate::inference::flashmoe::constraints::NativeToolConstraint,
+    transcript: &[u8],
+    at_eos: bool,
+) -> bool {
+    match std::str::from_utf8(transcript) {
+        Ok(decoded) => constraint.probe_transcript(decoded, at_eos),
+        Err(error) if error.error_len().is_none() && !at_eos => {
+            let valid_prefix = &transcript[..error.valid_up_to()];
+            let Ok(decoded_prefix) = std::str::from_utf8(valid_prefix) else {
+                return false;
+            };
+            if !constraint.probe_transcript(decoded_prefix, false) {
+                return false;
+            }
+            let Ok(mut checkpoint) = constraint.candidate_checkpoint() else {
+                return false;
+            };
+            for character in incomplete_utf8_probe_chars(
+                &transcript[error.valid_up_to()..],
+                constraint.utf8_probe_chars(),
+            ) {
+                let mut trial = String::with_capacity(decoded_prefix.len() + character.len_utf8());
+                trial.push_str(decoded_prefix);
+                trial.push(character);
+                let valid = constraint.probe_transcript(&trial, false);
+                if constraint
+                    .restore_candidate_checkpoint(checkpoint.as_mut())
+                    .is_err()
+                {
+                    return false;
+                }
+                if valid {
+                    return true;
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 fn llama_chat_tools(tools: &Value) -> Result<Vec<crate::inference::flashmoe::ChatTool>> {
     let tools = tools
         .as_array()
@@ -1509,6 +1634,10 @@ fn apply_llama_collar_mask(
     vocabulary: &LlamaCollarVocabulary,
     transcript: &[u8],
 ) -> Result<()> {
+    if !constraint.probe(transcript, false) {
+        bail!("llama.cpp control collar candidate base is not a valid transcript prefix");
+    }
+    let mut checkpoint = constraint.candidate_checkpoint()?;
     let mut allowed = 0usize;
     for candidate in &mut candidates.data {
         let id = usize::try_from(candidate.id().0)
@@ -1527,7 +1656,9 @@ fn apply_llama_collar_mask(
             let mut trial = Vec::with_capacity(transcript.len().saturating_add(bytes.len()));
             trial.extend_from_slice(transcript);
             trial.extend_from_slice(bytes);
-            constraint.probe(&trial, at_eos)
+            let valid = constraint.probe(&trial, at_eos);
+            constraint.restore_candidate_checkpoint(&mut checkpoint)?;
+            valid
         };
         if valid {
             allowed = allowed.saturating_add(1);
@@ -1536,7 +1667,23 @@ fn apply_llama_collar_mask(
         }
     }
     if allowed == 0 {
-        bail!("llama.cpp control collar produced an empty full-vocabulary mask");
+        let missing_ascii = (0x20u8..=0x7e)
+            .filter(|byte| {
+                !vocabulary
+                    .visible_bytes
+                    .iter()
+                    .zip(&vocabulary.eos)
+                    .any(|(piece, at_eos)| !at_eos && piece.as_slice() == [*byte])
+            })
+            .map(char::from)
+            .collect::<String>();
+        let mut ascii_i_trial = Vec::with_capacity(transcript.len().saturating_add(1));
+        ascii_i_trial.extend_from_slice(transcript);
+        ascii_i_trial.push(b'i');
+        let ascii_i_valid_after_scan = constraint.probe(&ascii_i_trial, false);
+        bail!(
+            "llama.cpp control collar produced an empty full-vocabulary mask (missing non-EOG single-byte printable ASCII pieces: {missing_ascii:?}; synthetic 'i' valid after scan: {ascii_i_valid_after_scan})"
+        );
     }
     candidates.sorted = false;
     candidates.selected = None;
@@ -1744,6 +1891,17 @@ mod tests {
     }
 
     #[test]
+    fn constrained_output_is_the_exact_validated_utf8_transcript() {
+        assert_eq!(
+            constrained_output(b"<tool_call>{}</tool_call>", false).unwrap(),
+            "<tool_call>{}</tool_call>"
+        );
+        assert_eq!(constrained_output(b"valid\xf0\x9f", true).unwrap(), "valid");
+        assert!(constrained_output(&[0xf0, 0x9f], false).is_err());
+        assert!(constrained_output(&[b'x', 0xff], true).is_err());
+    }
+
+    #[test]
     fn prompt_batch_ranges_splits_prompts_larger_than_batch_capacity() {
         assert_eq!(
             prompt_batch_ranges(1_025, 512),
@@ -1898,6 +2056,7 @@ mod tests {
             mutation_snapshot: None,
             language_layers: None,
             semantic_boundary: None,
+            debug_constrained_transcript: false,
             ctx_size: 128,
             threads: None,
             threads_batch: None,
@@ -1953,6 +2112,7 @@ mod tests {
             mutation_snapshot: Some(pb_control_collar::mutation::WorkspaceSnapshot::default()),
             language_layers: None,
             semantic_boundary: None,
+            debug_constrained_transcript: false,
             ctx_size: 128,
             threads: None,
             threads_batch: None,
@@ -1988,6 +2148,252 @@ mod tests {
     }
 
     #[test]
+    fn llama_mask_validates_bytes_before_an_incomplete_utf8_tail() {
+        let request = LlamaCppChatRequest {
+            messages: json!([]),
+            tools: json!([{
+                "type":"function",
+                "function":{
+                    "name":"submit_plan",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"id":{"type":"string"}},
+                        "required":["id"],
+                        "additionalProperties":false
+                    }
+                }
+            }]),
+            stage_root: None,
+            json_schema: None,
+            tool_constraint_mode:
+                crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired,
+            terminal_tool_names: vec!["submit_plan".to_string()],
+            mutation_snapshot: None,
+            language_layers: None,
+            semantic_boundary: None,
+            debug_constrained_transcript: false,
+            ctx_size: 128,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            max_tokens: 16,
+            top_k: 2,
+            temperature: 0.0,
+            seed: 1,
+        };
+        let mut constraint = LlamaToolConstraint::compile("<tool_call>", &request)
+            .unwrap()
+            .unwrap();
+        let vocabulary = LlamaCollarVocabulary {
+            visible_bytes: vec![b".\xf0".to_vec(), b"{\xf0".to_vec(), b"{\"".to_vec()],
+            eos: vec![false, false, false],
+        };
+        let mut candidates = LlamaTokenDataArray::new(
+            vec![
+                LlamaTokenData::new(LlamaToken::new(0), 10.0, 0.0),
+                LlamaTokenData::new(LlamaToken::new(1), 9.0, 0.0),
+                LlamaTokenData::new(LlamaToken::new(2), 8.0, 0.0),
+            ],
+            false,
+        );
+
+        apply_llama_collar_mask(
+            &mut candidates,
+            &mut constraint,
+            &vocabulary,
+            b"<tool_call>",
+        )
+        .unwrap();
+
+        assert_eq!(candidates.data[0].logit(), f32::NEG_INFINITY);
+        assert_eq!(candidates.data[1].logit(), f32::NEG_INFINITY);
+        assert_eq!(candidates.data[2].logit(), 8.0);
+    }
+
+    #[test]
+    fn llama_patch_mask_keeps_the_exact_context_continuation() {
+        let patch = concat!(
+            "--- a/answer.py\n",
+            "+++ b/answer.py\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-answer: int = 3\n",
+            "+answer: int = 4\n",
+        );
+        let snapshot = pb_control_collar::mutation::WorkspaceSnapshot::new(vec![
+            pb_control_collar::mutation::SnapshotEntry::new(
+                pb_control_collar::mutation::LogicalPath::parse("answer.py").unwrap(),
+                b"answer: int = 3\n".to_vec(),
+            ),
+        ])
+        .unwrap();
+        let request = LlamaCppChatRequest {
+            messages: json!([]),
+            tools: json!([{
+                "type":"function",
+                "function":{
+                    "name":"apply_patch",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"patch":{"type":"string","const":patch}},
+                        "required":["patch"],
+                        "additionalProperties":false
+                    }
+                }
+            }]),
+            stage_root: None,
+            json_schema: None,
+            tool_constraint_mode:
+                crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired,
+            terminal_tool_names: vec!["apply_patch".to_string()],
+            mutation_snapshot: Some(snapshot),
+            language_layers: None,
+            semantic_boundary: None,
+            debug_constrained_transcript: false,
+            ctx_size: 128,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            max_tokens: 16,
+            top_k: 2,
+            temperature: 0.0,
+            seed: 1,
+        };
+        let mut constraint = LlamaToolConstraint::compile("<tool_call>", &request)
+            .unwrap()
+            .unwrap();
+        let transcript = concat!(
+            "<tool_call>\n  {\n    \"name\": \"apply_patch\",\n",
+            "    \"arguments\": {\n      \"patch\": ",
+            "\"--- a/answer.py\\n+++ b/answer.py\\n@@ -1,1 +1,1 @@\\n-answer: ",
+        );
+        let vocabulary = LlamaCollarVocabulary {
+            visible_bytes: vec![b"\xf0\x9f".to_vec(), b"x".to_vec(), b"i".to_vec()],
+            eos: vec![false, false, false],
+        };
+        let mut candidates = LlamaTokenDataArray::new(
+            vec![
+                LlamaTokenData::new(LlamaToken::new(0), 10.0, 0.0),
+                LlamaTokenData::new(LlamaToken::new(1), 9.0, 0.0),
+                LlamaTokenData::new(LlamaToken::new(2), 8.0, 0.0),
+            ],
+            false,
+        );
+
+        apply_llama_collar_mask(
+            &mut candidates,
+            &mut constraint,
+            &vocabulary,
+            transcript.as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(candidates.data[0].logit(), f32::NEG_INFINITY);
+        assert_eq!(candidates.data[1].logit(), f32::NEG_INFINITY);
+        assert_eq!(candidates.data[2].logit(), 8.0);
+        let mut continued = transcript.as_bytes().to_vec();
+        continued.push(b'i');
+        assert!(constraint.probe(&continued, false));
+    }
+
+    #[test]
+    fn llama_patch_mask_preserves_state_across_accepted_prefix_tokens() {
+        let patch = concat!(
+            "--- a/answer.py\n",
+            "+++ b/answer.py\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-answer: int = 3\n",
+            "+answer: int = 4\n",
+        );
+        let snapshot = pb_control_collar::mutation::WorkspaceSnapshot::new(vec![
+            pb_control_collar::mutation::SnapshotEntry::new(
+                pb_control_collar::mutation::LogicalPath::parse("answer.py").unwrap(),
+                b"answer: int = 3\n".to_vec(),
+            ),
+        ])
+        .unwrap();
+        let request = LlamaCppChatRequest {
+            messages: json!([]),
+            tools: json!([{
+                "type":"function",
+                "function":{
+                    "name":"apply_patch",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"patch":{"type":"string","const":patch}},
+                        "required":["patch"],
+                        "additionalProperties":false
+                    }
+                }
+            }]),
+            stage_root: None,
+            json_schema: None,
+            tool_constraint_mode:
+                crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired,
+            terminal_tool_names: vec!["apply_patch".to_string()],
+            mutation_snapshot: Some(snapshot),
+            language_layers: None,
+            semantic_boundary: None,
+            debug_constrained_transcript: false,
+            ctx_size: 128,
+            threads: None,
+            threads_batch: None,
+            gpu_layers: 0,
+            max_tokens: 16,
+            top_k: 2,
+            temperature: 0.0,
+            seed: 1,
+        };
+        let mut constraint = LlamaToolConstraint::compile("<tool_call>", &request)
+            .unwrap()
+            .unwrap();
+        let target = concat!(
+            "<tool_call>\n  {\n    \"name\": \"apply_patch\",\n",
+            "    \"arguments\": {\n      \"patch\": ",
+            "\"--- a/answer.py\\n+++ b/answer.py\\n@@ -1,1 +1,1 @@\\n-answer: int = 3\\n",
+        );
+        let mut pieces = std::collections::BTreeSet::new();
+        pieces.extend((0u8..=0x7f).map(|byte| vec![byte]));
+        for start in 0..target.len() {
+            for end in start + 1..=target.len().min(start.saturating_add(32)) {
+                pieces.insert(target.as_bytes()[start..end].to_vec());
+            }
+        }
+        pieces.extend([
+            vec![0xff],
+            vec![b'i', 0xff],
+            b"int = 3\\n+answer: int = 4\\n\"}}\n</tool_call>".to_vec(),
+        ]);
+        let visible_bytes = pieces.into_iter().collect::<Vec<_>>();
+        let vocabulary = LlamaCollarVocabulary {
+            eos: vec![false; visible_bytes.len()],
+            visible_bytes,
+        };
+        let mut transcript = Vec::new();
+        for (offset, next) in target.bytes().enumerate() {
+            let mut candidates = LlamaTokenDataArray::new(
+                (0..vocabulary.visible_bytes.len())
+                    .map(|id| LlamaTokenData::new(LlamaToken::new(id as i32), 1.0, 0.0))
+                    .collect(),
+                false,
+            );
+            apply_llama_collar_mask(&mut candidates, &mut constraint, &vocabulary, &transcript)
+                .unwrap_or_else(|error| panic!("mask failed at byte {offset}: {error:#}"));
+            let id = vocabulary
+                .visible_bytes
+                .iter()
+                .position(|piece| piece.as_slice() == [next])
+                .unwrap();
+            assert_ne!(
+                candidates.data[id].logit(),
+                f32::NEG_INFINITY,
+                "required byte {next:?} was rejected at transcript offset {offset}"
+            );
+            transcript.push(next);
+        }
+        assert!(constraint.probe(&transcript, false));
+    }
+
+    #[test]
     fn llama_full_vocabulary_mask_rejects_semantic_closure_before_top_k() {
         let request = LlamaCppChatRequest {
             messages: json!([]),
@@ -2016,6 +2422,7 @@ mod tests {
             semantic_boundary: Some(crate::inference::SemanticBoundaryControl::new(
                 RejectSemanticBoundary,
             )),
+            debug_constrained_transcript: false,
             ctx_size: 128,
             threads: None,
             threads_batch: None,

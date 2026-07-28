@@ -17,6 +17,8 @@ pub mod tool;
 pub mod vocabulary;
 
 pub use diagnostics::{CollarError, CollarResult};
-pub use gate::{CompletionDecision, MutationCompletionGate, RejectionCode};
+pub use gate::{
+    CompletionDecision, MutationCandidateCheckpoint, MutationCompletionGate, RejectionCode,
+};
 pub use json::{JsonConstraintFactory, JsonConstraintSession, validate_llguidance_json_schema};
 pub use mask::TokenMask;

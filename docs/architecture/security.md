@@ -133,8 +133,12 @@ The model does not need to supply its target path; pb resolves it from the accep
 records the resolved path in the tool event. Bounded multi-create batches validate every member
 before execution and roll back earlier members after an execution failure. Diagnostic previews
 cannot mint selected-check evidence and are rejected if they alter repository or Git control state.
-An empty constrained candidate frontier preserves only a diagnostic partial transcript, executes no
-call, and can authorize at most one fresh retry of the same mutation capability and target.
+Sibling vocabulary candidates run from one request-local parser, mutation, patch, and language-layer
+checkpoint and are rolled back before the next candidate. An incomplete UTF-8 token fragment is not
+treated as invisible: it remains eligible only when a bounded schema-aware scalar completion can
+still satisfy the active protocol state. An empty constrained candidate frontier preserves only a
+diagnostic partial transcript, executes no call, and can authorize at most one fresh retry of the
+same mutation capability and target.
 Optional contract `work_unit_guidance` is size-bounded advisory prompt text for an exact allowed
 path; it grants no capability, scope, evidence, progress, or stage transition.
 Intrinsic deterministic controller actions preserve the same boundary and cannot be configured or

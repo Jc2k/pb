@@ -709,13 +709,20 @@ JavaScript/JSX, HTML, and CSS. They require UTF-8 and reject error or missing no
 checks explicit element closure and supported embedded JavaScript, TypeScript, JSON, and CSS. This
 is the cross-language baseline, not a general name-resolution, type, borrow, module-resolution,
 CSS-semantics, or Python runtime guarantee. Rust v1 adds only its explicitly promoted import and
-literal/call-shape contradictions. The conservative prefix layer advances only over newly decoded logical
-payload bytes, keeps constant-time persistent-stack checkpoints for candidate branches, and probes
-canonical patch additions/context before line closure; final Tree-sitter validation still decides
-complete-file acceptance. The checked-in tokenizer qualifier covers both production Qwen and
-DeepSeek tokenizer boundaries without loading model weights. Deeper Rust layers and future native
-Python and TypeScript/JavaScript crates use the same versioned event/checkpoint interface only after
-each error class has its own soundness corpus and fail-closed qualification.
+literal/call-shape contradictions. The conservative prefix layer advances only over newly decoded
+logical payload bytes, keeps constant-time persistent-stack checkpoints for candidate branches, and
+probes canonical patch additions/context before line closure; final Tree-sitter validation still
+decides complete-file acceptance. Qwen and DSML byte-BPE fragments that end inside a UTF-8 scalar
+remain eligible only when the active protocol/schema has at least one bounded viable scalar
+completion; candidate probing restores the exact protocol, patch, and language-layer base between
+sibling tokens. The checked-in tokenizer qualifier covers both production Qwen and DeepSeek
+tokenizer boundaries without loading model weights. A hidden no-execution llama.cpp fixture runner
+also loads an exact GGUF and reports complete calls plus content-free constraint counts; one pinned
+Qwen profile passes valid write/patch and fail-closed malformed/truncation cases. This is profile
+evidence, not a claim that every llama.cpp template or the DeepSeek llama.cpp dialect is promoted.
+Deeper Rust layers and future native Python and TypeScript/JavaScript crates use the same versioned
+event/checkpoint interface only after each error class has its own soundness corpus and fail-closed
+qualification.
 
 Strict JSON artifacts use a separate tokenizer-neutral constraint session and cannot be combined with
 native tools in one request. FlashMoe computes the LLGuidance allowed-token set before top-k. On

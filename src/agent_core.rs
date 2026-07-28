@@ -15161,6 +15161,7 @@ fn llama_chat_request(
         mutation_snapshot: None,
         language_layers: None,
         semantic_boundary: None,
+        debug_constrained_transcript: false,
         ctx_size: args.ctx_size,
         threads: args.threads,
         threads_batch: args.threads_batch,
@@ -16388,7 +16389,7 @@ fn escape_json_string_control_chars(input: &str) -> String {
     output
 }
 
-fn parse_model_tool_call_output(content: &mut String) -> Result<Vec<AgentToolCall>> {
+pub(crate) fn parse_model_tool_call_output(content: &mut String) -> Result<Vec<AgentToolCall>> {
     let mut remaining = content.as_str();
     let mut text = String::new();
     let mut tool_calls = Vec::new();

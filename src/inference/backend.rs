@@ -105,6 +105,7 @@ impl InferenceBackend for crate::inference::llamacpp::LlamaCppBackend {
             mutation_snapshot: None,
             language_layers: None,
             semantic_boundary: None,
+            debug_constrained_transcript: false,
             ctx_size: llama_ctx_size(&request.options)?,
             threads: request.options.threads,
             threads_batch: request.options.threads_batch,

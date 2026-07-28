@@ -72,6 +72,13 @@ pub struct MutationCompletionGate {
     language_layers: Option<Arc<Mutex<LanguageLayerStack>>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct MutationCandidateCheckpoint {
+    prefix: Option<PrefixCandidateCheckpoint>,
+    patch: Option<PatchCandidateCheckpoint>,
+    layers: Option<LayerStackCheckpoint>,
+}
+
 impl MutationCompletionGate {
     pub fn new(manifest: CollarManifest) -> Result<Self, CollarError> {
         manifest.validate()?;
@@ -109,6 +116,70 @@ impl MutationCompletionGate {
 
     pub fn manifest(&self) -> &CollarManifest {
         &self.manifest
+    }
+
+    /// Snapshot only request-local streaming parser state before probing sibling vocabulary
+    /// candidates. The immutable workspace and language configuration remain shared.
+    pub fn candidate_checkpoint(&self) -> Result<MutationCandidateCheckpoint, CollarError> {
+        let layers = self
+            .language_layers
+            .as_ref()
+            .map(|layers| {
+                layers
+                    .lock()
+                    .map_err(|_| {
+                        CollarError::Analysis("language-layer stack lock is poisoned".to_string())
+                    })?
+                    .checkpoint()
+            })
+            .transpose()?;
+        let prefix = self
+            .prefix_cache
+            .lock()
+            .map_err(|_| CollarError::Analysis("prefix cache lock is poisoned".to_string()))?
+            .candidate_checkpoint(layers.clone());
+        let patch = self
+            .patch_cache
+            .lock()
+            .map_err(|_| CollarError::Mutation("patch cache lock is poisoned".to_string()))?
+            .candidate_checkpoint(layers.clone());
+        Ok(MutationCandidateCheckpoint {
+            prefix,
+            patch,
+            layers,
+        })
+    }
+
+    /// Roll every speculative parser/language layer back to the exact candidate-batch base.
+    pub fn restore_candidate_checkpoint(
+        &self,
+        checkpoint: &mut MutationCandidateCheckpoint,
+    ) -> Result<(), CollarError> {
+        let refreshed_layers = match (&self.language_layers, checkpoint.layers.clone()) {
+            (Some(layers), Some(layer_checkpoint)) => {
+                let mut layers = layers.lock().map_err(|_| {
+                    CollarError::Analysis("language-layer stack lock is poisoned".to_string())
+                })?;
+                layers.rollback(layer_checkpoint)?;
+                Some(layers.checkpoint()?)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(CollarError::Analysis(
+                    "candidate checkpoint does not match its language-layer stack".to_string(),
+                ));
+            }
+        };
+        self.prefix_cache
+            .lock()
+            .map_err(|_| CollarError::Analysis("prefix cache lock is poisoned".to_string()))?
+            .restore_candidate_checkpoint(checkpoint.prefix.as_ref(), refreshed_layers.clone())?;
+        self.patch_cache
+            .lock()
+            .map_err(|_| CollarError::Mutation("patch cache lock is poisoned".to_string()))?
+            .restore_candidate_checkpoint(checkpoint.patch.as_ref(), refreshed_layers.clone())?;
+        checkpoint.layers = refreshed_layers;
+        Ok(())
     }
 
     pub fn evaluate(&self, name: &str, arguments: &Value) -> CompletionDecision {
@@ -827,7 +898,62 @@ struct CombinedPrefixReport {
     semantic: Option<Analysis>,
 }
 
+#[derive(Clone, Debug)]
+struct PrefixCandidateCheckpoint {
+    identity: PrefixProbeIdentity,
+    generated_prefix: Vec<u8>,
+    prefix: PrefixCheckpoint,
+}
+
 impl PrefixProbeCache {
+    fn candidate_checkpoint(
+        &mut self,
+        layers: Option<LayerStackCheckpoint>,
+    ) -> Option<PrefixCandidateCheckpoint> {
+        self.entry.as_mut().map(|entry| {
+            let prefix = entry.oracle.checkpoint();
+            entry.checkpoints = vec![PrefixProbeCheckpoint {
+                payload_len: entry.generated_prefix.len(),
+                prefix: prefix.clone(),
+                layers,
+            }];
+            PrefixCandidateCheckpoint {
+                identity: entry.identity.clone(),
+                generated_prefix: entry.generated_prefix.clone(),
+                prefix,
+            }
+        })
+    }
+
+    fn restore_candidate_checkpoint(
+        &mut self,
+        checkpoint: Option<&PrefixCandidateCheckpoint>,
+        layers: Option<LayerStackCheckpoint>,
+    ) -> Result<(), CollarError> {
+        let Some(checkpoint) = checkpoint else {
+            self.entry = None;
+            return Ok(());
+        };
+        let entry = self.entry.as_mut().ok_or_else(|| {
+            CollarError::Analysis("prefix candidate cache disappeared during probing".to_string())
+        })?;
+        if entry.identity != checkpoint.identity {
+            return Err(CollarError::Analysis(
+                "prefix candidate identity changed during probing".to_string(),
+            ));
+        }
+        entry.oracle.rollback(checkpoint.prefix.clone())?;
+        entry
+            .generated_prefix
+            .clone_from(&checkpoint.generated_prefix);
+        entry.checkpoints = vec![PrefixProbeCheckpoint {
+            payload_len: checkpoint.generated_prefix.len(),
+            prefix: checkpoint.prefix.clone(),
+            layers,
+        }];
+        Ok(())
+    }
+
     fn probe(
         &mut self,
         identity: PrefixProbeIdentity,
@@ -952,6 +1078,13 @@ struct PatchProbeCache {
     entry: Option<CachedPatchProbe>,
 }
 
+#[derive(Clone, Debug)]
+struct PatchCandidateCheckpoint {
+    generated_prefix: Vec<u8>,
+    patch: PatchCheckpoint,
+    mirror: PatchLayerMirror,
+}
+
 #[derive(Debug)]
 struct CachedPatchProbe {
     stream: PatchStream,
@@ -983,6 +1116,52 @@ struct PatchLayerFileMirror {
 }
 
 impl PatchProbeCache {
+    fn candidate_checkpoint(
+        &mut self,
+        layers: Option<LayerStackCheckpoint>,
+    ) -> Option<PatchCandidateCheckpoint> {
+        self.entry.as_mut().map(|entry| {
+            let patch = entry.stream.checkpoint();
+            entry.checkpoints = vec![PatchProbeCheckpoint {
+                payload_len: entry.generated_prefix.len(),
+                patch: patch.clone(),
+                mirror: entry.mirror.clone(),
+                layers,
+            }];
+            PatchCandidateCheckpoint {
+                generated_prefix: entry.generated_prefix.clone(),
+                patch,
+                mirror: entry.mirror.clone(),
+            }
+        })
+    }
+
+    fn restore_candidate_checkpoint(
+        &mut self,
+        checkpoint: Option<&PatchCandidateCheckpoint>,
+        layers: Option<LayerStackCheckpoint>,
+    ) -> Result<(), CollarError> {
+        let Some(checkpoint) = checkpoint else {
+            self.entry = None;
+            return Ok(());
+        };
+        let entry = self.entry.as_mut().ok_or_else(|| {
+            CollarError::Mutation("patch candidate cache disappeared during probing".to_string())
+        })?;
+        entry.stream.rollback(checkpoint.patch.clone())?;
+        entry
+            .generated_prefix
+            .clone_from(&checkpoint.generated_prefix);
+        entry.mirror = checkpoint.mirror.clone();
+        entry.checkpoints = vec![PatchProbeCheckpoint {
+            payload_len: checkpoint.generated_prefix.len(),
+            patch: checkpoint.patch.clone(),
+            mirror: checkpoint.mirror.clone(),
+            layers,
+        }];
+        Ok(())
+    }
+
     fn probe(
         &mut self,
         manifest: &CollarManifest,
@@ -1370,6 +1549,45 @@ mod tests {
                 &patch_arguments,
                 &format!("{patch_common}+value = [1, 2]")
             ),
+            CompletionDecision::Accept
+        );
+    }
+
+    #[test]
+    fn candidate_checkpoint_restores_exact_patch_and_language_state() {
+        let path = LogicalPath::parse("main.py").unwrap();
+        let layer = MockRustLayer::new();
+        let stack =
+            LanguageLayerStack::new(vec![Box::new(layer)], ProgramSnapshot::default()).unwrap();
+        let gate = MutationCompletionGate::with_language_layers(
+            manifest(vec![SnapshotEntry::new(path, b"value = (1)\n".to_vec())]),
+            stack,
+        )
+        .unwrap();
+        let arguments = serde_json::Map::new();
+        let common = concat!(
+            "--- a/main.py\n",
+            "+++ b/main.py\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-value = ",
+        );
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, common),
+            CompletionDecision::Accept
+        );
+        let mut checkpoint = gate.candidate_checkpoint().unwrap();
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, &format!("{common}x")),
+            CompletionDecision::Reject(RejectionCode::InvalidPatch)
+        );
+        gate.restore_candidate_checkpoint(&mut checkpoint).unwrap();
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, &format!("{common}(")),
+            CompletionDecision::Accept
+        );
+        gate.restore_candidate_checkpoint(&mut checkpoint).unwrap();
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, &format!("{common}(")),
             CompletionDecision::Accept
         );
     }

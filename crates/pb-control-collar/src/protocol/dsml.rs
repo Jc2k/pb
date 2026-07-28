@@ -9,6 +9,7 @@ use crate::{
     CollarError, CollarResult, CompletionDecision, MutationCompletionGate, RejectionCode,
     analysis::LanguageLayerStack,
     tool::{CollarManifest, ToolConstraintMode},
+    vocabulary::{incomplete_utf8_probe_chars, schema_utf8_probe_chars},
 };
 
 pub const CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
@@ -48,6 +49,7 @@ pub struct DsmlConstraint {
     schemas: BTreeMap<String, Value>,
     terminal_tools: BTreeSet<String>,
     mutation_gate: Option<MutationCompletionGate>,
+    utf8_probe_chars: Vec<char>,
 }
 
 impl DsmlConstraint {
@@ -79,12 +81,34 @@ impl DsmlConstraint {
                 )));
             }
         }
+        let utf8_probe_chars = schema_utf8_probe_chars(&schemas, &['｜']);
         Ok(Self {
             mode: manifest.mode,
             schemas,
             terminal_tools: manifest.terminal_tools.into_iter().collect(),
             mutation_gate,
+            utf8_probe_chars,
         })
+    }
+
+    pub fn candidate_checkpoint(&self) -> CollarResult<Option<crate::MutationCandidateCheckpoint>> {
+        self.mutation_gate
+            .as_ref()
+            .map(MutationCompletionGate::candidate_checkpoint)
+            .transpose()
+    }
+
+    pub fn restore_candidate_checkpoint(
+        &self,
+        checkpoint: Option<&mut crate::MutationCandidateCheckpoint>,
+    ) -> CollarResult<()> {
+        match (self.mutation_gate.as_ref(), checkpoint) {
+            (Some(gate), Some(checkpoint)) => gate.restore_candidate_checkpoint(checkpoint),
+            (None, None) => Ok(()),
+            _ => Err(CollarError::Analysis(
+                "DSML candidate checkpoint does not match its mutation gate".to_string(),
+            )),
+        }
     }
 
     pub fn probe(&self, transcript: &[u8], at_eos: bool) -> DsmlProbe {
@@ -95,10 +119,44 @@ impl DsmlConstraint {
                 let Ok(decoded) = std::str::from_utf8(valid) else {
                     return invalid_probe(None);
                 };
-                return self.probe(decoded.as_bytes(), false);
+                let base = self.probe_decoded(decoded, false);
+                if !base.valid {
+                    return base;
+                }
+                let Ok(mut checkpoint) = self.candidate_checkpoint() else {
+                    return invalid_probe(None);
+                };
+                for character in incomplete_utf8_probe_chars(
+                    &transcript[error.valid_up_to()..],
+                    &self.utf8_probe_chars,
+                ) {
+                    let mut trial = String::with_capacity(decoded.len() + character.len_utf8());
+                    trial.push_str(decoded);
+                    trial.push(character);
+                    let valid = self.probe_decoded(&trial, false).valid;
+                    if self
+                        .restore_candidate_checkpoint(checkpoint.as_mut())
+                        .is_err()
+                    {
+                        return invalid_probe(None);
+                    }
+                    if valid {
+                        return DsmlProbe {
+                            valid: true,
+                            complete: false,
+                            complete_terminal_call: false,
+                            rejection: None,
+                        };
+                    }
+                }
+                return invalid_probe(None);
             }
             Err(_) => return invalid_probe(None),
         };
+        self.probe_decoded(decoded, at_eos)
+    }
+
+    fn probe_decoded(&self, decoded: &str, at_eos: bool) -> DsmlProbe {
         let Some(start) = decoded.find(CALLS_OPEN) else {
             if let Some(marker) = decoded.rfind("｜DSML｜") {
                 let structural_start = decoded[..marker].rfind('<').unwrap_or(marker);
@@ -1054,6 +1112,23 @@ mod tests {
         let complete = format!("{valid}{PARAMETER_CLOSE}\n{INVOKE_CLOSE}\n{CALLS_CLOSE}");
         let probe = constraint.probe(complete.as_bytes(), false);
         assert!(probe.valid && probe.complete && probe.complete_terminal_call);
+    }
+
+    #[test]
+    fn incomplete_utf8_requires_a_viable_dsml_continuation() {
+        let constraint = constraint();
+        let mut structural = format!("{CALLS_OPEN}\n{INVOKE_OPEN}").into_bytes();
+        structural.push(0xc3);
+        assert!(!constraint.probe(&structural, false).valid);
+
+        let mut string_value = format!(
+            "{CALLS_OPEN}\n{INVOKE_OPEN}write_file\">\n{PARAMETER_OPEN}path\" string=\"true\">"
+        )
+        .into_bytes();
+        string_value.push(0xc3);
+        assert!(constraint.probe(&string_value, false).valid);
+        string_value.push(0xa9);
+        assert!(constraint.probe(&string_value, false).valid);
     }
 
     #[test]

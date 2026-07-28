@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{CollarError, CollarResult};
 
@@ -26,6 +27,118 @@ pub struct VocabularyEntry {
 pub struct Vocabulary {
     entries: Vec<VocabularyEntry>,
     eos_tokens: BTreeSet<u32>,
+}
+
+pub const MAX_SCHEMA_UTF8_PROBE_CHARS: usize = 4_096;
+
+/// Collect non-ASCII scalar values that carry exact schema/protocol meaning during a split UTF-8
+/// token probe. Dialects add their own non-ASCII structural characters through `extras`.
+pub fn schema_utf8_probe_chars(schemas: &BTreeMap<String, Value>, extras: &[char]) -> Vec<char> {
+    fn collect(value: &Value, chars: &mut BTreeSet<char>) {
+        if chars.len() >= MAX_SCHEMA_UTF8_PROBE_CHARS {
+            return;
+        }
+        match value {
+            Value::String(value) => {
+                for character in value.chars().filter(|ch| !ch.is_ascii()) {
+                    if chars.len() >= MAX_SCHEMA_UTF8_PROBE_CHARS {
+                        break;
+                    }
+                    chars.insert(character);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    collect(value, chars);
+                    if chars.len() >= MAX_SCHEMA_UTF8_PROBE_CHARS {
+                        break;
+                    }
+                }
+            }
+            Value::Object(values) => {
+                for (key, value) in values {
+                    for character in key.chars().filter(|ch| !ch.is_ascii()) {
+                        if chars.len() >= MAX_SCHEMA_UTF8_PROBE_CHARS {
+                            break;
+                        }
+                        chars.insert(character);
+                    }
+                    collect(value, chars);
+                    if chars.len() >= MAX_SCHEMA_UTF8_PROBE_CHARS {
+                        break;
+                    }
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+
+    let mut chars = extras
+        .iter()
+        .copied()
+        .take(MAX_SCHEMA_UTF8_PROBE_CHARS)
+        .collect::<BTreeSet<_>>();
+    for (name, schema) in schemas {
+        for character in name.chars().filter(|ch| !ch.is_ascii()) {
+            if chars.len() >= MAX_SCHEMA_UTF8_PROBE_CHARS {
+                break;
+            }
+            chars.insert(character);
+        }
+        collect(schema, &mut chars);
+        if chars.len() >= MAX_SCHEMA_UTF8_PROBE_CHARS {
+            break;
+        }
+    }
+    chars.into_iter().collect()
+}
+
+/// Produce a bounded set of complete scalars that can extend an incomplete UTF-8 tail. Exact
+/// schema scalars are retained; representative continuation bytes cover unconstrained string and
+/// prose positions without enumerating an entire Unicode plane in the vocabulary hot path.
+pub fn incomplete_utf8_probe_chars(tail: &[u8], schema_chars: &[char]) -> Vec<char> {
+    let expected_len = match tail.first().copied() {
+        Some(0xc2..=0xdf) => 2,
+        Some(0xe0..=0xef) => 3,
+        Some(0xf0..=0xf4) => 4,
+        _ => return Vec::new(),
+    };
+    if tail.len() >= expected_len {
+        return Vec::new();
+    }
+
+    let mut candidates = BTreeSet::new();
+    candidates.extend(schema_chars.iter().copied().filter(|character| {
+        let mut bytes = [0u8; 4];
+        character
+            .encode_utf8(&mut bytes)
+            .as_bytes()
+            .starts_with(tail)
+    }));
+    const REPRESENTATIVE_CONTINUATIONS: [u8; 6] = [0x80, 0x8f, 0x9f, 0xa0, 0xb0, 0xbf];
+    fn add_representatives(
+        bytes: &mut Vec<u8>,
+        expected_len: usize,
+        candidates: &mut BTreeSet<char>,
+    ) {
+        if bytes.len() == expected_len {
+            if let Ok(value) = std::str::from_utf8(bytes)
+                && let Some(character) = value.chars().next()
+                && character.len_utf8() == value.len()
+            {
+                candidates.insert(character);
+            }
+            return;
+        }
+        for byte in REPRESENTATIVE_CONTINUATIONS {
+            bytes.push(byte);
+            add_representatives(bytes, expected_len, candidates);
+            bytes.pop();
+        }
+    }
+    let mut bytes = tail.to_vec();
+    add_representatives(&mut bytes, expected_len, &mut candidates);
+    candidates.into_iter().collect()
 }
 
 impl Vocabulary {
@@ -157,6 +270,8 @@ impl Vocabulary {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -204,6 +319,38 @@ mod tests {
         assert_eq!(
             vocabulary.llguidance_token_bytes(0xff),
             vec![b"a".to_vec(), vec![0xff]]
+        );
+    }
+
+    #[test]
+    fn utf8_probe_candidates_preserve_exact_schema_scalars_with_bounded_fallbacks() {
+        let schemas = BTreeMap::from([(
+            "submit_💡".to_string(),
+            json!({
+                "type":"object",
+                "properties":{"café":{"type":"string","const":"💡"}}
+            }),
+        )]);
+        let schema_chars = schema_utf8_probe_chars(&schemas, &['｜']);
+        assert!(schema_chars.contains(&'é'));
+        assert!(schema_chars.contains(&'💡'));
+        assert!(schema_chars.contains(&'｜'));
+
+        let candidates = incomplete_utf8_probe_chars(&[0xf0, 0x9f], &schema_chars);
+        assert!(candidates.contains(&'💡'));
+        assert!(candidates.len() <= 37);
+        assert!(incomplete_utf8_probe_chars(&[0xff], &schema_chars).is_empty());
+
+        let many_scalars = (0x1000..0x1000 + MAX_SCHEMA_UTF8_PROBE_CHARS as u32 + 32)
+            .filter_map(char::from_u32)
+            .collect::<String>();
+        let large = BTreeMap::from([(
+            "tool".to_string(),
+            json!({"type":"string","const":many_scalars}),
+        )]);
+        assert_eq!(
+            schema_utf8_probe_chars(&large, &[]).len(),
+            MAX_SCHEMA_UTF8_PROBE_CHARS
         );
     }
 }

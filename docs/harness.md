@@ -570,6 +570,17 @@ are canonical repository-relative paths and the same 32 MiB production bound app
 fixture surface is for deterministic Qwen/DeepSeek tokenizer and mutation-gate qualification; it is
 not a configuration switch and never reads or writes the named workspace files.
 Reproducible Python create and patch examples are checked in under `fixtures/control-collar/`.
+`pb harness llama-infer PROMPT --model MODEL.gguf --tool-fixture FIXTURE.json` is the corresponding
+exact-GGUF qualification surface for the production llama.cpp adapter. It loads the named local
+model, forces the fixture's native tool call through the full-vocabulary collar, never executes the
+returned mutation, and prints a JSON report containing token/timing counts, the content-free
+constraint report, and complete parsed calls. It exits nonzero for an empty candidate frontier,
+token exhaustion without a complete call, a malformed call, or fixture/model setup failure.
+`--show-transcript` is an explicit local debugging opt-in that can print generated tool arguments or
+source fragments to the terminal on failure; normal runs omit that sensitive preview. The command is
+bounded by `--max-tokens`, does not persist the transcript, and may report the existing CPU-only
+correctness fallback when accelerated context creation fails. It qualifies one exact
+model/tokenizer/template profile and does not promote unrelated GGUFs or dialects.
 `pb harness collar-qualify` is the model-free promotion surface for the source-prefix layer. It
 loads the exact tokenizer and tokenizer-configuration artifacts selected by `--model`, replays the
 versioned `fixtures/control-collar/prefix-language-v1.json` corpus at every real token boundary,

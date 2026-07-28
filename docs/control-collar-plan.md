@@ -45,9 +45,12 @@ Current implementation ledger:
 - **Phase 8 adapter implemented:** llama.cpp now masks the full vocabulary before sampling
   truncation, accepts sampler state once, reuses both tool dialects and the shared executor, and
   reports the same guarantee/rejection fields. Fresh and cached Qwen requests also complete only a
-  missing deterministic parser-envelope suffix after semantic termination. One pinned Qwen profile
-  has crossed constrained planning and review; write/patch/malformed/truncation and differential
-  qualification remain before any broad backend-parity claim.
+  missing deterministic parser-envelope suffix after semantic termination. Candidate probes use
+  exact request-local parser, patch, and language-layer checkpoints; incomplete byte-BPE UTF-8 tails
+  remain open only when a bounded schema-aware scalar completion can still satisfy the active wire
+  grammar. One pinned Qwen profile now passes direct valid-write, exact context-sensitive patch,
+  invalid-source, stale-context, and token-truncation cases. DeepSeek-dialect live-model,
+  differential, and throughput qualification remain before any broad backend-parity claim.
 - **Phase 9 capability only:** both backends explicitly report `candidate_probe_only`. The replay
   and snapshot variants exist as typed future capability names but are not implemented or inferred
   from session caches.
@@ -269,8 +272,9 @@ The current implementation has these concrete boundaries:
   candidate diagnostic debt, reject definite classified errors at mutation-payload closure, and
   repeat the transaction gate before publication. This is opt-in and defaults to disabled;
 - llama.cpp has a full-vocabulary pre-truncation adapter for both supported dialects and shares the
-  constrained mutation/executor path, but pinned live model/tokenizer/template qualification is
-  still outstanding; and
+  constrained mutation/executor path. A pinned Qwen2.5-Coder GGUF passes the direct write/patch and
+  fail-closed malformed/truncation matrix; pinned DeepSeek-dialect, differential, and throughput
+  qualification is still outstanding; and
 - the executor independently reconstructs the mutation, verifies live bases and syntax, publishes
   file writes atomically, and requires exact `git apply --check`/`git apply` parity for constrained
   patches without `--recount`.
@@ -1092,13 +1096,13 @@ workspace, not an earlier phase branch.
 
 | Evidence | Status | Current result |
 | --- | --- | --- |
-| Collar unit and chunk-boundary corpus | Passed | 61 deterministic tests, including all six language families plus TSX/JSX, byte/random chunk equivalence, monotonic hard rejection, source-length-only Rust branch rollback, partial patch-line probing, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches, malformed patch corpus, controller-bound and scalar-exact Qwen/DSML payload closure, immutable semantic identities/debt and receipts, and control-token identity |
+| Collar unit and chunk-boundary corpus | Passed | 65 deterministic tests, including all six language families plus TSX/JSX, byte/random chunk equivalence, monotonic hard rejection, source-length-only Rust branch rollback, transactional sibling-candidate restoration, viable split-UTF-8 Qwen/DSML boundaries, partial patch-line probing, embedded HTML languages, virtual write replacement, exact multi-hunk/create/delete patches, malformed patch corpus, controller-bound and scalar-exact Qwen/DSML payload closure, immutable semantic identities/debt and receipts, and control-token identity |
 | Qwen native constraint corpus | Passed | Focused native tests cover closure rejection for invalid syntax, the one-mutation batch bound, content-first pathless target-bound calls, and model paths that cannot override controller authority |
 | Scalar exact-schema constraints | Passed | Qwen JSON and DeepSeek DSML both enforce scalar `const`; completed alternate values are rejected, incomplete string prefixes remain open only while they can reach the exact value, contradictory `const`/`enum` schemas fail preflight, and object/array `const` remain unsupported |
 | DeepSeek DSML renderer/parser corpus | Passed | 3 focused root tests plus 3 collar DSML tests for typed parameters, ordered JSON-string mutation history, closure boundaries, and exact scalar paths |
 | Workspace format/check/Clippy | Passed | `cargo fmt --all -- --check`, `cargo check --workspace --all-targets -j 1`, and the repository warning/correctness Clippy gate |
 | Executor and event focused tests | Passed | Snapshot freshness, exact patch/Git differential result, inexact hunk rejection, and additive/backward-compatible event round trip |
-| Workspace all-target tests | Passed | On 2026-07-28, 1,477 root tests passed with 24 device/environment/qualification tests ignored, 2 environment-contract tests passed, all 61 collar tests passed, and all 8 native Rust tests passed |
+| Workspace all-target tests | Passed | On 2026-07-28, 1,482 root tests passed with 24 device/environment/qualification tests ignored, 2 environment-contract tests passed, all 65 collar tests passed, and all 8 native Rust tests passed |
 | Web and documentation tests | Passed | 76 web tests passed; mdBook and link validation checked 59 pages and 98 rendered files |
 | Production asset/release build | Passed | On 2026-07-28, web assets and the optimized macOS arm64 release binary rebuilt successfully |
 | Required FlashMoe one-token smoke | Quality gate failed | On 2026-07-28, the rebuilt release binary again exited zero but printed `5` for `2+2=`; token `4` was second by 0.320473 logit. The repository gate requires a sensible answer, so promotion remains blocked. Existing upstream-parity evidence classifies this as checkpoint/model quality rather than a collar failure, and no output correction is permitted |
@@ -1114,7 +1118,7 @@ workspace, not an earlier phase branch.
 | Current live write/patch fixtures | Passed | On 2026-07-28, the rebuilt release binary compiled the checked-in Qwen fixture containing exact path `const`, generated exactly `answer.py` with valid Python after 21 rejected candidates, and generated the exact snapshot-valid canonical one-line patch after 20 rejected candidates and one invalid-argument closure rejection |
 | Phase 7 native Rust production qualification | Partially passed; promotion blocked | Focused implementation, strict workspace gates, representative cold/warm/replay measurement, one current end-to-end Rust edit, and current live write/patch generation pass. The required FlashMoe arithmetic smoke is currently nonsensical; representative large projects, cancellation, sustained concurrency/memory, and longer randomized rollback corpora still gate promotion beyond the narrow shipped v1 claim |
 | Phase 7 deeper/later language profiles | Pending | Rust macro/build-script/compiler parity, `pb-control-python`/Astral `ty`, and `pb-control-typescript` project matrices ship independently after their own soundness, lifecycle, multi-file, dependency, cancellation, latency, and final-replay evidence |
-| Phase 8 live llama.cpp profiles | Partially passed | Preserved Qwen2.5-Coder-7B GGUF run `1785224314409-33712-0` exposed a backend defect: the collar reported `complete_terminal_tool_call`, but llama.cpp returned the completed JSON body without the required parser envelope close, so the shared parser rejected it. After the exact-suffix fix, identical run `1785225019481-34844-0` accepted constrained `submit_plan` and `submit_plan_review` through fresh and cached sessions. It later failed safely at the step limit after the model twice omitted `write_file.completion.id`; no fixture mutation occurred. Pinned write/patch/malformed/truncation, DeepSeek-dialect, performance, and FlashMoe differential runs still gate a backend-parity claim |
+| Phase 8 live llama.cpp profiles | Qwen direct matrix passed; broader parity pending | On 2026-07-28, the final rebuilt binary and exact local Qwen2.5-Coder-7B Q4_K_M GGUF passed the no-execution `llama-infer` fixture matrix through the production CPU-fallback adapter. A valid Python write closed in 41 tokens/11.840 s after 5,587,481 rejected candidates. The exact immutable-snapshot patch closed in 72 tokens/25.506 s after 11,426,985 rejected candidates and returned the canonical hunk byte-for-byte. An exact invalid Python constant and an exact stale-context patch each reached an empty full-vocabulary frontier and exited nonzero without a call; a one-token cap likewise returned no call. These runs exposed and fixed structural-whitespace, partial-hunk, returned-byte/validated-byte, incomplete UTF-8/JSON escape, canonical scalar-wire, and speculative candidate-state defects. The earlier workflow envelope-close fix remains covered. Live DeepSeek-dialect GGUF, FlashMoe/llama mask differential, repeated throughput/resource, and unsupported-profile preflight runs still gate a backend-parity claim. |
 | Pinned DeepSeek direct mutation qualification | Passed | The checked-in `fixtures/control-collar/` inputs produced syntax-valid `answer.py` after 2 candidate rejections and an exact snapshot-bound one-line patch after 8, reporting 1 file and 16 snapshot bytes; an alternate capped patch attempt reported 7 `invalid_patch` closure rejections and executed no call |
 | Pinned DeepSeek strict workflow | Passed | An 11-invocation delivery crossed tool-schema narrowing, reused unchanged exact roots, cold-started changed roots, executed constrained `write_file`, passed review, and ended `contract_status=satisfied`, `verified_completed=true` |
 | DeepSeek candidate-probe budget | Passed | On the same patch prompt and pinned checkpoint, current-release constrained decode sustained 7.678 tokens/s versus 9.358 tokens/s unconstrained, a 18.0% reduction within the accepted 25% qualification ceiling |
@@ -1202,6 +1206,12 @@ throughput budgets. Rust, TypeScript/JavaScript, and Python ship independently. 
 their syntax claim until a separately scoped semantic provider is justified.
 
 ### Phase 8 — llama.cpp control-collar parity
+
+Implementation status: **8A–8C implemented; the pinned Qwen direct 8D mutation matrix passes and
+broader parity remains in qualification.** The adapter now has an explicit no-execution GGUF fixture
+surface, exact candidate transactions, repairable UTF-8 byte-tail probing, and fail-closed
+empty-frontier/truncation behavior. A live DeepSeek-dialect GGUF, cross-backend mask differential,
+repeat throughput/resource bounds, and unsupported-profile preflight evidence remain.
 
 - **8A — Add a native vocabulary adapter.** Build the collar vocabulary from exact llama.cpp token
   bytes, marker-only special-token identities, and every end-of-generation token. Bind dialect and

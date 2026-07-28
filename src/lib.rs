@@ -7,6 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, RANGE};
 use serde::{Deserialize, Serialize};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Duration, Instant, sleep};
@@ -482,9 +483,60 @@ pub enum HarnessCommand {
     /// Qualify real-tokenizer source-prefix reachability, rollback, and latency
     #[command(name = "collar-qualify", hide = true)]
     CollarQualify(HarnessCollarQualifyArgs),
+    /// Run one bounded llama.cpp native-tool fixture without executing the generated mutation
+    #[command(name = "llama-infer", hide = true)]
+    LlamaInfer(HarnessLlamaInferArgs),
     /// Qualify a digest-pinned semantic provider against a versioned mutation corpus
     #[command(name = "semantic-qualify", hide = true)]
     SemanticQualify(HarnessSemanticQualifyArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HarnessLlamaInferArgs {
+    /// Prompt to send through the model's exact chat template
+    pub prompt: String,
+
+    /// Exact GGUF model file to load
+    #[arg(long, value_name = "GGUF")]
+    pub model: PathBuf,
+
+    /// Versioned native-tool fixture and immutable mutation snapshot
+    #[arg(long, value_name = "PATH")]
+    pub tool_fixture: PathBuf,
+
+    /// Maximum generated tokens
+    #[arg(long, default_value_t = 256)]
+    pub max_tokens: i32,
+
+    /// Context size
+    #[arg(long, default_value_t = 32768)]
+    pub ctx_size: u32,
+
+    #[arg(long)]
+    pub threads: Option<i32>,
+
+    #[arg(long)]
+    pub threads_batch: Option<i32>,
+
+    /// Number of transformer layers to offload to the GPU
+    #[arg(long, default_value_t = GPU_FULL_OFFLOAD)]
+    pub gpu_layers: u32,
+
+    /// Sampling temperature; 0.0 is deterministic
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+
+    /// Top-k candidates to sample from
+    #[arg(long, default_value_t = 1)]
+    pub top_k: i32,
+
+    /// RNG seed
+    #[arg(long, default_value_t = 1)]
+    pub seed: u32,
+
+    /// Print the bounded generated wire transcript on a failed qualification
+    #[arg(long)]
+    pub show_transcript: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2544,6 +2596,7 @@ fn run_harness_command(command: HarnessCommand) -> Result<()> {
             harness_eval::run_action_elision_eval_command(args)
         }
         HarnessCommand::CollarQualify(args) => run_collar_qualification(args),
+        HarnessCommand::LlamaInfer(args) => run_llama_tool_fixture(args),
         HarnessCommand::SemanticQualify(args) => run_semantic_qualification(args),
     }
 }
@@ -2657,7 +2710,7 @@ fn format_cache_bytes(bytes: u64) -> String {
     }
 }
 
-fn load_flashmoe_tool_fixture(
+fn load_tool_fixture(
     path: &Path,
 ) -> Result<(
     Vec<inference::flashmoe::ChatTool>,
@@ -2666,9 +2719,29 @@ fn load_flashmoe_tool_fixture(
 )> {
     const MAX_FIXTURE_FILES: usize = 32;
     const MAX_FIXTURE_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_FIXTURE_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_FIXTURE_TOOLS: usize = 64;
 
-    let bytes = std::fs::read(path)
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open tool fixture {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect tool fixture {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("tool fixture is not a regular file: {}", path.display());
+    }
+    if metadata.len() > MAX_FIXTURE_DOCUMENT_BYTES {
+        bail!("tool fixture exceeds the {MAX_FIXTURE_DOCUMENT_BYTES}-byte document limit");
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(MAX_FIXTURE_DOCUMENT_BYTES)).unwrap_or(0),
+    );
+    file.take(MAX_FIXTURE_DOCUMENT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read tool fixture {}", path.display()))?;
+    if bytes.len() as u64 > MAX_FIXTURE_DOCUMENT_BYTES {
+        bail!("tool fixture exceeds the {MAX_FIXTURE_DOCUMENT_BYTES}-byte document limit");
+    }
     let fixture = serde_json::from_slice::<FlashMoeToolFixture>(&bytes)
         .with_context(|| format!("failed to parse tool fixture {}", path.display()))?;
     if fixture.version != 1 {
@@ -2676,6 +2749,9 @@ fn load_flashmoe_tool_fixture(
     }
     if fixture.tools.is_empty() {
         bail!("tool fixture must expose at least one tool");
+    }
+    if fixture.tools.len() > MAX_FIXTURE_TOOLS {
+        bail!("tool fixture exceeds the {MAX_FIXTURE_TOOLS}-tool limit");
     }
     if fixture.files.len() > MAX_FIXTURE_FILES {
         bail!("tool fixture exceeds the {MAX_FIXTURE_FILES}-file snapshot limit");
@@ -2720,6 +2796,154 @@ fn load_flashmoe_tool_fixture(
     }
 
     Ok((fixture.tools, fixture.terminal_tool_names, snapshot))
+}
+
+fn run_llama_tool_fixture(args: HarnessLlamaInferArgs) -> Result<()> {
+    if args.prompt.trim().is_empty() {
+        bail!("prompt cannot be empty");
+    }
+    if args.max_tokens < 1 {
+        bail!("--max-tokens must be at least 1");
+    }
+    if args.ctx_size == 0 {
+        bail!("--ctx-size must be at least 1");
+    }
+    if args.top_k < 1 {
+        bail!("--top-k must be at least 1");
+    }
+    if !args.temperature.is_finite() || args.temperature < 0.0 {
+        bail!("--temperature must be finite and non-negative");
+    }
+    if args.threads.is_some_and(|threads| threads < 1) {
+        bail!("--threads must be at least 1");
+    }
+    if args
+        .threads_batch
+        .is_some_and(|threads_batch| threads_batch < 1)
+    {
+        bail!("--threads-batch must be at least 1");
+    }
+    if !args.model.is_file() {
+        bail!(
+            "llama.cpp GGUF model does not exist: {}",
+            args.model.display()
+        );
+    }
+
+    let (tools, terminal_tool_names, snapshot) = load_tool_fixture(&args.tool_fixture)?;
+    let tool_values = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let request = inference::llamacpp::LlamaCppChatRequest {
+        messages: serde_json::json!([{
+            "role": "user",
+            "content": args.prompt,
+        }]),
+        tools: serde_json::Value::Array(tool_values),
+        stage_root: None,
+        json_schema: None,
+        tool_constraint_mode: inference::flashmoe::NativeToolConstraintMode::ToolRequired,
+        terminal_tool_names,
+        mutation_snapshot: Some(snapshot),
+        language_layers: None,
+        semantic_boundary: None,
+        debug_constrained_transcript: args.show_transcript,
+        ctx_size: args.ctx_size,
+        threads: args.threads,
+        threads_batch: args.threads_batch,
+        gpu_layers: args.gpu_layers,
+        max_tokens: args.max_tokens,
+        top_k: args.top_k,
+        temperature: args.temperature,
+        seed: args.seed,
+    };
+
+    let load_started = Instant::now();
+    let (backend, fallback) = inference::llamacpp::load_text_from_file(
+        &args.model,
+        args.gpu_layers,
+        args.ctx_size,
+        args.threads,
+        args.threads_batch,
+    )?;
+    if let Some(fallback) = fallback {
+        eprintln!("llama.cpp fixture: {fallback}");
+    }
+    eprintln!(
+        "llama.cpp fixture: backend loaded in {} ms",
+        load_started.elapsed().as_millis()
+    );
+
+    let mut output = backend.generate_chat(&request)?;
+    let finish_reason = match output.finish_reason {
+        inference::llamacpp::FinishReason::EndOfGeneration => "end_of_generation",
+        inference::llamacpp::FinishReason::MaxTokens => "max_tokens",
+    };
+    let calls = if output
+        .content
+        .contains(pb_control_collar::protocol::dsml::CALLS_OPEN)
+    {
+        pb_control_collar::protocol::parse_dsml_output(
+            &output.content,
+            output.finish_reason == inference::llamacpp::FinishReason::MaxTokens,
+        )?
+        .calls
+        .into_iter()
+        .map(|call| {
+            serde_json::json!({
+                "name": call.name,
+                "arguments": call.arguments,
+            })
+        })
+        .collect::<Vec<_>>()
+    } else {
+        agent_core::parse_model_tool_call_output(&mut output.content)?
+            .into_iter()
+            .map(|call| {
+                serde_json::json!({
+                    "id": call.id,
+                    "name": call.tool,
+                    "arguments": call.arguments,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    if calls.is_empty() {
+        if args.show_transcript {
+            let preview = output.content.chars().take(2_000).collect::<String>();
+            eprintln!(
+                "llama.cpp fixture: incomplete transcript ({} bytes): {preview:?}",
+                output.content.len()
+            );
+        }
+        bail!(
+            "llama.cpp tool-fixture inference returned no complete tool call (finish_reason={finish_reason}, generated_tokens={})",
+            output.generated_tokens
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "backend": "llama_cpp",
+            "finish_reason": finish_reason,
+            "prompt_tokens": output.prompt_tokens,
+            "generated_tokens": output.generated_tokens,
+            "duration_ms": output.duration_ms,
+            "tool_constraints": output.tool_constraints,
+            "tool_calls": calls,
+        }))?
+    );
+    Ok(())
 }
 
 fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
@@ -2798,7 +3022,7 @@ fn run_flashmoe_infer(args: FlashMoeInferArgs) -> Result<()> {
     let tool_fixture = args
         .tool_fixture
         .as_deref()
-        .map(load_flashmoe_tool_fixture)
+        .map(load_tool_fixture)
         .transpose()?;
 
     let user_config = UserConfig::load()?;
@@ -5410,17 +5634,75 @@ mod tests {
     fn harness_tool_fixture_builds_a_bounded_immutable_snapshot() {
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/control-collar");
         let (tools, terminals, snapshot) =
-            load_flashmoe_tool_fixture(&fixture_root.join("write-python-v1.json")).unwrap();
+            load_tool_fixture(&fixture_root.join("write-python-v1.json")).unwrap();
         assert_eq!(tools[0].name, "write_file");
         assert_eq!(terminals, ["write_file"]);
         assert!(snapshot.is_empty());
 
         let (tools, terminals, snapshot) =
-            load_flashmoe_tool_fixture(&fixture_root.join("patch-python-v1.json")).unwrap();
+            load_tool_fixture(&fixture_root.join("patch-python-v1.json")).unwrap();
         assert_eq!(tools[0].name, "apply_patch");
         assert_eq!(terminals, ["apply_patch"]);
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot.total_bytes(), 16);
+
+        let (tools, terminals, snapshot) =
+            load_tool_fixture(&fixture_root.join("patch-python-exact-v1.json")).unwrap();
+        assert_eq!(tools[0].name, "apply_patch");
+        assert_eq!(terminals, ["apply_patch"]);
+        assert_eq!(snapshot.len(), 1);
+
+        let (tools, terminals, snapshot) =
+            load_tool_fixture(&fixture_root.join("write-invalid-python-v1.json")).unwrap();
+        assert_eq!(tools[0].name, "write_file");
+        assert_eq!(terminals, ["write_file"]);
+        assert!(snapshot.is_empty());
+
+        let (tools, terminals, snapshot) =
+            load_tool_fixture(&fixture_root.join("patch-invalid-context-v1.json")).unwrap();
+        assert_eq!(tools[0].name, "apply_patch");
+        assert_eq!(terminals, ["apply_patch"]);
+        assert_eq!(snapshot.len(), 1);
+
+        let temporary = tempdir().unwrap();
+        assert!(load_tool_fixture(temporary.path()).is_err());
+        let oversized = temporary.path().join("oversized.json");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(64 * 1024 * 1024 + 1).unwrap();
+        assert!(load_tool_fixture(&oversized).is_err());
+    }
+
+    #[test]
+    fn llama_fixture_cli_requires_explicit_reproducible_inputs() {
+        let cli = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "llama-infer",
+            "Create answer.py",
+            "--model",
+            "model.gguf",
+            "--tool-fixture",
+            "fixture.json",
+            "--max-tokens",
+            "384",
+            "--ctx-size",
+            "8192",
+            "--gpu-layers",
+            "42",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::LlamaInfer(args),
+        } = cli.command
+        else {
+            panic!("expected harness llama-infer command");
+        };
+        assert_eq!(args.model, PathBuf::from("model.gguf"));
+        assert_eq!(args.tool_fixture, PathBuf::from("fixture.json"));
+        assert_eq!(args.max_tokens, 384);
+        assert_eq!(args.ctx_size, 8192);
+        assert_eq!(args.gpu_layers, 42);
+        assert!(!args.show_transcript);
     }
 
     #[test]

@@ -81,6 +81,13 @@ it adds no hosted inference, telemetry, synchronization, or network edge. The ca
 contains token ids and derived model state and therefore remains sensitive local data under the
 ordinary cache ownership and cleanup model.
 
+The hidden exact-GGUF tool-fixture runner likewise keeps model loading, prompts, snapshots, and
+constraint probing local and does not execute fixture mutations. Its normal JSON report contains
+complete calls because the fixture is an explicit local test input; it does not add telemetry or
+remote persistence. The separate `--show-transcript` debugging opt-in may print an incomplete tool
+argument or source fragment to the invoking terminal on failure. That preview is not persisted by
+the runner and is disabled by default.
+
 The DeepSeek V4 Flash extension keeps its model, resident tensors, streamed expert packs, tokenizer,
 Metal state, and prompts on the same local path. Its typed hyperconnection/compressed-attention state
 is not currently written to the FlashMoe session cache or reused across requests; the state is reset
