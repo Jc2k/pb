@@ -755,12 +755,20 @@ impl IncrementalAnalyzer for PythonWorkspaceStreamingLayer {
             CollarError::Analysis("Python checkpoint is not part of this stream".to_string())
         })?;
         match (&mut self.active, &snapshot.active) {
-            (Some(active), Some(saved)) => active.restore(saved)?,
+            (Some(active), Some(saved)) if active.path == saved.path => active.restore(saved)?,
             (active, None) => *active = None,
-            (None, Some(_)) => {
-                return Err(CollarError::Analysis(
-                    "Python checkpoint lost its active file".to_string(),
-                ));
+            (active, Some(saved)) => {
+                // A multi-file patch may have ended this earlier file and moved to a later one
+                // before a sibling-token probe rolls back across the file boundary. The complete
+                // candidate is already retained under the same request byte bound, so reconstruct
+                // the earlier append-only prefix from it instead of copying source into every
+                // checkpoint.
+                let completed = self.completed.get(&saved.path).ok_or_else(|| {
+                    CollarError::Analysis(
+                        "Python checkpoint lost its earlier completed file".to_string(),
+                    )
+                })?;
+                *active = Some(saved.restore_from_completed(completed)?);
             }
         }
         self.completed.clone_from(&snapshot.completed);
@@ -860,6 +868,35 @@ struct PythonFileSnapshot {
     source_len: usize,
     generated_ranges: Vec<(usize, usize)>,
     tree: Tree,
+}
+
+impl PythonFileSnapshot {
+    fn restore_from_completed(
+        &self,
+        completed: &PythonCandidateMutation,
+    ) -> CollarResult<PythonFileState> {
+        let source = match (self.mutation, completed) {
+            (MutationKind::Delete, PythonCandidateMutation::Delete) => Vec::new(),
+            (
+                MutationKind::Create | MutationKind::Modify,
+                PythonCandidateMutation::Upsert(source),
+            ) if self.source_len <= source.len() && source.is_char_boundary(self.source_len) => {
+                source.as_bytes()[..self.source_len].to_vec()
+            }
+            _ => {
+                return Err(CollarError::Analysis(
+                    "Python completed candidate cannot restore the checkpointed file".to_string(),
+                ));
+            }
+        };
+        Ok(PythonFileState {
+            path: self.path.clone(),
+            mutation: self.mutation,
+            source,
+            generated_ranges: self.generated_ranges.clone(),
+            tree: self.tree.clone(),
+        })
+    }
 }
 
 struct PythonStateSnapshot {
@@ -1891,6 +1928,81 @@ mod tests {
                 .values()
                 .all(|report| report.introduced.is_empty())
         );
+    }
+
+    #[test]
+    fn rollback_reconstructs_an_earlier_file_after_crossing_a_patch_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "helper.py",
+            "def render(value: str) -> str:\n    return value\n",
+        );
+        write(
+            root.path(),
+            "main.py",
+            "from helper import render\nresult: str = render(\"ok\")\n",
+        );
+        let world = PythonProjectWorld::load_and_prime(config(root.path())).unwrap();
+        let request = world
+            .snapshot_for_request(&world.descriptor().world)
+            .unwrap();
+        let mut layer = request.into_streaming_layer(1024 * 1024, 64).unwrap();
+        layer.begin(ProgramSnapshot::default()).unwrap();
+        let language = LanguageId("python".to_string());
+        let helper = LogicalPath::parse("helper.py".to_string()).unwrap();
+        let main = LogicalPath::parse("main.py".to_string()).unwrap();
+        let helper_source = b"def render(value: int) -> int:\n    return value\n";
+        let main_source = b"from helper import render\nresult: int = render(1)\n";
+
+        layer
+            .apply(SourceEvent::BeginFile {
+                path: &helper,
+                language: &language,
+                mutation: MutationKind::Modify,
+            })
+            .unwrap();
+        layer
+            .apply(SourceEvent::Bytes {
+                origin: SourceOrigin::Generated,
+                bytes: helper_source,
+            })
+            .unwrap();
+        let earlier = layer.checkpoint().unwrap();
+        layer.apply(SourceEvent::EndFile).unwrap();
+        layer
+            .apply(SourceEvent::BeginFile {
+                path: &main,
+                language: &language,
+                mutation: MutationKind::Modify,
+            })
+            .unwrap();
+        layer
+            .apply(SourceEvent::Bytes {
+                origin: SourceOrigin::Generated,
+                bytes: main_source,
+            })
+            .unwrap();
+
+        layer.rollback(earlier).unwrap();
+        layer.apply(SourceEvent::EndFile).unwrap();
+        layer
+            .apply(SourceEvent::BeginFile {
+                path: &main,
+                language: &language,
+                mutation: MutationKind::Modify,
+            })
+            .unwrap();
+        layer
+            .apply(SourceEvent::Bytes {
+                origin: SourceOrigin::Generated,
+                bytes: main_source,
+            })
+            .unwrap();
+        layer.apply(SourceEvent::EndFile).unwrap();
+        let closure = layer.finalize().unwrap();
+        assert_eq!(closure.viability, Viability::Valid);
+        assert_eq!(closure.closure, ClosureVerdict::Allow);
     }
 
     #[test]

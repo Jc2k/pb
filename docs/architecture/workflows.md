@@ -719,7 +719,20 @@ rejecting. Immediately before executor entry, pb reconstructs the completed virt
 write/edit/replacement/patch—including the final hunk and untouched base tail—and replays it through
 a fresh stack bound to the same live world identity. Candidate checkpoints retain append-only
 source lengths and parser/semantic state rather than copying the virtual file for every accepted
-token.
+token. When a streamed tool string closes, the generation gate first synchronizes the remaining
+known suffix or patch base tail, emits the final file boundary, and finalizes every participating
+language layer; closing a candidate does not bypass a closure-only diagnostic. The enclosing sampler
+checkpoint can restore that closure and probe a sibling token from the exact earlier parser,
+virtual-file, and semantic state.
+
+The hidden model-free Rust semantic qualifier uses an ephemeral offline Cargo workspace and the
+ordinary production lifecycle. Its checked corpus compares generation closure, independent executor
+replay, and direct content-free diagnostic/unknown results for all promoted classes, baseline debt,
+cross-crate transactions, source-topology unknowns, and all four mutation tools. It probes every
+logical UTF-8 payload boundary and 64 deterministic rollback/full-replay branches per case; after a
+prefix becomes impossible, every longer prefix must remain impossible. It runs no model, LSP, build
+script, procedural macro, or generated mutation. Passing proves only the pinned profile and corpus,
+not rustc equivalence.
 
 **Shipped Python v1 behavior.** If a real local backend exposes a tool schema that can edit or
 create a Python file, pb creates an exact verified shadow—even if the project has no Python file
@@ -789,8 +802,10 @@ unannotated, baseline-debt, dynamic-unknown, dependency, and multi-file cases al
 native `ty` resolver and request overlays as production; no live LSP or incomplete-document
 diagnostic stream participates. Corpus validation requires both valid and invalid examples for the
 three primary profiles, every promoted diagnostic class, and write/replace/edit/patch coverage.
-This is differential evidence for the existing profile, not authority for an additional
-token-time rule or a universal Python soundness claim.
+It also probes every logical UTF-8 payload boundary and 64 deterministic rollback/full-replay
+branches per case under the same monotonic-rejection rule as Rust. This is differential evidence for
+the existing profile, not authority for an additional token-time rule or a universal Python
+soundness claim.
 
 The syntax profiles are pinned Tree-sitter grammars for Rust, Python, TypeScript/TSX,
 JavaScript/JSX, HTML, and CSS. They require UTF-8 and reject error or missing nodes; HTML additionally

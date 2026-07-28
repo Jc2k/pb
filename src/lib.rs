@@ -58,6 +58,7 @@ pub mod projects;
 mod public_network;
 mod python_semantic_config;
 mod python_semantic_qualification;
+mod rust_semantic_qualification;
 pub mod semantic;
 mod semantic_qualification;
 pub mod service;
@@ -498,6 +499,9 @@ pub enum HarnessCommand {
     /// Qualify native Python semantic classes through generation and execution replay
     #[command(name = "python-semantic-qualify", hide = true)]
     PythonSemanticQualify(python_semantic_qualification::HarnessPythonSemanticQualifyArgs),
+    /// Qualify native Rust semantic classes, conservative unknowns, and prefix monotonicity
+    #[command(name = "rust-semantic-qualify", hide = true)]
+    RustSemanticQualify(rust_semantic_qualification::HarnessRustSemanticQualifyArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2610,6 +2614,7 @@ fn run_harness_command(command: HarnessCommand) -> Result<()> {
         HarnessCommand::SemanticQualify(args) => run_semantic_qualification(args),
         HarnessCommand::NativeWorldQualify(args) => native_qualification::run(args),
         HarnessCommand::PythonSemanticQualify(args) => python_semantic_qualification::run(args),
+        HarnessCommand::RustSemanticQualify(args) => rust_semantic_qualification::run(args),
     }
 }
 
@@ -5834,6 +5839,31 @@ mod tests {
         assert_eq!(args.corpus, PathBuf::from("semantic-python.json"));
         assert_eq!(args.max_cold_millis, 90_000);
         assert_eq!(args.max_case_millis, 12_000);
+    }
+
+    #[test]
+    fn rust_semantic_qualification_has_explicit_corpus_and_budgets() {
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "rust-semantic-qualify",
+            "--corpus",
+            "semantic-rust.json",
+            "--max-cold-millis",
+            "150000",
+            "--max-case-millis",
+            "18000",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::RustSemanticQualify(args),
+        } = parsed.command
+        else {
+            panic!("expected Rust semantic qualification command");
+        };
+        assert_eq!(args.corpus, PathBuf::from("semantic-rust.json"));
+        assert_eq!(args.max_cold_millis, 150_000);
+        assert_eq!(args.max_case_millis, 18_000);
     }
 
     #[test]

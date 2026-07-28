@@ -27,7 +27,10 @@ use pb_control_collar::{
     tool::{CollarLimits, CollarManifest, ExposedTool, MutationPolicy, ToolConstraintMode},
 };
 use pb_control_python::{PYTHON_LAYER_CONTRACT_VERSION, PythonProjectConfig, PythonProjectWorld};
-use pb_control_rust::{RUST_LAYER_CONTRACT_VERSION, RustProjectConfig, RustProjectWorld};
+use pb_control_rust::{
+    RUST_LAYER_CONTRACT_VERSION, RustDeepDiagnostic, RustDeepProfile, RustDeepUnknownReason,
+    RustProjectConfig, RustProjectWorld,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -120,6 +123,8 @@ pub(crate) struct PythonSemanticQualificationObservation {
     pub(crate) generation_millis: u64,
     pub(crate) final_replay_millis: u64,
     pub(crate) diagnostic_millis: u64,
+    pub(crate) prefix_probes: u64,
+    pub(crate) rollback_replays: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +136,33 @@ pub(crate) struct PythonSemanticWorldObservation {
     pub(crate) load_millis: u64,
     pub(crate) prime_millis: u64,
     pub(crate) primed_queries: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RustSemanticQualificationObservation {
+    pub(crate) generation: CompletionDecision,
+    pub(crate) final_replay: CompletionDecision,
+    pub(crate) diagnostic_result:
+        std::result::Result<BTreeSet<RustDeepDiagnostic>, RustDeepUnknownReason>,
+    pub(crate) warm_millis: u64,
+    pub(crate) generation_millis: u64,
+    pub(crate) final_replay_millis: u64,
+    pub(crate) diagnostic_millis: u64,
+    pub(crate) prefix_probes: u64,
+    pub(crate) rollback_replays: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RustSemanticWorldObservation {
+    pub(crate) world_sha256: String,
+    pub(crate) configuration_sha256: String,
+    pub(crate) dependency_sha256: String,
+    pub(crate) provider_version: String,
+    pub(crate) load_millis: u64,
+    pub(crate) prime_millis: u64,
+    pub(crate) primed_queries: u64,
+    pub(crate) target_count: usize,
+    pub(crate) deep_profile: RustDeepProfile,
 }
 
 impl Default for ControlLayerLifecycle {
@@ -2245,7 +2277,9 @@ pub(crate) fn qualify_python_semantic_case(
     .context("failed to create the Python semantic generation gate")?;
     let generation_started = std::time::Instant::now();
     let (closed_arguments, payload) = semantic_qualification_payload(name, arguments)?;
-    let prefix = gate.evaluate_prefix(name, &closed_arguments, payload);
+    let prefix_qualification =
+        qualify_semantic_prefix_stream(&gate, name, &closed_arguments, payload, "Python")?;
+    let prefix = prefix_qualification.full_decision;
     let generation = match prefix {
         CompletionDecision::Reject(_) => prefix,
         CompletionDecision::Accept | CompletionDecision::NotApplicable => {
@@ -2300,6 +2334,181 @@ pub(crate) fn qualify_python_semantic_case(
         generation_millis,
         final_replay_millis,
         diagnostic_millis,
+        prefix_probes: prefix_qualification.prefix_probes,
+        rollback_replays: prefix_qualification.rollback_replays,
+    })
+}
+
+const SEMANTIC_QUALIFICATION_ROLLBACK_REPLAYS: usize = 64;
+
+struct SemanticPrefixQualification {
+    full_decision: CompletionDecision,
+    prefix_probes: u64,
+    rollback_replays: u64,
+}
+
+/// Replay every UTF-8 boundary in one accepted wire payload, then repeatedly roll back to a
+/// deterministic earlier boundary and replay the complete payload. Once a prefix is impossible,
+/// every longer prefix must stay impossible: relaxing a hard rejection would prove that the rule is
+/// not prefix-monotonic and therefore cannot steer decoding safely.
+fn qualify_semantic_prefix_stream(
+    gate: &MutationCompletionGate,
+    name: &str,
+    arguments: &serde_json::Map<String, Value>,
+    payload: &str,
+    language: &str,
+) -> Result<SemanticPrefixQualification> {
+    let mut boundaries = payload
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(payload.len());
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut first_rejection = None;
+    let mut full_decision = CompletionDecision::Accept;
+    for boundary in &boundaries {
+        let decision = gate.evaluate_prefix(name, arguments, &payload[..*boundary]);
+        if let Some(first) = first_rejection
+            && !matches!(decision, CompletionDecision::Reject(_))
+        {
+            bail!(
+                "{language} semantic prefix rejection from byte {first} was not monotonic at byte {boundary}"
+            );
+        }
+        if matches!(decision, CompletionDecision::Reject(_)) && first_rejection.is_none() {
+            first_rejection = Some(*boundary);
+        }
+        if *boundary == payload.len() {
+            full_decision = decision;
+        }
+    }
+
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ payload.len() as u64;
+    let mut rollback_replays = 0u64;
+    for _ in 0..SEMANTIC_QUALIFICATION_ROLLBACK_REPLAYS {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let index = usize::try_from(state % boundaries.len() as u64).unwrap_or_default();
+        let boundary = boundaries[index];
+        let fork = gate.evaluate_prefix(name, arguments, &payload[..boundary]);
+        if first_rejection.is_some_and(|offset| boundary >= offset)
+            && !matches!(fork, CompletionDecision::Reject(_))
+        {
+            bail!("{language} semantic rollback relaxed a monotonic rejection at byte {boundary}");
+        }
+        let replay = gate.evaluate_prefix(name, arguments, payload);
+        if replay != full_decision {
+            bail!(
+                "{language} semantic full-prefix replay changed after rollback: {replay:?} != {full_decision:?}"
+            );
+        }
+        rollback_replays = rollback_replays.saturating_add(1);
+    }
+
+    Ok(SemanticPrefixQualification {
+        full_decision,
+        prefix_probes: u64::try_from(boundaries.len()).unwrap_or(u64::MAX),
+        rollback_replays,
+    })
+}
+
+/// Qualify one complete Rust transaction against the production generation and execution gates,
+/// then replay only the promoted diagnostic classes directly against the already-prepared native
+/// world. The caller owns the frozen corpus; no source leaves the process.
+pub(crate) fn qualify_rust_semantic_case(
+    lifecycle: &mut ControlLayerLifecycle,
+    workspace_root: &Path,
+    tool: &BuiltInToolSchema,
+    snapshot: &WorkspaceSnapshot,
+    name: &str,
+    arguments: &Value,
+) -> Result<RustSemanticQualificationObservation> {
+    let warm_started = std::time::Instant::now();
+    let layers = lifecycle
+        .prepare_for_inference_cancellable(
+            workspace_root,
+            std::slice::from_ref(tool),
+            Some(snapshot),
+            &|| Ok(()),
+        )?
+        .context("Rust semantic qualification did not prepare a native layer")?;
+    let warm_millis = elapsed_millis(warm_started);
+
+    let gate = MutationCompletionGate::with_shared_language_layers(
+        execution_manifest(std::slice::from_ref(tool), snapshot.clone()),
+        layers,
+    )
+    .context("failed to create the Rust semantic generation gate")?;
+    let generation_started = std::time::Instant::now();
+    let (closed_arguments, payload) = semantic_qualification_payload(name, arguments)?;
+    let prefix_qualification =
+        qualify_semantic_prefix_stream(&gate, name, &closed_arguments, payload, "Rust")?;
+    let generation = match prefix_qualification.full_decision {
+        CompletionDecision::Reject(_) => prefix_qualification.full_decision,
+        CompletionDecision::Accept | CompletionDecision::NotApplicable => {
+            gate.evaluate(name, arguments)
+        }
+    };
+    let generation_millis = elapsed_millis(generation_started);
+
+    let final_started = std::time::Instant::now();
+    let final_replay = lifecycle.validate_completed_mutation(
+        workspace_root,
+        std::slice::from_ref(tool),
+        snapshot,
+        name,
+        arguments,
+    )?;
+    let final_replay_millis = elapsed_millis(final_started);
+
+    let diagnostic_started = std::time::Instant::now();
+    let mutations = crate::semantic::semantic_mutations_from_call(snapshot, name, arguments)?;
+    let source_topology_changed = mutations.iter().any(|mutation| mutation.result.is_none());
+    let candidates = mutations
+        .into_iter()
+        .filter_map(|mutation| {
+            mutation.result.map(|result| {
+                Ok((
+                    pb_control_collar::mutation::LogicalPath::parse(mutation.path)?,
+                    result.into_bytes(),
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let prepared = lifecycle
+        .rust
+        .as_ref()
+        .context("Rust semantic qualification lifecycle lost its prepared world")?;
+    let prepared = prepared
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Rust semantic qualification world lock is poisoned"))?;
+    let expected = &prepared.world.descriptor().world;
+    let request = prepared
+        .world
+        .snapshot_for_request(expected)
+        .context("Rust semantic qualification could not snapshot the prepared world")?;
+    let diagnostic_result = if source_topology_changed {
+        Err(RustDeepUnknownReason::SourceTopologyChanged)
+    } else {
+        request
+            .qualification_diagnostic_delta(&candidates)
+            .map(|diagnostics| diagnostics.into_iter().collect())
+    };
+    let diagnostic_millis = elapsed_millis(diagnostic_started);
+
+    Ok(RustSemanticQualificationObservation {
+        generation,
+        final_replay,
+        diagnostic_result,
+        warm_millis,
+        generation_millis,
+        final_replay_millis,
+        diagnostic_millis,
+        prefix_probes: prefix_qualification.prefix_probes,
+        rollback_replays: prefix_qualification.rollback_replays,
     })
 }
 
@@ -2347,6 +2556,31 @@ pub(crate) fn python_semantic_world_observation(
         load_millis: receipt.load_millis,
         prime_millis: receipt.prime_millis,
         primed_queries: receipt.primed_queries,
+    })
+}
+
+pub(crate) fn rust_semantic_world_observation(
+    lifecycle: &ControlLayerLifecycle,
+) -> Result<RustSemanticWorldObservation> {
+    let prepared = lifecycle
+        .rust
+        .as_ref()
+        .context("Rust semantic qualification lifecycle has no prepared world")?;
+    let prepared = prepared
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Rust semantic qualification world lock is poisoned"))?;
+    let world = &prepared.world.descriptor().world;
+    let receipt = prepared.world.readiness_receipt();
+    Ok(RustSemanticWorldObservation {
+        world_sha256: world.world_sha256.clone(),
+        configuration_sha256: world.configuration_sha256.clone(),
+        dependency_sha256: world.dependency_sha256.clone(),
+        provider_version: world.provider_version.clone(),
+        load_millis: receipt.load_millis,
+        prime_millis: receipt.prime_millis,
+        primed_queries: receipt.primed_queries,
+        target_count: prepared.world.targets().len(),
+        deep_profile: prepared.world.deep_profile().clone(),
     })
 }
 

@@ -359,40 +359,94 @@ impl MutationCompletionGate {
             .map_err(|_| {
                 CollarError::Analysis("language-layer stack lock is poisoned".to_string())
             })?;
-        let mut analyses = Vec::new();
-        for file in files {
-            let Some(profile) = SyntaxProfile::for_path(&file.path) else {
-                continue;
-            };
-            let language = profile.language_id();
-            analyses.push(layers.apply(SourceEvent::BeginFile {
-                path: &file.path,
-                language: &language,
-                mutation: file.kind,
-            })?);
-            let mut cursor = 0usize;
-            for deletion in &file.deletions {
-                replay_result_range(
-                    file,
-                    cursor,
-                    deletion.result_offset,
+        replay_virtual_files_locked(&mut layers, files)
+    }
+
+    fn complete_streamed_file(
+        &self,
+        identity: PrefixProbeIdentity,
+        generated: &[u8],
+        known_suffix: &[u8],
+        fallback: &PatchVirtualFile,
+    ) -> CompletionDecision {
+        let Some(layers) = self.language_layers.as_ref() else {
+            return CompletionDecision::Accept;
+        };
+        let cache_state = match self.prefix_cache.lock() {
+            Ok(cache) => cache.state(&identity, generated),
+            Err(_) => return CompletionDecision::Reject(RejectionCode::InvalidSemantics),
+        };
+        let mut layers = match layers.lock() {
+            Ok(layers) => layers,
+            Err(_) => return CompletionDecision::Reject(RejectionCode::InvalidSemantics),
+        };
+        let analysis = match cache_state {
+            PrefixCacheState::Exact => (|| {
+                let mut analyses = Vec::new();
+                if !known_suffix.is_empty() {
+                    analyses.push(layers.apply(SourceEvent::Bytes {
+                        origin: SourceOrigin::Known,
+                        bytes: known_suffix,
+                    })?);
+                }
+                analyses.push(layers.apply(SourceEvent::EndFile)?);
+                analyses.push(layers.finalize()?);
+                Ok(Analysis::compose(analyses))
+            })(),
+            PrefixCacheState::Empty => {
+                replay_virtual_files_locked(&mut layers, std::slice::from_ref(fallback))
+            }
+            PrefixCacheState::Mismatch => Err(CollarError::Analysis(
+                "completed file does not match the active prefix cache".to_string(),
+            )),
+        };
+        completion_from_analysis(analysis)
+    }
+
+    fn complete_streamed_patch(&self, patch: &str) -> CompletionDecision {
+        let Some(layers) = self.language_layers.as_ref() else {
+            return CompletionDecision::Accept;
+        };
+        let mut cache = match self.patch_cache.lock() {
+            Ok(cache) => cache,
+            Err(_) => return CompletionDecision::Reject(RejectionCode::InvalidSemantics),
+        };
+        let mut layers = match layers.lock() {
+            Ok(layers) => layers,
+            Err(_) => return CompletionDecision::Reject(RejectionCode::InvalidSemantics),
+        };
+        let analysis = match cache.entry.as_mut() {
+            Some(entry) if entry.generated_prefix == patch.as_bytes() => (|| {
+                let (_, files) = entry.stream.clone().finish_with_virtual_files()?;
+                let mut analyses = vec![sync_patch_language_layers(
+                    &mut entry.mirror,
+                    &files,
                     &mut layers,
-                    &mut analyses,
+                    self.manifest
+                        .limits
+                        .max_snapshot_bytes
+                        .saturating_add(self.manifest.limits.max_argument_bytes)
+                        .max(1),
+                )?];
+                analyses.push(layers.finalize()?);
+                Ok(Analysis::compose(analyses))
+            })(),
+            None => (|| {
+                let mut stream = PatchStream::new(
+                    self.manifest.workspace.clone(),
+                    self.manifest.limits.max_argument_bytes,
+                    self.manifest.limits.max_files,
+                    self.manifest.limits.max_patch_hunks,
                 )?;
-                analyses.push(layers.apply(SourceEvent::DeleteKnownBytes(&deletion.bytes))?);
-                cursor = deletion.result_offset;
-            }
-            replay_result_range(file, cursor, file.len(), &mut layers, &mut analyses)?;
-            analyses.push(layers.apply(SourceEvent::EndFile)?);
-            if analyses.last().is_some_and(|analysis| {
-                analysis.viability == Viability::Impossible
-                    || analysis.closure == crate::analysis::ClosureVerdict::Reject
-            }) {
-                return Ok(Analysis::compose(analyses));
-            }
-        }
-        analyses.push(layers.finalize()?);
-        Ok(Analysis::compose(analyses))
+                stream.push(patch.as_bytes())?;
+                let (_, files) = stream.finish_with_virtual_files()?;
+                replay_virtual_files_locked(&mut layers, &files)
+            })(),
+            Some(_) => Err(CollarError::Analysis(
+                "completed patch does not match the active patch prefix cache".to_string(),
+            )),
+        };
+        completion_from_analysis(analysis)
     }
 
     /// Conservatively probes a decoded mutation payload before its enclosing string closes.
@@ -581,7 +635,7 @@ impl MutationCompletionGate {
         };
         let mut stream = match VirtualFileStream::new(
             self.manifest.workspace.clone(),
-            path,
+            path.clone(),
             mode,
             self.manifest.limits.max_argument_bytes,
         ) {
@@ -593,9 +647,27 @@ impl MutationCompletionGate {
         if let Err(error) = stream.push(content.as_bytes()) {
             return CompletionDecision::Reject(classify_mutation_error(&error));
         }
-        let result = stream.finish();
-        match result {
-            Ok(_) => self.language_closure_decision(),
+        match stream.finish() {
+            Ok(prepared) => {
+                let Some(result) = prepared.result_bytes() else {
+                    return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+                };
+                let base = replace
+                    .then(|| {
+                        self.manifest
+                            .workspace
+                            .get(&path)
+                            .map(|entry| entry.bytes.as_slice())
+                    })
+                    .flatten();
+                let fallback =
+                    replacement_virtual_file(path.clone(), prepared.kind(), base, result);
+                let identity = match self.prefix_identity(&path, prepared.kind(), &[]) {
+                    Ok(identity) => identity,
+                    Err(decision) => return decision,
+                };
+                self.complete_streamed_file(identity, content.as_bytes(), &[], &fallback)
+            }
             Err(error) => CompletionDecision::Reject(classify_mutation_error(&error)),
         }
     }
@@ -628,9 +700,31 @@ impl MutationCompletionGate {
         if base_text.matches(old_text).take(2).count() != 1 {
             return CompletionDecision::Reject(RejectionCode::InvalidArguments);
         }
+        let Some(start) = base_text.find(old_text) else {
+            return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+        };
         let result = base_text.replacen(old_text, new_text, 1);
         match prepare_replace(&self.manifest.workspace, path, result.into_bytes()) {
-            Ok(_) => self.language_closure_decision(),
+            Ok(prepared) => {
+                let Some(result) = prepared.result_bytes() else {
+                    return CompletionDecision::Reject(RejectionCode::InvalidArguments);
+                };
+                let path = prepared.path().clone();
+                let fallback = replacement_virtual_file(
+                    path.clone(),
+                    prepared.kind(),
+                    Some(&base.bytes),
+                    result,
+                );
+                let known_prefix = &base.bytes[..start];
+                let suffix_start = start.saturating_add(old_text.len());
+                let known_suffix = &base.bytes[suffix_start..];
+                let identity = match self.prefix_identity(&path, prepared.kind(), known_prefix) {
+                    Ok(identity) => identity,
+                    Err(decision) => return decision,
+                };
+                self.complete_streamed_file(identity, new_text.as_bytes(), known_suffix, &fallback)
+            }
             Err(error) => CompletionDecision::Reject(classify_mutation_error(&error)),
         }
     }
@@ -657,9 +751,29 @@ impl MutationCompletionGate {
             return CompletionDecision::Reject(classify_mutation_error(&error));
         }
         match stream.finish() {
-            Ok(_) => self.language_closure_decision(),
+            Ok(_) => self.complete_streamed_patch(patch),
             Err(error) => CompletionDecision::Reject(classify_mutation_error(&error)),
         }
+    }
+
+    fn prefix_identity(
+        &self,
+        path: &LogicalPath,
+        mutation: MutationKind,
+        known_prefix: &[u8],
+    ) -> Result<PrefixProbeIdentity, CompletionDecision> {
+        let source_limit = known_prefix
+            .len()
+            .checked_add(self.manifest.limits.max_argument_bytes)
+            .ok_or(CompletionDecision::Reject(RejectionCode::InvalidPrefix))?
+            .max(1);
+        Ok(PrefixProbeIdentity {
+            path: path.clone(),
+            mutation,
+            known_prefix_sha256: Digest::of(known_prefix),
+            known_prefix_len: known_prefix.len(),
+            source_limit,
+        })
     }
 
     fn prefix_decision(
@@ -669,19 +783,9 @@ impl MutationCompletionGate {
         known_prefix: &[u8],
         generated_prefix: &[u8],
     ) -> CompletionDecision {
-        let source_limit = match known_prefix
-            .len()
-            .checked_add(self.manifest.limits.max_argument_bytes)
-        {
-            Some(limit) => limit.max(1),
-            None => return CompletionDecision::Reject(RejectionCode::InvalidPrefix),
-        };
-        let identity = PrefixProbeIdentity {
-            path: path.clone(),
-            mutation,
-            known_prefix_sha256: Digest::of(known_prefix),
-            known_prefix_len: known_prefix.len(),
-            source_limit,
+        let identity = match self.prefix_identity(path, mutation, known_prefix) {
+            Ok(identity) => identity,
+            Err(decision) => return decision,
         };
         let report = (|| {
             let mut cache = self.prefix_cache.lock().map_err(|_| {
@@ -722,26 +826,52 @@ impl MutationCompletionGate {
             Err(_) => CompletionDecision::Reject(RejectionCode::InvalidPrefix),
         }
     }
+}
 
-    fn language_closure_decision(&self) -> CompletionDecision {
-        let Some(layers) = self.language_layers.as_ref() else {
-            return CompletionDecision::Accept;
+fn completion_from_analysis(analysis: Result<Analysis, CollarError>) -> CompletionDecision {
+    match analysis {
+        Ok(analysis)
+            if analysis.viability != Viability::Impossible
+                && analysis.closure != crate::analysis::ClosureVerdict::Reject =>
+        {
+            CompletionDecision::Accept
+        }
+        Ok(_) | Err(_) => CompletionDecision::Reject(RejectionCode::InvalidSemantics),
+    }
+}
+
+fn replay_virtual_files_locked(
+    layers: &mut LanguageLayerStack,
+    files: &[PatchVirtualFile],
+) -> Result<Analysis, CollarError> {
+    let mut analyses = Vec::new();
+    for file in files {
+        let Some(profile) = SyntaxProfile::for_path(&file.path) else {
+            continue;
         };
-        let analysis = layers
-            .lock()
-            .map_err(|_| ())
-            .and_then(|mut layers| layers.finalize().map_err(|_| ()));
-        match analysis {
-            Ok(analysis)
-                if analysis.viability == Viability::Impossible
-                    || analysis.closure == crate::analysis::ClosureVerdict::Reject =>
-            {
-                CompletionDecision::Reject(RejectionCode::InvalidSemantics)
-            }
-            Ok(_) => CompletionDecision::Accept,
-            Err(()) => CompletionDecision::Reject(RejectionCode::InvalidSemantics),
+        let language = profile.language_id();
+        analyses.push(layers.apply(SourceEvent::BeginFile {
+            path: &file.path,
+            language: &language,
+            mutation: file.kind,
+        })?);
+        let mut cursor = 0usize;
+        for deletion in &file.deletions {
+            replay_result_range(file, cursor, deletion.result_offset, layers, &mut analyses)?;
+            analyses.push(layers.apply(SourceEvent::DeleteKnownBytes(&deletion.bytes))?);
+            cursor = deletion.result_offset;
+        }
+        replay_result_range(file, cursor, file.len(), layers, &mut analyses)?;
+        analyses.push(layers.apply(SourceEvent::EndFile)?);
+        if analyses.last().is_some_and(|analysis| {
+            analysis.viability == Viability::Impossible
+                || analysis.closure == crate::analysis::ClosureVerdict::Reject
+        }) {
+            return Ok(Analysis::compose(analyses));
         }
     }
+    analyses.push(layers.finalize()?);
+    Ok(Analysis::compose(analyses))
 }
 
 fn required_logical_path(arguments: &Value) -> Result<LogicalPath, CollarError> {
@@ -925,6 +1055,13 @@ struct CombinedPrefixReport {
     semantic: Option<Analysis>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixCacheState {
+    Empty,
+    Exact,
+    Mismatch,
+}
+
 #[derive(Clone, Debug)]
 struct PrefixCandidateCheckpoint {
     identity: PrefixProbeIdentity,
@@ -933,6 +1070,16 @@ struct PrefixCandidateCheckpoint {
 }
 
 impl PrefixProbeCache {
+    fn state(&self, identity: &PrefixProbeIdentity, generated: &[u8]) -> PrefixCacheState {
+        match &self.entry {
+            None => PrefixCacheState::Empty,
+            Some(entry) if &entry.identity == identity && entry.generated_prefix == generated => {
+                PrefixCacheState::Exact
+            }
+            Some(_) => PrefixCacheState::Mismatch,
+        }
+    }
+
     fn candidate_checkpoint(
         &mut self,
         layers: Option<LayerStackCheckpoint>,
@@ -1642,6 +1789,32 @@ mod tests {
             gate.evaluate_prefix("write_file", &arguments, &format!("{common}BTreeMap;")),
             CompletionDecision::Accept
         );
+        let valid = format!("{common}BTreeMap;\n");
+        assert_eq!(
+            gate.evaluate_prefix("write_file", &arguments, common),
+            CompletionDecision::Accept
+        );
+        let mut checkpoint = gate.candidate_checkpoint().unwrap();
+        assert_eq!(
+            gate.evaluate_prefix("write_file", &arguments, &valid),
+            CompletionDecision::Accept
+        );
+        assert_eq!(
+            gate.evaluate(
+                "write_file",
+                &json!({"path": "src/lib.rs", "content": valid})
+            ),
+            CompletionDecision::Accept
+        );
+        gate.restore_candidate_checkpoint(&mut checkpoint).unwrap();
+        assert_eq!(
+            gate.evaluate_prefix(
+                "write_file",
+                &arguments,
+                &format!("{common}DefinitelyMissing;")
+            ),
+            CompletionDecision::Reject(RejectionCode::InvalidSemantics)
+        );
     }
 
     #[test]
@@ -1715,6 +1888,183 @@ mod tests {
             gate.evaluate_prefix("apply_patch", &arguments, &format!("{common}BTreeMap;")),
             CompletionDecision::Accept
         );
+    }
+
+    #[test]
+    fn candidate_checkpoint_restores_patch_after_completion_closes_the_file() {
+        let path = LogicalPath::parse("src/lib.rs").unwrap();
+        let entries = vec![SnapshotEntry::new(
+            path,
+            b"use std::collections::BTreeMap;\n".to_vec(),
+        )];
+        let stack = LanguageLayerStack::new(
+            vec![Box::new(MockRustLayer::new())],
+            ProgramSnapshot::default(),
+        )
+        .unwrap();
+        let gate = MutationCompletionGate::with_language_layers(manifest(entries), stack).unwrap();
+        let arguments = serde_json::Map::new();
+        let common = concat!(
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-use std::collections::BTreeMap;\n",
+            "+use std::collections::",
+        );
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, common),
+            CompletionDecision::Accept
+        );
+        let mut checkpoint = gate.candidate_checkpoint().unwrap();
+        let valid = format!("{common}BTreeSet;\n");
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, &valid),
+            CompletionDecision::Accept
+        );
+        assert_eq!(
+            gate.evaluate("apply_patch", &json!({"patch": valid})),
+            CompletionDecision::Accept
+        );
+
+        gate.restore_candidate_checkpoint(&mut checkpoint).unwrap();
+        let invalid = format!("{common}DefinitelyMissing;\n");
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, &invalid),
+            CompletionDecision::Reject(RejectionCode::InvalidSemantics)
+        );
+    }
+
+    #[test]
+    fn patch_virtual_stream_orders_deletion_before_following_generated_bytes() {
+        let path = LogicalPath::parse("src/lib.rs").unwrap();
+        let entries = vec![SnapshotEntry::new(
+            path,
+            b"pub fn local() -> i32 { old() }\n".to_vec(),
+        )];
+        let stack = LanguageLayerStack::new(
+            vec![Box::new(MockRustLayer::new())],
+            ProgramSnapshot::default(),
+        )
+        .unwrap();
+        let gate = MutationCompletionGate::with_language_layers(manifest(entries), stack).unwrap();
+        let arguments = serde_json::Map::new();
+        let patch = concat!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-pub fn local() -> i32 { old() }\n",
+            "+pub fn local() -> i32 { new() }\n",
+        );
+
+        for (offset, _) in patch.char_indices() {
+            assert_eq!(
+                gate.evaluate_prefix("apply_patch", &arguments, &patch[..offset]),
+                CompletionDecision::Accept,
+                "valid patch prefix rejected at byte {offset}"
+            );
+        }
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, patch),
+            CompletionDecision::Accept
+        );
+        let midpoint = patch.find("+pub").unwrap();
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, &patch[..midpoint]),
+            CompletionDecision::Accept
+        );
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, patch),
+            CompletionDecision::Accept
+        );
+        assert_eq!(
+            gate.evaluate("apply_patch", &json!({"patch": patch})),
+            CompletionDecision::Accept
+        );
+    }
+
+    #[test]
+    fn multi_file_patch_prefix_stays_reachable_between_file_headers() {
+        let entries = vec![
+            SnapshotEntry::new(
+                LogicalPath::parse("app/src/lib.rs").unwrap(),
+                b"pub mod debt;\npub fn local() -> i32 { dep::api::add(1, 2) }\n".to_vec(),
+            ),
+            SnapshotEntry::new(
+                LogicalPath::parse("dep/src/lib.rs").unwrap(),
+                concat!(
+                    "pub mod api {\n",
+                    "    pub fn add(left: i32, right: i32) -> i32 { left + right }\n",
+                    "    pub fn takes_int(value: i32) -> i32 { value }\n",
+                    "    pub struct Public { pub value: i32, hidden: i32 }\n",
+                    "    pub fn public() -> Public { Public { value: 1, hidden: 2 } }\n",
+                    "    pub trait Required { fn required(&self); }\n",
+                    "}\n",
+                )
+                .as_bytes()
+                .to_vec(),
+            ),
+        ];
+        let stack = LanguageLayerStack::new(
+            vec![Box::new(MockRustLayer::new())],
+            ProgramSnapshot::default(),
+        )
+        .unwrap();
+        let gate = MutationCompletionGate::with_language_layers(manifest(entries), stack).unwrap();
+        let arguments = serde_json::Map::new();
+        let patch = concat!(
+            "diff --git a/app/src/lib.rs b/app/src/lib.rs\n",
+            "--- a/app/src/lib.rs\n",
+            "+++ b/app/src/lib.rs\n",
+            "@@ -1,2 +1,3 @@\n",
+            " pub mod debt;\n",
+            "-pub fn local() -> i32 { dep::api::add(1, 2) }\n",
+            "+use dep::api::new_api;\n",
+            "+pub fn local() -> i32 { new_api() }\n",
+            "diff --git a/dep/src/lib.rs b/dep/src/lib.rs\n",
+            "--- a/dep/src/lib.rs\n",
+            "+++ b/dep/src/lib.rs\n",
+            "@@ -1,5 +1,6 @@\n",
+            " pub mod api {\n",
+            "     pub fn add(left: i32, right: i32) -> i32 { left + right }\n",
+            "+    pub fn new_api() -> i32 { 42 }\n",
+            "     pub fn takes_int(value: i32) -> i32 { value }\n",
+            "     pub struct Public { pub value: i32, hidden: i32 }\n",
+            "     pub fn public() -> Public { Public { value: 1, hidden: 2 } }\n",
+        );
+
+        for (offset, _) in patch.char_indices() {
+            assert_eq!(
+                gate.evaluate_prefix("apply_patch", &arguments, &patch[..offset]),
+                CompletionDecision::Accept,
+                "valid multi-file patch prefix rejected at byte {offset}"
+            );
+        }
+        assert_eq!(
+            gate.evaluate_prefix("apply_patch", &arguments, patch),
+            CompletionDecision::Accept
+        );
+        let boundaries = patch
+            .char_indices()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ patch.len() as u64;
+        for _ in 0..64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let boundary = boundaries[(state % boundaries.len() as u64) as usize];
+            assert_eq!(
+                gate.evaluate_prefix("apply_patch", &arguments, &patch[..boundary]),
+                CompletionDecision::Accept,
+                "valid rollback prefix rejected at byte {boundary}"
+            );
+            assert_eq!(
+                gate.evaluate_prefix("apply_patch", &arguments, patch),
+                CompletionDecision::Accept,
+                "full patch changed after rollback from byte {boundary}"
+            );
+        }
     }
 
     #[test]

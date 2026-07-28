@@ -1,4 +1,4 @@
-//! Python-owned semantic qualification through the production mutation lifecycle.
+//! Rust-owned semantic and prefix-monotonicity qualification through the production lifecycle.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -15,6 +15,7 @@ use pb_control_collar::{
     CompletionDecision, RejectionCode,
     mutation::{LogicalPath, SnapshotEntry, WorkspaceSnapshot},
 };
+use pb_control_rust::{RustDeepDiagnostic, RustDeepProfile, RustDeepUnknownReason};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,40 +23,47 @@ use sha2::{Digest, Sha256};
 use crate::{
     agent_core::BuiltInToolSchema,
     control_layers::{
-        ControlLayerLifecycle, PythonSemanticQualificationObservation,
-        python_semantic_world_observation, qualify_python_semantic_case,
+        ControlLayerLifecycle, RustSemanticQualificationObservation, qualify_rust_semantic_case,
+        rust_semantic_world_observation,
     },
 };
 
-const CORPUS_VERSION: u32 = 1;
+const CORPUS_VERSION: u32 = 2;
 const REPORT_VERSION: u32 = 1;
 const MAX_CORPUS_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_FILES: usize = 64;
-const MAX_DEPENDENCY_FILES: usize = 256;
+const MAX_FILES: usize = 128;
 const MAX_CASES: usize = 256;
 const MAX_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
-const DEFAULT_MAX_COLD_MILLIS: u64 = 60_000;
+const DEFAULT_MAX_COLD_MILLIS: u64 = 120_000;
 const DEFAULT_MAX_CASE_MILLIS: u64 = 20_000;
-const PYTHON_ENVIRONMENT_CONFIG: &str = "version = 3.12.8\n";
-const PYTHON_GITIGNORE: &str = ".venv/\n";
-const PROMOTED_CODES: [&str; 6] = [
-    "invalid-argument-type",
-    "invalid-assignment",
-    "invalid-return-type",
-    "unresolved-attribute",
-    "unresolved-import",
-    "unsupported-operator",
+const PROMOTED_DIAGNOSTICS: [RustDeepDiagnostic; 10] = [
+    RustDeepDiagnostic::UnresolvedName,
+    RustDeepDiagnostic::UnresolvedImport,
+    RustDeepDiagnostic::MissingField,
+    RustDeepDiagnostic::MissingMethod,
+    RustDeepDiagnostic::Privacy,
+    RustDeepDiagnostic::TypeMismatch,
+    RustDeepDiagnostic::InvalidCall,
+    RustDeepDiagnostic::Mutability,
+    RustDeepDiagnostic::Ownership,
+    RustDeepDiagnostic::TraitContract,
 ];
-const REQUIRED_CATEGORIES: [PythonCorpusCategory; 3] = [
-    PythonCorpusCategory::Annotated,
-    PythonCorpusCategory::Unannotated,
-    PythonCorpusCategory::ThirdParty,
+const REQUIRED_UNKNOWN_REASONS: [RustDeepUnknownReason; 2] = [
+    RustDeepUnknownReason::ImportResolutionUnsupported,
+    RustDeepUnknownReason::SourceTopologyChanged,
+];
+const REQUIRED_CATEGORIES: [RustCorpusCategory; 5] = [
+    RustCorpusCategory::Positive,
+    RustCorpusCategory::Diagnostic,
+    RustCorpusCategory::BaselineDebt,
+    RustCorpusCategory::Transaction,
+    RustCorpusCategory::Unknown,
 ];
 const REQUIRED_TOOLS: [&str; 4] = ["write_file", "replace_file", "edit_file", "apply_patch"];
 
 #[derive(Args, Debug, Clone)]
-pub struct HarnessPythonSemanticQualifyArgs {
-    /// Versioned Python semantic corpus
+pub struct HarnessRustSemanticQualifyArgs {
+    /// Versioned Rust semantic and prefix-monotonicity corpus
     #[arg(long)]
     pub(crate) corpus: PathBuf,
 
@@ -71,72 +79,70 @@ pub struct HarnessPythonSemanticQualifyArgs {
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-enum PythonCorpusCategory {
-    Annotated,
-    Unannotated,
-    ThirdParty,
+enum RustCorpusCategory {
+    Positive,
+    Diagnostic,
     BaselineDebt,
     Transaction,
-    DynamicUnknown,
+    Unknown,
 }
 
-impl PythonCorpusCategory {
-    fn id(self) -> &'static str {
+impl RustCorpusCategory {
+    const fn id(self) -> &'static str {
         match self {
-            Self::Annotated => "annotated",
-            Self::Unannotated => "unannotated",
-            Self::ThirdParty => "third_party",
+            Self::Positive => "positive",
+            Self::Diagnostic => "diagnostic",
             Self::BaselineDebt => "baseline_debt",
             Self::Transaction => "transaction",
-            Self::DynamicUnknown => "dynamic_unknown",
+            Self::Unknown => "unknown",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum PythonCorpusOutcome {
+enum RustCorpusOutcome {
     Allow,
     Reject,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PythonSemanticCorpus {
+struct RustSemanticCorpus {
     version: u32,
-    python_version: String,
-    files: Vec<PythonCorpusFile>,
-    dependencies: Vec<PythonCorpusFile>,
-    cases: Vec<PythonCorpusCase>,
+    files: Vec<RustCorpusFile>,
+    cases: Vec<RustCorpusCase>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PythonCorpusFile {
+struct RustCorpusFile {
     path: String,
     content: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PythonCorpusCase {
+struct RustCorpusCase {
     id: String,
-    category: PythonCorpusCategory,
+    category: RustCorpusCategory,
     tool: String,
     arguments: Value,
-    expected: PythonCorpusExpectation,
+    expected: RustCorpusExpectation,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PythonCorpusExpectation {
-    outcome: PythonCorpusOutcome,
+struct RustCorpusExpectation {
+    outcome: RustCorpusOutcome,
     #[serde(default)]
-    diagnostic_codes: Vec<String>,
+    diagnostics: Vec<RustDeepDiagnostic>,
+    #[serde(default)]
+    unknown_reason: Option<RustDeepUnknownReason>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PythonSemanticQualificationReport {
+struct RustSemanticQualificationReport {
     version: u32,
     corpus_sha256: String,
     provider_version: String,
@@ -144,10 +150,11 @@ struct PythonSemanticQualificationReport {
     configuration_sha256: String,
     dependency_sha256: String,
     file_count: usize,
-    dependency_file_count: usize,
+    target_count: usize,
     case_count: usize,
     category_counts: BTreeMap<String, usize>,
     diagnostic_counts: BTreeMap<String, usize>,
+    unknown_counts: BTreeMap<String, usize>,
     allow_count: usize,
     reject_count: usize,
     generation_final_parity_count: usize,
@@ -166,7 +173,7 @@ struct PythonSemanticQualificationReport {
     passed: bool,
 }
 
-pub(crate) fn run(args: HarnessPythonSemanticQualifyArgs) -> Result<()> {
+pub(crate) fn run(args: HarnessRustSemanticQualifyArgs) -> Result<()> {
     let report = qualify(&args.corpus, args.max_cold_millis, args.max_case_millis)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -176,15 +183,15 @@ fn qualify(
     corpus_path: &Path,
     max_cold_millis: u64,
     max_case_millis: u64,
-) -> Result<PythonSemanticQualificationReport> {
+) -> Result<RustSemanticQualificationReport> {
     if max_cold_millis == 0 || max_case_millis == 0 {
-        bail!("Python semantic qualification budgets must be non-zero");
+        bail!("Rust semantic qualification budgets must be non-zero");
     }
     let bytes = read_bounded(corpus_path, MAX_CORPUS_BYTES)?;
     let corpus_sha256 = format!("{:x}", Sha256::digest(&bytes));
-    let corpus: PythonSemanticCorpus = serde_json::from_slice(&bytes).with_context(|| {
+    let corpus: RustSemanticCorpus = serde_json::from_slice(&bytes).with_context(|| {
         format!(
-            "failed to parse Python semantic corpus {}",
+            "failed to parse Rust semantic corpus {}",
             corpus_path.display()
         )
     })?;
@@ -202,18 +209,25 @@ fn qualify(
             Some(&base_snapshot),
             &|| Ok(()),
         )?
-        .context("Python semantic corpus did not prepare a native world")?;
+        .context("Rust semantic corpus did not prepare a native world")?;
     let cold_millis = elapsed_millis(cold_started);
     drop(cold_layers);
     if cold_millis > max_cold_millis {
         bail!(
-            "Python semantic corpus exceeded its cold budget: {cold_millis} > {max_cold_millis} ms"
+            "Rust semantic corpus exceeded its cold budget: {cold_millis} > {max_cold_millis} ms"
         );
     }
-    let world = python_semantic_world_observation(&lifecycle)?;
+    let world = rust_semantic_world_observation(&lifecycle)?;
+    if world.deep_profile != RustDeepProfile::Exact {
+        bail!(
+            "Rust semantic corpus requires the exact no-execution profile, got {:?}",
+            world.deep_profile
+        );
+    }
 
     let mut category_counts = BTreeMap::new();
     let mut diagnostic_counts = BTreeMap::new();
+    let mut unknown_counts = BTreeMap::new();
     let mut allow_count = 0usize;
     let mut reject_count = 0usize;
     let mut generation_final_parity_count = 0usize;
@@ -237,7 +251,7 @@ fn qualify(
                 .with_bound_mutation_path(bound_path.context("mutation case has no path")?)
         };
         let tool = tool_schema(&case.tool, snapshot.bound_mutation_path())?;
-        let observation = qualify_python_semantic_case(
+        let observation = qualify_rust_semantic_case(
             &mut lifecycle,
             &fixture.root,
             &tool,
@@ -245,7 +259,7 @@ fn qualify(
             &case.tool,
             &case.arguments,
         )
-        .with_context(|| format!("Python semantic case {} failed", case.id))?;
+        .with_context(|| format!("Rust semantic case {} failed", case.id))?;
         case_latencies.extend([
             observation.warm_millis,
             observation.generation_millis,
@@ -263,12 +277,19 @@ fn qualify(
         *category_counts
             .entry(case.category.id().to_string())
             .or_insert(0usize) += 1;
-        for code in &case.expected.diagnostic_codes {
-            *diagnostic_counts.entry(code.clone()).or_insert(0usize) += 1;
+        for diagnostic in &case.expected.diagnostics {
+            *diagnostic_counts
+                .entry(diagnostic.id().to_string())
+                .or_insert(0usize) += 1;
+        }
+        if let Some(reason) = case.expected.unknown_reason {
+            *unknown_counts
+                .entry(reason.id().to_string())
+                .or_insert(0usize) += 1;
         }
         match case.expected.outcome {
-            PythonCorpusOutcome::Allow => allow_count = allow_count.saturating_add(1),
-            PythonCorpusOutcome::Reject => reject_count = reject_count.saturating_add(1),
+            RustCorpusOutcome::Allow => allow_count = allow_count.saturating_add(1),
+            RustCorpusOutcome::Reject => reject_count = reject_count.saturating_add(1),
         }
     }
 
@@ -284,13 +305,13 @@ fn qualify(
     }
     if !failures.is_empty() {
         bail!(
-            "Python semantic qualification failed {} observation(s): {}",
+            "Rust semantic qualification failed {} observation(s): {}",
             failures.len(),
             failures.join("; ")
         );
     }
 
-    Ok(PythonSemanticQualificationReport {
+    Ok(RustSemanticQualificationReport {
         version: REPORT_VERSION,
         corpus_sha256,
         provider_version: world.provider_version,
@@ -298,10 +319,11 @@ fn qualify(
         configuration_sha256: world.configuration_sha256,
         dependency_sha256: world.dependency_sha256,
         file_count: corpus.files.len(),
-        dependency_file_count: corpus.dependencies.len(),
+        target_count: world.target_count,
         case_count: corpus.cases.len(),
         category_counts,
         diagnostic_counts,
+        unknown_counts,
         allow_count,
         reject_count,
         generation_final_parity_count,
@@ -322,12 +344,12 @@ fn qualify(
 }
 
 fn validate_observation(
-    case: &PythonCorpusCase,
-    observation: &PythonSemanticQualificationObservation,
+    case: &RustCorpusCase,
+    observation: &RustSemanticQualificationObservation,
 ) -> Result<()> {
     let expected_decision = match case.expected.outcome {
-        PythonCorpusOutcome::Allow => CompletionDecision::Accept,
-        PythonCorpusOutcome::Reject => CompletionDecision::Reject(RejectionCode::InvalidSemantics),
+        RustCorpusOutcome::Allow => CompletionDecision::Accept,
+        RustCorpusOutcome::Reject => CompletionDecision::Reject(RejectionCode::InvalidSemantics),
     };
     if observation.generation != expected_decision {
         bail!(
@@ -343,120 +365,109 @@ fn validate_observation(
             expected_decision
         );
     }
-    let expected_codes = case
+    let expected_diagnostics = case
         .expected
-        .diagnostic_codes
+        .diagnostics
         .iter()
-        .cloned()
+        .copied()
         .collect::<BTreeSet<_>>();
-    if observation.diagnostic_codes != expected_codes {
-        bail!(
-            "diagnostic codes {:?} did not match {:?}",
-            observation.diagnostic_codes,
-            expected_codes
-        );
+    match (&observation.diagnostic_result, case.expected.unknown_reason) {
+        (Ok(actual), None) if actual == &expected_diagnostics => Ok(()),
+        (Err(actual), Some(expected)) if *actual == expected => Ok(()),
+        (actual, expected_unknown) => bail!(
+            "diagnostic result {actual:?} did not match diagnostics {expected_diagnostics:?} and unknown {expected_unknown:?}"
+        ),
     }
-    Ok(())
 }
 
-fn validate_corpus(corpus: &PythonSemanticCorpus) -> Result<()> {
+fn validate_corpus(corpus: &RustSemanticCorpus) -> Result<()> {
     if corpus.version != CORPUS_VERSION {
-        bail!("Python semantic corpus version must be {CORPUS_VERSION}");
-    }
-    if corpus.python_version != "3.12" {
-        bail!("Python semantic corpus must target the promoted Python 3.12 profile");
+        bail!("Rust semantic corpus version must be {CORPUS_VERSION}");
     }
     if corpus.files.is_empty() || corpus.files.len() > MAX_FILES {
-        bail!("Python semantic corpus must contain 1..={MAX_FILES} first-party files");
-    }
-    if corpus.dependencies.is_empty() || corpus.dependencies.len() > MAX_DEPENDENCY_FILES {
-        bail!("Python semantic corpus must contain 1..={MAX_DEPENDENCY_FILES} dependency files");
+        bail!("Rust semantic corpus must contain 1..={MAX_FILES} files");
     }
     if corpus.cases.is_empty() || corpus.cases.len() > MAX_CASES {
-        bail!("Python semantic corpus must contain 1..={MAX_CASES} cases");
+        bail!("Rust semantic corpus must contain 1..={MAX_CASES} cases");
     }
 
     let mut total_bytes = 0usize;
-    let mut first_party_paths = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    let mut has_root_manifest = false;
+    let mut has_rust_source = false;
     for file in &corpus.files {
         let path = LogicalPath::parse(file.path.clone())?;
-        if !is_python_path(path.as_str()) || !first_party_paths.insert(file.path.as_str()) {
-            bail!("Python semantic corpus has a repeated or non-Python first-party path");
+        if !paths.insert(file.path.as_str()) {
+            bail!("Rust semantic corpus has a repeated file path");
         }
+        has_root_manifest |= path.as_str() == "Cargo.toml";
+        has_rust_source |= is_rust_path(path.as_str());
         total_bytes = checked_workspace_bytes(total_bytes, file.content.len())?;
     }
-    let mut dependency_paths = BTreeSet::new();
-    for file in &corpus.dependencies {
-        let path = LogicalPath::parse(file.path.clone())?;
-        if forbidden_dependency_path(path.as_str()) || !dependency_paths.insert(file.path.as_str())
-        {
-            bail!("Python semantic corpus has a repeated or unsafe dependency path");
-        }
-        total_bytes = checked_workspace_bytes(total_bytes, file.content.len())?;
+    if !has_root_manifest || !has_rust_source {
+        bail!("Rust semantic corpus requires a root Cargo.toml and at least one Rust source");
     }
     if total_bytes > MAX_WORKSPACE_BYTES {
-        bail!("Python semantic corpus exceeds the {MAX_WORKSPACE_BYTES}-byte workspace bound");
+        bail!("Rust semantic corpus exceeds the {MAX_WORKSPACE_BYTES}-byte workspace bound");
     }
 
-    let promoted = PROMOTED_CODES.into_iter().collect::<BTreeSet<_>>();
-    let mut observed_codes = BTreeSet::new();
+    let promoted = PROMOTED_DIAGNOSTICS.into_iter().collect::<BTreeSet<_>>();
+    let required_unknown = REQUIRED_UNKNOWN_REASONS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut observed_diagnostics = BTreeSet::new();
+    let mut observed_unknown = BTreeSet::new();
     let mut ids = BTreeSet::new();
-    let mut category_outcomes = BTreeSet::new();
+    let mut categories = BTreeSet::new();
     let mut tools = BTreeSet::new();
     for case in &corpus.cases {
         if case.id.is_empty() || case.id.len() > 128 || !ids.insert(case.id.as_str()) {
-            bail!("Python semantic corpus case ids must be bounded, non-empty, and unique");
+            bail!("Rust semantic corpus case ids must be bounded, non-empty, and unique");
         }
         if !REQUIRED_TOOLS.contains(&case.tool.as_str()) {
-            bail!("Python semantic case {} uses an unsupported tool", case.id);
+            bail!("Rust semantic case {} uses an unsupported tool", case.id);
         }
         tools.insert(case.tool.as_str());
-        category_outcomes.insert((
-            case.category,
-            case.expected.outcome == PythonCorpusOutcome::Reject,
-        ));
-        let codes = case
+        categories.insert(case.category);
+        let diagnostics = case
             .expected
-            .diagnostic_codes
+            .diagnostics
             .iter()
-            .map(String::as_str)
+            .copied()
             .collect::<BTreeSet<_>>();
-        if codes.len() != case.expected.diagnostic_codes.len()
-            || !codes.is_subset(&promoted)
-            || (case.expected.outcome == PythonCorpusOutcome::Allow && !codes.is_empty())
-            || (case.expected.outcome == PythonCorpusOutcome::Reject && codes.is_empty())
+        if diagnostics.len() != case.expected.diagnostics.len()
+            || !diagnostics.is_subset(&promoted)
+            || (case.expected.outcome == RustCorpusOutcome::Allow && !diagnostics.is_empty())
+            || (case.expected.outcome == RustCorpusOutcome::Reject && diagnostics.is_empty())
+            || (case.expected.unknown_reason.is_some() && !diagnostics.is_empty())
+            || (case.expected.unknown_reason.is_some()
+                && case.expected.outcome != RustCorpusOutcome::Allow)
         {
             bail!(
-                "Python semantic case {} has an invalid expected diagnostic set",
+                "Rust semantic case {} has an invalid diagnostic/unknown expectation",
                 case.id
             );
         }
-        observed_codes.extend(codes);
-        validate_case_arguments(case, &first_party_paths)?;
+        observed_diagnostics.extend(diagnostics);
+        observed_unknown.extend(case.expected.unknown_reason);
+        validate_case_arguments(case, &paths)?;
     }
-    if observed_codes != promoted {
-        bail!("Python semantic corpus must exercise every promoted diagnostic code");
+    if observed_diagnostics != promoted {
+        bail!("Rust semantic corpus must exercise every promoted diagnostic class");
+    }
+    if !required_unknown.is_subset(&observed_unknown) {
+        bail!("Rust semantic corpus must exercise every required conservative unknown reason");
     }
     if tools != REQUIRED_TOOLS.into_iter().collect::<BTreeSet<_>>() {
-        bail!("Python semantic corpus must exercise every supported mutation tool");
+        bail!("Rust semantic corpus must exercise every supported mutation tool");
     }
-    for category in REQUIRED_CATEGORIES {
-        if !category_outcomes.contains(&(category, false))
-            || !category_outcomes.contains(&(category, true))
-        {
-            bail!(
-                "Python semantic corpus category {} requires allow and reject cases",
-                category.id()
-            );
-        }
+    if categories != REQUIRED_CATEGORIES.into_iter().collect::<BTreeSet<_>>() {
+        bail!("Rust semantic corpus must exercise every required category");
     }
     Ok(())
 }
 
-fn validate_case_arguments(
-    case: &PythonCorpusCase,
-    first_party_paths: &BTreeSet<&str>,
-) -> Result<()> {
+fn validate_case_arguments(case: &RustCorpusCase, paths: &BTreeSet<&str>) -> Result<()> {
     if case.tool == "apply_patch" {
         if case
             .arguments
@@ -464,7 +475,7 @@ fn validate_case_arguments(
             .and_then(Value::as_str)
             .is_none()
         {
-            bail!("Python semantic patch case {} has no patch", case.id);
+            bail!("Rust semantic patch case {} has no patch", case.id);
         }
         return Ok(());
     }
@@ -472,21 +483,21 @@ fn validate_case_arguments(
         .arguments
         .get("path")
         .and_then(Value::as_str)
-        .with_context(|| format!("Python semantic case {} has no path", case.id))?;
+        .with_context(|| format!("Rust semantic case {} has no path", case.id))?;
     let logical = LogicalPath::parse(path.to_string())?;
-    if !is_python_path(logical.as_str()) {
-        bail!("Python semantic case {} targets a non-Python file", case.id);
+    if !is_rust_path(logical.as_str()) {
+        bail!("Rust semantic case {} targets a non-Rust file", case.id);
     }
     match case.tool.as_str() {
-        "write_file" if first_party_paths.contains(path) => {
+        "write_file" if paths.contains(path) => {
             bail!(
-                "Python semantic write case {} targets an existing file",
+                "Rust semantic write case {} targets an existing file",
                 case.id
             )
         }
-        "replace_file" | "edit_file" if !first_party_paths.contains(path) => {
+        "replace_file" | "edit_file" if !paths.contains(path) => {
             bail!(
-                "Python semantic modify case {} targets a missing file",
+                "Rust semantic modify case {} targets a missing file",
                 case.id
             )
         }
@@ -495,41 +506,34 @@ fn validate_case_arguments(
     Ok(())
 }
 
-fn materialize_corpus(corpus: &PythonSemanticCorpus) -> Result<PythonCorpusFixture> {
+fn materialize_corpus(corpus: &RustSemanticCorpus) -> Result<RustCorpusFixture> {
     let owner = tempfile::Builder::new()
-        .prefix("pb-python-semantic-")
+        .prefix("pb-rust-semantic-")
         .tempdir()
-        .context("failed to create Python semantic corpus workspace")?;
+        .context("failed to create Rust semantic corpus workspace")?;
     let root = owner.path().to_path_buf();
     initialize_git(&root)?;
-    fs::write(root.join(".gitignore"), PYTHON_GITIGNORE)?;
-    let site_packages = root.join(".venv/lib/python3.12/site-packages");
-    fs::create_dir_all(&site_packages)?;
-    fs::write(root.join(".venv/pyvenv.cfg"), PYTHON_ENVIRONMENT_CONFIG)?;
     for file in &corpus.files {
         write_fixture_file(&root, file)?;
     }
-    for file in &corpus.dependencies {
-        write_fixture_file(&site_packages, file)?;
-    }
-    Ok(PythonCorpusFixture {
+    Ok(RustCorpusFixture {
         _owner: owner,
         root,
     })
 }
 
-struct PythonCorpusFixture {
+struct RustCorpusFixture {
     _owner: tempfile::TempDir,
     root: PathBuf,
 }
 
-fn write_fixture_file(root: &Path, file: &PythonCorpusFile) -> Result<()> {
+fn write_fixture_file(root: &Path, file: &RustCorpusFile) -> Result<()> {
     let path = root.join(&file.path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(&path, file.content.as_bytes())
-        .with_context(|| format!("failed to write Python semantic fixture {}", file.path))
+        .with_context(|| format!("failed to write Rust semantic fixture {}", file.path))
 }
 
 fn initialize_git(root: &Path) -> Result<()> {
@@ -537,14 +541,14 @@ fn initialize_git(root: &Path) -> Result<()> {
         .args(["init", "--quiet"])
         .current_dir(root)
         .status()
-        .context("failed to initialize Python semantic Git fixture")?;
+        .context("failed to initialize Rust semantic Git fixture")?;
     if !status.success() {
-        bail!("failed to initialize Python semantic Git fixture");
+        bail!("failed to initialize Rust semantic Git fixture");
     }
     Ok(())
 }
 
-fn workspace_snapshot(files: &[PythonCorpusFile]) -> Result<WorkspaceSnapshot> {
+fn workspace_snapshot(files: &[RustCorpusFile]) -> Result<WorkspaceSnapshot> {
     WorkspaceSnapshot::new(
         files
             .iter()
@@ -590,52 +594,39 @@ fn tool_schema(name: &str, bound_path: Option<&LogicalPath>) -> Result<BuiltInTo
             "required": ["patch"],
             "additionalProperties": false
         }),
-        _ => bail!("unsupported Python semantic qualification tool {name}"),
+        _ => bail!("unsupported Rust semantic qualification tool {name}"),
     };
     Ok(BuiltInToolSchema {
         name: name.to_string(),
-        description: "Python semantic qualification mutation".to_string(),
+        description: "Rust semantic qualification mutation".to_string(),
         input_schema,
     })
 }
 
-fn forbidden_dependency_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".pth")
-        || lower.ends_with(".so")
-        || lower.ends_with(".dylib")
-        || lower.ends_with(".dll")
-        || lower.ends_with(".pyd")
-        || lower.contains("__pycache__")
-}
-
-fn is_python_path(path: &str) -> bool {
-    path.ends_with(".py") || path.ends_with(".pyi")
+fn is_rust_path(path: &str) -> bool {
+    path.ends_with(".rs")
 }
 
 fn checked_workspace_bytes(total: usize, next: usize) -> Result<usize> {
     total
         .checked_add(next)
-        .context("Python semantic corpus workspace size overflowed")
+        .context("Rust semantic corpus workspace size overflowed")
 }
 
 fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     let file = fs::File::open(path)
-        .with_context(|| format!("failed to open Python semantic corpus {}", path.display()))?;
-    let metadata = file.metadata().with_context(|| {
-        format!(
-            "failed to inspect Python semantic corpus {}",
-            path.display()
-        )
-    })?;
+        .with_context(|| format!("failed to open Rust semantic corpus {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect Rust semantic corpus {}", path.display()))?;
     if !metadata.is_file() || metadata.len() > max_bytes {
-        bail!("Python semantic corpus must be a regular file of at most {max_bytes} bytes");
+        bail!("Rust semantic corpus must be a regular file of at most {max_bytes} bytes");
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes || bytes.len() as u64 != metadata.len() {
-        bail!("Python semantic corpus changed or exceeded its byte bound while reading");
+        bail!("Rust semantic corpus changed or exceeded its byte bound while reading");
     }
     Ok(bytes)
 }
@@ -662,58 +653,45 @@ fn percentile(values: &[u64], percentile: usize) -> u64 {
 mod tests {
     use super::*;
 
-    const CHECKED_CORPUS: &str = include_str!("../fixtures/control-collar/semantic-python-v1.json");
+    const CHECKED_CORPUS: &str = include_str!("../fixtures/control-collar/semantic-rust-v2.json");
 
     #[test]
-    fn checked_python_semantic_corpus_is_complete() {
-        let corpus: PythonSemanticCorpus = serde_json::from_str(CHECKED_CORPUS).unwrap();
+    fn checked_rust_semantic_corpus_is_complete() {
+        let corpus: RustSemanticCorpus = serde_json::from_str(CHECKED_CORPUS).unwrap();
         validate_corpus(&corpus).unwrap();
-        assert_eq!(
-            format!("{:x}", Sha256::digest(CHECKED_CORPUS.as_bytes())),
-            "e073204a58aab27a8f52c17912734f138e7a6a239c2999d95841ece93f1f0b40"
-        );
     }
 
     #[test]
-    fn corpus_contract_rejects_unsafe_dependencies_and_missing_profile_arms() {
-        let mut unsafe_dependency: Value = serde_json::from_str(CHECKED_CORPUS).unwrap();
-        unsafe_dependency["dependencies"][0]["path"] = Value::String("../outside.py".to_string());
-        let corpus: PythonSemanticCorpus = serde_json::from_value(unsafe_dependency).unwrap();
-        assert!(validate_corpus(&corpus).is_err());
-
-        let mut missing_profile: Value = serde_json::from_str(CHECKED_CORPUS).unwrap();
-        for case in missing_profile["cases"].as_array_mut().unwrap() {
-            if case["category"] == "third_party" {
-                case["category"] = Value::String("annotated".to_string());
+    fn corpus_contract_rejects_missing_diagnostics_and_unknown_coverage() {
+        let mut missing_diagnostic: Value = serde_json::from_str(CHECKED_CORPUS).unwrap();
+        for case in missing_diagnostic["cases"].as_array_mut().unwrap() {
+            if case["expected"]["diagnostics"] == serde_json::json!(["ownership"]) {
+                case["expected"]["diagnostics"] = serde_json::json!(["type_mismatch"]);
             }
         }
-        let corpus: PythonSemanticCorpus = serde_json::from_value(missing_profile).unwrap();
+        let corpus: RustSemanticCorpus = serde_json::from_value(missing_diagnostic).unwrap();
+        assert!(validate_corpus(&corpus).is_err());
+
+        let mut missing_unknown: Value = serde_json::from_str(CHECKED_CORPUS).unwrap();
+        for case in missing_unknown["cases"].as_array_mut().unwrap() {
+            if case["expected"]["unknown_reason"] == "import_resolution_unsupported" {
+                case["expected"]["unknown_reason"] =
+                    Value::String("source_topology_changed".to_string());
+            }
+        }
+        let corpus: RustSemanticCorpus = serde_json::from_value(missing_unknown).unwrap();
         assert!(validate_corpus(&corpus).is_err());
     }
 
     #[test]
-    fn corpus_contract_rejects_unpromoted_or_duplicate_diagnostic_expectations() {
-        let mut unpromoted: Value = serde_json::from_str(CHECKED_CORPUS).unwrap();
-        unpromoted["cases"][1]["expected"]["diagnostic_codes"][0] =
-            Value::String("not-promoted".to_string());
-        let corpus: PythonSemanticCorpus = serde_json::from_value(unpromoted).unwrap();
-        assert!(validate_corpus(&corpus).is_err());
-
-        let mut duplicate: Value = serde_json::from_str(CHECKED_CORPUS).unwrap();
-        duplicate["cases"][1]["expected"]["diagnostic_codes"] =
-            serde_json::json!(["invalid-argument-type", "invalid-argument-type"]);
-        let corpus: PythonSemanticCorpus = serde_json::from_value(duplicate).unwrap();
-        assert!(validate_corpus(&corpus).is_err());
-    }
-
-    #[test]
-    fn checked_python_semantic_corpus_passes_production_gates() {
+    fn checked_rust_semantic_corpus_passes_production_gates() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/control-collar/semantic-python-v1.json");
+            .join("fixtures/control-collar/semantic-rust-v2.json");
         let report = qualify(&path, DEFAULT_MAX_COLD_MILLIS, DEFAULT_MAX_CASE_MILLIS).unwrap();
-        assert_eq!(report.case_count, 24);
         assert_eq!(report.generation_final_parity_count, report.case_count);
-        assert_eq!(report.diagnostic_counts.len(), PROMOTED_CODES.len());
+        assert_eq!(report.diagnostic_counts.len(), PROMOTED_DIAGNOSTICS.len());
+        assert!(report.prefix_probe_count >= report.case_count as u64);
+        assert_eq!(report.rollback_replay_count, report.case_count as u64 * 64);
         assert!(report.passed);
     }
 }

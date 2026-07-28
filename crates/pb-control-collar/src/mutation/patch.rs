@@ -807,17 +807,30 @@ impl PrefixFile {
 
     fn virtual_file(&self, complete: bool, partial_line: &[u8]) -> CollarResult<PatchVirtualFile> {
         let mut segments = self.result_segments.clone();
+        let mut deletions = self.result_deletions.clone();
         let Some(hunk) = self.hunk.as_ref() else {
             return Ok(PatchVirtualFile {
                 path: self.path.clone(),
                 kind: self.kind,
                 segments,
-                deletions: self.result_deletions.clone(),
+                deletions,
                 complete,
             });
         };
+        // `pending` is the previous complete patch line. It will be committed before the current
+        // partial line, so include it when deciding whether that partial line can be the next hunk
+        // or file header. Otherwise the first byte of a valid `diff --git` line is misclassified as
+        // hunk content for one token and then accepted later, violating prefix monotonicity.
+        let projected_old = hunk.old_seen.saturating_add(usize::from(matches!(
+            hunk.pending,
+            Some((HunkLineKind::Context | HunkLineKind::Deletion, _))
+        )));
+        let projected_new = hunk.new_seen.saturating_add(usize::from(matches!(
+            hunk.pending,
+            Some((HunkLineKind::Context | HunkLineKind::Addition, _))
+        )));
         let counts_complete =
-            hunk.old_seen == hunk.header.old_count && hunk.new_seen == hunk.header.new_count;
+            projected_old == hunk.header.old_count && projected_new == hunk.header.new_count;
         const NO_NEWLINE_MARKER: &[u8] = b"\\ No newline at end of file";
         let partial_is_marker =
             partial_line.first() == Some(&b'\\') && NO_NEWLINE_MARKER.starts_with(partial_line);
@@ -832,6 +845,17 @@ impl PrefixFile {
                 if !partial_line.is_empty() && !partial_is_marker {
                     push_virtual_segment(&mut segments, origin, b"\n");
                 }
+            } else if matches!(kind, HunkLineKind::Deletion)
+                && !partial_line.is_empty()
+                && !partial_is_marker
+            {
+                // A following non-marker line proves this pending deletion is newline-terminated.
+                // Project its event before exposing bytes from that line so the language mirror
+                // retains append-only event ordering without losing same-line semantic steering.
+                let mut bytes = pending.clone();
+                bytes.push(b'\n');
+                let result_offset = segments.iter().map(|segment| segment.bytes.len()).sum();
+                push_virtual_deletion(&mut deletions, result_offset, &bytes);
             }
         }
         if !partial_line.is_empty() && !partial_is_marker && !counts_complete {
@@ -855,7 +879,7 @@ impl PrefixFile {
             path: self.path.clone(),
             kind: self.kind,
             segments,
-            deletions: self.result_deletions.clone(),
+            deletions,
             complete,
         })
     }

@@ -1,0 +1,260 @@
+{
+  "version": 2,
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "content": "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n"
+    },
+    {
+      "path": "app/Cargo.toml",
+      "content": "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n"
+    },
+    {
+      "path": "app/src/lib.rs",
+      "content": "pub mod debt;\npub fn local() -> i32 { dep::api::add(1, 2) }\n"
+    },
+    {
+      "path": "app/src/debt.rs",
+      "content": "pub fn existing() -> i32 { \"baseline debt\" }\n"
+    },
+    {
+      "path": "dep/Cargo.toml",
+      "content": "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+    },
+    {
+      "path": "dep/src/lib.rs",
+      "content": "pub mod api {\n    pub fn add(left: i32, right: i32) -> i32 { left + right }\n    pub fn takes_int(value: i32) -> i32 { value }\n    pub struct Public { pub value: i32, hidden: i32 }\n    pub fn public() -> Public { Public { value: 1, hidden: 2 } }\n    pub trait Required { fn required(&self); }\n}\n"
+    }
+  ],
+  "cases": [
+    {
+      "id": "positive-known-std-symbol",
+      "category": "positive",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\nuse std::collections::BTreeSet;\npub fn local() -> usize { BTreeSet::<String>::new().len() }\n"
+      },
+      "expected": { "outcome": "allow" }
+    },
+    {
+      "id": "positive-dependency-shape",
+      "category": "positive",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn local() -> i32 { dep::api::takes_int(4) }\n"
+      },
+      "expected": { "outcome": "allow" }
+    },
+    {
+      "id": "positive-forward-declaration",
+      "category": "positive",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn local() -> i32 { helper() }\nfn helper() -> i32 { 4 }\n"
+      },
+      "expected": { "outcome": "allow" }
+    },
+    {
+      "id": "diagnostic-unresolved-name",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn local() { definitely_missing(); }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["unresolved_name"] }
+    },
+    {
+      "id": "diagnostic-unresolved-import",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\nuse dep::api::definitely_missing;\npub fn local() { definitely_missing(); }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["unresolved_import", "unresolved_name"] }
+    },
+    {
+      "id": "diagnostic-missing-field",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn local() { let _ = dep::api::Public { value: 1, missing: 2 }; }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["missing_field"] }
+    },
+    {
+      "id": "diagnostic-missing-method",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn local() { let _ = \"text\".definitely_missing(); }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["missing_method"] }
+    },
+    {
+      "id": "diagnostic-privacy",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn local() { let _ = dep::api::public().hidden; }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["privacy"] }
+    },
+    {
+      "id": "diagnostic-type-mismatch",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn local() { let _: i32 = \"text\"; }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["type_mismatch"] }
+    },
+    {
+      "id": "diagnostic-invalid-call",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn local() { let _ = dep::api::takes_int(); }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["invalid_call"] }
+    },
+    {
+      "id": "diagnostic-mutability",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn local() { let value = 1; value = 2; }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["mutability"] }
+    },
+    {
+      "id": "diagnostic-ownership",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn take(_: String) {}\npub fn local() { let value = String::new(); let borrowed = &value; take(*borrowed); }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["ownership"] }
+    },
+    {
+      "id": "diagnostic-trait-contract",
+      "category": "diagnostic",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\npub fn needs<T: dep::api::Required>(_: T) {}\npub fn local() { needs(1_i32); }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["trait_contract"] }
+    },
+    {
+      "id": "positive-exact-edit",
+      "category": "positive",
+      "tool": "edit_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "old_text": "dep::api::add(1, 2)",
+        "new_text": "dep::api::add(2, 3)"
+      },
+      "expected": { "outcome": "allow" }
+    },
+    {
+      "id": "diagnostic-edit-invalid-call",
+      "category": "diagnostic",
+      "tool": "edit_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "old_text": "dep::api::add(1, 2)",
+        "new_text": "dep::api::add(1)"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["invalid_call"] }
+    },
+    {
+      "id": "baseline-debt-preserved",
+      "category": "baseline_debt",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/debt.rs",
+        "content": "pub fn existing() -> i32 { \"baseline debt\" }\npub fn valid() -> i32 { 4 }\n"
+      },
+      "expected": { "outcome": "allow" }
+    },
+    {
+      "id": "baseline-debt-increased",
+      "category": "baseline_debt",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/debt.rs",
+        "content": "pub fn existing() -> i32 { \"baseline debt\" }\npub fn new_error() -> i32 { \"new debt\" }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["type_mismatch"] }
+    },
+    {
+      "id": "transaction-cross-crate-repair",
+      "category": "transaction",
+      "tool": "apply_patch",
+      "arguments": {
+        "patch": "diff --git a/app/src/lib.rs b/app/src/lib.rs\n--- a/app/src/lib.rs\n+++ b/app/src/lib.rs\n@@ -1,2 +1,3 @@\n pub mod debt;\n-pub fn local() -> i32 { dep::api::add(1, 2) }\n+use dep::api::new_api;\n+pub fn local() -> i32 { new_api() }\ndiff --git a/dep/src/lib.rs b/dep/src/lib.rs\n--- a/dep/src/lib.rs\n+++ b/dep/src/lib.rs\n@@ -1,5 +1,6 @@\n pub mod api {\n     pub fn add(left: i32, right: i32) -> i32 { left + right }\n+    pub fn new_api() -> i32 { 42 }\n     pub fn takes_int(value: i32) -> i32 { value }\n     pub struct Public { pub value: i32, hidden: i32 }\n     pub fn public() -> Public { Public { value: 1, hidden: 2 } }\n"
+      },
+      "expected": { "outcome": "allow" }
+    },
+    {
+      "id": "transaction-cross-crate-unresolved-import",
+      "category": "transaction",
+      "tool": "apply_patch",
+      "arguments": {
+        "patch": "diff --git a/app/src/lib.rs b/app/src/lib.rs\n--- a/app/src/lib.rs\n+++ b/app/src/lib.rs\n@@ -1,2 +1,3 @@\n pub mod debt;\n-pub fn local() -> i32 { dep::api::add(1, 2) }\n+use dep::api::new_api;\n+pub fn local() -> i32 { new_api() }\ndiff --git a/dep/src/lib.rs b/dep/src/lib.rs\n--- a/dep/src/lib.rs\n+++ b/dep/src/lib.rs\n@@ -1,5 +1,5 @@\n pub mod api {\n-    pub fn add(left: i32, right: i32) -> i32 { left + right }\n+    pub fn replacement() -> i32 { 42 }\n     pub fn takes_int(value: i32) -> i32 { value }\n     pub struct Public { pub value: i32, hidden: i32 }\n     pub fn public() -> Public { Public { value: 1, hidden: 2 } }\n"
+      },
+      "expected": { "outcome": "reject", "diagnostics": ["unresolved_name", "unresolved_import"] }
+    },
+    {
+      "id": "unknown-new-valid-source",
+      "category": "unknown",
+      "tool": "write_file",
+      "arguments": {
+        "path": "app/src/generated.rs",
+        "content": "pub fn generated() -> i32 { 4 }\n"
+      },
+      "expected": { "outcome": "allow", "unknown_reason": "source_topology_changed" }
+    },
+    {
+      "id": "unknown-new-type-error",
+      "category": "unknown",
+      "tool": "write_file",
+      "arguments": {
+        "path": "app/src/generated_invalid.rs",
+        "content": "pub fn generated() -> i32 { \"dynamic topology\" }\n"
+      },
+      "expected": { "outcome": "allow", "unknown_reason": "source_topology_changed" }
+    },
+    {
+      "id": "unknown-delete-source",
+      "category": "unknown",
+      "tool": "apply_patch",
+      "arguments": {
+        "patch": "diff --git a/app/src/debt.rs b/app/src/debt.rs\ndeleted file mode 100644\n--- a/app/src/debt.rs\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-pub fn existing() -> i32 { \"baseline debt\" }\n"
+      },
+      "expected": { "outcome": "allow", "unknown_reason": "source_topology_changed" }
+    },
+    {
+      "id": "unknown-relative-import-context",
+      "category": "unknown",
+      "tool": "replace_file",
+      "arguments": {
+        "path": "app/src/lib.rs",
+        "content": "pub mod debt;\nmod nested { use self::maybe_later; }\n"
+      },
+      "expected": { "outcome": "allow", "unknown_reason": "import_resolution_unsupported" }
+    }
+  ]
+}

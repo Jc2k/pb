@@ -92,6 +92,10 @@ request databases, and an exact-flight result awaiting its registered local wait
 bounded process caches retain only local analyzer worlds and durable events remain content-free. A
 cancelled request may leave its one already-started local Python preparation worker finishing into
 that bounded cache or handoff, but adds no network or durable source persistence.
+The hidden Rust semantic qualifier has the same local-only boundary: it materializes its checked
+offline Cargo corpus in an ephemeral workspace, invokes no model or LSP, executes no build script,
+procedural macro, or generated mutation, and emits only native-world/corpus identities, counts,
+decisions, and timings. Its exhaustive prefix and deterministic rollback probes remain in process.
 The hidden Python semantic qualifier materializes its checked-in first-party and dependency corpus
 only in an ephemeral local workspace. It starts no model, LSP, package installer, or network
 request, and emits only content-free digests, counts, parity results, and timings. The native Python

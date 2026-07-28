@@ -624,10 +624,21 @@ execution-time replay, and a separate promoted-diagnostic delta. The checked-in 
 requires allow and reject cases for annotated, unannotated, and frozen third-party code; all six
 promoted diagnostic classes; baseline debt, dynamic unknowns, and multi-file transactions; and all
 four write/replace/edit/patch tools. The report contains only corpus/world/configuration/dependency
-digests, category and diagnostic counts, parity counts, and timings. It never invokes an LSP,
-network, package installer, or model. Frozen dependency imports and symbol shapes are resolved
-directly by the language crate before inference. Passing this corpus does not promote another
-diagnostic to token-time hard rejection: that still requires a separately named monotonic proof.
+digests, category and diagnostic counts, parity counts, exhaustive UTF-8 prefix-probe and
+deterministic rollback-replay counts, and timings. Every case probes every logical UTF-8 boundary and
+64 reproducible rollback/full-replay branches; a hard rejection must remain hard for every longer
+prefix. It never invokes an LSP, network, package installer, or model. Frozen dependency imports and
+symbol shapes are resolved directly by the language crate before inference. Passing this corpus does
+not promote another diagnostic to token-time hard rejection: that still requires a separately named
+monotonic proof.
+`pb harness rust-semantic-qualify --corpus fixtures/control-collar/semantic-rust-v2.json` applies the
+same production generation, independent final-replay, direct diagnostic-delta, exhaustive prefix,
+and rollback checks to the exact native Rust profile. Corpus validation requires all ten promoted
+diagnostic classes, baseline debt, cross-crate repair and failure, conservative unknowns for import
+context and create/delete topology, and all four mutation tools. The fixture is an ephemeral offline
+Cargo workspace; no build script, procedural macro, model, LSP, network, or generated mutation is
+executed. The content-free report additionally records the prepared Rust target count and native
+world identity. This qualifier proves the checked profile and corpus, not rustc equivalence.
 For Qwen prefill qualification, `infer --prefill-mode auto|scalar|layer-major` selects the promoted
 policy, exact scalar reference, or an explicit layer-major request. `auto` promotes only a prepared
 Qwen3-Coder-Next affine-Q4 graph with at least 32 fresh tokens and sufficient live Metal reserve.

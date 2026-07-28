@@ -53,6 +53,21 @@ pub enum RustDeepDiagnostic {
 }
 
 impl RustDeepDiagnostic {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::UnresolvedName => "unresolved_name",
+            Self::UnresolvedImport => "unresolved_import",
+            Self::MissingField => "missing_field",
+            Self::MissingMethod => "missing_method",
+            Self::Privacy => "privacy",
+            Self::TypeMismatch => "type_mismatch",
+            Self::InvalidCall => "invalid_call",
+            Self::Mutability => "mutability",
+            Self::Ownership => "ownership",
+            Self::TraitContract => "trait_contract",
+        }
+    }
+
     fn obligation(self) -> &'static str {
         match self {
             Self::UnresolvedName => "rust_deep_unresolved_name",
@@ -80,6 +95,16 @@ pub enum RustDeepUnknownReason {
 }
 
 impl RustDeepUnknownReason {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::BuildScriptDisabled => "build_script_disabled",
+            Self::ProceduralMacroDisabled => "procedural_macro_disabled",
+            Self::DependencyManifestUnavailable => "dependency_manifest_unavailable",
+            Self::ImportResolutionUnsupported => "import_resolution_unsupported",
+            Self::SourceTopologyChanged => "source_topology_changed",
+        }
+    }
+
     fn obligation(self) -> &'static str {
         match self {
             Self::BuildScriptDisabled => "rust_deep_build_script_unknown",
@@ -636,6 +661,16 @@ impl RustProjectRequestWorld {
         Ok(diagnostics)
     }
 
+    /// Content-free promotion evidence for the checked-in semantic qualifier. Production
+    /// generation and execution use the same private implementation through `finalize`; this
+    /// method exposes only diagnostic classes (or a conservative unknown reason), never source.
+    pub fn qualification_diagnostic_delta(
+        &self,
+        candidates: &[(pb_control_collar::mutation::LogicalPath, Vec<u8>)],
+    ) -> Result<Vec<RustDeepDiagnostic>, RustDeepUnknownReason> {
+        self.deep_diagnostic_delta(candidates)
+    }
+
     fn deep_profile_unknown_reason(&self) -> RustDeepUnknownReason {
         match &self.deep_profile {
             RustDeepProfile::Exact => RustDeepUnknownReason::DependencyManifestUnavailable,
@@ -937,7 +972,10 @@ fn symbol_shape(
 }
 
 fn callable_shape(db: &RootDatabase, function: Function) -> RustCallableShape {
-    RustCallableShape {
+    // Generic signatures in the next trait solver consult rust-analyzer's thread-local database
+    // interner. Public HIR calls usually attach it through a query boundary, but direct shape
+    // extraction is one of the APIs where the caller must establish that scope explicitly.
+    ra_ap_hir_ty::attach_db(db, || RustCallableShape {
         parameters: function
             .params_without_self(db)
             .iter()
@@ -945,7 +983,7 @@ fn callable_shape(db: &RootDatabase, function: Function) -> RustCallableShape {
             .collect(),
         accepts_extra_arguments: None,
         result: type_shape(&function.ret_type(db)),
-    }
+    })
 }
 
 fn type_shape(ty: &Type<'_>) -> RustTypeShape {
