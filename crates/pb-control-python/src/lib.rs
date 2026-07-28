@@ -266,6 +266,7 @@ impl PythonProjectWorld {
             receipt: self.receipt.clone(),
             db,
             baseline: Arc::clone(&self.baseline),
+            first_party_files: Arc::clone(&self.first_party_files),
             applied_paths: BTreeSet::new(),
             request_epoch: Arc::clone(&self.request_epoch),
         })
@@ -277,6 +278,7 @@ pub struct PythonProjectRequestWorld {
     receipt: LayerReadinessReceipt,
     db: PythonDatabase,
     baseline: Arc<BTreeMap<String, Vec<PythonDiagnostic>>>,
+    first_party_files: Arc<BTreeMap<String, SystemPathBuf>>,
     applied_paths: BTreeSet<LogicalPath>,
     #[allow(dead_code)]
     request_epoch: Arc<()>,
@@ -286,6 +288,12 @@ pub struct PythonProjectRequestWorld {
 enum PythonCandidateMutation {
     Upsert(String),
     Delete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PythonCheckScope {
+    Candidates,
+    FrozenProject,
 }
 
 impl PythonProjectRequestWorld {
@@ -310,6 +318,21 @@ impl PythonProjectRequestWorld {
         &mut self,
         candidates: &BTreeMap<LogicalPath, PythonCandidateMutation>,
     ) -> Result<BTreeMap<String, PythonCheckReport>, PythonLayerError> {
+        self.check_mutations_in_scope(candidates, PythonCheckScope::Candidates)
+    }
+
+    fn check_project_mutations(
+        &mut self,
+        candidates: &BTreeMap<LogicalPath, PythonCandidateMutation>,
+    ) -> Result<BTreeMap<String, PythonCheckReport>, PythonLayerError> {
+        self.check_mutations_in_scope(candidates, PythonCheckScope::FrozenProject)
+    }
+
+    fn check_mutations_in_scope(
+        &mut self,
+        candidates: &BTreeMap<LogicalPath, PythonCandidateMutation>,
+        scope: PythonCheckScope,
+    ) -> Result<BTreeMap<String, PythonCheckReport>, PythonLayerError> {
         // Semantic probes are speculative. Restore every path touched by the previous probe to the
         // frozen base before applying the next complete candidate set, so rollback never leaks a
         // generated module or stale edit into another decoder branch.
@@ -318,7 +341,6 @@ impl PythonProjectRequestWorld {
             self.db.system.reset(&path)?;
             File::sync_path(&mut self.db, &path);
         }
-        let mut files = BTreeMap::new();
         for (logical, mutation) in candidates {
             let path = virtual_path(logical.as_str())?;
             match mutation {
@@ -329,16 +351,37 @@ impl PythonProjectRequestWorld {
             }
             File::sync_path(&mut self.db, &path);
             self.applied_paths.insert(logical.clone());
-            if matches!(mutation, PythonCandidateMutation::Delete) {
-                continue;
+        }
+        let mut selected = BTreeMap::new();
+        if scope == PythonCheckScope::FrozenProject {
+            let deleted = candidates
+                .iter()
+                .filter_map(|(logical, mutation)| {
+                    matches!(mutation, PythonCandidateMutation::Delete).then_some(logical.as_str())
+                })
+                .collect::<BTreeSet<_>>();
+            for (logical, path) in self.first_party_files.iter() {
+                if !deleted.contains(logical.as_str()) {
+                    selected.insert(logical.clone(), path.clone());
+                }
             }
+        }
+        for (logical, mutation) in candidates {
+            if matches!(mutation, PythonCandidateMutation::Upsert(_)) {
+                selected.insert(
+                    logical.as_str().to_string(),
+                    virtual_path(logical.as_str())?,
+                );
+            }
+        }
+        let mut files = BTreeMap::new();
+        for (logical, path) in selected {
             let file = system_path_to_file(&self.db, &path).map_err(|error| {
                 PythonLayerError::ProviderUnavailable(format!(
-                    "failed to intern candidate Python file {}: {error}",
-                    logical.as_str()
+                    "failed to intern Python closure file {logical}: {error}",
                 ))
             })?;
-            files.insert(logical.as_str().to_string(), file);
+            files.insert(logical, file);
         }
         let mut reports = BTreeMap::new();
         for (logical, file) in files {
@@ -681,7 +724,7 @@ impl IncrementalAnalyzer for PythonWorkspaceStreamingLayer {
         }
         let reports = self
             .project
-            .check_mutations(&self.completed)
+            .check_project_mutations(&self.completed)
             .map_err(|error| CollarError::Analysis(error.to_string()))?;
         let introduced = reports
             .values()
@@ -1356,7 +1399,57 @@ mod tests {
     }
 
     #[test]
-    fn request_overlay_treats_deleted_modules_as_absent_for_other_candidates() {
+    fn streaming_rollback_clears_a_finalized_branch_semantic_overlay() {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "main.py", "value = 1\n");
+        let world = PythonProjectWorld::load_and_prime(config(root.path())).unwrap();
+        let request = world
+            .snapshot_for_request(&world.descriptor().world)
+            .unwrap();
+        let mut layer = request.into_streaming_layer(1024 * 1024, 64).unwrap();
+        layer.begin(ProgramSnapshot::default()).unwrap();
+        let checkpoint = layer.checkpoint().unwrap();
+        let language = LanguageId("python".to_string());
+        let helper = LogicalPath::parse("helper.py".to_string()).unwrap();
+        layer
+            .apply(SourceEvent::BeginFile {
+                path: &helper,
+                language: &language,
+                mutation: MutationKind::Create,
+            })
+            .unwrap();
+        layer
+            .apply(SourceEvent::Bytes {
+                origin: SourceOrigin::Generated,
+                bytes: b"def add(value: int) -> int:\n    return value + 1\n",
+            })
+            .unwrap();
+        layer.apply(SourceEvent::EndFile).unwrap();
+        assert_eq!(layer.finalize().unwrap().closure, ClosureVerdict::Allow);
+
+        layer.rollback(checkpoint).unwrap();
+        let main = LogicalPath::parse("main.py".to_string()).unwrap();
+        layer
+            .apply(SourceEvent::BeginFile {
+                path: &main,
+                language: &language,
+                mutation: MutationKind::Modify,
+            })
+            .unwrap();
+        layer
+            .apply(SourceEvent::Bytes {
+                origin: SourceOrigin::Generated,
+                bytes: b"from helper import add\nvalue = add(1)\n",
+            })
+            .unwrap();
+        layer.apply(SourceEvent::EndFile).unwrap();
+        let analysis = layer.finalize().unwrap();
+        assert_eq!(analysis.viability, Viability::Impossible);
+        assert_eq!(analysis.closure, ClosureVerdict::Reject);
+    }
+
+    #[test]
+    fn project_closure_treats_deleted_modules_as_absent_for_untouched_dependants() {
         let root = tempfile::tempdir().unwrap();
         write(
             root.path(),
@@ -1372,21 +1465,14 @@ mod tests {
         let mut request = world
             .snapshot_for_request(&world.descriptor().world)
             .unwrap();
-        let candidates = BTreeMap::from([
-            (
-                LogicalPath::parse("helper.py".to_string()).unwrap(),
-                PythonCandidateMutation::Delete,
-            ),
-            (
-                LogicalPath::parse("main.py".to_string()).unwrap(),
-                PythonCandidateMutation::Upsert(
-                    "from helper import add\nvalue = add(1)\n".to_string(),
-                ),
-            ),
-        ]);
+        let candidates = BTreeMap::from([(
+            LogicalPath::parse("helper.py".to_string()).unwrap(),
+            PythonCandidateMutation::Delete,
+        )]);
 
+        assert!(request.check_mutations(&candidates).unwrap().is_empty());
         assert!(
-            request.check_mutations(&candidates).unwrap()["main.py"]
+            request.check_project_mutations(&candidates).unwrap()["main.py"]
                 .introduced
                 .iter()
                 .any(|diagnostic| diagnostic.code == "unresolved-import")
@@ -1394,7 +1480,62 @@ mod tests {
     }
 
     #[test]
-    fn streaming_transaction_propagates_a_module_deletion_to_other_files() {
+    fn project_closure_rejects_a_public_shape_change_until_dependants_are_updated() {
+        let root = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "helper.py",
+            "def render(value: str) -> str:\n    return value\n",
+        );
+        write(
+            root.path(),
+            "main.py",
+            "from helper import render\nresult: str = render(\"ok\")\n",
+        );
+        let world = PythonProjectWorld::load_and_prime(config(root.path())).unwrap();
+        let mut request = world
+            .snapshot_for_request(&world.descriptor().world)
+            .unwrap();
+        let helper = LogicalPath::parse("helper.py".to_string()).unwrap();
+        let changed_helper = PythonCandidateMutation::Upsert(
+            "def render(value: int) -> int:\n    return value\n".to_string(),
+        );
+        let changed = BTreeMap::from([(helper.clone(), changed_helper.clone())]);
+        assert!(
+            request.check_mutations(&changed).unwrap()["helper.py"]
+                .introduced
+                .is_empty()
+        );
+        assert!(
+            request.check_project_mutations(&changed).unwrap()["main.py"]
+                .introduced
+                .iter()
+                .any(|diagnostic| matches!(
+                    diagnostic.code.as_str(),
+                    "invalid-argument-type" | "invalid-assignment"
+                ))
+        );
+
+        let coordinated = BTreeMap::from([
+            (helper, changed_helper),
+            (
+                LogicalPath::parse("main.py".to_string()).unwrap(),
+                PythonCandidateMutation::Upsert(
+                    "from helper import render\nresult: int = render(1)\n".to_string(),
+                ),
+            ),
+        ]);
+        assert!(
+            request
+                .check_project_mutations(&coordinated)
+                .unwrap()
+                .values()
+                .all(|report| report.introduced.is_empty())
+        );
+    }
+
+    #[test]
+    fn streaming_project_closure_propagates_a_module_deletion_to_untouched_files() {
         let root = tempfile::tempdir().unwrap();
         write(
             root.path(),
@@ -1419,28 +1560,6 @@ mod tests {
                 path: &helper,
                 language: &language,
                 mutation: MutationKind::Delete,
-            })
-            .unwrap();
-        layer.apply(SourceEvent::EndFile).unwrap();
-
-        let main = LogicalPath::parse("main.py".to_string()).unwrap();
-        layer
-            .apply(SourceEvent::BeginFile {
-                path: &main,
-                language: &language,
-                mutation: MutationKind::Modify,
-            })
-            .unwrap();
-        layer
-            .apply(SourceEvent::Bytes {
-                origin: SourceOrigin::Known,
-                bytes: b"from helper import add\n",
-            })
-            .unwrap();
-        layer
-            .apply(SourceEvent::Bytes {
-                origin: SourceOrigin::Generated,
-                bytes: b"value = add(2)\n",
             })
             .unwrap();
         layer.apply(SourceEvent::EndFile).unwrap();

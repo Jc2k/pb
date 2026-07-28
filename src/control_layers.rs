@@ -1275,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn python_execution_replay_resolves_deletions_across_one_patch_transaction() {
+    fn python_execution_replay_rejects_deletion_that_breaks_an_untouched_dependant() {
         let root = tempfile::tempdir().unwrap();
         fs::write(
             root.path().join("helper.py"),
@@ -1297,16 +1297,10 @@ mod tests {
                 .success()
         );
         let patch_tool = tool("apply_patch", json!({"type": "string"}));
-        let snapshot = WorkspaceSnapshot::new(vec![
-            SnapshotEntry::new(
-                LogicalPath::parse("helper.py").unwrap(),
-                fs::read(root.path().join("helper.py")).unwrap(),
-            ),
-            SnapshotEntry::new(
-                LogicalPath::parse("main.py").unwrap(),
-                fs::read(root.path().join("main.py")).unwrap(),
-            ),
-        ])
+        let snapshot = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            LogicalPath::parse("helper.py").unwrap(),
+            fs::read(root.path().join("helper.py")).unwrap(),
+        )])
         .unwrap();
         let mut lifecycle = ControlLayerLifecycle::default();
         assert!(
@@ -1327,29 +1321,12 @@ mod tests {
             "@@ -1,2 +0,0 @@\n",
             "-def add(value: int) -> int:\n",
             "-    return value + 1\n",
-            "diff --git a/main.py b/main.py\n",
-            "--- a/main.py\n",
-            "+++ b/main.py\n",
-            "@@ -1,2 +1,2 @@\n",
-            " from helper import add\n",
-            "-value = add(1)\n",
-            "+value = add(2)\n",
         );
-        let mut stream = PatchStream::new(snapshot.clone(), patch.len(), 2, 2).unwrap();
+        let mut stream = PatchStream::new(snapshot.clone(), patch.len(), 1, 1).unwrap();
         stream.push(patch.as_bytes()).unwrap();
         let (_, virtual_files) = stream.finish_with_virtual_files().unwrap();
-        assert_eq!(virtual_files.len(), 2);
+        assert_eq!(virtual_files.len(), 1);
         assert_eq!(virtual_files[0].kind, MutationKind::Delete);
-        assert_eq!(virtual_files[1].kind, MutationKind::Modify);
-        assert_eq!(
-            virtual_files[1]
-                .segments
-                .iter()
-                .flat_map(|segment| &segment.bytes)
-                .copied()
-                .collect::<Vec<_>>(),
-            b"from helper import add\nvalue = add(2)\n"
-        );
 
         assert_eq!(
             lifecycle

@@ -253,9 +253,11 @@ time, waiters poll cancellation every 100 ms, and a cancelled request never star
 Request-local overlays apply created, modified, and deleted candidate files together, and the
 completed mutation is replayed through a fresh database before execution. The current guarantee is
 narrow: complete generated string-plus-integer literal additions and selected newly introduced `ty`
-diagnostics in non-deleted transaction files may be rejected. Untouched dependants are not yet
-rechecked; `Any`, dynamic behavior, unqualified external dependencies, and unpromoted diagnostics
-remain unknown. There is no environment toggle for this behavior.
+diagnostics may be rejected. At closure, pb checks every non-deleted frozen first-party file plus
+newly created Python files, so a changed or deleted public symbol can be rejected when it breaks an
+untouched in-project dependant. `Any`, dynamic behavior, external dependants, unqualified external
+dependencies, and unpromoted diagnostics remain unknown. There is no environment toggle for this
+behavior.
 
 A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
 at least 32 tokens with true layer-major Metal prefill. The live Metal working-set snapshot chooses

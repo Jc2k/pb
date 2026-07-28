@@ -724,10 +724,11 @@ The Python stream keeps known/generated origins, verifies a complete structural 
 semantic pruning, and hard-rejects only a generated string-plus-integer literal addition confirmed
 by the pinned checker. Complete create/modify/delete candidates are overlaid together, with deletion
 represented as absence, so new imports and callable signatures resolve coherently within the
-transaction. Finalization checks each non-deleted transaction file and compares promoted diagnostic
-multisets against baseline debt; it does not yet expand the check to untouched dependants.
-Preserved baseline suppressions remain baseline, while generated `ty: ignore` or `type: ignore`
-directives reject. `Any`, dynamic behavior, unpromoted diagnostics, and dependencies outside the
+transaction. Finalization checks every non-deleted frozen first-party file plus newly created Python
+files and compares promoted diagnostic multisets against baseline debt. This catches promoted errors
+introduced into untouched in-project dependants by a changed or deleted public symbol. Preserved
+baseline suppressions remain baseline, while generated `ty: ignore` or `type: ignore` directives
+reject. `Any`, dynamic behavior, unpromoted diagnostics, and dependencies or dependants outside the
 frozen project remain unknown. Immediately before execution, pb reconstructs and replays the
 complete mutation through a fresh Python request database against the same live identity.
 

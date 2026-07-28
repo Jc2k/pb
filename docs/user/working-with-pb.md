@@ -62,7 +62,8 @@ Rust and Python additionally have narrow native semantic layers prepared before 
 replayed before execution. Rust can veto only its promoted exact import/call/literal
 contradictions. Python applies all candidate files—including deletions—as one overlay and can veto
 complete generated string-plus-integer literal additions and selected newly introduced pinned-`ty`
-diagnostics in non-deleted transaction files. Untouched dependants, `Any`, dynamic/runtime behavior,
+diagnostics across the frozen first-party project, including untouched in-project dependants of a
+changed or deleted symbol. `Any`, dynamic/runtime behavior, dependants outside the frozen project,
 external environment packages, and other diagnostics remain unknown. These layers do not promise
 general type correctness, compilation, passing checks, or safe runtime behavior; configured checks
 and review still decide those claims.

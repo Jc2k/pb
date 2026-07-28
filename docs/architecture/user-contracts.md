@@ -116,11 +116,13 @@ sources, bundled typeshed, and configuration/dependency-manifest identities to a
 world. Request overlays resolve newly generated files and imports together, and a deleted candidate
 is absent from that transaction's import graph. It can reject a complete
 generated string-plus-integer literal operation at a proven statement boundary and newly introduced
-promoted `ty` diagnostics in non-deleted files included in the mutation transaction at closure;
-generated type-suppression directives cannot hide those errors. Untouched dependants are not yet
-rechecked. `Any`, dynamic imports, monkey-patching, descriptors, runtime dispatch, dependencies
-outside the frozen project, and unpromoted diagnostics remain unknown. A fresh complete replay runs
-before executor entry. This is not general Python type or runtime correctness.
+promoted `ty` diagnostics at closure. Closure applies every candidate together, then checks every
+non-deleted frozen first-party file plus newly created Python files, so an API change or deletion can
+be rejected when it introduces a promoted error in an untouched in-project dependant. Generated
+type-suppression directives cannot hide those errors. `Any`, dynamic imports, monkey-patching,
+descriptors, runtime dispatch, dependencies outside the frozen project, and unpromoted diagnostics
+remain unknown. A fresh complete replay runs before executor entry. This is not general Python type
+or runtime correctness.
 
 Settled-transaction LSP symbol/type claims are separately opt-in through a server's
 `semantic_enforcement` mode.
