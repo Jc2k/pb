@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     agent_core::BuiltInToolSchema,
+    python_semantic_config::{PYTHON_SEMANTIC_CONFIG_PATH, PythonSemanticConfig},
     semantic::{SemanticShadowExtraFile, SemanticShadowWorkspace},
 };
 
@@ -44,6 +45,8 @@ const PYTHON_LAYER_MAX_PROJECT_FILES: usize = 100_000;
 const PYTHON_LAYER_MAX_PROJECT_BYTES: usize = 256 * 1024 * 1024;
 const PYTHON_DEPENDENCY_SHADOW_PREFIX: &str = ".pb-semantic-dependencies/python";
 const PYTHON_DEPENDENCY_MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const PYTHON_DEPENDENCY_MAX_SEARCH_ROOTS: usize = 32;
+const PYTHON_DEPENDENCY_MAX_PTH_LINE_BYTES: usize = 4 * 1024;
 const MAX_PROCESS_RUST_WORLDS: usize = 2;
 const MAX_PROCESS_PYTHON_WORLDS: usize = 2;
 // A cold rust-analyzer world can consume substantial memory. Detached cancellation must not let
@@ -63,6 +66,7 @@ pub(crate) struct ControlLayerLifecycle {
     python_cold_builds: u64,
     python_warm_requests: u64,
     python_process_cache_hits: u64,
+    python_dependency_authority: crate::python_semantic_config::PythonExternalAuthority,
 }
 
 struct PreparedRustWorld {
@@ -85,6 +89,7 @@ struct PreparedPythonWorld {
 struct PythonDependencySnapshot {
     fingerprint: String,
     python_version: String,
+    first_party_roots: Vec<PathBuf>,
     site_packages_roots: Vec<PathBuf>,
     external_imports_complete: bool,
     files: Vec<SemanticShadowExtraFile>,
@@ -139,6 +144,7 @@ impl Default for ControlLayerLifecycle {
             python_cold_builds: 0,
             python_warm_requests: 0,
             python_process_cache_hits: 0,
+            python_dependency_authority: Default::default(),
         }
     }
 }
@@ -223,6 +229,15 @@ struct PythonWorldPreparationPublisher {
 static PYTHON_WORLD_PREPARATIONS: OnceLock<PythonWorldPreparationCoordinator> = OnceLock::new();
 
 impl ControlLayerLifecycle {
+    pub(crate) fn with_python_dependency_authority(
+        authority: crate::python_semantic_config::PythonExternalAuthority,
+    ) -> Self {
+        Self {
+            python_dependency_authority: authority,
+            ..Self::default()
+        }
+    }
+
     /// Establish all expensive state before the caller reserves or records a model invocation.
     /// Returning successfully means the supplied stack is bound to the exact live-workspace
     /// identity observed after loading and priming completed.
@@ -376,8 +391,13 @@ impl ControlLayerLifecycle {
         live: &crate::workspace::ContentSnapshot,
         cancellation: &dyn Fn() -> Result<()>,
     ) -> Result<Option<Box<dyn IncrementalAnalyzer + Send>>> {
-        let dependencies = capture_python_dependencies(canonical_root, live, cancellation)
-            .context("failed to capture the local Python dependency world before inference")?;
+        let dependencies = capture_python_dependencies(
+            canonical_root,
+            live,
+            &self.python_dependency_authority,
+            cancellation,
+        )
+        .context("failed to capture the local Python dependency world before inference")?;
         let dependency_sha256 = python_dependency_identity(live, &dependencies);
         let current_matches = self
             .python
@@ -431,6 +451,7 @@ impl ControlLayerLifecycle {
                                 live.clone(),
                                 dependencies,
                                 dependency_sha256,
+                                self.python_dependency_authority.clone(),
                             )?;
                             self.python_cold_builds = self.python_cold_builds.saturating_add(1);
                             self.python =
@@ -485,10 +506,15 @@ impl ControlLayerLifecycle {
         let validate_rust = tools_may_mutate_rust(tools, bound_path);
         let validate_python = tools_may_mutate_python(tools, bound_path);
         let current_python_dependency_sha256 = if validate_python {
-            let dependencies = capture_python_dependencies(&canonical_root, &live, &|| Ok(()))
-                .context(
-                    "failed to revalidate the local Python dependency world before mutation execution",
-                )?;
+            let dependencies = capture_python_dependencies(
+                &canonical_root,
+                &live,
+                &self.python_dependency_authority,
+                &|| Ok(()),
+            )
+            .context(
+                "failed to revalidate the local Python dependency world before mutation execution",
+            )?;
             Some(python_dependency_identity(&live, &dependencies))
         } else {
             None
@@ -595,6 +621,7 @@ impl ControlLayerLifecycle {
         expected: crate::workspace::ContentSnapshot,
         dependencies: PythonDependencySnapshot,
         dependency_sha256: String,
+        authority: crate::python_semantic_config::PythonExternalAuthority,
     ) -> Result<PreparedPythonWorld> {
         let shadow = SemanticShadowWorkspace::capture_with_extra_files(
             workspace_root,
@@ -605,7 +632,7 @@ impl ControlLayerLifecycle {
         let config = PythonProjectConfig {
             contract_version: PYTHON_LAYER_CONTRACT_VERSION,
             shadow_root: shadow.path().to_path_buf(),
-            first_party_roots: Vec::new(),
+            first_party_roots: dependencies.first_party_roots.clone(),
             site_packages_roots: dependencies.site_packages_roots.clone(),
             external_imports_complete: dependencies.external_imports_complete,
             python_version: dependencies.python_version.clone(),
@@ -621,8 +648,9 @@ impl ControlLayerLifecycle {
         let after = crate::workspace::ContentSnapshot::capture(workspace_root)
             .context("failed to revalidate the Python semantic world after priming")?;
         ensure_unchanged_during_python_preparation(&expected, &after)?;
-        let after_dependencies = capture_python_dependencies(workspace_root, &after, &|| Ok(()))
-            .context("failed to revalidate the local Python dependency world after priming")?;
+        let after_dependencies =
+            capture_python_dependencies(workspace_root, &after, &authority, &|| Ok(()))
+                .context("failed to revalidate the local Python dependency world after priming")?;
         if python_dependency_identity(&after, &after_dependencies) != dependency_sha256 {
             bail!(
                 "local Python dependencies changed while Astral ty was loading; refusing Python-edit-capable inference until the controller recaptures one exact dependency image"
@@ -633,6 +661,7 @@ impl ControlLayerLifecycle {
             dependency_sha256 = %dependency_sha256,
             dependency_files = dependencies.files.len(),
             dependency_roots = dependencies.site_packages_roots.len(),
+            editable_first_party_roots = dependencies.first_party_roots.len(),
             external_imports_complete = dependencies.external_imports_complete,
             load_millis = world.readiness_receipt().load_millis,
             prime_millis = world.readiness_receipt().prime_millis,
@@ -956,6 +985,7 @@ fn spawn_python_world_build(
     expected: crate::workspace::ContentSnapshot,
     dependencies: PythonDependencySnapshot,
     dependency_sha256: String,
+    authority: crate::python_semantic_config::PythonExternalAuthority,
 ) -> Result<Receiver<Result<PreparedPythonHandle>>> {
     let publisher = PythonWorldPreparationPublisher {
         coordinator: preparation.coordinator,
@@ -968,6 +998,7 @@ fn spawn_python_world_build(
                 expected,
                 dependencies,
                 dependency_sha256,
+                authority,
             )?,
         ));
         insert_process_python_world(Arc::clone(&prepared))?;
@@ -1319,6 +1350,7 @@ fn constrained_paths(schema: &Value) -> Option<Vec<&str>> {
 fn capture_python_dependencies(
     workspace_root: &Path,
     snapshot: &crate::workspace::ContentSnapshot,
+    external_authority: &crate::python_semantic_config::PythonExternalAuthority,
     cancellation: &dyn Fn() -> Result<()>,
 ) -> Result<PythonDependencySnapshot> {
     cancellation()?;
@@ -1331,101 +1363,160 @@ fn capture_python_dependencies(
         );
     }
 
-    let mut project_roots = BTreeSet::from([PathBuf::new()]);
-    for path in snapshot
-        .paths
-        .keys()
-        .filter(|path| is_python_project_marker(path))
+    let project_policy = PythonSemanticConfig::load(workspace_root)?;
+    let authority_path = workspace_root.join(PYTHON_SEMANTIC_CONFIG_PATH);
+    if authority_path.exists()
+        && !snapshot
+            .paths
+            .get(PYTHON_SEMANTIC_CONFIG_PATH)
+            .is_some_and(|entry| entry.kind == "file")
     {
-        let path = Path::new(path);
-        project_roots.insert(path.parent().unwrap_or_else(|| Path::new("")).to_path_buf());
+        bail!(
+            "{} must be a controller-observed project file before it can grant native Python dependency authority",
+            PYTHON_SEMANTIC_CONFIG_PATH
+        );
     }
+    let canonical_workspace = workspace_root
+        .canonicalize()
+        .context("failed to resolve the Python semantic workspace root")?;
+    let allowed_editable_roots = external_authority
+        .editable_roots
+        .iter()
+        .map(|path| resolve_declared_python_directory(workspace_root, path, "editable root"))
+        .collect::<Result<BTreeSet<_>>>()?;
+
+    if project_policy.environment.is_some() && external_authority.environment.is_some() {
+        bail!("native Python environment is selected by both project policy and user authority");
+    }
+    let environment_candidates = if let Some(environment) = external_authority.environment.as_ref()
+    {
+        let resolved =
+            resolve_declared_python_directory(workspace_root, environment, "environment")?;
+        vec![(resolved.clone(), resolved)]
+    } else if let Some(environment) = project_policy.environment.as_ref() {
+        let resolved =
+            resolve_declared_python_directory(workspace_root, environment, "environment")?;
+        if !resolved.starts_with(&canonical_workspace) {
+            bail!(
+                "repository-owned {} may select only an environment inside the workspace",
+                PYTHON_SEMANTIC_CONFIG_PATH
+            );
+        }
+        let relative = resolved
+            .strip_prefix(&canonical_workspace)
+            .context("project Python environment escaped its workspace identity")?
+            .to_path_buf();
+        vec![(relative, resolved)]
+    } else {
+        let mut project_roots = BTreeSet::from([PathBuf::new()]);
+        for path in snapshot
+            .paths
+            .keys()
+            .filter(|path| is_python_project_marker(path))
+        {
+            let path = Path::new(path);
+            project_roots.insert(path.parent().unwrap_or_else(|| Path::new("")).to_path_buf());
+        }
+        project_roots
+            .into_iter()
+            .flat_map(|project_root| {
+                [".venv", "venv"].map(move |name| {
+                    let relative = project_root.join(name);
+                    let environment = workspace_root.join(&relative);
+                    (relative, environment)
+                })
+            })
+            .collect()
+    };
 
     let mut environments = Vec::new();
     let mut observed = Vec::new();
-    for project_root in project_roots {
-        for name in [".venv", "venv"] {
-            cancellation()?;
-            let relative = project_root.join(name);
-            let environment = workspace_root.join(&relative);
-            let metadata = match std::fs::symlink_metadata(&environment) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
+    for (relative, environment) in environment_candidates {
+        cancellation()?;
+        let metadata = match std::fs::symlink_metadata(&environment) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                if external_authority.environment.is_some() || project_policy.environment.is_some()
+                {
                     return Err(error).with_context(|| {
                         format!(
-                            "failed to inspect local Python environment {}",
+                            "failed to inspect configured Python environment {}",
                             environment.display()
                         )
                     });
                 }
-            };
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                observed.push((relative, b"unsafe-environment-root".to_vec()));
                 continue;
             }
-            let config_path = environment.join("pyvenv.cfg");
-            let config =
-                match read_python_dependency_file(&config_path, PYTHON_DEPENDENCY_MAX_CONFIG_BYTES)
-                {
-                    Ok(config) => config,
-                    Err(error) => {
-                        tracing::debug!(
-                            %error,
-                            path = %config_path.display(),
-                            "local Python environment metadata is not safely capturable"
-                        );
-                        observed.push((relative, b"unreadable-pyvenv-config".to_vec()));
-                        continue;
-                    }
-                };
-            observed.push((relative.clone(), config.clone()));
-            let python_version = match parse_pyvenv_python_version(&config) {
-                Ok(version) => version,
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            observed.push((relative, b"unsafe-environment-root".to_vec()));
+            continue;
+        }
+        let config_path = environment.join("pyvenv.cfg");
+        let config =
+            match read_python_dependency_file(&config_path, PYTHON_DEPENDENCY_MAX_CONFIG_BYTES) {
+                Ok(config) => config,
                 Err(error) => {
                     tracing::debug!(
                         %error,
                         path = %config_path.display(),
-                        "local Python environment version is not safely qualified"
+                        "local Python environment metadata is not safely capturable"
                     );
+                    observed.push((relative, b"unreadable-pyvenv-config".to_vec()));
                     continue;
                 }
             };
-            let site_packages_relative = if cfg!(target_os = "windows") {
-                relative.join("Lib").join("site-packages")
-            } else {
-                relative
-                    .join("lib")
-                    .join(format!("python{python_version}"))
-                    .join("site-packages")
-            };
-            let site_packages = workspace_root.join(&site_packages_relative);
-            let site_metadata = match std::fs::symlink_metadata(&site_packages) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    tracing::debug!(
-                        %error,
-                        path = %site_packages.display(),
-                        "local Python environment has no safely capturable site-packages root"
-                    );
-                    continue;
-                }
-            };
-            if site_metadata.file_type().is_symlink() || !site_metadata.is_dir() {
+        observed.push((relative.clone(), config.clone()));
+        let python_version = match parse_pyvenv_python_version(&config) {
+            Ok(version) => version,
+            Err(error) => {
                 tracing::debug!(
-                    path = %site_packages.display(),
-                    "local Python site-packages root is not a real directory"
+                    %error,
+                    path = %config_path.display(),
+                    "local Python environment version is not safely qualified"
                 );
                 continue;
             }
-            environments.push((
-                relative,
-                config,
-                python_version,
-                site_packages_relative,
-                site_packages,
-            ));
+        };
+        if pyvenv_includes_system_site_packages(&config)? {
+            observed.push((relative, b"system-site-packages-enabled".to_vec()));
+            continue;
         }
+        let site_packages_relative = if cfg!(target_os = "windows") {
+            relative.join("Lib").join("site-packages")
+        } else {
+            relative
+                .join("lib")
+                .join(format!("python{python_version}"))
+                .join("site-packages")
+        };
+        let site_packages = workspace_root.join(&site_packages_relative);
+        let site_metadata = match std::fs::symlink_metadata(&site_packages) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    path = %site_packages.display(),
+                    "local Python environment has no safely capturable site-packages root"
+                );
+                continue;
+            }
+        };
+        if site_metadata.file_type().is_symlink() || !site_metadata.is_dir() {
+            tracing::debug!(
+                path = %site_packages.display(),
+                "local Python site-packages root is not a real directory"
+            );
+            continue;
+        }
+        environments.push((
+            relative,
+            config,
+            python_version,
+            site_packages_relative,
+            site_packages,
+        ));
     }
 
     if environments.len() != 1 {
@@ -1441,14 +1532,23 @@ fn capture_python_dependencies(
         environments
             .pop()
             .context("Python environment disappeared")?;
+    let canonical_site_source = site_source.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve local Python site-packages root {}",
+            site_source.display()
+        )
+    })?;
     let site_shadow = PathBuf::from(PYTHON_DEPENDENCY_SHADOW_PREFIX)
         .join("site-packages")
         .join("0");
+    let mut site_packages_roots = vec![site_shadow.clone()];
     let mut files = Vec::new();
+    let mut first_party_roots = Vec::new();
     let mut selected_bytes = config.len();
     let mut scanned_entries = 0usize;
-    let mut external_imports_complete = true;
+    let external_imports_complete = true;
     let mut unsafe_search_path = false;
+    let mut pth_search_paths = Vec::new();
     let mut digest = Sha256::new();
     digest.update(b"pb-python-dependency-image-v1\0");
     hash_python_dependency_record(
@@ -1480,7 +1580,7 @@ fn capture_python_dependencies(
             continue;
         }
         scanned_entries = scanned_entries.saturating_add(1);
-        if scanned_entries > PYTHON_LAYER_MAX_PROJECT_FILES {
+        if scanned_entries > PYTHON_LAYER_MAX_PROJECT_FILES || entry.path().to_str().is_none() {
             unsafe_search_path = true;
             break;
         }
@@ -1497,11 +1597,7 @@ fn capture_python_dependencies(
         if !entry.file_type().is_file() {
             continue;
         }
-        if is_python_native_module(relative) {
-            external_imports_complete = false;
-            continue;
-        }
-        if is_unsupported_python_search_artifact(relative) {
+        if is_python_native_module(relative) || is_unsupported_python_search_artifact(relative) {
             unsafe_search_path = true;
             break;
         }
@@ -1530,10 +1626,11 @@ fn capture_python_dependencies(
                     entry.path().display()
                 )
             })?;
-        if relative
-            .extension()
-            .and_then(|extension| extension.to_str())
-            == Some("pth")
+        if relative.components().count() == 1
+            && relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("pth")
         {
             let pth = match python_pth_policy(&bytes) {
                 Ok(policy) => policy,
@@ -1542,13 +1639,11 @@ fn capture_python_dependencies(
                     break;
                 }
             };
-            if pth.has_search_path {
+            if pth.has_import_hook {
                 unsafe_search_path = true;
                 break;
             }
-            if pth.has_import_hook {
-                external_imports_complete = false;
-            }
+            pth_search_paths.extend(pth.search_paths);
         }
         selected_bytes = selected_bytes
             .checked_add(bytes.len())
@@ -1569,6 +1664,156 @@ fn capture_python_dependencies(
         });
     }
 
+    if !unsafe_search_path {
+        let mut captured_external_roots = BTreeSet::new();
+        for path in pth_search_paths {
+            cancellation()?;
+            let path = Path::new(&path);
+            let candidate = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                site_source.join(path)
+            };
+            let metadata = match std::fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    unsafe_search_path = true;
+                    break;
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                unsafe_search_path = true;
+                break;
+            }
+            let target = candidate.canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve Python editable root {}",
+                    candidate.display()
+                )
+            })?;
+            if target.starts_with(&canonical_site_source) {
+                let relative = target
+                    .strip_prefix(&canonical_site_source)
+                    .with_context(|| {
+                        format!(
+                            "Python .pth target escaped site-packages identity: {}",
+                            target.display()
+                        )
+                    })?;
+                if relative.as_os_str().is_empty() {
+                    continue;
+                }
+                let root_shadow = site_shadow.join(relative);
+                let prefix = format!("{}/", root_shadow.to_string_lossy().replace('\\', "/"));
+                if files
+                    .iter()
+                    .any(|file| file.path.as_str().starts_with(&prefix))
+                    && !site_packages_roots.contains(&root_shadow)
+                {
+                    if site_packages_roots
+                        .len()
+                        .saturating_add(first_party_roots.len())
+                        >= PYTHON_DEPENDENCY_MAX_SEARCH_ROOTS
+                    {
+                        unsafe_search_path = true;
+                        break;
+                    }
+                    hash_python_dependency_record(
+                        &mut digest,
+                        b"site-packages-pth-root",
+                        slash_relative_path(relative)?.as_bytes(),
+                    );
+                    site_packages_roots.push(root_shadow);
+                }
+                continue;
+            }
+            if target.starts_with(&canonical_workspace) {
+                let relative = target.strip_prefix(&canonical_workspace).with_context(|| {
+                    format!(
+                        "Python editable root escaped workspace identity: {}",
+                        target.display()
+                    )
+                })?;
+                if relative.as_os_str().is_empty() {
+                    continue;
+                }
+                if !validate_project_python_root(
+                    &canonical_workspace,
+                    relative,
+                    snapshot,
+                    cancellation,
+                )? {
+                    unsafe_search_path = true;
+                    break;
+                }
+                let relative = PathBuf::from(slash_relative_path(relative)?);
+                if !first_party_roots.contains(&relative) {
+                    // Naming explicit first-party roots disables the layer's implicit project-root
+                    // default, so the first editable consumes two entries: the project root and
+                    // the editable root itself.
+                    let additional_roots = if first_party_roots.is_empty() { 2 } else { 1 };
+                    if site_packages_roots
+                        .len()
+                        .saturating_add(first_party_roots.len())
+                        .saturating_add(additional_roots)
+                        > PYTHON_DEPENDENCY_MAX_SEARCH_ROOTS
+                    {
+                        unsafe_search_path = true;
+                        break;
+                    }
+                    if first_party_roots.is_empty() {
+                        first_party_roots.push(PathBuf::new());
+                    }
+                    hash_python_dependency_record(
+                        &mut digest,
+                        b"editable-first-party-root",
+                        relative.to_string_lossy().as_bytes(),
+                    );
+                    first_party_roots.push(relative);
+                }
+                continue;
+            }
+            if !allowed_editable_roots.contains(&target) {
+                unsafe_search_path = true;
+                break;
+            }
+            if !captured_external_roots.insert(target.clone()) {
+                continue;
+            }
+            if site_packages_roots
+                .len()
+                .saturating_add(first_party_roots.len())
+                >= PYTHON_DEPENDENCY_MAX_SEARCH_ROOTS
+            {
+                unsafe_search_path = true;
+                break;
+            }
+            let root_index = captured_external_roots.len();
+            let root_shadow = PathBuf::from(PYTHON_DEPENDENCY_SHADOW_PREFIX)
+                .join("site-packages")
+                .join(root_index.to_string());
+            hash_python_dependency_record(
+                &mut digest,
+                b"editable-external-root",
+                target.to_string_lossy().as_bytes(),
+            );
+            if !capture_external_python_root(
+                &target,
+                &root_shadow,
+                &mut files,
+                &mut digest,
+                &mut selected_bytes,
+                &mut scanned_entries,
+                cancellation,
+            )? {
+                unsafe_search_path = true;
+                break;
+            }
+            site_packages_roots.push(root_shadow);
+        }
+    }
+
     if unsafe_search_path {
         observed.push((environment_relative, b"unsupported-search-path".to_vec()));
         return Ok(unqualified_python_dependencies(
@@ -1581,7 +1826,8 @@ fn capture_python_dependencies(
     Ok(PythonDependencySnapshot {
         fingerprint: format!("{:x}", digest.finalize()),
         python_version,
-        site_packages_roots: vec![site_shadow],
+        first_party_roots,
+        site_packages_roots,
         external_imports_complete,
         files,
     })
@@ -1600,10 +1846,172 @@ fn unqualified_python_dependencies(
     PythonDependencySnapshot {
         fingerprint: format!("{:x}", digest.finalize()),
         python_version: "3.12".to_string(),
+        first_party_roots: Vec::new(),
         site_packages_roots: Vec::new(),
         external_imports_complete: false,
         files: Vec::new(),
     }
+}
+
+fn resolve_declared_python_directory(
+    workspace_root: &Path,
+    declared: &Path,
+    label: &str,
+) -> Result<PathBuf> {
+    let candidate = if declared.is_absolute() {
+        declared.to_path_buf()
+    } else {
+        workspace_root.join(declared)
+    };
+    let metadata = std::fs::symlink_metadata(&candidate).with_context(|| {
+        format!(
+            "failed to inspect configured Python {label} {}",
+            candidate.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "configured Python {label} must be a real directory: {}",
+            candidate.display()
+        );
+    }
+    candidate.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve configured Python {label} {}",
+            candidate.display()
+        )
+    })
+}
+
+fn validate_project_python_root(
+    workspace_root: &Path,
+    relative_root: &Path,
+    snapshot: &crate::workspace::ContentSnapshot,
+    cancellation: &dyn Fn() -> Result<()>,
+) -> Result<bool> {
+    let source = workspace_root.join(relative_root);
+    let mut entries = 0usize;
+    for entry in walkdir::WalkDir::new(&source)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        cancellation()?;
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to inspect project-local Python editable root {}",
+                source.display()
+            )
+        })?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        entries = entries.saturating_add(1);
+        if entries > PYTHON_LAYER_MAX_PROJECT_FILES
+            || entry.file_type().is_symlink()
+            || entry.path().to_str().is_none()
+        {
+            return Ok(false);
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(workspace_root).with_context(|| {
+            format!(
+                "project-local Python editable path escaped the workspace: {}",
+                entry.path().display()
+            )
+        })?;
+        if is_python_native_module(relative) || is_unsupported_python_search_artifact(relative) {
+            return Ok(false);
+        }
+        if !is_python_dependency_capture_file(relative) {
+            continue;
+        }
+        let logical = slash_relative_path(relative)?;
+        if !snapshot
+            .paths
+            .get(&logical)
+            .is_some_and(|content| content.kind == "file")
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_external_python_root(
+    source: &Path,
+    shadow: &Path,
+    files: &mut Vec<SemanticShadowExtraFile>,
+    digest: &mut Sha256,
+    selected_bytes: &mut usize,
+    scanned_entries: &mut usize,
+    cancellation: &dyn Fn() -> Result<()>,
+) -> Result<bool> {
+    for entry in walkdir::WalkDir::new(source)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        cancellation()?;
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to walk configured Python editable root {}",
+                source.display()
+            )
+        })?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        *scanned_entries = scanned_entries.saturating_add(1);
+        if *scanned_entries > PYTHON_LAYER_MAX_PROJECT_FILES
+            || entry.file_type().is_symlink()
+            || entry.path().to_str().is_none()
+        {
+            return Ok(false);
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(source).with_context(|| {
+            format!(
+                "configured Python editable path escaped its root: {}",
+                entry.path().display()
+            )
+        })?;
+        if is_python_native_module(relative)
+            || is_unsupported_python_search_artifact(relative)
+            || relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("pth")
+        {
+            return Ok(false);
+        }
+        if !is_python_dependency_capture_file(relative) {
+            continue;
+        }
+        let remaining = PYTHON_LAYER_MAX_PROJECT_BYTES.saturating_sub(*selected_bytes);
+        let bytes =
+            read_python_dependency_file(entry.path(), remaining as u64).with_context(|| {
+                format!(
+                    "failed to snapshot configured Python editable dependency {}",
+                    entry.path().display()
+                )
+            })?;
+        *selected_bytes = selected_bytes
+            .checked_add(bytes.len())
+            .context("configured Python editable byte count overflowed")?;
+        let relative_text = slash_relative_path(relative)?;
+        hash_python_dependency_record(digest, relative_text.as_bytes(), &bytes);
+        files.push(SemanticShadowExtraFile {
+            path: pb_control_collar::mutation::LogicalPath::parse(
+                shadow.join(relative).to_string_lossy().replace('\\', "/"),
+            )?,
+            bytes,
+        });
+    }
+    Ok(true)
 }
 
 fn hash_python_dependency_record(digest: &mut Sha256, path: &[u8], bytes: &[u8]) {
@@ -1662,6 +2070,17 @@ fn parse_pyvenv_python_version(config: &[u8]) -> Result<String> {
         }
     }
     bail!("pyvenv.cfg contains neither version nor version_info")
+}
+
+fn pyvenv_includes_system_site_packages(config: &[u8]) -> Result<bool> {
+    let config = std::str::from_utf8(config).context("pyvenv.cfg is not UTF-8")?;
+    Ok(config.lines().any(|line| {
+        line.split_once('=').is_some_and(|(key, value)| {
+            key.trim()
+                .eq_ignore_ascii_case("include-system-site-packages")
+                && value.trim().eq_ignore_ascii_case("true")
+        })
+    }))
 }
 
 fn elapsed_millis(started: std::time::Instant) -> u64 {
@@ -1931,9 +2350,9 @@ pub(crate) fn python_semantic_world_observation(
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PythonPthPolicy {
-    has_search_path: bool,
+    search_paths: Vec<String>,
     has_import_hook: bool,
 }
 
@@ -1941,14 +2360,23 @@ fn python_pth_policy(bytes: &[u8]) -> Result<PythonPthPolicy> {
     let contents = std::str::from_utf8(bytes).context("Python .pth file is not UTF-8")?;
     let mut policy = PythonPthPolicy::default();
     for line in contents.lines() {
-        let line = line.trim();
+        let line = line.trim_end();
         if line.is_empty() || line.starts_with('#') {
             continue;
+        }
+        if line.len() > PYTHON_DEPENDENCY_MAX_PTH_LINE_BYTES {
+            bail!("Python .pth search line exceeds the bounded length");
         }
         if line.starts_with("import ") || line.starts_with("import\t") {
             policy.has_import_hook = true;
         } else {
-            policy.has_search_path = true;
+            if line.contains('\0') {
+                bail!("Python .pth search path contains a NUL byte");
+            }
+            policy.search_paths.push(line.to_string());
+            if policy.search_paths.len() > PYTHON_DEPENDENCY_MAX_SEARCH_ROOTS {
+                bail!("Python .pth file exceeds the bounded search-root count");
+            }
         }
     }
     Ok(policy)
@@ -2000,7 +2428,10 @@ fn is_python_native_module(path: &Path) -> bool {
 fn is_unsupported_python_search_artifact(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
-        Some("egg-link" | "egg" | "zip")
+        Some("egg-link" | "egg" | "zip" | "pyc" | "pyo")
+    ) || matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("sitecustomize.py" | "sitecustomize.pyi" | "usercustomize.py" | "usercustomize.pyi")
     )
 }
 
@@ -2070,7 +2501,13 @@ fn is_rust_dependency_input(path: &str) -> bool {
 fn is_python_configuration_input(path: &str) -> bool {
     matches!(
         path,
-        "pyproject.toml" | "ty.toml" | ".python-version" | "setup.cfg" | "tox.ini" | "mypy.ini"
+        "pyproject.toml"
+            | "ty.toml"
+            | ".python-version"
+            | "setup.cfg"
+            | "tox.ini"
+            | "mypy.ini"
+            | PYTHON_SEMANTIC_CONFIG_PATH
     ) || path.ends_with("/pyproject.toml")
         || path.ends_with("/ty.toml")
 }
@@ -2085,6 +2522,7 @@ fn is_python_dependency_input(path: &str) -> bool {
             | "poetry.lock"
             | "Pipfile"
             | "Pipfile.lock"
+            | PYTHON_SEMANTIC_CONFIG_PATH
     ) || path.ends_with("/requirements.txt")
         || path.ends_with("/uv.lock")
         || path.ends_with("/poetry.lock")
@@ -2174,7 +2612,7 @@ mod tests {
     }
 
     #[test]
-    fn python_dependency_capture_downgrades_native_and_path_injected_environments() {
+    fn python_dependency_capture_downgrades_native_hooks_and_undeclared_external_paths() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join(".gitignore"), ".venv/\n").unwrap();
         let site_packages = root.path().join(".venv/lib/python3.12/site-packages");
@@ -2191,21 +2629,488 @@ mod tests {
                 .success()
         );
         let source = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
-        let native = capture_python_dependencies(root.path(), &source, &|| Ok(())).unwrap();
-        assert_eq!(native.site_packages_roots.len(), 1);
+        let native =
+            capture_python_dependencies(root.path(), &source, &Default::default(), &|| Ok(()))
+                .unwrap();
+        assert!(native.site_packages_roots.is_empty());
         assert!(!native.external_imports_complete);
+        assert!(native.files.is_empty());
 
         fs::remove_file(site_packages.join("native.abi3.so")).unwrap();
         fs::write(site_packages.join("editable.pth"), "import editable_hook\n").unwrap();
-        let import_hook = capture_python_dependencies(root.path(), &source, &|| Ok(())).unwrap();
-        assert_eq!(import_hook.site_packages_roots.len(), 1);
+        let import_hook =
+            capture_python_dependencies(root.path(), &source, &Default::default(), &|| Ok(()))
+                .unwrap();
+        assert!(import_hook.site_packages_roots.is_empty());
         assert!(!import_hook.external_imports_complete);
+        assert!(import_hook.files.is_empty());
 
+        let undeclared = site_packages.parent().unwrap().join("editable-source");
+        fs::create_dir_all(&undeclared).unwrap();
+        fs::write(undeclared.join("external_package.py"), "value: int = 1\n").unwrap();
         fs::write(site_packages.join("editable.pth"), "../editable-source\n").unwrap();
-        let path_injected = capture_python_dependencies(root.path(), &source, &|| Ok(())).unwrap();
+        let path_injected =
+            capture_python_dependencies(root.path(), &source, &Default::default(), &|| Ok(()))
+                .unwrap();
         assert!(path_injected.site_packages_roots.is_empty());
         assert!(!path_injected.external_imports_complete);
         assert!(path_injected.files.is_empty());
+    }
+
+    #[test]
+    fn python_dependency_capture_downgrades_implicit_or_executable_search_state() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".gitignore"), ".venv/\n").unwrap();
+        let site_packages = root.path().join(".venv/lib/python3.12/site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        fs::write(
+            root.path().join(".venv/pyvenv.cfg"),
+            "version = 3.12.8\ninclude-system-site-packages = true\n",
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let source = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        let capture = || {
+            capture_python_dependencies(root.path(), &source, &Default::default(), &|| Ok(()))
+                .unwrap()
+        };
+        assert!(capture().site_packages_roots.is_empty());
+
+        fs::write(root.path().join(".venv/pyvenv.cfg"), "version = 3.12.8\n").unwrap();
+        fs::write(
+            site_packages.join("sitecustomize.py"),
+            "import sys\nsys.path.append('/dynamic')\n",
+        )
+        .unwrap();
+        assert!(capture().site_packages_roots.is_empty());
+
+        fs::remove_file(site_packages.join("sitecustomize.py")).unwrap();
+        fs::write(site_packages.join("sourceless.pyc"), b"bytecode").unwrap();
+        assert!(capture().site_packages_roots.is_empty());
+    }
+
+    #[test]
+    fn repository_python_policy_cannot_grant_external_or_ignored_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        PythonSemanticConfig {
+            environment: Some(external.path().to_path_buf()),
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let source = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        assert!(
+            capture_python_dependencies(root.path(), &source, &Default::default(), &|| Ok(()),)
+                .unwrap_err()
+                .to_string()
+                .contains("may select only an environment inside the workspace")
+        );
+
+        fs::write(root.path().join(".gitignore"), ".pb/python.toml\n").unwrap();
+        let source = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        assert!(
+            capture_python_dependencies(root.path(), &source, &Default::default(), &|| Ok(()),)
+                .unwrap_err()
+                .to_string()
+                .contains("must be a controller-observed project file")
+        );
+    }
+
+    #[test]
+    fn repository_python_policy_can_disambiguate_an_in_workspace_environment() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".gitignore"), ".venv/\nvenv/\n").unwrap();
+        for name in [".venv", "venv"] {
+            let site_packages = root
+                .path()
+                .join(name)
+                .join("lib/python3.12/site-packages/dependency");
+            fs::create_dir_all(&site_packages).unwrap();
+            fs::write(
+                root.path().join(name).join("pyvenv.cfg"),
+                "version = 3.12.8\n",
+            )
+            .unwrap();
+            fs::write(
+                site_packages.join("__init__.py"),
+                "def parse(value: str) -> str:\n    return value\n",
+            )
+            .unwrap();
+        }
+        PythonSemanticConfig {
+            environment: Some(PathBuf::from("venv")),
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let source = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        let dependencies =
+            capture_python_dependencies(root.path(), &source, &Default::default(), &|| Ok(()))
+                .unwrap();
+        assert_eq!(dependencies.site_packages_roots.len(), 1);
+        assert!(dependencies.external_imports_complete);
+        assert!(dependencies.files.iter().any(|file| {
+            file.path.as_str()
+                == ".pb-semantic-dependencies/python/site-packages/0/dependency/__init__.py"
+        }));
+    }
+
+    #[test]
+    fn project_local_plain_path_editable_is_a_frozen_first_party_root() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".gitignore"), ".venv/\n").unwrap();
+        fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"editable-project\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("main.py"),
+            "from dependency import parse\nresult: str = parse(\"ok\")\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("src/dependency")).unwrap();
+        fs::write(
+            root.path().join("src/dependency/__init__.py"),
+            "def parse(value: str) -> str:\n    return value\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("src/dependency/py.typed"), "").unwrap();
+        let site_packages = root.path().join(".venv/lib/python3.12/site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        fs::write(root.path().join(".venv/pyvenv.cfg"), "version = 3.12.8\n").unwrap();
+        fs::write(
+            site_packages.join("editable.pth"),
+            format!("{}\n", root.path().join("src").display()),
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let source = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        let dependencies =
+            capture_python_dependencies(root.path(), &source, &Default::default(), &|| Ok(()))
+                .unwrap();
+        assert_eq!(
+            dependencies.first_party_roots,
+            vec![PathBuf::new(), PathBuf::from("src")]
+        );
+        assert_eq!(dependencies.site_packages_roots.len(), 1);
+        assert!(dependencies.external_imports_complete);
+
+        let python_tool = tool("replace_file", json!({"const": "main.py"}));
+        let snapshot = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            LogicalPath::parse("main.py").unwrap(),
+            fs::read(root.path().join("main.py")).unwrap(),
+        )])
+        .unwrap();
+        let mut lifecycle = ControlLayerLifecycle::default();
+        assert!(
+            lifecycle
+                .prepare_for_inference(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    Some(&snapshot),
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    &snapshot,
+                    "replace_file",
+                    &json!({
+                        "path": "main.py",
+                        "content": "from dependency import parse\nresult: str = parse(1)\n"
+                    }),
+                )
+                .unwrap(),
+            CompletionDecision::Reject(pb_control_collar::RejectionCode::InvalidSemantics)
+        );
+    }
+
+    #[test]
+    fn project_editable_root_accounts_for_the_explicit_project_root_limit() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".gitignore"), ".venv/\n").unwrap();
+        fs::create_dir_all(root.path().join("src/dependency")).unwrap();
+        fs::write(
+            root.path().join("src/dependency/__init__.py"),
+            "value: int = 1\n",
+        )
+        .unwrap();
+        let site_packages = root.path().join(".venv/lib/python3.12/site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        fs::write(root.path().join(".venv/pyvenv.cfg"), "version = 3.12.8\n").unwrap();
+        let mut search_paths = String::new();
+        for index in 0..30 {
+            let package = site_packages.join(format!("package-{index}"));
+            fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("__init__.py"), "value: int = 1\n").unwrap();
+            search_paths.push_str(&format!("package-{index}\n"));
+        }
+        search_paths.push_str(&format!("{}\n", root.path().join("src").display()));
+        fs::write(site_packages.join("editable.pth"), search_paths).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let source = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        let dependencies =
+            capture_python_dependencies(root.path(), &source, &Default::default(), &|| Ok(()))
+                .unwrap();
+        assert!(dependencies.first_party_roots.is_empty());
+        assert!(dependencies.site_packages_roots.is_empty());
+        assert!(!dependencies.external_imports_complete);
+    }
+
+    #[test]
+    fn configured_external_plain_path_editable_is_frozen_and_revalidated() {
+        let root = tempfile::tempdir().unwrap();
+        let editable = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".gitignore"), ".venv/\n").unwrap();
+        fs::write(
+            root.path().join("main.py"),
+            "from dependency import parse\nresult: str = parse(\"ok\")\n",
+        )
+        .unwrap();
+        fs::create_dir_all(editable.path().join("dependency")).unwrap();
+        fs::write(
+            editable.path().join("dependency/__init__.py"),
+            "def parse(value: str) -> str:\n    return value\n",
+        )
+        .unwrap();
+        fs::write(editable.path().join("dependency/py.typed"), "").unwrap();
+        let site_packages = root.path().join(".venv/lib/python3.12/site-packages");
+        fs::create_dir_all(&site_packages).unwrap();
+        fs::write(root.path().join(".venv/pyvenv.cfg"), "version = 3.12.8\n").unwrap();
+        fs::write(
+            site_packages.join("editable.pth"),
+            format!("{}\n", editable.path().display()),
+        )
+        .unwrap();
+        let authority = crate::python_semantic_config::PythonExternalAuthority {
+            environment: None,
+            editable_roots: vec![editable.path().to_path_buf()],
+        };
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let source_before = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        let dependencies =
+            capture_python_dependencies(root.path(), &source_before, &authority, &|| Ok(()))
+                .unwrap();
+        assert!(dependencies.first_party_roots.is_empty());
+        assert_eq!(dependencies.site_packages_roots.len(), 2);
+        assert!(dependencies.external_imports_complete);
+        assert!(dependencies.files.iter().any(|file| {
+            file.path.as_str()
+                == ".pb-semantic-dependencies/python/site-packages/1/dependency/__init__.py"
+        }));
+
+        let python_tool = tool("replace_file", json!({"const": "main.py"}));
+        let snapshot = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            LogicalPath::parse("main.py").unwrap(),
+            fs::read(root.path().join("main.py")).unwrap(),
+        )])
+        .unwrap();
+        let mut lifecycle =
+            ControlLayerLifecycle::with_python_dependency_authority(authority.clone());
+        assert!(
+            lifecycle
+                .prepare_for_inference(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    Some(&snapshot),
+                )
+                .unwrap()
+                .is_some()
+        );
+        let invalid = json!({
+            "path": "main.py",
+            "content": "from dependency import parse\nresult: str = parse(1)\n"
+        });
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    &snapshot,
+                    "replace_file",
+                    &invalid,
+                )
+                .unwrap(),
+            CompletionDecision::Reject(pb_control_collar::RejectionCode::InvalidSemantics)
+        );
+
+        fs::write(
+            editable.path().join("dependency/__init__.py"),
+            "def parse(value: int) -> int:\n    return value\n",
+        )
+        .unwrap();
+        let source_after = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        assert_eq!(source_before.fingerprint, source_after.fingerprint);
+        assert!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    &snapshot,
+                    "replace_file",
+                    &invalid,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("local Python dependencies changed")
+        );
+        assert!(
+            lifecycle
+                .prepare_for_inference(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    Some(&snapshot),
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    &snapshot,
+                    "replace_file",
+                    &json!({
+                        "path": "main.py",
+                        "content": "from dependency import parse\nresult: int = parse(1)\n"
+                    }),
+                )
+                .unwrap(),
+            CompletionDecision::Accept
+        );
+    }
+
+    #[test]
+    fn configured_external_environment_resolves_dependency_shapes() {
+        let root = tempfile::tempdir().unwrap();
+        let environment_owner = tempfile::tempdir().unwrap();
+        let environment = environment_owner.path().join("environment");
+        let site_packages = environment.join("lib/python3.12/site-packages");
+        fs::create_dir_all(site_packages.join("dependency")).unwrap();
+        fs::write(environment.join("pyvenv.cfg"), "version = 3.12.8\n").unwrap();
+        fs::write(
+            site_packages.join("dependency/__init__.py"),
+            "def parse(value: str) -> str:\n    return value\n",
+        )
+        .unwrap();
+        fs::write(site_packages.join("dependency/py.typed"), "").unwrap();
+        fs::write(
+            root.path().join("main.py"),
+            "from dependency import parse\nresult: str = parse(\"ok\")\n",
+        )
+        .unwrap();
+        let authority = crate::python_semantic_config::PythonExternalAuthority {
+            environment: Some(environment),
+            editable_roots: Vec::new(),
+        };
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let source = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        let dependencies =
+            capture_python_dependencies(root.path(), &source, &authority, &|| Ok(())).unwrap();
+        assert_eq!(dependencies.site_packages_roots.len(), 1);
+        assert!(dependencies.external_imports_complete);
+
+        let python_tool = tool("replace_file", json!({"const": "main.py"}));
+        let snapshot = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            LogicalPath::parse("main.py").unwrap(),
+            fs::read(root.path().join("main.py")).unwrap(),
+        )])
+        .unwrap();
+        let mut lifecycle = ControlLayerLifecycle::with_python_dependency_authority(authority);
+        assert!(
+            lifecycle
+                .prepare_for_inference(
+                    root.path(),
+                    std::slice::from_ref(&python_tool),
+                    Some(&snapshot),
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            lifecycle
+                .validate_completed_mutation(
+                    root.path(),
+                    &[python_tool],
+                    &snapshot,
+                    "replace_file",
+                    &json!({
+                        "path": "main.py",
+                        "content": "from dependency import parse\nresult: str = parse(1)\n"
+                    }),
+                )
+                .unwrap(),
+            CompletionDecision::Reject(pb_control_collar::RejectionCode::InvalidSemantics)
+        );
     }
 
     #[test]

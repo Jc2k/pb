@@ -21,6 +21,7 @@ The user configuration file is `<config-dir>/pb/config.toml`. It covers:
 - model identifier, directory, context, sampling, and resource defaults;
 - intrinsic deterministic controller-action safety policy;
 - storage roots and inference session-cache policy;
+- exact workspace-bound grants for native Python dependency reads outside a repository;
 - FlashMoe in-memory session and resident-runtime bounds;
 - global MCP and LSP server definitions;
 - an optional separate personal-memory repository.
@@ -250,12 +251,42 @@ bundled typeshed. By default pb also looks for `.venv` and `venv` at the project
 Python project manifests. If exactly one environment has a safe conventional layout, pb derives its
 supported Python version from `pyvenv.cfg` and copies bounded `.py`, `.pyi`, `.pth`, `py.typed`, and
 selected distribution metadata into the temporary semantic shadow. Git-ignored environment files
-are included in a separate dependency identity. pb does not execute the interpreter, follow
-dependency symlinks, apply path-injecting `.pth` files, contact a language server, or use a package
-index. Preparation is local, process-cached, single-flight, and automatic; at most one cold Python
-world is built at a time, waiters poll cancellation every 100 ms, and a cancelled request never
-starts inference. Every captured dependency module is type-primed before inference, and the
-dependency identity is recaptured after priming and immediately before execution.
+are included in a separate dependency identity. A plain-path `.pth` entry naming a fully
+controller-observed repository directory becomes an additional frozen first-party root.
+
+The versioned `.pb/python.toml` file can select one exact environment inside the repository when
+automatic discovery would be ambiguous. `pb init` creates the default document for detected Python
+projects:
+
+```toml
+version = 1
+# environment = "tools/.venv"
+```
+
+Repository configuration cannot authorize an out-of-repository read. Such a read requires a
+user-owned grant in `<config-dir>/pb/config.toml`, bound to the canonical repository root:
+
+```toml
+[[inference.python_dependency_authorities]]
+workspace = "/absolute/path/to/repository"
+environment = "/absolute/path/to/virtual-environment" # optional
+editable_roots = ["/absolute/path/to/shared-package/src"]
+```
+
+All paths in this user-owned grant are exact, non-root absolute paths. `environment` selects the
+virtual environment; `editable_roots` authorizes only matching plain-path `.pth` targets and does
+not add an unreferenced directory to Python's search order. Grants are runtime-owned and are not
+serialized into agent requests. Missing, duplicate, relative, filesystem-root, or wrong-workspace
+grants fail closed or grant nothing.
+
+For an authorized external plain-path editable, pb copies the bounded static source/stub tree into
+the immutable shadow. It does not execute the interpreter, follow dependency symlinks, evaluate
+`.pth` import hooks, contact a language server, or use a package index. Native modules, import
+hooks, undeclared external paths, nested search artifacts, and incomplete or over-limit trees remain
+partial or unknown. Preparation is local, process-cached, single-flight, and automatic; at most one
+cold Python world is built at a time, waiters poll cancellation every 100 ms, and a cancelled
+request never starts inference. Every captured dependency module is type-primed before inference,
+and the dependency identity is recaptured after priming and immediately before execution.
 Request-local overlays apply created, modified, and deleted candidate files together, and the
 completed mutation is replayed through a fresh database before execution. The current guarantee is
 narrow: complete generated string-plus-integer literal additions and selected newly introduced `ty`
@@ -264,7 +295,7 @@ newly created Python files, so a changed or deleted public symbol can be rejecte
 untouched in-project dependant. A complete static local environment can also prove an invalid
 external import or a dependency callable-shape mismatch. Missing imports remain unknown when no
 environment is qualified or when multiple environments, native modules, import hooks, symlinks, or
-path injection make its search space partial. `Any`, dynamic behavior, external dependants, and
+undeclared path injection make its search space partial. `Any`, dynamic behavior, external dependants, and
 unpromoted diagnostics remain unknown. There is no environment toggle for this behavior.
 
 A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
@@ -386,11 +417,13 @@ Project-specific files live below `.pb/` in the repository:
 | `.pb/workflow.toml` | Workflow limits and configured task/check policy. |
 | `.pb/goal.toml` | Durable Goal ceilings; cannot enable Auto, automatic continuation, or publication. |
 | `.pb/tasks.toml` | Task decomposition effort presets, aggregate ceilings, and coordination limits. |
+| `.pb/python.toml` | Repository-local native Python environment selection; cannot grant external reads. |
 | `.pb/policy.toml` | User/tool policy rules evaluated for this project. |
 | `.pb/mcp.toml` | Project MCP servers and their declared capabilities. |
 
 Not every project needs every file. `pb init` creates or preserves the environment, workspace,
-strict-workflow, durable-Goal, and Task-decomposition foundations.
+strict-workflow, durable-Goal, and Task-decomposition foundations, plus `.pb/python.toml` for a
+detected Python project.
 
 ## Task decomposition policy
 

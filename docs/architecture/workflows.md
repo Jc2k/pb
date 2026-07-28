@@ -716,11 +716,19 @@ yet—and loads/primes exact-pinned Astral `ty` state
 before inference. Python 3.12 is the fallback; when exactly one conventional project-local
 `.venv` or `venv` can be qualified, its `pyvenv.cfg` selects the supported Python version and pb
 copies bounded `.py`, `.pyi`, `.pth`, `py.typed`, and distribution-metadata inputs from its
-`site-packages` into the immutable shadow. The host platform, first-party sources, bundled typeshed,
-configuration inputs, dependency manifests, and this separate dependency-image digest identify the
-world. Dependency traversal is explicitly sorted, so identical environment bytes cannot acquire a
-different identity from filesystem enumeration order. Ignored environment files are therefore
-covered without becoming repository files. Each request gets an
+`site-packages` into the immutable shadow. A static plain-path `.pth` target inside the repository is
+accepted only when every relevant file is already controller-observed, then becomes an additional
+first-party root so candidate edits and dependant closure use the same overlay. A repository-owned
+`.pb/python.toml` may select one exact in-workspace environment but cannot authorize an external
+read. External environments and exact external plain-path editable roots require user-owned
+configuration bound to the canonical workspace; those static trees are copied into separate frozen
+dependency roots. The runtime-owned grant is not serialized into an agent request.
+
+The host platform, first-party roots, bundled typeshed, configuration inputs, dependency manifests,
+external-root identity, and the separate dependency-image digest identify the world. Dependency
+traversal is explicitly sorted, so identical bytes cannot acquire a different identity from
+filesystem enumeration order. Ignored environment files are therefore covered without becoming
+repository files. Each request gets an
 independently writable Salsa database over shared frozen bytes; this avoids treating a read-only
 Salsa snapshot as a mutable overlay. Every captured dependency module is interned and type-primed
 before the request reaches token generation. Exact worlds use a bounded process cache and the same
@@ -743,9 +751,12 @@ introduced into untouched in-project dependants by a changed or deleted public s
 baseline suppressions remain baseline, while generated `ty: ignore` or `type: ignore` directives
 reject. A complete captured static environment may prove a missing external import; resolved
 dependency source/stub shapes can participate in the same promoted type checks. Multiple local
-environments, path-injecting or symlinked layouts, native modules, `.pth` import hooks, absent
+environments, undeclared or symlinked layouts, native modules, `.pth` import hooks, absent
 environments, `Any`, dynamic behavior, unpromoted diagnostics, and dependants outside the frozen
-project remain partial or unknown. Without a complete qualified external search space, a missing
+project remain partial or unknown. Search roots and `.pth` line lengths are explicitly bounded;
+missing configured roots, non-directory targets, nested-search artifacts, duplicate authority, and
+resource overflow cannot produce a complete environment. A nonexistent plain-path `.pth` target is
+ignored exactly as Python would ignore it. Without a complete qualified external search space, a missing
 absolute third-party import cannot veto generation. Immediately before execution, pb recaptures the
 dependency identity, reconstructs the mutation, and replays it through a fresh Python request
 database against the same frozen world.

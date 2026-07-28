@@ -57,6 +57,7 @@ pub struct ProjectInspection {
     pub has_pb_workflow: bool,
     pub has_pb_goal: bool,
     pub has_pb_tasks: bool,
+    pub has_pb_python: bool,
 
     // Vision / image assets
     /// Project contains image files (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`).
@@ -185,6 +186,7 @@ pub fn inspect(root: &Path) -> Result<ProjectInspection> {
     info.has_pb_workflow = root.join(".pb").join("workflow.toml").exists();
     info.has_pb_goal = root.join(".pb").join("goal.toml").exists();
     info.has_pb_tasks = root.join(".pb").join("tasks.toml").exists();
+    info.has_pb_python = root.join(".pb").join("python.toml").exists();
 
     info.environment_evidence.sort_by(|left, right| {
         left.component
@@ -1063,6 +1065,23 @@ pub fn run_init(workdir: Option<PathBuf>, backend: Option<EnvironmentBackend>) -
 
     if backend.is_none() {
         write_component_environment_configs(&root, &info)?;
+    }
+
+    if info.has_pyproject_toml || info.has_requirements_txt {
+        println!();
+        if info.has_pb_python {
+            let _ = crate::python_semantic_config::PythonSemanticConfig::load(&root)?;
+            println!(
+                "Existing native Python semantic policy found at {}.",
+                root.join(".pb").join("python.toml").display()
+            );
+        } else {
+            crate::python_semantic_config::PythonSemanticConfig::default().save(&root)?;
+            println!(
+                "Native Python semantic policy written to {}.",
+                root.join(".pb").join("python.toml").display()
+            );
+        }
     }
 
     println!();
@@ -2005,6 +2024,32 @@ mod tests {
         write(dir.path(), ".pb/tasks.toml", "version = 1\n");
         let info = inspect(dir.path()).unwrap();
         assert!(info.has_pb_tasks);
+    }
+
+    #[test]
+    fn inspect_existing_pb_python_policy() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".pb/python.toml", "version = 1\n");
+        let info = inspect(dir.path()).unwrap();
+        assert!(info.has_pb_python);
+    }
+
+    #[test]
+    fn init_writes_default_python_policy_for_python_projects() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "pyproject.toml",
+            "[project]\nname = \"example\"\nversion = \"0.1.0\"\n",
+        );
+        run_init(
+            Some(dir.path().to_path_buf()),
+            Some(EnvironmentBackend::Local),
+        )
+        .unwrap();
+
+        let config = crate::python_semantic_config::PythonSemanticConfig::load(dir.path()).unwrap();
+        assert_eq!(config, Default::default());
     }
 
     #[test]

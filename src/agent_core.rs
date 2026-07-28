@@ -630,6 +630,9 @@ pub struct AgentRequest {
     pub seed: u32,
     /// Optional environment config; when `None`, loaded from `.pb/environment.toml` at runtime.
     pub environment: Option<EnvironmentConfig>,
+    /// Runtime-owned user authority for exact native Python reads outside this workspace.
+    #[serde(skip)]
+    pub(crate) python_dependency_authority: crate::python_semantic_config::PythonExternalAuthority,
     /// Runtime-owned, bounded environment evidence exposed to model invocations. This is rebuilt
     /// from repository inspection for every run and cannot be supplied through a persisted/API
     /// request, because evidence informs planning but must never grant host execution authority.
@@ -2848,6 +2851,9 @@ fn run_agent_inner<S: EventSink>(
 
     let user_config =
         crate::config::UserConfig::load().context("failed to load user MCP config")?;
+    args.python_dependency_authority = user_config
+        .python_dependency_authority(&workspace_root)
+        .context("failed to resolve native Python dependency authority")?;
     let project_mcp_config = if args.repository_less {
         None
     } else {
@@ -6585,7 +6591,10 @@ fn run_agent_steps(
         workspace_root,
         command_backend.is_some(),
     )?);
-    let mut control_layer_lifecycle = crate::control_layers::ControlLayerLifecycle::default();
+    let mut control_layer_lifecycle =
+        crate::control_layers::ControlLayerLifecycle::with_python_dependency_authority(
+            args.python_dependency_authority.clone(),
+        );
     let read_cache = RefCell::new(DeterministicReadCache::default());
     let proactive_lsp = if args.repository_less || lsp_registry.servers.is_empty() {
         None
@@ -23668,6 +23677,7 @@ mod tests {
             top_k: 40,
             seed: 42,
             environment: None,
+            python_dependency_authority: Default::default(),
             environment_evidence_context: None,
             workspace_graph: None,
             repository_context: None,
@@ -23677,6 +23687,20 @@ mod tests {
             goal_context: None,
             contract: None,
         }
+    }
+
+    #[test]
+    fn persisted_agent_requests_cannot_carry_python_dependency_authority() {
+        let mut request = test_agent_request(AgentProfile::Build, 512);
+        request.python_dependency_authority =
+            crate::python_semantic_config::PythonExternalAuthority {
+                environment: Some(PathBuf::from("/private/external-environment")),
+                editable_roots: vec![PathBuf::from("/private/external-editable")],
+            };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("external-environment"));
+        let decoded: AgentRequest = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.python_dependency_authority, Default::default());
     }
 
     #[test]
@@ -34635,6 +34659,7 @@ the next imagined action"#;
             top_k: 40,
             seed: 42,
             environment: None,
+            python_dependency_authority: Default::default(),
             environment_evidence_context: None,
             workspace_graph: None,
             repository_context: None,
@@ -34720,6 +34745,7 @@ the next imagined action"#;
             top_k: 40,
             seed: 42,
             environment: None,
+            python_dependency_authority: Default::default(),
             environment_evidence_context: None,
             workspace_graph: None,
             repository_context: None,

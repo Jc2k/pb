@@ -304,14 +304,16 @@ The current implementation has these concrete boundaries:
   dependency facts stay `Unknown`;
 - Python-edit-capable real-backend requests prepare exact-pinned Astral `ty` state before
   inference. The enforced profile resolves first-party and newly generated cross-file imports
-  against bundled typeshed and, for one unambiguous safe project-local `.venv`/`venv`, a bounded
-  immutable source/stub/marker/metadata image. Dependency identity is separate from Git-visible
-  source identity, every captured dependency module is primed before inference, and ignored
+  against bundled typeshed and a bounded immutable source/stub/marker/metadata image from one
+  unambiguous safe project-local or exact user-authorized external environment. Fully observed
+  repository-local plain-path editables become first-party roots; exact external editable roots
+  require user-owned authority bound to the canonical workspace. Dependency identity is separate
+  from Git-visible source identity, every captured dependency module is primed before inference, and ignored
   dependency bytes are rechecked after preparation and before execution. It rejects generated suppression directives, promotes a narrow
   diagnostic set across every non-deleted frozen first-party file plus new Python files at closure,
   and hard-rejects only complete generated
   string-plus-integer literal operations at statement boundaries. Python `Any`, dynamic imports,
-  monkey-patching, descriptors, runtime dispatch, absent/ambiguous/path-injecting/symlinked/native/
+  monkey-patching, descriptors, runtime dispatch, absent/ambiguous/undeclared/symlinked/native/
   hook-bearing environment gaps, external dependants, and unpromoted diagnostics remain outside the
   claim. A missing absolute external import can veto only when the static search space is qualified
   complete;
@@ -332,8 +334,8 @@ The current implementation has these concrete boundaries:
 This implementation prevents an invalid supported complete file from closing and executing, and it
 hard-masks a deliberately small set of proven-impossible prefixes and Rust/Python semantic
 contradictions. It does not claim exact grammar extendability, general Rust type/borrow correctness,
-build-script or procedural-macro completeness, general Python type/runtime correctness, configured
-editable/out-of-project/native Python environment completeness, TypeScript semantic steering, live-model llama.cpp parity, or
+build-script or procedural-macro completeness, general Python type/runtime correctness, dynamic
+editable/native Python environment completeness, TypeScript semantic steering, live-model llama.cpp parity, or
 model-state rollback. Those remain independently promoted gates.
 
 ## Authority and correctness invariants
@@ -1182,7 +1184,7 @@ workspace, not an earlier phase branch.
 | Phase 7 shadow/evidence foundation | Passed | Semantic analysis uses a fresh exact bounded shadow tree and isolated LSP session for each transaction, rejects symlinks and post-copy drift, permits only an LSP-specific read-only analysis-root mount, and emits independently validated content-free generation and final-executor receipts |
 | Phase 7 legacy pinned Rust LSP attempt | Failed safely (historical) | `ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b26526…173d` (rust-analyzer 1.96.0) never produced a non-empty crate graph or document membership within the required barrier; this is why incomplete-code LSP diagnostics were not adopted as the streaming architecture |
 | Phase 7 native Rust implementation | Passed focused implementation gates | Exact-pinned rust-analyzer 0.0.344 loads one offline project world; 8 crate tests cover dependency/sysroot shape certainty, invalid import/type steering, target selection, cross-file rollback, identity/staleness, active-request refresh exclusion, and zero-load source refresh. The root lifecycle test covers cold preparation, warm reuse, independent invalid/valid final replay, in-memory source refresh, cross-stage process-cache reuse, and exact non-Rust target bypass |
-| Phase 7 native Python implementation | Passed expanded focused gates; broader qualification pending | Exact-pinned Astral `ty` 0.0.6 loads and primes a frozen project/typeshed world before inference. Fourteen crate tests cover all six promoted diagnostic codes, `Any`/dynamic unknowns, baseline debt, generated suppression, rollback, project closure, and the repairable-prefix rule. Five codes are explicitly closure-only; only the independently proven generated string-plus-integer literal can use `unsupported-operator` for statement-time hard rejection. A later-file import repair proves why complete-looking statements stay open until the whole patch is known. Root lifecycle tests cover safe project-local `.venv`/`venv` capture even when Git-ignored, dependency callable and complete-search import rejection, pre-inference dependency-module priming, separate deterministically ordered dependency identity, post-prime/pre-execution drift rejection, cold rebuild after dependency changes, dynamic/native/path-injection downgrade, concurrent exact single flight, cancellation polling, cold/warm/process-cache reuse, and independent final replay. The checked-in 24-case Python semantic corpus differentially compares generation closure, final execution replay, and exact promoted-code deltas across annotated, unannotated, frozen third-party, baseline-debt, dynamic, and multi-file cases, with all four mutation tools and all six promoted codes represented. Broader public-project/external-oracle corpora, editable/out-of-project environment support, and live-model Python semantic fixtures remain pending. |
+| Phase 7 native Python implementation | Passed expanded focused gates; broader qualification pending | Exact-pinned Astral `ty` 0.0.6 loads and primes a frozen project/typeshed world before inference. Fourteen crate tests cover all six promoted diagnostic codes, `Any`/dynamic unknowns, baseline debt, generated suppression, rollback, project closure, and the repairable-prefix rule. Five codes are explicitly closure-only; only the independently proven generated string-plus-integer literal can use `unsupported-operator` for statement-time hard rejection. A later-file import repair proves why complete-looking statements stay open until the whole patch is known. Root lifecycle tests cover safe project-local `.venv`/`venv` capture even when Git-ignored, fully observed repository-local plain-path editables, exact user-authorized external environments and editable roots, dependency callable and complete-search import rejection, pre-inference dependency-module priming, separate deterministically ordered dependency identity, post-prime/pre-execution external drift rejection, cold rebuild after dependency changes, dynamic/native/undeclared-path downgrade, repository-versus-user authority isolation, concurrent exact single flight, cancellation polling, cold/warm/process-cache reuse, and independent final replay. The checked-in 24-case Python semantic corpus differentially compares generation closure, final execution replay, and exact promoted-code deltas across annotated, unannotated, frozen third-party, baseline-debt, dynamic, and multi-file cases, with all four mutation tools and all six promoted codes represented. Broader public-project/external-oracle corpora, dynamic editable/import-hook/native environment support, and live-model Python semantic fixtures remain pending. |
 | Phase 7 native Python lifecycle/resource qualifier | Passed initial matrix | Release-arm64 profile `aeeca87b…966e` ran each case in a fresh process through the exact cold readiness, warm request, process-cache, invalid replay, and valid replay paths. Tiny 4/7 files measured 49/14/14/16/15 ms and 39.6 MB peak; representative 1,024/515 measured 337/67/67/73/74 ms and 53.7 MB; large 10,000/5,003 measured 3,106/601/602/662/660 ms and 192.4 MB. All 15,001 large-case source modules were primed before inference. The accepted ceilings are 60 s cold, 20 s warm/cache, 20 s per replay, and 1 GiB process peak. This simple annotated-module matrix is a reproducible scaling baseline, not a universal project budget |
 | Phase 7 native Python semantic qualifier | Passed initial matrix | Release-arm64 corpus `e073204a…0b40` ran 24 annotated, unannotated, frozen-third-party, baseline-debt, dynamic-unknown, and multi-file cases through production generation closure, independent final execution replay, and direct promoted-code replay. All 24 decisions matched across generation/final, with 9 allows, 15 semantic rejections, all six promoted codes, and all four mutation tools represented. Cold readiness was 52 ms; 96 case stages measured 8 ms p50, 16 ms p95/p99, and 16 ms maximum. The frozen HTTP client stub is a distilled dependency surface, not a full upstream conformance claim; broader public-project and external-oracle corpora remain |
 | Phase 7 lifecycle overlap/cancellation boundary | Passed narrow shipped guarantee | The root lifecycle tests hold one request lease across source drift and prove the next request receives an independently cold-built world; two simultaneous exact requests produce one cold build plus one process-cache hit; and any drift during loading requires a fresh controller snapshot rather than an internal retry. Deterministic tests hold a detached cold worker open and prove that its initiating request and a different project waiting for the global one-worker capacity both observe cancellation through the 100 ms poll while the exact single-flight remains owned until worker completion. A separate agent test proves pre-inference cancellation causes zero model invocations and zero consumed completion records. The analyzer computation itself is not cooperatively interrupted. |
@@ -1260,14 +1262,17 @@ the pinned end-to-end decode-throughput reduction remains within the existing 25
   execution. The promoted set starts with
   selected import/attribute/operator/argument/assignment/return diagnostics and a streaming proof
   for complete generated string-plus-integer literal addition. `Any`, dynamic imports,
-  monkey-patching, descriptors, runtime dispatch, unpromoted diagnostics, multiple/path-injecting/
-  symlinked/native/hook-bearing environment gaps, and dependencies outside the frozen project remain
-  `Unknown`. The process-isolated tiny/representative/large dependency-world lifecycle and resource
+  monkey-patching, descriptors, runtime dispatch, unpromoted diagnostics, multiple/undeclared/
+  symlinked/native/hook-bearing environment gaps, and dependants outside the frozen project remain
+  `Unknown`. Fully observed repository-local plain-path editables now become first-party roots.
+  Exact external environments and editable roots can be frozen only through user-owned authority
+  bound to one canonical workspace; repository configuration and serialized requests cannot grant
+  that read. The process-isolated tiny/representative/large dependency-world lifecycle and resource
   matrix is implemented. The initial checked-in 24-case semantic matrix now covers
   annotated/unannotated/frozen-dependency allow and reject behavior, baseline debt, dynamic
   unknowns, multi-file transactions, all four mutation tools, and all six promoted codes through
-  generation/final/direct-diagnostic differential replay. Next, add editable/out-of-project
-  dependency authority, expand into public-project and independently provisioned external-oracle
+  generation/final/direct-diagnostic differential replay. Next, expand into public-project and
+  independently provisioned external-oracle
   corpora, and require a separately named monotonic proof before granting any new token-time
   hard-mask authority. An exact Pyright release may be a CI/research differential oracle, but it is
   not a pb runtime or hidden-harness dependency and is never the token-time state machine.
@@ -1375,8 +1380,17 @@ general Rust type correctness.
 `ty` project/type state is the token-time resolver; an LSP is not run over incomplete source. The
 first-party/typeshed profile and the separately qualified project-local environment image can ship
 only with narrow per-code evidence. Static dependency completeness remains explicitly distinct from
-editable/out-of-project environments, native/dynamic import behavior, and Python runtime
+dynamic editable/import-hook/native environment behavior and Python runtime
 correctness.
+
+**Amended 2026-07-28:** static editable/out-of-project authority is now split across trust scopes.
+Repository-local plain-path editables are accepted only from controller-observed files.
+Repository-owned `.pb/python.toml` can select only an in-workspace environment. Exact external
+environment/editable paths require user-owned configuration bound to the canonical workspace; that
+runtime authority is excluded from serialized agent requests. Every accepted external tree is
+bounded, frozen before inference, included in dependency identity, and recaptured before execution.
+Symlinks, import hooks, native modules, undeclared roots, nested search artifacts, ambiguity, and
+resource overflow remain partial or fail closed.
 
 ### Patch and batch compatibility
 
@@ -1425,7 +1439,7 @@ their named phase produces evidence:
 | Whether DeepSeek ephemeral complete-state snapshots beat deterministic replay | Phase 9 | Snapshot copy cost, memory peak, restore parity, branch depth, and end-to-end energy |
 | Rust deeper native boundary | Phase 7D | rust-analyzer/compiler parity corpus including macros, traits, `cfg`, ownership, and workspace edits |
 | TypeScript/JavaScript native project layer | Phase 7F | Module-resolution, ambient-type, JSX, and multi-file corpus |
-| Python `ty` deeper profile and `Unknown` policy | Phase 7E | First-party/typeshed plus bounded safe project-local environment identity, isolated dependency-resource matrices, and the initial six-code positive/unknown/repairable-prefix corpus are implemented. A checked-in 24-case annotated/unannotated/frozen-third-party matrix now requires generation/final/direct-diagnostic parity across all four mutation tools. Five diagnostics remain closure-only; one literal operator has a named token proof. Broader public-project and independently provisioned CI/research external-oracle corpora, editable/out-of-project environments, a larger false-rejection audit, and any broader token-time promotion remain. Pyright is explicitly excluded from the pb binary and hidden harness. |
+| Python `ty` deeper profile and `Unknown` policy | Phase 7E | First-party/typeshed, bounded safe project-local environments, fully observed repository-local plain-path editables, and exact user-authorized external environments/editable roots are implemented with isolated dependency identity and final drift replay. The lifecycle resource matrices and initial six-code positive/unknown/repairable-prefix corpus are implemented. A checked-in 24-case annotated/unannotated/frozen-third-party matrix now requires generation/final/direct-diagnostic parity across all four mutation tools. Five diagnostics remain closure-only; one literal operator has a named token proof. Broader public-project and independently provisioned CI/research external-oracle corpora, dynamic/import-hook/native environments, a larger false-rejection audit, and any broader token-time promotion remain. Pyright is explicitly excluded from the pb binary and hidden harness. |
 
 Unsupported language profiles remain protocol-constrained and executor-validated; they must not be
 reported as syntax- or semantic-constrained. A supported profile whose required analyzer cannot be

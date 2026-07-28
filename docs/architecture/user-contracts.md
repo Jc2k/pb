@@ -114,10 +114,14 @@ For a real local backend that may edit Python, pb likewise prepares exact-pinned
 before inference. The shipped v1 profile uses Python 3.12 as its fallback and binds the host target
 platform, first-party sources, bundled typeshed, and configuration/dependency-manifest identities to
 a frozen project world. When exactly one conventional project-local `.venv` or `venv` has a safe,
-bounded static layout, pb additionally snapshots its Python/stub/package-marker metadata, derives
-the supported Python version from `pyvenv.cfg`, primes every captured dependency module before
-inference, and includes the dependency image in cache/single-flight identity. It does not execute an
-interpreter or contact a package index. Request overlays resolve newly generated files and imports together, and a deleted candidate
+bounded static layout, pb additionally snapshots its Python/stub/package-marker metadata. A
+plain-path `.pth` entry can add a fully observed repository directory as a first-party root. An
+external environment or exact external editable root can participate only through user-owned
+configuration bound to the canonical workspace; repository-owned `.pb/python.toml` can select only
+an in-workspace environment. pb derives the supported Python version from `pyvenv.cfg`, primes every
+captured dependency module before inference, and includes the dependency image in
+cache/single-flight identity. It does not execute an interpreter or contact a package index. Request
+overlays resolve newly generated files and imports together, and a deleted candidate
 is absent from that transaction's import graph. It can reject a complete
 generated string-plus-integer literal operation at a proven statement boundary and newly introduced
 promoted `ty` diagnostics at closure. Argument, assignment, return, attribute, and import diagnostics
@@ -127,9 +131,9 @@ Closure applies every candidate together, then checks every
 non-deleted frozen first-party file plus newly created Python files, so an API change or deletion can
 be rejected when it introduces a promoted error in an untouched in-project dependant. Generated
 type-suppression directives cannot hide those errors. Missing external imports can veto only when
-the static environment search space is complete. Ambiguous environments, path-injecting `.pth`
-files, symlinked layouts, native extensions, import hooks, `Any`, dynamic imports, monkey-patching,
-descriptors, runtime dispatch, dependencies outside the frozen project, and unpromoted diagnostics
+the static environment search space is complete. Ambiguous environments, undeclared `.pth` paths,
+symlinked layouts, native extensions, import hooks, `Any`, dynamic imports, monkey-patching,
+descriptors, runtime dispatch, dependants outside the frozen project, and unpromoted diagnostics
 remain partial or unknown. The dependency image is recaptured before execution, then a fresh
 complete replay runs against the original immutable world. This is not general Python type or
 runtime correctness.

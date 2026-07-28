@@ -584,6 +584,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tiny_python_case_crosses_every_production_lifecycle_barrier() {
+        let isolated_test = "native_qualification::tests::isolated_tiny_python_case_crosses_every_production_lifecycle_barrier";
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", isolated_test, "--nocapture"])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "process-isolated native Python qualification test failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "invoked in a dedicated process by the production lifecycle barrier test"]
+    fn isolated_tiny_python_case_crosses_every_production_lifecycle_barrier() {
         let report = qualify_python_case(NativeWorldCase::Tiny).unwrap();
         assert_eq!(report.first_party_files, 4);
         assert_eq!(report.dependency_files, 7);

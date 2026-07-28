@@ -78,10 +78,14 @@ bytes into a frozen in-memory filesystem before running exact-pinned Astral `ty`
 process. The controller also inspects conventional project-local `.venv`/`venv` directories—even
 when Git ignores them—and, for one unambiguous safe layout, copies bounded Python source, stubs,
 package markers, selected distribution metadata, and `pyvenv.cfg` into that same temporary shadow.
-It never executes the environment's interpreter, processes dynamic path injection, contacts a live
-LSP or package index, or reads an out-of-project environment. Dependency bytes and identities are
-used only by the local analyzer, are type-primed before inference, and are recaptured before
-execution; they are not added to prompts or durable events. Generated overlays, diagnostic debt,
+Static plain-path editables inside the repository can become frozen first-party roots. An exact
+external environment or editable root is read only when the user-owned pb configuration grants that
+path to this canonical workspace; repository configuration and serialized agent requests cannot
+grant the read. External static source/stub bytes are copied into the same bounded temporary shadow.
+It never executes the environment's interpreter, evaluates `.pth` import hooks, contacts a live LSP
+or package index, or follows dependency symlinks. Dependency bytes and identities are used only by
+the local analyzer, are type-primed before inference, and are recaptured before execution; they are
+not added to prompts or durable events. Generated overlays, diagnostic debt,
 request databases, and an exact-flight result awaiting its registered local waiters stay in memory;
 bounded process caches retain only local analyzer worlds and durable events remain content-free. A
 cancelled request may leave its one already-started local Python preparation worker finishing into

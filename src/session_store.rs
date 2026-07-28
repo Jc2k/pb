@@ -459,6 +459,7 @@ mod tests {
             top_k: 1,
             seed: 0,
             environment: None::<EnvironmentConfig>,
+            python_dependency_authority: Default::default(),
             environment_evidence_context: None,
             workspace_graph: None,
             repository_context: None,

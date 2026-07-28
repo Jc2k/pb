@@ -56,6 +56,7 @@ mod native_qualification;
 pub mod policy;
 pub mod projects;
 mod public_network;
+mod python_semantic_config;
 mod python_semantic_qualification;
 pub mod semantic;
 mod semantic_qualification;
@@ -1437,6 +1438,7 @@ async fn run_serve() -> Result<()> {
         top_k: user_config.effective_top_k(),
         seed: user_config.effective_seed(),
         environment: None,
+        python_dependency_authority: Default::default(),
         environment_evidence_context: None,
         workspace_graph: None,
         repository_context: None,

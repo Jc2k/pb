@@ -22,6 +22,12 @@ updates, and provider publication are explicit paths across the machine boundary
 The optional personal-memory setting points at a separate repository chosen by you. pb does not
 silently turn one project repository into cross-project memory.
 
+A native Python dependency-authority entry in user settings can grant one canonical workspace
+read-only access to an exact external virtual environment or editable source root. pb copies only
+bounded static analyzer inputs into an ephemeral local shadow, never adds those bytes to prompts or
+durable events, and rechecks their content identity before a mutation executes. Repository-owned
+configuration cannot create this grant.
+
 ## When data can leave the machine
 
 Data crosses the local boundary when you choose a feature that requires it:

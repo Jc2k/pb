@@ -864,6 +864,7 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
         top_k: args.top_k.unwrap_or_else(|| user_config.effective_top_k()),
         seed: args.seed.unwrap_or_else(|| user_config.effective_seed()),
         environment: Some(harness_environment()),
+        python_dependency_authority: Default::default(),
         environment_evidence_context: None,
         workspace_graph: Some(workspace_graph),
         repository_context: Some(repository_context),

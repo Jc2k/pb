@@ -68,5 +68,6 @@ mutation-tool coverage, and incomplete promoted-code coverage.
 
 This is differential evidence for the current six-code Python profile and the existing
 string-plus-integer token proof. It does not make dynamic Python sound, prove the complete HTTP
-client API, qualify editable or out-of-project environments, grant token-time authority to the five
-closure-only codes, or replace broader public-project and independent external-oracle corpora.
+client API, exercise the separately qualified editable/external-environment lifecycle profiles,
+grant token-time authority to the five closure-only codes, or replace broader public-project and
+independent external-oracle corpora.

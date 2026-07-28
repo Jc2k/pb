@@ -125,6 +125,17 @@ exact result into the bounded process cache and a direct handoff retained only w
 registered exact-identity waiters consume it. This handoff prevents unrelated LRU churn from
 duplicating a completed expensive preparation and grants no new project or mutation authority.
 
+`pb-control-python` receives only a frozen in-memory filesystem and exact identities; it does not
+read a live environment or interpret `.pth` code. Conventional repository-local environments need
+no extra authority. Repository-owned `.pb/python.toml` may disambiguate only an environment whose
+canonical directory remains inside that repository. Exact external environments and plain-path
+editable roots require a user-owned `inference.python_dependency_authorities` entry bound to the
+same canonical workspace. That runtime grant is skipped by request serialization, so a stored/API
+request and a hostile checkout cannot manufacture it. Capture rejects symlinks, undeclared roots,
+dynamic hooks, nested search artifacts, ambiguity, and resource overflow; native modules make the
+external search space partial. The exact captured bytes and ordered search roots join the world
+identity and are recaptured before executor entry.
+
 The executor does not trust generation-time acceptance. It repeats path/capability/schema/read gates,
 reconstructs the virtual mutation, verifies current base hashes and syntax, and publishes through
 the existing atomic file operations. When a native Rust world was prepared, executor entry first
@@ -369,7 +380,7 @@ resolved versioned namespace; it never targets the storage root itself.
 | Goal automatic continuation | Explicit per-Goal user authority inside snapshotted totals. It does not approve new paths, integrations, network access, policy prompts, or publication. |
 | Syntax-constrained mutation | Prevents a supported file from completing with parser-invalid syntax. It does not prove type correctness, name resolution, compilation, test success, runtime behavior, or security. Unsupported extensions retain ordinary executor checks. |
 | Native Rust v1 constraint | Resolves project targets, imports, and selected callable/literal shapes against one exact pinned rust-analyzer world. Only qualified exact facts may veto. Disabled build scripts/procedural macros, generated APIs, partial dependency state, deeper inference, ownership, and runtime behavior remain unknown; this is not a compilation guarantee. |
-| Native Python v1 constraint | Resolves first-party and newly generated cross-file imports plus selected promoted type shapes against one exact pinned Astral `ty` world. The fallback is Python 3.12/typeshed; one safely qualified project-local `.venv`/`venv` contributes a bounded immutable source/stub/marker/metadata image and Python version without executing an interpreter. Dependency modules are primed before inference and the separate dependency digest is rechecked before execution. Create/modify/delete candidates are applied as one overlay transaction; closure checks every non-deleted frozen first-party file plus new Python files, including untouched in-project dependants. Only complete literal contradictions and newly introduced promoted diagnostics may veto; generated suppressions cannot bypass the gate. Missing external imports remain unknown for absent, ambiguous, path-injecting, symlinked, native, or hook-bearing environments. `Any`, dynamic/runtime behavior, dependants outside the frozen project, and unpromoted diagnostics remain unknown; this is not a general type-correctness guarantee. |
+| Native Python v1 constraint | Resolves first-party and newly generated cross-file imports plus selected promoted type shapes against one exact pinned Astral `ty` world. The fallback is Python 3.12/typeshed; one safely qualified local or user-authorized exact external `.venv`/`venv` contributes a bounded immutable source/stub/marker/metadata image and Python version without executing an interpreter. Fully observed repository-local plain-path editables become first-party roots; exact external editable roots require a user-owned grant bound to the canonical workspace. Repository configuration cannot authorize external reads, and runtime authority is not serialized into agent requests. Dependency modules are primed before inference and the separate dependency digest is rechecked before execution. Create/modify/delete candidates are applied as one overlay transaction; closure checks every non-deleted frozen first-party file plus new Python files, including untouched in-project dependants. Only complete literal contradictions and newly introduced promoted diagnostics may veto; generated suppressions cannot bypass the gate. Missing external imports remain unknown for absent, ambiguous, undeclared, symlinked, native, or hook-bearing environments. `Any`, dynamic/runtime behavior, dependants outside the frozen project, and unpromoted diagnostics remain unknown; this is not a general type-correctness guarantee. |
 
 ## Credentials
 

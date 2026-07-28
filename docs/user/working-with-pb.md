@@ -65,9 +65,12 @@ complete generated string-plus-integer literal additions and selected newly intr
 diagnostics across the frozen first-party project, including untouched in-project dependants of a
 changed or deleted symbol. Before inference, one unambiguous safe project-local `.venv`/`venv` is
 also copied into the frozen world and its dependency modules are type-primed; this can constrain
-imports and callable shapes from installed Python source or stubs. pb never runs the environment's
-interpreter. Ambiguous, path-injecting, symlinked, native, or hook-bearing environment facts remain
-partial, and an unqualified missing external import stays open. `Any`, dynamic/runtime behavior,
+imports and callable shapes from installed Python source or stubs. Plain-path editables inside the
+repository join the frozen first-party search roots. An exact external environment or editable root
+can participate only through user-owned, canonical-workspace-bound configuration; repository files
+cannot grant that read. pb never runs the environment's interpreter. Ambiguous, undeclared,
+symlinked, native, or hook-bearing environment facts remain partial, and an unqualified missing
+external import stays open. `Any`, dynamic/runtime behavior,
 dependants outside the frozen project, and other diagnostics remain unknown. These layers do not promise
 general type correctness, compilation, passing checks, or safe runtime behavior; configured checks
 and review still decide those claims.

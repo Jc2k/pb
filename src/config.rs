@@ -60,6 +60,22 @@ pub struct InferenceConfig {
     pub llamacpp_session_cache_max_bytes: Option<u64>,
     pub flashmoe_session_cache_enabled: Option<bool>,
     pub flashmoe_session_cache_max_bytes: Option<u64>,
+    /// User-owned grants for native Python reads outside one exact workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub python_dependency_authorities: Vec<PythonDependencyAuthorityConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PythonDependencyAuthorityConfig {
+    /// Exact repository root to which this authority applies.
+    pub workspace: PathBuf,
+    /// Optional exact virtual-environment directory outside that repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<PathBuf>,
+    /// Exact external directories that plain-path `.pth` entries may expose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub editable_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -449,6 +465,40 @@ impl UserConfig {
         }
     }
 
+    pub(crate) fn python_dependency_authority(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<crate::python_semantic_config::PythonExternalAuthority> {
+        let workspace_root = workspace_root
+            .canonicalize()
+            .with_context(|| format!("failed to resolve workspace {}", workspace_root.display()))?;
+        let mut matched = self
+            .inference
+            .python_dependency_authorities
+            .iter()
+            .filter_map(|authority| {
+                authority
+                    .workspace
+                    .canonicalize()
+                    .ok()
+                    .filter(|candidate| candidate == &workspace_root)
+                    .map(|_| authority)
+            });
+        let Some(authority) = matched.next() else {
+            return Ok(Default::default());
+        };
+        if matched.next().is_some() {
+            bail!(
+                "multiple native Python dependency authorities resolve to workspace {}",
+                workspace_root.display()
+            );
+        }
+        Ok(crate::python_semantic_config::PythonExternalAuthority {
+            environment: authority.environment.clone(),
+            editable_roots: authority.editable_roots.clone(),
+        })
+    }
+
     fn validate(&self) -> Result<()> {
         validate_optional_absolute_path("storage.state_dir", self.storage.state_dir.as_deref())?;
         validate_optional_absolute_path("storage.cache_dir", self.storage.cache_dir.as_deref())?;
@@ -456,6 +506,49 @@ impl UserConfig {
             "inference.llamacpp_session_cache_max_bytes",
             self.inference.llamacpp_session_cache_max_bytes,
         )?;
+        if self.inference.python_dependency_authorities.len() > 32 {
+            bail!("inference.python_dependency_authorities permits at most 32 workspaces");
+        }
+        let mut workspaces = std::collections::BTreeSet::new();
+        for authority in &self.inference.python_dependency_authorities {
+            validate_exact_authority_path(
+                "inference.python_dependency_authorities.workspace",
+                &authority.workspace,
+            )?;
+            if authority.environment.is_none() && authority.editable_roots.is_empty() {
+                bail!(
+                    "a native Python dependency authority must grant an environment or editable root"
+                );
+            }
+            if let Some(environment) = &authority.environment {
+                validate_exact_authority_path(
+                    "inference.python_dependency_authorities.environment",
+                    environment,
+                )?;
+            }
+            if authority.editable_roots.len() > 32 {
+                bail!("a native Python dependency authority permits at most 32 editable roots");
+            }
+            let mut editable_roots = std::collections::BTreeSet::new();
+            for root in &authority.editable_roots {
+                validate_exact_authority_path(
+                    "inference.python_dependency_authorities.editable_roots",
+                    root,
+                )?;
+                if !editable_roots.insert(root) {
+                    bail!(
+                        "native Python dependency authority repeats editable root {}",
+                        root.display()
+                    );
+                }
+            }
+            if !workspaces.insert(&authority.workspace) {
+                bail!(
+                    "native Python dependency authority repeats workspace {}",
+                    authority.workspace.display()
+                );
+            }
+        }
         validate_optional_positive(
             "inference.flashmoe_session_cache_max_bytes",
             self.inference.flashmoe_session_cache_max_bytes,
@@ -469,6 +562,19 @@ impl UserConfig {
         validate_optional_positive("flashmoe.idle_seconds", self.flashmoe.idle_seconds)?;
         Ok(())
     }
+}
+
+fn validate_exact_authority_path(key: &str, path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() || !path.is_absolute() || path.parent().is_none() {
+        bail!("invalid value for {key}: expected an exact non-root absolute path");
+    }
+    let text = path
+        .to_str()
+        .with_context(|| format!("invalid value for {key}: expected a UTF-8 path"))?;
+    if text.contains(['\0', '\n', '\r']) {
+        bail!("invalid value for {key}: expected a single-line path");
+    }
+    Ok(())
 }
 
 fn config_lock_path(path: &Path) -> PathBuf {
@@ -576,6 +682,59 @@ mod tests {
         );
         assert_eq!(loaded.model.temperature, Some(0.7));
         assert_eq!(loaded.model.profile, Some(AgentProfile::Review));
+    }
+
+    #[test]
+    fn native_python_dependency_authority_is_user_owned_and_workspace_bound() {
+        let owner = tempdir().unwrap();
+        let workspace = owner.path().join("workspace");
+        let other_workspace = owner.path().join("other-workspace");
+        let environment = owner.path().join("environment");
+        let editable = owner.path().join("editable");
+        for directory in [&workspace, &other_workspace, &environment, &editable] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let path = owner.path().join("config.toml");
+        let mut config = UserConfig::default();
+        config.inference.python_dependency_authorities = vec![PythonDependencyAuthorityConfig {
+            workspace: workspace.clone(),
+            environment: Some(environment.clone()),
+            editable_roots: vec![editable.clone()],
+        }];
+        config.save_to_path(&path).unwrap();
+        let loaded = UserConfig::load_from_path(&path).unwrap();
+
+        assert_eq!(
+            loaded.python_dependency_authority(&workspace).unwrap(),
+            crate::python_semantic_config::PythonExternalAuthority {
+                environment: Some(environment),
+                editable_roots: vec![editable],
+            }
+        );
+        assert_eq!(
+            loaded
+                .python_dependency_authority(&other_workspace)
+                .unwrap(),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn native_python_dependency_authority_rejects_relative_or_empty_grants() {
+        let mut config = UserConfig::default();
+        config.inference.python_dependency_authorities = vec![PythonDependencyAuthorityConfig {
+            workspace: PathBuf::from("relative"),
+            environment: Some(PathBuf::from("/tmp/environment")),
+            editable_roots: Vec::new(),
+        }];
+        assert!(config.validate().is_err());
+
+        config.inference.python_dependency_authorities[0] = PythonDependencyAuthorityConfig {
+            workspace: PathBuf::from("/tmp/workspace"),
+            environment: None,
+            editable_roots: Vec::new(),
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

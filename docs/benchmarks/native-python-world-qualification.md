@@ -59,9 +59,17 @@ target/aarch64-apple-darwin/release/pb harness native-world-qualify --language p
 The command emits only content-free identities, counts, byte totals, timings, and memory values.
 Each child creates and removes its own synthetic Git workspace and ignored `.venv`.
 
+The same production lifecycle also has deterministic focused regression coverage for a fully
+observed repository-local plain-path editable, an exact user-authorized external editable, and an
+exact user-authorized external environment. Those cases prove native import/call-shape resolution,
+repository-versus-user authority isolation, external-byte drift rejection, cold recapture, and
+independent final replay. They share the limits exercised above but are not additional timing rows
+in this version 1 resource matrix.
+
 ## Scope
 
 This is an accepted lifecycle/scaling baseline for simple, fully annotated static module graphs. It
-does not establish a universal project latency promise, a complex-AST throughput bound, editable or
-out-of-project environment support, native-extension authority, dynamic Python soundness, or a
-semantic false-rejection rate. Those remain separate Phase 7E/7H qualification work.
+does not establish a universal project latency promise, a complex-AST throughput bound, a separate
+large external-editable resource profile, dynamic/import-hook/native-extension authority, dynamic
+Python soundness, or a semantic false-rejection rate. Those remain separate Phase 7E/7H
+qualification work.
