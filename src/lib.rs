@@ -52,6 +52,7 @@ mod jsonrpc;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;
+mod native_qualification;
 pub mod policy;
 pub mod projects;
 mod public_network;
@@ -489,6 +490,9 @@ pub enum HarnessCommand {
     /// Qualify a digest-pinned semantic provider against a versioned mutation corpus
     #[command(name = "semantic-qualify", hide = true)]
     SemanticQualify(HarnessSemanticQualifyArgs),
+    /// Qualify native project-world lifecycle, scaling, and resource bounds without a model
+    #[command(name = "native-world-qualify", hide = true)]
+    NativeWorldQualify(native_qualification::HarnessNativeWorldQualifyArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2598,6 +2602,7 @@ fn run_harness_command(command: HarnessCommand) -> Result<()> {
         HarnessCommand::CollarQualify(args) => run_collar_qualification(args),
         HarnessCommand::LlamaInfer(args) => run_llama_tool_fixture(args),
         HarnessCommand::SemanticQualify(args) => run_semantic_qualification(args),
+        HarnessCommand::NativeWorldQualify(args) => native_qualification::run(args),
     }
 }
 
@@ -5762,6 +5767,41 @@ mod tests {
         assert_eq!(args.server, "typescript");
         assert_eq!(args.corpus, PathBuf::from("semantic.json"));
         assert_eq!(args.latency_budget_millis, 5000);
+    }
+
+    #[test]
+    fn native_world_qualification_has_explicit_lifecycle_and_resource_budgets() {
+        let parsed = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "native-world-qualify",
+            "--language",
+            "python",
+            "--max-cold-millis",
+            "90000",
+            "--max-warm-millis",
+            "8000",
+            "--max-replay-millis",
+            "12000",
+            "--max-peak-resident-bytes",
+            "2147483648",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::NativeWorldQualify(args),
+        } = parsed.command
+        else {
+            panic!("expected native-world qualification command");
+        };
+        assert_eq!(
+            args.language,
+            native_qualification::NativeWorldLanguage::Python
+        );
+        assert_eq!(args.max_cold_millis, 90_000);
+        assert_eq!(args.max_warm_millis, 8_000);
+        assert_eq!(args.max_replay_millis, 12_000);
+        assert_eq!(args.max_peak_resident_bytes, 2_147_483_648);
+        assert!(args.case.is_none());
     }
 
     #[test]

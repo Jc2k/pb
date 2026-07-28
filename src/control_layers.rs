@@ -5,7 +5,7 @@
 //! it never loads Cargo metadata, starts a language server, or reads the live workspace.
 
 use std::{
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     io::Read,
     path::{Path, PathBuf},
     sync::{
@@ -90,6 +90,22 @@ struct PythonDependencySnapshot {
     files: Vec<SemanticShadowExtraFile>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PythonWorldQualificationObservation {
+    pub(crate) world_sha256: String,
+    pub(crate) configuration_sha256: String,
+    pub(crate) dependency_sha256: String,
+    pub(crate) provider_version: String,
+    pub(crate) load_millis: u64,
+    pub(crate) prime_millis: u64,
+    pub(crate) primed_queries: u64,
+    pub(crate) cold_millis: u64,
+    pub(crate) warm_millis: u64,
+    pub(crate) process_cache_hit_millis: u64,
+    pub(crate) invalid_replay_millis: u64,
+    pub(crate) valid_replay_millis: u64,
+}
+
 impl Default for ControlLayerLifecycle {
     fn default() -> Self {
         Self {
@@ -125,8 +141,15 @@ struct PythonWorldKey {
 }
 
 #[derive(Default)]
+struct RustWorldPreparationState {
+    active: HashSet<RustWorldKey>,
+    waiters: HashMap<RustWorldKey, usize>,
+    completed: HashMap<RustWorldKey, PreparedRustHandle>,
+}
+
+#[derive(Default)]
 struct RustWorldPreparationCoordinator {
-    active: Mutex<HashSet<RustWorldKey>>,
+    state: Mutex<RustWorldPreparationState>,
     ready: Condvar,
 }
 
@@ -135,15 +158,42 @@ struct RustWorldPreparationGuard {
     key: RustWorldKey,
 }
 
+enum RustWorldPreparation {
+    Owner(RustWorldPreparationGuard),
+    Shared(PreparedRustHandle),
+}
+
+struct RustWorldPreparationPublisher {
+    coordinator: &'static RustWorldPreparationCoordinator,
+    key: RustWorldKey,
+}
+
 static RUST_WORLD_PREPARATIONS: OnceLock<RustWorldPreparationCoordinator> = OnceLock::new();
 
 #[derive(Default)]
+struct PythonWorldPreparationState {
+    active: HashSet<PythonWorldKey>,
+    waiters: HashMap<PythonWorldKey, usize>,
+    completed: HashMap<PythonWorldKey, PreparedPythonHandle>,
+}
+
+#[derive(Default)]
 struct PythonWorldPreparationCoordinator {
-    active: Mutex<HashSet<PythonWorldKey>>,
+    state: Mutex<PythonWorldPreparationState>,
     ready: Condvar,
 }
 
 struct PythonWorldPreparationGuard {
+    coordinator: &'static PythonWorldPreparationCoordinator,
+    key: PythonWorldKey,
+}
+
+enum PythonWorldPreparation {
+    Owner(PythonWorldPreparationGuard),
+    Shared(PreparedPythonHandle),
+}
+
+struct PythonWorldPreparationPublisher {
     coordinator: &'static PythonWorldPreparationCoordinator,
     key: PythonWorldKey,
 }
@@ -251,22 +301,32 @@ impl ControlLayerLifecycle {
                     },
                     cancellation,
                 )?;
-                if let Some(cached) = process_cached_world(canonical_root, &live.fingerprint)? {
-                    self.rust = Some(cached);
-                    self.process_cache_hits = self.process_cache_hits.saturating_add(1);
-                } else if let Some(refreshed) =
-                    self.try_incremental_refresh(canonical_root, live)?
-                {
-                    insert_process_world(Arc::clone(&refreshed))?;
-                    self.rust = Some(refreshed);
-                } else {
-                    let receiver = spawn_rust_world_build(
-                        preparation,
-                        canonical_root.to_path_buf(),
-                        live.clone(),
-                    )?;
-                    self.cold_builds = self.cold_builds.saturating_add(1);
-                    self.rust = Some(wait_for_rust_preparation(&receiver, cancellation)?);
+                match preparation {
+                    RustWorldPreparation::Shared(shared) => {
+                        self.rust = Some(shared);
+                        self.process_cache_hits = self.process_cache_hits.saturating_add(1);
+                    }
+                    RustWorldPreparation::Owner(preparation) => {
+                        if let Some(cached) =
+                            process_cached_world(canonical_root, &live.fingerprint)?
+                        {
+                            self.rust = Some(cached);
+                            self.process_cache_hits = self.process_cache_hits.saturating_add(1);
+                        } else if let Some(refreshed) =
+                            self.try_incremental_refresh(canonical_root, live)?
+                        {
+                            insert_process_world(Arc::clone(&refreshed))?;
+                            self.rust = Some(refreshed);
+                        } else {
+                            let receiver = spawn_rust_world_build(
+                                preparation,
+                                canonical_root.to_path_buf(),
+                                live.clone(),
+                            )?;
+                            self.cold_builds = self.cold_builds.saturating_add(1);
+                            self.rust = Some(wait_for_rust_preparation(&receiver, cancellation)?);
+                        }
+                    }
                 }
             }
         }
@@ -327,24 +387,34 @@ impl ControlLayerLifecycle {
                     },
                     cancellation,
                 )?;
-                if let Some(cached) = process_cached_python_world(
-                    canonical_root,
-                    &live.fingerprint,
-                    &dependency_sha256,
-                )? {
-                    self.python = Some(cached);
-                    self.python_process_cache_hits =
-                        self.python_process_cache_hits.saturating_add(1);
-                } else {
-                    let receiver = spawn_python_world_build(
-                        preparation,
-                        canonical_root.to_path_buf(),
-                        live.clone(),
-                        dependencies,
-                        dependency_sha256,
-                    )?;
-                    self.python_cold_builds = self.python_cold_builds.saturating_add(1);
-                    self.python = Some(wait_for_python_preparation(&receiver, cancellation)?);
+                match preparation {
+                    PythonWorldPreparation::Shared(shared) => {
+                        self.python = Some(shared);
+                        self.python_process_cache_hits =
+                            self.python_process_cache_hits.saturating_add(1);
+                    }
+                    PythonWorldPreparation::Owner(preparation) => {
+                        if let Some(cached) = process_cached_python_world(
+                            canonical_root,
+                            &live.fingerprint,
+                            &dependency_sha256,
+                        )? {
+                            self.python = Some(cached);
+                            self.python_process_cache_hits =
+                                self.python_process_cache_hits.saturating_add(1);
+                        } else {
+                            let receiver = spawn_python_world_build(
+                                preparation,
+                                canonical_root.to_path_buf(),
+                                live.clone(),
+                                dependencies,
+                                dependency_sha256,
+                            )?;
+                            self.python_cold_builds = self.python_cold_builds.saturating_add(1);
+                            self.python =
+                                Some(wait_for_python_preparation(&receiver, cancellation)?);
+                        }
+                    }
                 }
             }
         }
@@ -648,70 +718,194 @@ impl ControlLayerLifecycle {
 
 impl Drop for RustWorldPreparationGuard {
     fn drop(&mut self) {
-        let mut active = self
+        let mut state = self
             .coordinator
-            .active
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.remove(&self.key);
+        state.active.remove(&self.key);
         self.coordinator.ready.notify_all();
     }
 }
 
 impl Drop for PythonWorldPreparationGuard {
     fn drop(&mut self) {
-        let mut active = self
+        let mut state = self
             .coordinator
-            .active
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.remove(&self.key);
+        state.active.remove(&self.key);
         self.coordinator.ready.notify_all();
+    }
+}
+
+impl RustWorldPreparationState {
+    fn register_wait(&mut self, key: &RustWorldKey) -> Result<()> {
+        let waiters = self.waiters.entry(key.clone()).or_default();
+        *waiters = waiters
+            .checked_add(1)
+            .context("Rust semantic preparation waiter count overflowed")?;
+        Ok(())
+    }
+
+    fn finish_wait(&mut self, key: &RustWorldKey) -> Option<PreparedRustHandle> {
+        let completed = self.completed.get(key).cloned();
+        if let Some(waiters) = self.waiters.get_mut(key) {
+            *waiters = waiters.saturating_sub(1);
+            if *waiters == 0 {
+                self.waiters.remove(key);
+                self.completed.remove(key);
+            }
+        }
+        completed
+    }
+}
+
+impl PythonWorldPreparationState {
+    fn register_wait(&mut self, key: &PythonWorldKey) -> Result<()> {
+        let waiters = self.waiters.entry(key.clone()).or_default();
+        *waiters = waiters
+            .checked_add(1)
+            .context("Python semantic preparation waiter count overflowed")?;
+        Ok(())
+    }
+
+    fn finish_wait(&mut self, key: &PythonWorldKey) -> Option<PreparedPythonHandle> {
+        let completed = self.completed.get(key).cloned();
+        if let Some(waiters) = self.waiters.get_mut(key) {
+            *waiters = waiters.saturating_sub(1);
+            if *waiters == 0 {
+                self.waiters.remove(key);
+                self.completed.remove(key);
+            }
+        }
+        completed
+    }
+}
+
+impl RustWorldPreparationPublisher {
+    fn publish(&self, world: PreparedRustHandle) -> Result<()> {
+        let mut state =
+            self.coordinator.state.lock().map_err(|_| {
+                anyhow::anyhow!("Rust semantic preparation coordinator is poisoned")
+            })?;
+        if state.waiters.get(&self.key).copied().unwrap_or(0) > 0 {
+            state.completed.insert(self.key.clone(), world);
+        }
+        Ok(())
+    }
+}
+
+impl PythonWorldPreparationPublisher {
+    fn publish(&self, world: PreparedPythonHandle) -> Result<()> {
+        let mut state =
+            self.coordinator.state.lock().map_err(|_| {
+                anyhow::anyhow!("Python semantic preparation coordinator is poisoned")
+            })?;
+        if state.waiters.get(&self.key).copied().unwrap_or(0) > 0 {
+            state.completed.insert(self.key.clone(), world);
+        }
+        Ok(())
     }
 }
 
 fn begin_rust_world_preparation(
     key: RustWorldKey,
     cancellation: &dyn Fn() -> Result<()>,
-) -> Result<RustWorldPreparationGuard> {
+) -> Result<RustWorldPreparation> {
     cancellation()?;
     let coordinator = RUST_WORLD_PREPARATIONS.get_or_init(Default::default);
-    let mut active = coordinator
-        .active
+    let mut state = coordinator
+        .state
         .lock()
         .map_err(|_| anyhow::anyhow!("Rust semantic preparation coordinator is poisoned"))?;
-    while active.contains(&key) || active.len() >= MAX_CONCURRENT_RUST_WORLD_PREPARATIONS {
+    let mut registered = false;
+    loop {
+        if state.completed.contains_key(&key) {
+            let completed = if registered {
+                state.finish_wait(&key)
+            } else {
+                state.completed.get(&key).cloned()
+            }
+            .context("Rust semantic preparation handoff disappeared")?;
+            return Ok(RustWorldPreparation::Shared(completed));
+        }
+        if !state.active.contains(&key)
+            && state.active.len() < MAX_CONCURRENT_RUST_WORLD_PREPARATIONS
+        {
+            if registered {
+                state.finish_wait(&key);
+            }
+            state.active.insert(key.clone());
+            return Ok(RustWorldPreparation::Owner(RustWorldPreparationGuard {
+                coordinator,
+                key,
+            }));
+        }
+        if !registered {
+            state.register_wait(&key)?;
+            registered = true;
+        }
         let (next, _) = coordinator
             .ready
-            .wait_timeout(active, PREPARATION_WAIT_POLL)
+            .wait_timeout(state, PREPARATION_WAIT_POLL)
             .map_err(|_| anyhow::anyhow!("Rust semantic preparation coordinator is poisoned"))?;
-        active = next;
-        cancellation()?;
+        state = next;
+        if let Err(error) = cancellation() {
+            state.finish_wait(&key);
+            return Err(error);
+        }
     }
-    active.insert(key.clone());
-    Ok(RustWorldPreparationGuard { coordinator, key })
 }
 
 fn begin_python_world_preparation(
     key: PythonWorldKey,
     cancellation: &dyn Fn() -> Result<()>,
-) -> Result<PythonWorldPreparationGuard> {
+) -> Result<PythonWorldPreparation> {
     cancellation()?;
     let coordinator = PYTHON_WORLD_PREPARATIONS.get_or_init(Default::default);
-    let mut active = coordinator
-        .active
+    let mut state = coordinator
+        .state
         .lock()
         .map_err(|_| anyhow::anyhow!("Python semantic preparation coordinator is poisoned"))?;
-    while active.contains(&key) || active.len() >= MAX_CONCURRENT_PYTHON_WORLD_PREPARATIONS {
+    let mut registered = false;
+    loop {
+        if state.completed.contains_key(&key) {
+            let completed = if registered {
+                state.finish_wait(&key)
+            } else {
+                state.completed.get(&key).cloned()
+            }
+            .context("Python semantic preparation handoff disappeared")?;
+            return Ok(PythonWorldPreparation::Shared(completed));
+        }
+        if !state.active.contains(&key)
+            && state.active.len() < MAX_CONCURRENT_PYTHON_WORLD_PREPARATIONS
+        {
+            if registered {
+                state.finish_wait(&key);
+            }
+            state.active.insert(key.clone());
+            return Ok(PythonWorldPreparation::Owner(PythonWorldPreparationGuard {
+                coordinator,
+                key,
+            }));
+        }
+        if !registered {
+            state.register_wait(&key)?;
+            registered = true;
+        }
         let (next, _) = coordinator
             .ready
-            .wait_timeout(active, PREPARATION_WAIT_POLL)
+            .wait_timeout(state, PREPARATION_WAIT_POLL)
             .map_err(|_| anyhow::anyhow!("Python semantic preparation coordinator is poisoned"))?;
-        active = next;
-        cancellation()?;
+        state = next;
+        if let Err(error) = cancellation() {
+            state.finish_wait(&key);
+            return Err(error);
+        }
     }
-    active.insert(key.clone());
-    Ok(PythonWorldPreparationGuard { coordinator, key })
 }
 
 fn spawn_rust_world_build(
@@ -719,12 +913,17 @@ fn spawn_rust_world_build(
     workspace_root: PathBuf,
     expected: crate::workspace::ContentSnapshot,
 ) -> Result<Receiver<Result<PreparedRustHandle>>> {
+    let publisher = RustWorldPreparationPublisher {
+        coordinator: preparation.coordinator,
+        key: preparation.key.clone(),
+    };
     spawn_rust_preparation_worker(preparation, move || {
         let prepared = Arc::new(Mutex::new(ControlLayerLifecycle::build_current_world(
             &workspace_root,
             expected,
         )?));
         insert_process_world(Arc::clone(&prepared))?;
+        publisher.publish(Arc::clone(&prepared))?;
         Ok(prepared)
     })
 }
@@ -736,6 +935,10 @@ fn spawn_python_world_build(
     dependencies: PythonDependencySnapshot,
     dependency_sha256: String,
 ) -> Result<Receiver<Result<PreparedPythonHandle>>> {
+    let publisher = PythonWorldPreparationPublisher {
+        coordinator: preparation.coordinator,
+        key: preparation.key.clone(),
+    };
     spawn_python_preparation_worker(preparation, move || {
         let prepared = Arc::new(Mutex::new(
             ControlLayerLifecycle::build_current_python_world(
@@ -746,6 +949,7 @@ fn spawn_python_world_build(
             )?,
         ));
         insert_process_python_world(Arc::clone(&prepared))?;
+        publisher.publish(Arc::clone(&prepared))?;
         Ok(prepared)
     })
 }
@@ -1237,7 +1441,12 @@ fn capture_python_dependencies(
         bytes: config,
     });
 
-    for entry in walkdir::WalkDir::new(&site_source).follow_links(false) {
+    // Dependency identity must not inherit filesystem enumeration order. `sort_by_file_name`
+    // gives the capture, shadow image, and digest one stable traversal for the same exact tree.
+    for entry in walkdir::WalkDir::new(&site_source)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
         cancellation()?;
         let entry = entry.with_context(|| {
             format!(
@@ -1431,6 +1640,139 @@ fn parse_pyvenv_python_version(config: &[u8]) -> Result<String> {
         }
     }
     bail!("pyvenv.cfg contains neither version nor version_info")
+}
+
+fn elapsed_millis(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Exercise the exact production lifecycle without invoking a model. The caller owns fixture
+/// construction and process isolation; this function proves that cold preparation, warm request
+/// construction, process-cache reuse, and both final replay outcomes cross the ordinary barriers.
+pub(crate) fn qualify_python_world_fixture(
+    workspace_root: &Path,
+    target_path: &str,
+    invalid_source: &str,
+    valid_source: &str,
+) -> Result<PythonWorldQualificationObservation> {
+    let logical_path = pb_control_collar::mutation::LogicalPath::parse(target_path.to_string())?;
+    let snapshot = WorkspaceSnapshot::new(vec![pb_control_collar::mutation::SnapshotEntry::new(
+        logical_path.clone(),
+        std::fs::read(workspace_root.join(target_path))
+            .with_context(|| format!("failed to read Python qualification target {target_path}"))?,
+    )])?
+    .with_bound_mutation_path(logical_path);
+    let tool = BuiltInToolSchema {
+        name: "replace_file".to_string(),
+        description: "Native Python world qualification mutation".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "const": target_path } }
+        }),
+    };
+
+    let mut lifecycle = ControlLayerLifecycle::default();
+    let cold_started = std::time::Instant::now();
+    let cold_layers = lifecycle
+        .prepare_for_inference_cancellable(
+            workspace_root,
+            std::slice::from_ref(&tool),
+            Some(&snapshot),
+            &|| Ok(()),
+        )?
+        .context("Python qualification fixture did not prepare a native layer")?;
+    let cold_millis = elapsed_millis(cold_started);
+    drop(cold_layers);
+
+    let prepared = lifecycle
+        .python
+        .as_ref()
+        .context("Python qualification lifecycle lost its prepared world")?;
+    let prepared = prepared
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Python qualification world lock is poisoned"))?;
+    let receipt = prepared.world.readiness_receipt().clone();
+    let world = prepared.world.descriptor().world.clone();
+    drop(prepared);
+
+    let invalid_started = std::time::Instant::now();
+    let invalid = lifecycle.validate_completed_mutation(
+        workspace_root,
+        std::slice::from_ref(&tool),
+        &snapshot,
+        "replace_file",
+        &serde_json::json!({ "path": target_path, "content": invalid_source }),
+    )?;
+    let invalid_replay_millis = elapsed_millis(invalid_started);
+    if invalid != CompletionDecision::Reject(pb_control_collar::RejectionCode::InvalidSemantics) {
+        bail!("Python qualification invalid replay was not rejected: {invalid:?}");
+    }
+
+    let valid_started = std::time::Instant::now();
+    let valid = lifecycle.validate_completed_mutation(
+        workspace_root,
+        std::slice::from_ref(&tool),
+        &snapshot,
+        "replace_file",
+        &serde_json::json!({ "path": target_path, "content": valid_source }),
+    )?;
+    let valid_replay_millis = elapsed_millis(valid_started);
+    if valid != CompletionDecision::Accept {
+        bail!("Python qualification valid replay was not accepted: {valid:?}");
+    }
+
+    let warm_started = std::time::Instant::now();
+    let warm_layers = lifecycle
+        .prepare_for_inference_cancellable(
+            workspace_root,
+            std::slice::from_ref(&tool),
+            Some(&snapshot),
+            &|| Ok(()),
+        )?
+        .context("Python qualification warm request did not prepare a native layer")?;
+    let warm_millis = elapsed_millis(warm_started);
+    drop(warm_layers);
+    if (lifecycle.python_cold_builds, lifecycle.python_warm_requests) != (1, 2) {
+        bail!(
+            "Python qualification lifecycle did not record one cold build and two ready requests"
+        );
+    }
+
+    let mut next_lifecycle = ControlLayerLifecycle::default();
+    let cache_started = std::time::Instant::now();
+    let cached_layers = next_lifecycle
+        .prepare_for_inference_cancellable(
+            workspace_root,
+            std::slice::from_ref(&tool),
+            Some(&snapshot),
+            &|| Ok(()),
+        )?
+        .context("Python qualification process-cache request did not prepare a native layer")?;
+    let process_cache_hit_millis = elapsed_millis(cache_started);
+    drop(cached_layers);
+    if (
+        next_lifecycle.python_cold_builds,
+        next_lifecycle.python_warm_requests,
+        next_lifecycle.python_process_cache_hits,
+    ) != (0, 1, 1)
+    {
+        bail!("Python qualification request did not use the exact process cache");
+    }
+
+    Ok(PythonWorldQualificationObservation {
+        world_sha256: world.world_sha256,
+        configuration_sha256: world.configuration_sha256,
+        dependency_sha256: world.dependency_sha256,
+        provider_version: world.provider_version,
+        load_millis: receipt.load_millis,
+        prime_millis: receipt.prime_millis,
+        primed_queries: receipt.primed_queries,
+        cold_millis,
+        warm_millis,
+        process_cache_hit_millis,
+        invalid_replay_millis,
+        valid_replay_millis,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1785,7 +2127,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(next_stage.python_stats(), (0, 1, 1));
+        let (cold, ready, cache_hits) = next_stage.python_stats();
+        assert_eq!(ready, 1);
+        assert!(
+            (cold, cache_hits) == (0, 1) || (cold, cache_hits) == (1, 0),
+            "a bounded process cache may be evicted by another concurrent project test"
+        );
     }
 
     #[test]
@@ -2228,7 +2575,12 @@ mod tests {
             workspace_root: PathBuf::from("/bounded/cold-owner-cancellation-fixture"),
             source_sha256: "b".repeat(64),
         };
-        let preparation = begin_rust_world_preparation(key.clone(), &|| Ok(())).unwrap();
+        let preparation = match begin_rust_world_preparation(key.clone(), &|| Ok(())).unwrap() {
+            RustWorldPreparation::Owner(preparation) => preparation,
+            RustWorldPreparation::Shared(_) => {
+                panic!("synthetic cold key unexpectedly had a world")
+            }
+        };
         let (started_sender, started_receiver) = sync_channel(1);
         let (release_sender, release_receiver) = sync_channel(1);
         let receiver = spawn_rust_preparation_worker(preparation, move || {
@@ -2253,7 +2605,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
 
         let coordinator = RUST_WORLD_PREPARATIONS.get().unwrap();
-        assert!(coordinator.active.lock().unwrap().contains(&key));
+        assert!(coordinator.state.lock().unwrap().active.contains(&key));
 
         let other_key = RustWorldKey {
             workspace_root: PathBuf::from("/bounded/other-cold-world-fixture"),

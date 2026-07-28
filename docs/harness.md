@@ -601,6 +601,20 @@ percentiles. Provider unavailability, an incomplete project graph, detached docu
 result, or a latency-budget breach fails qualification and does not enable semantic enforcement.
 The checked-in Rust corpus covers valid standard-library and forward references, type/call/name/
 field/method/mutability/ownership failures, and a canonical multi-file patch.
+`pb harness native-world-qualify --language python` is the model-free native lifecycle and resource
+qualification surface. It starts a separate pb process for each deterministic tiny,
+representative, and large Python module graph: 4/7, 1,024/515, and 10,000/5,003
+first-party/dependency files. Each arm uses the ordinary ignored-project-local-virtual-environment
+capture and production pre-inference lifecycle, then requires one cold readiness barrier, one warm
+request, one exact process-cache hit, a rejected invalid final replay, and an accepted valid final
+replay. The report contains only profile/world identities, counts, byte totals, `ty` load/prime
+timings, complete lifecycle timings, and process peak resident bytes; no fixture source is printed
+or persisted. Defaults fail any arm above 60 seconds cold, 20 seconds warm/cache, 20 seconds per
+final replay, or 1 GiB process peak resident memory. These are explicit qualifier ceilings, not
+latency promises for arbitrary user projects, and may be overridden only on this hidden measurement
+command. Process peak measurement currently requires a Unix host. The qualifier never loads a
+model, and passing it does not substitute for live backend fixtures or semantic false-rejection
+corpora.
 For Qwen prefill qualification, `infer --prefill-mode auto|scalar|layer-major` selects the promoted
 policy, exact scalar reference, or an explicit layer-major request. `auto` promotes only a prepared
 Qwen3-Coder-Next affine-Q4 graph with at least 32 fresh tokens and sufficient live Metal reserve.

@@ -63,13 +63,14 @@ The controller copies the exact repository snapshot to an ephemeral verified sha
 `pb-control-rust` runs pinned rust-analyzer internals in the pb process, invokes Cargo metadata with
 `--offline`, starts no procedural-macro server, and does not run build scripts. It may read already
 installed sysroot and dependency source caches, but it adds no network edge and sends no dependency
-or repository source to the model. Exact warmed worlds are retained only in bounded process memory;
-request snapshots and candidate branches are in-memory leases. Shadows are temporary and durable
+or repository source to the model. Exact warmed worlds are retained only in bounded process memory,
+either by an active request, registered exact-flight handoff, or the small process cache; request
+snapshots and candidate branches are in-memory leases. Shadows are temporary and durable
 events contain only identities, readiness/decision classes, counts, and timings. A cancelled
 request may leave its already-started cold analyzer worker running locally until that exact build
-finishes; at most one such cold worker runs process-wide, and its shadow/world is then dropped or
-retained only by the same bounded in-memory cache. Cancellation adds no network or durable source
-persistence.
+finishes; at most one such cold worker runs process-wide, and its shadow/world is then dropped,
+handed to already registered exact waiters, or retained by the same bounded in-memory cache.
+Cancellation adds no network or durable source persistence.
 
 Python-edit-capable real-backend requests use the same local-only lifecycle. The controller creates
 an ephemeral verified shadow, and `pb-control-python` copies relevant Python/stub/package-marker
@@ -81,10 +82,10 @@ It never executes the environment's interpreter, processes dynamic path injectio
 LSP or package index, or reads an out-of-project environment. Dependency bytes and identities are
 used only by the local analyzer, are type-primed before inference, and are recaptured before
 execution; they are not added to prompts or durable events. Generated overlays, diagnostic debt,
-and request databases stay in memory; bounded process caches retain only local analyzer worlds and
-durable events remain content-free. A cancelled request may leave its one already-started local
-Python preparation worker finishing into that bounded cache, but adds no network or durable source
-persistence.
+request databases, and an exact-flight result awaiting its registered local waiters stay in memory;
+bounded process caches retain only local analyzer worlds and durable events remain content-free. A
+cancelled request may leave its one already-started local Python preparation worker finishing into
+that bounded cache or handoff, but adds no network or durable source persistence.
 `inference.llamacpp_session_cache_enabled=false` and
 `inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are

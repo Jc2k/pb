@@ -678,7 +678,9 @@ file, pb captures the exact project, creates a verified immutable shadow, and lo
 project-wide pinned rust-analyzer HIR/Salsa world before prompt reservation, durable invocation
 accounting, or backend entry. Cargo metadata is offline. Preparation of one exact project identity
 is process-wide single-flight, so concurrent edit-capable tasks wait for and reuse one load instead
-of duplicating it. Cold loads execute in a request-independent in-process worker, and at most one
+of duplicating it. The owner hands the exact completed world directly to registered waiters before
+releasing the flight; reuse therefore does not depend on the small process LRU retaining that world
+while unrelated projects load. Cold loads execute in a request-independent in-process worker, and at most one
 cold Rust world is constructed process-wide at a time. Exact worlds are reused across turns and
 workflow stages. Changes to already
 indexed `.rs` files use Salsa invalidation only after all request snapshots from the previous
@@ -716,10 +718,13 @@ before inference. Python 3.12 is the fallback; when exactly one conventional pro
 copies bounded `.py`, `.pyi`, `.pth`, `py.typed`, and distribution-metadata inputs from its
 `site-packages` into the immutable shadow. The host platform, first-party sources, bundled typeshed,
 configuration inputs, dependency manifests, and this separate dependency-image digest identify the
-world. Ignored environment files are therefore covered without becoming repository files. Each request gets an
+world. Dependency traversal is explicitly sorted, so identical environment bytes cannot acquire a
+different identity from filesystem enumeration order. Ignored environment files are therefore
+covered without becoming repository files. Each request gets an
 independently writable Salsa database over shared frozen bytes; this avoids treating a read-only
 Salsa snapshot as a mutable overlay. Every captured dependency module is interned and type-primed
-before the request reaches token generation. Exact worlds use a bounded process cache and single flight, with at most one cold
+before the request reaches token generation. Exact worlds use a bounded process cache and the same
+direct-result single flight, with at most one cold
 Python loader. Cancellation is polled while initiating or queued requests wait, and no model starts
 after cancellation. When Rust and Python are both reachable, Rust preparation completes first and
 the model starts only after both readiness receipts exist.
@@ -744,6 +749,15 @@ project remain partial or unknown. Without a complete qualified external search 
 absolute third-party import cannot veto generation. Immediately before execution, pb recaptures the
 dependency identity, reconstructs the mutation, and replays it through a fresh Python request
 database against the same frozen world.
+
+The hidden model-free native-world qualifier runs the exact production Python lifecycle in isolated
+processes over deterministic 4/7, 1,024/515, and 10,000/5,003 first-party/dependency-file graphs.
+It separately records native load/prime time, the complete cold pre-inference barrier, warm request
+construction, exact process-cache reuse, invalid and valid execution replay, and peak resident
+memory. It fails closed against explicit command-line ceilings and emits only content-free
+identities, counts, byte totals, and timings. The matrix establishes a reproducible scaling
+baseline; it is not a universal latency or memory guarantee for projects with different syntax,
+plugins, dynamic environment behavior, or dependency shapes.
 
 The syntax profiles are pinned Tree-sitter grammars for Rust, Python, TypeScript/TSX,
 JavaScript/JSX, HTML, and CSS. They require UTF-8 and reject error or missing nodes; HTML additionally

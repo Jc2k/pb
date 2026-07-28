@@ -64,6 +64,7 @@
   - [Prompt-root Phase 0 baseline](benchmarks/prompt-root-phase0.md)
   - [Stable prompt-root release qualification](benchmarks/stable-prompt-root-production.md)
 - [Streaming tool-output control collar](control-collar-plan.md)
+  - [Native Python world qualification](benchmarks/native-python-world-qualification.md)
 - [External publication follow-on](external-publication-workflow-follow-on.md)
 - [FlashMoe architecture parity](flashmoe-architecture-parity-plan.md)
   - [Resource baseline](benchmarks/harness-r0-baseline.md)

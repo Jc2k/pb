@@ -121,7 +121,9 @@ concurrent request or unsupported invalidation receives another prepared world. 
 runs in a request-independent in-process worker under the exact-world single-flight lease and a
 global one-worker limit. Cancelling the initiating request stops its wait but does not grant the
 detached worker new authority: it can only finish the already captured local shadow and publish the
-exact result into the bounded process cache.
+exact result into the bounded process cache and a direct handoff retained only while already
+registered exact-identity waiters consume it. This handoff prevents unrelated LRU churn from
+duplicating a completed expensive preparation and grants no new project or mutation authority.
 
 The executor does not trust generation-time acceptance. It repeats path/capability/schema/read gates,
 reconstructs the virtual mutation, verifies current base hashes and syntax, and publishes through
