@@ -382,6 +382,12 @@ resolved versioned namespace; it never targets the storage root itself.
 | Native Rust v1 constraint | Resolves project targets, imports, and selected callable/literal shapes against one exact pinned rust-analyzer world. Only qualified exact facts may veto. Disabled build scripts/procedural macros, generated APIs, partial dependency state, deeper inference, ownership, and runtime behavior remain unknown; this is not a compilation guarantee. |
 | Native Python v1 constraint | Resolves first-party and newly generated cross-file imports plus selected promoted type shapes against one exact pinned Astral `ty` world. The fallback is Python 3.12/typeshed; one safely qualified local or user-authorized exact external `.venv`/`venv` contributes a bounded immutable source/stub/marker/metadata image and Python version without executing an interpreter. Fully observed repository-local plain-path editables become first-party roots; exact external editable roots require a user-owned grant bound to the canonical workspace. Repository configuration cannot authorize external reads, and runtime authority is not serialized into agent requests. Dependency modules are primed before inference and the separate dependency digest is rechecked before execution. Create/modify/delete candidates are applied as one overlay transaction; closure checks every non-deleted frozen first-party file plus new Python files, including untouched in-project dependants. Only complete literal contradictions and newly introduced promoted diagnostics may veto; generated suppressions cannot bypass the gate. Missing external imports remain unknown for absent, ambiguous, undeclared, symlinked, native, or hook-bearing environments. `Any`, dynamic/runtime behavior, dependants outside the frozen project, and unpromoted diagnostics remain unknown; this is not a general type-correctness guarantee. |
 
+The external Python differential-oracle interface is development-only and has no authority row in
+the table above. It materializes complete corpus states for an independently provisioned checker,
+then validates an exact corpus-bound artifact containing only provider/configuration identities,
+case IDs, verdicts, and stable diagnostic IDs. Provider messages, source excerpts, and unknown fields
+are rejected. Disagreement is audit evidence and cannot promote a runtime constraint.
+
 ## Credentials
 
 The GitHub OAuth flow uses PKCE and a loopback callback. Its token is stored below the user

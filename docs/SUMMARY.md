@@ -66,6 +66,7 @@
 - [Streaming tool-output control collar](control-collar-plan.md)
   - [Native Python world qualification](benchmarks/native-python-world-qualification.md)
   - [Native Python semantic qualification](benchmarks/native-python-semantic-qualification.md)
+  - [Native Python external-oracle interface](benchmarks/native-python-external-oracle.md)
 - [External publication follow-on](external-publication-workflow-follow-on.md)
 - [FlashMoe architecture parity](flashmoe-architecture-parity-plan.md)
   - [Resource baseline](benchmarks/harness-r0-baseline.md)

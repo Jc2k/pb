@@ -29,6 +29,9 @@ jobs:
       - name: Run web UI tests
         run: deno task test:web
 
+      - name: Test external Python oracle interface
+        run: deno task test:python-oracle
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

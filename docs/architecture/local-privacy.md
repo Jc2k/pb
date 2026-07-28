@@ -94,7 +94,9 @@ The hidden Python semantic qualifier materializes its checked-in first-party and
 only in an ephemeral local workspace. It starts no model, LSP, package installer, or network
 request, and emits only content-free digests, counts, parity results, and timings. The native Python
 layer and qualifier do not bundle, install, invoke, or require Pyright;
-an independently provisioned CI/research comparison may use it outside the pb runtime. A Pyright
+the separate Deno development interface can materialize complete baseline/candidate trees for an
+independently provisioned CI/research comparison and accepts only a corpus-bound, content-free
+verdict artifact. It neither provisions a checker nor grants its results runtime authority. A Pyright
 provider that a user explicitly configures through the generic LSP interface remains an optional
 external sidecar and does not change the native layer's dependency or authority model.
 `inference.llamacpp_session_cache_enabled=false` and

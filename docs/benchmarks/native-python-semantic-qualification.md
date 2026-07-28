@@ -70,4 +70,6 @@ This is differential evidence for the current six-code Python profile and the ex
 string-plus-integer token proof. It does not make dynamic Python sound, prove the complete HTTP
 client API, exercise the separately qualified editable/external-environment lifecycle profiles,
 grant token-time authority to the five closure-only codes, or replace broader public-project and
-independent external-oracle corpora.
+independent external-oracle corpora. The checked
+[external-oracle interface](native-python-external-oracle.md) materializes this corpus for such a
+comparison without making an external checker a pb runtime dependency or authority.

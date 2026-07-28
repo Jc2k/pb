@@ -1028,7 +1028,9 @@ Most correctness evidence belongs in the new crate and must run without a model.
   immutable shadow workspaces with offline dependency caches. Independently provisioned CI or
   research jobs may compare the native Python layer with an exact Pyright release, but Pyright must
   never be linked, installed, invoked, or exposed as a dependency by the pb binary or its hidden
-  harness. Include dependency changes, lockfile/config invalidation, missing stubs/sources, and
+  harness. The checked provider-neutral Deno interface now materializes complete baseline/candidate
+  states and validates exact corpus-bound content-free results; ordinary CI tests that boundary
+  without provisioning a checker. Include dependency changes, lockfile/config invalidation, missing stubs/sources, and
   intentionally hostile Rust build scripts or proc macros to prove the sandbox boundary.
 - Verify deterministic replay with greedy sampling and stable sampler-state restoration for any
   backend that advertises rollback.
@@ -1271,15 +1273,18 @@ the pinned end-to-end decode-throughput reduction remains within the existing 25
   matrix is implemented. The initial checked-in 24-case semantic matrix now covers
   annotated/unannotated/frozen-dependency allow and reject behavior, baseline debt, dynamic
   unknowns, multi-file transactions, all four mutation tools, and all six promoted codes through
-  generation/final/direct-diagnostic differential replay. Next, expand into public-project and
-  independently provisioned external-oracle
-  corpora, and require a separately named monotonic proof before granting any new token-time
+  generation/final/direct-diagnostic differential replay. The provider-neutral external-oracle
+  request/result interface and ordinary CI contract tests are implemented without any checker
+  dependency in pb; no independent provider result is yet promoted. Next, expand into public-project
+  corpora and independently provisioned comparison runs, and require a separately named monotonic proof before granting any new token-time
   hard-mask authority. An exact Pyright release may be a CI/research differential oracle, but it is
   not a pb runtime or hidden-harness dependency and is never the token-time state machine.
 - **7F — Add `pb-control-typescript`.** Integrate TypeScript project/program/type-checker state with
   versioned virtual files, exact `tsconfig`, module resolution, JSX mode, ambient declarations, and
   project references. JavaScript receives type guarantees only under explicit `checkJs`/JSDoc or an
-  equivalent known-type profile.
+  equivalent known-type profile. **Deferred for the current tranche:** JavaScript and TypeScript
+  remain at their shipped lexical/syntax constraint level until this phase is explicitly resumed;
+  completing the current Python and Rust work does not depend on it.
 - **7G — Deepen steering without changing soundness.** Carry visible symbols, expected types and
   unresolved obligations through language-native layers. Apply sparse positive token biases where
   useful, but never hard-exclude a name because it is absent from a finite completion list. Prefer
@@ -1438,8 +1443,8 @@ their named phase produces evidence:
 | llama.cpp model/template qualification | Phase 8 | Token/special/EOG identity, dialect rendering, full-vocabulary mask ordering, stateful-sampler acceptance, and live mutation corpus |
 | Whether DeepSeek ephemeral complete-state snapshots beat deterministic replay | Phase 9 | Snapshot copy cost, memory peak, restore parity, branch depth, and end-to-end energy |
 | Rust deeper native boundary | Phase 7D | rust-analyzer/compiler parity corpus including macros, traits, `cfg`, ownership, and workspace edits |
-| TypeScript/JavaScript native project layer | Phase 7F | Module-resolution, ambient-type, JSX, and multi-file corpus |
-| Python `ty` deeper profile and `Unknown` policy | Phase 7E | First-party/typeshed, bounded safe project-local environments, fully observed repository-local plain-path editables, and exact user-authorized external environments/editable roots are implemented with isolated dependency identity and final drift replay. The lifecycle resource matrices and initial six-code positive/unknown/repairable-prefix corpus are implemented. A checked-in 24-case annotated/unannotated/frozen-third-party matrix now requires generation/final/direct-diagnostic parity across all four mutation tools. Five diagnostics remain closure-only; one literal operator has a named token proof. Broader public-project and independently provisioned CI/research external-oracle corpora, dynamic/import-hook/native environments, a larger false-rejection audit, and any broader token-time promotion remain. Pyright is explicitly excluded from the pb binary and hidden harness. |
+| TypeScript/JavaScript native project layer | Phase 7F (deferred) | Keep the shipped lexical/syntax constraint level for the current tranche. Module-resolution, ambient-type, JSX, and multi-file semantic work resumes only after an explicit scope decision. |
+| Python `ty` deeper profile and `Unknown` policy | Phase 7E | First-party/typeshed, bounded safe project-local environments, fully observed repository-local plain-path editables, and exact user-authorized external environments/editable roots are implemented with isolated dependency identity and final drift replay. The lifecycle resource matrices and initial six-code positive/unknown/repairable-prefix corpus are implemented. A checked-in 24-case annotated/unannotated/frozen-third-party matrix now requires generation/final/direct-diagnostic parity across all four mutation tools. A provider-neutral CI/research interface materializes complete states and validates corpus-bound content-free oracle artifacts without provisioning a checker. Five diagnostics remain closure-only; one literal operator has a named token proof. Broader public-project and independently provisioned comparison corpora/runs, dynamic/import-hook/native environments, a larger false-rejection audit, and any broader token-time promotion remain. Pyright is explicitly excluded from the pb binary and hidden harness. |
 
 Unsupported language profiles remain protocol-constrained and executor-validated; they must not be
 reported as syntax- or semantic-constrained. A supported profile whose required analyzer cannot be
