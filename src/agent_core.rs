@@ -15758,10 +15758,17 @@ fn generate_and_parse_action_with_retries(
             bound_mutation_path,
         )?;
         let language_layers = if generator.supports_streaming_language_layers() {
-            control_layer_lifecycle.prepare_for_inference(
+            control_layer_lifecycle.prepare_for_inference_cancellable(
                 workspace_root,
                 attempt_tools,
                 mutation_snapshot.as_ref(),
+                &|| {
+                    if sink.should_cancel() {
+                        Err(PreInferenceCancellation.into())
+                    } else {
+                        Ok(())
+                    }
+                },
             )?
         } else {
             None

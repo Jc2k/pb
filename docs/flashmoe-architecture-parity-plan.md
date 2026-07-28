@@ -321,6 +321,10 @@ without that snapshot fails closed. A target-scoped request also carries the acc
 in the snapshot, allowing its byte-stable model schema to omit `path`; prefix and completion
 validation inject exactly that controller-owned path before applying the virtual mutation. Qwen
 JSON and DeepSeek DSML allow at most one mutation per generated batch.
+Rust-edit-capable requests establish their exact rust-analyzer project world before either backend
+starts inference. Identical concurrent preparations are process-wide single-flight and reuse one
+result. Workspace drift aborts the invocation instead of rebuilding against a mutation snapshot
+captured before that drift; a subsequent request must recapture both boundaries.
 At a mutation-payload close, the collar constructs the exact create, replacement, edit, or canonical
 patch result. Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, and CSS must pass their pinned
 complete-file syntax profiles. The executor independently repeats snapshot/hash, virtual-result,

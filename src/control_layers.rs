@@ -5,9 +5,10 @@
 //! it never loads Cargo metadata, starts a language server, or reads the live workspace.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -26,8 +27,8 @@ use crate::{agent_core::BuiltInToolSchema, semantic::SemanticShadowWorkspace};
 
 const RUST_LAYER_MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const RUST_LAYER_MAX_CHECKPOINTS: usize = 4_096;
-const MAX_WORLD_REBUILD_ATTEMPTS: usize = 2;
 const MAX_PROCESS_RUST_WORLDS: usize = 2;
+const PREPARATION_WAIT_POLL: Duration = Duration::from_millis(100);
 
 pub(crate) type SharedLanguageLayers = Arc<Mutex<LanguageLayerStack>>;
 
@@ -61,15 +62,45 @@ type PreparedRustHandle = Arc<Mutex<PreparedRustWorld>>;
 
 static RUST_WORLD_CACHE: OnceLock<Mutex<VecDeque<PreparedRustHandle>>> = OnceLock::new();
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RustWorldKey {
+    workspace_root: PathBuf,
+    source_sha256: String,
+}
+
+#[derive(Default)]
+struct RustWorldPreparationCoordinator {
+    active: Mutex<HashSet<RustWorldKey>>,
+    ready: Condvar,
+}
+
+struct RustWorldPreparationGuard {
+    coordinator: &'static RustWorldPreparationCoordinator,
+    key: RustWorldKey,
+}
+
+static RUST_WORLD_PREPARATIONS: OnceLock<RustWorldPreparationCoordinator> = OnceLock::new();
+
 impl ControlLayerLifecycle {
     /// Establish all expensive state before the caller reserves or records a model invocation.
     /// Returning successfully means the supplied stack is bound to the exact live-workspace
     /// identity observed after loading and priming completed.
-    pub(crate) fn prepare_for_inference(
+    #[cfg(test)]
+    fn prepare_for_inference(
         &mut self,
         workspace_root: &Path,
         tools: &[BuiltInToolSchema],
         mutation_snapshot: Option<&WorkspaceSnapshot>,
+    ) -> Result<Option<SharedLanguageLayers>> {
+        self.prepare_for_inference_cancellable(workspace_root, tools, mutation_snapshot, &|| Ok(()))
+    }
+
+    pub(crate) fn prepare_for_inference_cancellable(
+        &mut self,
+        workspace_root: &Path,
+        tools: &[BuiltInToolSchema],
+        mutation_snapshot: Option<&WorkspaceSnapshot>,
+        cancellation: &dyn Fn() -> Result<()>,
     ) -> Result<Option<SharedLanguageLayers>> {
         if !tools_may_mutate_rust(
             tools,
@@ -77,6 +108,7 @@ impl ControlLayerLifecycle {
         ) {
             return Ok(None);
         }
+        cancellation()?;
         let snapshot = mutation_snapshot.context(
             "Rust-edit-capable inference requires a controller-authorized mutation snapshot",
         )?;
@@ -113,15 +145,34 @@ impl ControlLayerLifecycle {
             if let Some(cached) = process_cached_world(&canonical_root, &live.fingerprint)? {
                 self.rust = Some(cached);
                 self.process_cache_hits = self.process_cache_hits.saturating_add(1);
-            } else if let Some(refreshed) = self.try_incremental_refresh(&canonical_root, &live)? {
-                insert_process_world(Arc::clone(&refreshed))?;
-                self.rust = Some(refreshed);
             } else {
-                let prepared =
-                    Arc::new(Mutex::new(self.build_current_world(&canonical_root, live)?));
-                self.cold_builds = self.cold_builds.saturating_add(1);
-                insert_process_world(Arc::clone(&prepared))?;
-                self.rust = Some(prepared);
+                // Project loading can be much slower than inference setup. Serialize preparation
+                // for one exact world so simultaneous edit-capable tasks do not each run Cargo and
+                // construct an identical rust-analyzer database. The cache is checked again after
+                // acquiring the flight because another request may have populated it while this
+                // request waited.
+                let _preparation = begin_rust_world_preparation(
+                    RustWorldKey {
+                        workspace_root: canonical_root.clone(),
+                        source_sha256: live.fingerprint.clone(),
+                    },
+                    cancellation,
+                )?;
+                if let Some(cached) = process_cached_world(&canonical_root, &live.fingerprint)? {
+                    self.rust = Some(cached);
+                    self.process_cache_hits = self.process_cache_hits.saturating_add(1);
+                } else if let Some(refreshed) =
+                    self.try_incremental_refresh(&canonical_root, &live)?
+                {
+                    insert_process_world(Arc::clone(&refreshed))?;
+                    self.rust = Some(refreshed);
+                } else {
+                    let prepared =
+                        Arc::new(Mutex::new(self.build_current_world(&canonical_root, live)?));
+                    self.cold_builds = self.cold_builds.saturating_add(1);
+                    insert_process_world(Arc::clone(&prepared))?;
+                    self.rust = Some(prepared);
+                }
             }
         }
         let prepared = self
@@ -199,48 +250,38 @@ impl ControlLayerLifecycle {
     fn build_current_world(
         &self,
         workspace_root: &Path,
-        mut expected: crate::workspace::ContentSnapshot,
+        expected: crate::workspace::ContentSnapshot,
     ) -> Result<PreparedRustWorld> {
-        for attempt in 1..=MAX_WORLD_REBUILD_ATTEMPTS {
-            let shadow = SemanticShadowWorkspace::capture(workspace_root, &expected)
-                .context("failed to capture an immutable Rust semantic shadow")?;
-            let configuration_sha256 = subset_identity(&expected, is_rust_configuration_input);
-            let dependency_sha256 = subset_identity(&expected, is_rust_dependency_input);
-            let config = RustProjectConfig {
-                contract_version: RUST_LAYER_CONTRACT_VERSION,
-                shadow_root: shadow.path().to_path_buf(),
-                world_sha256: expected.fingerprint.clone(),
-                configuration_sha256,
-                dependency_sha256,
-            };
-            let world = RustProjectWorld::load_and_prime(config)
-                .context("failed to load and prime rust-analyzer before inference")?;
-            let after = crate::workspace::ContentSnapshot::capture(workspace_root)
-                .context("failed to revalidate the Rust semantic world after priming")?;
-            if after.fingerprint == expected.fingerprint {
-                tracing::info!(
-                    world_sha256 = %expected.fingerprint,
-                    load_millis = world.readiness_receipt().load_millis,
-                    prime_millis = world.readiness_receipt().prime_millis,
-                    targets = world.targets().len(),
-                    "Rust streaming semantic world is ready before inference"
-                );
-                return Ok(PreparedRustWorld {
-                    workspace_root: workspace_root.to_path_buf(),
-                    source_sha256: expected.fingerprint.clone(),
-                    content: expected,
-                    _shadow: Arc::new(shadow),
-                    world,
-                });
-            }
-            if attempt == MAX_WORLD_REBUILD_ATTEMPTS {
-                bail!(
-                    "workspace changed while rust-analyzer was loading; refusing Rust-edit-capable inference without an exact ready world"
-                );
-            }
-            expected = after;
-        }
-        unreachable!("bounded Rust world rebuild loop always returns or fails")
+        let shadow = SemanticShadowWorkspace::capture(workspace_root, &expected)
+            .context("failed to capture an immutable Rust semantic shadow")?;
+        let configuration_sha256 = subset_identity(&expected, is_rust_configuration_input);
+        let dependency_sha256 = subset_identity(&expected, is_rust_dependency_input);
+        let config = RustProjectConfig {
+            contract_version: RUST_LAYER_CONTRACT_VERSION,
+            shadow_root: shadow.path().to_path_buf(),
+            world_sha256: expected.fingerprint.clone(),
+            configuration_sha256,
+            dependency_sha256,
+        };
+        let world = RustProjectWorld::load_and_prime(config)
+            .context("failed to load and prime rust-analyzer before inference")?;
+        let after = crate::workspace::ContentSnapshot::capture(workspace_root)
+            .context("failed to revalidate the Rust semantic world after priming")?;
+        ensure_unchanged_during_rust_preparation(&expected, &after)?;
+        tracing::info!(
+            world_sha256 = %expected.fingerprint,
+            load_millis = world.readiness_receipt().load_millis,
+            prime_millis = world.readiness_receipt().prime_millis,
+            targets = world.targets().len(),
+            "Rust streaming semantic world is ready before inference"
+        );
+        Ok(PreparedRustWorld {
+            workspace_root: workspace_root.to_path_buf(),
+            source_sha256: expected.fingerprint.clone(),
+            content: expected,
+            _shadow: Arc::new(shadow),
+            world,
+        })
     }
 
     fn try_incremental_refresh(
@@ -322,6 +363,52 @@ impl ControlLayerLifecycle {
             self.process_cache_hits,
         )
     }
+}
+
+impl Drop for RustWorldPreparationGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .coordinator
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.remove(&self.key);
+        self.coordinator.ready.notify_all();
+    }
+}
+
+fn begin_rust_world_preparation(
+    key: RustWorldKey,
+    cancellation: &dyn Fn() -> Result<()>,
+) -> Result<RustWorldPreparationGuard> {
+    cancellation()?;
+    let coordinator = RUST_WORLD_PREPARATIONS.get_or_init(Default::default);
+    let mut active = coordinator
+        .active
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Rust semantic preparation coordinator is poisoned"))?;
+    while active.contains(&key) {
+        let (next, _) = coordinator
+            .ready
+            .wait_timeout(active, PREPARATION_WAIT_POLL)
+            .map_err(|_| anyhow::anyhow!("Rust semantic preparation coordinator is poisoned"))?;
+        active = next;
+        cancellation()?;
+    }
+    active.insert(key.clone());
+    Ok(RustWorldPreparationGuard { coordinator, key })
+}
+
+fn ensure_unchanged_during_rust_preparation(
+    expected: &crate::workspace::ContentSnapshot,
+    after: &crate::workspace::ContentSnapshot,
+) -> Result<()> {
+    if after.fingerprint != expected.fingerprint {
+        bail!(
+            "workspace changed while rust-analyzer was loading; refusing Rust-edit-capable inference until the controller recaptures one exact mutation and semantic snapshot"
+        );
+    }
+    Ok(())
 }
 
 fn execution_manifest(tools: &[BuiltInToolSchema], workspace: WorkspaceSnapshot) -> CollarManifest {
@@ -489,7 +576,14 @@ fn is_rust_dependency_input(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process::Command};
+    use std::{
+        fs,
+        process::Command,
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use pb_control_collar::mutation::{LogicalPath, SnapshotEntry};
     use serde_json::json;
@@ -535,6 +629,62 @@ mod tests {
             &[tool("apply_patch", json!({"const": "README.md"}))],
             Some(&readme),
         ));
+    }
+
+    #[test]
+    fn workspace_drift_requires_a_fresh_controller_snapshot_instead_of_an_internal_retry() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"drift-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let expected = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn changed_value() {}\n",
+        )
+        .unwrap();
+        let after = crate::workspace::ContentSnapshot::capture(root.path()).unwrap();
+        let error = ensure_unchanged_during_rust_preparation(&expected, &after)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("controller recaptures"), "{error}");
+    }
+
+    #[test]
+    fn cancelled_waiter_does_not_wait_for_an_existing_world_preparation() {
+        let key = RustWorldKey {
+            workspace_root: PathBuf::from("/bounded/cancellation-fixture"),
+            source_sha256: "a".repeat(64),
+        };
+        let active = begin_rust_world_preparation(key.clone(), &|| Ok(())).unwrap();
+        let polls = AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let error = begin_rust_world_preparation(key, &|| {
+            if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                bail!("cancelled while waiting for Rust preparation")
+            }
+        })
+        .err()
+        .expect("the waiter should observe cancellation");
+        assert!(error.to_string().contains("cancelled while waiting"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(active);
     }
 
     #[test]
@@ -687,6 +837,66 @@ mod tests {
         // the other, and the lifecycle never revises the Salsa database leased by active_layers.
         drop(replacement_layers);
         drop(active_layers);
+    }
+
+    #[test]
+    fn simultaneous_requests_share_one_exact_rust_world_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"single-flight-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let rust_tool = tool("replace_file", json!({"const": "src/lib.rs"}));
+        let snapshot = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            LogicalPath::parse("src/lib.rs").unwrap(),
+            fs::read(root.path().join("src/lib.rs")).unwrap(),
+        )])
+        .unwrap();
+        let root = root.path().to_path_buf();
+        let start = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let root = root.clone();
+                let start = Arc::clone(&start);
+                let rust_tool = rust_tool.clone();
+                let snapshot = snapshot.clone();
+                std::thread::spawn(move || {
+                    let mut lifecycle = ControlLayerLifecycle::default();
+                    start.wait();
+                    let layers = lifecycle
+                        .prepare_for_inference(&root, &[rust_tool], Some(&snapshot))
+                        .unwrap();
+                    assert!(layers.is_some());
+                    lifecycle.stats()
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let stats = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(stats.iter().map(|stats| stats.0).sum::<u64>(), 1);
+        assert_eq!(stats.iter().map(|stats| stats.1).sum::<u64>(), 2);
+        assert_eq!(stats.iter().map(|stats| stats.2).sum::<u64>(), 1);
     }
 
     #[test]
