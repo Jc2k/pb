@@ -728,6 +728,13 @@ fn validate_value(schema: &Value, value: &Value) -> CollarResult<()> {
             "value is outside schema enum".to_string(),
         ));
     }
+    if let Some(expected) = schema.get("const")
+        && expected != value
+    {
+        return Err(CollarError::Protocol(
+            "value does not match schema const".to_string(),
+        ));
+    }
     match kind {
         "object" => {
             let object = value.as_object().expect("validated object");
@@ -1097,6 +1104,57 @@ mod tests {
         let complete = format!("{open}{PARAMETER_CLOSE}{INVOKE_CLOSE}{CALLS_CLOSE}");
         let probe = constraint.probe(complete.as_bytes(), false);
         assert!(probe.valid && probe.complete && probe.complete_terminal_call);
+    }
+
+    #[test]
+    fn scalar_const_schema_rejects_a_different_dsml_parameter() {
+        let constraint = DsmlConstraint::compile(CollarManifest {
+            contract_version: 1,
+            dialect: ToolDialect::DeepSeekDsml,
+            mode: ToolConstraintMode::ToolRequired,
+            tools: vec![ExposedTool {
+                name: "write_file".to_string(),
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "path":{"type":"string","const":"answer.py"},
+                        "content":{"type":"string"}
+                    },
+                    "required":["path","content"],
+                    "additionalProperties":false
+                }),
+            }],
+            terminal_tools: vec!["write_file".to_string()],
+            mutation_policy: MutationPolicy {
+                allow_write_file: true,
+                allow_replace_file: false,
+                allow_apply_patch: false,
+                max_mutation_calls_per_batch: 1,
+            },
+            workspace: WorkspaceSnapshot::default(),
+            limits: CollarLimits {
+                max_argument_bytes: 4096,
+                max_snapshot_bytes: 4096,
+                max_files: 4,
+                max_patch_hunks: 16,
+            },
+        })
+        .unwrap();
+        let transcript = |path: &str| {
+            format!(
+                "{CALLS_OPEN}{INVOKE_OPEN}write_file\">{PARAMETER_OPEN}path\" string=\"true\">{path}{PARAMETER_CLOSE}{PARAMETER_OPEN}content\" string=\"false\">\"answer: int = 4\\n\"{PARAMETER_CLOSE}{INVOKE_CLOSE}{CALLS_CLOSE}"
+            )
+        };
+        assert!(
+            constraint
+                .probe(transcript("answer.py").as_bytes(), false)
+                .valid
+        );
+        assert!(
+            !constraint
+                .probe(transcript("other.py").as_bytes(), false)
+                .valid
+        );
     }
 
     #[test]

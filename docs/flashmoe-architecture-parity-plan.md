@@ -271,6 +271,10 @@ LLGuidance sampler.
 Native constrained tool generation is a structured-text/sampling capability rather than an expert
 scheduler. It may restrict output only to the tool names and JSON-schema subset already exposed by
 the deterministic agent controller; executor capability and schema validation remain authoritative.
+That native subset now treats scalar `const` as an exact generation constraint for Qwen JSON and
+DeepSeek DSML, validates it against the declared scalar type and any `enum` during preflight, and
+keeps object/array `const` unsupported. This lets controller-scoped exact paths remain exact on the
+wire instead of failing native request setup or widening to an unconstrained string.
 The workspace-internal `pb-control-collar` owns tokenizer surfaces, shared LLGuidance JSON sessions,
 DeepSeek DSML parsing, immutable virtual mutations, canonical patch application, and pinned final-
 syntax gates. It has no graph, filesystem, Git, process, or capability authority. Qwen and DeepSeek

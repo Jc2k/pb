@@ -1387,6 +1387,7 @@ fn validate_supported_schema(schema: &Value, location: &str) -> Result<()> {
                 | "additionalProperties"
                 | "items"
                 | "enum"
+                | "const"
                 | "maxLength"
                 | "minLength"
                 | "maxItems"
@@ -1402,7 +1403,7 @@ fn validate_supported_schema(schema: &Value, location: &str) -> Result<()> {
         .and_then(Value::as_str)
         .with_context(|| format!("{location} schema requires one string type"))?;
     for key in object.keys() {
-        let common = matches!(key.as_str(), "type" | "description" | "enum");
+        let common = matches!(key.as_str(), "type" | "description" | "enum" | "const");
         let kind_specific = match kind {
             "object" => matches!(
                 key.as_str(),
@@ -1466,6 +1467,21 @@ fn validate_supported_schema(schema: &Value, location: &str) -> Result<()> {
         }
         if values.iter().any(|value| !value_matches_kind(value, kind)) {
             bail!("{location}.enum contains a value outside declared type {kind}");
+        }
+    }
+    if let Some(value) = object.get("const") {
+        if matches!(kind, "object" | "array") {
+            bail!("{location}.const is supported only for scalar native constraint types");
+        }
+        if !value_matches_kind(value, kind) {
+            bail!("{location}.const contains a value outside declared type {kind}");
+        }
+        if object
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.contains(value))
+        {
+            bail!("{location}.const is outside the declared enum");
         }
     }
     if kind == "string" {
@@ -1921,7 +1937,7 @@ impl<'a> JsonPrefixParser<'a> {
                         .get("minLength")
                         .and_then(Value::as_u64)
                         .is_some_and(|min| (value.chars().count() as u64) < min)
-                    || !enum_accepts(schema, &Value::String(value))
+                    || !schema_accepts_value(schema, &Value::String(value))
                 {
                     PrefixStatus::Invalid
                 } else {
@@ -1942,6 +1958,10 @@ impl<'a> JsonPrefixParser<'a> {
                                 .filter_map(Value::as_str)
                                 .any(|value| value.starts_with(&prefix))
                         })
+                    || schema
+                        .get("const")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.starts_with(&prefix))
                 {
                     PrefixStatus::Invalid
                 } else {
@@ -1973,7 +1993,8 @@ impl<'a> JsonPrefixParser<'a> {
         };
         match value {
             Some(value)
-                if enum_accepts(schema, &value) && numeric_bounds_accept(schema, &value) =>
+                if schema_accepts_value(schema, &value)
+                    && numeric_bounds_accept(schema, &value) =>
             {
                 PrefixStatus::Complete(end)
             }
@@ -1988,7 +2009,7 @@ impl<'a> JsonPrefixParser<'a> {
         for literal in allowed {
             if remaining.starts_with(literal) {
                 let value = Value::Bool(*literal == "true");
-                return if enum_accepts(schema, &value) {
+                return if schema_accepts_value(schema, &value) {
                     PrefixStatus::Complete(position + literal.len())
                 } else {
                     PrefixStatus::Invalid
@@ -2003,11 +2024,13 @@ impl<'a> JsonPrefixParser<'a> {
     }
 }
 
-fn enum_accepts(schema: &Value, value: &Value) -> bool {
-    schema
+fn schema_accepts_value(schema: &Value, value: &Value) -> bool {
+    let enum_accepts = schema
         .get("enum")
         .and_then(Value::as_array)
-        .is_none_or(|values| values.contains(value))
+        .is_none_or(|values| values.contains(value));
+    let const_accepts = schema.get("const").is_none_or(|expected| expected == value);
+    enum_accepts && const_accepts
 }
 
 fn numeric_bounds_accept(schema: &Value, value: &Value) -> bool {
@@ -2123,6 +2146,49 @@ mod tests {
             "<tool_call>{\"name\":\"submit_review\",\"arguments\":{\"verdict\":\"pass\",\"notes\":[\"one\",]}}</tool_call>",
             true
         ));
+    }
+
+    #[test]
+    fn scalar_const_schema_constrains_prefixes_and_completed_calls() {
+        let tools = vec![ChatTool {
+            name: "write_file".to_string(),
+            description: None,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "const": "answer.py"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        }];
+        let constraint =
+            NativeToolConstraint::compile(NativeToolConstraintMode::ToolRequired, &tools)
+                .unwrap()
+                .unwrap();
+        let valid = concat!(
+            "<tool_call>{\"name\":\"write_file\",\"arguments\":{",
+            "\"path\":\"answer.py\",\"content\":\"answer: int = 4\\n\"}}",
+            "</tool_call>"
+        );
+        assert!(constraint.output_prefix_is_valid(valid, true));
+        assert!(constraint.output_prefix_is_valid(
+            "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"ans",
+            false
+        ));
+        assert!(!constraint.output_prefix_is_valid(
+            "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"other",
+            false
+        ));
+        assert!(!constraint.output_prefix_is_valid(&valid.replace("answer.py", "other.py"), true));
+
+        let mut conflicting = tools;
+        conflicting[0].input_schema["properties"]["path"]["enum"] = json!(["different.py"]);
+        assert!(
+            NativeToolConstraint::compile(NativeToolConstraintMode::ToolRequired, &conflicting)
+                .is_err()
+        );
     }
 
     #[test]

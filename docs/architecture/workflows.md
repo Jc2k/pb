@@ -633,7 +633,9 @@ exposed tool names and supported JSON-schema subset before inference. Qwen/GLM u
 envelope; DeepSeek uses its DSML control-token identity and ordered parameter dialect. Terminal-only
 turns require their single terminal tool. Candidate filtering cannot grant authority or replace
 executor validation, and an unsupported schema fails preflight rather than silently disabling
-constraints.
+constraints. The supported scalar subset includes exact `const` values as well as `enum`; both
+dialects reject a non-matching value while it is generated, and preflight rejects contradictory
+`const`/`enum` declarations. Object and array `const` remain unsupported by native tool constraints.
 The controller also identifies an exposed stage-submission tool as terminal. Once its constrained
 JSON body is complete, native generation stops semantically; pb supplies a missing Qwen envelope
 close only to the structured parser. Ordinary tools remain batchable, so this is not a one-call-per-
