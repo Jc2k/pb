@@ -236,7 +236,9 @@ dependencies. Missing local dependency sources or a workspace that changes while
 model turn rather than silently dropping the Rust layer. This behavior is automatic and has no
 environment toggle. Its guarantee is intentionally narrow: exact qualified import and selected
 literal/call-shape contradictions can be rejected, while build-script/procedural-macro and deeper
-type/ownership facts remain unknown.
+type/ownership facts remain unknown. If cancellation arrives during this preparation, pb will not
+start the model afterward. The embedded analyzer cannot yet interrupt every in-progress load or HIR
+query, so the cancellation itself may wait for that preparation boundary.
 
 A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
 at least 32 tokens with true layer-major Metal prefill. The live Metal working-set snapshot chooses

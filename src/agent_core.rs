@@ -5718,6 +5718,10 @@ struct StepRunOutcome {
     gate_state: GateState,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("agent cancelled after pre-inference preparation and before model invocation")]
+struct PreInferenceCancellation;
+
 fn incomplete_contract_status(args: &AgentRequest) -> ContractStatus {
     if args.contract.is_some() {
         ContractStatus::Unsatisfied
@@ -5727,6 +5731,9 @@ fn incomplete_contract_status(args: &AgentRequest) -> ContractStatus {
 }
 
 fn termination_reason_for_runtime_error(error: &anyhow::Error) -> TerminationReason {
+    if error.downcast_ref::<PreInferenceCancellation>().is_some() {
+        return TerminationReason::Cancelled;
+    }
     if error.downcast_ref::<ContextLimitError>().is_some() {
         return TerminationReason::ContextLimit;
     }
@@ -7186,6 +7193,26 @@ fn run_agent_steps(
         ) {
             Ok(generated) => generated,
             Err(error) => {
+                if error.downcast_ref::<PreInferenceCancellation>().is_some() {
+                    sink.emit(AgentEvent::Correction {
+                        message: "The user cancelled this run during pre-inference preparation; repository content and collected evidence are being preserved, and no model invocation was started."
+                            .to_string(),
+                        summary: "Run cancelled".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    return Ok(StepRunOutcome {
+                        reached_final: false,
+                        contract_status: incomplete_contract_status(args),
+                        verified_completed: false,
+                        termination_reason: TerminationReason::Cancelled,
+                        final_content: Some("Cancelled by user".to_string()),
+                        metrics,
+                        gate_state: gate_state.into_inner(),
+                    });
+                }
                 let termination_reason = termination_reason_for_runtime_error(&error);
                 emit_context_limit_event(&error, nesting_depth, sink);
                 sink.emit(AgentEvent::Error {
@@ -15739,6 +15766,14 @@ fn generate_and_parse_action_with_retries(
         } else {
             None
         };
+        // Native project preparation can be much slower than ordinary request setup. A user
+        // cancellation that arrives while it is running must never be followed by a model
+        // invocation, token reservation, or generated mutation. The embedded analyzer currently
+        // cannot be interrupted inside every rust-analyzer query, so this is a post-preparation
+        // safety barrier rather than a claim of bounded cancellation latency.
+        if sink.should_cancel() {
+            return Err(PreInferenceCancellation.into());
+        }
         let semantic_boundary = mutation_snapshot
             .as_ref()
             .map(|snapshot| {
@@ -23633,6 +23668,54 @@ mod tests {
             goal_context: None,
             contract: None,
         }
+    }
+
+    #[test]
+    fn cancellation_during_pre_inference_work_never_starts_the_model() {
+        #[derive(Default)]
+        struct CancelAfterInitialBoundary {
+            probes: std::cell::Cell<usize>,
+            events: Vec<AgentEvent>,
+        }
+
+        impl EventSink for CancelAfterInitialBoundary {
+            fn emit(&mut self, event: AgentEvent) {
+                self.events.push(event);
+            }
+
+            fn should_cancel(&self) -> bool {
+                let probe = self.probes.get();
+                self.probes.set(probe.saturating_add(1));
+                probe > 0
+            }
+        }
+
+        let repo = init_contract_test_repo();
+        let request = test_agent_request(AgentProfile::Build, 128);
+        let mut sink = CancelAfterInitialBoundary::default();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![text_completion("model must not run".to_string())],
+            repo.path(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::Cancelled);
+        assert_eq!(outcome.llm_invocations, 0);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { message, summary, .. }
+                if summary == "Run cancelled"
+                    && message.contains("no model invocation was started")
+        )));
+        assert!(
+            !sink
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. }))
+        );
     }
 
     #[test]

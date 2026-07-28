@@ -663,6 +663,24 @@ The controller owns lifecycle even though a language crate owns the analyzer imp
    project graph/toolchain/dependency changes, active leases, ambiguity, or refresh errors rebuild a
    separate world before inference.
 
+The shipped Rust v1 scheduler uses a synchronous readiness barrier immediately before the first
+edit-capable invocation. Read-only planning and review turns do not pay this cost, and an exact
+non-Rust work-unit target does not trigger it. A future latency optimization may start one
+content-addressed, deduplicated prewarm after the controller has accepted a Rust-targeted work unit
+while a read-only stage continues, but the edit-capable invocation must still await readiness and
+repeat the exact live identity check. A speculative prewarm can never reserve model budget, emit an
+invocation event, grant mutation authority, or make a stale world usable.
+
+Cancellation has two distinct guarantees. Shipped v1 rechecks cancellation after native
+preparation, so a cancellation that arrives during a slow load is never followed by prompt work or
+model inference. It does **not** yet promise bounded cancellation latency inside
+`rust-analyzer` project loading or HIR priming because the pinned in-process APIs lack cooperative
+cancellation at every query and child-process wait. Promotion of a bounded-cancellation claim
+requires pinned native cancellation hooks through project discovery, Cargo/toolchain subprocesses,
+VFS loading, and Salsa priming. Process isolation is an acceptable fallback only if the
+language-owned worker retains the complete native analyzer/request epoch; it must not replace direct
+rust-analyzer integration with a generic serialized fact pack or synchronous LSP diagnostics.
+
 Cold-build, warm-hit, incremental-refresh, priming, memory, and eviction budgets are qualified per
 language. Correctness does not depend on a cache hit.
 
@@ -1075,7 +1093,7 @@ workspace, not an earlier phase branch.
 | DeepSeek DSML renderer/parser corpus | Passed | 3 focused root tests plus 3 collar DSML tests for typed parameters, ordered JSON-string mutation history, closure boundaries, and exact scalar paths |
 | Workspace format/check/Clippy | Passed | `cargo fmt --all -- --check`, `cargo check --workspace --all-targets -j 1`, and the repository warning/correctness Clippy gate |
 | Executor and event focused tests | Passed | Snapshot freshness, exact patch/Git differential result, inexact hunk rejection, and additive/backward-compatible event round trip |
-| Workspace all-target tests | Passed | On 2026-07-28, 1,472 root tests passed with 24 device/environment/qualification tests ignored, 2 environment-contract tests passed, all 61 collar tests passed, and all 8 native Rust tests passed |
+| Workspace all-target tests | Passed | On 2026-07-28, 1,473 root tests passed with 24 device/environment/qualification tests ignored, 2 environment-contract tests passed, all 61 collar tests passed, and all 8 native Rust tests passed |
 | Web and documentation tests | Passed | 76 web tests passed; mdBook and link validation checked 59 pages and 98 rendered files |
 | Production asset/release build | Passed | On 2026-07-27, web assets and the optimized macOS arm64 release binary rebuilt successfully |
 | Required FlashMoe one-token smoke | Quality gate failed | On 2026-07-28, the rebuilt release binary again exited zero but printed `5` for `2+2=`; token `4` was second by 0.320473 logit. The repository gate requires a sensible answer, so promotion remains blocked. Existing upstream-parity evidence classifies this as checkpoint/model quality rather than a collar failure, and no output correction is permitted |
@@ -1085,6 +1103,7 @@ workspace, not an earlier phase branch.
 | Phase 7 shadow/evidence foundation | Passed | Semantic analysis uses a fresh exact bounded shadow tree and isolated LSP session for each transaction, rejects symlinks and post-copy drift, permits only an LSP-specific read-only analysis-root mount, and emits independently validated content-free generation and final-executor receipts |
 | Phase 7 legacy pinned Rust LSP attempt | Failed safely (historical) | `ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b26526…173d` (rust-analyzer 1.96.0) never produced a non-empty crate graph or document membership within the required barrier; this is why incomplete-code LSP diagnostics were not adopted as the streaming architecture |
 | Phase 7 native Rust implementation | Passed focused implementation gates | Exact-pinned rust-analyzer 0.0.344 loads one offline project world; 8 crate tests cover dependency/sysroot shape certainty, invalid import/type steering, target selection, cross-file rollback, identity/staleness, active-request refresh exclusion, and zero-load source refresh. The root lifecycle test covers cold preparation, warm reuse, independent invalid/valid final replay, in-memory source refresh, cross-stage process-cache reuse, and exact non-Rust target bypass |
+| Phase 7 lifecycle overlap/cancellation boundary | Passed narrow shipped guarantee | The root lifecycle test now holds one request lease across source drift and proves the next request receives an independently cold-built world. A deterministic agent test injects cancellation after pre-inference work and proves zero model invocations and zero consumed completion records. Mid-query rust-analyzer cancellation latency remains unbounded and is still a promotion gate |
 | Phase 7 native Rust latency/resource qualifier | Passed current representative run | The full pb workspace measured an 81.475 s cold load, 972 ms independent execution replay, and 966 ms warm request; process maximum RSS was 2,127,577,088 bytes and measured peak footprint was 129,778,360 bytes. These are recorded baselines, not universal budgets; large-project, cancellation, and sustained-concurrency qualification remains |
 | Phase 7 live Rust workflow | Passed | Preserved run `1785221083352-60887-0` in `/private/tmp/pb-control-rust-e2e-20260727-4` crossed the strict workflow, prepared Rust before the edit-capable model invocation, accepted a controller-bound `edit_file`, rejected 14 invalid candidates without executing them, passed 3 locked Cargo tests and API review, reached `Ready`, and committed `56aca5c feat: add average function with unit tests` with a clean worktree |
 | Current live write/patch fixtures | Passed | On 2026-07-28, the rebuilt release binary compiled the checked-in Qwen fixture containing exact path `const`, generated exactly `answer.py` with valid Python after 21 rejected candidates, and generated the exact snapshot-valid canonical one-line patch after 20 rejected candidates and one invalid-argument closure rejection |

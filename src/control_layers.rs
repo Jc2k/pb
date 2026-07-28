@@ -647,11 +647,46 @@ mod tests {
         let mut next_stage = ControlLayerLifecycle::default();
         assert!(
             next_stage
-                .prepare_for_inference(root.path(), &[rust_tool], Some(&changed))
+                .prepare_for_inference(
+                    root.path(),
+                    std::slice::from_ref(&rust_tool),
+                    Some(&changed)
+                )
                 .unwrap()
                 .is_some()
         );
         assert_eq!(next_stage.stats(), (0, 1, 1));
+
+        let active_layers = next_stage
+            .prepare_for_inference(
+                root.path(),
+                std::slice::from_ref(&rust_tool),
+                Some(&changed),
+            )
+            .unwrap()
+            .expect("the exact warm Rust world should produce a request lease");
+        assert_eq!(next_stage.stats(), (0, 2, 1));
+
+        fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn value() -> i32 { 3 }\n",
+        )
+        .unwrap();
+        let changed_while_active = WorkspaceSnapshot::new(vec![SnapshotEntry::new(
+            LogicalPath::parse("src/lib.rs").unwrap(),
+            fs::read(root.path().join("src/lib.rs")).unwrap(),
+        )])
+        .unwrap();
+        let replacement_layers = next_stage
+            .prepare_for_inference(root.path(), &[rust_tool], Some(&changed_while_active))
+            .unwrap();
+        assert!(replacement_layers.is_some());
+        assert_eq!(next_stage.stats(), (1, 3, 1));
+
+        // Both immutable request revisions can coexist. Dropping either request must not affect
+        // the other, and the lifecycle never revises the Salsa database leased by active_layers.
+        drop(replacement_layers);
+        drop(active_layers);
     }
 
     #[test]
