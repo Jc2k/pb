@@ -117,7 +117,11 @@ started in the safe profile. Missing cached dependencies fail readiness instead 
 project world must be loaded and primed before a Rust-edit-capable model invocation; decoding uses a
 request-local Salsa snapshot and performs no filesystem, Cargo, network, process, or LSP activity.
 An epoch lease prevents the cache from revising that database while a decoder can query it. A
-concurrent request or unsupported invalidation receives another prepared world.
+concurrent request or unsupported invalidation receives another prepared world. Cold construction
+runs in a request-independent in-process worker under the exact-world single-flight lease and a
+global one-worker limit. Cancelling the initiating request stops its wait but does not grant the
+detached worker new authority: it can only finish the already captured local shadow and publish the
+exact result into the bounded process cache.
 
 The executor does not trust generation-time acceptance. It repeats path/capability/schema/read gates,
 reconstructs the virtual mutation, verifies current base hashes and syntax, and publishes through

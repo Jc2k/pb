@@ -7,7 +7,11 @@
 use std::{
     collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, OnceLock},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock,
+        mpsc::{Receiver, RecvTimeoutError, sync_channel},
+    },
+    thread,
     time::Duration,
 };
 
@@ -28,6 +32,9 @@ use crate::{agent_core::BuiltInToolSchema, semantic::SemanticShadowWorkspace};
 const RUST_LAYER_MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const RUST_LAYER_MAX_CHECKPOINTS: usize = 4_096;
 const MAX_PROCESS_RUST_WORLDS: usize = 2;
+// A cold rust-analyzer world can consume substantial memory. Detached cancellation must not let
+// abandoned requests accumulate concurrent loaders for different workspaces.
+const MAX_CONCURRENT_RUST_WORLD_PREPARATIONS: usize = 1;
 const PREPARATION_WAIT_POLL: Duration = Duration::from_millis(100);
 
 pub(crate) type SharedLanguageLayers = Arc<Mutex<LanguageLayerStack>>;
@@ -151,7 +158,7 @@ impl ControlLayerLifecycle {
                 // construct an identical rust-analyzer database. The cache is checked again after
                 // acquiring the flight because another request may have populated it while this
                 // request waited.
-                let _preparation = begin_rust_world_preparation(
+                let preparation = begin_rust_world_preparation(
                     RustWorldKey {
                         workspace_root: canonical_root.clone(),
                         source_sha256: live.fingerprint.clone(),
@@ -167,10 +174,15 @@ impl ControlLayerLifecycle {
                     insert_process_world(Arc::clone(&refreshed))?;
                     self.rust = Some(refreshed);
                 } else {
-                    let prepared =
-                        Arc::new(Mutex::new(self.build_current_world(&canonical_root, live)?));
+                    // The request that discovers a cold miss must not own the uninterruptible
+                    // rust-analyzer load. Transfer the single-flight lease and exact immutable
+                    // inputs to an in-process worker, then wait through the same cancellable polling
+                    // boundary as every other request. Cancellation abandons only this wait: the
+                    // worker finishes the exact world and may populate the bounded process cache.
+                    let receiver =
+                        spawn_rust_world_build(preparation, canonical_root.clone(), live)?;
                     self.cold_builds = self.cold_builds.saturating_add(1);
-                    insert_process_world(Arc::clone(&prepared))?;
+                    let prepared = wait_for_rust_preparation(&receiver, cancellation)?;
                     self.rust = Some(prepared);
                 }
             }
@@ -248,7 +260,6 @@ impl ControlLayerLifecycle {
     }
 
     fn build_current_world(
-        &self,
         workspace_root: &Path,
         expected: crate::workspace::ContentSnapshot,
     ) -> Result<PreparedRustWorld> {
@@ -387,7 +398,7 @@ fn begin_rust_world_preparation(
         .active
         .lock()
         .map_err(|_| anyhow::anyhow!("Rust semantic preparation coordinator is poisoned"))?;
-    while active.contains(&key) {
+    while active.contains(&key) || active.len() >= MAX_CONCURRENT_RUST_WORLD_PREPARATIONS {
         let (next, _) = coordinator
             .ready
             .wait_timeout(active, PREPARATION_WAIT_POLL)
@@ -397,6 +408,68 @@ fn begin_rust_world_preparation(
     }
     active.insert(key.clone());
     Ok(RustWorldPreparationGuard { coordinator, key })
+}
+
+fn spawn_rust_world_build(
+    preparation: RustWorldPreparationGuard,
+    workspace_root: PathBuf,
+    expected: crate::workspace::ContentSnapshot,
+) -> Result<Receiver<Result<PreparedRustHandle>>> {
+    spawn_rust_preparation_worker(preparation, move || {
+        let prepared = Arc::new(Mutex::new(ControlLayerLifecycle::build_current_world(
+            &workspace_root,
+            expected,
+        )?));
+        insert_process_world(Arc::clone(&prepared))?;
+        Ok(prepared)
+    })
+}
+
+fn spawn_rust_preparation_worker<T>(
+    preparation: RustWorldPreparationGuard,
+    prepare: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<Receiver<Result<T>>>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = sync_channel(1);
+    thread::Builder::new()
+        .name("pb-rust-world-preparation".to_string())
+        .spawn(move || {
+            let result = prepare();
+            drop(preparation);
+            // A cancelled initiating request may have dropped its receiver. The worker still
+            // finishes cache publication and releases the single-flight guard before this send.
+            if let Err(disconnected) = sender.send(result)
+                && let Err(error) = disconnected.0
+            {
+                tracing::warn!(
+                    %error,
+                    "detached Rust semantic preparation failed after its request stopped waiting"
+                );
+            }
+        })
+        .context("failed to start the Rust semantic preparation worker")?;
+    Ok(receiver)
+}
+
+fn wait_for_rust_preparation<T>(
+    receiver: &Receiver<Result<T>>,
+    cancellation: &dyn Fn() -> Result<()>,
+) -> Result<T> {
+    loop {
+        cancellation()?;
+        match receiver.recv_timeout(PREPARATION_WAIT_POLL) {
+            Ok(result) => {
+                cancellation()?;
+                return result;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("Rust semantic preparation worker stopped without a result")
+            }
+        }
+    }
 }
 
 fn ensure_unchanged_during_rust_preparation(
@@ -685,6 +758,68 @@ mod tests {
         assert!(error.to_string().contains("cancelled while waiting"));
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(active);
+    }
+
+    #[test]
+    fn initiating_cold_world_wait_is_cancellable_while_worker_keeps_single_flight() {
+        let key = RustWorldKey {
+            workspace_root: PathBuf::from("/bounded/cold-owner-cancellation-fixture"),
+            source_sha256: "b".repeat(64),
+        };
+        let preparation = begin_rust_world_preparation(key.clone(), &|| Ok(())).unwrap();
+        let (started_sender, started_receiver) = sync_channel(1);
+        let (release_sender, release_receiver) = sync_channel(1);
+        let receiver = spawn_rust_preparation_worker(preparation, move || {
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+        started_receiver.recv().unwrap();
+
+        let polls = AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let error = wait_for_rust_preparation(&receiver, &|| {
+            if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                bail!("initiating request cancelled during cold Rust preparation")
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("initiating request cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let coordinator = RUST_WORLD_PREPARATIONS.get().unwrap();
+        assert!(coordinator.active.lock().unwrap().contains(&key));
+
+        let other_key = RustWorldKey {
+            workspace_root: PathBuf::from("/bounded/other-cold-world-fixture"),
+            source_sha256: "c".repeat(64),
+        };
+        let capacity_polls = AtomicUsize::new(0);
+        let capacity_result = begin_rust_world_preparation(other_key.clone(), &|| {
+            if capacity_polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                bail!("cancelled while waiting for Rust preparation capacity")
+            }
+        });
+        let error = match capacity_result {
+            Ok(_) => panic!("the second cold world should wait for process capacity"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("preparation capacity"));
+
+        release_sender.send(()).unwrap();
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let next = begin_rust_world_preparation(key, &|| Ok(())).unwrap();
+        drop(next);
+        let other = begin_rust_world_preparation(other_key, &|| Ok(())).unwrap();
+        drop(other);
     }
 
     #[test]

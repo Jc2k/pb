@@ -237,8 +237,11 @@ model turn rather than silently dropping the Rust layer. This behavior is automa
 environment toggle. Its guarantee is intentionally narrow: exact qualified import and selected
 literal/call-shape contradictions can be rejected, while build-script/procedural-macro and deeper
 type/ownership facts remain unknown. If cancellation arrives during this preparation, pb will not
-start the model afterward. The embedded analyzer cannot yet interrupt every in-progress load or HIR
-query, so the cancellation itself may wait for that preparation boundary.
+start the model afterward. Cold loads run in a request-independent local worker; the initiating
+request and queued requests poll cancellation every 100 ms, and only one cold Rust load runs at a
+time. Cancelling stops the request wait, but the embedded analyzer cannot interrupt every
+in-progress Cargo, VFS, or HIR query, so the exact local build may finish in the background and warm
+the bounded process cache.
 
 A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
 at least 32 tokens with true layer-major Metal prefill. The live Metal working-set snapshot chooses

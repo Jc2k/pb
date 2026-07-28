@@ -65,7 +65,11 @@ The controller copies the exact repository snapshot to an ephemeral verified sha
 installed sysroot and dependency source caches, but it adds no network edge and sends no dependency
 or repository source to the model. Exact warmed worlds are retained only in bounded process memory;
 request snapshots and candidate branches are in-memory leases. Shadows are temporary and durable
-events contain only identities, readiness/decision classes, counts, and timings.
+events contain only identities, readiness/decision classes, counts, and timings. A cancelled
+request may leave its already-started cold analyzer worker running locally until that exact build
+finishes; at most one such cold worker runs process-wide, and its shadow/world is then dropped or
+retained only by the same bounded in-memory cache. Cancellation adds no network or durable source
+persistence.
 `inference.llamacpp_session_cache_enabled=false` and
 `inference.flashmoe_session_cache_enabled=false` independently disable disk persistence without
 disabling in-process reuse. These controls, their byte budgets, and the optional cache root are

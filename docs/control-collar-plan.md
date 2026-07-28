@@ -23,13 +23,16 @@ Current implementation ledger:
   request-local snapshot. It does not ask an LSP for diagnostics on incomplete source.
 - **Lifecycle implemented:** exact workspace/configuration/dependency identities key a bounded
   process cache. Concurrent requests for one exact identity use a process-wide single flight and
-  reuse its result. Existing `.rs` edits revise the warm Salsa world only after all request leases
-  from the previous world have ended. New/deleted source files, Cargo/configuration changes,
-  ambiguity, overlapping inference, or refresh failure cause an independent cold rebuild before
-  the next model invocation. Exact controller-bound non-Rust mutations skip this cost; multi-path
-  patches conservatively prepare Rust. Workspace drift during load aborts rather than silently
-  rebasing an already captured mutation snapshot; drift between inference and execution also fails
-  closed.
+  reuse its result. A cold load runs in a request-independent in-process worker under that flight;
+  both its initiating request and later waiters poll cancellation every 100 ms. At most one cold
+  Rust world is built at a time, so cancelled requests cannot accumulate concurrent rust-analyzer
+  loads. Cancellation abandons the request, not the exact local build, which may finish into the
+  bounded cache. Existing `.rs` edits revise the warm Salsa world only after all request leases from
+  the previous world have ended. New/deleted source files, Cargo/configuration changes, ambiguity,
+  overlapping inference, or refresh failure cause an independent cold rebuild before the next
+  model invocation. Exact controller-bound non-Rust mutations skip this cost; multi-path patches
+  conservatively prepare Rust. Workspace drift during load aborts rather than silently rebasing an
+  already captured mutation snapshot; drift between inference and execution also fails closed.
 - **Controller-bound targets implemented:** target-scoped workflow schemas remain byte-stable and
   may omit `path`. The controller carries the accepted work-unit path out of band in the immutable
   snapshot; Qwen payload extraction and the mutation gate normalize the call exactly as the
@@ -680,13 +683,20 @@ while a read-only stage continues, but the edit-capable invocation must still aw
 repeat the exact live identity check. A speculative prewarm can never reserve model budget, emit an
 invocation event, grant mutation authority, or make a stale world usable.
 
-Cancellation has two distinct guarantees. Shipped v1 rechecks cancellation after native
-preparation, so a cancellation that arrives during a slow load is never followed by prompt work or
-model inference. It does **not** yet promise bounded cancellation latency inside
-`rust-analyzer` project loading or HIR priming because the pinned in-process APIs lack cooperative
-cancellation at every query and child-process wait. Promotion of a bounded-cancellation claim
-requires pinned native cancellation hooks through project discovery, Cargo/toolchain subprocesses,
-VFS loading, and Salsa priming. Process isolation is an acceptable fallback only if the
+Cancellation has two distinct guarantees. Shipped v1 rechecks cancellation before and after native
+preparation, so a cancellation is never followed by prompt work or model inference. Cold project
+loading and HIR priming run in a request-independent in-process thread under the exact-world
+single-flight lease; the initiating request and queued requests poll cancellation every 100 ms, and
+only one cold Rust load runs process-wide. A cancelled request therefore stops waiting promptly
+without abandoning a partially constructed analyzer database or allowing repeated cancellations to
+multiply resident loaders. The local worker may continue after the request ends and publish its
+exact successful result to the bounded process cache.
+
+This is bounded **request wait cancellation**, not cooperative analyzer-work cancellation. The
+pinned in-process APIs still cannot interrupt every project-discovery, Cargo/toolchain subprocess,
+VFS, or Salsa query. Incremental refresh and initial live-snapshot capture also retain their own
+operation boundaries. A future resource-reclamation claim requires pinned native cancellation hooks
+through those operations. Process isolation remains an acceptable fallback only if the
 language-owned worker retains the complete native analyzer/request epoch; it must not replace direct
 rust-analyzer integration with a generic serialized fact pack or synchronous LSP diagnostics.
 
@@ -1112,11 +1122,11 @@ workspace, not an earlier phase branch.
 | Phase 7 shadow/evidence foundation | Passed | Semantic analysis uses a fresh exact bounded shadow tree and isolated LSP session for each transaction, rejects symlinks and post-copy drift, permits only an LSP-specific read-only analysis-root mount, and emits independently validated content-free generation and final-executor receipts |
 | Phase 7 legacy pinned Rust LSP attempt | Failed safely (historical) | `ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:07b26526…173d` (rust-analyzer 1.96.0) never produced a non-empty crate graph or document membership within the required barrier; this is why incomplete-code LSP diagnostics were not adopted as the streaming architecture |
 | Phase 7 native Rust implementation | Passed focused implementation gates | Exact-pinned rust-analyzer 0.0.344 loads one offline project world; 8 crate tests cover dependency/sysroot shape certainty, invalid import/type steering, target selection, cross-file rollback, identity/staleness, active-request refresh exclusion, and zero-load source refresh. The root lifecycle test covers cold preparation, warm reuse, independent invalid/valid final replay, in-memory source refresh, cross-stage process-cache reuse, and exact non-Rust target bypass |
-| Phase 7 lifecycle overlap/cancellation boundary | Passed narrow shipped guarantee | The root lifecycle tests hold one request lease across source drift and prove the next request receives an independently cold-built world; two simultaneous exact requests produce one cold build plus one process-cache hit; any drift during loading requires a fresh controller snapshot rather than an internal retry; and a single-flight waiter polls cancellation at 100 ms intervals. A deterministic agent test injects cancellation during pre-inference work and proves zero model invocations and zero consumed completion records. Mid-query cancellation latency for the request that owns rust-analyzer loading remains unbounded and is still a promotion gate |
-| Phase 7 native Rust latency/resource qualifier | Passed current representative run | On exact commit `23754bbe`, the full pb workspace measured an 87.289 s cold load, 1.014 s independent execution replay, and 1.007 s warm request. The prior instrumented run recorded process maximum RSS of 2,127,577,088 bytes and measured peak footprint of 129,778,360 bytes. These are baselines, not universal budgets; additional large-project, owner-load cancellation, and sustained-concurrency/memory qualification remains |
+| Phase 7 lifecycle overlap/cancellation boundary | Passed narrow shipped guarantee | The root lifecycle tests hold one request lease across source drift and prove the next request receives an independently cold-built world; two simultaneous exact requests produce one cold build plus one process-cache hit; and any drift during loading requires a fresh controller snapshot rather than an internal retry. Deterministic tests hold a detached cold worker open and prove that its initiating request and a different project waiting for the global one-worker capacity both observe cancellation through the 100 ms poll while the exact single-flight remains owned until worker completion. A separate agent test proves pre-inference cancellation causes zero model invocations and zero consumed completion records. The analyzer computation itself is not cooperatively interrupted. |
+| Phase 7 native Rust latency/resource qualifier | Passed current representative run | On exact commit `23754bbe`, the full pb workspace measured an 87.289 s cold load, 1.014 s independent execution replay, and 1.007 s warm request. The prior instrumented run recorded process maximum RSS of 2,127,577,088 bytes and measured peak footprint of 129,778,360 bytes. These are baselines, not universal budgets; additional large-project, detached-worker completion/reclamation, and sustained-concurrency/memory qualification remains |
 | Phase 7 live Rust workflow | Passed | Preserved run `1785221083352-60887-0` in `/private/tmp/pb-control-rust-e2e-20260727-4` crossed the strict workflow, prepared Rust before the edit-capable model invocation, accepted a controller-bound `edit_file`, rejected 14 invalid candidates without executing them, passed 3 locked Cargo tests and API review, reached `Ready`, and committed `56aca5c feat: add average function with unit tests` with a clean worktree |
 | Current live write/patch fixtures | Passed | On 2026-07-28, the rebuilt release binary compiled the checked-in Qwen fixture containing exact path `const`, generated exactly `answer.py` with valid Python after 21 rejected candidates, and generated the exact snapshot-valid canonical one-line patch after 20 rejected candidates and one invalid-argument closure rejection |
-| Phase 7 native Rust production qualification | Partially passed; promotion blocked | Focused implementation, strict workspace gates, representative cold/warm/replay measurement, one current end-to-end Rust edit, and current live write/patch generation pass. The required FlashMoe arithmetic smoke is currently nonsensical; representative large projects, cancellation, sustained concurrency/memory, and longer randomized rollback corpora still gate promotion beyond the narrow shipped v1 claim |
+| Phase 7 native Rust production qualification | Partially passed; promotion blocked | Focused implementation, strict workspace gates, representative cold/warm/replay measurement, deterministic detached-owner cancellation, one current end-to-end Rust edit, and current live write/patch generation pass. The required FlashMoe arithmetic smoke is currently nonsensical; representative large projects, sustained detached-worker concurrency/memory, resource reclamation, and longer randomized rollback corpora still gate promotion beyond the narrow shipped v1 claim |
 | Phase 7 deeper/later language profiles | Pending | Rust macro/build-script/compiler parity, `pb-control-python`/Astral `ty`, and `pb-control-typescript` project matrices ship independently after their own soundness, lifecycle, multi-file, dependency, cancellation, latency, and final-replay evidence |
 | Phase 8 live llama.cpp profiles | Qwen direct matrix passed; broader parity pending | On 2026-07-28, the final rebuilt binary and exact local Qwen2.5-Coder-7B Q4_K_M GGUF passed the no-execution `llama-infer` fixture matrix through the production CPU-fallback adapter. A valid Python write closed in 41 tokens/11.840 s after 5,587,481 rejected candidates. The exact immutable-snapshot patch closed in 72 tokens/25.506 s after 11,426,985 rejected candidates and returned the canonical hunk byte-for-byte. An exact invalid Python constant and an exact stale-context patch each reached an empty full-vocabulary frontier and exited nonzero without a call; a one-token cap likewise returned no call. These runs exposed and fixed structural-whitespace, partial-hunk, returned-byte/validated-byte, incomplete UTF-8/JSON escape, canonical scalar-wire, and speculative candidate-state defects. The earlier workflow envelope-close fix remains covered. Live DeepSeek-dialect GGUF, FlashMoe/llama mask differential, repeated throughput/resource, and unsupported-profile preflight runs still gate a backend-parity claim. |
 | Pinned DeepSeek direct mutation qualification | Passed | The checked-in `fixtures/control-collar/` inputs produced syntax-valid `answer.py` after 2 candidate rejections and an exact snapshot-bound one-line patch after 8, reporting 1 file and 16 snapshot bytes; an alternate capped patch attempt reported 7 `invalid_patch` closure rejections and executed no call |

@@ -5719,7 +5719,7 @@ struct StepRunOutcome {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("agent cancelled after pre-inference preparation and before model invocation")]
+#[error("agent cancelled during pre-inference preparation and before model invocation")]
 struct PreInferenceCancellation;
 
 fn incomplete_contract_status(args: &AgentRequest) -> ContractStatus {
@@ -15776,9 +15776,9 @@ fn generate_and_parse_action_with_retries(
         };
         // Native project preparation can be much slower than ordinary request setup. A user
         // cancellation that arrives while it is running must never be followed by a model
-        // invocation, token reservation, or generated mutation. The embedded analyzer currently
-        // cannot be interrupted inside every rust-analyzer query, so this is a post-preparation
-        // safety barrier rather than a claim of bounded cancellation latency.
+        // invocation, token reservation, or generated mutation. Cold loads run independently of
+        // request ownership, so this post-wait check closes the race between the last cancellable
+        // preparation poll and prompt work.
         if sink.should_cancel() {
             return Err(PreInferenceCancellation.into());
         }
