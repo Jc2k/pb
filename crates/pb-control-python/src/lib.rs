@@ -585,7 +585,9 @@ impl PythonWorkspaceStreamingLayer {
         if matches!(
             boundary,
             AnalysisBoundary::Statement | AnalysisBoundary::File
-        ) && literal_operator_contradiction(&state.tree, &state.source, &state.generated_ranges)
+        ) && diagnostic_profile("unsupported-operator").is_some_and(|profile| {
+            profile.token_proof == Some(PythonTokenProof::GeneratedLiteralOperator)
+        }) && literal_operator_contradiction(&state.tree, &state.source, &state.generated_ranges)
         {
             let mut candidates = self.completed.clone();
             candidates.insert(
@@ -1096,22 +1098,61 @@ struct PythonPromotionPolicy {
     external_imports_complete: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PythonTokenProof {
+    GeneratedLiteralOperator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PythonDiagnosticProfile {
+    code: &'static str,
+    /// `None` means that the diagnostic is authoritative only after every file in the mutation is
+    /// known. A future token-time promotion must name and qualify a monotonic local proof here.
+    token_proof: Option<PythonTokenProof>,
+}
+
+const PYTHON_DIAGNOSTIC_PROFILES: &[PythonDiagnosticProfile] = &[
+    PythonDiagnosticProfile {
+        code: "invalid-argument-type",
+        token_proof: None,
+    },
+    PythonDiagnosticProfile {
+        code: "invalid-assignment",
+        token_proof: None,
+    },
+    PythonDiagnosticProfile {
+        code: "invalid-return-type",
+        token_proof: None,
+    },
+    PythonDiagnosticProfile {
+        code: "unresolved-attribute",
+        token_proof: None,
+    },
+    PythonDiagnosticProfile {
+        code: "unresolved-import",
+        token_proof: None,
+    },
+    PythonDiagnosticProfile {
+        code: "unsupported-operator",
+        token_proof: Some(PythonTokenProof::GeneratedLiteralOperator),
+    },
+];
+
+fn diagnostic_profile(code: &str) -> Option<PythonDiagnosticProfile> {
+    PYTHON_DIAGNOSTIC_PROFILES
+        .iter()
+        .copied()
+        .find(|profile| profile.code == code)
+}
+
 fn promoted(
     diagnostics: Vec<PythonDiagnostic>,
     policy: &PythonPromotionPolicy,
 ) -> Vec<PythonDiagnostic> {
-    const PROMOTED: &[&str] = &[
-        "invalid-argument-type",
-        "invalid-assignment",
-        "invalid-return-type",
-        "unresolved-attribute",
-        "unresolved-import",
-        "unsupported-operator",
-    ];
     diagnostics
         .into_iter()
         .filter(|diagnostic| {
-            PROMOTED.contains(&diagnostic.code.as_str())
+            diagnostic_profile(&diagnostic.code).is_some()
                 && (diagnostic.code != "unresolved-import"
                     || policy.external_imports_complete
                     || import_is_controlled(diagnostic, policy))
@@ -1382,6 +1423,27 @@ mod tests {
         }
     }
 
+    const PROMOTED_DIAGNOSTIC_FIXTURES: [(&str, &str); 6] = [
+        (
+            "invalid-argument-type",
+            "def consume(value: int) -> None:\n    pass\nconsume(\"bad\")\n",
+        ),
+        ("invalid-assignment", "value: int = \"bad\"\n"),
+        (
+            "invalid-return-type",
+            "def produce() -> int:\n    return \"bad\"\n",
+        ),
+        (
+            "unresolved-attribute",
+            "class Item:\n    pass\nvalue = Item().missing\n",
+        ),
+        (
+            "unresolved-import",
+            "import package_absent_from_the_complete_static_world\n",
+        ),
+        ("unsupported-operator", "value = \"bad\" + 1\n"),
+    ];
+
     fn write(root: &Path, path: &str, source: &str) {
         let path = root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1436,6 +1498,153 @@ mod tests {
             .unwrap();
 
         assert!(reports["main.py"].introduced.is_empty());
+    }
+
+    #[test]
+    fn every_promoted_diagnostic_has_an_exact_complete_candidate_fixture() {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "main.py", "value = 1\n");
+        let world = PythonProjectWorld::load_and_prime(qualified_config(root.path())).unwrap();
+        let mut request = world
+            .snapshot_for_request(&world.descriptor().world)
+            .unwrap();
+        let path = LogicalPath::parse("main.py".to_string()).unwrap();
+        let cases = PROMOTED_DIAGNOSTIC_FIXTURES;
+        assert_eq!(
+            cases.iter().map(|(code, _)| *code).collect::<BTreeSet<_>>(),
+            PYTHON_DIAGNOSTIC_PROFILES
+                .iter()
+                .map(|profile| profile.code)
+                .collect::<BTreeSet<_>>()
+        );
+
+        for (expected, source) in cases {
+            let report = request
+                .check_candidates(&BTreeMap::from([(path.clone(), source.to_string())]))
+                .unwrap();
+            assert!(
+                report["main.py"]
+                    .introduced
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == expected),
+                "expected promoted diagnostic {expected}, got {:?}",
+                report["main.py"].introduced
+            );
+        }
+
+        let dynamic = "from typing import Any\n\nclass Dynamic:\n    def __getattr__(self, name: str) -> Any:\n        return 1\n\ndef consume(value: int) -> None:\n    pass\n\ndef produce(value: Any) -> int:\n    return value\n\ndynamic: Any = Dynamic().anything\nconsume(dynamic)\nassigned: int = dynamic\nattribute = dynamic.missing\noperator = dynamic + 1\nresult: int = produce(dynamic)\n";
+        assert!(
+            request
+                .check_candidates(&BTreeMap::from([(path, dynamic.to_string())]))
+                .unwrap()["main.py"]
+                .introduced
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn closure_only_diagnostics_never_hard_reject_a_statement_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "main.py", "value = 1\n");
+        let world = PythonProjectWorld::load_and_prime(qualified_config(root.path())).unwrap();
+        let language = LanguageId("python".to_string());
+        let path = LogicalPath::parse("main.py".to_string()).unwrap();
+
+        for (expected, source) in
+            PROMOTED_DIAGNOSTIC_FIXTURES
+                .iter()
+                .copied()
+                .filter(|(code, _)| {
+                    diagnostic_profile(code).is_some_and(|profile| profile.token_proof.is_none())
+                })
+        {
+            let request = world
+                .snapshot_for_request(&world.descriptor().world)
+                .unwrap();
+            let mut layer = request.into_streaming_layer(1024 * 1024, 64).unwrap();
+            layer.begin(ProgramSnapshot::default()).unwrap();
+            layer
+                .apply(SourceEvent::BeginFile {
+                    path: &path,
+                    language: &language,
+                    mutation: MutationKind::Modify,
+                })
+                .unwrap();
+            layer
+                .apply(SourceEvent::Bytes {
+                    origin: SourceOrigin::Generated,
+                    bytes: source.as_bytes(),
+                })
+                .unwrap();
+            let boundary = layer
+                .apply(SourceEvent::Boundary(AnalysisBoundary::Statement))
+                .unwrap();
+            assert_ne!(
+                boundary.viability,
+                Viability::Impossible,
+                "{expected} must remain repairable until transaction closure"
+            );
+            layer.apply(SourceEvent::EndFile).unwrap();
+            let closure = layer.finalize().unwrap();
+            assert_eq!(closure.viability, Viability::Impossible, "{expected}");
+            assert_eq!(closure.closure, ClosureVerdict::Reject, "{expected}");
+            assert!(closure.obligations.iter().any(|obligation| {
+                obligation.kind == format!("python_{}", expected.replace('-', "_"))
+            }));
+        }
+    }
+
+    #[test]
+    fn unresolved_import_stays_repairable_until_later_patch_files_are_known() {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "main.py", "value = 1\n");
+        let world = PythonProjectWorld::load_and_prime(qualified_config(root.path())).unwrap();
+        let request = world
+            .snapshot_for_request(&world.descriptor().world)
+            .unwrap();
+        let mut layer = request.into_streaming_layer(1024 * 1024, 64).unwrap();
+        layer.begin(ProgramSnapshot::default()).unwrap();
+        let language = LanguageId("python".to_string());
+        let main = LogicalPath::parse("main.py".to_string()).unwrap();
+        layer
+            .apply(SourceEvent::BeginFile {
+                path: &main,
+                language: &language,
+                mutation: MutationKind::Modify,
+            })
+            .unwrap();
+        layer
+            .apply(SourceEvent::Bytes {
+                origin: SourceOrigin::Generated,
+                bytes: b"from future_helper import answer\nvalue: int = answer()\n",
+            })
+            .unwrap();
+        let boundary = layer
+            .apply(SourceEvent::Boundary(AnalysisBoundary::Statement))
+            .unwrap();
+        assert_ne!(boundary.viability, Viability::Impossible);
+        assert_ne!(boundary.closure, ClosureVerdict::Reject);
+        layer.apply(SourceEvent::EndFile).unwrap();
+
+        let helper = LogicalPath::parse("future_helper.py".to_string()).unwrap();
+        layer
+            .apply(SourceEvent::BeginFile {
+                path: &helper,
+                language: &language,
+                mutation: MutationKind::Create,
+            })
+            .unwrap();
+        layer
+            .apply(SourceEvent::Bytes {
+                origin: SourceOrigin::Generated,
+                bytes: b"def answer() -> int:\n    return 42\n",
+            })
+            .unwrap();
+        layer.apply(SourceEvent::EndFile).unwrap();
+
+        let analysis = layer.finalize().unwrap();
+        assert_eq!(analysis.viability, Viability::Valid);
+        assert_eq!(analysis.closure, ClosureVerdict::Allow);
     }
 
     #[test]

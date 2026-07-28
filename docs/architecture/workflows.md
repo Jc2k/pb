@@ -726,7 +726,11 @@ the model starts only after both readiness receipts exist.
 
 The Python stream keeps known/generated origins, verifies a complete structural boundary before
 semantic pruning, and hard-rejects only a generated string-plus-integer literal addition confirmed
-by the pinned checker. Complete create/modify/delete candidates are overlaid together, with deletion
+by the pinned checker. The per-code policy marks `invalid-argument-type`, `invalid-assignment`,
+`invalid-return-type`, `unresolved-attribute`, and `unresolved-import` as closure-only: even a
+parser-complete statement cannot hard-reject on those diagnostics because a later file in the same
+patch can repair it. `unsupported-operator` has token-time authority only through the separately
+qualified generated-literal proof; its broader checker diagnostic is still closure-scoped. Complete create/modify/delete candidates are overlaid together, with deletion
 represented as absence, so new imports and callable signatures resolve coherently within the
 transaction. Finalization checks every non-deleted frozen first-party file plus newly created Python
 files and compares promoted diagnostic multisets against baseline debt. This catches promoted errors

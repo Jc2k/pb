@@ -120,7 +120,10 @@ inference, and includes the dependency image in cache/single-flight identity. It
 interpreter or contact a package index. Request overlays resolve newly generated files and imports together, and a deleted candidate
 is absent from that transaction's import graph. It can reject a complete
 generated string-plus-integer literal operation at a proven statement boundary and newly introduced
-promoted `ty` diagnostics at closure. Closure applies every candidate together, then checks every
+promoted `ty` diagnostics at closure. Argument, assignment, return, attribute, and import diagnostics
+are never statement-prefix hard masks: later files in the same patch may repair them. The broader
+unsupported-operator diagnostic is also closure-only unless the generated-literal proof applies.
+Closure applies every candidate together, then checks every
 non-deleted frozen first-party file plus newly created Python files, so an API change or deletion can
 be rejected when it introduces a promoted error in an untouched in-project dependant. Generated
 type-suppression directives cannot hide those errors. Missing external imports can veto only when
