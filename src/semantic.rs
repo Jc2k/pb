@@ -39,13 +39,42 @@ pub(crate) struct SemanticShadowWorkspace {
     snapshot: LspOverlayTreeSnapshot,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SemanticShadowExtraFile {
+    pub(crate) path: LogicalPath,
+    pub(crate) bytes: Vec<u8>,
+}
+
 impl SemanticShadowWorkspace {
     pub(crate) fn capture(
         workspace_root: &Path,
         content: &crate::workspace::ContentSnapshot,
     ) -> Result<Self> {
-        if content.paths.len() > SEMANTIC_SHADOW_MAX_FILES {
+        Self::capture_with_extra_files(workspace_root, content, &[])
+    }
+
+    pub(crate) fn capture_with_extra_files(
+        workspace_root: &Path,
+        content: &crate::workspace::ContentSnapshot,
+        extra_files: &[SemanticShadowExtraFile],
+    ) -> Result<Self> {
+        if content.paths.len().saturating_add(extra_files.len()) > SEMANTIC_SHADOW_MAX_FILES {
             bail!("semantic shadow exceeds the {SEMANTIC_SHADOW_MAX_FILES}-file bound");
+        }
+        let mut extra_paths = BTreeSet::new();
+        for extra in extra_files {
+            if content.paths.contains_key(extra.path.as_str()) {
+                bail!(
+                    "semantic shadow extra file collides with workspace path {}",
+                    extra.path.as_str()
+                );
+            }
+            if !extra_paths.insert(extra.path.as_str()) {
+                bail!(
+                    "semantic shadow contains repeated extra path {}",
+                    extra.path.as_str()
+                );
+            }
         }
         let directory = tempfile::Builder::new()
             .prefix("pb-semantic-shadow-")
@@ -90,6 +119,30 @@ impl SemanticShadowWorkspace {
                 .with_context(|| format!("failed to verify semantic shadow entry {relative}"))?;
             if Digest::of(&copied) != Digest::of(&bytes) {
                 bail!("semantic shadow copy verification failed for {relative}");
+            }
+        }
+        for extra in extra_files {
+            total_bytes = total_bytes
+                .checked_add(extra.bytes.len() as u64)
+                .context("semantic shadow byte count overflowed")?;
+            if total_bytes > SEMANTIC_SHADOW_MAX_BYTES {
+                bail!("semantic shadow exceeds the {SEMANTIC_SHADOW_MAX_BYTES}-byte bound");
+            }
+            let relative = extra.path.as_str();
+            let destination = directory.path().join(relative);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create semantic shadow parent for {relative}")
+                })?;
+            }
+            std::fs::write(&destination, &extra.bytes).with_context(|| {
+                format!("failed to write semantic shadow extra file {relative}")
+            })?;
+            let copied = std::fs::read(&destination).with_context(|| {
+                format!("failed to verify semantic shadow extra file {relative}")
+            })?;
+            if Digest::of(&copied) != Digest::of(&extra.bytes) {
+                bail!("semantic shadow extra-file verification failed for {relative}");
             }
         }
         let after = crate::workspace::ContentSnapshot::capture(workspace_root)?;

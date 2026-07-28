@@ -711,11 +711,15 @@ token.
 **Shipped Python v1 behavior.** If a real local backend exposes a tool schema that can edit or
 create a Python file, pb creates an exact verified shadow—even if the project has no Python file
 yet—and loads/primes exact-pinned Astral `ty` state
-before inference. Python 3.12, the host platform, first-party sources, bundled typeshed,
-configuration inputs, and dependency manifests identify the world. Each request gets an
+before inference. Python 3.12 is the fallback; when exactly one conventional project-local
+`.venv` or `venv` can be qualified, its `pyvenv.cfg` selects the supported Python version and pb
+copies bounded `.py`, `.pyi`, `.pth`, `py.typed`, and distribution-metadata inputs from its
+`site-packages` into the immutable shadow. The host platform, first-party sources, bundled typeshed,
+configuration inputs, dependency manifests, and this separate dependency-image digest identify the
+world. Ignored environment files are therefore covered without becoming repository files. Each request gets an
 independently writable Salsa database over shared frozen bytes; this avoids treating a read-only
-Salsa snapshot as a mutable overlay and ensures no project/type loading is deferred until token
-generation. Exact worlds use a bounded process cache and single flight, with at most one cold
+Salsa snapshot as a mutable overlay. Every captured dependency module is interned and type-primed
+before the request reaches token generation. Exact worlds use a bounded process cache and single flight, with at most one cold
 Python loader. Cancellation is polled while initiating or queued requests wait, and no model starts
 after cancellation. When Rust and Python are both reachable, Rust preparation completes first and
 the model starts only after both readiness receipts exist.
@@ -728,9 +732,14 @@ transaction. Finalization checks every non-deleted frozen first-party file plus 
 files and compares promoted diagnostic multisets against baseline debt. This catches promoted errors
 introduced into untouched in-project dependants by a changed or deleted public symbol. Preserved
 baseline suppressions remain baseline, while generated `ty: ignore` or `type: ignore` directives
-reject. `Any`, dynamic behavior, unpromoted diagnostics, and dependencies or dependants outside the
-frozen project remain unknown. Immediately before execution, pb reconstructs and replays the
-complete mutation through a fresh Python request database against the same live identity.
+reject. A complete captured static environment may prove a missing external import; resolved
+dependency source/stub shapes can participate in the same promoted type checks. Multiple local
+environments, path-injecting or symlinked layouts, native modules, `.pth` import hooks, absent
+environments, `Any`, dynamic behavior, unpromoted diagnostics, and dependants outside the frozen
+project remain partial or unknown. Without a complete qualified external search space, a missing
+absolute third-party import cannot veto generation. Immediately before execution, pb recaptures the
+dependency identity, reconstructs the mutation, and replays it through a fresh Python request
+database against the same frozen world.
 
 The syntax profiles are pinned Tree-sitter grammars for Rust, Python, TypeScript/TSX,
 JavaScript/JSX, HTML, and CSS. They require UTF-8 and reject error or missing nodes; HTML additionally

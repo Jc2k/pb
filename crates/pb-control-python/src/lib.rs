@@ -50,7 +50,7 @@ use walkdir::WalkDir;
 mod system;
 use system::PythonSystem;
 
-pub const PYTHON_LAYER_CONTRACT_VERSION: u32 = 1;
+pub const PYTHON_LAYER_CONTRACT_VERSION: u32 = 2;
 pub const TY_PROVIDER_VERSION: &str = "ty_0.0.6";
 const VIRTUAL_PROJECT_ROOT: &str = "/workspace";
 
@@ -63,6 +63,9 @@ pub struct PythonProjectConfig {
     pub first_party_roots: Vec<PathBuf>,
     /// Snapshotted dependency roots relative to `shadow_root` (for example `.venv/.../site-packages`).
     pub site_packages_roots: Vec<PathBuf>,
+    /// True only when the controller proved that the selected static external import search space
+    /// was captured completely. When false, missing absolute third-party imports remain unknown.
+    pub external_imports_complete: bool,
     pub python_version: String,
     pub python_platform: String,
     pub world_sha256: String,
@@ -153,6 +156,8 @@ pub struct PythonProjectWorld {
     factory: Arc<PythonDatabaseFactory>,
     baseline: Arc<BTreeMap<String, Vec<PythonDiagnostic>>>,
     first_party_files: Arc<BTreeMap<String, SystemPathBuf>>,
+    dependency_files: Arc<BTreeMap<String, SystemPathBuf>>,
+    promotion_policy: Arc<PythonPromotionPolicy>,
     request_epoch: Arc<()>,
 }
 
@@ -161,6 +166,10 @@ impl PythonProjectWorld {
         config.validate()?;
         let load_started = Instant::now();
         let image = FrozenImage::capture(&config)?;
+        let promotion_policy = Arc::new(PythonPromotionPolicy {
+            controlled_modules: image.controlled_modules.clone(),
+            external_imports_complete: config.external_imports_complete,
+        });
         let version = PythonVersion::from_str(&config.python_version)
             .map_err(|error| PythonLayerError::InvalidConfig(error.to_string()))?;
         let factory = Arc::new(PythonDatabaseFactory {
@@ -183,7 +192,19 @@ impl PythonProjectWorld {
                 ))
             })?;
             let diagnostics = diagnostic_records(&db, file, logical, check_file_unwrap(&db, file));
-            baseline.insert(logical.clone(), promoted(diagnostics));
+            baseline.insert(
+                logical.clone(),
+                promoted(diagnostics, promotion_policy.as_ref()),
+            );
+            primed_queries = primed_queries.saturating_add(1);
+        }
+        for (logical, path) in &image.dependency_files {
+            let file = system_path_to_file(&db, path).map_err(|error| {
+                PythonLayerError::ProviderUnavailable(format!(
+                    "failed to intern frozen Python dependency {logical}: {error}"
+                ))
+            })?;
+            let _ = check_file_unwrap(&db, file);
             primed_queries = primed_queries.saturating_add(1);
         }
         let prime_millis = elapsed_millis(prime_started);
@@ -221,6 +242,8 @@ impl PythonProjectWorld {
             factory,
             baseline: Arc::new(baseline),
             first_party_files: Arc::new(image.first_party_files),
+            dependency_files: Arc::new(image.dependency_files),
+            promotion_policy,
             request_epoch: Arc::new(()),
         })
     }
@@ -261,12 +284,21 @@ impl PythonProjectWorld {
             })?;
             let _ = check_file_unwrap(&db, file);
         }
+        for (logical, path) in self.dependency_files.iter() {
+            let file = system_path_to_file(&db, path).map_err(|error| {
+                PythonLayerError::ProviderUnavailable(format!(
+                    "failed to intern prepared Python dependency {logical}: {error}"
+                ))
+            })?;
+            let _ = check_file_unwrap(&db, file);
+        }
         Ok(PythonProjectRequestWorld {
             descriptor: self.descriptor.clone(),
             receipt: self.receipt.clone(),
             db,
             baseline: Arc::clone(&self.baseline),
             first_party_files: Arc::clone(&self.first_party_files),
+            promotion_policy: Arc::clone(&self.promotion_policy),
             applied_paths: BTreeSet::new(),
             request_epoch: Arc::clone(&self.request_epoch),
         })
@@ -279,6 +311,7 @@ pub struct PythonProjectRequestWorld {
     db: PythonDatabase,
     baseline: Arc<BTreeMap<String, Vec<PythonDiagnostic>>>,
     first_party_files: Arc<BTreeMap<String, SystemPathBuf>>,
+    promotion_policy: Arc<PythonPromotionPolicy>,
     applied_paths: BTreeSet<LogicalPath>,
     #[allow(dead_code)]
     request_epoch: Arc<()>,
@@ -385,12 +418,10 @@ impl PythonProjectRequestWorld {
         }
         let mut reports = BTreeMap::new();
         for (logical, file) in files {
-            let candidate = promoted(diagnostic_records(
-                &self.db,
-                file,
-                &logical,
-                check_file_unwrap(&self.db, file),
-            ));
+            let candidate = promoted(
+                diagnostic_records(&self.db, file, &logical, check_file_unwrap(&self.db, file)),
+                self.promotion_policy.as_ref(),
+            );
             let baseline = self.baseline.get(&logical).cloned().unwrap_or_default();
             let introduced = multiset_difference(&candidate, &baseline);
             reports.insert(
@@ -943,6 +974,8 @@ impl salsa::Database for PythonDatabase {}
 struct FrozenImage {
     fs: MemoryFileSystem,
     first_party_files: BTreeMap<String, SystemPathBuf>,
+    dependency_files: BTreeMap<String, SystemPathBuf>,
+    controlled_modules: BTreeSet<String>,
 }
 
 impl FrozenImage {
@@ -955,6 +988,8 @@ impl FrozenImage {
             config.first_party_roots.clone()
         };
         let mut first_party_files = BTreeMap::new();
+        let mut dependency_files = BTreeMap::new();
+        let mut controlled_modules = BTreeSet::new();
         let mut files = 0usize;
         let mut bytes = 0usize;
         for entry in WalkDir::new(&config.shadow_root).follow_links(false) {
@@ -986,14 +1021,39 @@ impl FrozenImage {
             let target = root.join(&logical);
             fs.write_file_all(&target, contents.as_bytes())?;
             if (logical.ends_with(".py") || logical.ends_with(".pyi"))
-                && first_roots.iter().any(|first| relative.starts_with(first))
+                && config
+                    .site_packages_roots
+                    .iter()
+                    .any(|dependency| relative.starts_with(dependency))
             {
+                dependency_files.insert(logical.clone(), target.clone());
+            }
+            if (logical.ends_with(".py") || logical.ends_with(".pyi"))
+                && first_roots.iter().any(|first| relative.starts_with(first))
+                && !config
+                    .site_packages_roots
+                    .iter()
+                    .any(|dependency| relative.starts_with(dependency))
+                && !relative
+                    .components()
+                    .any(|component| component.as_os_str().to_str() == Some("site-packages"))
+            {
+                for first in &first_roots {
+                    let Ok(module_path) = relative.strip_prefix(first) else {
+                        continue;
+                    };
+                    if let Some(module) = top_level_module(module_path) {
+                        controlled_modules.insert(module);
+                    }
+                }
                 first_party_files.insert(logical, target);
             }
         }
         Ok(Self {
             fs,
             first_party_files,
+            dependency_files,
+            controlled_modules,
         })
     }
 }
@@ -1030,7 +1090,16 @@ fn diagnostic_records(
         .collect()
 }
 
-fn promoted(diagnostics: Vec<PythonDiagnostic>) -> Vec<PythonDiagnostic> {
+#[derive(Clone, Debug)]
+struct PythonPromotionPolicy {
+    controlled_modules: BTreeSet<String>,
+    external_imports_complete: bool,
+}
+
+fn promoted(
+    diagnostics: Vec<PythonDiagnostic>,
+    policy: &PythonPromotionPolicy,
+) -> Vec<PythonDiagnostic> {
     const PROMOTED: &[&str] = &[
         "invalid-argument-type",
         "invalid-assignment",
@@ -1041,8 +1110,25 @@ fn promoted(diagnostics: Vec<PythonDiagnostic>) -> Vec<PythonDiagnostic> {
     ];
     diagnostics
         .into_iter()
-        .filter(|diagnostic| PROMOTED.contains(&diagnostic.code.as_str()))
+        .filter(|diagnostic| {
+            PROMOTED.contains(&diagnostic.code.as_str())
+                && (diagnostic.code != "unresolved-import"
+                    || policy.external_imports_complete
+                    || import_is_controlled(diagnostic, policy))
+        })
         .collect()
+}
+
+fn import_is_controlled(diagnostic: &PythonDiagnostic, policy: &PythonPromotionPolicy) -> bool {
+    let import = diagnostic.source_excerpt.trim();
+    if import.starts_with('.') || diagnostic.message.contains("module `.") {
+        return true;
+    }
+    let top_level = import
+        .split(['.', ' ', '\t', '\n', ','])
+        .next()
+        .unwrap_or_default();
+    policy.controlled_modules.contains(top_level)
 }
 
 fn multiset_difference(
@@ -1224,6 +1310,15 @@ fn slash_path(path: &Path) -> Result<String, PythonLayerError> {
     Ok(text.replace('\\', "/"))
 }
 
+fn top_level_module(path: &Path) -> Option<String> {
+    let first = path.components().next()?.as_os_str().to_str()?;
+    let module = first
+        .strip_suffix(".pyi")
+        .or_else(|| first.strip_suffix(".py"))
+        .unwrap_or(first);
+    (!module.is_empty() && module != "__init__").then(|| module.to_string())
+}
+
 fn is_python_semantic_input(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
@@ -1269,6 +1364,7 @@ mod tests {
             shadow_root: root.to_path_buf(),
             first_party_roots: Vec::new(),
             site_packages_roots: Vec::new(),
+            external_imports_complete: false,
             python_version: "3.12".to_string(),
             python_platform: "linux".to_string(),
             world_sha256: "1".repeat(64),
@@ -1276,6 +1372,13 @@ mod tests {
             dependency_sha256: "3".repeat(64),
             max_files: 1_000,
             max_bytes: 8 * 1024 * 1024,
+        }
+    }
+
+    fn qualified_config(root: &Path) -> PythonProjectConfig {
+        PythonProjectConfig {
+            external_imports_complete: true,
+            ..config(root)
         }
     }
 
@@ -1315,6 +1418,24 @@ mod tests {
                 .introduced
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn unresolved_absolute_import_stays_unknown_without_a_qualified_environment() {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "main.py", "value = 1\n");
+        let world = PythonProjectWorld::load_and_prime(config(root.path())).unwrap();
+        let mut request = world
+            .snapshot_for_request(&world.descriptor().world)
+            .unwrap();
+        let reports = request
+            .check_candidates(&BTreeMap::from([(
+                LogicalPath::parse("main.py".to_string()).unwrap(),
+                "import package_that_is_not_in_the_frozen_world\nvalue = 1\n".to_string(),
+            )]))
+            .unwrap();
+
+        assert!(reports["main.py"].introduced.is_empty());
     }
 
     #[test]
@@ -1364,7 +1485,7 @@ mod tests {
     fn speculative_new_modules_do_not_leak_between_candidate_checks() {
         let root = tempfile::tempdir().unwrap();
         write(root.path(), "main.py", "value = 1\n");
-        let world = PythonProjectWorld::load_and_prime(config(root.path())).unwrap();
+        let world = PythonProjectWorld::load_and_prime(qualified_config(root.path())).unwrap();
         let mut request = world
             .snapshot_for_request(&world.descriptor().world)
             .unwrap();
@@ -1402,7 +1523,7 @@ mod tests {
     fn streaming_rollback_clears_a_finalized_branch_semantic_overlay() {
         let root = tempfile::tempdir().unwrap();
         write(root.path(), "main.py", "value = 1\n");
-        let world = PythonProjectWorld::load_and_prime(config(root.path())).unwrap();
+        let world = PythonProjectWorld::load_and_prime(qualified_config(root.path())).unwrap();
         let request = world
             .snapshot_for_request(&world.descriptor().world)
             .unwrap();

@@ -245,19 +245,27 @@ the bounded process cache.
 
 When a real local backend can edit or create Python, pb similarly prepares a pinned native Astral
 `ty` world before the model starts, including for the first Python file in a project. The shipped
-default targets Python 3.12 on the host platform and includes
-the exact first-party project plus bundled typeshed. It does not discover a live interpreter,
-virtual environment, external site-packages tree, language server, or package index. Preparation is
-local, process-cached, single-flight, and automatic; at most one cold Python world is built at a
-time, waiters poll cancellation every 100 ms, and a cancelled request never starts inference.
+fallback targets Python 3.12 on the host platform and includes the exact first-party project plus
+bundled typeshed. By default pb also looks for `.venv` and `venv` at the project root and beside
+Python project manifests. If exactly one environment has a safe conventional layout, pb derives its
+supported Python version from `pyvenv.cfg` and copies bounded `.py`, `.pyi`, `.pth`, `py.typed`, and
+selected distribution metadata into the temporary semantic shadow. Git-ignored environment files
+are included in a separate dependency identity. pb does not execute the interpreter, follow
+dependency symlinks, apply path-injecting `.pth` files, contact a language server, or use a package
+index. Preparation is local, process-cached, single-flight, and automatic; at most one cold Python
+world is built at a time, waiters poll cancellation every 100 ms, and a cancelled request never
+starts inference. Every captured dependency module is type-primed before inference, and the
+dependency identity is recaptured after priming and immediately before execution.
 Request-local overlays apply created, modified, and deleted candidate files together, and the
 completed mutation is replayed through a fresh database before execution. The current guarantee is
 narrow: complete generated string-plus-integer literal additions and selected newly introduced `ty`
 diagnostics may be rejected. At closure, pb checks every non-deleted frozen first-party file plus
 newly created Python files, so a changed or deleted public symbol can be rejected when it breaks an
-untouched in-project dependant. `Any`, dynamic behavior, external dependants, unqualified external
-dependencies, and unpromoted diagnostics remain unknown. There is no environment toggle for this
-behavior.
+untouched in-project dependant. A complete static local environment can also prove an invalid
+external import or a dependency callable-shape mismatch. Missing imports remain unknown when no
+environment is qualified or when multiple environments, native modules, import hooks, symlinks, or
+path injection make its search space partial. `Any`, dynamic behavior, external dependants, and
+unpromoted diagnostics remain unknown. There is no environment toggle for this behavior.
 
 A compatible Qwen3-Coder-Next affine-Q4 graph processes fresh suffixes of
 at least 32 tokens with true layer-major Metal prefill. The live Metal working-set snapshot chooses

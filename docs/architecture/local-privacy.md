@@ -74,8 +74,13 @@ persistence.
 Python-edit-capable real-backend requests use the same local-only lifecycle. The controller creates
 an ephemeral verified shadow, and `pb-control-python` copies relevant Python/stub/package-marker
 bytes into a frozen in-memory filesystem before running exact-pinned Astral `ty` internals in the pb
-process. The current profile uses bundled typeshed and does not discover or contact a live LSP,
-interpreter, package index, or external virtual environment. Generated overlays, diagnostic debt,
+process. The controller also inspects conventional project-local `.venv`/`venv` directories—even
+when Git ignores them—and, for one unambiguous safe layout, copies bounded Python source, stubs,
+package markers, selected distribution metadata, and `pyvenv.cfg` into that same temporary shadow.
+It never executes the environment's interpreter, processes dynamic path injection, contacts a live
+LSP or package index, or reads an out-of-project environment. Dependency bytes and identities are
+used only by the local analyzer, are type-primed before inference, and are recaptured before
+execution; they are not added to prompts or durable events. Generated overlays, diagnostic debt,
 and request databases stay in memory; bounded process caches retain only local analyzer worlds and
 durable events remain content-free. A cancelled request may leave its one already-started local
 Python preparation worker finishing into that bounded cache, but adds no network or durable source
