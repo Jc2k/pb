@@ -428,7 +428,7 @@ The runtime applies these boundaries before a result can become evidence:
 | --- | --- |
 | File reads and discovery | `read_file` accepts bounded UTF-8 files; glob, regex, and skill discovery have time/input ceilings; results are prompt-bounded with explicit continuation or failure rather than silent partial authority. |
 | File mutation | Existing files require an exact content fingerprint from the bytes actually read. Create and replace use synced temporary files and atomic no-clobber/replace operations; stale concurrent edits fail. `edit_file` requires one unique match. Real local backends prepare the exact virtual result through the control collar and refuse to close or execute a supported Rust, Python, TypeScript/TSX, JavaScript/JSX, HTML, or CSS mutation unless the pinned complete-file parser accepts it. Rust- and Python-edit-capable requests additionally require their ready exact native worlds before inference and independent final replay; only promoted exact contradictions can veto, while partial or dynamic facts remain unknown. Unsupported extensions retain the ordinary executor checks and are not reported as syntax constrained. For an initial Python or Python-stub modify whose complete controller-observed file consumes at most half the bounded replacement allowance, pb exposes only atomic `replace_file`; this avoids indentation-fragment errors while requiring the model to preserve unrelated bytes. Other languages, larger or range-only observations, and diagnostic repair retain exact-edit behavior. Diff events are bounded and identify truncation. |
-| Patch, move, and remove | FlashMoe `apply_patch` accepts a bounded canonical text-only unified-diff subset: exact offsets, counts, context and deletion bytes; LF; unquoted `a/` and `b/` paths; optional matching `diff --git`; and exact `100644` create/delete metadata. It rejects recount-dependent hunks, mode changes, renames, copies, timestamps, index metadata, and binary patches, applies the patch to an immutable controller snapshot in memory, validates every supported resulting file, rechecks live base hashes, and then requires exact `git apply --check` parity before publication. The llama.cpp compatibility path retains its broader Git/recount behavior and is never a fallback after collar rejection. `mv` moves only a file or symlink and cannot overwrite. `rm` operates on the final filesystem entry and removes only a file, symlink, or empty directory; recursive directory mutation is not an agent capability. |
+| Patch, move, and remove | FlashMoe `apply_patch` accepts a bounded canonical text-only unified-diff subset: exact offsets, counts, context and deletion bytes; LF; unquoted `a/` and `b/` paths; optional matching `diff --git`; and exact `100644` create/delete metadata. It rejects recount-dependent hunks, mode changes, renames, copies, timestamps, index metadata, and binary patches, applies the patch to an immutable controller snapshot in memory, validates every supported resulting file, rechecks live base hashes, and then requires exact `git apply --check` parity before publication. When an accepted work unit binds one target, the collar rejects any patch file outside that target; a range-only observation further confines every old-side hunk to observed bytes. The llama.cpp compatibility path retains its broader Git/recount behavior and is never a fallback after collar rejection. `mv` moves only a file or symlink and cannot overwrite. `rm` operates on the final filesystem entry and removes only a file, symlink, or empty directory; recursive directory mutation is not an agent capability. |
 | Configured tasks | `run_task` executes against an isolated snapshot, rejects Git-control or undeclared-path changes, bounds promoted path/file totals, validates symlinks, stages every output, and rolls back the destination set if promotion fails. It never earns named-check credit. |
 | Commands and checks | Host and managed commands drain stdout/stderr concurrently, cap combined output, have explicit timeouts, observe user cancellation, and stop the owned process group or managed exec. `run_command` defaults to 120 seconds and is capped at 600; configured checks/tasks use their validated timeout. |
 | Public research | Every URL and redirect is restricted to HTTP(S), resolved before connection, rejected if any answer is private/special-use, and pinned to the validated public address. Proxies are bypassed. Bodies are capped and oversized chunked responses fail instead of being returned as complete. |
@@ -457,7 +457,11 @@ a new invocation identifier cannot itself alter the checkpoint's refs fingerprin
 The workflow budgets stage steps, model invocations, generated tokens, advisory calls, plan cycles,
 and repair cycles. It also detects repeated no-progress operations against unchanged state and
 stops loops deterministically. A request-level step ceiling narrows every model-driven stage; the
-lower of that ceiling and the compiled workflow policy is cumulative across validation attempts.
+lower of that ceiling and the compiled workflow policy is cumulative within a plan or repair
+cycle. Each accepted cycle grants one additional stage-sized cumulative tranche while each model
+invocation remains capped to one tranche. An implementation-requested replan consumes the same
+bounded plan-cycle allowance as a critic-requested revision, so replanning cannot reset or bypass
+the workflow-wide invocation and token budgets.
 Work-unit target paths are bound before loop signatures are calculated, so omitting or redundantly
 supplying the hidden fixed path cannot disguise an identical action. An exact deterministic read
 cache hit remains fully preserved in durable evidence, but the next prompt receives only a compact
@@ -614,10 +618,13 @@ outcome remains unknown rather than being displayed as success.
 
 An exact active small-file observation may satisfy read-before-write only while its current
 fingerprint and complete prompt bytes remain valid. For an oversized UTF-8 Modify work unit, pb may
-instead select a small set of task-relevant line windows using exact or one-edit task-term matches.
-It admits those windows only when a rare or multi-term match provides a useful anchor, records their
-exact byte hashes, and exposes only target-bound `edit_file`; the edit's old text must lie wholly
-inside an included byte window. A work-unit observation is retained whenever it survives the real
+instead select a small set of task-relevant line windows using exact, identifier-aware, one-edit,
+or narrow UI-control synonym matches. It admits those windows only when a rare or multi-term match
+provides a useful anchor, records their exact byte hashes, and exposes target-bound `edit_file` and
+canonical `apply_patch`. An edit's old text and every patch hunk's complete old-side range must lie
+wholly inside an included byte window. A range-bound patch may carry separated hunks, but the
+generation collar and executor both bind every hunk to the active accepted-plan path; it cannot use
+one work unit to touch another file. A work-unit observation is retained whenever it survives the real
 context preflight; the lower prompt-share heuristic is reserved for optional multi-file planning
 and review batches. This avoids falling back from a viable range to an impossible complete-file
 read on a large accepted target. A failed-diagnostic range has the same edit boundary and is

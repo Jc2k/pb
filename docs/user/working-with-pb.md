@@ -67,7 +67,9 @@ protocol. Independent tool calls can share one model response, while dependent s
 mutation/check batches are rejected before any call runs.
 
 For a large accepted Modify target, pb can provide a small, task-relevant, fingerprinted range and
-open the exact-path edit action immediately. Replayed reads remain available in the session's
+open exact-path mutation actions immediately. One canonical patch can update several separated
+hunks when every old-side hunk remains inside the shown ranges; it cannot touch another path.
+Replayed reads remain available in the session's
 technical evidence, but the agent receives a compact replay receipt instead of another full copy of
 the same file contents; repeating that exact read is then stopped before it runs again.
 
@@ -85,8 +87,10 @@ glob, search, or read first; the next turn incorporates those exact results.
 
 During implementation, pb exposes one accepted-plan file operation at a time and inserts that
 controller-owned target into the action before validation. For a large existing text file, pb can
-also place a few task-relevant, fingerprinted line windows into context and allow only an edit whose
-old text is inside those windows. If no confident task anchor exists, the normal read flow remains
+also place a few task-relevant, fingerprinted line windows into context and allow an exact edit or
+multi-hunk patch only within those windows. Identifier forms such as `branchPicker`, `branch-picker`,
+and nearby `<select>` controls can contribute conservative anchors. If no confident task anchor
+exists, the normal read flow remains
 available. A failed path lookup can show similarly named existing files, but pb never silently
 changes the requested path. Consecutive new files do not share one model output budget. If
 constrained generation reaches a file-payload boundary well before its token

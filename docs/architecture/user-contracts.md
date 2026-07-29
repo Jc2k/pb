@@ -108,7 +108,9 @@ also rejects promoted local impossibilities such as an unmatched closer. It incr
 new logical payload bytes, rolls candidate branches back to bounded checkpoints, and checks partial
 canonical hunk additions/context before their newline; it is not a claim that every accepted prefix
 is grammar-extendable. Existing-file and patch validation is bound to the exact controller-observed
-base; stale bytes fail rather than being patched approximately.
+base; stale bytes fail rather than being patched approximately. A controller-bound work unit also
+binds every patch file to its one accepted path. If the observation covered only ranges, every
+old-side hunk must remain wholly inside one of those exact byte ranges.
 
 For a real local backend that may edit Rust in a Cargo project, pb automatically prepares a pinned
 rust-analyzer world before inference. Immutable external dependency and sysroot facts can constrain

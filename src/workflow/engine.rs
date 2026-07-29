@@ -33,21 +33,22 @@ pub struct WorkflowUsage {
 }
 
 impl WorkflowCounters {
-    fn record(
-        &mut self,
+    pub(crate) fn stage_step_limit(
+        &self,
         stage: WorkflowStage,
-        usage: WorkflowUsage,
-        limits: WorkflowLimits,
+        base_stage_steps: usize,
         earned_work_unit_progress: usize,
-    ) -> Option<WorkflowOutcome> {
-        let stage_steps = self.stage_steps.entry(stage).or_default();
-        *stage_steps = stage_steps.saturating_add(usage.stage_steps);
-        self.model_invocations = self
-            .model_invocations
-            .saturating_add(usage.model_invocations);
-        self.generated_tokens = self.generated_tokens.saturating_add(usage.generated_tokens);
-        self.advisory_calls = self.advisory_calls.saturating_add(usage.advisory_calls);
-        let stage_step_limit = limits.stage_steps.saturating_add(
+    ) -> usize {
+        let cycle_count = match stage {
+            WorkflowStage::Planning
+            | WorkflowStage::PlanRevision
+            | WorkflowStage::PlanReview
+            | WorkflowStage::Implementing => self.plan_cycles,
+            WorkflowStage::Repairing | WorkflowStage::CodeReview => self.repair_cycles,
+            _ => 0,
+        };
+        let cycle_budget = base_stage_steps.saturating_mul(cycle_count.saturating_add(1));
+        cycle_budget.saturating_add(
             if matches!(
                 stage,
                 WorkflowStage::Implementing | WorkflowStage::Repairing
@@ -56,7 +57,25 @@ impl WorkflowCounters {
             } else {
                 0
             },
-        );
+        )
+    }
+
+    fn record(
+        &mut self,
+        stage: WorkflowStage,
+        usage: WorkflowUsage,
+        limits: WorkflowLimits,
+        earned_work_unit_progress: usize,
+    ) -> Option<WorkflowOutcome> {
+        let stage_step_limit =
+            self.stage_step_limit(stage, limits.stage_steps, earned_work_unit_progress);
+        let stage_steps = self.stage_steps.entry(stage).or_default();
+        *stage_steps = stage_steps.saturating_add(usage.stage_steps);
+        self.model_invocations = self
+            .model_invocations
+            .saturating_add(usage.model_invocations);
+        self.generated_tokens = self.generated_tokens.saturating_add(usage.generated_tokens);
+        self.advisory_calls = self.advisory_calls.saturating_add(usage.advisory_calls);
         if *stage_steps > stage_step_limit {
             Some(WorkflowOutcome::StepLimit)
         } else if self.model_invocations > limits.total_model_invocations {
@@ -343,6 +362,13 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
                 "request replan",
             )?;
             required("replan reason", reason)?;
+            if run.counters.plan_cycles >= run.policy.limits.plan_cycles {
+                run.stage = WorkflowStage::Failed;
+                run.outcome = Some(WorkflowOutcome::PlanCyclesExhausted);
+                run.blocked_reason = Some("plan revision cycle limit exhausted".to_string());
+                return Ok(run);
+            }
+            run.counters.plan_cycles = run.counters.plan_cycles.saturating_add(1);
             if let Some(planning_snapshot) = planning_snapshot {
                 run.planning_snapshot = Some(planning_snapshot);
             }
@@ -917,6 +943,61 @@ mod tests {
         .unwrap();
         assert_eq!(run.stage, WorkflowStage::PlanRevision);
         assert_eq!(run.counters.plan_cycles, 1);
+    }
+
+    #[test]
+    fn implementation_replans_consume_cycles_and_refresh_stage_step_allowance() {
+        let mut run = run();
+        let plan = plan();
+        run.apply(WorkflowEvent::PlanSubmitted { plan: plan.clone() })
+            .unwrap();
+        run.apply(WorkflowEvent::UsageRecorded {
+            usage: WorkflowUsage {
+                stage_steps: run.policy.limits.stage_steps,
+                ..WorkflowUsage::default()
+            },
+        })
+        .unwrap();
+        run.apply(WorkflowEvent::PlanReviewSubmitted {
+            review: plan_review(&plan),
+        })
+        .unwrap();
+
+        run.apply(WorkflowEvent::ReplanRequested {
+            reason: "the accepted path cannot satisfy the requirement".to_string(),
+            planning_snapshot: None,
+        })
+        .unwrap();
+        assert_eq!(run.stage, WorkflowStage::Planning);
+        assert_eq!(run.counters.plan_cycles, 1);
+
+        run.apply(WorkflowEvent::PlanSubmitted { plan: plan.clone() })
+            .unwrap();
+        run.apply(WorkflowEvent::UsageRecorded {
+            usage: WorkflowUsage {
+                stage_steps: run.policy.limits.stage_steps,
+                ..WorkflowUsage::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(run.stage, WorkflowStage::PlanReview);
+        assert_eq!(
+            run.counters.stage_steps[&WorkflowStage::PlanReview],
+            run.policy.limits.stage_steps * 2
+        );
+        run.apply(WorkflowEvent::PlanReviewSubmitted {
+            review: plan_review(&plan),
+        })
+        .unwrap();
+
+        run.counters.plan_cycles = run.policy.limits.plan_cycles;
+        run.apply(WorkflowEvent::ReplanRequested {
+            reason: "another material plan defect".to_string(),
+            planning_snapshot: None,
+        })
+        .unwrap();
+        assert_eq!(run.stage, WorkflowStage::Failed);
+        assert_eq!(run.outcome, Some(WorkflowOutcome::PlanCyclesExhausted));
     }
 
     #[test]

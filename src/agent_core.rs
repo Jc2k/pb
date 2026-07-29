@@ -4755,11 +4755,11 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
         ),
         builtin_tool(
             "apply_patch",
-            "Apply a canonical text-only unified diff. Use exact hunk counts and offsets, LF line endings, a/ and b/ paths, and exact current context. New and deleted files require the matching `new file mode 100644` or `deleted file mode 100644` line. Omit index hashes, mode changes, renames, copies, quoted paths, timestamps, binary patches, and recount-dependent hunks.",
-            object_schema(
+            "Apply a canonical text-only unified diff. Use exact hunk counts and offsets, LF line endings, a/ and b/ paths, and exact current context. New and deleted files require the matching `new file mode 100644` or `deleted file mode 100644` line. Omit index hashes, mode changes, renames, copies, quoted paths, timestamps, binary patches, and recount-dependent hunks. When this is the final accepted work unit, the exposed completion field can close implementation without another model turn.",
+            mutation_schema_with_inline_completion(object_schema(
                 [string_property("patch", "Unified diff patch text.")],
                 ["patch"],
-            ),
+            )),
         ),
         builtin_tool(
             "mv",
@@ -5522,11 +5522,13 @@ fn scope_tools_to_work_unit(
             &["read_file", "request_replan"][..]
         }
         WorkUnitState::DiagnosticRepairReady => {
-            &["replace_file", "edit_file", "request_replan"][..]
+            &["replace_file", "edit_file", "apply_patch", "request_replan"][..]
         }
         WorkUnitState::MutationReady => match unit.operation {
             PlannedChange::Create => &["write_file", "request_replan"],
-            PlannedChange::Modify => &["replace_file", "edit_file", "request_replan"],
+            PlannedChange::Modify => {
+                &["replace_file", "edit_file", "apply_patch", "request_replan"]
+            }
             PlannedChange::Delete => &["rm", "request_replan"],
         },
         WorkUnitState::BlockedForReplan => &["request_replan"],
@@ -7231,7 +7233,7 @@ fn run_agent_steps(
                         unit.id, unit.path, diagnostic_obligations
                     ),
                     (_, crate::workflow::WorkUnitState::DiagnosticRepairReady) => format!(
-                        "Harness diagnostic repair unit {}: repair only {} with target-bound replace_file or edit_file. Address every failure from the latest diagnostic in one mutation; a partial repair consumes another evidence-and-repair cycle. This repair authority does not reopen any other accepted-plan path. Do not request replan when this exact path can satisfy the listed failures.{}",
+                        "Harness diagnostic repair unit {}: repair only {} with a target-bound mutation tool. Address every failure from the latest diagnostic in one mutation; apply_patch can carry separated hunks when bounded ranges are shown. A partial repair consumes another evidence-and-repair cycle. This repair authority does not reopen any other accepted-plan path. Do not request replan when this exact path can satisfy the listed failures.{}",
                         unit.id, unit.path, diagnostic_obligations
                     ),
                     (
@@ -7241,10 +7243,21 @@ fn run_agent_steps(
                         "Harness work unit {}: create {} now with one complete atomic write_file payload. pb binds this exact target, so do not include a path. If the full implementation will not fit, write the smallest syntactically loadable scaffold that preserves a later edit path.",
                         unit.id, unit.path
                     ),
-                    (operation, crate::workflow::WorkUnitState::MutationReady) => format!(
-                        "Harness work unit {}: perform only the target-bound {:?} mutation for {}. The observed target fingerprint remains the write authority.",
-                        unit.id, operation, unit.path
-                    ),
+                    (operation, crate::workflow::WorkUnitState::MutationReady) => {
+                        let ranged_guidance = gate_state
+                            .borrow()
+                            .controller_observation_for_path(&unit.path)
+                            .is_some_and(|receipt| {
+                                receipt.coverage
+                                    == crate::workflow::ObservationCoverage::Ranges
+                            })
+                            .then_some(" The controller showed bounded ranges rather than the complete file. apply_patch can update several separated hunks, but every old-side hunk must remain wholly inside those ranges. The accepted Modify authority covers requirement-related supporting code throughout this same path: multiple distant hunks are not a scope change and do not justify replanning. Request replan only when satisfying the user actually requires another path or change type.")
+                            .unwrap_or_default();
+                        format!(
+                            "Harness work unit {}: perform only the target-bound {:?} mutation for {}. The observed target fingerprint remains the write authority.{ranged_guidance}",
+                            unit.id, operation, unit.path
+                        )
+                    }
                     (_, crate::workflow::WorkUnitState::BlockedForReplan) => format!(
                         "Harness work unit {} is blocked because {} no longer has the filesystem state required for {:?}. Request replan instead of mutating another path.",
                         unit.id, unit.path, unit.operation
@@ -7345,7 +7358,10 @@ fn run_agent_steps(
             {
                 if receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
                     scoped_tools.retain(|tool| {
-                        matches!(tool.name.as_str(), "edit_file" | "request_replan")
+                        matches!(
+                            tool.name.as_str(),
+                            "edit_file" | "apply_patch" | "request_replan"
+                        )
                     });
                 } else {
                     let _ = prefer_atomic_replace_for_small_python_observation(
@@ -12553,17 +12569,10 @@ fn run_delivery_workflow(
             checkpoint_delivery(&run, sink)?;
         }
         let consumed_stage_steps = run.counters.stage_steps.get(&stage).copied().unwrap_or(0);
-        let stage_step_limit = base_stage_step_limit.saturating_add(
-            if matches!(
-                stage,
-                crate::workflow::WorkflowStage::Implementing
-                    | crate::workflow::WorkflowStage::Repairing
-            ) {
-                run.work_units.progress_credited_units.len()
-            } else {
-                0
-            },
-        );
+        let earned_work_unit_progress = run.work_units.progress_credited_units.len();
+        let stage_step_limit =
+            run.counters
+                .stage_step_limit(stage, base_stage_step_limit, earned_work_unit_progress);
         if consumed_stage_steps >= stage_step_limit {
             run.apply(crate::workflow::WorkflowEvent::Failed {
                 outcome: crate::workflow::WorkflowOutcome::StepLimit,
@@ -12614,7 +12623,20 @@ fn run_delivery_workflow(
         }
         let mut contract =
             crate::workflow::StageContract::strict(stage, policy.limits, args.max_tokens)?;
-        contract.max_steps = stage_step_limit.saturating_sub(consumed_stage_steps);
+        let current_cycle_step_limit = base_stage_step_limit.saturating_add(
+            if matches!(
+                stage,
+                crate::workflow::WorkflowStage::Implementing
+                    | crate::workflow::WorkflowStage::Repairing
+            ) {
+                earned_work_unit_progress.min(crate::workflow::MAX_WORK_UNIT_PROGRESS_CREDITS)
+            } else {
+                0
+            },
+        );
+        contract.max_steps = stage_step_limit
+            .saturating_sub(consumed_stage_steps)
+            .min(current_cycle_step_limit);
         if stage == crate::workflow::WorkflowStage::CodeReview {
             let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
             if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
@@ -18398,16 +18420,39 @@ fn task_line_windows(task: &str, text: &str, total_lines: usize) -> Vec<(usize, 
     }
 
     fn words(value: &str) -> Vec<String> {
-        value
-            .split(|character: char| !character.is_ascii_alphanumeric())
-            .map(str::to_ascii_lowercase)
-            .filter(|word| !word.is_empty())
-            .collect()
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut previous_was_lowercase = false;
+        for character in value.chars() {
+            if !character.is_ascii_alphanumeric() {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+                previous_was_lowercase = false;
+                continue;
+            }
+            if character.is_ascii_uppercase() && previous_was_lowercase && !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            current.push(character.to_ascii_lowercase());
+            previous_was_lowercase = character.is_ascii_lowercase();
+        }
+        if !current.is_empty() {
+            words.push(current);
+        }
+        words
     }
 
     fn match_quality(term: &str, candidate: &str) -> usize {
         if term == candidate {
             return 3;
+        }
+        if matches!(
+            (term, candidate),
+            ("selector", "select" | "picker" | "dropdown")
+                | ("select" | "picker" | "dropdown", "selector")
+        ) {
+            return 2;
         }
         if term.len() >= 5
             && candidate.len() >= 5
@@ -18465,7 +18510,7 @@ fn task_line_windows(task: &str, text: &str, total_lines: usize) -> Vec<(usize, 
         .filter_map(|(line, line_matches)| {
             let confident = line_matches
                 .iter()
-                .any(|(term_index, quality)| *quality >= 2 && frequencies[*term_index] <= 12)
+                .any(|(term_index, quality)| *quality >= 2 && frequencies[*term_index] <= 24)
                 || line_matches.len() >= 2;
             confident.then(|| {
                 let score = line_matches
@@ -18485,7 +18530,7 @@ fn task_line_windows(task: &str, text: &str, total_lines: usize) -> Vec<(usize, 
         if selected.iter().all(|existing| existing.abs_diff(line) > 32) {
             selected.push(line);
         }
-        if selected.len() >= 4 {
+        if selected.len() >= 8 {
             break;
         }
     }
@@ -18794,7 +18839,12 @@ fn maybe_inject_controller_read_observation(
     );
     apply_mutation_payload_limit(&mut candidate_tools, boosted_max_tokens(args));
     if candidate.receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
-        candidate_tools.retain(|tool| matches!(tool.name.as_str(), "edit_file" | "request_replan"));
+        candidate_tools.retain(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "edit_file" | "apply_patch" | "request_replan"
+            )
+        });
     } else {
         let _ = prefer_atomic_replace_for_small_python_observation(
             &mut candidate_tools,
@@ -19513,6 +19563,12 @@ fn run_tool(
                 context.request,
                 changed_paths.iter().map(String::as_str),
             )?;
+            ensure_patch_within_controller_observations(
+                context.gate_state,
+                patch,
+                &changed_paths,
+                workspace_root,
+            )?;
             let mut snapshot_entries = Vec::new();
             for path in &changed_paths {
                 let resolved = resolve_workspace_path(workspace_root, path, false)?;
@@ -19628,7 +19684,11 @@ fn run_tool(
                 timestamp_ms: Some(now_millis()),
             });
             context.gate_state.borrow_mut().record_content_mutation();
-            Ok(format!("applied patch to {}", changed_paths.join(", ")))
+            Ok(mutation_result_with_inline_completion(
+                format!("applied patch to {}", changed_paths.join(", ")),
+                arguments,
+                context,
+            ))
         }
         "mv" => {
             let source = arguments
@@ -21357,6 +21417,81 @@ fn ensure_edit_within_controller_observation(
     )
 }
 
+fn ensure_patch_within_controller_observations(
+    gate_state: &RefCell<GateState>,
+    patch: &str,
+    changed_paths: &[String],
+    workspace_root: &Path,
+) -> Result<()> {
+    let hunks = parse_patch_hunk_diagnostics(patch);
+    let state = gate_state.borrow();
+    for path in changed_paths {
+        let Some(receipt) = state.controller_observation_for_path(path) else {
+            continue;
+        };
+        if receipt.coverage != crate::workflow::ObservationCoverage::Ranges {
+            continue;
+        }
+        let path_hunks = hunks
+            .iter()
+            .filter(|hunk| hunk.path == *path)
+            .collect::<Vec<_>>();
+        if path_hunks.is_empty() {
+            bail!("apply_patch did not declare a textual hunk for range-observed path '{path}'");
+        }
+        let resolved = resolve_workspace_path(workspace_root, path, true)?;
+        let existing = read_bounded_utf8_file(
+            &resolved,
+            MAX_READ_FILE_BYTES,
+            "range-observed patch target",
+        )?;
+        for hunk in path_hunks {
+            if hunk.old_count == 0 {
+                bail!(
+                    "apply_patch cannot insert without old-side context into range-observed path '{path}'"
+                );
+            }
+            let (start, end) = old_hunk_byte_range(&existing, hunk.expected_line, hunk.old_count)
+                .with_context(|| {
+                format!(
+                    "apply_patch old-side range {}+{} is outside '{path}'",
+                    hunk.expected_line, hunk.old_count
+                )
+            })?;
+            if !receipt
+                .included_ranges
+                .iter()
+                .any(|range| start >= range.start_byte && end <= range.end_byte)
+            {
+                bail!(
+                    "apply_patch hunk at {path}:{} falls outside the controller-observed ranges; gather a targeted read_file range before editing that location",
+                    hunk.expected_line
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn old_hunk_byte_range(text: &str, start_line: usize, old_count: usize) -> Option<(usize, usize)> {
+    if start_line == 0 || old_count == 0 {
+        return None;
+    }
+    let mut offsets = Vec::new();
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset = offset.saturating_add(line.len());
+        offsets.push((start, offset));
+    }
+    if offsets.is_empty() && !text.is_empty() {
+        offsets.push((0, text.len()));
+    }
+    let start_index = start_line.checked_sub(1)?;
+    let end_index = start_index.checked_add(old_count.checked_sub(1)?)?;
+    Some((offsets.get(start_index)?.0, offsets.get(end_index)?.1))
+}
+
 fn task_with_attachments(args: &AgentRequest) -> String {
     if args.attachments.is_empty() {
         return args.task.clone();
@@ -22086,6 +22221,7 @@ fn run_git_apply_patch(patch: &str, workspace_root: &Path) -> Result<()> {
 struct PatchHunkDiagnostic {
     path: String,
     expected_line: usize,
+    old_count: usize,
     expected_context: Vec<String>,
 }
 
@@ -22141,7 +22277,7 @@ fn parse_patch_hunk_diagnostics(patch: &str) -> Vec<PatchHunkDiagnostic> {
             path = normalized_patch_path(raw);
             continue;
         }
-        let Some(expected_line) = parse_hunk_old_start(line) else {
+        let Some((expected_line, old_count)) = parse_hunk_old_range(line) else {
             continue;
         };
         let Some(path) = path.clone() else {
@@ -22167,6 +22303,7 @@ fn parse_patch_hunk_diagnostics(patch: &str) -> Vec<PatchHunkDiagnostic> {
         hunks.push(PatchHunkDiagnostic {
             path,
             expected_line,
+            old_count,
             expected_context,
         });
     }
@@ -22186,15 +22323,13 @@ fn normalized_patch_path(raw: &str) -> Option<String> {
     )
 }
 
-fn parse_hunk_old_start(line: &str) -> Option<usize> {
+fn parse_hunk_old_range(line: &str) -> Option<(usize, usize)> {
     let header = line.strip_prefix("@@ -")?;
     let old_range = header.split_whitespace().next()?;
-    old_range
-        .split(',')
-        .next()?
-        .parse::<usize>()
-        .ok()
-        .map(|line| line.max(1))
+    let (start, count) = old_range
+        .split_once(',')
+        .map_or((old_range, "1"), |(start, count)| (start, count));
+    Some((start.parse::<usize>().ok()?.max(1), count.parse().ok()?))
 }
 
 fn parse_git_patch_failure_target(error: &str) -> Option<(String, usize)> {
@@ -25840,6 +25975,52 @@ the next imagined action"#;
                 .contains("branchPicker")
         );
         assert!(task_ranged.stage_entry.is_none());
+        let gate = RefCell::new(GateState::default());
+        {
+            let mut state = gate.borrow_mut();
+            state.read_paths.insert("game.js".to_string());
+            state.read_content_fingerprints.insert(
+                "game.js".to_string(),
+                task_ranged.receipt.content_sha256.clone(),
+            );
+            state
+                .stage_evidence
+                .controller_observations
+                .push(task_ranged.receipt.clone());
+        }
+        let observed_patch = concat!(
+            "--- a/game.js\n",
+            "+++ b/game.js\n",
+            "@@ -999,3 +999,2 @@\n",
+            " const value_999 = 999;\n",
+            "-const branchPicker = project.branch;\n",
+            " const value_1001 = 1001;\n",
+        );
+        ensure_patch_within_controller_observations(
+            &gate,
+            observed_patch,
+            &["game.js".to_string()],
+            repo.path(),
+        )
+        .unwrap();
+        let unobserved_patch = concat!(
+            "--- a/game.js\n",
+            "+++ b/game.js\n",
+            "@@ -1,2 +1,1 @@\n",
+            "-const value_1 = 1;\n",
+            " const value_2 = 2;\n",
+        );
+        assert!(
+            ensure_patch_within_controller_observations(
+                &gate,
+                unobserved_patch,
+                &["game.js".to_string()],
+                repo.path(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("outside the controller-observed ranges")
+        );
 
         unit.state = crate::workflow::WorkUnitState::DiagnosticFailed;
         let ranged = build_controller_read_observation(
@@ -29790,6 +29971,116 @@ the next imagined action"#;
             outcome.stage.submission,
             Some(crate::workflow::StageSubmission::Replan { .. })
         ));
+    }
+
+    #[test]
+    fn large_modify_work_unit_applies_separated_hunks_only_from_controller_ranges() {
+        let repo = init_contract_test_repo();
+        let mut lines = (1..=2_000)
+            .map(|line| format!("const value_{line} = {line};"))
+            .collect::<Vec<_>>();
+        lines[149] = "const [branch, setBranch] = useState('main');".to_string();
+        lines[275] = "<label htmlFor=\"branch-picker\">Base branch</label>".to_string();
+        lines[276] = "<select id=\"branch-picker\" value={branch}>".to_string();
+        lines[277] = "</select>".to_string();
+        lines[510] = "<Meta label=\"Default branch\" value={defaultBranch} />".to_string();
+        let before = lines.join("\n");
+        std::fs::write(repo.path().join("game.js"), &before).unwrap();
+        git_run(&["add", "game.js"], repo.path()).unwrap();
+        git_run(
+            &["commit", "-m", "test: add large multi-hunk fixture"],
+            repo.path(),
+        )
+        .unwrap();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let plan = delivery_plan(
+            Some(("game.js", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let after = lines
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !matches!(*index, 149 | 275 | 276 | 277 | 510))
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reviewed_fingerprint = fingerprint_with_file_content(repo.path(), "game.js", &after);
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.ctx_size = 32_768;
+        request.task = "Remove the branch selector from the project page".to_string();
+        request.repository_context = Some(repository);
+        request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
+        let mut contract = normalized_test_contract("true");
+        contract.checks.clear();
+        request.contract = Some(contract);
+        let patch = concat!(
+            "--- a/game.js\n",
+            "+++ b/game.js\n",
+            "@@ -149,3 +149,2 @@\n",
+            " const value_149 = 149;\n",
+            "-const [branch, setBranch] = useState('main');\n",
+            " const value_151 = 151;\n",
+            "@@ -275,5 +274,2 @@\n",
+            " const value_275 = 275;\n",
+            "-<label htmlFor=\"branch-picker\">Base branch</label>\n",
+            "-<select id=\"branch-picker\" value={branch}>\n",
+            "-</select>\n",
+            " const value_279 = 279;\n",
+            "@@ -510,3 +506,2 @@\n",
+            " const value_510 = 510;\n",
+            "-<Meta label=\"Default branch\" value={defaultBranch} />\n",
+            " const value_512 = 512;\n",
+        );
+        let completion = json!({
+            "id": "implementation-inline-multi-hunk",
+            "steps": [{
+                "step_id": "step-delivery",
+                "status": "completed",
+                "summary": "Removed the branch selector and its supporting state."
+            }],
+            "summary": "Removed the project branch selector.",
+            "semantic_commit_subject": "fix: remove project branch selector"
+        });
+
+        let (outcome, generator, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                tool_completion(
+                    "apply_patch",
+                    json!({"patch": patch, "completion": completion}),
+                ),
+                text_completion(code_review_submission(
+                    &reviewed_fingerprint,
+                    crate::workflow::ReviewVerdict::Pass,
+                    None,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready),
+            "{:#?}",
+            outcome.checkpoint.run
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("game.js")).unwrap(),
+            after
+        );
+        assert!(generator.generation_tool_names[2].contains(&"apply_patch".to_string()));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCall { tool, .. } if tool == "read_file"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, result, .. }
+                if tool == "apply_patch" && result.contains("inline_completion=accepted")
+        )));
     }
 
     #[test]

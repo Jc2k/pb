@@ -350,6 +350,7 @@ impl MutationCompletionGate {
         )?;
         stream.push(patch.as_bytes())?;
         let (_, files) = stream.finish_with_virtual_files()?;
+        validate_bound_patch_files(&self.manifest, &files)?;
         Ok(files)
     }
 
@@ -753,8 +754,13 @@ impl MutationCompletionGate {
         if let Err(error) = stream.push(patch.as_bytes()) {
             return CompletionDecision::Reject(classify_mutation_error(&error));
         }
-        match stream.finish() {
-            Ok(_) => self.complete_streamed_patch(patch),
+        match stream.finish_with_virtual_files() {
+            Ok((_, files)) => {
+                if let Err(error) = validate_bound_patch_files(&self.manifest, &files) {
+                    return CompletionDecision::Reject(classify_mutation_error(&error));
+                }
+                self.complete_streamed_patch(patch)
+            }
             Err(error) => CompletionDecision::Reject(classify_mutation_error(&error)),
         }
     }
@@ -875,6 +881,22 @@ fn replay_virtual_files_locked(
     }
     analyses.push(layers.finalize()?);
     Ok(Analysis::compose(analyses))
+}
+
+fn validate_bound_patch_files(
+    manifest: &CollarManifest,
+    files: &[PatchVirtualFile],
+) -> Result<(), CollarError> {
+    let Some(bound_path) = manifest.workspace.bound_mutation_path() else {
+        return Ok(());
+    };
+    if files.iter().any(|file| &file.path != bound_path) {
+        return Err(CollarError::Mutation(format!(
+            "patch mutation is bound to {:?}",
+            bound_path.as_str()
+        )));
+    }
+    Ok(())
 }
 
 fn required_logical_path(arguments: &Value) -> Result<LogicalPath, CollarError> {
@@ -1396,6 +1418,7 @@ impl PatchProbeCache {
             return Err(error);
         }
         let virtual_files = entry.stream.virtual_files()?;
+        validate_bound_patch_files(manifest, &virtual_files)?;
         let semantic = layers
             .as_deref_mut()
             .map(|layers| {
@@ -1655,6 +1678,31 @@ mod tests {
             bound_gate.evaluate("replace_file", &json!({"content":"pub fn broken( {"})),
             CompletionDecision::Reject(RejectionCode::InvalidSyntax)
         );
+        let bound_patch = concat!(
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-pub fn before() {}\n",
+            "+pub fn after() {}\n",
+        );
+        assert_eq!(
+            bound_gate.evaluate("apply_patch", &json!({"patch": bound_patch})),
+            CompletionDecision::Accept
+        );
+        let alternate_patch = concat!(
+            "--- /dev/null\n",
+            "+++ b/model/supplied/alternate.rs\n",
+            "@@ -0,0 +1,1 @@\n",
+            "+pub fn alternate() {}\n",
+        );
+        assert!(matches!(
+            bound_gate.evaluate("apply_patch", &json!({"patch": alternate_patch})),
+            CompletionDecision::Reject(_)
+        ));
+        assert!(matches!(
+            bound_gate.evaluate_prefix("apply_patch", &serde_json::Map::new(), alternate_patch),
+            CompletionDecision::Reject(_)
+        ));
         assert_eq!(
             bound_gate.evaluate_prefix(
                 "replace_file",
