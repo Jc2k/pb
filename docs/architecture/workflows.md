@@ -630,7 +630,12 @@ fingerprint and complete prompt bytes remain valid. For an oversized UTF-8 Modif
 instead select a small set of task-relevant line windows using exact, identifier-aware, one-edit,
 or narrow UI-control synonym matches. It admits those windows only when a rare or multi-term match
 provides a useful anchor, records their exact byte hashes, and exposes target-bound `edit_file` and
-canonical `apply_patch`. An edit's old text and every patch hunk's complete old-side range must lie
+canonical `apply_patch`. It also retains target-bound `read_file` as a narrow escape hatch: the
+model must provide explicit start and end lines for a missing fact, while whole-file and generic
+continuation reads are rejected. If constrained mutation generation stops after the teammate says
+such evidence is missing, Trinity gives the next recovery invocation only this bounded-read shape
+instead of forcing another attempt at the same incomplete mutation. An edit's old text and every
+patch hunk's complete old-side range must lie
 wholly inside an included byte window. A range-bound patch may carry separated hunks, but the
 generation collar and executor both bind every hunk to the active accepted-plan path; it cannot use
 one work unit to touch another file. A work-unit observation is retained whenever it survives the real

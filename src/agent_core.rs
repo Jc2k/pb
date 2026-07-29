@@ -5551,6 +5551,33 @@ fn scope_tools_to_work_unit(
     }
 }
 
+fn scope_tools_to_ranged_work_unit(
+    tools: &mut Vec<BuiltInToolSchema>,
+    available_tools: &[BuiltInToolSchema],
+) {
+    if !tools.iter().any(|tool| tool.name == "read_file")
+        && let Some(mut read_tool) = available_tools
+            .iter()
+            .find(|tool| tool.name == "read_file")
+            .cloned()
+    {
+        if let Some(required) = read_tool
+            .input_schema
+            .get_mut("required")
+            .and_then(Value::as_array_mut)
+        {
+            required.retain(|field| field.as_str() != Some("path"));
+        }
+        tools.insert(0, read_tool);
+    }
+    tools.retain(|tool| {
+        matches!(
+            tool.name.as_str(),
+            "read_file" | "edit_file" | "apply_patch" | "request_replan"
+        )
+    });
+}
+
 fn prefer_atomic_replace_for_small_python_observation(
     tools: &mut Vec<BuiltInToolSchema>,
     unit: &crate::workflow::WorkUnit,
@@ -5591,6 +5618,19 @@ fn prefer_atomic_replace_for_small_python_observation(
         );
     }
     true
+}
+
+fn scope_tools_to_controller_observation(
+    tools: &mut Vec<BuiltInToolSchema>,
+    available_tools: &[BuiltInToolSchema],
+    unit: &crate::workflow::WorkUnit,
+    receipt: &crate::workflow::ControllerObservationReceipt,
+) -> bool {
+    if receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
+        scope_tools_to_ranged_work_unit(tools, available_tools);
+        return false;
+    }
+    prefer_atomic_replace_for_small_python_observation(tools, unit, receipt)
 }
 
 fn active_unit_can_inline_completion(
@@ -7281,7 +7321,7 @@ fn run_agent_steps(
                                 receipt.coverage
                                     == crate::workflow::ObservationCoverage::Ranges
                             })
-                            .then_some(" The controller showed bounded ranges rather than the complete file. apply_patch can update several separated hunks, but every old-side hunk must remain wholly inside those ranges. The accepted Modify authority covers requirement-related supporting code throughout this same path: multiple distant hunks are not a scope change and do not justify replanning. Request replan only when satisfying the user actually requires another path or change type.")
+                            .then_some(" The controller showed bounded ranges rather than the complete file. Treat those ranges as your current read and mutate now when they contain the necessary bytes. If one concrete fact is absent, call target-bound read_file with explicit start and end lines for only that missing range; a whole-file reread is rejected. apply_patch can update several separated hunks, but every old-side hunk must remain wholly inside observed ranges. The accepted Modify authority covers requirement-related supporting code throughout this same path: multiple distant hunks are not a scope change and do not justify replanning. Request replan only when satisfying the user actually requires another path or change type.")
                             .unwrap_or_default();
                         format!(
                             "Harness work unit {}: perform only the target-bound {:?} mutation for {}. The observed target fingerprint remains the write authority.{ranged_guidance}",
@@ -7386,20 +7426,12 @@ fn run_agent_steps(
                 .borrow()
                 .controller_observation_for_path(&unit.path)
             {
-                if receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
-                    scoped_tools.retain(|tool| {
-                        matches!(
-                            tool.name.as_str(),
-                            "edit_file" | "apply_patch" | "request_replan"
-                        )
-                    });
-                } else {
-                    let _ = prefer_atomic_replace_for_small_python_observation(
-                        &mut scoped_tools,
-                        unit,
-                        receipt,
-                    );
-                }
+                let _ = scope_tools_to_controller_observation(
+                    &mut scoped_tools,
+                    &available_tools,
+                    unit,
+                    receipt,
+                );
             }
         } else if work_units.is_some() {
             scoped_tools.retain(|tool| {
@@ -11069,6 +11101,54 @@ fn truncated_native_tool_name(output: &str) -> Option<&str> {
         .split_once('"')
         .map(|(name, _)| name)
         .filter(|name| !name.is_empty())
+}
+
+fn output_requests_read_before_mutation(output: &str) -> bool {
+    let explanation = output
+        .split_once("<tool_call>")
+        .map_or(output, |(explanation, _)| explanation)
+        .to_ascii_lowercase();
+    [
+        "need to read",
+        "need to inspect",
+        "read the file first",
+        "inspect the file first",
+        "start by reading",
+        "start by inspecting",
+    ]
+    .iter()
+    .any(|marker| explanation.contains(marker))
+}
+
+fn bounded_read_recovery_tool(tools: &[BuiltInToolSchema]) -> Option<BuiltInToolSchema> {
+    let mut tool = tools.iter().find(|tool| tool.name == "read_file")?.clone();
+    {
+        let required = tool
+            .input_schema
+            .get_mut("required")
+            .and_then(Value::as_array_mut)?;
+        required.retain(|field| field.as_str() != Some("path"));
+        for field in ["start", "end"] {
+            if !required
+                .iter()
+                .any(|required| required.as_str() == Some(field))
+            {
+                required.push(json!(field));
+            }
+        }
+    }
+    for field in ["start", "end"] {
+        if let Some(property) = tool
+            .input_schema
+            .pointer_mut(&format!("/properties/{field}"))
+        {
+            property["minimum"] = json!(1);
+        }
+    }
+    tool.description.push_str(
+        " Recovery is bound to the active accepted-plan path. Supply explicit start and end lines for one missing bounded excerpt; a whole-file reread is not available.",
+    );
+    Some(tool)
 }
 
 fn truncated_native_mutation_path(output: &str) -> Option<String> {
@@ -16441,6 +16521,38 @@ fn generate_and_parse_action_with_retries(
                     )));
                 }
                 let failure = ParseFailure::from_completion(completion, error, request.max_tokens);
+                let constraint_dead_end =
+                    failure.constraint_terminal_state.as_deref() == Some("constraint_dead_end");
+                if constraint_dead_end
+                    && bound_mutation_path.is_some()
+                    && truncated_native_tool_name(&failure.output)
+                        .is_some_and(|tool| matches!(tool, "edit_file" | "apply_patch"))
+                    && output_requests_read_before_mutation(&failure.output)
+                    && !mutation_retry_used
+                    && let Some(read_tool) = bounded_read_recovery_tool(tools)
+                {
+                    mutation_retry_used = true;
+                    attempt_enable_thinking = false;
+                    retry_reason = Some(AgentRetryReason::BoundedReadAfterMutationDeadEnd);
+                    retry_tools = Some(vec![read_tool]);
+                    cap_growth_used = true;
+                    let instruction = "The attempted mutation stopped before forming a valid call, and the teammate explicitly said one more file excerpt was needed. The accepted-plan target is already fixed. Call only read_file now with explicit start and end line numbers for the smallest missing range; do not retry the mutation or request the whole file in this recovery turn.";
+                    sink.emit(AgentEvent::Correction {
+                        message: instruction.to_string(),
+                        summary: "Requesting missing bounded evidence".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
+                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                        timestamp_ms: Some(now_millis()),
+                    });
+                    let mut read_retry_messages = messages.to_vec();
+                    read_retry_messages.push(correction_chat_message(
+                        "Missing bounded evidence",
+                        instruction,
+                    ));
+                    retry_messages = Some(read_retry_messages);
+                    continue;
+                }
 
                 if attempt_enable_thinking {
                     tracing::warn!(
@@ -16482,8 +16594,6 @@ fn generate_and_parse_action_with_retries(
                     continue;
                 }
 
-                let constraint_dead_end =
-                    failure.constraint_terminal_state.as_deref() == Some("constraint_dead_end");
                 let truncated_mutation = truncated_native_tool_name(&failure.output)
                     .filter(|tool| {
                         matches!(*tool, "write_file" | "replace_file")
@@ -19009,20 +19119,12 @@ fn maybe_inject_controller_read_observation(
         ),
     );
     apply_mutation_payload_limit(&mut candidate_tools, boosted_max_tokens(args));
-    if candidate.receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
-        candidate_tools.retain(|tool| {
-            matches!(
-                tool.name.as_str(),
-                "edit_file" | "apply_patch" | "request_replan"
-            )
-        });
-    } else {
-        let _ = prefer_atomic_replace_for_small_python_observation(
-            &mut candidate_tools,
-            &candidate_unit,
-            &candidate.receipt,
-        );
-    }
+    let _ = scope_tools_to_controller_observation(
+        &mut candidate_tools,
+        available_tools,
+        &candidate_unit,
+        &candidate.receipt,
+    );
     if !controller_observation_survives_preflight(
         generator,
         args,
@@ -25650,6 +25752,59 @@ mod tests {
     }
 
     #[test]
+    fn ranged_modify_work_unit_keeps_only_target_bound_mutation_and_bounded_read_tools() {
+        let unit = crate::workflow::WorkUnit {
+            id: "s1:0".to_string(),
+            plan_step_id: "s1".to_string(),
+            contributing_step_ids: Vec::new(),
+            operation: crate::workflow::PlannedChange::Modify,
+            path: "webui/src/pages/ProjectsPage.tsx".to_string(),
+            baseline_path_fingerprint: Some("before".to_string()),
+            invocation_path_fingerprint: Some("before".to_string()),
+            current_path_fingerprint: Some("before".to_string()),
+            adopted: false,
+            state: crate::workflow::WorkUnitState::MutationReady,
+        };
+        let available_tools = all_builtin_tool_specs();
+        let mut tools = available_tools.clone();
+        scope_tools_to_work_unit(&mut tools, &unit, true);
+        scope_tools_to_ranged_work_unit(&mut tools, &available_tools);
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["read_file", "edit_file", "apply_patch", "request_replan"]
+        );
+        let read = tools.iter().find(|tool| tool.name == "read_file").unwrap();
+        assert!(
+            !read.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "path")
+        );
+
+        let recovery = bounded_read_recovery_tool(&tools).unwrap();
+        assert_eq!(recovery.input_schema["required"], json!(["start", "end"]));
+        assert_eq!(
+            recovery.input_schema["properties"]["start"]["minimum"],
+            json!(1)
+        );
+        assert_eq!(
+            recovery.input_schema["properties"]["end"]["minimum"],
+            json!(1)
+        );
+        assert!(output_requests_read_before_mutation(
+            "I need to read the file first. <tool_call>{\"name\":\"apply_patch\""
+        ));
+        assert!(!output_requests_read_before_mutation(
+            "I can make the bounded edit now. <tool_call>{\"name\":\"apply_patch\""
+        ));
+    }
+
+    #[test]
     fn model_tool_rendering_is_canonical_across_input_order() {
         let mut forward = vec![
             builtin_tool("zeta", "last", json!({"type": "object"})),
@@ -25975,9 +26130,14 @@ the next imagined action"#;
         apply_mutation_payload_limit(&mut tools, 1_024);
         scope_tools_to_work_unit(&mut tools, &unit, true);
         assert!(tools.iter().any(|tool| tool.name == "edit_file"));
-        assert!(prefer_atomic_replace_for_small_python_observation(
-            &mut tools, &unit, &receipt,
+        let available_tools = all_builtin_tool_specs();
+        assert!(scope_tools_to_controller_observation(
+            &mut tools,
+            &available_tools,
+            &unit,
+            &receipt,
         ));
+        assert!(!tools.iter().any(|tool| tool.name == "read_file"));
         assert!(!tools.iter().any(|tool| tool.name == "edit_file"));
         assert!(
             tools
@@ -25992,8 +26152,9 @@ the next imagined action"#;
         let mut large_tools = all_builtin_tool_specs();
         apply_mutation_payload_limit(&mut large_tools, 1_024);
         scope_tools_to_work_unit(&mut large_tools, &unit, true);
-        assert!(!prefer_atomic_replace_for_small_python_observation(
+        assert!(!scope_tools_to_controller_observation(
             &mut large_tools,
+            &available_tools,
             &unit,
             &receipt,
         ));
@@ -26004,8 +26165,9 @@ the next imagined action"#;
         let mut repair_tools = all_builtin_tool_specs();
         apply_mutation_payload_limit(&mut repair_tools, 1_024);
         scope_tools_to_work_unit(&mut repair_tools, &unit, true);
-        assert!(!prefer_atomic_replace_for_small_python_observation(
+        assert!(!scope_tools_to_controller_observation(
             &mut repair_tools,
+            &available_tools,
             &unit,
             &receipt,
         ));
@@ -26017,8 +26179,9 @@ the next imagined action"#;
         let mut rust_tools = all_builtin_tool_specs();
         apply_mutation_payload_limit(&mut rust_tools, 1_024);
         scope_tools_to_work_unit(&mut rust_tools, &unit, true);
-        assert!(!prefer_atomic_replace_for_small_python_observation(
+        assert!(!scope_tools_to_controller_observation(
             &mut rust_tools,
+            &available_tools,
             &unit,
             &receipt,
         ));
@@ -28533,6 +28696,7 @@ the next imagined action"#;
             outcome.checkpoint.run
         );
         assert_eq!(generator.generation_tool_names.len(), 4);
+        assert!(generator.generation_tool_names[2].contains(&"read_file".to_string()));
         assert!(generator.generation_tool_names[2].contains(&"edit_file".to_string()));
         assert!(!events.iter().any(|event| matches!(
             event,
@@ -28544,6 +28708,111 @@ the next imagined action"#;
                 if receipt.stage == crate::workflow::WorkflowStage::Implementing
                     && receipt.path == "game.js"
                     && receipt.coverage == crate::workflow::ObservationCoverage::Ranges
+        )));
+    }
+
+    #[test]
+    fn ranged_modify_constraint_dead_end_recovers_with_one_targeted_read() {
+        let repo = init_contract_test_repo();
+        let before = (1..=2_000)
+            .map(|line| {
+                if line == 1_000 {
+                    "const branchSelector = project.branch;".to_string()
+                } else {
+                    format!("const value_{line} = {line};")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(repo.path().join("game.js"), &before).unwrap();
+        git_run(&["add", "game.js"], repo.path()).unwrap();
+        git_run(
+            &["commit", "-m", "test: add ranged recovery fixture"],
+            repo.path(),
+        )
+        .unwrap();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let plan = delivery_plan(
+            Some(("game.js", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let after = before.replace("const branchSelector = project.branch;", "");
+        let reviewed_fingerprint = fingerprint_with_file_content(repo.path(), "game.js", &after);
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.ctx_size = 32_768;
+        request.task = "Remove the branch selector from the project page".to_string();
+        request.repository_context = Some(repository);
+        request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
+        let mut contract = normalized_test_contract("true");
+        contract.checks.clear();
+        request.contract = Some(contract);
+        let completion = json!({
+            "id": "implementation-inline-ranged-recovery",
+            "steps": [{
+                "step_id": "step-delivery",
+                "status": "completed",
+                "summary": "Removed the accepted branch selector line."
+            }],
+            "summary": "Removed the project branch selector.",
+            "semantic_commit_subject": "fix: remove project branch selector"
+        });
+
+        let (outcome, generator, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                ScriptedCompletion {
+                    content: format!(
+                        "{SCRIPTED_CONSTRAINT_DEAD_END_PREFIX}I need to read the file first so I can use the exact surrounding bytes. <tool_call>{{\"name\":\"apply_patch\",\"arguments\":"
+                    ),
+                    truncated: true,
+                },
+                tool_completion("read_file", json!({"start": 995, "end": 1_005})),
+                tool_completion(
+                    "edit_file",
+                    json!({
+                        "old_text": "const branchSelector = project.branch;",
+                        "new_text": "",
+                        "completion": completion
+                    }),
+                ),
+                text_completion(code_review_submission(
+                    &reviewed_fingerprint,
+                    crate::workflow::ReviewVerdict::Pass,
+                    None,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready),
+            "{:#?}\nevents: {events:#?}",
+            outcome.checkpoint.run
+        );
+        assert_eq!(generator.generation_tool_names[3], vec!["read_file"]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { summary, message, .. }
+                if summary == "Requesting missing bounded evidence"
+                    && message.contains("explicit start and end")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCall { tool, arguments, .. }
+                if tool == "read_file"
+                    && arguments["path"] == "game.js"
+                    && arguments["start"] == 995
+                    && arguments["end"] == 1_005
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::LlmInvocation { context: Some(context), .. }
+                if context.retry_reason
+                    == Some(AgentRetryReason::BoundedReadAfterMutationDeadEnd)
         )));
     }
 

@@ -801,8 +801,8 @@ includes an optional backward-compatible context snapshot covering capacity, gen
 prompt high-water utilization, preflight/backend token counts, safety margin, message/schema size,
 thinking mode, retry reason, and the compaction/cache/closure counters introduced by later
 milestones. Evaluation summaries count `thinking_off_truncation_retries`,
-`expanded_mutation_payload_retries`, `compact_mutation_truncation_retries`, and
-`larger_cap_truncation_retries` separately. Runtime
+`bounded_read_constraint_retries`, `expanded_mutation_payload_retries`,
+`compact_mutation_truncation_retries`, and `larger_cap_truncation_retries` separately. Runtime
 setup failures are reported separately from artifact quality so a backend experiment error is not
 scored as model reasoning.
 
