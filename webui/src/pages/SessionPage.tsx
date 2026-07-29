@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Aside } from "../Aside";
-import type { ComposerMode, EventEnvelope, SessionDetails } from "../types";
+import type {
+  ComposerMode,
+  EventEnvelope,
+  SessionDetails,
+  WorkflowSummary,
+} from "../types";
 import { IntentControl } from "../components/IntentControl";
 import { GoalAmendmentSheet } from "../components/GoalAmendmentSheet";
 import { GoalDrawer } from "../components/GoalDrawer";
@@ -38,6 +43,47 @@ import {
   latestAssistantProfile,
 } from "../lib/sessionUtils";
 
+export function workflowRecoveryPresentation(
+  workflow?: WorkflowSummary,
+): {
+  title: string;
+  description: string;
+  label: string;
+  action: "resume" | "restart-delivery";
+} {
+  if (workflow?.recovery === "restart_from_current_files") {
+    const contentChanged = workflow.blocked_reason?.includes(
+      "repository content changed",
+    );
+    return {
+      title: contentChanged
+        ? "The project changed during review"
+        : "This delivery needs a fresh plan",
+      description: contentChanged
+        ? "The review stays tied to its earlier snapshot. Restart planning against the current files; the previous plan and review remain in this history."
+        : "The old checkpoint cannot continue safely. Restart planning against the current files; the previous attempt remains in this history.",
+      label: "Restart with current files",
+      action: "restart-delivery",
+    };
+  }
+  if (workflow?.recovery === "resume") {
+    return {
+      title: "Delivery is waiting on a prerequisite",
+      description:
+        "Resolve the reported executor problem, then continue from the preserved stage.",
+      label: "Resume after fixing",
+      action: "resume",
+    };
+  }
+  return {
+    title: "Session paused safely",
+    description:
+      "This session was restored after a service restart and is waiting for you to continue it.",
+    label: "Resume",
+    action: "resume",
+  };
+}
+
 export function SessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
@@ -57,6 +103,8 @@ export function SessionPage() {
   const [voiceInputActive, setVoiceInputActive] = useState(false);
   const [shareMessage, setShareMessage] = useState("");
   const [taskRecoveryBusy, setTaskRecoveryBusy] = useState(false);
+  const [workflowRecoveryBusy, setWorkflowRecoveryBusy] = useState(false);
+  const [workflowRecoveryError, setWorkflowRecoveryError] = useState("");
   const sourceRef = useRef<EventSource | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
@@ -219,10 +267,25 @@ export function SessionPage() {
     await mutateGoal(`amendments/${amendmentId}/discard`);
   };
 
-  const resumeSession = async () => {
-    await fetch(`/api/sessions/${sessionId}/resume`, { method: "POST" });
-    setSessionRunning(false);
-    await fetchSession();
+  const recoverWorkflow = async (action: "resume" | "restart-delivery") => {
+    setWorkflowRecoveryBusy(true);
+    setWorkflowRecoveryError("");
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}/${action}`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        setWorkflowRecoveryError(
+          action === "restart-delivery"
+            ? "The delivery could not restart from the current files. Refresh the session and try again."
+            : "The preserved stage is not ready to resume yet.",
+        );
+      }
+      setSessionRunning(false);
+      await fetchSession();
+    } finally {
+      setWorkflowRecoveryBusy(false);
+    }
   };
 
   const cancelSession = async () => {
@@ -389,6 +452,7 @@ export function SessionPage() {
   const sessionStartMs =
     events.find((event) => event.event.type === "started")?.event
       .timestamp_ms ?? session.updated_at_ms;
+  const workflowRecovery = workflowRecoveryPresentation(session.workflow);
 
   return (
     <div className="app-shell session-shell">
@@ -529,7 +593,6 @@ export function SessionPage() {
                           actor={grouped.actor}
                           assistingProfile={grouped.assistingProfile}
                           inferenceEvents={grouped.inferenceEvents}
-                          reasoningEvents={grouped.reasoningEvents}
                           toolCalls={grouped.toolCalls}
                           toolResults={grouped.toolResults}
                           controllerActions={grouped.controllerActions}
@@ -542,6 +605,7 @@ export function SessionPage() {
                         envelope={grouped as EventEnvelope}
                         activityProfile={latestAssistantProfile(events)}
                         evidenceEvents={events}
+                        workflow={session.workflow}
                       />
                     );
                   },
@@ -802,15 +866,26 @@ export function SessionPage() {
           ? (
             <footer className="composer paused-composer">
               <div className="paused-composer-copy small text-body-secondary">
-                {session.workflow?.stage === "blocked"
-                  ? "Delivery needs help. Resolve the reported prerequisite, then resume from the preserved stage."
-                  : "This session was restored after a daemon restart and is paused until you resume it."}
+                <strong>{workflowRecovery.title}</strong>
+                <span>{workflowRecovery.description}</span>
+                {workflowRecoveryError
+                  ? (
+                    <span className="text-danger" role="alert">
+                      {workflowRecoveryError}
+                    </span>
+                  )
+                  : null}
               </div>
               <button
-                className="btn btn-warning composer-action"
-                onClick={() => void resumeSession()}
+                className={`btn composer-action ${
+                  workflowRecovery.action === "restart-delivery"
+                    ? "btn-primary"
+                    : "btn-warning"
+                }`}
+                disabled={workflowRecoveryBusy}
+                onClick={() => void recoverWorkflow(workflowRecovery.action)}
               >
-                Resume
+                {workflowRecoveryBusy ? "Starting…" : workflowRecovery.label}
               </button>
             </footer>
           )

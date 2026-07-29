@@ -60,9 +60,11 @@ Keeping those flows separate prevents common agent failure modes:
 ## Repository and workspace
 
 pb resolves the repository root and the task focus independently. Multi-component projects can
-describe workspace topology, executors, generated outputs, and affected checks. Delivery happens in
-a task-owned workspace so the harness can compare the accepted baseline with the delivered change
-and promote only declared outputs.
+describe workspace topology, executors, generated outputs, and affected checks. Apple-container
+delivery happens in a task-owned worktree so the harness can compare the accepted baseline with the
+delivered change and promote only declared outputs. Explicit local execution instead uses the
+registered repository itself; pb captures exact content and Git-control baselines and stops on
+concurrent drift, but does not claim filesystem isolation from another local session or editor.
 
 The selected environment can be:
 

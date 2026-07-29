@@ -12169,6 +12169,33 @@ fn validate_resumed_delivery_content(
     Ok(())
 }
 
+fn workflow_content_drift_reason(
+    stage: crate::workflow::WorkflowStage,
+    expected: &crate::workspace::ContentSnapshot,
+    current: &crate::workspace::ContentSnapshot,
+) -> String {
+    const DISPLAY_LIMIT: usize = 6;
+    let changed = expected.changed_paths(current);
+    let visible = changed
+        .iter()
+        .take(DISPLAY_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let suffix = if changed.len() > DISPLAY_LIMIT {
+        format!(" and {} more", changed.len() - DISPLAY_LIMIT)
+    } else {
+        String::new()
+    };
+    if visible.is_empty() {
+        format!("repository content changed while the read-only {stage:?} stage was running")
+    } else {
+        format!(
+            "repository content changed while the read-only {stage:?} stage was running; changed paths: {}{suffix}",
+            visible.join(", ")
+        )
+    }
+}
+
 fn resumed_commit_matches_reviewed_delta(
     run: &crate::workflow::WorkflowRun,
     expected_control: &GitControlState,
@@ -12680,9 +12707,7 @@ fn run_delivery_workflow(
             if current.fingerprint != run.planning_content().fingerprint {
                 run.apply(crate::workflow::WorkflowEvent::Blocked {
                     outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
-                    reason: format!(
-                        "repository content changed while the read-only {stage:?} stage was running"
-                    ),
+                    reason: workflow_content_drift_reason(stage, run.planning_content(), &current),
                 })?;
                 return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
             }
@@ -13741,7 +13766,7 @@ fn run_delivery_commit(
 const PLAN_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan function exactly once with arguments shaped as:
 {"id":"plan-1","summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":{"create":["path/to/new-file.ext"],"modify":[],"delete":[]},"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["required-check-id"],"description":"..."}]}
-Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Each step groups paths into create, modify, and delete arrays. Create paths are new repository-relative names. Modify and delete paths are native-collar constrained to a bounded set of existing paths selected from task-relevant repository structure and exact local discovery results; if the intended path is absent, use glob, ripgrep/search, or read_file before submitting instead of spelling a guess. For repository-local file, symbol, and component discovery, use those local tools rather than public web search; use public research only when the task genuinely depends on external or current facts absent from the repository. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Consolidate one path's intended transition within a step: create final contents rather than planning a redundant later modify, and use modify rather than delete-then-create replacement. Every requirement must appear in a step and acceptance fact. When the harness names projected contract check ids, leave those ids out of check_ids; pb will add them deterministically after submission. Include only additional configured check ids selected by the plan. Use [] for component_ids or check_ids when there are no additional ids. Do not return the arguments as prose or a final action."#;
+Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Each step groups paths into create, modify, and delete arrays. Create paths are new repository-relative names. Modify and delete paths are native-collar constrained to a bounded set of existing paths selected from task-relevant repository structure and exact local discovery results; if the intended path is absent, use glob, ripgrep/search, or read_file before submitting instead of spelling a guess. For repository-local file, symbol, and component discovery, use those local tools rather than public web search; use public research only when the task genuinely depends on external or current facts absent from the repository. For removal work, inspect the containing code and make the plan account for state, imports, derived values, payload fields, and tests that would become unused or behaviorally ambiguous when the visible control or feature disappears. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Consolidate one path's intended transition within a step: create final contents rather than planning a redundant later modify, and use modify rather than delete-then-create replacement. Every requirement must appear in a step and acceptance fact. When the harness names projected contract check ids, leave those ids out of check_ids; pb will add them deterministically after submission. Include only additional configured check ids selected by the plan. Use [] for component_ids or check_ids when there are no additional ids. Do not return the arguments as prose or a final action."#;
 
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan_review function exactly once with arguments shaped as:
@@ -14022,7 +14047,7 @@ fn delivery_stage_context(
             let plan_json = serde_json::to_string_pretty(plan)?;
             Ok(StageContext {
                 system_prompt: stable_workflow_stage_system_prompt(
-                    "You are a fresh-context adversarial plan critic. You did not receive the planner transcript or conclusions. Exact complete-file evidence carried and revalidated by the harness counts as observed repository bytes in this stage; use read-only tools for anything absent or partial. Challenge requirement coverage, architecture, component impact, test strategy, failure modes, and assumptions, then end only with submit_plan_review. Do not invent a blocker when the plan is sound, but a pass with a P0/P1 challenge is invalid. Every repository path cited as evidence must be present in the current carried bundle or read in this invocation.",
+                    "You are a fresh-context adversarial plan critic. You did not receive the planner transcript or conclusions. Exact complete-file evidence carried and revalidated by the harness counts as observed repository bytes in this stage; use read-only tools for anything absent or partial. Challenge requirement coverage, architecture, component impact, test strategy, failure modes, and assumptions, then end only with submit_plan_review. For removal work, trace the removed feature through its state, imports, derived values, payloads, and tests; challenge a plan that removes only visible markup while leaving ambiguous or obsolete behavior. Do not invent a blocker when the plan is sound, but a pass with a P0/P1 challenge is invalid. Every repository path cited as evidence must be present in the current carried bundle or read in this invocation.",
                     PLAN_REVIEW_SUBMISSION_GUIDANCE,
                 ),
                 user_prompt: format!(
@@ -24825,6 +24850,8 @@ mod tests {
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("groups paths into create, modify, and delete"));
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("\"check_ids\":[\"required-check-id\"]"));
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("native-collar constrained"));
+        assert!(PLAN_SUBMISSION_GUIDANCE.contains("For removal work"));
+        assert!(PLAN_SUBMISSION_GUIDANCE.contains("state, imports, derived values"));
         assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("submit_plan_review"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("exact current content fingerprint"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Never imitate pb's transcript"));
@@ -28885,6 +28912,27 @@ the next imagined action"#;
         );
         assert!(sanitize_repository_remote("secret@example.test:team/project.git").is_none());
         assert!(sanitize_repository_remote("https://[malformed").is_none());
+    }
+
+    #[test]
+    fn workflow_content_drift_names_the_files_that_invalidated_review() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("project.tsx"), "before\n").unwrap();
+        git_run(&["add", "project.tsx"], repo.path()).unwrap();
+        git_run(&["commit", "-m", "test: add project"], repo.path()).unwrap();
+        let expected = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        std::fs::write(repo.path().join("project.tsx"), "after\n").unwrap();
+        std::fs::write(repo.path().join("new.css"), "body {}\n").unwrap();
+        let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+
+        let reason = workflow_content_drift_reason(
+            crate::workflow::WorkflowStage::PlanReview,
+            &expected,
+            &current,
+        );
+        assert!(reason.contains("changed paths:"), "{reason}");
+        assert!(reason.contains("project.tsx"), "{reason}");
+        assert!(reason.contains("new.css"), "{reason}");
     }
 
     #[test]

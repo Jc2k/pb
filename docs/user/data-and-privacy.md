@@ -16,7 +16,7 @@ updates, and provider publication are explicit paths across the machine boundary
 | Project configuration | `<repository>/.pb/` | Owned by the repository; may be committed intentionally. |
 | Session history, workflow, Goal, and multi-Task checkpoints | Repository-local Git notes under `refs/notes/pb/sessions` | Kept locally until the session is deleted; may include accepted Task plans, budgets, local model qualification digests, active child state, and bounded exact bytes from complete small-file reads for cross-stage evidence; Git notes are not pushed by ordinary branch pushes. |
 | Durable project memory | Repository-local `refs/pb/memory` | Evidence-backed Markdown outside the working tree and ordinary branch pushes; bounded to 500 entries and 4 MiB until the ref is changed or removed. |
-| Session containers, networks, workspaces, and services | Runtime-managed, session-owned resources | Reconciled and removed at terminal cleanup or expiry. |
+| Session containers, networks, container worktrees, and services | Runtime-managed, session-owned resources | Reconciled and removed at terminal cleanup or expiry. Explicit local execution uses the registered repository and does not create a session-owned worktree. |
 | Declared images and caches | Container/model runtime storage | May persist for reuse and garbage collection. |
 
 The optional personal-memory setting points at a separate repository chosen by you. pb does not

@@ -1145,6 +1145,62 @@ export interface ReadyEvidenceBundle {
   repository_remote?: string;
 }
 
+export interface WorkflowArtifactEnvelope<T> {
+  id: string;
+  sha256: string;
+  artifact: T;
+}
+
+export interface WorkflowPlanArtifact {
+  summary: string;
+  requirements: Array<{
+    id: string;
+    description: string;
+    source: string;
+  }>;
+  steps: Array<{
+    id: string;
+    requirement_ids: string[];
+    component_ids?: string[];
+    paths: Array<{
+      path: string;
+      change: "create" | "modify" | "delete";
+    }>;
+    description: string;
+  }>;
+  acceptance: Array<{
+    id: string;
+    requirement_ids: string[];
+    check_ids?: string[];
+    description: string;
+  }>;
+  risks?: Array<{
+    id: string;
+    description: string;
+    mitigation: string;
+  }>;
+  assumptions?: string[];
+  open_questions?: string[];
+  resolved_challenge_ids?: string[];
+}
+
+export interface WorkflowPlanReviewArtifact {
+  plan_id: string;
+  plan_sha256: string;
+  assessments: Array<{
+    kind: string;
+    status: "pass" | "concern" | "fail";
+    explanation?: string;
+  }>;
+  challenges: Array<{
+    id: string;
+    severity: "p0" | "p1" | "p2" | "p3";
+    requirement_ids?: string[];
+    description: string;
+  }>;
+  verdict: "pass" | "revise";
+}
+
 export interface WorkflowSummary {
   id: string;
   source_turn_id: string;
@@ -1154,6 +1210,11 @@ export interface WorkflowSummary {
   policy_sha256: string;
   commit_oid?: string;
   ready_evidence?: ReadyEvidenceBundle;
+  paused_stage?: WorkflowStage;
+  blocked_reason?: string;
+  recovery?: "resume" | "restart_from_current_files";
+  plan?: WorkflowArtifactEnvelope<WorkflowPlanArtifact>;
+  plan_review?: WorkflowArtifactEnvelope<WorkflowPlanReviewArtifact>;
 }
 
 export interface SessionItem {

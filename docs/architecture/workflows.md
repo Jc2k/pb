@@ -59,6 +59,14 @@ Planning ──→ Plan review ──→ Implementing ──→ Checking ──�
 Each model-driven stage has one permitted structured terminal action. Checking and committing are
 deterministic harness stages and do not run a model.
 
+**Shipped recovery contract.** A blocked checkpoint advertises its controller-selected recovery
+instead of presenting every stop as resumable. `ExecutorUnavailable` retains the exact stage and can
+resume after its prerequisite is repaired. `CommitBlocked` requires a fresh delivery from the
+repository's current files: pb archives the blocked workflow summary, clears stage evidence and the
+old repository baseline, captures a new baseline, and starts planning under a new turn id. The UI
+labels that action **Restart with current files**. A generic resume request is rejected for these
+content-sensitive blocks so it cannot queue an immediately stale checkpoint.
+
 ### High-level Tasks
 
 **Shipped and on by default for new Builds.** Before an eligible explicit Build starts, pb decides
@@ -142,7 +150,16 @@ fail to produce an acceptable plan, but an invalid artifact never becomes delive
 Strict delivery does not expose `session_title`: the original task is already the stable title
 fallback, so cosmetic rewriting cannot consume a planning inference. Planning guidance requires
 local evidence before naming an existing path and reserves public web research for genuinely
-external or current facts rather than repository-local file discovery.
+external or current facts rather than repository-local file discovery. Removal plans are prompted
+to account for state, imports, derived values, payload fields, and tests that can become obsolete
+when a visible control disappears. The fresh plan critic receives the corresponding component-impact
+check and is told to challenge markup-only removal plans that leave ambiguous behavior.
+
+Accepted plan and plan-review artifacts remain in the workflow summary projection. The web
+transcript renders the latest accepted plan at its acceptance event with requirements, steps, paths,
+and acceptance facts. Reviewer prose remains a normal teammate message even when the next event is
+the structured review submission; action grouping applies to instrumentation and tool calls, not
+model-authored feedback.
 The model-facing plan schema groups each step's paths by Create, Modify, and Delete. Create remains a
 free repository-relative name. Modify and Delete are native-collar constrained to at most 32 exact
 existing paths selected from task-relevant repository names, contract/current evidence, and exact

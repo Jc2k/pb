@@ -564,6 +564,10 @@ pub async fn run_server_with_ready(
         .route("/api/sessions/{id}/message", post(send_session_message))
         .route("/api/sessions/{id}/resume", post(resume_session))
         .route(
+            "/api/sessions/{id}/restart-delivery",
+            post(restart_delivery),
+        )
+        .route(
             "/api/sessions/{id}/retry-task-planning",
             post(retry_task_planning),
         )
@@ -2230,6 +2234,10 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
         .workflow
         .as_ref()
         .is_some_and(|checkpoint| checkpoint.run.stage == crate::workflow::WorkflowStage::Blocked);
+    let blocked_workflow_requires_restart = session.workflow.as_ref().is_some_and(|checkpoint| {
+        checkpoint.run.stage == crate::workflow::WorkflowStage::Blocked
+            && checkpoint.run.outcome == Some(crate::workflow::WorkflowOutcome::CommitBlocked)
+    });
     let resumable_multi_task = session.multi_task.as_ref().is_some_and(|checkpoint| {
         matches!(
             checkpoint.run.stage,
@@ -2240,6 +2248,9 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
         && !(session.status == SessionStatus::Failed && (blocked_workflow || resumable_multi_task)))
         || session.pending_question.is_some()
     {
+        anyhow::bail!(ResumeSessionError::Conflict);
+    }
+    if blocked_workflow_requires_restart {
         anyhow::bail!(ResumeSessionError::Conflict);
     }
     let mut request = session.request_template.clone();
@@ -2343,6 +2354,115 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
         completed_multi_tasks,
     );
     dispatch_next_session(state.clone());
+    Ok(SessionResponse { session_id: id })
+}
+
+async fn restart_delivery(
+    Path(id): Path<String>,
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<SessionResponse>, StatusCode> {
+    restart_delivery_inner(state, id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::CONFLICT)
+}
+
+fn prepare_blocked_workflow_restart(session: &mut SessionState, session_id: &str) -> Result<()> {
+    let checkpoint = session
+        .workflow
+        .as_ref()
+        .context("session has no blocked delivery to restart")?;
+    if session.status != SessionStatus::Failed
+        || session.running
+        || session.pending_question.is_some()
+        || session.multi_task.is_some()
+        || session.goal.is_some()
+        || checkpoint.run.stage != crate::workflow::WorkflowStage::Blocked
+        || checkpoint.run.outcome != Some(crate::workflow::WorkflowOutcome::CommitBlocked)
+    {
+        bail!("session has no content-sensitive blocked delivery to restart");
+    }
+
+    let summary = crate::workflow::WorkflowSummary::from(&checkpoint.run);
+    if session
+        .completed_workflows
+        .last()
+        .is_none_or(|existing| existing.id != summary.id)
+    {
+        session.completed_workflows.push(summary);
+    }
+    session.workflow = None;
+
+    let turn_id = new_turn_id(session_id);
+    let request = &mut session.request_template;
+    request.turn_id = turn_id.clone();
+    request.intent = Some(crate::workflow::TurnIntent::Deliver);
+    request.workflow_stage = None;
+    request.workflow_expected_content_fingerprint = None;
+    request.workflow_plan_identity = None;
+    request.workflow_action_first_turn = false;
+    request.workflow_creation_path_order.clear();
+    request.workflow_work_units = None;
+    request.workflow_stage_evidence = None;
+    request.workflow_checkpoint = None;
+    request.repository_context = None;
+    request.prior_check_evidence = crate::checks::CheckEvidenceLedger::default();
+    request.conversation_handoff =
+        delivery_handoff_for_turn(request.intent, &turn_id, &request.task, None);
+
+    session.running = false;
+    session.paused = false;
+    session.status = SessionStatus::Queued;
+    session.updated_at_ms = now_millis();
+    session.cancel_token.store(false, Ordering::SeqCst);
+    session.pause_token.store(false, Ordering::SeqCst);
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::Correction {
+            message: "I kept the blocked plan and review in the session history, accepted the repository's current files as the new baseline, and started a fresh planning pass."
+                .to_string(),
+            summary: "Restarting delivery from current files".to_string(),
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(crate::agent_core::AgentProfile::Plan),
+            nesting_depth: None,
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+    Ok(())
+}
+
+async fn restart_delivery_inner(state: AppState, id: String) -> Result<SessionResponse> {
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions
+        .get_mut(&id)
+        .with_context(|| format!("session not found: {id}"))?;
+    prepare_blocked_workflow_restart(session, &id)?;
+    let request = session.request_template.clone();
+    let branch = session.branch.clone();
+    let workdir = session.workdir.clone();
+    let history = Arc::clone(&session.history);
+    let usage_records = Arc::clone(&session.usage_records);
+    let completed_workflows = session.completed_workflows.clone();
+    let completed_goals = session.completed_goals.clone();
+    let completed_multi_tasks = session.completed_multi_tasks.clone();
+    drop(sessions);
+    persist_session_snapshot(
+        &id,
+        &request,
+        branch,
+        workdir,
+        SessionStatus::Queued,
+        &history,
+        &usage_records,
+        None,
+        completed_workflows,
+        None,
+        completed_goals,
+        None,
+        completed_multi_tasks,
+    );
+    dispatch_next_session(state);
     Ok(SessionResponse { session_id: id })
 }
 
@@ -5897,6 +6017,84 @@ mod workflow_tests {
                     }
                 ))
         );
+    }
+
+    #[tokio::test]
+    async fn content_sensitive_blocks_require_a_fresh_current_files_restart() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let request = request(repo.path());
+        let original_turn = request.turn_id.clone();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let mut run = crate::workflow::WorkflowRun::start(
+            "workflow-web-restart",
+            request.turn_id.clone(),
+            request.task.clone(),
+            request.workflow_policy.clone().unwrap(),
+            repository,
+        )
+        .unwrap();
+        run.apply(crate::workflow::WorkflowEvent::Blocked {
+            outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            reason: "repository content changed while the read-only PlanReview stage was running"
+                .to_string(),
+        })
+        .unwrap();
+        let checkpoint = crate::workflow::WorkflowCheckpoint::new(run).unwrap();
+        let mut persisted = PersistedSession::from_parts(
+            request.session_id.clone(),
+            request.clone(),
+            request.branch.clone(),
+            request.workdir.clone(),
+            false,
+            SessionStatus::Failed,
+            Vec::new(),
+        );
+        persisted.workflow = Some(checkpoint);
+        let (session_id, restored) = session_from_persisted(persisted);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+        };
+
+        assert!(
+            resume_session_inner(state.clone(), session_id.clone())
+                .await
+                .is_err()
+        );
+        {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions.get_mut(&session_id).unwrap();
+            prepare_blocked_workflow_restart(session, &session_id).unwrap();
+            assert_eq!(session.status, SessionStatus::Queued);
+            assert!(session.workflow.is_none());
+            assert_eq!(session.completed_workflows.len(), 1);
+            assert_eq!(
+                session.completed_workflows[0].recovery,
+                Some(crate::workflow::WorkflowRecovery::RestartFromCurrentFiles)
+            );
+            assert_ne!(session.request_template.turn_id, original_turn);
+            assert!(session.request_template.workflow_checkpoint.is_none());
+            assert!(session.request_template.repository_context.is_none());
+            assert!(session.history.lock().unwrap().iter().any(|envelope| {
+                matches!(
+                    &envelope.event,
+                    AgentEvent::Correction { summary, .. }
+                        if summary == "Restarting delivery from current files"
+                )
+            }));
+        }
     }
 
     #[tokio::test]

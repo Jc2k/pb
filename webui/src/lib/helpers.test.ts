@@ -305,7 +305,7 @@ Deno.test("groupActionEvents leaves an inference visible when it produces chat t
   equal((grouped[1] as EventEnvelope).event.type, "reasoning");
 });
 
-Deno.test("groupActionEvents folds tool-directed reasoning into the expanded teammate run", () => {
+Deno.test("groupActionEvents keeps teammate reasoning visible before its action run", () => {
   const actor = { kind: "agent" as const, id: "build" };
   const events: EventEnvelope[] = [
     {
@@ -350,14 +350,16 @@ Deno.test("groupActionEvents folds tool-directed reasoning into the expanded tea
   ];
 
   const grouped = groupActionEvents(events);
-  equal(grouped.length, 1);
-  const run = grouped[0];
+  equal(grouped.length, 3);
+  equal((grouped[0] as EventEnvelope).event.type, "llm_invocation");
+  equal((grouped[1] as EventEnvelope).event.type, "reasoning");
+  const run = grouped[2];
   if (!("type" in run) || run.type !== "action_group") {
     throw new Error("expected one action run");
   }
-  equal(run.inferenceEvents.length, 1);
-  equal(run.reasoningEvents.length, 1);
+  equal(run.inferenceEvents.length, 0);
   equal(run.toolCalls.length, 1);
+  equal(run.toolResults.length, 1);
 });
 
 Deno.test("groupActionEvents correlates reordered identical tools across intervening messages", () => {

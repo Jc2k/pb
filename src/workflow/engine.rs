@@ -852,12 +852,10 @@ mod tests {
             evidence.repository_remote.as_deref(),
             Some("git@example.test:team/project.git")
         );
-        assert_eq!(
-            super::super::WorkflowSummary::from(&run)
-                .ready_evidence
-                .as_ref(),
-            Some(evidence)
-        );
+        let summary = super::super::WorkflowSummary::from(&run);
+        assert_eq!(summary.ready_evidence.as_ref(), Some(evidence));
+        assert_eq!(summary.plan.as_ref(), Some(&plan));
+        assert_eq!(summary.plan_review.as_ref(), run.plan_review.as_ref());
         WorkflowCheckpoint::new(run.clone())
             .unwrap()
             .validate()

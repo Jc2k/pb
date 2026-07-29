@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{WorkflowOutcome, WorkflowRun, WorkflowStage};
+use super::{
+    ArtifactEnvelope, PlanArtifact, PlanReviewArtifact, WorkflowOutcome, WorkflowRun, WorkflowStage,
+};
 
 pub const READY_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
@@ -109,6 +111,23 @@ pub struct WorkflowSummary {
     pub commit_oid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_evidence: Option<ReadyEvidenceBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_stage: Option<WorkflowStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<WorkflowRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<ArtifactEnvelope<PlanArtifact>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_review: Option<ArtifactEnvelope<PlanReviewArtifact>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRecovery {
+    Resume,
+    RestartFromCurrentFiles,
 }
 
 impl From<&WorkflowRun> for WorkflowSummary {
@@ -122,6 +141,19 @@ impl From<&WorkflowRun> for WorkflowSummary {
             policy_sha256: run.policy_sha256.clone(),
             commit_oid: run.commit.as_ref().map(|commit| commit.oid.clone()),
             ready_evidence: run.ready_evidence.clone(),
+            paused_stage: run.paused_stage,
+            blocked_reason: run.blocked_reason.clone(),
+            recovery: match (run.stage, run.outcome) {
+                (WorkflowStage::Blocked, Some(WorkflowOutcome::ExecutorUnavailable)) => {
+                    Some(WorkflowRecovery::Resume)
+                }
+                (WorkflowStage::Blocked, Some(WorkflowOutcome::CommitBlocked)) => {
+                    Some(WorkflowRecovery::RestartFromCurrentFiles)
+                }
+                _ => None,
+            },
+            plan: run.plan.clone(),
+            plan_review: run.plan_review.clone(),
         }
     }
 }
@@ -288,7 +320,7 @@ impl ReadyEvidenceBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::{WorkflowConfigDocument, WorkflowRun};
+    use crate::workflow::{WorkflowConfigDocument, WorkflowEvent, WorkflowRun};
     use crate::workspace::RepositoryContext;
 
     #[test]
@@ -343,5 +375,40 @@ mod tests {
         let legacy = WorkflowCheckpoint::new(run).unwrap();
         legacy.validate().unwrap();
         assert!(WorkflowSummary::from(&legacy.run).ready_evidence.is_none());
+    }
+
+    #[test]
+    fn blocked_summary_exposes_the_safe_recovery_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let repository = RepositoryContext::capture(dir.path(), dir.path()).unwrap();
+        let mut run = WorkflowRun::start(
+            "workflow-recovery",
+            "turn-recovery",
+            "task",
+            WorkflowConfigDocument::default().compile().unwrap(),
+            repository,
+        )
+        .unwrap();
+        run.apply(WorkflowEvent::Blocked {
+            outcome: WorkflowOutcome::CommitBlocked,
+            reason: "repository content changed during review".to_string(),
+        })
+        .unwrap();
+
+        let summary = WorkflowSummary::from(&run);
+        assert_eq!(summary.paused_stage, Some(WorkflowStage::Planning));
+        assert_eq!(
+            summary.recovery,
+            Some(WorkflowRecovery::RestartFromCurrentFiles)
+        );
+        assert_eq!(
+            summary.blocked_reason.as_deref(),
+            Some("repository content changed during review")
+        );
     }
 }

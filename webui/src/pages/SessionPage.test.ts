@@ -8,6 +8,7 @@ import {
   readyEvidenceLabel,
   workflowOutcomeLabel,
   workflowProgressLabel,
+  workflowRecoveryPresentation,
   workflowStageLabel,
 } from "./SessionPage.tsx";
 
@@ -122,9 +123,10 @@ Deno.test("workflow controls preserve work and restore conversation after termin
   const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
 
   ok(page.includes("`/api/sessions/${sessionId}/cancel`"));
-  ok(page.includes("`/api/sessions/${sessionId}/resume`"));
+  ok(page.includes("`/api/sessions/${sessionId}/${action}`"));
+  ok(page.includes('action: "restart-delivery"'));
   ok(page.includes('session.workflow?.stage === "blocked"'));
-  ok(page.includes("resume from the preserved stage"));
+  ok(page.includes("Restart with current files"));
   ok(page.includes('setIntent("discuss")'));
   ok(page.includes(": !isRunning &&"));
   ok(
@@ -133,6 +135,35 @@ Deno.test("workflow controls preserve work and restore conversation after termin
     ),
   );
   ok(page.includes("<IntentControl intent={intent} onChange={setIntent} />"));
+});
+
+Deno.test("blocked delivery recovery is reason-aware", () => {
+  const restart = workflowRecoveryPresentation({
+    id: "workflow-1",
+    source_turn_id: "turn-1",
+    task: "Update the project page",
+    stage: "blocked",
+    outcome: "commit_blocked",
+    policy_sha256: "policy",
+    blocked_reason:
+      "repository content changed while the read-only PlanReview stage was running",
+    recovery: "restart_from_current_files",
+  });
+  equal(restart.action, "restart-delivery");
+  equal(restart.label, "Restart with current files");
+  ok(restart.description.includes("previous plan and review remain"));
+
+  const resume = workflowRecoveryPresentation({
+    id: "workflow-2",
+    source_turn_id: "turn-2",
+    task: "Update the project page",
+    stage: "blocked",
+    outcome: "executor_unavailable",
+    policy_sha256: "policy",
+    recovery: "resume",
+  });
+  equal(resume.action, "resume");
+  equal(resume.label, "Resume after fixing");
 });
 
 Deno.test("running sessions keep a plain-message composer without intent controls", async () => {
@@ -150,7 +181,7 @@ Deno.test("paused session composer keeps resume action at intrinsic width", asyn
   const css = await Deno.readTextFile("webui/src/session.css");
 
   ok(markup.includes('className="composer paused-composer"'));
-  ok(markup.includes('className="btn btn-warning composer-action"'));
+  ok(markup.includes("className={`btn composer-action"));
   const actionRule = cssRule(css, ".composer .btn.composer-action");
   ok(actionRule.includes("flex: 0 0 auto;"));
   ok(actionRule.includes("width: auto;"));
@@ -179,6 +210,22 @@ Deno.test("session corrections render as truthful steward messages", async () =>
   ok(component.includes("Delivery paused safely"));
   ok(component.includes('className="action-origin"'));
   ok(css.includes(".correction-bubble"));
+});
+
+Deno.test("accepted delivery plans and reviewer prose stay visible in chat", async () => {
+  const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+  const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+  const helpers = await Deno.readTextFile("webui/src/lib/helpers.ts");
+
+  ok(component.includes("function DeliveryPlanCard"));
+  ok(component.includes('"Review invalidated"'));
+  ok(component.includes("What it must achieve"));
+  ok(component.includes("Implementation"));
+  ok(component.includes("Done when"));
+  ok(component.includes('case "workflow_artifact_accepted"'));
+  ok(page.includes("workflow={session.workflow}"));
+  ok(!component.includes("Notes from this run"));
+  ok(!helpers.includes("reasoningEvents:"));
 });
 
 Deno.test("final assistant messages use profile avatars", async () => {

@@ -56,6 +56,10 @@ configured checks, independent code review, bounded repair when necessary, and a
 The active stage controls which tools are visible and which structured submission can advance the
 workflow.
 
+The accepted delivery plan appears in the main session transcript with its requirements,
+implementation steps, target paths, and acceptance facts. A reviewer verdict is additional chat
+from the review teammate rather than content hidden inside the following submission action.
+
 Small complete files read during one stage may appear in the next stage as harness-carried evidence.
 pb rechecks their hashes first; changed, partial, or oversized reads must be inspected again. Strict
 Build stages use the accepted plan and checkpoint for progress instead of exposing a second TODO
@@ -180,9 +184,10 @@ separate activity feed. A simple request that skipped model-based Task partition
 empty zero-call planning disclosure above the transcript.
 
 Standalone model-inference rows show the responsible teammate and elapsed time. When the same
-teammate makes consecutive tool-directed calls, the transcript folds them and their intermediate
-notes into one collapsed action run with one avatar and name; the notes remain available when the
-run is expanded. Chat, user input, stage changes, and material Trinity feedback start a new run.
+teammate makes consecutive tool-directed calls, the transcript folds the actions into one collapsed
+run with one avatar and name. Model prose remains visible as ordinary teammate chat and ends the
+action run; it is never moved into the action disclosure merely because a tool submission follows.
+User input, stage changes, and material Trinity feedback also start a new run.
 Internal turn-credit accounting stays out of chat, and a repeat-limit failure is explained by
 Trinity instead of appearing again as an unattached red error. When the repeat stop and delivery
 outcome are adjacent, Trinity presents them together while the stored evidence keeps both causes.
@@ -214,6 +219,18 @@ title fallback instead of spending a model call on cosmetic title rewriting. A s
 inconsistent plan-review verdict is rejected inside the same live review turn, preserving the
 reviewer's reads and restricting the correction turn to the review submission rather than starting
 another evidence pass.
+
+If repository content changes while a read-only plan or code review is running, pb keeps the review
+bound to its earlier exact snapshot and stops before implementation or commit. The session names the
+changed paths and offers **Restart with current files**. That action preserves the earlier plan and
+review in history, captures the current repository as a new baseline, and starts fresh planning;
+generic **Resume** is reserved for a preserved stage whose prerequisite can actually be repaired in
+place, such as an unavailable executor.
+
+Apple-container-backed work uses a pb-owned session worktree. Local execution is intentionally a
+compatibility mode and works in the registered repository itself, so another editor or session can
+change those files while a task is running. Content fingerprints prevent stale review or commit
+evidence from being accepted, but they are conflict detection rather than filesystem isolation.
 
 Sessions saved before actor attribution remain readable. Their model tool actions appear as
 **Legacy** rather than being guessed from the closest chat message.

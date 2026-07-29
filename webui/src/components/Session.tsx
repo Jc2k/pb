@@ -1,6 +1,11 @@
 import type React from "react";
 import { Fragment, useEffect, useId, useRef, useState } from "react";
-import type { AgentEvent, EventEnvelope, SessionItem } from "../types";
+import type {
+  AgentEvent,
+  EventEnvelope,
+  SessionItem,
+  WorkflowSummary,
+} from "../types";
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "../lib/constants";
 import {
   formatEventTime,
@@ -219,7 +224,6 @@ export function ActionGroupBubble({
   actor,
   assistingProfile,
   inferenceEvents,
-  reasoningEvents,
   toolCalls,
   toolResults,
   controllerActions,
@@ -227,7 +231,6 @@ export function ActionGroupBubble({
   actor?: import("../types").TeamActor;
   assistingProfile?: string;
   inferenceEvents: EventEnvelope[];
-  reasoningEvents: EventEnvelope[];
   toolCalls: EventEnvelope[];
   toolResults: EventEnvelope[];
   controllerActions: EventEnvelope[];
@@ -360,24 +363,8 @@ export function ActionGroupBubble({
           </button>
           <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
             <div className="tool-list">
-              {reasoningEvents.length > 0
-                ? (
-                  <div className="action-run-notes">
-                    <strong>Notes from this run</strong>
-                    {reasoningEvents.map((envelope, index) =>
-                      envelope.event.type === "reasoning"
-                        ? (
-                          <RichText
-                            key={index}
-                            content={envelope.event.content}
-                          />
-                        )
-                        : null
-                    )}
-                  </div>
-                )
-                : null}
-              {controllerItems}{toolItems}
+              {controllerItems}
+              {toolItems}
             </div>
           </div>
         </div>
@@ -664,10 +651,15 @@ function WorkflowBlockedNotice({
   const repeatedProfile = repeatedAction?.event.type === "correction"
     ? repeatedAction.event.assisting_profile || recentProfile
     : recentProfile;
-  const repeatedName = repeatedProfile ? profileName(repeatedProfile) : "A teammate";
+  const repeatedName = repeatedProfile
+    ? profileName(repeatedProfile)
+    : "A teammate";
   const planningFailure = event.outcome === "plan_rejected" ||
     event.reason.toLowerCase().includes("planning submission");
   const gitControlChanged = event.reason.includes("changed Git control state");
+  const repositoryContentChanged = event.reason.includes(
+    "repository content changed while the read-only",
+  );
   const repeatLimit = event.reason.includes("deterministic repeat limit");
   const message = planningFailure
     ? `${
@@ -677,6 +669,8 @@ function WorkflowBlockedNotice({
     ? `${repeatedName} got stuck repeating the same action, so I blocked the duplicate before it ran. The repository’s Git state also changed during the pass; I preserved the content and stopped before committing or overwriting somebody else’s work.`
     : gitControlChanged
     ? "The repository’s Git state changed while the team was working. I preserved the content and stopped before committing or overwriting somebody else’s work."
+    : repositoryContentChanged
+    ? `The project changed while ${repeatedName} was reviewing an earlier snapshot. I kept the review tied to those exact files and stopped before implementation. Restart with the current files to make a fresh plan without overwriting the newer work.`
     : repeatLimit
     ? event.reason
     : "I stopped this delivery at a safe boundary because the team needs help before it can continue.";
@@ -771,6 +765,91 @@ function AssistantMessageRow({
         </div>
       </div>
     </article>
+  );
+}
+
+function DeliveryPlanCard({
+  workflow,
+  timestampMs,
+}: {
+  workflow: WorkflowSummary;
+  timestampMs?: number;
+}) {
+  const envelope = workflow.plan;
+  if (!envelope) return null;
+  const plan = envelope.artifact;
+  const review = workflow.plan_review?.artifact;
+  const reviewMatchesPlan = review?.plan_sha256 === envelope.sha256;
+  const reviewWasInvalidated = !reviewMatchesPlan &&
+    workflow.stage === "blocked" &&
+    workflow.paused_stage === "plan_review" &&
+    workflow.blocked_reason?.includes("repository content changed");
+  const reviewLabel = reviewMatchesPlan
+    ? review?.verdict === "pass"
+      ? `${profileName("review")} reviewed`
+      : "Changes requested"
+    : reviewWasInvalidated
+    ? "Review invalidated"
+    : "Awaiting review";
+
+  return (
+    <AssistantMessageRow profile="plan" timestampMs={timestampMs}>
+      <section className="delivery-plan" aria-label="Delivery plan">
+        <div className="delivery-plan-heading">
+          <span className="handoff-state">Delivery plan</span>
+          <span className="delivery-plan-review">
+            <i
+              className={reviewMatchesPlan && review?.verdict === "pass"
+                ? "bi bi-check2-circle"
+                : reviewWasInvalidated
+                ? "bi bi-exclamation-circle"
+                : "bi bi-hourglass-split"}
+              aria-hidden="true"
+            >
+            </i>
+            {reviewLabel}
+          </span>
+        </div>
+        <strong className="feedback-heading">{plan.summary}</strong>
+        <section>
+          <h3>What it must achieve</h3>
+          <ul>
+            {plan.requirements.map((requirement) => (
+              <li key={requirement.id}>{requirement.description}</li>
+            ))}
+          </ul>
+        </section>
+        <section>
+          <h3>Implementation</h3>
+          <ol>
+            {plan.steps.map((step) => (
+              <li key={step.id}>
+                <span>{step.description}</span>
+                {step.paths.length > 0
+                  ? (
+                    <div className="delivery-plan-paths">
+                      {step.paths.map((path) => (
+                        <code key={`${step.id}-${path.change}-${path.path}`}>
+                          <span>{path.change}</span> {path.path}
+                        </code>
+                      ))}
+                    </div>
+                  )
+                  : null}
+              </li>
+            ))}
+          </ol>
+        </section>
+        <section>
+          <h3>Done when</h3>
+          <ul>
+            {plan.acceptance.map((acceptance) => (
+              <li key={acceptance.id}>{acceptance.description}</li>
+            ))}
+          </ul>
+        </section>
+      </section>
+    </AssistantMessageRow>
   );
 }
 
@@ -1603,10 +1682,12 @@ export function MessageBubble({
   envelope,
   activityProfile,
   evidenceEvents = [],
+  workflow,
 }: {
   envelope: EventEnvelope;
   activityProfile?: string;
   evidenceEvents?: EventEnvelope[];
+  workflow?: WorkflowSummary;
 }) {
   const e = envelope.event;
   const nearestPriorProfile = () => {
@@ -1850,6 +1931,12 @@ export function MessageBubble({
     case "llm_invocation":
       return <InferenceDetails event={e} activityProfile={activityProfile} />;
 
+    case "workflow_artifact_accepted":
+      return e.artifact_kind === "plan" &&
+          workflow?.plan?.sha256 === e.sha256
+        ? <DeliveryPlanCard workflow={workflow} timestampMs={e.timestamp_ms} />
+        : null;
+
     case "executor_started":
     case "task_plan_accepted":
     case "task_plan_rejected":
@@ -1858,7 +1945,6 @@ export function MessageBubble({
     case "workflow_resumed":
     case "workflow_stage_started":
     case "workflow_stage_completed":
-    case "workflow_artifact_accepted":
     case "workflow_completed":
     case "check_result":
     case "commit_result":

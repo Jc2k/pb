@@ -87,9 +87,11 @@ a session that can complete without applying it.
 ## Scope contract
 
 The repository root, task focus, allowed paths, configured tasks, and expected outputs constrain
-where delivery may act. A task-owned workspace separates the user's baseline from in-progress work.
-Promotion and commit checks prevent undeclared output or unrelated repository state from being
-quietly absorbed into the result.
+where delivery may act. An Apple-container-backed task-owned worktree separates the user's baseline
+from in-progress work. Explicit local execution instead operates in the canonical repository and
+uses exact baseline fingerprints plus stale-evidence rejection; another local process can still
+change those files. Promotion and commit checks prevent undeclared output or unrelated repository
+state from being quietly absorbed into the result.
 
 For built-in file mutation, “read before write” means the exact bytes read still match immediately
 before atomic replacement. A concurrent edit invalidates that evidence. Configured tasks stage and

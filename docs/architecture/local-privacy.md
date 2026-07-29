@@ -280,7 +280,7 @@ explicit local backend inherits host connectivity.
 | --- | --- | --- |
 | User-global | Model preferences, project registry, OAuth token | Stored below the user's config/data roots; not checked into a project. |
 | Repository-owned | `.pb/` configuration, source, acceptance facts | Visible to project collaborators if committed; secret values should not appear here. |
-| Session-owned | Task workspace, container, services, network, event stream, active/completed Goal and multi-Task checkpoints | Reconciled or removed when terminal/expired, except persisted history. |
+| Session-owned | Container-backed task worktree, container, services, network, event stream, active/completed Goal and multi-Task checkpoints | Reconciled or removed when terminal/expired, except persisted history. Explicit local execution uses the registered repository rather than a session-owned worktree. |
 | Durable project memory | Evidence-backed Markdown entries under local `refs/pb/memory` | Outside the working tree and ordinary branch pushes; bounded and retained until that ref is changed or removed. |
 | Reusable local artifact | Model weights, images, declared caches, llama.cpp and FlashMoe session state | May survive sessions; managed separately from task cleanup. |
 | External disclosure | Search query, remote tool arguments, provider mutation | Occurs only through an enabled edge; governed by its provider and local policy. |
