@@ -112,6 +112,34 @@ pub(crate) struct PythonWorldQualificationObservation {
     pub(crate) process_cache_hit_millis: u64,
     pub(crate) invalid_replay_millis: u64,
     pub(crate) valid_replay_millis: u64,
+    pub(crate) stress_replay_count: u64,
+    pub(crate) stress_millis: u64,
+    pub(crate) max_stress_replay_millis: u64,
+    pub(crate) pre_stress_resident_bytes: u64,
+    pub(crate) post_stress_resident_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RustWorldQualificationObservation {
+    pub(crate) world_sha256: String,
+    pub(crate) configuration_sha256: String,
+    pub(crate) dependency_sha256: String,
+    pub(crate) provider_version: String,
+    pub(crate) load_millis: u64,
+    pub(crate) prime_millis: u64,
+    pub(crate) primed_queries: u64,
+    pub(crate) target_count: usize,
+    pub(crate) deep_profile: RustDeepProfile,
+    pub(crate) cold_millis: u64,
+    pub(crate) warm_millis: u64,
+    pub(crate) process_cache_hit_millis: u64,
+    pub(crate) invalid_replay_millis: u64,
+    pub(crate) valid_replay_millis: u64,
+    pub(crate) stress_replay_count: u64,
+    pub(crate) stress_millis: u64,
+    pub(crate) max_stress_replay_millis: u64,
+    pub(crate) pre_stress_resident_bytes: u64,
+    pub(crate) post_stress_resident_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2127,6 +2155,9 @@ pub(crate) fn qualify_python_world_fixture(
     target_path: &str,
     invalid_source: &str,
     valid_source: &str,
+    stress_workers: usize,
+    stress_replays_per_worker: usize,
+    resident_probe: &dyn Fn() -> Result<u64>,
 ) -> Result<PythonWorldQualificationObservation> {
     let logical_path = pb_control_collar::mutation::LogicalPath::parse(target_path.to_string())?;
     let snapshot = WorkspaceSnapshot::new(vec![pb_control_collar::mutation::SnapshotEntry::new(
@@ -2232,6 +2263,21 @@ pub(crate) fn qualify_python_world_fixture(
         bail!("Python qualification request did not use the exact process cache");
     }
 
+    let pre_stress_resident_bytes = resident_probe()?;
+    let stress = qualify_serialized_replays(
+        &lifecycle,
+        workspace_root,
+        &tool,
+        &snapshot,
+        target_path,
+        invalid_source,
+        valid_source,
+        stress_workers,
+        stress_replays_per_worker,
+        "Python",
+    )?;
+    let post_stress_resident_bytes = resident_probe()?;
+
     Ok(PythonWorldQualificationObservation {
         world_sha256: world.world_sha256,
         configuration_sha256: world.configuration_sha256,
@@ -2245,6 +2291,267 @@ pub(crate) fn qualify_python_world_fixture(
         process_cache_hit_millis,
         invalid_replay_millis,
         valid_replay_millis,
+        stress_replay_count: stress.replay_count,
+        stress_millis: stress.total_millis,
+        max_stress_replay_millis: stress.max_replay_millis,
+        pre_stress_resident_bytes,
+        post_stress_resident_bytes,
+    })
+}
+
+/// Exercise the Rust production lifecycle and its serialized writable Salsa overlay without a
+/// model. The caller owns a process-isolated fixture and supplies complete valid/invalid sources for
+/// one existing indexed target.
+pub(crate) fn qualify_rust_world_fixture(
+    workspace_root: &Path,
+    target_path: &str,
+    invalid_source: &str,
+    valid_source: &str,
+    stress_workers: usize,
+    stress_replays_per_worker: usize,
+    resident_probe: &dyn Fn() -> Result<u64>,
+) -> Result<RustWorldQualificationObservation> {
+    let logical_path = pb_control_collar::mutation::LogicalPath::parse(target_path.to_string())?;
+    let snapshot = WorkspaceSnapshot::new(vec![pb_control_collar::mutation::SnapshotEntry::new(
+        logical_path.clone(),
+        std::fs::read(workspace_root.join(target_path))
+            .with_context(|| format!("failed to read Rust qualification target {target_path}"))?,
+    )])?
+    .with_bound_mutation_path(logical_path);
+    let tool = BuiltInToolSchema {
+        name: "replace_file".to_string(),
+        description: "Native Rust world qualification mutation".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "const": target_path } }
+        }),
+    };
+
+    let mut lifecycle = ControlLayerLifecycle::default();
+    let cold_started = std::time::Instant::now();
+    let cold_layers = lifecycle
+        .prepare_for_inference_cancellable(
+            workspace_root,
+            std::slice::from_ref(&tool),
+            Some(&snapshot),
+            &|| Ok(()),
+        )?
+        .context("Rust qualification fixture did not prepare a native layer")?;
+    let cold_millis = elapsed_millis(cold_started);
+    drop(cold_layers);
+
+    let prepared = lifecycle
+        .rust
+        .as_ref()
+        .context("Rust qualification lifecycle lost its prepared world")?;
+    let prepared = prepared
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Rust qualification world lock is poisoned"))?;
+    let receipt = prepared.world.readiness_receipt().clone();
+    let world = prepared.world.descriptor().world.clone();
+    let target_count = prepared.world.targets().len();
+    let deep_profile = prepared.world.deep_profile().clone();
+    drop(prepared);
+    if deep_profile != RustDeepProfile::Exact {
+        bail!("Rust native-world qualification requires the exact deep profile");
+    }
+
+    let invalid_started = std::time::Instant::now();
+    let invalid = lifecycle.validate_completed_mutation(
+        workspace_root,
+        std::slice::from_ref(&tool),
+        &snapshot,
+        "replace_file",
+        &serde_json::json!({ "path": target_path, "content": invalid_source }),
+    )?;
+    let invalid_replay_millis = elapsed_millis(invalid_started);
+    if invalid != CompletionDecision::Reject(pb_control_collar::RejectionCode::InvalidSemantics) {
+        bail!("Rust qualification invalid replay was not rejected: {invalid:?}");
+    }
+
+    let valid_started = std::time::Instant::now();
+    let valid = lifecycle.validate_completed_mutation(
+        workspace_root,
+        std::slice::from_ref(&tool),
+        &snapshot,
+        "replace_file",
+        &serde_json::json!({ "path": target_path, "content": valid_source }),
+    )?;
+    let valid_replay_millis = elapsed_millis(valid_started);
+    if valid != CompletionDecision::Accept {
+        bail!("Rust qualification valid replay was not accepted: {valid:?}");
+    }
+
+    let warm_started = std::time::Instant::now();
+    let warm_layers = lifecycle
+        .prepare_for_inference_cancellable(
+            workspace_root,
+            std::slice::from_ref(&tool),
+            Some(&snapshot),
+            &|| Ok(()),
+        )?
+        .context("Rust qualification warm request did not prepare a native layer")?;
+    let warm_millis = elapsed_millis(warm_started);
+    drop(warm_layers);
+    if (lifecycle.cold_builds, lifecycle.warm_requests) != (1, 2) {
+        bail!("Rust qualification lifecycle did not record one cold build and two ready requests");
+    }
+
+    let mut next_lifecycle = ControlLayerLifecycle::default();
+    let cache_started = std::time::Instant::now();
+    let cached_layers = next_lifecycle
+        .prepare_for_inference_cancellable(
+            workspace_root,
+            std::slice::from_ref(&tool),
+            Some(&snapshot),
+            &|| Ok(()),
+        )?
+        .context("Rust qualification process-cache request did not prepare a native layer")?;
+    let process_cache_hit_millis = elapsed_millis(cache_started);
+    drop(cached_layers);
+    if (
+        next_lifecycle.cold_builds,
+        next_lifecycle.warm_requests,
+        next_lifecycle.process_cache_hits,
+    ) != (0, 1, 1)
+    {
+        bail!("Rust qualification request did not use the exact process cache");
+    }
+
+    let pre_stress_resident_bytes = resident_probe()?;
+    let stress = qualify_serialized_replays(
+        &lifecycle,
+        workspace_root,
+        &tool,
+        &snapshot,
+        target_path,
+        invalid_source,
+        valid_source,
+        stress_workers,
+        stress_replays_per_worker,
+        "Rust",
+    )?;
+    let post_stress_resident_bytes = resident_probe()?;
+
+    Ok(RustWorldQualificationObservation {
+        world_sha256: world.world_sha256,
+        configuration_sha256: world.configuration_sha256,
+        dependency_sha256: world.dependency_sha256,
+        provider_version: world.provider_version,
+        load_millis: receipt.load_millis,
+        prime_millis: receipt.prime_millis,
+        primed_queries: receipt.primed_queries,
+        target_count,
+        deep_profile,
+        cold_millis,
+        warm_millis,
+        process_cache_hit_millis,
+        invalid_replay_millis,
+        valid_replay_millis,
+        stress_replay_count: stress.replay_count,
+        stress_millis: stress.total_millis,
+        max_stress_replay_millis: stress.max_replay_millis,
+        pre_stress_resident_bytes,
+        post_stress_resident_bytes,
+    })
+}
+
+struct SerializedReplayObservation {
+    replay_count: u64,
+    total_millis: u64,
+    max_replay_millis: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qualify_serialized_replays(
+    lifecycle: &ControlLayerLifecycle,
+    workspace_root: &Path,
+    tool: &BuiltInToolSchema,
+    snapshot: &WorkspaceSnapshot,
+    target_path: &str,
+    invalid_source: &str,
+    valid_source: &str,
+    workers: usize,
+    replays_per_worker: usize,
+    language: &str,
+) -> Result<SerializedReplayObservation> {
+    if workers == 0 || replays_per_worker == 0 {
+        bail!("{language} native-world stress dimensions must be non-zero");
+    }
+    let started = std::time::Instant::now();
+    let maxima = std::thread::scope(|scope| -> Result<Vec<u64>> {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            handles.push(scope.spawn(move || -> Result<u64> {
+                let mut maximum = 0u64;
+                for replay in 0..replays_per_worker {
+                    let should_reject = (worker.saturating_add(replay)) % 2 == 0;
+                    let source = if should_reject {
+                        invalid_source
+                    } else {
+                        valid_source
+                    };
+                    let replay_started = std::time::Instant::now();
+                    let decision = lifecycle.validate_completed_mutation(
+                        workspace_root,
+                        std::slice::from_ref(tool),
+                        snapshot,
+                        "replace_file",
+                        &serde_json::json!({ "path": target_path, "content": source }),
+                    )?;
+                    maximum = maximum.max(elapsed_millis(replay_started));
+                    let expected = if should_reject {
+                        CompletionDecision::Reject(
+                            pb_control_collar::RejectionCode::InvalidSemantics,
+                        )
+                    } else {
+                        CompletionDecision::Accept
+                    };
+                    if decision != expected {
+                        bail!(
+                            "{language} serialized overlay replay returned {decision:?}, expected {expected:?}"
+                        );
+                    }
+                }
+                Ok(maximum)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("{language} replay worker panicked"))?
+            })
+            .collect()
+    })?;
+
+    // A final valid replay proves every rejecting worker restored the shared writable database.
+    let recovery_started = std::time::Instant::now();
+    let recovery = lifecycle.validate_completed_mutation(
+        workspace_root,
+        std::slice::from_ref(tool),
+        snapshot,
+        "replace_file",
+        &serde_json::json!({ "path": target_path, "content": valid_source }),
+    )?;
+    let recovery_millis = elapsed_millis(recovery_started);
+    if recovery != CompletionDecision::Accept {
+        bail!("{language} serialized overlay did not recover to an accepted valid replay");
+    }
+    let replay_count = workers
+        .checked_mul(replays_per_worker)
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| u64::try_from(count).ok())
+        .context("native-world stress replay count overflowed")?;
+    Ok(SerializedReplayObservation {
+        replay_count,
+        total_millis: elapsed_millis(started),
+        max_replay_millis: maxima
+            .into_iter()
+            .max()
+            .unwrap_or_default()
+            .max(recovery_millis),
     })
 }
 

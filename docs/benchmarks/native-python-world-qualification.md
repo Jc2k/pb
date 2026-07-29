@@ -1,22 +1,23 @@
 # Native Python world qualification
 
 - Date: **2026-07-28**
-- Profile SHA-256: `aeeca87bd8032bede70a174dd124ee341de33beeed1739998c11d94b8134966e`
+- Profile SHA-256: `a6093b4fa3f4b762d432291226aee27c111afae72745aa0dede09a64ee0ac0bc`
 - Provider: **Astral `ty` 0.0.6**
 - Artifact: **optimized macOS arm64 release binary**
 - Host surface: **arm64, macOS 26.5.2 (25F84)**
 
 ## Result
 
-The version 1 process-isolated matrix passed its default ceilings: 60 seconds for a complete cold
+The version 2 process-isolated matrix passed its default ceilings: 60 seconds for a complete cold
 pre-inference barrier, 20 seconds for a warm or exact process-cache request, 20 seconds for each
-independent final replay, and 1 GiB whole-process peak resident memory.
+independent final replay, 120 seconds for serialized-overlay stress, 1 GiB whole-process peak
+resident memory, and 512 MiB of current resident growth retained after stress.
 
-| Case | First-party / dependency files | Primed queries | Native load / prime | Complete cold barrier | Warm / process cache | Invalid / valid replay | Process peak / incremental peak |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Tiny | 4 / 7 | 9 | 1 / 11 ms | 49 ms | 14 / 14 ms | 16 / 15 ms | 39,550,976 / 22,970,368 bytes |
-| Representative | 1,024 / 515 | 1,537 | 22 / 42 ms | 337 ms | 67 / 67 ms | 73 / 74 ms | 53,657,600 / 36,978,688 bytes |
-| Large | 10,000 / 5,003 | 15,001 | 280 / 371 ms | 3,106 ms | 601 / 602 ms | 662 / 660 ms | 192,380,928 / 175,718,400 bytes |
+| Case | First-party / dependency files | Primed queries | Native load / prime | Cold | Warm / cache | Invalid / valid replay | Stress replays / total / maximum | Peak RSS / retained growth |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Tiny | 4 / 7 | 9 | 1 / 11 ms | 50 ms | 16 / 15 ms | 18 / 17 ms | 65 / 516 / 41 ms | 44,105,728 / 2,621,440 bytes |
+| Representative | 1,024 / 515 | 1,537 | 21 / 41 ms | 317 ms | 67 / 68 ms | 74 / 73 ms | 33 / 1,469 / 219 ms | 59,342,848 / 4,931,584 bytes |
+| Large | 10,000 / 5,003 | 15,001 | 282 / 375 ms | 3,121 ms | 612 / 606 ms | 666 / 670 ms | 9 / 4,126 / 1,178 ms | 201,850,880 / 14,499,840 bytes |
 
 The source/dependency byte pairs were 405/288, 113,625/29,752, and
 1,109,961/290,056. The matrix therefore stresses project and dependency module count more than
@@ -42,9 +43,16 @@ gate. The invalid arm must reject a string-parameter function called with an int
 must accept a changed string call. Thus these measurements cover the executor-side replay contract,
 not only analyzer startup.
 
+The stress arm uses 4 workers for tiny and representative and 2 for large. They submit alternating
+invalid and valid replays through the same production lifecycle, which serializes access to the
+writable Salsa overlay. Tiny runs 16 replays per worker, representative 8, and large 4; the reported
+counts include one final accepted recovery replay after all workers join. Every decision matched,
+and the recovery proves a rejecting branch did not leak candidate state into the next request.
+
 Every case runs in a fresh child process. Peak memory is the operating system's whole-process
 maximum resident set; incremental peak subtracts the maximum already observed after fixture
-construction. It is not an allocation-accounting claim for `ty` alone.
+construction. Retained growth is the saturating difference between current RSS immediately before
+and after stress. Neither is an allocation-accounting claim for `ty` alone.
 
 ## Reproduction
 
@@ -68,8 +76,8 @@ in this version 1 resource matrix.
 
 ## Scope
 
-This is an accepted lifecycle/scaling baseline for simple, fully annotated static module graphs. It
-does not establish a universal project latency promise, a complex-AST throughput bound, a separate
-large external-editable resource profile, dynamic/import-hook/native-extension authority, dynamic
-Python soundness, or a semantic false-rejection rate. Those remain separate Phase 7E/7H
-qualification work.
+This is the accepted lifecycle, serialization, reclamation, and scaling baseline for the shipped
+Python profile over simple, fully annotated static module graphs. It does not establish a universal
+project latency promise, a complex-AST throughput bound, a separate large external-editable resource
+profile, dynamic/import-hook/native-extension authority, dynamic Python soundness, or semantic
+authority beyond the separately qualified corpus.

@@ -27,11 +27,13 @@ The rejection expectations exercised `invalid-argument-type` 3 times, `invalid-a
 `unsupported-operator` 3. The corpus covers create, replace, exact edit, and canonical multi-file
 patch calls.
 
-The initial native-world readiness barrier took 52 ms, including 1 ms of provider load and 12 ms
-of priming for 10 source/stub modules. Across the 96 measured warm-preparation, generation,
-execution-replay, and direct-diagnostic stages, latency was 8 ms p50, 16 ms p95, 16 ms p99, and
-16 ms maximum. The accepted qualifier ceilings remain deliberately loose at 60 seconds cold and
-20 seconds per case stage; they are failure bounds, not user-facing latency promises.
+The final release run's native-world readiness barrier took 42 ms. Across the measured
+warm-preparation, generation, execution-replay, direct-diagnostic, prefix, and rollback stages,
+latency was 8 ms p50, 15 ms p95, and 16 ms p99/maximum. The same run completed 2,007 exhaustive
+logical UTF-8 prefix probes and 1,536 deterministic rollback/full-replay branches. Once a prefix
+became impossible, every longer prefix remained impossible. The accepted qualifier ceilings remain
+deliberately loose at 60 seconds cold and 20 seconds per case stage; they are failure bounds, not
+user-facing latency promises.
 
 ## Dependency and lifecycle boundary
 
@@ -59,10 +61,10 @@ target/aarch64-apple-darwin/release/pb harness python-semantic-qualify \
   --corpus fixtures/control-collar/semantic-python-v1.json
 ```
 
-The command emits only content-free identities, profile/category/diagnostic counts, parity counts,
-and timings. The corpus contract rejects unsafe dependency paths, absent annotated/unannotated/
-third-party allow-or-reject arms, unpromoted diagnostic expectations, duplicate codes, missing
-mutation-tool coverage, and incomplete promoted-code coverage.
+The command emits only content-free identities, profile/category/diagnostic counts, parity and
+prefix/rollback counts, and timings. The corpus contract rejects unsafe dependency paths, absent
+annotated/unannotated/third-party allow-or-reject arms, unpromoted diagnostic expectations,
+duplicate codes, missing mutation-tool coverage, and incomplete promoted-code coverage.
 
 ## Scope
 

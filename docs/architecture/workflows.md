@@ -785,14 +785,18 @@ absolute third-party import cannot veto generation. Immediately before execution
 dependency identity, reconstructs the mutation, and replays it through a fresh Python request
 database against the same frozen world.
 
-The hidden model-free native-world qualifier runs the exact production Python lifecycle in isolated
-processes over deterministic 4/7, 1,024/515, and 10,000/5,003 first-party/dependency-file graphs.
-It separately records native load/prime time, the complete cold pre-inference barrier, warm request
-construction, exact process-cache reuse, invalid and valid execution replay, and peak resident
-memory. It fails closed against explicit command-line ceilings and emits only content-free
-identities, counts, byte totals, and timings. The matrix establishes a reproducible scaling
-baseline; it is not a universal latency or memory guarantee for projects with different syntax,
-plugins, dynamic environment behavior, or dependency shapes.
+The hidden model-free native-world qualifier runs the exact production Python or Rust lifecycle in
+separate processes over deterministic tiny, representative, and large project/dependency graphs. It
+records native load/prime time, the complete cold pre-inference barrier, warm request construction,
+exact process-cache reuse, invalid and valid execution replay, and peak resident memory. Multiple
+host workers then submit alternating invalid and valid completed mutations to the same lifecycle;
+the language-owned writable database must serialize them, return the exact decision for every
+replay, and accept one final recovery replay. Current resident memory before and after that stress is
+bounded separately from whole-process peak RSS. The command fails closed against explicit
+language-specific ceilings and emits only content-free identities, counts, byte totals, and timings.
+The matrices establish reproducible lifecycle, serialization, and reclamation baselines; they are
+not universal latency or memory guarantees for projects with different syntax, macros, plugins,
+dynamic environment behavior, or dependency shapes.
 
 The separate Python semantic qualifier keeps this lifecycle outside inference while exercising
 language behavior. Its checked-in corpus freezes first-party files and a typed third-party package
@@ -817,9 +821,10 @@ borrow checker. The conservative prefix layer advances only over newly decoded
 logical payload bytes, keeps constant-time persistent-stack checkpoints for candidate branches, and
 probes canonical patch additions/context before line closure; final Tree-sitter validation still
 decides complete-file acceptance. Qwen and DSML byte-BPE fragments that end inside a UTF-8 scalar
-remain eligible only when the active protocol/schema has at least one bounded viable scalar
-completion; candidate probing restores the exact protocol, patch, and language-layer base between
-sibling tokens. The checked-in tokenizer qualifier covers both production Qwen and DeepSeek
+  remain eligible only when the active protocol/schema has at least one bounded viable scalar
+  completion; candidate probing restores the same reusable protocol, patch, and language-layer
+  batch base between sibling tokens. It does not allocate a replacement analyzer checkpoint per
+  vocabulary entry. The checked-in tokenizer qualifier covers both production Qwen and DeepSeek
 tokenizer boundaries without loading model weights. A hidden no-execution llama.cpp fixture runner
 also loads an exact GGUF and reports complete calls plus content-free constraint counts; one pinned
 Qwen profile passes valid write/patch and fail-closed malformed/truncation cases. This is profile

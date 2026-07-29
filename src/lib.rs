@@ -5795,8 +5795,12 @@ mod tests {
             "8000",
             "--max-replay-millis",
             "12000",
+            "--max-stress-millis",
+            "24000",
             "--max-peak-resident-bytes",
             "2147483648",
+            "--max-retained-growth-bytes",
+            "268435456",
         ])
         .unwrap();
         let Commands::Harness {
@@ -5809,11 +5813,32 @@ mod tests {
             args.language,
             native_qualification::NativeWorldLanguage::Python
         );
-        assert_eq!(args.max_cold_millis, 90_000);
-        assert_eq!(args.max_warm_millis, 8_000);
-        assert_eq!(args.max_replay_millis, 12_000);
-        assert_eq!(args.max_peak_resident_bytes, 2_147_483_648);
+        assert_eq!(args.max_cold_millis, Some(90_000));
+        assert_eq!(args.max_warm_millis, Some(8_000));
+        assert_eq!(args.max_replay_millis, Some(12_000));
+        assert_eq!(args.max_stress_millis, Some(24_000));
+        assert_eq!(args.max_peak_resident_bytes, Some(2_147_483_648));
+        assert_eq!(args.max_retained_growth_bytes, Some(268_435_456));
         assert!(args.case.is_none());
+
+        let rust = Cli::try_parse_from([
+            "pb",
+            "harness",
+            "native-world-qualify",
+            "--language",
+            "rust",
+        ])
+        .unwrap();
+        let Commands::Harness {
+            command: HarnessCommand::NativeWorldQualify(args),
+        } = rust.command
+        else {
+            panic!("expected Rust native-world qualification command");
+        };
+        assert_eq!(
+            args.language,
+            native_qualification::NativeWorldLanguage::Rust
+        );
     }
 
     #[test]
