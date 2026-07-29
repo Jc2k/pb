@@ -571,7 +571,7 @@ fn sanitize_bounded(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
-fn edit_distance(left: &str, right: &str) -> usize {
+pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     let right = right.chars().collect::<Vec<_>>();
     let mut previous = (0..=right.len()).collect::<Vec<_>>();
     for (left_index, left_character) in left.chars().enumerate() {

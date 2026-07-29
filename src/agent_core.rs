@@ -68,6 +68,10 @@ use crate::session_store::now_millis;
 
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_GLOB_RESULTS: usize = 200;
+// Existing-file plan targets are constrained to a small controller-owned vocabulary. The
+// vocabulary is seeded from task-relevant repository paths and refreshed by exact local discovery
+// results, so the native collar never needs the whole repository path set in one tool schema.
+const MAX_PLANNING_PATH_CANDIDATES: usize = 32;
 const MAX_WEB_SEARCH_RESULTS: usize = 8;
 const MAX_WEB_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_WEB_RESULT_CHARS: usize = 20_000;
@@ -5133,16 +5137,15 @@ fn plan_submission_schema() -> Value {
                             "requirement_ids": non_empty_string_array_schema("Requirement ids covered by this step."),
                             "component_ids": string_array_schema("Workspace component ids affected by this step."),
                             "paths": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "path": {"type": "string"},
-                                        "change": {"type": "string", "enum": ["create", "modify", "delete"]},
-                                    },
-                                    "required": ["path", "change"],
-                                    "additionalProperties": false,
+                                "type": "object",
+                                "description": "Paths grouped by their ordered transition. Create paths are new names. Modify and delete paths are constrained per turn to a bounded controller-owned set of existing repository paths.",
+                                "properties": {
+                                    "create": string_array_schema("New repository-relative paths created by this step."),
+                                    "modify": string_array_schema("Existing repository-relative paths modified by this step."),
+                                    "delete": string_array_schema("Existing repository-relative paths deleted by this step."),
                                 },
+                                "required": ["create", "modify", "delete"],
+                                "additionalProperties": false,
                             },
                             "description": non_empty_workflow_string_schema(),
                         },
@@ -5448,6 +5451,46 @@ fn set_tool_target_path(tools: &mut [BuiltInToolSchema], tool_name: &str, target
         if let Some(property) = tool.input_schema.pointer_mut("/properties/path") {
             property["enum"] = json!([target_path]);
         }
+    }
+}
+
+fn configure_plan_path_candidates(tools: &mut [BuiltInToolSchema], candidates: &[String]) {
+    let Some(schema) = tools
+        .iter_mut()
+        .find(|tool| tool.name == "submit_plan")
+        .map(|tool| &mut tool.input_schema)
+    else {
+        return;
+    };
+    for operation in ["modify", "delete"] {
+        let Some(paths) = schema.pointer_mut(&format!(
+            "/properties/steps/items/properties/paths/properties/{operation}"
+        )) else {
+            continue;
+        };
+        let Some(paths) = paths.as_object_mut() else {
+            continue;
+        };
+        if candidates.is_empty() {
+            // A zero-length array remains representable without inventing an impossible empty
+            // string enum, which the native constraint compiler correctly rejects.
+            paths.insert("maxItems".to_string(), json!(0));
+            if let Some(items) = paths.get_mut("items").and_then(Value::as_object_mut) {
+                items.remove("enum");
+            }
+        } else {
+            paths.remove("maxItems");
+            if let Some(items) = paths.get_mut("items") {
+                items["enum"] = json!(candidates);
+            }
+        }
+    }
+    if let Some(tool) = tools.iter_mut().find(|tool| tool.name == "submit_plan") {
+        tool.description.push_str(if candidates.is_empty() {
+            " No existing-path candidates are currently established, so modify and delete must remain empty; use a local discovery tool before submitting an existing-file plan."
+        } else {
+            " Modify and delete targets are native-collar constrained to a bounded set of task-matched or locally discovered existing paths; create targets remain free repository-relative paths."
+        });
     }
 }
 
@@ -5850,6 +5893,7 @@ struct LegacyReviewContractEvidence {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CachedEvidenceEffects {
     read_paths: Vec<String>,
+    planning_path_candidates: Vec<String>,
     read_content_fingerprints: BTreeMap<String, String>,
     contract_read_evidence: BTreeMap<String, String>,
     legacy_review_read_evidence_gathered: bool,
@@ -5864,6 +5908,12 @@ impl CachedEvidenceEffects {
             .cloned()
             .collect::<Vec<_>>();
         read_paths.sort();
+        let planning_path_candidates = after
+            .planning_path_candidates
+            .iter()
+            .filter(|path| !before.planning_path_candidates.contains(*path))
+            .cloned()
+            .collect();
         let contract_read_evidence = after
             .contract_read_evidence
             .iter()
@@ -5882,6 +5932,7 @@ impl CachedEvidenceEffects {
             .collect();
         Self {
             read_paths,
+            planning_path_candidates,
             read_content_fingerprints,
             contract_read_evidence,
             legacy_review_read_evidence_gathered: !before.legacy_review_read_evidence_gathered
@@ -5892,6 +5943,9 @@ impl CachedEvidenceEffects {
 
     fn apply(&self, state: &mut GateState) -> Result<()> {
         state.read_paths.extend(self.read_paths.iter().cloned());
+        for path in self.planning_path_candidates.iter().rev() {
+            state.record_planning_path_candidate(path.clone());
+        }
         state
             .read_content_fingerprints
             .extend(self.read_content_fingerprints.clone());
@@ -5948,6 +6002,7 @@ impl DeterministicReadCache {
 #[derive(Debug, Default, Clone)]
 struct GateState {
     read_paths: HashSet<String>,
+    planning_path_candidates: Vec<String>,
     read_content_fingerprints: HashMap<String, String>,
     stage_evidence: crate::workflow::StageEvidenceBundle,
     contract_read_evidence: HashMap<String, String>,
@@ -5971,6 +6026,19 @@ struct GateState {
 }
 
 impl GateState {
+    fn record_planning_path_candidate(&mut self, path: String) {
+        if let Some(index) = self
+            .planning_path_candidates
+            .iter()
+            .position(|candidate| candidate == &path)
+        {
+            self.planning_path_candidates.remove(index);
+        }
+        self.planning_path_candidates.insert(0, path);
+        self.planning_path_candidates
+            .truncate(MAX_PLANNING_PATH_CANDIDATES);
+    }
+
     fn record_content_mutation(&mut self) {
         self.record_workspace_change(true);
     }
@@ -6532,6 +6600,126 @@ fn read_cache_key(
     })
 }
 
+fn planning_path_words(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_lowercase = false;
+    for character in value.chars() {
+        if !character.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            previous_lowercase = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_lowercase && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(character.to_ascii_lowercase());
+        previous_lowercase = character.is_ascii_lowercase();
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn planning_path_term_quality(term: &str, candidate: &str) -> usize {
+    let singular_match =
+        term.strip_suffix('s') == Some(candidate) || candidate.strip_suffix('s') == Some(term);
+    if term == candidate || singular_match {
+        return 4;
+    }
+    if term.len() >= 4
+        && candidate.len() >= 4
+        && (term.contains(candidate) || candidate.contains(term))
+    {
+        return 2;
+    }
+    if term.len() >= 5
+        && candidate.len() >= 5
+        && term.len().abs_diff(candidate.len()) <= 1
+        && agent_tool_errors::edit_distance(term, candidate) <= 1
+    {
+        return 1;
+    }
+    0
+}
+
+fn task_relevant_existing_paths(
+    task: &str,
+    snapshot: &crate::workspace::ContentSnapshot,
+) -> Vec<String> {
+    let task_terms = planning_path_words(task)
+        .into_iter()
+        .filter(|term| {
+            term.len() >= 3
+                && !matches!(
+                    term.as_str(),
+                    "add"
+                        | "change"
+                        | "create"
+                        | "delete"
+                        | "file"
+                        | "from"
+                        | "into"
+                        | "make"
+                        | "modify"
+                        | "remove"
+                        | "repository"
+                        | "that"
+                        | "the"
+                        | "this"
+                        | "update"
+                        | "with"
+                )
+        })
+        .collect::<BTreeSet<_>>();
+    if task_terms.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked = snapshot
+        .paths
+        .keys()
+        .filter_map(|path| {
+            let path_terms = planning_path_words(path);
+            let matches = task_terms
+                .iter()
+                .filter_map(|term| {
+                    let quality = path_terms
+                        .iter()
+                        .map(|candidate| planning_path_term_quality(term, candidate))
+                        .max()
+                        .unwrap_or(0);
+                    (quality > 0).then_some((term.len(), quality))
+                })
+                .collect::<Vec<_>>();
+            let strong_single = matches
+                .iter()
+                .any(|(length, quality)| *length >= 7 && *quality >= 2);
+            (matches.len() >= 2 || strong_single).then(|| {
+                let score = matches
+                    .iter()
+                    .map(|(length, quality)| length.saturating_mul(*quality))
+                    .sum::<usize>();
+                (score, matches.len(), path.clone())
+            })
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(score, matches, path)| {
+        (
+            std::cmp::Reverse(*score),
+            std::cmp::Reverse(*matches),
+            path.clone(),
+        )
+    });
+    ranked
+        .into_iter()
+        .take(MAX_PLANNING_PATH_CANDIDATES)
+        .map(|(_, _, path)| path)
+        .collect()
+}
+
 fn initial_gate_state(
     args: &AgentRequest,
     workspace_root: &Path,
@@ -6567,7 +6755,7 @@ fn initial_gate_state(
         .as_ref()
         .map(|ledger| ledger.progress_credited_units.clone())
         .unwrap_or_default();
-    Ok(GateState {
+    let mut state = GateState {
         read_paths,
         read_content_fingerprints,
         stage_evidence,
@@ -6577,7 +6765,50 @@ fn initial_gate_state(
         legacy_review_command_evidence_gathered: args.repository_less,
         legacy_review_command_required: !args.repository_less && command_backend_available,
         ..GateState::default()
-    })
+    };
+    if matches!(
+        args.workflow_stage,
+        Some(
+            crate::workflow::WorkflowStage::Planning | crate::workflow::WorkflowStage::PlanRevision
+        )
+    ) && !args.repository_less
+    {
+        let snapshot = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+        // The repository brief already discloses top-level structure. Carry a small slice into the
+        // same native vocabulary so generic fixtures and root-file tasks do not need a redundant
+        // discovery turn merely because their filenames contain no useful task term.
+        let top_level = snapshot
+            .paths
+            .keys()
+            .filter(|path| !path.contains('/'))
+            .take(MAX_PLANNING_PATH_CANDIDATES / 4)
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in top_level.into_iter().rev() {
+            state.record_planning_path_candidate(path);
+        }
+        for path in task_relevant_existing_paths(&args.task, &snapshot)
+            .into_iter()
+            .rev()
+        {
+            state.record_planning_path_candidate(path);
+        }
+        if let Some(contract) = args.contract.as_ref() {
+            for path in contract.allowed_paths.iter().rev() {
+                if snapshot.paths.contains_key(path) {
+                    state.record_planning_path_candidate(path.clone());
+                }
+            }
+        }
+        let mut observed = state.read_paths.iter().cloned().collect::<Vec<_>>();
+        observed.sort();
+        for path in observed.into_iter().rev() {
+            if snapshot.paths.contains_key(&path) {
+                state.record_planning_path_candidate(path);
+            }
+        }
+    }
+    Ok(state)
 }
 
 fn run_agent_steps(
@@ -7133,6 +7364,18 @@ fn run_agent_steps(
                 ));
             }
         }
+        if matches!(
+            args.workflow_stage,
+            Some(
+                crate::workflow::WorkflowStage::Planning
+                    | crate::workflow::WorkflowStage::PlanRevision
+            )
+        ) {
+            configure_plan_path_candidates(
+                &mut scoped_tools,
+                &gate_state.borrow().planning_path_candidates,
+            );
+        }
         let terminal_tools = terminal_submission_only
             .then(|| {
                 args.workflow_stage
@@ -7157,7 +7400,7 @@ fn run_agent_steps(
                 .as_ref()
                 .zip(terminal_tool)
                 .map(|(state, terminal_tool)| {
-                    let terminal_schema = available_tools
+                    let terminal_schema = scoped_tools
                         .iter()
                         .find(|tool| tool.name == terminal_tool)
                         .cloned()
@@ -7862,15 +8105,17 @@ fn run_agent_steps(
                     record_blocked_tool_loop(
                         &output,
                         &loop_check.feedback,
+                        args.profile,
                         nesting_depth,
                         messages,
                         sink,
                     );
                     if loop_failure_count.is_some_and(|count| count >= MAX_IDENTICAL_GATE_FAILURES)
                     {
+                        let (summary, message) = deterministic_tool_loop_error(args.profile);
                         sink.emit(AgentEvent::Error {
-                            message: "the same tool-loop signature reached its deterministic stop threshold; no further model turn will run".to_string(),
-                            summary: "Deterministic tool loop".to_string(),
+                            message,
+                            summary,
                             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                             timestamp_ms: Some(now_millis()),
                         });
@@ -8060,15 +8305,17 @@ fn run_agent_steps(
                     record_blocked_tool_loop(
                         &output,
                         &loop_check.feedback,
+                        args.profile,
                         nesting_depth,
                         messages,
                         sink,
                     );
                     if loop_failure_count.is_some_and(|count| count >= MAX_IDENTICAL_GATE_FAILURES)
                     {
+                        let (summary, message) = deterministic_tool_loop_error(args.profile);
                         sink.emit(AgentEvent::Error {
-                            message: "the same tool-loop signature reached its deterministic stop threshold; no further model turn will run".to_string(),
-                            summary: "Deterministic tool loop".to_string(),
+                            message,
+                            summary,
                             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                             timestamp_ms: Some(now_millis()),
                         });
@@ -9880,6 +10127,9 @@ fn execute_tool_calls(
         };
 
         call.arguments = normalize_legacy_submission_arguments(&call.tool, &call.arguments);
+        if call.tool == "submit_plan" {
+            call.arguments = normalize_legacy_plan_path_arrays(&call.arguments);
+        }
         if let Some(issue) =
             agent_tool_errors::validate_arguments(&exposed_schema.input_schema, &call.arguments)
         {
@@ -11227,6 +11477,7 @@ fn record_progress_warning(
 fn record_blocked_tool_loop(
     output: &str,
     feedback: &Option<String>,
+    profile: AgentProfile,
     nesting_depth: usize,
     messages: &mut Vec<ChatMessage>,
     sink: &mut dyn EventSink,
@@ -11236,9 +11487,9 @@ fn record_blocked_tool_loop(
     );
     sink.emit(AgentEvent::Correction {
         message: feedback.to_string(),
-        summary: "Repeated tool call blocked".to_string(),
+        summary: format!("{} repeated the same action", profile.teammate_first_name()),
         actor: crate::events::TeamActor::workflow_steward(),
-        assisting_profile: None,
+        assisting_profile: Some(profile),
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
@@ -11247,6 +11498,16 @@ fn record_blocked_tool_loop(
         "Repeated tool call blocked",
         feedback,
     ));
+}
+
+fn deterministic_tool_loop_error(profile: AgentProfile) -> (String, String) {
+    let first_name = profile.teammate_first_name();
+    (
+        format!("{first_name} reached the repeat limit"),
+        format!(
+            "{first_name} repeated the same tool call after guidance. Trinity blocked the duplicate before execution and stopped this pass at the deterministic repeat limit; no further model turn ran."
+        ),
+    )
 }
 
 fn tool_call_signature(call: &AgentToolCall) -> String {
@@ -12503,12 +12764,20 @@ fn run_delivery_workflow(
             }
             let workflow_outcome =
                 workflow_outcome_for_termination(stage_outcome.termination_reason);
-            run.apply(crate::workflow::WorkflowEvent::Failed {
-                outcome: workflow_outcome,
-                reason: format!(
+            let reason = if stage_outcome.termination_reason == TerminationReason::GateLoop {
+                format!(
+                    "{} stopped making progress in the {stage:?} stage and reached a deterministic repeat limit; Trinity preserved the repository and stopped this pass before another duplicate action ran",
+                    args.profile.teammate_first_name()
+                )
+            } else {
+                format!(
                     "model stage {stage:?} ended without its required structured submission ({})",
                     stage_outcome.termination_reason
-                ),
+                )
+            };
+            run.apply(crate::workflow::WorkflowEvent::Failed {
+                outcome: workflow_outcome,
+                reason,
             })?;
             return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
         };
@@ -13471,8 +13740,8 @@ fn run_delivery_commit(
 
 const PLAN_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan function exactly once with arguments shaped as:
-{"id":"plan-1","summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":[{"path":"path/to/file.ext","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["required-check-id"],"description":"..."}]}
-Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Never guess a repository path: inspect it with local repository tools before naming it as modify or delete. For repository-local file, symbol, and component discovery, use glob, ripgrep/search, and read_file rather than public web search; use public research only when the task genuinely depends on external or current facts absent from the repository. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Paths are evaluated in step order: use create before a later modify when the path is currently missing, never modify or delete it before that create, and never create it again while it exists. Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. When the harness names projected contract check ids, leave those ids out of check_ids; pb will add them deterministically after submission. Include only additional configured check ids selected by the plan. Use [] for component_ids or check_ids when there are no additional ids. Do not return the arguments as prose or a final action."#;
+{"id":"plan-1","summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":{"create":["path/to/new-file.ext"],"modify":[],"delete":[]},"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["required-check-id"],"description":"..."}]}
+Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Each step groups paths into create, modify, and delete arrays. Create paths are new repository-relative names. Modify and delete paths are native-collar constrained to a bounded set of existing paths selected from task-relevant repository structure and exact local discovery results; if the intended path is absent, use glob, ripgrep/search, or read_file before submitting instead of spelling a guess. For repository-local file, symbol, and component discovery, use those local tools rather than public web search; use public research only when the task genuinely depends on external or current facts absent from the repository. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Consolidate one path's intended transition within a step: create final contents rather than planning a redundant later modify, and use modify rather than delete-then-create replacement. Every requirement must appear in a step and acceptance fact. When the harness names projected contract check ids, leave those ids out of check_ids; pb will add them deterministically after submission. Include only additional configured check ids selected by the plan. Use [] for component_ids or check_ids when there are no additional ids. Do not return the arguments as prose or a final action."#;
 
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan_review function exactly once with arguments shaped as:
@@ -13480,7 +13749,7 @@ Required terminal action: call the provided submit_plan_review function exactly 
 pb supplies the exact accepted plan id and digest. Assessments contain only kind and status; do not repeat explanations or evidence there. Put each concern's specific explanation and any observed evidence once in challenges, where every cited repository path must have current review evidence. Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]}, set verdict to revise, and set at least one corresponding assessment status to concern or fail. Never request revision while every assessment is pass. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, every assessment must pass and there must be no p0/p1 challenge. For repository-local evidence, use local repository tools rather than public web search. Do not return prose or a final action."#;
 
 const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
-When the plan creates a missing file, call write_file with arguments such as {"path":"path/to/file.ext","content":"exact contents"}. Never call write_file for a path that already exists. For an existing file, first call read_file as one turn with {"path":"path/to/file.ext"}; after pb returns the real contents, call replace_file in a later turn with {"path":"path/to/file.ext","content":"complete replacement contents"}, or use edit_file/apply_patch with their declared schemas. Paths are relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Use the native function-call interface described by the system tool schema. If native calls are unavailable, use exactly one compatibility action with no markdown or surrounding prose, for example {"type":"tool_call","tool":"write_file","arguments":{"path":"...","content":"..."}}, {"type":"tool_call","tool":"read_file","arguments":{"path":"..."}}, or {"type":"tool_call","tool":"replace_file","arguments":{"path":"...","content":"..."}}. Never return an argument object by itself. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
+When the plan creates a missing file, call write_file with arguments such as {"path":"path/to/file.ext","content":"exact contents"}. Never call write_file for a path that already exists. For an existing file, use the exact target-bound tools exposed on the current turn. pb may inject complete bytes or a task-relevant bounded byte range and expose edit_file immediately; in that case edit only text visible in the supplied observation. If read_file is exposed, call read_file as one turn for the target. Follow any read_file continuation from next_line instead of restarting at line 1, and do not claim you can write while the current schema still exposes only read_file. After pb returns sufficient real contents, call replace_file in a later turn when it is exposed, or use the exposed target-bound edit_file action. Paths are relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Use the native function-call interface described by the system tool schema. If native calls are unavailable, use exactly one compatibility action with no markdown or surrounding prose, for example {"type":"tool_call","tool":"write_file","arguments":{"path":"...","content":"..."}}, {"type":"tool_call","tool":"read_file","arguments":{"path":"..."}}, or {"type":"tool_call","tool":"replace_file","arguments":{"path":"...","content":"..."}}. Never return an argument object by itself. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
 One action ends the current turn. After closing a compatibility JSON object, stop generating immediately. Never imitate pb's transcript or invent later tool results: do not output `Tool calls:`, `[tool]`, or `[assistant]`, and do not act as though a file changed until pb returns the real tool result and content fingerprint. When the final mutation schema exposes the required completion field, put the same model-authored implementation accounting object there; pb executes the mutation first, projects structural facts only after success, and ignores or rejects premature completion without pretending the mutation failed.
 After the last work unit is structurally complete, call the provided submit_implementation function exactly once with arguments shaped as:
 {"id":"implementation-1","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","summary":"..."}],"summary":"...","semantic_commit_subject":"feat: concise semantic subject"}
@@ -16234,6 +16503,11 @@ fn recover_unwrapped_workflow_tool_call(
         .iter()
         .filter(|tool| {
             let normalized = normalize_legacy_submission_arguments(&tool.name, &arguments);
+            let normalized = if tool.name == "submit_plan" {
+                normalize_legacy_plan_path_arrays(&normalized)
+            } else {
+                normalized
+            };
             agent_tool_errors::validate_arguments(&tool.input_schema, &normalized).is_none()
         })
         .collect::<Vec<_>>();
@@ -17345,6 +17619,63 @@ fn run_ripgrep(
     }
 }
 
+fn discovered_paths_from_tool_result(tool: &str, result: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in result.lines().filter(|line| *line != "no matches") {
+        match tool {
+            "glob" => {
+                if !paths.iter().any(|candidate| candidate == line) {
+                    paths.push(line.to_string());
+                }
+            }
+            "ripgrep" | "search" => {
+                // Results are path:line:content. Content and legal repository paths may contain
+                // colons, so retain every prefix followed by a numeric segment and let the exact
+                // current snapshot select the real path below.
+                for (separator, _) in line.match_indices(':') {
+                    let remainder = &line[separator + 1..];
+                    let Some(next) = remainder.find(':') else {
+                        break;
+                    };
+                    if remainder[..next].parse::<usize>().is_ok() {
+                        let path = &line[..separator];
+                        if !paths.iter().any(|candidate| candidate == path) {
+                            paths.push(path.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    paths
+}
+
+fn record_discovered_planning_paths(
+    tool: &str,
+    result: &str,
+    context: &ToolContext<'_>,
+) -> Result<()> {
+    if !matches!(
+        context.request.workflow_stage,
+        Some(
+            crate::workflow::WorkflowStage::Planning | crate::workflow::WorkflowStage::PlanRevision
+        )
+    ) {
+        return Ok(());
+    }
+    let snapshot = crate::workspace::ContentSnapshot::capture(context.workspace_root)?;
+    let paths = discovered_paths_from_tool_result(tool, result)
+        .into_iter()
+        .filter(|path| snapshot.paths.contains_key(path))
+        .collect::<Vec<_>>();
+    let mut gate = context.gate_state.borrow_mut();
+    for path in paths.into_iter().rev() {
+        gate.record_planning_path_candidate(path);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct PreparedControllerObservation {
     receipt: crate::workflow::ControllerObservationReceipt,
@@ -17946,6 +18277,151 @@ fn diagnostic_line_windows(
     merged
 }
 
+fn task_line_windows(task: &str, text: &str, total_lines: usize) -> Vec<(usize, usize)> {
+    fn useful_task_term(term: &str) -> bool {
+        term.len() >= 4
+            && !matches!(
+                term,
+                "add"
+                    | "change"
+                    | "code"
+                    | "create"
+                    | "delete"
+                    | "file"
+                    | "from"
+                    | "into"
+                    | "make"
+                    | "modify"
+                    | "page"
+                    | "project"
+                    | "remove"
+                    | "repository"
+                    | "should"
+                    | "that"
+                    | "this"
+                    | "update"
+                    | "user"
+                    | "using"
+                    | "web"
+                    | "with"
+            )
+    }
+
+    fn words(value: &str) -> Vec<String> {
+        value
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .map(str::to_ascii_lowercase)
+            .filter(|word| !word.is_empty())
+            .collect()
+    }
+
+    fn match_quality(term: &str, candidate: &str) -> usize {
+        if term == candidate {
+            return 3;
+        }
+        if term.len() >= 5
+            && candidate.len() >= 5
+            && term.len().abs_diff(candidate.len()) <= 1
+            && agent_tool_errors::edit_distance(term, candidate) <= 1
+        {
+            return 2;
+        }
+        if term.len() >= 5
+            && candidate.len() >= 5
+            && (candidate.contains(term) || term.contains(candidate))
+        {
+            return 1;
+        }
+        0
+    }
+
+    let mut terms = words(task)
+        .into_iter()
+        .filter(|term| useful_task_term(term))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    terms.sort();
+    if terms.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+
+    let tokenized_lines = text.lines().map(words).collect::<Vec<_>>();
+    let mut matches = Vec::<(usize, Vec<(usize, usize)>)>::new();
+    let mut frequencies = vec![0usize; terms.len()];
+    for (line_index, line_words) in tokenized_lines.iter().enumerate() {
+        let line_matches = terms
+            .iter()
+            .enumerate()
+            .filter_map(|(term_index, term)| {
+                let quality = line_words
+                    .iter()
+                    .map(|candidate| match_quality(term, candidate))
+                    .max()
+                    .unwrap_or(0);
+                (quality > 0).then_some((term_index, quality))
+            })
+            .collect::<Vec<_>>();
+        for (term_index, _) in &line_matches {
+            frequencies[*term_index] = frequencies[*term_index].saturating_add(1);
+        }
+        if !line_matches.is_empty() {
+            matches.push((line_index + 1, line_matches));
+        }
+    }
+
+    let mut ranked = matches
+        .into_iter()
+        .filter_map(|(line, line_matches)| {
+            let confident = line_matches
+                .iter()
+                .any(|(term_index, quality)| *quality >= 2 && frequencies[*term_index] <= 12)
+                || line_matches.len() >= 2;
+            confident.then(|| {
+                let score = line_matches
+                    .iter()
+                    .map(|(term_index, quality)| {
+                        quality.saturating_mul(10_000) / frequencies[*term_index].max(1)
+                    })
+                    .sum::<usize>();
+                (score, line)
+            })
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(score, line)| (std::cmp::Reverse(*score), *line));
+
+    let mut selected = Vec::<usize>::new();
+    for (_, line) in ranked {
+        if selected.iter().all(|existing| existing.abs_diff(line) > 32) {
+            selected.push(line);
+        }
+        if selected.len() >= 4 {
+            break;
+        }
+    }
+    selected.sort_unstable();
+    let mut windows = selected
+        .into_iter()
+        .map(|line| {
+            (
+                line.saturating_sub(20).max(1),
+                line.saturating_add(20).min(total_lines),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut merged = Vec::<(usize, usize)>::new();
+    for (start, end) in windows.drain(..) {
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1.saturating_add(1)
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
 fn render_controller_file_ranges(
     path: &str,
     text: &str,
@@ -18096,10 +18572,12 @@ fn build_controller_read_observation(
     let (coverage, result, included_ranges) =
         if full_coverage && text.len() <= crate::workflow::MAX_STAGE_EVIDENCE_ENTRY_BYTES {
             (ObservationCoverage::Full, full_result, full_ranges)
-        } else if unit.operation == PlannedChange::Modify
-            && unit.state == WorkUnitState::DiagnosticFailed
-        {
-            let windows = diagnostic_line_windows(&unit.path, diagnostic_feedback, total_lines);
+        } else if unit.operation == PlannedChange::Modify {
+            let windows = if unit.state == WorkUnitState::DiagnosticFailed {
+                diagnostic_line_windows(&unit.path, diagnostic_feedback, total_lines)
+            } else {
+                task_line_windows(&args.task, text, total_lines)
+            };
             if windows.is_empty() {
                 return Ok(None);
             }
@@ -18454,11 +18932,9 @@ fn render_bounded_read_file(
         next_line = index + 2;
     }
 
-    if next_line <= end_line {
-        let suggested_end = requested_end
-            .unwrap_or_else(|| next_line.saturating_add(199))
-            .min(end_line);
-        let omitted_lines = end_line.saturating_sub(next_line).saturating_add(1);
+    if next_line <= lines.len() {
+        let suggested_end = next_line.saturating_add(199).min(lines.len());
+        let omitted_lines = lines.len().saturating_sub(next_line).saturating_add(1);
         if output.is_empty() {
             output.push_str("(no complete line fits the current read-result budget)\n");
         }
@@ -18496,6 +18972,7 @@ fn record_read_path_evidence(
         .transpose()?;
     let mut gate_state = context.gate_state.borrow_mut();
     gate_state.read_paths.insert(path_key.clone());
+    gate_state.record_planning_path_candidate(path_key.clone());
     gate_state
         .read_content_fingerprints
         .insert(path_key.clone(), content_fingerprint);
@@ -18659,8 +19136,12 @@ fn run_tool(
             };
             let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
             let end = arguments.get("end").and_then(Value::as_u64);
-            let resolved = resolve_workspace_path(workspace_root, path, true)
-                .with_context(|| format!("failed to resolve path: {path}"))?;
+            let resolved = resolve_workspace_path(workspace_root, path, true).map_err(|error| {
+                anyhow!(
+                    "failed to resolve path '{path}': {error:#}{}",
+                    workspace_path_suggestion_note(workspace_root, path)
+                )
+            })?;
             let text = read_bounded_utf8_file(&resolved, MAX_READ_FILE_BYTES, "read_file")
                 .with_context(|| {
                     format!(
@@ -18707,7 +19188,9 @@ fn run_tool(
             }
             let relative_path = arguments.get("path").and_then(Value::as_str);
             let limit = tool_result_limit(arguments, "glob", MAX_GLOB_RESULTS)?;
-            run_glob(pattern, relative_path, limit, workspace_root)
+            let result = run_glob(pattern, relative_path, limit, workspace_root)?;
+            record_discovered_planning_paths("glob", &result, context)?;
+            Ok(result)
         }
         "ripgrep" | "search" => {
             let pattern = arguments
@@ -18719,7 +19202,9 @@ fn run_tool(
             }
             let relative_path = arguments.get("path").and_then(Value::as_str);
             let limit = tool_result_limit(arguments, tool, MAX_SEARCH_RESULTS)?;
-            run_ripgrep(pattern, relative_path, limit, workspace_root)
+            let result = run_ripgrep(pattern, relative_path, limit, workspace_root)?;
+            record_discovered_planning_paths(tool, &result, context)?;
+            Ok(result)
         }
         "write_file" => {
             let path = arguments
@@ -19398,7 +19883,11 @@ fn run_tool(
             sink.request_goal_change("budget", &format!("{}: {summary}", goal.id))
         }
         "submit_plan" => {
-            let (plan, normalized_json_string) = parse_submission_artifact(arguments, "plan")?;
+            let projected = project_plan_path_groups(
+                arguments,
+                &context.gate_state.borrow().planning_path_candidates,
+            )?;
+            let (plan, normalized_json_string) = parse_submission_artifact(&projected, "plan")?;
             let (plan, projected_check_ids) =
                 project_contract_plan_checks(plan, context.request.contract.as_ref())?;
             if matches!(
@@ -19415,7 +19904,12 @@ fn run_tool(
                     .context("strict planning submission requires a workspace graph")?;
                 let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
                 plan.validate_digest()?;
-                plan.artifact.validate(graph, &current)?;
+                if let Err(error) = plan.artifact.validate(graph, &current) {
+                    return Err(anyhow!(
+                        "{error:#}{}",
+                        plan_path_suggestion_note(&plan.artifact, &current)
+                    ));
+                }
                 validate_plan_contract_paths(context.request, &plan.artifact)?;
             }
             let mut result = accept_stage_artifact_submission(
@@ -19790,6 +20284,71 @@ fn bounded_goal_request_text(arguments: &Value, field: &str) -> Result<String> {
     Ok(text.to_string())
 }
 
+fn project_plan_path_groups(arguments: &Value, existing_candidates: &[String]) -> Result<Value> {
+    let mut projected = arguments.clone();
+    let Some(steps) = projected.get_mut("steps").and_then(Value::as_array_mut) else {
+        // Leave malformed or legacy-wrapped submissions to the ordinary artifact parser so its
+        // error remains accurate. Native calls use flattened arguments with steps at the root.
+        return Ok(projected);
+    };
+    let existing_candidates = existing_candidates
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    for (step_index, step) in steps.iter_mut().enumerate() {
+        let Some(step) = step.as_object_mut() else {
+            continue;
+        };
+        let Some(paths) = step.get("paths") else {
+            continue;
+        };
+        if paths.is_array() {
+            // Compatibility for preserved transcripts and non-native callers. New model-facing
+            // schemas expose the grouped form below.
+            continue;
+        }
+        let paths = paths.as_object().with_context(|| {
+            format!(
+                "plan step {} paths must be an operation-grouped object",
+                step_index + 1
+            )
+        })?;
+        let mut flattened = Vec::new();
+        for (operation, change) in [
+            ("create", "create"),
+            ("modify", "modify"),
+            ("delete", "delete"),
+        ] {
+            let values = paths
+                .get(operation)
+                .and_then(Value::as_array)
+                .with_context(|| {
+                    format!(
+                        "plan step {} paths.{operation} must be an array",
+                        step_index + 1
+                    )
+                })?;
+            for value in values {
+                let path = value.as_str().with_context(|| {
+                    format!(
+                        "plan step {} paths.{operation} entries must be strings",
+                        step_index + 1
+                    )
+                })?;
+                if operation != "create" && !existing_candidates.contains(path) {
+                    bail!(
+                        "plan step {} {operation} path '{path}' is outside the bounded existing-path candidates; discover the exact path locally before submitting",
+                        step_index + 1
+                    );
+                }
+                flattened.push(json!({"path": path, "change": change}));
+            }
+        }
+        step.insert("paths".to_string(), Value::Array(flattened));
+    }
+    Ok(projected)
+}
+
 fn parse_submission_artifact<T>(
     arguments: &Value,
     field: &str,
@@ -19822,6 +20381,42 @@ where
         crate::workflow::ArtifactEnvelope::new(id, artifact)?,
         normalized_json_string,
     ))
+}
+
+fn normalize_legacy_plan_path_arrays(arguments: &Value) -> Value {
+    let mut normalized = arguments.clone();
+    let Some(steps) = normalized.get_mut("steps").and_then(Value::as_array_mut) else {
+        return normalized;
+    };
+    for step in steps {
+        let Some(step) = step.as_object_mut() else {
+            continue;
+        };
+        let Some(paths) = step.get("paths").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut grouped = Map::from_iter([
+            ("create".to_string(), json!([])),
+            ("modify".to_string(), json!([])),
+            ("delete".to_string(), json!([])),
+        ]);
+        for path in paths {
+            let Some(path) = path.as_object() else {
+                continue;
+            };
+            let (Some(value), Some(change)) = (
+                path.get("path").and_then(Value::as_str),
+                path.get("change").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if let Some(values) = grouped.get_mut(change).and_then(Value::as_array_mut) {
+                values.push(json!(value));
+            }
+        }
+        step.insert("paths".to_string(), Value::Object(grouped));
+    }
+    normalized
 }
 
 fn normalize_legacy_submission_arguments(tool: &str, arguments: &Value) -> Value {
@@ -22190,6 +22785,140 @@ fn lexical_normalize(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+fn similar_snapshot_paths(
+    snapshot: &crate::workspace::ContentSnapshot,
+    requested: &str,
+    limit: usize,
+) -> Vec<String> {
+    let requested_path = requested.to_ascii_lowercase();
+    let requested_name = Path::new(requested)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(requested)
+        .to_ascii_lowercase();
+    let requested_extension = Path::new(requested)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let threshold = requested_name.chars().count().saturating_div(4).max(2);
+    let mut candidates = snapshot
+        .paths
+        .iter()
+        .filter(|(_, content)| content.kind == "file")
+        .filter_map(|(path, _)| {
+            let candidate_name = Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())?
+                .to_ascii_lowercase();
+            let candidate_extension = Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase);
+            if requested_extension.is_some() && requested_extension != candidate_extension {
+                return None;
+            }
+            let name_distance = agent_tool_errors::edit_distance(&requested_name, &candidate_name);
+            if name_distance > threshold {
+                return None;
+            }
+            let path_distance =
+                agent_tool_errors::edit_distance(&requested_path, &path.to_ascii_lowercase());
+            Some((name_distance, path_distance, path.clone()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(name_distance, path_distance, path)| {
+        (*name_distance, *path_distance, path.clone())
+    });
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, path)| path)
+        .collect()
+}
+
+fn workspace_path_suggestion_note(workspace_root: &Path, requested: &str) -> String {
+    if Path::new(requested).is_absolute()
+        || Path::new(requested)
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return String::new();
+    }
+    let Ok(snapshot) = crate::workspace::ContentSnapshot::capture(workspace_root) else {
+        return String::new();
+    };
+    let candidates = similar_snapshot_paths(&snapshot, requested, 3);
+    if candidates.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Closest existing path{}: {}. Inspect the intended path before retrying; pb did not rewrite the request.",
+            if candidates.len() == 1 { "" } else { "s" },
+            candidates
+                .iter()
+                .map(|path| format!("'{path}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn plan_path_suggestion_note(
+    plan: &crate::workflow::PlanArtifact,
+    snapshot: &crate::workspace::ContentSnapshot,
+) -> String {
+    let mut present = snapshot
+        .paths
+        .iter()
+        .filter(|(_, content)| content.kind != "missing")
+        .map(|(path, _)| path.clone())
+        .collect::<HashSet<_>>();
+    let mut notes = Vec::new();
+    for planned in plan.steps.iter().flat_map(|step| step.paths.iter()) {
+        let exists = present.contains(&planned.path);
+        if matches!(
+            planned.change,
+            crate::workflow::PlannedChange::Modify | crate::workflow::PlannedChange::Delete
+        ) && !exists
+        {
+            let candidates = similar_snapshot_paths(snapshot, &planned.path, 3);
+            if !candidates.is_empty() {
+                notes.push(format!(
+                    "for '{}', closest existing path{}: {}",
+                    planned.path,
+                    if candidates.len() == 1 {
+                        " is"
+                    } else {
+                        "s are"
+                    },
+                    candidates
+                        .iter()
+                        .map(|path| format!("'{path}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        match planned.change {
+            crate::workflow::PlannedChange::Create => {
+                present.insert(planned.path.clone());
+            }
+            crate::workflow::PlannedChange::Delete => {
+                present.remove(&planned.path);
+            }
+            crate::workflow::PlannedChange::Modify => {}
+        }
+    }
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Similar-path guidance: {}. Inspect with local repository tools before resubmitting; pb did not change the plan.",
+            notes.join("; ")
+        )
+    }
+}
+
 fn resolve_workspace_path(workspace_root: &Path, input: &str, must_exist: bool) -> Result<PathBuf> {
     let workspace_root = workspace_root.canonicalize().with_context(|| {
         format!(
@@ -23972,7 +24701,7 @@ mod tests {
 
         assert_eq!(
             schema("submit_plan")
-                .pointer("/properties/steps/items/properties/paths/items/properties/change/enum")
+                .pointer("/properties/steps/items/properties/paths/required")
                 .unwrap(),
             &json!(["create", "modify", "delete"])
         );
@@ -24093,9 +24822,9 @@ mod tests {
             2
         );
         assert!(!PLAN_SUBMISSION_GUIDANCE.contains("\"plan\":{"));
-        assert!(PLAN_SUBMISSION_GUIDANCE.contains("evaluated in step order"));
+        assert!(PLAN_SUBMISSION_GUIDANCE.contains("groups paths into create, modify, and delete"));
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("\"check_ids\":[\"required-check-id\"]"));
-        assert!(PLAN_SUBMISSION_GUIDANCE.contains("never modify or delete it before that create"));
+        assert!(PLAN_SUBMISSION_GUIDANCE.contains("native-collar constrained"));
         assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("submit_plan_review"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("exact current content fingerprint"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Never imitate pb's transcript"));
@@ -24116,6 +24845,111 @@ mod tests {
             assert!(guidance.contains("compatibility action"));
             assert!(!guidance.contains("return exactly one pb tool-call JSON object"));
         }
+    }
+
+    #[test]
+    fn planning_path_collar_uses_bounded_existing_candidates_without_constraining_creates() {
+        let mut tools = all_builtin_tool_specs();
+        configure_plan_path_candidates(
+            &mut tools,
+            &[
+                "webui/src/pages/ProjectsPage.tsx".to_string(),
+                "webui/src/session.css".to_string(),
+            ],
+        );
+        let schema = &tools
+            .iter()
+            .find(|tool| tool.name == "submit_plan")
+            .unwrap()
+            .input_schema;
+        let candidates = json!(["webui/src/pages/ProjectsPage.tsx", "webui/src/session.css"]);
+        for operation in ["modify", "delete"] {
+            assert_eq!(
+                schema.pointer(&format!(
+                    "/properties/steps/items/properties/paths/properties/{operation}/items/enum"
+                )),
+                Some(&candidates)
+            );
+        }
+        assert_eq!(
+            schema.pointer("/properties/steps/items/properties/paths/properties/create/items/enum"),
+            None
+        );
+        crate::inference::flashmoe::validate_native_tool_schema(schema).unwrap();
+
+        configure_plan_path_candidates(&mut tools, &[]);
+        let schema = &tools
+            .iter()
+            .find(|tool| tool.name == "submit_plan")
+            .unwrap()
+            .input_schema;
+        for operation in ["modify", "delete"] {
+            assert_eq!(
+                schema.pointer(&format!(
+                    "/properties/steps/items/properties/paths/properties/{operation}/maxItems"
+                )),
+                Some(&json!(0))
+            );
+        }
+        crate::inference::flashmoe::validate_native_tool_schema(schema).unwrap();
+    }
+
+    #[test]
+    fn task_path_candidates_surface_the_existing_project_page_without_a_repo_wide_enum() {
+        let repo = init_contract_test_repo();
+        std::fs::create_dir_all(repo.path().join("webui/src/pages")).unwrap();
+        std::fs::write(
+            repo.path().join("webui/src/pages/ProjectsPage.tsx"),
+            "export function ProjectsPage() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("webui/src/pages/SettingsPage.tsx"),
+            "export function SettingsPage() {}\n",
+        )
+        .unwrap();
+        let snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let candidates = task_relevant_existing_paths(
+            "Remove the branch selector from the project page of the web UI",
+            &snapshot,
+        );
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("webui/src/pages/ProjectsPage.tsx")
+        );
+        assert!(candidates.len() <= MAX_PLANNING_PATH_CANDIDATES);
+    }
+
+    #[test]
+    fn grouped_plan_paths_project_to_the_durable_ordered_artifact() {
+        let arguments = json!({
+            "id": "plan-1",
+            "summary": "Update the project page",
+            "requirements": [{"id":"r1","description":"Remove selector","source":"user"}],
+            "steps": [{
+                "id": "s1",
+                "requirement_ids": ["r1"],
+                "paths": {
+                    "create": ["webui/src/pages/ProjectPage.test.tsx"],
+                    "modify": ["webui/src/pages/ProjectsPage.tsx"],
+                    "delete": []
+                },
+                "description": "Update and test the page"
+            }],
+            "acceptance": [{"id":"a1","requirement_ids":["r1"],"description":"Selector is absent"}]
+        });
+        let projected = project_plan_path_groups(
+            &arguments,
+            &["webui/src/pages/ProjectsPage.tsx".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            projected.pointer("/steps/0/paths"),
+            Some(&json!([
+                {"path":"webui/src/pages/ProjectPage.test.tsx","change":"create"},
+                {"path":"webui/src/pages/ProjectsPage.tsx","change":"modify"}
+            ]))
+        );
     }
 
     #[test]
@@ -24457,7 +25291,7 @@ mod tests {
             .into_iter()
             .find(|tool| tool.name == "submit_plan")
             .unwrap();
-        let output = r#"<tool_call>{"name":"submit_plan","arguments":{"id":"plan-1","summary":"Build the game","requirements":[{"id":"r1","description":"Create the game","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":[{"path":"game.js","change":"create"}],"description":"Implement it"}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"description":"The game works"}]}}"#;
+        let output = r#"<tool_call>{"name":"submit_plan","arguments":{"id":"plan-1","summary":"Build the game","requirements":[{"id":"r1","description":"Create the game","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":{"create":["game.js"],"modify":[],"delete":[]},"description":"Implement it"}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"description":"The game works"}]}}"#;
 
         assert!(
             crate::inference::flashmoe::terminal_tool_output_is_complete(
@@ -24816,7 +25650,7 @@ the next imagined action"#;
     }
 
     #[test]
-    fn controller_read_selects_full_small_files_and_diagnostic_ranges_only() {
+    fn controller_read_selects_full_small_files_and_task_or_diagnostic_ranges() {
         let repo = init_contract_test_repo();
         std::fs::write(repo.path().join("game.js"), "const answer = 41;\n").unwrap();
         git_run(&["add", "game.js"], repo.path()).unwrap();
@@ -24885,7 +25719,13 @@ the next imagined action"#;
         assert!(created_repair.stage_entry.is_some());
 
         let large = (1..=2_000)
-            .map(|line| format!("const value_{line} = {line};"))
+            .map(|line| {
+                if line == 1_000 {
+                    "const branchPicker = project.branch;".to_string()
+                } else {
+                    format!("const value_{line} = {line};")
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(repo.path().join("game.js"), &large).unwrap();
@@ -24893,6 +25733,22 @@ the next imagined action"#;
         let current = snapshot.paths["game.js"].fingerprint.clone();
         unit.current_path_fingerprint = Some(current);
         unit.operation = crate::workflow::PlannedChange::Modify;
+        unit.state = crate::workflow::WorkUnitState::EvidenceNeeded;
+        request.task = "Remove the brach selector from the project page".to_string();
+        let task_ranged = build_controller_read_observation(&request, &unit, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task_ranged.receipt.coverage,
+            crate::workflow::ObservationCoverage::Ranges
+        );
+        assert!(
+            task_ranged.prompt_messages[0]
+                .content
+                .contains("branchPicker")
+        );
+        assert!(task_ranged.stage_entry.is_none());
+
         unit.state = crate::workflow::WorkUnitState::DiagnosticFailed;
         let ranged = build_controller_read_observation(
             &request,
@@ -30862,7 +31718,14 @@ the next imagined action"#;
     #[test]
     fn invalid_plan_submission_retries_inside_the_live_planning_stage() {
         let repo = init_contract_test_repo();
+        std::fs::create_dir_all(repo.path().join("webui/src/pages")).unwrap();
+        std::fs::write(
+            repo.path().join("webui/src/pages/ProjectsPage.tsx"),
+            "export function ProjectsPage() {}\n",
+        )
+        .unwrap();
         let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.task = "Remove the branch selector from the project page".to_string();
         request.max_steps = 2;
         request.workflow_stage = Some(crate::workflow::WorkflowStage::Planning);
         let invalid = tool_completion(
@@ -30880,7 +31743,7 @@ the next imagined action"#;
                         "id": "step-invalid",
                         "requirement_ids": ["req-invalid"],
                         "component_ids": [],
-                        "paths": [{"path": "missing.tsx", "change": "modify"}],
+                        "paths": [{"path": "webui/src/pages/ProjectPage.tsx", "change": "modify"}],
                         "description": "Modify a path that has not been discovered"
                     }],
                     "acceptance": [{
@@ -30920,7 +31783,7 @@ the next imagined action"#;
             event,
             AgentEvent::ToolResult { tool, result, .. }
                 if tool == "submit_plan"
-                    && result.contains("marks path 'missing.tsx' as Modify before it exists")
+                    && result.contains("not one of the declared enum values")
         )));
     }
 
@@ -35293,6 +36156,20 @@ the next imagined action"#;
         assert!(result.contains(&format!(r#""start":{next_line}"#)));
         assert!(!result.contains(&format!("{}: line {}:", next_line, next_line)));
         assert!(result.contains("\"tool\":\"ripgrep\""));
+    }
+
+    #[test]
+    fn ranged_read_reports_that_the_file_continues_past_an_explicit_end() {
+        let text = (1..=900)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = render_bounded_read_file("large.txt", &text, 396, Some(595), 16_000);
+        assert!(result.starts_with("396: line 396\n"));
+        assert!(result.contains("[read_file continuation]"));
+        assert!(result.contains("next_line=596"));
+        assert!(result.contains(r#""start":596"#));
+        assert!(result.contains(r#""end":795"#));
     }
 
     #[test]
