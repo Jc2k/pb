@@ -56,6 +56,21 @@ impl ProgressGuard {
             self.state = Some(state);
             return None;
         }
+        let repeated_cache_replay = self.failures.back().is_some_and(|previous| {
+            tool_family == "repository_read"
+                && cache_replay_request(&previous.call_fingerprint)
+                    .is_some_and(|request| read_request(call_fingerprint) == Some(request))
+        });
+        if repeated_cache_replay {
+            return Some(format!(
+                "No-progress guard blocked an exact read that just returned a deterministic cache replay on the unchanged file. Previous outcome: {}. The blocked call consumed no tool runtime and earned no new evidence. {}",
+                self.failures
+                    .back()
+                    .map(|failure| failure.summary.as_str())
+                    .unwrap_or("the exact read was already replayed from cache"),
+                alternatives_for_family(tool_family),
+            ));
+        }
         if self.failures.len() < 2 {
             let repeated_known_empty_read = self.failures.back().is_some_and(|previous| {
                 tool_family == "repository_read"
@@ -160,7 +175,20 @@ fn known_empty_read_path(fingerprint: &str) -> Option<&str> {
 }
 
 fn prior_empty_read_path(fingerprint: &str) -> Option<&str> {
-    known_empty_read_path(fingerprint)
+    known_empty_read_path(fingerprint).or_else(|| {
+        fingerprint
+            .strip_prefix("read_file:cache_replay:")
+            .and_then(|value| value.split(':').next())
+    })
+}
+
+fn cache_replay_request(fingerprint: &str) -> Option<&str> {
+    fingerprint.strip_prefix("read_file:cache_replay:")
+}
+
+fn read_request(fingerprint: &str) -> Option<&str> {
+    fingerprint
+        .strip_prefix("read_file:path:")
         .or_else(|| fingerprint.strip_prefix("read_file:cache_replay:"))
 }
 
@@ -334,6 +362,40 @@ mod tests {
                     },
                 )
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn exact_read_after_cache_replay_is_blocked_but_a_different_range_is_allowed() {
+        let mut guard = ProgressGuard::default();
+        let state = ProgressState {
+            workspace_fingerprint: "state-1".to_string(),
+            evidence_fingerprint: "state-1".to_string(),
+        };
+        let mut replay = failed(
+            "repository_read",
+            "read_file:cache_replay:path-hash:arguments-hash",
+            "state-1",
+        );
+        replay.call_fingerprint = "read_file:cache_replay:path-hash:arguments-hash".to_string();
+        assert_eq!(guard.record(replay), ProgressDecision::Continue);
+
+        assert!(
+            guard
+                .preflight(
+                    "repository_read",
+                    "read_file:path:path-hash:arguments-hash",
+                    state.clone(),
+                )
+                .is_some()
+        );
+        assert_eq!(
+            guard.preflight(
+                "repository_read",
+                "read_file:path:path-hash:different-range",
+                state,
+            ),
+            None
         );
     }
 

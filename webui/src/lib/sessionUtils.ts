@@ -487,12 +487,14 @@ function isRepeatedToolCorrection(event: EventEnvelope): boolean {
   return event.event.type === "correction" &&
     (event.event.summary === "Repeated tool call detected" ||
       event.event.summary === "Repeated tool call blocked" ||
+      event.event.summary === "No-progress tool outcome detected" ||
       event.event.summary?.includes("repeated the same action") === true);
 }
 
 function isTerminalToolLoopError(event: EventEnvelope): boolean {
   return event.event.type === "error" &&
     (event.event.summary === "Deterministic tool loop" ||
+      event.event.summary === "No-progress tool loop" ||
       event.event.summary?.includes("reached the repeat limit") === true);
 }
 

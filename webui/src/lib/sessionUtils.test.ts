@@ -564,6 +564,43 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
   deepEqual(visible.map((event) => event.event.type), ["workflow_blocked"]);
 });
 
+Deno.test("no-progress loop errors collapse into the terminal Trinity message", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "v1",
+      event: {
+        type: "correction",
+        summary: "No-progress tool outcome detected",
+        message: "Use a different action that changes the work unit.",
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "build",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "error",
+        summary: "No-progress tool loop",
+        message:
+          "The same read result reached its deterministic stop threshold.",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "workflow_blocked",
+        workflow_id: "workflow-1",
+        outcome: "step_limit",
+        reason:
+          "Kate stopped making progress in the Implementing stage and reached a deterministic repeat limit.",
+      },
+    },
+  ];
+
+  const visible = chatEventsWithOnlyLatestStep(events);
+  deepEqual(visible.map((event) => event.event.type), ["workflow_blocked"]);
+});
+
 Deno.test("work-unit progress credits do not split adjacent action runs", () => {
   const visible = chatEventsWithOnlyLatestStep([{
     version: "v1",

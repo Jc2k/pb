@@ -66,6 +66,11 @@ Build stages use the accepted plan and checkpoint for progress instead of exposi
 protocol. Independent tool calls can share one model response, while dependent same-path or
 mutation/check batches are rejected before any call runs.
 
+For a large accepted Modify target, pb can provide a small, task-relevant, fingerprinted range and
+open the exact-path edit action immediately. Replayed reads remain available in the session's
+technical evidence, but the agent receives a compact replay receipt instead of another full copy of
+the same file contents; repeating that exact read is then stopped before it runs again.
+
 When a trusted contract names existing small text files as allowed paths, pb can place their exact
 current contents into the first planning turn automatically. The transcript labels these as
 automatic controller observations. If a file or the bounded context is unsuitable, pb simply leaves

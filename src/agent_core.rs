@@ -5671,6 +5671,16 @@ fn bind_work_unit_target(
     Ok(())
 }
 
+fn bind_work_unit_targets(
+    calls: &mut [AgentToolCall],
+    active_work_unit: Option<&crate::workflow::WorkUnit>,
+) -> Result<()> {
+    for call in calls {
+        bind_work_unit_target(call, active_work_unit)?;
+    }
+    Ok(())
+}
+
 fn set_mutation_target_path(tools: &mut [BuiltInToolSchema], target_path: &str) {
     for tool_name in ["write_file", "replace_file", "edit_file"] {
         set_tool_target_path(tools, tool_name, target_path);
@@ -8092,11 +8102,15 @@ fn run_agent_steps(
                                 | crate::workflow::WorkflowStage::CodeReview
                         )
                     );
-                let calls = vec![AgentToolCall {
+                let mut calls = vec![AgentToolCall {
                     id: None,
                     tool,
                     arguments,
                 }];
+                // The model-facing schema omits a work unit's fixed path. Normalize that hidden
+                // argument before loop/progress accounting so `{}` and an unnecessary explicit
+                // `path` cannot look like different actions while executing the same read.
+                bind_work_unit_targets(&mut calls, active_work_unit.as_ref())?;
                 let loop_check = tool_loop_guard.record_calls(&calls);
                 let loop_failure_count = loop_check.signature.map(|signature| {
                     deterministic_failures.record(DeterministicFailureKind::ToolLoop, signature)
@@ -8286,7 +8300,10 @@ fn run_agent_steps(
                     record_progress_warning(&feedback, nesting_depth, messages, sink);
                 }
             }
-            AgentAction::ToolCalls { calls, thinking } => {
+            AgentAction::ToolCalls {
+                mut calls,
+                thinking,
+            } => {
                 let review_terminal_attempt = calls.iter().any(|call| {
                     args_workflow_terminal_tool(args, &call.tool)
                         && matches!(
@@ -8297,6 +8314,7 @@ fn run_agent_steps(
                             )
                         )
                 });
+                bind_work_unit_targets(&mut calls, active_work_unit.as_ref())?;
                 let loop_check = tool_loop_guard.record_calls(&calls);
                 let loop_failure_count = loop_check.signature.map(|signature| {
                     deterministic_failures.record(DeterministicFailureKind::ToolLoop, signature)
@@ -9683,21 +9701,21 @@ fn progress_call_fingerprint(
     cache_hit: bool,
 ) -> String {
     if tool == "read_file"
-        && cache_hit
         && let Some(path) = arguments.get("path").and_then(Value::as_str)
     {
+        let path_fingerprint = format!("{:x}", Sha256::digest(path.as_bytes()));
+        if cache_hit {
+            return format!(
+                "read_file:cache_replay:{path_fingerprint}:{}",
+                agent_context::normalized_arguments_sha256(arguments)
+            );
+        }
+        if read_call_is_known_empty(arguments, result, workspace_root) {
+            return format!("read_file:known_empty:{path_fingerprint}");
+        }
         return format!(
-            "read_file:cache_replay:{:x}",
-            Sha256::digest(path.as_bytes())
-        );
-    }
-    if tool == "read_file"
-        && read_call_is_known_empty(arguments, result, workspace_root)
-        && let Some(path) = arguments.get("path").and_then(Value::as_str)
-    {
-        return format!(
-            "read_file:known_empty:{:x}",
-            Sha256::digest(path.as_bytes())
+            "read_file:path:{path_fingerprint}:{}",
+            agent_context::normalized_arguments_sha256(arguments)
         );
     }
     format!(
@@ -10577,15 +10595,30 @@ fn execute_tool_calls(
             env.args.ctx_size as usize,
             usize::try_from(boosted_max_tokens(env.args).max(1)).unwrap_or(usize::MAX),
         );
-        let prompt_result = agent_context::bound_tool_result_for_prompt(&result, result_budget);
+        let prompt_result_source = cache_hit
+            .then(|| compact_cache_replay_result(&tool, &result))
+            .unwrap_or_else(|| result.clone());
+        let prompt_result =
+            agent_context::bound_tool_result_for_prompt(&prompt_result_source, result_budget);
+        let (omitted_chars, omitted_bytes, omitted_lines) = if cache_hit {
+            // A replay receipt deliberately replaces, rather than truncates, the stored result.
+            // The complete result remains durable in ToolResult evidence above.
+            (result.chars().count(), result.len(), result.lines().count())
+        } else {
+            (
+                prompt_result.omitted_chars,
+                prompt_result.omitted_bytes,
+                prompt_result.omitted_lines,
+            )
+        };
         let metadata = PromptToolResultMetadata {
             arguments_sha256: agent_context::normalized_arguments_sha256(&arguments),
             success,
             raw_bytes: result.len(),
             raw_lines: result.lines().count(),
-            omitted_chars: prompt_result.omitted_chars,
-            omitted_bytes: prompt_result.omitted_bytes,
-            omitted_lines: prompt_result.omitted_lines,
+            omitted_chars,
+            omitted_bytes,
+            omitted_lines,
             workspace_fingerprint: result_workspace_fingerprint(&result).map(str::to_string),
             evidence_effects: tool_evidence_effects(&tool, &arguments, &result),
             ..PromptToolResultMetadata::default()
@@ -10612,6 +10645,26 @@ fn execute_tool_calls(
         timestamp_ms: Some(now_millis()),
     });
     Ok(progress_outcomes)
+}
+
+fn compact_cache_replay_result(tool: &str, result: &str) -> String {
+    let mut receipt = format!(
+        "Deterministic cache replay: this exact {tool} call returned the same stored result and added no new evidence. Do not repeat it."
+    );
+    if tool == "read_file" {
+        if let Some(next_call) = result
+            .lines()
+            .find_map(|line| line.strip_prefix("next_call="))
+        {
+            receipt.push_str("\nUse the earlier continuation instead: next_call=");
+            receipt.push_str(next_call);
+        }
+        if let Some(fingerprint) = result_workspace_fingerprint(result) {
+            receipt.push_str("\nHarness current content fingerprint: ");
+            receipt.push_str(fingerprint);
+        }
+    }
+    receipt
 }
 
 fn result_workspace_fingerprint(result: &str) -> Option<&str> {
@@ -17771,13 +17824,25 @@ fn controller_observation_survives_preflight(
     tools: &[BuiltInToolSchema],
     candidate: &PreparedControllerObservation,
 ) -> Result<bool> {
-    controller_observations_survive_preflight(
-        generator,
-        args,
-        messages,
-        tools,
-        std::slice::from_ref(candidate),
-    )
+    let mut candidate_messages = messages.to_vec();
+    candidate_messages.extend(candidate.prompt_messages.clone());
+    let prepared =
+        match prepare_generation_prompt(generator, args, &candidate_messages, tools, true) {
+            Ok(prepared) => prepared,
+            Err(error) if error.downcast_ref::<ContextLimitError>().is_some() => return Ok(false),
+            Err(error) => return Err(error),
+        };
+    // A work-unit observation is the viable path to a target-bound mutation, especially for a
+    // file too large to earn complete-file evidence through one manual read. Keep it whenever it
+    // survives real context preparation; the 55% batching heuristic below is only for optional
+    // multi-file planning/review observations.
+    Ok(prepared.messages.iter().any(|message| {
+        message
+            .prompt_tool_result
+            .as_ref()
+            .and_then(|metadata| metadata.observation_action_id.as_deref())
+            == Some(candidate.receipt.action_id.as_str())
+    }))
 }
 
 fn controller_observations_survive_preflight(
@@ -27876,6 +27941,96 @@ the next imagined action"#;
         )));
     }
 
+    #[test]
+    fn large_modify_work_unit_receives_an_editable_controller_range_without_a_read_turn() {
+        let repo = init_contract_test_repo();
+        let before = (1..=2_000)
+            .map(|line| {
+                if line == 1_000 {
+                    "const branchSelector = project.branch;".to_string()
+                } else {
+                    format!("const value_{line} = {line};")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(repo.path().join("game.js"), &before).unwrap();
+        git_run(&["add", "game.js"], repo.path()).unwrap();
+        git_run(
+            &["commit", "-m", "test: add large controller fixture"],
+            repo.path(),
+        )
+        .unwrap();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let plan = delivery_plan(
+            Some(("game.js", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let after = before.replace("const branchSelector = project.branch;", "");
+        let reviewed_fingerprint = fingerprint_with_file_content(repo.path(), "game.js", &after);
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.ctx_size = 32_768;
+        request.task = "Remove the branch selector from the project page".to_string();
+        request.repository_context = Some(repository);
+        request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
+        let mut contract = normalized_test_contract("true");
+        contract.checks.clear();
+        request.contract = Some(contract);
+        let completion = json!({
+            "id": "implementation-inline-large",
+            "steps": [{
+                "step_id": "step-delivery",
+                "status": "completed",
+                "summary": "Removed the accepted branch selector line."
+            }],
+            "summary": "Removed the project branch selector.",
+            "semantic_commit_subject": "fix: remove project branch selector"
+        });
+
+        let (outcome, generator, events) = run_scripted_delivery_workflow(
+            &request,
+            repo.path(),
+            vec![
+                text_completion(plan_envelope_submission(&plan)),
+                text_completion(plan_review_submission(&plan)),
+                tool_completion(
+                    "edit_file",
+                    json!({
+                        "old_text": "const branchSelector = project.branch;",
+                        "new_text": "",
+                        "completion": completion
+                    }),
+                ),
+                text_completion(code_review_submission(
+                    &reviewed_fingerprint,
+                    crate::workflow::ReviewVerdict::Pass,
+                    None,
+                )),
+            ],
+        );
+
+        assert_eq!(
+            outcome.checkpoint.run.outcome,
+            Some(crate::workflow::WorkflowOutcome::Ready),
+            "{:#?}",
+            outcome.checkpoint.run
+        );
+        assert_eq!(generator.generation_tool_names.len(), 4);
+        assert!(generator.generation_tool_names[2].contains(&"edit_file".to_string()));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCall { tool, .. } if tool == "read_file"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ControllerObservation { receipt, .. }
+                if receipt.stage == crate::workflow::WorkflowStage::Implementing
+                    && receipt.path == "game.js"
+                    && receipt.coverage == crate::workflow::ObservationCoverage::Ranges
+        )));
+    }
+
     fn fingerprint_with_file_content(workspace: &Path, path: &str, content: &str) -> String {
         let absolute = workspace.join(path);
         let original = std::fs::read(&absolute).unwrap();
@@ -32759,6 +32914,57 @@ the next imagined action"#;
     }
 
     #[test]
+    fn work_unit_binding_canonicalizes_hidden_and_redundant_target_paths() {
+        let unit = crate::workflow::WorkUnit {
+            id: "step:0".to_string(),
+            plan_step_id: "step".to_string(),
+            contributing_step_ids: Vec::new(),
+            operation: crate::workflow::PlannedChange::Modify,
+            path: "webui/src/pages/ProjectsPage.tsx".to_string(),
+            baseline_path_fingerprint: None,
+            invocation_path_fingerprint: None,
+            current_path_fingerprint: None,
+            adopted: false,
+            state: crate::workflow::WorkUnitState::EvidenceNeeded,
+        };
+        let mut calls = vec![
+            AgentToolCall {
+                id: None,
+                tool: "read_file".to_string(),
+                arguments: json!({}),
+            },
+            AgentToolCall {
+                id: None,
+                tool: "read_file".to_string(),
+                arguments: json!({"path": "invented.tsx"}),
+            },
+        ];
+
+        bind_work_unit_targets(&mut calls, Some(&unit)).unwrap();
+
+        assert_eq!(calls[0].arguments, calls[1].arguments);
+        assert_eq!(
+            calls[0].arguments["path"],
+            json!("webui/src/pages/ProjectsPage.tsx")
+        );
+    }
+
+    #[test]
+    fn cache_replay_prompt_is_compact_but_preserves_required_continuation() {
+        let fingerprint = "a".repeat(64);
+        let result = format!(
+            "1: large source line\n2: another source line\n\n[read_file continuation]\nnext_line=392\nnext_call={{\"path\":\"ProjectsPage.tsx\",\"start\":392,\"end\":591}}\n\nHarness current content fingerprint: {fingerprint}"
+        );
+
+        let compact = compact_cache_replay_result("read_file", &result);
+
+        assert!(compact.contains("added no new evidence"));
+        assert!(compact.contains("next_call={\"path\":\"ProjectsPage.tsx\""));
+        assert!(compact.contains(&fingerprint));
+        assert!(!compact.contains("large source line"));
+    }
+
+    #[test]
     fn pg1_third_exact_call_is_blocked_without_tool_runtime_or_mutation() {
         let repo = init_contract_test_repo();
         let before = crate::workspace::ContentSnapshot::capture(repo.path())
@@ -33021,6 +33227,42 @@ the next imagined action"#;
         assert!(replay.legacy_review_read_evidence_gathered);
         assert!(replay.named_check_evidence.is_empty());
         assert!(!replay.wrote_file);
+    }
+
+    #[test]
+    fn repeated_cache_replay_stops_before_a_second_replay_executes() {
+        let repo = init_contract_test_repo();
+        std::fs::write(repo.path().join("probe.txt"), "one\ntwo\nthree\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 5;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({"path": "probe.txt"})),
+                tool_completion(
+                    "read_file",
+                    json!({"path": "probe.txt", "start": 2, "end": 3}),
+                ),
+                tool_completion("read_file", json!({"path": "probe.txt"})),
+                tool_completion("read_file", json!({"path": "probe.txt"})),
+                scripted_final("must not run"),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::GateLoop);
+        assert_eq!(outcome.llm_invocations, 4);
+        assert_eq!(outcome.tool_calls, 3);
+        assert_eq!(outcome.remaining_completions, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { summary, message, .. }
+                if summary == "No-progress tool loop"
+                    && message.contains("deterministic cache replay")
+        )));
     }
 
     #[test]

@@ -458,6 +458,11 @@ The workflow budgets stage steps, model invocations, generated tokens, advisory 
 and repair cycles. It also detects repeated no-progress operations against unchanged state and
 stops loops deterministically. A request-level step ceiling narrows every model-driven stage; the
 lower of that ceiling and the compiled workflow policy is cumulative across validation attempts.
+Work-unit target paths are bound before loop signatures are calculated, so omitting or redundantly
+supplying the hidden fixed path cannot disguise an identical action. An exact deterministic read
+cache hit remains fully preserved in durable evidence, but the next prompt receives only a compact
+replay receipt, the required continuation when one exists, and the current fingerprint. Repeating
+that exact read after a replay is blocked before another tool execution.
 
 When a model response is truncated before producing a valid action, pb can retry with thinking
 disabled and, within the same global budget, use a larger output cap. A capped native `write_file`
@@ -612,9 +617,12 @@ fingerprint and complete prompt bytes remain valid. For an oversized UTF-8 Modif
 instead select a small set of task-relevant line windows using exact or one-edit task-term matches.
 It admits those windows only when a rare or multi-term match provides a useful anchor, records their
 exact byte hashes, and exposes only target-bound `edit_file`; the edit's old text must lie wholly
-inside an included byte window. A failed-diagnostic range has the same edit boundary and is selected
-from exact diagnostic locations. When no confident task window exists, the ordinary model-driven
-read path remains available. Fresh review inspection is injected only
+inside an included byte window. A work-unit observation is retained whenever it survives the real
+context preflight; the lower prompt-share heuristic is reserved for optional multi-file planning
+and review batches. This avoids falling back from a viable range to an impossible complete-file
+read on a large accepted target. A failed-diagnostic range has the same edit boundary and is
+selected from exact diagnostic locations. When no confident task window exists, the ordinary
+model-driven read path remains available. Fresh review inspection is injected only
 when every required changed path fits, and the reviewer still authors assessments, findings, and
 verdict. Optional completion fields on a successful final mutation remain model-authored. Automatic
 deletion is intrinsic but limited to a unique tracked, clean, unchanged, bounded plan deletion with

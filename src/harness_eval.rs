@@ -4203,7 +4203,16 @@ mod tests {
             assert!(context.tool_count_high_water > 0);
             assert!(context.tool_schema_chars_high_water > 0);
             assert_eq!(context.compacted_messages, 0);
-            assert_eq!(context.omitted_tool_result_chars, 0);
+            assert_eq!(
+                context.omitted_tool_result_chars,
+                if record.result.id == "repeated_blocked_action" {
+                    // The durable result remains complete, while a cache replay is represented to
+                    // the next inference by a compact receipt rather than duplicate contents.
+                    10
+                } else {
+                    0
+                }
+            );
             assert_eq!(
                 context.read_cache_hits,
                 usize::from(record.result.id == "repeated_blocked_action")
