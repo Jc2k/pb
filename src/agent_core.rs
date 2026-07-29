@@ -6691,6 +6691,9 @@ fn task_relevant_existing_paths(
     if task_terms.is_empty() {
         return Vec::new();
     }
+    let task_requests_test_evidence = task_terms
+        .iter()
+        .any(|term| matches!(term.as_str(), "test" | "tests" | "spec" | "specs"));
     let mut ranked = snapshot
         .paths
         .keys()
@@ -6720,9 +6723,16 @@ fn task_relevant_existing_paths(
         })
         .collect::<Vec<_>>();
     ranked.sort_by_key(|(score, matches, path)| {
+        let lowercase = path.to_ascii_lowercase();
+        let test_path = lowercase.contains("/tests/")
+            || lowercase.contains("/__tests__/")
+            || lowercase.contains(".test.")
+            || lowercase.contains(".spec.")
+            || lowercase.starts_with("tests/");
         (
             std::cmp::Reverse(*score),
             std::cmp::Reverse(*matches),
+            test_path && !task_requests_test_evidence,
             path.clone(),
         )
     });
@@ -25339,6 +25349,11 @@ mod tests {
         std::fs::write(
             repo.path().join("webui/src/pages/SettingsPage.tsx"),
             "export function SettingsPage() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("webui/src/pages/ProjectsPage.test.ts"),
+            "describe('ProjectsPage', () => {});\n",
         )
         .unwrap();
         let snapshot = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
