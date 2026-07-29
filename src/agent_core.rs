@@ -3419,6 +3419,15 @@ fn run_agent_inner<S: EventSink>(
 
     let (commits, diff_stat, diff) = if args.repository_less {
         (String::new(), String::new(), String::new())
+    } else if let Some(repository) = repository_context.as_ref() {
+        (
+            git_log_since_baseline(&workspace_root, repository.task_baseline.head.as_deref())
+                .unwrap_or_default(),
+            git_diff_stat_since_baseline(&workspace_root, repository.task_baseline.head.as_deref())
+                .unwrap_or_default(),
+            git_diff_since_baseline(&workspace_root, repository.task_baseline.head.as_deref())
+                .unwrap_or_default(),
+        )
     } else {
         (
             git_log_recent(&workspace_root, 5).unwrap_or_default(),
@@ -5038,6 +5047,19 @@ fn string_array_schema(description: &'static str) -> Value {
     })
 }
 
+fn non_empty_string_array_schema(description: &'static str) -> Value {
+    let mut schema = string_array_schema(description);
+    schema["minItems"] = json!(1);
+    schema
+}
+
+fn non_empty_workflow_string_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+    })
+}
+
 fn bounded_workflow_string_schema(maximum: usize, allow_empty: bool) -> Value {
     let mut schema = json!({
         "type": "string",
@@ -5068,7 +5090,11 @@ fn assessment_status_schema(kinds: &[&str]) -> Value {
         "type": "object",
         "properties": {
             "kind": {"type": "string", "enum": kinds},
-            "status": {"type": "string", "enum": ["pass", "concern", "fail"]},
+            "status": {
+                "type": "string",
+                "enum": ["pass", "concern", "fail"],
+                "description": "Use concern or fail for at least one corresponding dimension whenever the verdict is revise and a blocking challenge or finding is present."
+            },
         },
         "required": ["kind", "status"],
         "additionalProperties": false,
@@ -5082,15 +5108,16 @@ fn plan_submission_schema() -> Value {
         json!({
             "type": "object",
             "properties": {
-                "summary": {"type": "string"},
+                "summary": non_empty_workflow_string_schema(),
                 "requirements": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string"},
-                            "description": {"type": "string"},
-                            "source": {"type": "string"},
+                            "id": non_empty_workflow_string_schema(),
+                            "description": non_empty_workflow_string_schema(),
+                            "source": non_empty_workflow_string_schema(),
                         },
                         "required": ["id", "description", "source"],
                         "additionalProperties": false,
@@ -5098,11 +5125,12 @@ fn plan_submission_schema() -> Value {
                 },
                 "steps": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string"},
-                            "requirement_ids": string_array_schema("Requirement ids covered by this step."),
+                            "id": non_empty_workflow_string_schema(),
+                            "requirement_ids": non_empty_string_array_schema("Requirement ids covered by this step."),
                             "component_ids": string_array_schema("Workspace component ids affected by this step."),
                             "paths": {
                                 "type": "array",
@@ -5116,7 +5144,7 @@ fn plan_submission_schema() -> Value {
                                     "additionalProperties": false,
                                 },
                             },
-                            "description": {"type": "string"},
+                            "description": non_empty_workflow_string_schema(),
                         },
                         "required": ["id", "requirement_ids", "paths", "description"],
                         "additionalProperties": false,
@@ -5124,13 +5152,14 @@ fn plan_submission_schema() -> Value {
                 },
                 "acceptance": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string"},
-                            "requirement_ids": string_array_schema("Requirement ids proved by this fact."),
+                            "id": non_empty_workflow_string_schema(),
+                            "requirement_ids": non_empty_string_array_schema("Requirement ids proved by this fact."),
                             "check_ids": string_array_schema("Configured check ids that prove this fact."),
-                            "description": {"type": "string"},
+                            "description": non_empty_workflow_string_schema(),
                         },
                         "required": ["id", "requirement_ids", "description"],
                         "additionalProperties": false,
@@ -7300,6 +7329,7 @@ fn run_agent_steps(
                         repeated_parse_failures,
                         repeated_failure_limit,
                         required,
+                        terminal_submission_only,
                     )
                 } else {
                     parse_failure_feedback(
@@ -7811,6 +7841,14 @@ fn run_agent_steps(
                 arguments,
                 thinking,
             } => {
+                let review_terminal_attempt = args_workflow_terminal_tool(args, &tool)
+                    && matches!(
+                        args.workflow_stage,
+                        Some(
+                            crate::workflow::WorkflowStage::PlanReview
+                                | crate::workflow::WorkflowStage::CodeReview
+                        )
+                    );
                 let calls = vec![AgentToolCall {
                     id: None,
                     tool,
@@ -7905,6 +7943,12 @@ fn run_agent_steps(
                 if progress_outcomes.iter().any(|outcome| outcome.success) {
                     deterministic_failures.clear(DeterministicFailureKind::Parse);
                 }
+                if review_terminal_attempt && gate_state.borrow().workflow_submission.is_none() {
+                    // A review terminal call that failed structural prevalidation needs corrected
+                    // arguments, not another evidence chain. Keep the live transcript and bind the
+                    // next turn to the same terminal schema.
+                    terminal_submission_only = true;
+                }
                 let progress_decision = record_tool_progress(
                     &mut progress_guard,
                     &progress_outcomes,
@@ -7998,6 +8042,16 @@ fn run_agent_steps(
                 }
             }
             AgentAction::ToolCalls { calls, thinking } => {
+                let review_terminal_attempt = calls.iter().any(|call| {
+                    args_workflow_terminal_tool(args, &call.tool)
+                        && matches!(
+                            args.workflow_stage,
+                            Some(
+                                crate::workflow::WorkflowStage::PlanReview
+                                    | crate::workflow::WorkflowStage::CodeReview
+                            )
+                        )
+                });
                 let loop_check = tool_loop_guard.record_calls(&calls);
                 let loop_failure_count = loop_check.signature.map(|signature| {
                     deterministic_failures.record(DeterministicFailureKind::ToolLoop, signature)
@@ -8086,6 +8140,9 @@ fn run_agent_steps(
                 )?;
                 if progress_outcomes.iter().any(|outcome| outcome.success) {
                     deterministic_failures.clear(DeterministicFailureKind::Parse);
+                }
+                if review_terminal_attempt && gate_state.borrow().workflow_submission.is_none() {
+                    terminal_submission_only = true;
                 }
                 let progress_decision = record_tool_progress(
                     &mut progress_guard,
@@ -10798,10 +10855,20 @@ fn workflow_parse_failure_feedback(
     repeated_failures: usize,
     max_failures: usize,
     required_terminal_tool: &str,
+    terminal_submission_only: bool,
 ) -> String {
+    let next_action = if terminal_submission_only {
+        format!(
+            "The evidence step is already complete. Call only the provided {required_terminal_tool} function with its declared argument schema; do not start another read or search."
+        )
+    } else {
+        format!(
+            "Call an allowed evidence tool if more inspection is required. Otherwise call the provided {required_terminal_tool} function with its declared argument schema."
+        )
+    };
     let mut feedback = format!(
         "Structured action parsing error after attempt {consecutive_failures}/{max_failures}: {error}\n\n\
-         Your previous response was not accepted as a workflow action. Use only the native function-call interface described by the system tool schema; do not emit a pb compatibility {{\"type\":\"tool_call\",...}} object, markdown, or prose. Call an allowed evidence tool if more inspection is required. Otherwise call the provided {required_terminal_tool} function with its declared argument schema.\n",
+         Your previous response was not accepted as a workflow action. Use only the native function-call interface described by the system tool schema; do not emit a pb compatibility {{\"type\":\"tool_call\",...}} object, markdown, or prose. {next_action}\n",
     );
     append_parse_failure_retry_feedback(
         &mut feedback,
@@ -12638,7 +12705,7 @@ fn run_delivery_workflow(
                     message: feedback.clone(),
                     summary: "Workflow artifact validation failed".to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
-                    assisting_profile: None,
+                    assisting_profile: Some(contract.profile),
                     nesting_depth: None,
                     timestamp_ms: Some(now_millis()),
                 });
@@ -13405,12 +13472,12 @@ fn run_delivery_commit(
 const PLAN_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan function exactly once with arguments shaped as:
 {"id":"plan-1","summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":[{"path":"path/to/file.ext","change":"create"}],"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["required-check-id"],"description":"..."}]}
-Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Paths are evaluated in step order: use create before a later modify when the path is currently missing, never modify or delete it before that create, and never create it again while it exists. Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. When the harness names projected contract check ids, leave those ids out of check_ids; pb will add them deterministically after submission. Include only additional configured check ids selected by the plan. Use [] for component_ids or check_ids when there are no additional ids. Do not return the arguments as prose or a final action."#;
+Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Never guess a repository path: inspect it with local repository tools before naming it as modify or delete. For repository-local file, symbol, and component discovery, use glob, ripgrep/search, and read_file rather than public web search; use public research only when the task genuinely depends on external or current facts absent from the repository. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Paths are evaluated in step order: use create before a later modify when the path is currently missing, never modify or delete it before that create, and never create it again while it exists. Use only create, modify, or delete for change. Every requirement must appear in a step and acceptance fact. When the harness names projected contract check ids, leave those ids out of check_ids; pb will add them deterministically after submission. Include only additional configured check ids selected by the plan. Use [] for component_ids or check_ids when there are no additional ids. Do not return the arguments as prose or a final action."#;
 
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan_review function exactly once with arguments shaped as:
 {"id":"plan-review-1","assessments":[{"kind":"requirement_coverage","status":"pass"},{"kind":"architecture","status":"pass"},{"kind":"component_impact","status":"pass"},{"kind":"test_strategy","status":"pass"},{"kind":"failure_modes","status":"pass"},{"kind":"assumptions","status":"pass"}],"challenges":[],"verdict":"pass"}
-pb supplies the exact accepted plan id and digest. Assessments contain only kind and status; do not repeat explanations or evidence there. Put each concern's specific explanation and any observed evidence once in challenges, where every cited repository path must have current review evidence. Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]} and set verdict to revise. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, include no p0/p1 challenge. Do not return prose or a final action."#;
+pb supplies the exact accepted plan id and digest. Assessments contain only kind and status; do not repeat explanations or evidence there. Put each concern's specific explanation and any observed evidence once in challenges, where every cited repository path must have current review evidence. Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]}, set verdict to revise, and set at least one corresponding assessment status to concern or fail. Never request revision while every assessment is pass. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, every assessment must pass and there must be no p0/p1 challenge. For repository-local evidence, use local repository tools rather than public web search. Do not return prose or a final action."#;
 
 const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
 When the plan creates a missing file, call write_file with arguments such as {"path":"path/to/file.ext","content":"exact contents"}. Never call write_file for a path that already exists. For an existing file, first call read_file as one turn with {"path":"path/to/file.ext"}; after pb returns the real contents, call replace_file in a later turn with {"path":"path/to/file.ext","content":"complete replacement contents"}, or use edit_file/apply_patch with their declared schemas. Paths are relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Use the native function-call interface described by the system tool schema. If native calls are unavailable, use exactly one compatibility action with no markdown or surrounding prose, for example {"type":"tool_call","tool":"write_file","arguments":{"path":"...","content":"..."}}, {"type":"tool_call","tool":"read_file","arguments":{"path":"..."}}, or {"type":"tool_call","tool":"replace_file","arguments":{"path":"...","content":"..."}}. Never return an argument object by itself. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
@@ -19334,6 +19401,23 @@ fn run_tool(
             let (plan, normalized_json_string) = parse_submission_artifact(arguments, "plan")?;
             let (plan, projected_check_ids) =
                 project_contract_plan_checks(plan, context.request.contract.as_ref())?;
+            if matches!(
+                context.request.workflow_stage,
+                Some(
+                    crate::workflow::WorkflowStage::Planning
+                        | crate::workflow::WorkflowStage::PlanRevision
+                )
+            ) {
+                let graph = context
+                    .request
+                    .workspace_graph
+                    .as_ref()
+                    .context("strict planning submission requires a workspace graph")?;
+                let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+                plan.validate_digest()?;
+                plan.artifact.validate(graph, &current)?;
+                validate_plan_contract_paths(context.request, &plan.artifact)?;
+            }
             let mut result = accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::Plan { plan },
@@ -19350,7 +19434,11 @@ fn run_tool(
         }
         "submit_plan_review" => {
             let projected = project_plan_review_submission(arguments, context.request)?;
-            let (review, normalized_json_string) = parse_submission_artifact(&projected, "review")?;
+            let (review, normalized_json_string) = parse_submission_artifact::<
+                crate::workflow::PlanReviewArtifact,
+            >(&projected, "review")?;
+            review.validate_digest()?;
+            review.artifact.validate_disposition()?;
             accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::PlanReview { review },
@@ -23214,6 +23302,13 @@ fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
     git_run(&["log", "--oneline", &format!("-{n}")], workdir)
 }
 
+fn git_log_since_baseline(workdir: &Path, baseline_head: Option<&str>) -> Result<String> {
+    match baseline_head {
+        Some(head) => git_run(&["log", "--oneline", &format!("{head}..HEAD")], workdir),
+        None => git_run(&["log", "--oneline"], workdir),
+    }
+}
+
 fn run_session_changes(arguments: &Value, workspace_root: &Path) -> Result<String> {
     let path = arguments.get("path").and_then(Value::as_str);
     let commits = arguments.get("commits").and_then(Value::as_str);
@@ -23397,6 +23492,20 @@ fn git_diff_stat_from_main(workdir: &Path) -> Result<String> {
 
 fn git_diff_from_main(workdir: &Path) -> Result<String> {
     git_run(&["diff", "--find-renames", "main"], workdir)
+}
+
+fn git_diff_stat_since_baseline(workdir: &Path, baseline_head: Option<&str>) -> Result<String> {
+    match baseline_head {
+        Some(head) => git_run(&["diff", "--stat", head], workdir),
+        None => git_diff_stat_from_main(workdir),
+    }
+}
+
+fn git_diff_since_baseline(workdir: &Path, baseline_head: Option<&str>) -> Result<String> {
+    match baseline_head {
+        Some(head) => git_run(&["diff", "--find-renames", head], workdir),
+        None => git_diff_from_main(workdir),
+    }
 }
 
 pub fn find_model_in_cache_in(pull_root: &Path, model: &str) -> Result<PathBuf> {
@@ -23867,6 +23976,22 @@ mod tests {
                 .unwrap(),
             &json!(["create", "modify", "delete"])
         );
+        for field in ["requirements", "steps", "acceptance"] {
+            assert_eq!(
+                schema("submit_plan").pointer(&format!("/properties/{field}/minItems")),
+                Some(&json!(1))
+            );
+        }
+        assert_eq!(
+            schema("submit_plan")
+                .pointer("/properties/steps/items/properties/requirement_ids/minItems"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            schema("submit_plan")
+                .pointer("/properties/acceptance/items/properties/requirement_ids/minItems"),
+            Some(&json!(1))
+        );
         let signature = agent_tool_errors::schema_signature("submit_plan", schema("submit_plan"));
         assert!(signature.starts_with("submit_plan("));
         assert!(signature.contains("id: string"));
@@ -23942,6 +24067,7 @@ mod tests {
             Some(&json!(crate::workflow::MAX_IMPLEMENTATION_SUMMARY_CHARS))
         );
         crate::inference::flashmoe::validate_native_tool_schema(schema("edit_file")).unwrap();
+        crate::inference::flashmoe::validate_native_tool_schema(schema("submit_plan")).unwrap();
         crate::inference::flashmoe::validate_native_tool_schema(schema("submit_implementation"))
             .unwrap();
         assert_eq!(
@@ -25357,7 +25483,13 @@ the next imagined action"#;
     fn planning_stage_projects_contract_checks_before_returning_the_artifact() {
         let repo = init_contract_test_repo();
         let mut request = workflow_request(AgentProfile::Plan, repo.path());
-        request.contract = Some(normalized_test_contract("true"));
+        let harness_contract = normalized_test_contract("true");
+        request.workspace_graph = Some(
+            harness_contract
+                .compile_workspace_graph(request.workspace_graph.take().unwrap())
+                .unwrap(),
+        );
+        request.contract = Some(harness_contract);
         let contract = crate::workflow::StageContract::strict(
             crate::workflow::WorkflowStage::Planning,
             request.workflow_policy.as_ref().unwrap().limits,
@@ -30728,6 +30860,133 @@ the next imagined action"#;
     }
 
     #[test]
+    fn invalid_plan_submission_retries_inside_the_live_planning_stage() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.max_steps = 2;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Planning);
+        let invalid = tool_completion(
+            "submit_plan",
+            json!({
+                "id": "plan-invalid",
+                "plan": {
+                    "summary": "Implement the requested change",
+                    "requirements": [{
+                        "id": "req-invalid",
+                        "description": "Make the requested change",
+                        "source": "turn-1"
+                    }],
+                    "steps": [{
+                        "id": "step-invalid",
+                        "requirement_ids": ["req-invalid"],
+                        "component_ids": [],
+                        "paths": [{"path": "missing.tsx", "change": "modify"}],
+                        "description": "Modify a path that has not been discovered"
+                    }],
+                    "acceptance": [{
+                        "id": "accept-invalid",
+                        "requirement_ids": ["req-invalid"],
+                        "check_ids": [],
+                        "description": "The request is satisfied"
+                    }]
+                }
+            }),
+        );
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                invalid,
+                ScriptedCompletion {
+                    content: plan_submission(),
+                    truncated: false,
+                },
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.workflow_submission,
+            Some(crate::workflow::StageSubmission::Plan { .. })
+        ));
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["submit_plan".to_string()]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, result, .. }
+                if tool == "submit_plan"
+                    && result.contains("marks path 'missing.tsx' as Modify before it exists")
+        )));
+    }
+
+    #[test]
+    fn invalid_plan_review_disposition_retries_in_place_with_only_terminal_tool() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Review, repo.path());
+        request.max_steps = 2;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanReview);
+        request.workflow_plan_identity = Some(("plan-1".to_string(), "digest-1".to_string()));
+        let assessments = crate::workflow::REQUIRED_PLAN_ASSESSMENTS
+            .into_iter()
+            .map(|kind| json!({"kind": kind, "status": "pass"}))
+            .collect::<Vec<_>>();
+        let invalid = tool_completion(
+            "submit_plan_review",
+            json!({
+                "id": "review-invalid",
+                "assessments": assessments,
+                "challenges": [{
+                    "id": "challenge-1",
+                    "severity": "p1",
+                    "requirement_ids": ["r1"],
+                    "description": "The plan omits a required behavior.",
+                    "evidence": []
+                }],
+                "verdict": "revise"
+            }),
+        );
+        let valid = tool_completion(
+            "submit_plan_review",
+            json!({
+                "id": "review-valid",
+                "assessments": crate::workflow::REQUIRED_PLAN_ASSESSMENTS
+                    .into_iter()
+                    .map(|kind| json!({"kind": kind, "status": "pass"}))
+                    .collect::<Vec<_>>(),
+                "challenges": [],
+                "verdict": "pass"
+            }),
+        );
+        let mut events = Vec::new();
+
+        let outcome =
+            run_scripted_agent_steps(&request, vec![invalid, valid], repo.path(), &mut |event| {
+                events.push(event)
+            })
+            .unwrap();
+
+        assert!(matches!(
+            outcome.workflow_submission,
+            Some(crate::workflow::StageSubmission::PlanReview { .. })
+        ));
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["submit_plan_review".to_string()]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, result, .. }
+                if tool == "submit_plan_review"
+                    && result.contains("set the corresponding assessment to concern or fail")
+        )));
+    }
+
+    #[test]
     fn rv3_code_review_terminal_is_unavailable_until_changed_text_is_inspected() {
         let repo = init_contract_test_repo();
         let repository =
@@ -31506,12 +31765,17 @@ the next imagined action"#;
 
     #[test]
     fn workflow_parse_failure_feedback_uses_only_the_native_tool_dialect() {
-        let feedback = workflow_parse_failure_feedback("cut off", 1, 1, 3, "submit_plan");
+        let feedback = workflow_parse_failure_feedback("cut off", 1, 1, 3, "submit_plan", false);
 
         assert!(feedback.contains("native function-call interface"));
         assert!(feedback.contains("provided submit_plan function"));
         assert!(feedback.contains("do not emit a pb compatibility"));
         assert!(!feedback.contains("Valid forms:"));
+
+        let terminal_only =
+            workflow_parse_failure_feedback("cut off", 1, 1, 3, "submit_plan", true);
+        assert!(terminal_only.contains("evidence step is already complete"));
+        assert!(terminal_only.contains("Call only the provided submit_plan"));
     }
 
     #[test]
@@ -34806,6 +35070,66 @@ the next imagined action"#;
         assert!(diff.contains("-before"), "{diff}");
         assert!(diff.contains("+after"), "{diff}");
         assert!(stat.contains("game.js"), "{stat}");
+    }
+
+    #[test]
+    fn session_summary_only_reports_changes_after_the_task_baseline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(tmp.path().join("session.txt"), "before\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "session.txt"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "test: baseline"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let baseline = git_run(&["rev-parse", "HEAD"], tmp.path()).unwrap();
+
+        assert_eq!(
+            git_log_since_baseline(tmp.path(), Some(&baseline)).unwrap(),
+            ""
+        );
+
+        std::fs::write(tmp.path().join("session.txt"), "after\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["commit", "-am", "fix: session change"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let commits = git_log_since_baseline(tmp.path(), Some(&baseline)).unwrap();
+        let diff = git_diff_since_baseline(tmp.path(), Some(&baseline)).unwrap();
+        let stat = git_diff_stat_since_baseline(tmp.path(), Some(&baseline)).unwrap();
+        assert!(commits.contains("fix: session change"), "{commits}");
+        assert!(!commits.contains("test: baseline"), "{commits}");
+        assert!(diff.contains("+after"), "{diff}");
+        assert!(stat.contains("session.txt"), "{stat}");
     }
 
     #[test]

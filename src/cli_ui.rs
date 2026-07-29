@@ -150,7 +150,7 @@ pub fn render_event(event: &AgentEvent) {
             print_header(&action_label(*actor, "agent action"), tool)
         }
         AgentEvent::ControllerObservation { receipt, actor, .. } => print_header(
-            &action_label(Some(*actor), "automatic action"),
+            &action_label(Some(*actor), "harness action"),
             &format_controller_observation(
                 receipt.operation.as_str(),
                 &receipt.path,
@@ -159,10 +159,10 @@ pub fn render_event(event: &AgentEvent) {
             ),
         ),
         AgentEvent::ControllerClosure { reason, actor, .. } => {
-            print_header(&action_label(Some(*actor), "automatic action"), reason)
+            print_header(&action_label(Some(*actor), "harness action"), reason)
         }
         AgentEvent::ControllerMutation { receipt, actor, .. } => print_header(
-            &action_label(Some(*actor), "automatic action"),
+            &action_label(Some(*actor), "harness action"),
             &format_controller_delete(&receipt.path),
         ),
         AgentEvent::ToolBatch {
@@ -340,7 +340,7 @@ pub fn render_event(event: &AgentEvent) {
                 summary
             };
             print_header(
-                &format!("{} · automatic correction", actor.display_name()),
+                &format!("{} · harness correction", actor.display_name()),
                 body,
             );
         }
@@ -594,10 +594,10 @@ fn format_controller_delete(path: &str) -> String {
 fn action_label(actor: Option<TeamActor>, fallback: &str) -> String {
     match actor {
         Some(actor @ TeamActor::Agent(_)) => {
-            format!("{} action · model-requested", actor.display_name())
+            format!("{} action · model", actor.display_name())
         }
         Some(actor @ TeamActor::Automation(_)) => {
-            format!("{} action · automatic", actor.display_name())
+            format!("{} action · harness", actor.display_name())
         }
         None => format!("{fallback} · legacy origin"),
     }
@@ -606,10 +606,10 @@ fn action_label(actor: Option<TeamActor>, fallback: &str) -> String {
 fn action_result_label(actor: Option<TeamActor>) -> String {
     match actor {
         Some(actor @ TeamActor::Agent(_)) => {
-            format!("{} action result · model-requested", actor.display_name())
+            format!("{} action result · model", actor.display_name())
         }
         Some(actor @ TeamActor::Automation(_)) => {
-            format!("{} action result · automatic", actor.display_name())
+            format!("{} action result · harness", actor.display_name())
         }
         None => "tool result · legacy origin".to_string(),
     }
@@ -618,7 +618,7 @@ fn action_result_label(actor: Option<TeamActor>) -> String {
 fn actor_message_label(actor: TeamActor) -> String {
     match actor {
         TeamActor::Agent(_) => actor.display_name().to_string(),
-        TeamActor::Automation(_) => format!("{} · automatic", actor.display_name()),
+        TeamActor::Automation(_) => format!("{} · harness", actor.display_name()),
     }
 }
 
@@ -643,11 +643,19 @@ mod tests {
     fn terminal_action_labels_use_the_responsible_teammate() {
         assert_eq!(
             action_label(Some(TeamActor::agent(AgentProfile::Build)), "agent action"),
-            "Kate Libby action · model-requested"
+            "Kate Libby action · model"
         );
         assert_eq!(
-            action_label(Some(TeamActor::workflow_steward()), "automatic action"),
-            "Trinity Walker action · automatic"
+            action_label(Some(TeamActor::workflow_steward()), "harness action"),
+            "Trinity Walker action · harness"
+        );
+        assert_eq!(
+            action_result_label(Some(TeamActor::workflow_steward())),
+            "Trinity Walker action result · harness"
+        );
+        assert_eq!(
+            actor_message_label(TeamActor::workflow_steward()),
+            "Trinity Walker · harness"
         );
         assert_eq!(
             action_label(None, "agent action"),

@@ -9,8 +9,8 @@ import {
   projectSettingsPath,
   sessionPageDocumentTitle,
   sessionTitle,
-  usageStatsForToday,
   toolResultForCall,
+  usageStatsForToday,
 } from "./helpers.ts";
 
 Deno.test("sessionTitle prefers a trimmed title and falls back to the task", () => {
@@ -186,30 +186,189 @@ Deno.test("groupActionEvents presents proactive LSP work as Trinity's routine ac
   equal((grouped[0] as { toolResults: EventEnvelope[] }).toolResults.length, 1);
 });
 
+Deno.test("groupActionEvents folds adjacent tool-only inferences by the same teammate into one run", () => {
+  const actor = { kind: "agent" as const, id: "plan" };
+  const inference = (step: number): EventEnvelope => ({
+    version: "1",
+    event: {
+      type: "llm_invocation",
+      step,
+      profile: "plan",
+      purpose: "workflow_evidence",
+      duration_ms: 1000,
+      prompt_tokens: 100,
+      generated_tokens: 10,
+    },
+  });
+  const events: EventEnvelope[] = [
+    inference(1),
+    {
+      version: "1",
+      event: {
+        type: "tool_call",
+        tool: "glob",
+        arguments: { pattern: "webui/**/*.tsx" },
+        call_id: "one",
+        actor,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "tool_result",
+        tool: "glob",
+        result: "ProjectsPage.tsx",
+        call_id: "one",
+        actor,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "tool_batch",
+        call_count: 1,
+        parallel_safe_count: 1,
+        useful_count: 1,
+        bookkeeping_only_count: 0,
+        rejected_as_dependent: false,
+      },
+    },
+    inference(2),
+    {
+      version: "1",
+      event: {
+        type: "tool_call",
+        tool: "read_file",
+        arguments: { path: "webui/src/pages/ProjectsPage.tsx" },
+        call_id: "two",
+        actor,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "tool_result",
+        tool: "read_file",
+        result: "source",
+        call_id: "two",
+        actor,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "correction",
+        message: "Submit the plan now",
+        actor: { kind: "automation", id: "trinity" },
+      },
+    },
+  ];
+
+  const grouped = groupActionEvents(events);
+
+  equal(grouped.length, 2);
+  const run = grouped[0];
+  if (!("type" in run) || run.type !== "action_group") {
+    throw new Error("expected one action run");
+  }
+  equal(run.toolCalls.length, 2);
+  equal(run.toolResults.length, 2);
+  equal(run.inferenceEvents.length, 2);
+  equal((grouped[1] as EventEnvelope).event.type, "correction");
+});
+
+Deno.test("groupActionEvents leaves an inference visible when it produces chat text", () => {
+  const inference: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "llm_invocation",
+      step: 1,
+      profile: "review",
+      duration_ms: 1000,
+      prompt_tokens: 100,
+      generated_tokens: 10,
+    },
+  };
+  const reasoning: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "reasoning",
+      content: "I found the issue.",
+      profile: "review",
+    },
+  };
+
+  const grouped = groupActionEvents([inference, reasoning]);
+
+  equal(grouped.length, 2);
+  equal((grouped[0] as EventEnvelope).event.type, "llm_invocation");
+  equal((grouped[1] as EventEnvelope).event.type, "reasoning");
+});
+
 Deno.test("groupActionEvents correlates reordered identical tools across intervening messages", () => {
   const actor = { kind: "agent" as const, id: "build" };
   const callA: EventEnvelope = {
     version: "1",
-    event: { type: "tool_call", tool: "read_file", arguments: { path: "a.rs" }, call_id: "a", batch_id: "batch", actor },
+    event: {
+      type: "tool_call",
+      tool: "read_file",
+      arguments: { path: "a.rs" },
+      call_id: "a",
+      batch_id: "batch",
+      actor,
+    },
   };
   const callB: EventEnvelope = {
     version: "1",
-    event: { type: "tool_call", tool: "read_file", arguments: { path: "b.rs" }, call_id: "b", batch_id: "batch", actor },
+    event: {
+      type: "tool_call",
+      tool: "read_file",
+      arguments: { path: "b.rs" },
+      call_id: "b",
+      batch_id: "batch",
+      actor,
+    },
   };
   const correction: EventEnvelope = {
     version: "1",
-    event: { type: "correction", message: "keep going", actor: { kind: "automation", id: "trinity" } },
+    event: {
+      type: "correction",
+      message: "keep going",
+      actor: { kind: "automation", id: "trinity" },
+    },
   };
   const resultB: EventEnvelope = {
     version: "1",
-    event: { type: "tool_result", tool: "read_file", result: "B", call_id: "b", batch_id: "batch", outcome: "succeeded", actor },
+    event: {
+      type: "tool_result",
+      tool: "read_file",
+      result: "B",
+      call_id: "b",
+      batch_id: "batch",
+      outcome: "succeeded",
+      actor,
+    },
   };
   const resultA: EventEnvelope = {
     version: "1",
-    event: { type: "tool_result", tool: "read_file", result: "A", call_id: "a", batch_id: "batch", outcome: "succeeded", actor },
+    event: {
+      type: "tool_result",
+      tool: "read_file",
+      result: "A",
+      call_id: "a",
+      batch_id: "batch",
+      outcome: "succeeded",
+      actor,
+    },
   };
 
-  const grouped = groupActionEvents([callA, callB, correction, resultB, resultA]);
+  const grouped = groupActionEvents([
+    callA,
+    callB,
+    correction,
+    resultB,
+    resultA,
+  ]);
   const actions = grouped[0];
   if (!("type" in actions) || actions.type !== "action_group") {
     throw new Error("expected action group");
@@ -217,8 +376,14 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
   const matchedA = toolResultForCall(callA, actions.toolResults);
   const matchedB = toolResultForCall(callB, actions.toolResults);
   equal(matchedA?.event.type, "tool_result");
-  equal(matchedA?.event.type === "tool_result" ? matchedA.event.result : undefined, "A");
-  equal(matchedB?.event.type === "tool_result" ? matchedB.event.result : undefined, "B");
+  equal(
+    matchedA?.event.type === "tool_result" ? matchedA.event.result : undefined,
+    "A",
+  );
+  equal(
+    matchedB?.event.type === "tool_result" ? matchedB.event.result : undefined,
+    "B",
+  );
 });
 
 Deno.test("projectSettingsPath encodes project names under the project URL", () => {

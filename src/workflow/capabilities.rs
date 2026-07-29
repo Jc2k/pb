@@ -202,7 +202,11 @@ impl StageCapabilities {
                 self.repository_read && self.terminal_action == TerminalActionKind::SubmitCodeReview
             }
             "web_search" | "web_fetch" => self.public_research,
-            "attachments" | "vision_describe" | "session_title" => self.repository_read,
+            "attachments" | "vision_describe" => self.repository_read,
+            // Strict delivery already has the user's task as its stable title fallback. Spending
+            // a dedicated model turn on cosmetic title rewriting adds no workflow evidence or
+            // authority, so title changes remain a discussion-only capability.
+            "session_title" => self.terminal_action == TerminalActionKind::DiscussFinal,
             "ask_user" => {
                 matches!(self.terminal_action, TerminalActionKind::SubmitPlan)
             }
@@ -266,12 +270,16 @@ mod tests {
         assert!(plan.allows_tool("submit_plan"));
         assert!(!plan.allows_tool("run_command"));
         assert!(!plan.allows_tool("apply_patch"));
+        assert!(!plan.allows_tool("session_title"));
 
         let review = StageCapabilities::for_stage(WorkflowStage::CodeReview);
         assert!(review.allows_tool("inspect_change"));
         assert!(review.allows_tool("submit_code_review"));
         assert!(!review.allows_tool("submit_plan"));
         assert!(!review.allows_tool("run_command"));
+        assert!(!review.allows_tool("session_title"));
+
+        assert!(StageCapabilities::discuss().allows_tool("session_title"));
     }
 
     #[test]

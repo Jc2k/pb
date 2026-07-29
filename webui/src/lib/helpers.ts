@@ -65,6 +65,7 @@ export type ActionGroup = {
   type: "action_group";
   actor?: TeamActor;
   assistingProfile?: string;
+  inferenceEvents: EventEnvelope[];
   toolCalls: EventEnvelope[];
   toolResults: EventEnvelope[];
   controllerActions: EventEnvelope[];
@@ -108,18 +109,27 @@ export function groupActionEvents(
   let currentToolCalls: EventEnvelope[] = [];
   let currentToolResults: EventEnvelope[] = [];
   let currentControllerActions: EventEnvelope[] = [];
+  let currentInferenceEvents: EventEnvelope[] = [];
+  let pendingInferenceEvents: EventEnvelope[] = [];
+  let pendingInferenceActor: TeamActor | undefined;
   let currentActor: TeamActor | undefined;
   let currentAssistingProfile: string | undefined;
 
   const flush = () => {
-    if (
-      currentToolCalls.length === 0 && currentToolResults.length === 0 &&
-      currentControllerActions.length === 0
-    ) return;
+    const hasActions = currentToolCalls.length > 0 ||
+      currentToolResults.length > 0 || currentControllerActions.length > 0;
+    if (!hasActions) {
+      grouped.push(...currentInferenceEvents);
+      currentInferenceEvents = [];
+      currentActor = undefined;
+      currentAssistingProfile = undefined;
+      return;
+    }
     grouped.push({
       type: "action_group",
       actor: currentActor,
       assistingProfile: currentAssistingProfile,
+      inferenceEvents: [...currentInferenceEvents],
       toolCalls: [...currentToolCalls],
       toolResults: [...currentToolResults],
       controllerActions: [...currentControllerActions],
@@ -127,6 +137,7 @@ export function groupActionEvents(
     currentToolCalls = [];
     currentToolResults = [];
     currentControllerActions = [];
+    currentInferenceEvents = [];
     currentActor = undefined;
     currentAssistingProfile = undefined;
   };
@@ -136,29 +147,57 @@ export function groupActionEvents(
     assistingProfile?: string,
   ) => {
     const hasActions = currentToolCalls.length > 0 ||
-      currentToolResults.length > 0 || currentControllerActions.length > 0;
+      currentToolResults.length > 0 || currentControllerActions.length > 0 ||
+      currentInferenceEvents.length > 0;
     if (
       hasActions &&
       (teamActorKey(currentActor) !== teamActorKey(actor) ||
         currentAssistingProfile !== assistingProfile)
     ) flush();
     const groupIsEmpty = currentToolCalls.length === 0 &&
-      currentToolResults.length === 0 && currentControllerActions.length === 0;
+      currentToolResults.length === 0 &&
+      currentControllerActions.length === 0 &&
+      currentInferenceEvents.length === 0;
     if (groupIsEmpty) {
       currentActor = actor;
       currentAssistingProfile = assistingProfile;
     }
   };
 
+  const flushPendingInferences = () => {
+    if (pendingInferenceEvents.length === 0) return;
+    flush();
+    grouped.push(...pendingInferenceEvents);
+    pendingInferenceEvents = [];
+    pendingInferenceActor = undefined;
+  };
+
   for (let i = 0; i < events.length; i++) {
     const event = events[i];
 
-    if (event.event.type === "tool_call") {
-      beginOrSwitchGroup(event.event.actor);
+    if (event.event.type === "llm_invocation") {
+      flushPendingInferences();
+      pendingInferenceActor = event.event.profile
+        ? { kind: "agent" as const, id: event.event.profile }
+        : undefined;
+      pendingInferenceEvents.push(event);
+    } else if (event.event.type === "tool_call") {
+      const actor = event.event.actor;
+      if (
+        pendingInferenceEvents.length > 0 &&
+        teamActorKey(pendingInferenceActor) !== teamActorKey(actor)
+      ) {
+        flushPendingInferences();
+      }
+      beginOrSwitchGroup(actor);
+      currentInferenceEvents.push(...pendingInferenceEvents);
+      pendingInferenceEvents = [];
+      pendingInferenceActor = undefined;
       currentToolCalls.push(event);
     } else if (event.event.type === "tool_result") {
       const currentMatch = currentToolCalls.some((call) =>
-        toolEventsMatch(call, event) && !toolResultForCall(call, currentToolResults)
+        toolEventsMatch(call, event) &&
+        !toolResultForCall(call, currentToolResults)
       );
       if (currentMatch) {
         currentToolResults.push(event);
@@ -177,23 +216,32 @@ export function groupActionEvents(
       }
       flush();
       grouped.push(event);
+    } else if (event.event.type === "tool_batch") {
+      // Batch bookkeeping is represented by the calls themselves. It must not split adjacent
+      // tool-only turns by the same teammate into several chat messages.
+      continue;
     } else if (
       event.event.type === "controller_observation" ||
       event.event.type === "controller_closure" ||
       event.event.type === "controller_mutation"
     ) {
+      flushPendingInferences();
       beginOrSwitchGroup(
         event.event.actor || workflowStewardActor(),
         event.event.assisting_profile,
       );
       currentControllerActions.push(event);
     } else {
+      flushPendingInferences();
       flush();
       grouped.push(event);
     }
   }
 
   flush();
+  if (pendingInferenceEvents.length > 0) {
+    grouped.push(...pendingInferenceEvents);
+  }
 
   return grouped;
 }

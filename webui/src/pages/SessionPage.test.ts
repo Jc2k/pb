@@ -172,6 +172,11 @@ Deno.test("session corrections render as truthful steward messages", async () =>
   ok(component.includes("function CorrectionNotice"));
   ok(component.includes("workflowStewardActor()"));
   ok(component.includes("Correction from ${teammate.name}"));
+  ok(component.includes("needs a correction"));
+  ok(component.includes("I sent it back with guidance"));
+  ok(component.includes("Technical details"));
+  ok(component.includes("function WorkflowBlockedNotice"));
+  ok(component.includes("Delivery paused safely"));
   ok(component.includes('className="action-origin"'));
   ok(css.includes(".correction-bubble"));
 });
@@ -215,9 +220,18 @@ Deno.test("session page respects iPhone safe areas and prevents horizontal overf
   ok(!appCss.includes("/* diff viewer */ /*"));
 });
 
-Deno.test("session metrics expose the canonical estimate and its measurement quality", async () => {
+Deno.test("session metrics stay compact while inference details remain available", async () => {
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+  const css = await Deno.readTextFile("webui/src/session.css");
   const types = await Deno.readTextFile("webui/src/types/index.ts");
+  const inferenceDetails = component.slice(
+    component.indexOf("function InferenceDetails"),
+    component.indexOf("export function MessageBubble"),
+  );
+  const runtimeDetails = component.slice(
+    component.indexOf("function SessionMetricsDetails"),
+    component.indexOf("export function MessageBubble"),
+  );
 
   ok(types.includes("power_summary?: string"));
   ok(
@@ -230,64 +244,92 @@ Deno.test("session metrics expose the canonical estimate and its measurement qua
   ok(component.includes('case "llm_invocation"'));
   ok(types.includes('"task_partitioning"'));
   ok(types.includes('"workflow_recovery"'));
-  ok(component.includes('e.purpose.replaceAll("_", " ")'));
-  ok(component.includes("e.prompt_cache.cached_tokens"));
-  ok(component.includes("e.prompt_cache.prefilled_tokens"));
-  ok(component.includes("e.prompt_cache.miss_reason"));
-  ok(component.includes("e.prompt_cache.lookup_detail"));
-  ok(component.includes("e.prompt_cache.root.reused_tokens"));
-  ok(component.includes("e.prompt_cache.root.tokens"));
-  ok(component.includes("e.prompt_cache.root.authority_class"));
+  ok(inferenceDetails.includes("used the model"));
+  ok(inferenceDetails.includes("View inference ${event.step} details"));
+  ok(component.includes('role="dialog"'));
+  ok(inferenceDetails.includes("window.setTimeout"));
+  ok(inferenceDetails.includes("event.prompt_cache.cached_tokens"));
+  ok(inferenceDetails.includes("event.prompt_cache.prefilled_tokens"));
+  ok(inferenceDetails.includes("event.prompt_cache.miss_reason"));
+  ok(inferenceDetails.includes("event.prompt_cache.lookup_detail"));
+  ok(inferenceDetails.includes("event.prompt_cache.root.reused_tokens"));
+  ok(inferenceDetails.includes("event.prompt_cache.root.tokens"));
+  ok(inferenceDetails.includes("event.prompt_cache.root.authority_class"));
   ok(types.includes("cache_format_version"));
-  ok(component.includes("e.native?.refill"));
-  ok(component.includes("e.native.refill.fresh_suffix_prefill_wall_ms"));
-  ok(component.includes("e.native.prefill_command_kind"));
-  ok(component.includes("e.native.prefill_command_reason"));
-  ok(component.includes("e.native.refill.disk_read_decode_wall_ms"));
+  ok(inferenceDetails.includes("event.native.refill"));
   ok(
-    component.includes(
-      "e.native.refill.cpu_state_validation_allocation_wall_ms",
+    inferenceDetails.includes(
+      "event.native.refill.fresh_suffix_prefill_wall_ms",
     ),
   );
-  ok(component.includes("e.native.refill.persistence_queue_wall_ms"));
-  ok(component.includes("e.cache_persistence_completed_checkpoints"));
-  ok(component.includes('e.prompt_cache.source.replaceAll("_", " ")'));
-  ok(component.includes("Power-estimate details"));
-  ok(component.includes("Measurement coverage"));
+  ok(inferenceDetails.includes("event.native.refill.disk_read_decode_wall_ms"));
+  ok(
+    inferenceDetails.includes(
+      "event.native.refill.cpu_state_validation_allocation_wall_ms",
+    ),
+  );
+  ok(
+    inferenceDetails.includes("event.native.refill.persistence_queue_wall_ms"),
+  );
+  ok(component.includes("Runtime details"));
+  ok(runtimeDetails.includes('label="Coverage"'));
   ok(component.includes("Gross device energy"));
   ok(
     component.includes(
-      '<article className="session-correction" aria-label="Session metrics">',
+      'className="session-correction session-metrics-summary"',
     ),
   );
-  ok(
-    component.includes("? <time>{formatEventTime(e.timestamp_ms)}</time>"),
-  );
+  ok(component.includes('aria-label="Session runtime summary"'));
+  ok(runtimeDetails.includes("View session runtime details"));
+  ok(runtimeDetails.includes("<MetricsDialog"));
+  ok(!runtimeDetails.includes("<details>"));
+  ok(runtimeDetails.includes("event.cache_persistence_completed_checkpoints"));
   ok(!component.includes("<strong>Power</strong>"));
   ok(!component.includes("{e.power_summary"));
   ok(!component.includes('<i className="bi bi-speedometer2"></i>'));
+  const markerRule = cssRule(
+    css,
+    ".inference-marker,\n.session-metrics-summary",
+  );
+  ok(markerRule.includes("position: relative;"));
+  ok(markerRule.includes("width: fit-content;"));
+  const infoRule = cssRule(css, ".inference-info-button");
+  ok(infoRule.includes("position: absolute;"));
+  ok(infoRule.includes("opacity: 0;"));
+  ok(css.includes(".session-metrics-summary:hover .inference-info-button"));
 });
 
-Deno.test("session workspace separates user chat from assistant transcript content", async () => {
+Deno.test("session workspace prioritizes chat and shows work details only when useful", async () => {
   const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
   const css = await Deno.readTextFile("webui/src/session.css");
   const team = await Deno.readTextFile("webui/src/lib/team.ts");
+  const constants = await Deno.readTextFile("webui/src/lib/constants.ts");
 
   ok(page.includes('className="app-shell session-shell"'));
-  ok(page.includes("Session details"));
+  ok(page.includes("showWorkDrawer"));
+  ok(page.includes('aria-label="Work details"'));
   ok(page.includes('title="Actions"'));
   ok(page.includes('title="Plan"'));
-  ok(page.includes('title="Activity"'));
-  ok(page.includes("<SessionActivity events={events} />"));
+  ok(!page.includes("Session details"));
+  ok(!page.includes('title="Activity"'));
+  ok(!page.includes("<SessionActivity events={events} />"));
+  ok(!page.includes("workflow-progress"));
+  ok(page.includes("taskPlanningTranscript.attempts.length > 0"));
+  ok(page.includes("Branch: {session.branch}"));
+  ok(page.includes('event.event.type === "started"'));
   ok(component.includes("assistant-message assistant-transcript"));
   ok(component.includes("<strong>You</strong>"));
-  ok(component.includes("function activityLabel"));
+  ok(!component.includes("Session request"));
+  ok(!component.includes("function activityLabel"));
   ok(component.includes('className="action-origin"'));
   ok(component.includes("export function ActionDrawerItem"));
+  ok(component.includes('className="drawer-action-detail"'));
   ok(page.includes("buildActionTimeline(events)"));
-  ok(team.includes('provenance: "Model-requested"'));
-  ok(team.includes('provenance: "Automatic"'));
+  ok(team.includes('provenance: "Model"'));
+  ok(team.includes('provenance: "Harness"'));
+  ok(constants.includes('session_changes: "Review recent work"'));
+  ok(constants.includes('run_check: "Run acceptance check"'));
   ok(component.includes("Closed no-change work"));
   ok(component.includes('className="transcript-diff"'));
   ok(
@@ -296,8 +338,13 @@ Deno.test("session workspace separates user chat from assistant transcript conte
     ),
   );
   ok(css.includes(".transcript-diff-body"));
-  ok(css.includes(".tool-drawer-heading"));
-  ok(css.includes(".session-activity-list"));
+  ok(!css.includes(".tool-drawer-heading"));
+  ok(!css.includes(".session-activity-list"));
+  ok(!css.includes(".workflow-progress"));
+  const drawerTitleRule = cssRule(css, ".drawer-item .drawer-action-title");
+  ok(drawerTitleRule.includes("grid-template-columns: minmax(0, 1fr) auto;"));
+  const drawerDetailRule = cssRule(css, ".drawer-action-detail");
+  ok(drawerDetailRule.includes("overflow-wrap: anywhere;"));
 });
 
 Deno.test("handoff feedback renders as a teammate with expandable evidence", async () => {

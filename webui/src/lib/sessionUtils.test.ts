@@ -8,6 +8,7 @@ import {
   errorSummary,
   getToolDetail,
   latestAssistantProfile,
+  trustedSessionSummaryCommitLines,
 } from "./sessionUtils.ts";
 
 Deno.test("buildActionTimeline preserves chronology and actor provenance", () => {
@@ -66,6 +67,41 @@ Deno.test("buildActionTimeline preserves chronology and actor provenance", () =>
   equal(timeline[1].assistingProfile, "review");
 });
 
+Deno.test("strict workflow summaries require typed commit evidence", () => {
+  const workflow: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "workflow_started",
+      workflow_id: "run-1",
+      source_turn_id: "turn-1",
+      policy_sha256: "policy",
+    },
+  };
+  const commit: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "commit_result",
+      success: true,
+      created: true,
+      reused: false,
+      oid: "abc123",
+    },
+  };
+
+  deepEqual(
+    trustedSessionSummaryCommitLines("abc old repository history", [workflow]),
+    [],
+  );
+  deepEqual(
+    trustedSessionSummaryCommitLines("abc delivery commit", [workflow, commit]),
+    ["abc delivery commit"],
+  );
+  deepEqual(
+    trustedSessionSummaryCommitLines("abc legacy summary", []),
+    ["abc legacy summary"],
+  );
+});
+
 Deno.test("getToolDetail shows session_title call title", () => {
   const call: EventEnvelope = {
     version: "1",
@@ -77,6 +113,56 @@ Deno.test("getToolDetail shows session_title call title", () => {
   };
 
   equal(getToolDetail(call), "Wire title tool");
+});
+
+Deno.test("getToolDetail keeps search scope and summarizes workflow submissions", () => {
+  const search: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "tool_call",
+      tool: "search",
+      arguments: { pattern: "branch.*selector", path: "webui" },
+    },
+  };
+  const changes: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "tool_call",
+      tool: "session_changes",
+      arguments: {},
+    },
+  };
+  const plan: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "tool_call",
+      tool: "submit_plan",
+      arguments: {
+        requirements: [{ id: "r1" }],
+        steps: [{ id: "s1" }],
+        acceptance: [{ id: "a1" }],
+      },
+    },
+  };
+  const incompletePlan: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "tool_call",
+      tool: "submit_plan",
+      arguments: { requirements: [], steps: [], acceptance: [] },
+    },
+  };
+
+  equal(getToolDetail(search), "branch.*selector · in webui");
+  equal(getToolDetail(changes), "Recent sessions and changes");
+  equal(
+    getToolDetail(plan),
+    "1 requirement · 1 step · 1 acceptance check",
+  );
+  equal(
+    getToolDetail(incompletePlan),
+    "Incomplete plan · missing required sections",
+  );
 });
 
 Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
@@ -114,7 +200,12 @@ Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
 Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
   const call: EventEnvelope = {
     version: "1",
-    event: { type: "tool_call", tool: "lsp_proactive_diagnostics", arguments: { mode: "settled", paths: ["src/lib.rs"] }, call_id: "lsp-1" },
+    event: {
+      type: "tool_call",
+      tool: "lsp_proactive_diagnostics",
+      arguments: { mode: "settled", paths: ["src/lib.rs"] },
+      call_id: "lsp-1",
+    },
   };
   const result: EventEnvelope = {
     version: "1",
@@ -128,7 +219,10 @@ Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
         omitted_paths: 0,
         stale: false,
         complete: false,
-        requested_targets: [{ server: "rust", path: "src/lib.rs" }, { server: "second", path: "src/lib.rs" }],
+        requested_targets: [{ server: "rust", path: "src/lib.rs" }, {
+          server: "second",
+          path: "src/lib.rs",
+        }],
         completed_targets: [{ server: "rust", path: "src/lib.rs" }],
       }),
       call_id: "lsp-1",
@@ -136,7 +230,10 @@ Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
     },
   };
 
-  equal(getToolDetail(call, result), "settled · incomplete evidence · 1/2 server/file targets");
+  equal(
+    getToolDetail(call, result),
+    "settled · incomplete evidence · 1/2 server/file targets",
+  );
 });
 
 Deno.test("buildToolSummaries includes session_title parameters in drawer details", () => {
@@ -296,6 +393,47 @@ Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated 
     equal(summaryEvent.event.summary, undefined);
     equal(summaryEvent.event.commits, "abc123 fix: avoid duplicate summary");
   }
+});
+
+Deno.test("chat hides internal closure checkpoints and deduplicates blocked delivery text", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "v1",
+      event: {
+        type: "correction",
+        summary: "Workflow closure checkpoint",
+        message: '{"type":"workflow_closure_checkpoint","stage":"planning"}',
+        actor: { kind: "automation", id: "trinity" },
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "workflow_blocked",
+        workflow_id: "workflow-1",
+        outcome: "plan_rejected",
+        reason: "The planning submission was rejected three times.",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "session_summary",
+        branch: "main",
+        commits: "",
+        summary: "The planning submission was rejected three times.",
+      },
+    },
+  ];
+
+  const visible = chatEventsWithOnlyLatestStep(events);
+  deepEqual(visible.map((event) => event.event.type), [
+    "workflow_blocked",
+    "session_summary",
+  ]);
+  const summary = visible[1].event;
+  equal(summary.type, "session_summary");
+  if (summary.type === "session_summary") equal(summary.summary, undefined);
 });
 
 Deno.test("latestAssistantProfile falls back to the started profile for early activity", () => {

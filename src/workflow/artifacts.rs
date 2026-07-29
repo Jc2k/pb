@@ -371,6 +371,41 @@ pub struct EvidenceReference {
 }
 
 impl PlanReviewArtifact {
+    /// Validate the review's self-contained disposition before accepting the terminal tool call.
+    ///
+    /// This deliberately excludes plan identity, requirement references, and repository evidence,
+    /// which still require the accepted plan and the stage evidence ledger. Keeping the redundant
+    /// verdict/assessment fields consistent here lets the live review turn correct a malformed
+    /// submission without throwing away its conversation and reads.
+    pub fn validate_disposition(&self) -> Result<()> {
+        let blocking = self
+            .challenges
+            .iter()
+            .any(|challenge| challenge.severity.is_blocking());
+        let concerning_assessment = self
+            .assessments
+            .iter()
+            .any(|assessment| assessment.status != AssessmentStatus::Pass);
+        match (self.verdict, blocking) {
+            (ReviewVerdict::Pass, true) => {
+                bail!("passing plan review contains a blocking challenge")
+            }
+            (ReviewVerdict::Pass, false) if concerning_assessment => {
+                bail!("passing plan review contains a concern or failed assessment")
+            }
+            (ReviewVerdict::Revise, false) => {
+                bail!("plan review requests revision without a blocking challenge")
+            }
+            (ReviewVerdict::Revise, true) if !concerning_assessment => {
+                bail!(
+                    "plan review requests revision while every assessment passes; set the corresponding assessment to concern or fail, or submit a passing review without a blocking challenge"
+                )
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, plan: &ArtifactEnvelope<PlanArtifact>) -> Result<()> {
         plan.validate_digest()?;
         if self.plan_id != plan.id || self.plan_sha256 != plan.sha256 {
@@ -406,29 +441,7 @@ impl PlanReviewArtifact {
                     .collect(),
             )?;
         }
-        let blocking = self
-            .challenges
-            .iter()
-            .any(|challenge| challenge.severity.is_blocking());
-        let concerning_assessment = self
-            .assessments
-            .iter()
-            .any(|assessment| assessment.status != AssessmentStatus::Pass);
-        match (self.verdict, blocking) {
-            (ReviewVerdict::Pass, true) => {
-                bail!("passing plan review contains a blocking challenge")
-            }
-            (ReviewVerdict::Pass, false) if concerning_assessment => {
-                bail!("passing plan review contains a concern or failed assessment")
-            }
-            (ReviewVerdict::Revise, false) => {
-                bail!("plan review requests revision without a blocking challenge")
-            }
-            (ReviewVerdict::Revise, true) if !concerning_assessment => {
-                bail!("plan review requests revision while every assessment passes")
-            }
-            _ => {}
-        }
+        self.validate_disposition()?;
         artifact_bytes(self)?;
         Ok(())
     }

@@ -4,7 +4,7 @@ export interface TeamPresentation {
   name: string;
   role: string;
   avatar: string;
-  provenance: "Model-requested" | "Automatic" | "Legacy action";
+  provenance: "Model" | "Harness" | "Legacy";
 }
 
 const PROFILES: Record<string, Omit<TeamPresentation, "provenance">> = {
@@ -84,17 +84,17 @@ export function teamActorPresentation(
   if (actor?.kind === "agent") {
     return {
       ...profilePresentation(actor.id),
-      provenance: "Model-requested",
+      provenance: "Model",
     };
   }
   if (actor?.kind === "automation") {
-    return { ...TRINITY_STEWARD, provenance: "Automatic" };
+    return { ...TRINITY_STEWARD, provenance: "Harness" };
   }
   return {
     name: "Agent",
     role: "Earlier session",
     avatar: "/static/images/avatar.png",
-    provenance: "Legacy action",
+    provenance: "Legacy",
   };
 }
 

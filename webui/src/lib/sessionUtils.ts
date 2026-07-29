@@ -53,33 +53,65 @@ export function getToolDetail(
 
   const args = toolCall.event.arguments as Record<string, unknown>;
 
+  const scopedValue = (
+    value: unknown,
+    scope: unknown,
+    fallback: string,
+  ): string => {
+    const label = typeof value === "string" && value ? value : fallback;
+    return typeof scope === "string" && scope
+      ? `${label} · in ${scope}`
+      : label;
+  };
+
+  const arrayCount = (value: unknown): number =>
+    Array.isArray(value) ? value.length : 0;
+
   switch (toolCall.event.tool) {
     case "read_file": {
       const filePath = args ? (args.path as string) : undefined;
       return filePath || "(no path)";
     }
+    case "inspect_change":
+      return (args.path as string) || "(no path)";
     case "glob":
-      return (
-        (args.pattern as string) ||
-        "(no pattern)" + (args.relative_path ? ` in ${args.relative_path}` : "")
+      return scopedValue(
+        args.pattern,
+        args.path ?? args.relative_path,
+        "(no pattern)",
       );
     case "ripgrep":
     case "search":
-      return (
-        (args.pattern as string) ||
-        "(no pattern)" + (args.path ? ` in ${args.path}` : "")
-      );
+      return scopedValue(args.pattern, args.path, "(no pattern)");
     case "web_search":
       return (args.query as string) || "(no query)";
     case "web_fetch":
       return (args.url as string) || "(no url)";
     case "run_command":
       return (args.cmd as string) || "(no cmd)";
+    case "run_task":
+    case "run_check":
+      return (args.id as string) || "(no id)";
+    case "session_changes": {
+      const filters = [
+        typeof args.path === "string" && args.path
+          ? `File: ${args.path}`
+          : null,
+        typeof args.commits === "string" && args.commits
+          ? `Commits: ${args.commits}`
+          : null,
+      ].filter(Boolean);
+      return filters.length > 0
+        ? filters.join(" · ")
+        : "Recent sessions and changes";
+    }
     case "lsp_proactive_diagnostics": {
       const mode = typeof args.mode === "string" ? args.mode : "automatic";
       const requested = Array.isArray(args.paths) ? args.paths.length : 0;
       if (!toolResult || toolResult.event.type !== "tool_result") {
-        return `${mode} · ${requested} ${requested === 1 ? "file" : "files"} (pending)`;
+        return `${mode} · ${requested} ${
+          requested === 1 ? "file" : "files"
+        } (pending)`;
       }
       try {
         const report = JSON.parse(toolResult.event.result) as {
@@ -101,16 +133,28 @@ export function getToolDetail(
         const completedTargets = report.completed_targets?.length || 0;
         if (report.stale) return `${mode} · stale evidence discarded`;
         if (diagnostics > 0) {
-          return `${mode} · ${diagnostics} blocking ${diagnostics === 1 ? "diagnostic" : "diagnostics"} in ${scanned} ${scanned === 1 ? "file" : "files"}${omitted > 0 ? ` · ${omitted} deferred` : ""}`;
+          return `${mode} · ${diagnostics} blocking ${
+            diagnostics === 1 ? "diagnostic" : "diagnostics"
+          } in ${scanned} ${scanned === 1 ? "file" : "files"}${
+            omitted > 0 ? ` · ${omitted} deferred` : ""
+          }`;
         }
         if (failures > 0) {
-          return `${mode} · ${scanned}/${requested} files · ${failures} ${failures === 1 ? "server issue" : "server issues"}${omitted > 0 ? ` · ${omitted} deferred` : ""}`;
+          return `${mode} · ${scanned}/${requested} files · ${failures} ${
+            failures === 1 ? "server issue" : "server issues"
+          }${omitted > 0 ? ` · ${omitted} deferred` : ""}`;
         }
         if (report.complete !== true) {
-          return `${mode} · incomplete evidence · ${completedTargets}/${requestedTargets} server/file targets${omitted > 0 ? ` · ${omitted} deferred` : ""}`;
+          return `${mode} · incomplete evidence · ${completedTargets}/${requestedTargets} server/file targets${
+            omitted > 0 ? ` · ${omitted} deferred` : ""
+          }`;
         }
-        if (omitted > 0) return `${mode} · ${scanned} files · ${omitted} deferred`;
-        return `${mode} · ${scanned} ${scanned === 1 ? "file" : "files"} · clean`;
+        if (omitted > 0) {
+          return `${mode} · ${scanned} files · ${omitted} deferred`;
+        }
+        return `${mode} · ${scanned} ${
+          scanned === 1 ? "file" : "files"
+        } · clean`;
       } catch {
         return `${mode} · ${requested} ${requested === 1 ? "file" : "files"}`;
       }
@@ -138,6 +182,11 @@ export function getToolDetail(
       const filePath = args ? (args.path as string) : undefined;
       return filePath || "(no path)";
     }
+    case "write_file":
+    case "replace_file": {
+      const path = args ? (args.path as string) : undefined;
+      return path || "(no path)";
+    }
     case "edit_file": {
       const path = args.path as string;
       if (!path) return "(no path)";
@@ -151,6 +200,58 @@ export function getToolDetail(
       return (args.message as string) || "(no message)";
     case "session_title":
       return (args.title as string) || "(no title)";
+    case "memory_search":
+      return (args.query as string) || "All relevant project memory";
+    case "memory_read":
+      return (args.id as string) || "(no memory id)";
+    case "memory_propose":
+      return (args.title as string) || (args.kind as string) ||
+        "New project memory";
+    case "memory_supersede":
+      return (args.id as string) || "(no memory id)";
+    case "propose_delivery":
+    case "start_delivery":
+      return (args.task_summary as string) || "(no delivery summary)";
+    case "propose_goal":
+    case "start_goal":
+      return (args.objective as string) || "(no goal objective)";
+    case "goal_pause":
+    case "goal_request_budget":
+      return (args.reason as string) || "(no reason)";
+    case "goal_request_amendment":
+      return (args.summary as string) || "(no change summary)";
+    case "submit_plan": {
+      const requirements = arrayCount(args.requirements);
+      const steps = arrayCount(args.steps);
+      const acceptance = arrayCount(args.acceptance);
+      if (requirements === 0 || steps === 0 || acceptance === 0) {
+        return "Incomplete plan · missing required sections";
+      }
+      return `${requirements} ${
+        requirements === 1 ? "requirement" : "requirements"
+      } · ${steps} ${
+        steps === 1 ? "step" : "steps"
+      } · ${acceptance} acceptance ${acceptance === 1 ? "check" : "checks"}`;
+    }
+    case "submit_plan_review":
+    case "submit_code_review": {
+      const rawVerdict = typeof args.verdict === "string"
+        ? args.verdict.replaceAll("_", " ")
+        : "";
+      const verdict = rawVerdict
+        ? `${rawVerdict[0].toUpperCase()}${rawVerdict.slice(1)}`
+        : "Review submitted";
+      const concerns = arrayCount(args.challenges || args.findings);
+      return concerns > 0
+        ? `${verdict} · ${concerns} ${concerns === 1 ? "finding" : "findings"}`
+        : verdict;
+    }
+    case "submit_implementation": {
+      const steps = arrayCount(args.steps);
+      return `${steps} implementation ${steps === 1 ? "step" : "steps"}`;
+    }
+    case "request_replan":
+      return (args.reason as string) || "(no reason)";
     case "git_revert":
       return (args.commit as string) || "(no commit)";
     default:
@@ -238,7 +339,9 @@ export function buildToolSummaries(events: EventEnvelope[]): ToolSummary[] {
       return;
     }
     if (event.event.type === "tool_result" && pendingCalls.length > 0) {
-      const index = pendingCalls.findIndex((call) => toolEventsMatch(call, event));
+      const index = pendingCalls.findIndex((call) =>
+        toolEventsMatch(call, event)
+      );
       const call = index >= 0 ? pendingCalls.splice(index, 1)[0] : undefined;
       if (!call || call.event.type !== "tool_call") return;
       addToolSummaryItem(summaries, call, event);
@@ -284,6 +387,27 @@ export function buildActionTimeline(
   });
 
   return items;
+}
+
+export function trustedSessionSummaryCommitLines(
+  commits: string | undefined,
+  events: EventEnvelope[],
+): string[] {
+  const lines = commits?.trim()
+    ? commits.trim().split("\n").filter(Boolean)
+    : [];
+  if (lines.length === 0) return [];
+
+  const isStrictWorkflow = events.some((envelope) =>
+    envelope.event.type === "workflow_started"
+  );
+  if (!isStrictWorkflow) return lines;
+
+  const hasCommitReceipt = events.some((envelope) =>
+    envelope.event.type === "commit_result" && envelope.event.success &&
+    (envelope.event.created || envelope.event.reused || envelope.event.oid)
+  );
+  return hasCommitReceipt ? lines : [];
 }
 
 function addToolSummaryItem(
@@ -342,6 +466,8 @@ function isHiddenChatEvent(event: EventEnvelope): boolean {
     "Completion gate blocked final response",
     "The handoff teammate returned failed checks for repair",
   ].includes(event.event.summary || "");
+  const internalCheckpoint = event.event.type === "correction" &&
+    event.event.summary === "Workflow closure checkpoint";
   return event.event.type === "sub_agent_started" ||
     event.event.type === "sub_agent_finished" ||
     event.event.type === "user_message_applied" ||
@@ -350,7 +476,8 @@ function isHiddenChatEvent(event: EventEnvelope): boolean {
     event.event.type === "commit_result" ||
     event.event.type === "handoff_summary" ||
     event.event.type === "final_grace" ||
-    handoffCorrection;
+    handoffCorrection ||
+    internalCheckpoint;
 }
 
 function isTransientActivityEvent(event: EventEnvelope): boolean {
@@ -384,14 +511,25 @@ export function chatEventsWithOnlyLatestStep(
   events: EventEnvelope[],
 ): EventEnvelope[] {
   let lastFinalContent: string | undefined;
+  let lastWorkflowBlockReason: string | undefined;
   const chatEvents = events
     .filter((event) => !isHiddenChatEvent(event))
     .map((event) => {
-      const normalized = withoutDuplicateSessionSummary(
+      let normalized = withoutDuplicateSessionSummary(
         event,
         lastFinalContent,
       );
       if (event.event.type === "final") lastFinalContent = event.event.content;
+      if (event.event.type === "workflow_blocked") {
+        lastWorkflowBlockReason = event.event.reason;
+      }
+      if (
+        normalized.event.type === "session_summary" &&
+        normalized.event.summary?.trim() === lastWorkflowBlockReason?.trim()
+      ) {
+        const { summary: _summary, ...sessionSummary } = normalized.event;
+        normalized = { ...normalized, event: sessionSummary };
+      }
       return normalized;
     });
   const lastVisibleIndex = chatEvents.length - 1;

@@ -28,7 +28,6 @@ import {
   DrawerPanel,
   InitialUserMessage,
   MessageBubble,
-  SessionActivity,
   TodoDrawer,
 } from "../components/Session";
 import {
@@ -378,6 +377,17 @@ export function SessionPage() {
     );
   }
 
+  const actionTimeline = buildActionTimeline(events);
+  const todoTasks = buildTodoTasks(events);
+  const taskPlanningTranscript = session.task_planning_transcript ??
+    session.multi_task?.run.planning_transcript;
+  const showWorkDrawer = Boolean(
+    session.goal || actionTimeline.length > 0 || todoTasks.length > 0,
+  );
+  const sessionStartMs =
+    events.find((event) => event.event.type === "started")?.event
+      .timestamp_ms ?? session.updated_at_ms;
+
   return (
     <div className="app-shell session-shell">
       <Aside />
@@ -416,16 +426,22 @@ export function SessionPage() {
                   ? "Failed"
                   : "Completed"}
               </span>
-              {session.updated_at_ms && (
+              {sessionStartMs && (
                 <>
                   <span className="dot-sep"></span>
-                  <span>{formatStartTime(session.updated_at_ms)}</span>
+                  <span>{formatStartTime(sessionStartMs)}</span>
                 </>
               )}
-              <span className="dot-sep d-none d-sm-inline"></span>
-              <span className="d-none d-sm-inline">
-                Model: {session.branch}
-              </span>
+              {session.branch
+                ? (
+                  <>
+                    <span className="dot-sep d-none d-sm-inline"></span>
+                    <span className="d-none d-sm-inline">
+                      Branch: {session.branch}
+                    </span>
+                  </>
+                )
+                : null}
             </div>
           </div>
           <div className="share-action">
@@ -480,17 +496,19 @@ export function SessionPage() {
           )
           : null}
 
-        {session.task_planning_transcript ||
-            session.multi_task?.run.planning_transcript
+        {taskPlanningTranscript && taskPlanningTranscript.attempts.length > 0
           ? (
             <TaskPlanningDetails
-              transcript={(session.task_planning_transcript ??
-                session.multi_task?.run.planning_transcript)!}
+              transcript={taskPlanningTranscript}
             />
           )
           : null}
 
-        <div className="session-layout">
+        <div
+          className={`session-layout${
+            showWorkDrawer ? " has-work-drawer" : ""
+          }`}
+        >
           <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
             {events.length === 0
               ? (
@@ -508,6 +526,7 @@ export function SessionPage() {
                           key={i}
                           actor={grouped.actor}
                           assistingProfile={grouped.assistingProfile}
+                          inferenceEvents={grouped.inferenceEvents}
                           toolCalls={grouped.toolCalls}
                           toolResults={grouped.toolResults}
                           controllerActions={grouped.controllerActions}
@@ -527,98 +546,59 @@ export function SessionPage() {
               )}
           </main>
 
-          <aside className="tool-drawer d-none d-xl-block">
-            <div className="tool-drawer-heading">
-              <div>
-                <span>Workspace</span>
-                <h2>Session details</h2>
-              </div>
-              <i
-                className="bi bi-layout-sidebar-inset-reverse"
-                aria-hidden="true"
+          {showWorkDrawer
+            ? (
+              <aside
+                className="tool-drawer d-none d-xl-block"
+                aria-label="Work details"
               >
-              </i>
-            </div>
-            {session.goal
-              ? (
-                <DrawerPanel
-                  title="Goal"
-                  icon="bi bi-bullseye"
-                  count={session.goal.run.milestones.length}
-                >
-                  <GoalDrawer goal={session.goal} />
-                </DrawerPanel>
-              )
-              : null}
-            <DrawerPanel
-              title="Actions"
-              icon="bi bi-lightning-charge"
-              count={events.filter((e) =>
-                e.event.type === "tool_call" || isControllerActionEvent(e)
-              ).length}
-            >
-              {(() => {
-                const actionTimeline = buildActionTimeline(events);
-
-                if (actionTimeline.length === 0) {
-                  return (
-                    <div className="empty-detail compact">
-                      <i className="bi bi-lightning-charge"></i>
-                      <h3>No actions yet</h3>
-                      <p>
-                        Teammate actions will appear here with their origin and
-                        responsibility clearly identified.
-                      </p>
-                    </div>
-                  );
-                }
-
-                return (
-                  <>
-                    {actionTimeline.map((item, index) => (
-                      <ActionDrawerItem
-                        key={`action-${index}`}
-                        item={item}
-                      />
-                    ))}
-                  </>
-                );
-              })()}
-            </DrawerPanel>
-
-            <DrawerPanel
-              title="Plan"
-              icon="bi bi-check2-square"
-              count={buildTodoTasks(events).length}
-            >
-              <TodoDrawer tasks={buildTodoTasks(events)} />
-            </DrawerPanel>
-
-            <DrawerPanel
-              title="Activity"
-              icon="bi bi-clock-history"
-              count={events.length}
-            >
-              <SessionActivity events={events} />
-            </DrawerPanel>
-          </aside>
-        </div>
-
-        {session.strict_workflow && session.workflow
-          ? (
-            <div className="workflow-progress" role="status" aria-live="polite">
-              <i className="bi bi-diagram-3"></i>
-              <strong>{workflowStageLabel(session.workflow.stage)}</strong>
-              <span>
-                {session.workflow.ready_evidence
-                  ? readyEvidenceLabel(
-                    session.workflow.ready_evidence.commit_oid,
+                {session.goal
+                  ? (
+                    <DrawerPanel
+                      title="Goal"
+                      icon="bi bi-bullseye"
+                      count={session.goal.run.milestones.length}
+                    >
+                      <GoalDrawer goal={session.goal} />
+                    </DrawerPanel>
                   )
-                  : workflowOutcomeLabel(session.workflow.outcome)}
-              </span>
-            </div>
-          )
-          : null}
+                  : null}
+                {actionTimeline.length > 0
+                  ? (
+                    <DrawerPanel
+                      title="Actions"
+                      icon="bi bi-lightning-charge"
+                      count={events.filter((e) =>
+                        e.event.type === "tool_call" ||
+                        isControllerActionEvent(e)
+                      ).length}
+                      defaultOpen={false}
+                    >
+                      {actionTimeline.map((item, index) => (
+                        <ActionDrawerItem
+                          key={`action-${index}`}
+                          item={item}
+                        />
+                      ))}
+                    </DrawerPanel>
+                  )
+                  : null}
+
+                {todoTasks.length > 0
+                  ? (
+                    <DrawerPanel
+                      title="Plan"
+                      icon="bi bi-check2-square"
+                      count={todoTasks.length}
+                    >
+                      <TodoDrawer tasks={todoTasks} />
+                    </DrawerPanel>
+                  )
+                  : null}
+              </aside>
+            )
+            : null}
+        </div>
 
         {activeGoal?.run.stage === "awaiting_plan_approval"
           ? (

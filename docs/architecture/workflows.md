@@ -133,6 +133,17 @@ The planning profile reads the repository and submits a structured plan with sco
 steps, and checks. If a user-owned choice is missing, planning can ask a question. The stage cannot
 edit files or run a shell.
 
+The native `submit_plan` schema requires non-empty summary text plus at least one requirement,
+implementation step, and acceptance fact; step and acceptance records must each name a requirement.
+Constrained local decoding therefore cannot reproduce an empty plan skeleton. Schema constraints do
+not attempt repository-dependent proofs: Rust still validates IDs, coverage, configured checks, and
+ordered create/modify/delete path transitions before the workflow can advance. A model can still
+fail to produce an acceptable plan, but an invalid artifact never becomes delivery authority.
+Strict delivery does not expose `session_title`: the original task is already the stable title
+fallback, so cosmetic rewriting cannot consume a planning inference. Planning guidance requires
+local evidence before naming an existing path and reserves public web research for genuinely
+external or current facts rather than repository-local file discovery.
+
 For a trusted contract, pb may place the exact current contents of existing small UTF-8
 `allowed_paths` directly into the planning context. Each automatic read is bound to the workspace,
 path, and content hashes; it is admitted only when the complete set survives prompt preflight below
@@ -165,6 +176,11 @@ contain a concern or failed assessment, and a revision verdict needs both a bloc
 a corresponding concern or failed assessment. A blocker must describe a defect in the proposed
 plan; the critic is explicitly forbidden from treating an unchanged implementation defect as a
 plan defect when the exact plan already addresses it.
+The terminal review tool prevalidates that self-contained verdict/challenge/assessment consistency
+inside the live review turn. A malformed disposition therefore returns tool feedback without
+discarding the reviewer's conversation or repository reads, and the next turn exposes only the
+corrected terminal action. The outer workflow still validates accepted-plan identity, requirement
+references, and observed-path evidence before accepting the artifact.
 The critic need not re-read a task path merely to confirm code that the plan proposes to change when
 the task, exact plan, bounded repository brief, and carried evidence already support every structural
 assessment. Any repository fact it does cite must still come from current carried or model-read
@@ -579,10 +595,24 @@ cannot reopen another path or observe a create before the file exists.
 
 Terminal output and the web transcript present actions as work by teammates: the active profile
 character owns a model-requested tool action, while Trinity owns automatic observation, closure,
-mutation, correction, and handoff work. `Model-requested` and `Automatic` remain visible secondary
-provenance labels, and the **Actions** drawer preserves event chronology. Character attribution is
+mutation, correction, and handoff work. `Model` and `Harness` remain visible secondary provenance
+labels, and the compact, initially collapsed **Actions** drawer preserves event chronology without
+repeating actor identity in every row. Character attribution is
 presentation over typed events; it never changes a controller event into a model tool call or
 claims that a model requested an automatic action.
+
+The web transcript treats stored execution detail as progressive disclosure. A standalone
+inference keeps a stable one-line marker. Consecutive tool-only inferences by the same teammate are
+presented as one collapsed action run with one avatar and author line; stage changes, teammate chat,
+user messages, and Trinity feedback remain explicit boundaries. A fixed-size information affordance
+opens aggregate and per-call metrics without changing line layout. The session runtime summary uses
+the same labelled metric sheet. Harness artifact corrections render as Trinity
+feedback with human-readable context and expandable technical detail. Controller closure checkpoints
+remain durable events but are excluded from chat. Terminal session summaries and web delivery
+summaries derive commits and diffs from the task's captured repository baseline rather than an
+arbitrary recent-log window. For older strict-workflow summaries that predate this baseline, the web
+UI shows stored commit lines only when the event stream also contains a successful typed commit
+receipt.
 
 Proactive LSP collection uses the same typed action stream. The transcript shows Trinity inspecting
 language diagnostics and summarizes clean, blocking, stale, or incomplete results; the durable

@@ -135,21 +135,51 @@ The model receives one explicit pb-owned context block, never a fabricated assis
 The web transcript and **Actions** drawer show this work as messages and actions from the team. The
 active profile character owns tools the model requested—for example, Kate owns Build tool calls.
 Trinity Walker, the team steward, owns automatic reads, changed-path inspection, safe deletion,
-no-change closure, corrections, and handoff work. Each action also says **Model-requested** or
-**Automatic**, so the friendlier character metaphor does not hide provenance. Reads show their full
-or bounded-range coverage; deletion states that the path was tracked and Git-recoverable. The
-terminal uses the same character-first attribution and provenance.
+no-change closure, corrections, and handoff work. Each action also says **Model** or **Harness**, so
+the friendlier character metaphor does not hide provenance. Reads show their full or bounded-range
+coverage; deletion states that the path was tracked and Git-recoverable. The terminal uses the same
+character-first attribution and provenance.
 
-Model-inference rows show why the call was needed, prompt and generated token counts, energy when it
-is measurable, and prompt-cache work. A zero-reuse call includes the backend's reason—such as a cold
-session, changed prompt, unavailable stable prefix, unreadable cache, required context reset,
-disabled cache, or an unsupported runtime path. A cache hit reports reused and fresh token counts and
-does not carry a miss reason. When a stable root is available, the row additionally shows how many
-eligible root tokens were reused and the bounded workflow authority class. The stored diagnostic
-uses local digests and token counts rather than prompt or repository text.
+The work drawer appears only when a session has a Goal, recorded actions, or a managed plan. Actions
+use a compact chronological row instead of repeating the teammate identity already established in
+the transcript, and the drawer starts collapsed. Routine lifecycle activity is not repeated in a
+separate activity feed. A simple request that skipped model-based Task partitioning does not add an
+empty zero-call planning disclosure above the transcript.
+
+Standalone model-inference rows show the responsible teammate and elapsed time. When the same
+teammate makes consecutive tool-only calls, the transcript folds them into one collapsed action run
+with one avatar and name; chat, user input, stage changes, and Trinity feedback start a new run.
+On a pointer device, hover reveals a fixed-size information button that does not move or reflow the
+row; click it to open aggregate and per-call metrics. Touch devices show the action-run button and
+also support long-press on standalone inference rows. The detail sheet presents purpose, token
+counts, energy, prompt-cache work, and native-runtime timings as labelled fields. The session's
+runtime total uses the same interaction instead of an expandable block in the transcript. A
+zero-reuse call retains the backend's reason—such as a cold session, changed
+prompt, unavailable stable prefix, unreadable cache, required context reset, disabled cache, or an
+unsupported runtime path. When a stable root is available, the stored diagnostic retains its reused
+token count and bounded workflow authority class. These local diagnostics use digests and token
+counts rather than prompt or repository text.
+
+Harness validation feedback appears as a message from Trinity. The message identifies which
+teammate's artifact needs another pass and explains the problem in ordinary language; raw validation
+data stays behind **Technical details**, and internal closure checkpoints do not appear in chat.
+Delivery summaries list only commits and changes made after the session's captured repository
+baseline, so earlier repository history is not presented as work from the current delivery. Older
+strict-workflow sessions show their stored commit list only when they also contain a successful commit
+receipt.
+
+Planning is fail-closed. The constrained plan tool requires a non-empty summary, requirements,
+steps, acceptance facts, and the required requirement references. pb then checks repository-aware
+facts—such as coverage and whether a path exists before a proposed modification—before accepting the
+plan. These controls prevent an invalid plan from advancing; they cannot guarantee that a model will
+produce a valid plan within its retry budget. Delivery planning uses the original task as its stable
+title fallback instead of spending a model call on cosmetic title rewriting. A structurally
+inconsistent plan-review verdict is rejected inside the same live review turn, preserving the
+reviewer's reads and restricting the correction turn to the review submission rather than starting
+another evidence pass.
 
 Sessions saved before actor attribution remain readable. Their model tool actions appear as
-**Legacy action** rather than being guessed from the closest chat message.
+**Legacy** rather than being guessed from the closest chat message.
 
 If a file is missing, binary, symlinked, stale, oversized, or cannot fit the bounded prompt safely,
 pb does not pretend it was read. The normal model/tool path remains available. Automatic deletion

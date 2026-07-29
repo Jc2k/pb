@@ -58,6 +58,12 @@ delivered and the repository matches the prior terminal checkpoint. Task-plannin
 reinterpret the broad request: fallback runs the exact original Build task, and the full constrained
 planning transcript plus controller decision remains available in session details.
 
+The ordinary Build planner likewise gets schema constraints only for facts the decoder can prove
+locally: a non-empty plan shape and non-empty requirement references. Repository-aware structure,
+including requirement coverage and ordered path existence, remains a deterministic Rust acceptance
+check. Constraint success is never reported as plan acceptance, and a rejected plan grants no
+mutation authority.
+
 When planning discovers a materially missing choice, it may ask the user. The answer becomes part of
 the task contract. Guessing would make progress faster at the cost of changing ownership of the
 decision, so the workflow pauses instead.
@@ -297,8 +303,10 @@ replacement. A controller observation is one explicit user/context block with no
 and it cannot supply an approval, check result, review judgment, or semantic completion claim.
 In user-facing transcripts, Trinity Walker may speak for this deterministic workflow stewardship,
 but the durable event continues to record controller origin, the assisting profile, and its receipt.
-Model-requested actions are attributed to that profile's character. Actorless legacy tool events
-remain labelled as legacy instead of acquiring a guessed character.
+Model-requested actions are attributed to that profile's character. The presentation labels these
+origins **Model** and **Harness**; actorless legacy tool events remain labelled **Legacy** instead of
+acquiring a guessed character. Harness validation messages summarize the teammate mistake in plain
+language and keep the durable structured evidence behind expandable technical detail.
 In strict delivery and acceptance contracts, named check evidence comes only from `run_check(id)`;
 a similar `run_command` or `run_task` result is diagnostic evidence, not an acceptance receipt. A
 restored legacy/direct request may still route an exact configured guard command through the check

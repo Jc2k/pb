@@ -481,6 +481,7 @@ impl AppState {
     }
 }
 
+// `deno task build:web` refreshes these assets before Cargo embeds them.
 #[derive(RustEmbed)]
 #[folder = "webui/dist"]
 struct WebAssets;

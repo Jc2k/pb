@@ -1,5 +1,5 @@
 import type React from "react";
-import { Fragment, useId, useState } from "react";
+import { Fragment, useEffect, useId, useRef, useState } from "react";
 import type { AgentEvent, EventEnvelope, SessionItem } from "../types";
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "../lib/constants";
 import {
@@ -16,6 +16,7 @@ import {
   profileJobTitle,
   profileName,
   TODO_STATUS_LABELS,
+  trustedSessionSummaryCommitLines,
 } from "../lib/sessionUtils";
 import type { ActionTimelineItem, TodoTask } from "../lib/sessionUtils";
 import { parseRichText } from "../lib/richText";
@@ -47,6 +48,42 @@ function formatHumanDurationMs(ms?: number): string {
 
 function formatNumber(value: number): string {
   return Math.trunc(value).toLocaleString("en-US");
+}
+
+function sentenceCaseIdentifier(value: string): string {
+  const words = value.replaceAll("_", " ").trim();
+  return words ? `${words[0].toUpperCase()}${words.slice(1)}` : "Unknown";
+}
+
+function prettyTechnicalDetail(value: string): string {
+  const detail = value.trim();
+  if (!detail) return "";
+  try {
+    return JSON.stringify(JSON.parse(detail), null, 2);
+  } catch {
+    return detail;
+  }
+}
+
+function validationProblem(message: string): string {
+  const lower = message.toLowerCase();
+  if (
+    lower.includes("requires non-empty requirements, steps, and acceptance")
+  ) {
+    return "The plan was missing its requirements, implementation steps, and acceptance checks.";
+  }
+  if (lower.includes("requirements") && lower.includes("acceptance")) {
+    return "The plan did not include all of the required planning and acceptance information.";
+  }
+  if (lower.includes("fingerprint")) {
+    return "The submission described an older version of the workspace, so it was not safe to accept.";
+  }
+  if (
+    lower.includes("revision") && lower.includes("every assessment passes")
+  ) {
+    return "The review asked for changes but marked every review area as passing.";
+  }
+  return "The submission did not match the delivery structure the team needs to continue safely.";
 }
 
 function funEnergySummary(
@@ -181,12 +218,14 @@ function controllerActionPresentation(event: AgentEvent): {
 export function ActionGroupBubble({
   actor,
   assistingProfile,
+  inferenceEvents,
   toolCalls,
   toolResults,
   controllerActions,
 }: {
   actor?: import("../types").TeamActor;
   assistingProfile?: string;
+  inferenceEvents: EventEnvelope[];
   toolCalls: EventEnvelope[];
   toolResults: EventEnvelope[];
   controllerActions: EventEnvelope[];
@@ -244,7 +283,7 @@ export function ActionGroupBubble({
     );
   }).filter(Boolean);
 
-  const actionNames = toolCalls
+  const actionNameList = toolCalls
     .map((e, i) => {
       if (e.event.type === "tool_call") {
         return TOOL_FRIENDLY_NAMES[e.event.tool] || e.event.tool;
@@ -256,17 +295,27 @@ export function ActionGroupBubble({
         controllerActionPresentation(envelope.event)?.label || ""
       ),
     )
-    .filter(Boolean)
+    .filter(Boolean);
+  const actionNameCounts = actionNameList.reduce((counts, name) => {
+    counts.set(name, (counts.get(name) || 0) + 1);
+    return counts;
+  }, new Map<string, number>());
+  const actionNames = [...actionNameCounts.entries()]
+    .slice(0, 3)
+    .map(([name, count]) => count > 1 ? `${name} ×${count}` : name)
+    .concat(
+      actionNameCounts.size > 3 ? [`+${actionNameCounts.size - 3} more`] : [],
+    )
     .join(" · ");
   const actionCount = toolCalls.length + controllerActions.length;
   const assisting = assistingProfile
     ? profileName(assistingProfile)
     : undefined;
-  const actionSummary = actor?.kind === "automation"
-    ? `${actionCount} routine ${actionCount === 1 ? "action" : "actions"}${
-      assisting ? ` while assisting ${assisting}` : ""
-    }`
-    : `${actionCount} ${actionCount === 1 ? "action" : "actions"}`;
+  const actionSummary = actionCount === 1
+    ? actionNames
+    : actor?.kind === "automation"
+    ? `${actionCount} harness actions${assisting ? ` for ${assisting}` : ""}`
+    : `${actionCount} actions`;
   const firstEvent = toolCalls[0] || controllerActions[0];
   const timestampMs = firstEvent && "timestamp_ms" in firstEvent.event
     ? firstEvent.event.timestamp_ms
@@ -282,6 +331,10 @@ export function ActionGroupBubble({
           <strong>{teammate.name}</strong>
           <span>{teammate.role}</span>
           <span className="action-origin">{teammate.provenance}</span>
+          <ActionInferenceDetails
+            events={inferenceEvents}
+            teammate={teammate.name}
+          />
           {timestampMs ? <time>{formatEventTime(timestampMs)}</time> : null}
         </div>
         <div className="bubble thought-bubble action-bubble">
@@ -295,7 +348,9 @@ export function ActionGroupBubble({
             <span>
               <i className="bi bi-lightning-charge"></i> {actionSummary}
             </span>
-            <span className="tool-names">{actionNames}</span>
+            <span className="tool-names">
+              {actionCount > 1 ? actionNames : ""}
+            </span>
             <i
               className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
             >
@@ -330,21 +385,17 @@ export function ActionDrawerItem({ item }: { item: ActionTimelineItem }) {
     : undefined;
   return (
     <div className="drawer-item action-drawer-item">
-      <img className="drawer-action-avatar" src={teammate.avatar} alt="" />
+      <i className={icon} aria-hidden="true"></i>
       <span className="drawer-action-copy">
-        <span className="drawer-action-author">
-          <strong>{teammate.name}</strong>
-          <small>{teammate.role} · {teammate.provenance}</small>
+        <span className="drawer-action-title">
+          <strong>{label}</strong>
+          <small className="action-origin">{teammate.provenance}</small>
         </span>
-        <span className="drawer-action-detail">
-          <i className={icon}></i>
-          <span>
-            <strong>{label}</strong>
-            {detail ? <small>{detail}</small> : null}
-          </span>
-        </span>
+        {detail
+          ? <small className="drawer-action-detail">{detail}</small>
+          : null}
+        {timestampMs && <time>{formatEventTime(timestampMs)}</time>}
       </span>
-      {timestampMs && <time>{formatEventTime(timestampMs)}</time>}
     </div>
   );
 }
@@ -485,10 +536,30 @@ function CorrectionNotice({
 }: {
   event: Extract<AgentEvent, { type: "correction" }>;
 }) {
-  const text = (event.summary || event.message || "Agent framework correction")
-    .trim();
   const teammate = teamActorPresentation(event.actor || workflowStewardActor());
-  const detail = event.message.trim() === text ? "" : event.message.trim();
+  const assistedName = event.assisting_profile
+    ? profileName(event.assisting_profile)
+    : event.message.includes("Planning")
+    ? profileName("plan")
+    : "the model";
+  const isArtifactValidation = event.summary ===
+      "Workflow artifact validation failed" ||
+    /^submit_(?:plan|plan_review|implementation|code_review) tool call was not executed successfully$/
+      .test(event.summary || "");
+  const artifactLabel = event.assisting_profile === "build"
+    ? "implementation report"
+    : event.assisting_profile === "review"
+    ? "review"
+    : "plan";
+  const headline = isArtifactValidation
+    ? `${assistedName}’s ${artifactLabel} needs a correction`
+    : (event.summary || "I left some feedback").trim();
+  const message = isArtifactValidation
+    ? `${
+      validationProblem(event.message)
+    } I sent it back with guidance before the team continued.`
+    : `I noticed a problem in ${assistedName}’s current step and sent back clear guidance before the team continued.`;
+  const technicalDetail = prettyTechnicalDetail(event.message);
 
   return (
     <article
@@ -508,15 +579,60 @@ function CorrectionNotice({
             : null}
         </div>
         <div className="bubble thought-bubble correction-bubble">
-          <p>{text}</p>
-          {detail
+          <strong className="feedback-heading">{headline}</strong>
+          <p>{message}</p>
+          {technicalDetail
             ? (
               <details>
-                <summary>Details</summary>
-                <p>{detail}</p>
+                <summary>Technical details</summary>
+                <pre>{technicalDetail}</pre>
               </details>
             )
             : null}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function WorkflowBlockedNotice({
+  event,
+}: {
+  event: Extract<AgentEvent, { type: "workflow_blocked" }>;
+}) {
+  const teammate = teamActorPresentation(workflowStewardActor());
+  const planningFailure = event.outcome === "plan_rejected" ||
+    event.reason.toLowerCase().includes("planning submission");
+  const message = planningFailure
+    ? `${
+      validationProblem(event.reason)
+    } Dade’s plan was still missing those pieces after three attempts, so I paused this pass instead of sending unclear work to the rest of the team.`
+    : "I stopped this delivery at a safe boundary because the team needs help before it can continue.";
+
+  return (
+    <article
+      className="bot message-row assistant-message workflow-feedback"
+      aria-label={`Delivery feedback from ${teammate.name}`}
+    >
+      <div className="bot-avatar team-avatar">
+        <img src={teammate.avatar} alt={teammate.name} />
+      </div>
+      <div className="message-container">
+        <div className="author-line">
+          <strong>{teammate.name}</strong>
+          <span>{teammate.role}</span>
+          <span className="action-origin">{teammate.provenance}</span>
+          {event.timestamp_ms
+            ? <time>{formatEventTime(event.timestamp_ms)}</time>
+            : null}
+        </div>
+        <div className="bubble thought-bubble correction-bubble">
+          <span className="handoff-state">Delivery paused safely</span>
+          <p>{message}</p>
+          <details>
+            <summary>Technical details</summary>
+            <pre>{prettyTechnicalDetail(event.reason)}</pre>
+          </details>
         </div>
       </div>
     </article>
@@ -531,7 +647,6 @@ export function InitialUserMessage(
       <div className="message-container">
         <div className="author-line">
           <strong>You</strong>
-          <span>Session request</span>
           {timestampMs ? <time>{formatEventTime(timestampMs)}</time> : null}
         </div>
         <div className="bubble user-bubble">
@@ -548,7 +663,6 @@ export function InitialUserMessage(
 type AssistantMessageRowProps = {
   profile: string;
   timestampMs?: number;
-  nestingDepth?: number;
   compact?: boolean;
   children: React.ReactNode;
 };
@@ -556,7 +670,6 @@ type AssistantMessageRowProps = {
 function AssistantMessageRow({
   profile,
   timestampMs,
-  nestingDepth = 0,
   compact = false,
   children,
 }: AssistantMessageRowProps) {
@@ -565,7 +678,6 @@ function AssistantMessageRow({
       className={`bot message-row assistant-message assistant-transcript${
         compact ? " compact" : ""
       }`}
-      style={{ marginLeft: `${nestingDepth}rem` }}
     >
       <div className="bot-avatar">
         <img src={getAvatarForProfile(profile)} alt={profileName(profile)} />
@@ -746,6 +858,669 @@ function TeamMessageBubble({
   );
 }
 
+function MetricField(
+  { label, value }: { label: string; value: React.ReactNode },
+) {
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </div>
+  );
+}
+
+function MetricsDialog({
+  eyebrow,
+  title,
+  closeLabel,
+  onClose,
+  children,
+}: {
+  eyebrow: string;
+  title: string;
+  closeLabel: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  const dialogTitleId = useId();
+
+  useEffect(() => {
+    const closeOnEscape = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div className="metrics-dialog-backdrop" onMouseDown={onClose}>
+      <section
+        className="metrics-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={dialogTitleId}
+        onMouseDown={(mouseEvent) => mouseEvent.stopPropagation()}
+      >
+        <header>
+          <div>
+            <span>{eyebrow}</span>
+            <h2 id={dialogTitleId}>{title}</h2>
+          </div>
+          <button
+            className="btn btn-light btn-icon"
+            type="button"
+            autoFocus
+            aria-label={closeLabel}
+            onClick={onClose}
+          >
+            <i className="bi bi-x-lg" aria-hidden="true"></i>
+          </button>
+        </header>
+        {children}
+      </section>
+    </div>
+  );
+}
+
+function ActionInferenceDetails({
+  events,
+  teammate,
+}: {
+  events: EventEnvelope[];
+  teammate: string;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const inferences = events.flatMap((envelope) =>
+    envelope.event.type === "llm_invocation" ? [envelope.event] : []
+  );
+  if (inferences.length === 0) return null;
+
+  const durationMs = inferences.reduce(
+    (total, event) => total + event.duration_ms,
+    0,
+  );
+  const tokens = inferences.reduce(
+    (total, event) => total + event.prompt_tokens + event.generated_tokens,
+    0,
+  );
+
+  return (
+    <>
+      <button
+        className="inference-info-button action-run-info"
+        type="button"
+        aria-label={`View ${inferences.length} model call detail${
+          inferences.length === 1 ? "" : "s"
+        } for ${teammate}`}
+        onClick={() => setIsOpen(true)}
+      >
+        <i className="bi bi-info-circle" aria-hidden="true"></i>
+      </button>
+      {isOpen
+        ? (
+          <MetricsDialog
+            eyebrow="Model call details"
+            title={`${teammate} · ${inferences.length} call${
+              inferences.length === 1 ? "" : "s"
+            }`}
+            closeLabel="Close model call details"
+            onClose={() => setIsOpen(false)}
+          >
+            <dl className="metrics-grid">
+              <MetricField
+                label="Total duration"
+                value={formatHumanDurationMs(durationMs)}
+              />
+              <MetricField label="Total tokens" value={formatNumber(tokens)} />
+            </dl>
+            <div className="run-inference-list">
+              {inferences.map((event, index) => {
+                const totalTokens = event.prompt_tokens +
+                  event.generated_tokens;
+                return (
+                  <details
+                    className="metrics-section run-inference-step"
+                    key={`${event.step}-${index}`}
+                  >
+                    <summary>
+                      <span>Step {event.step}</span>
+                      <small>
+                        {sentenceCaseIdentifier(
+                          event.purpose || "unclassified",
+                        )} · {formatHumanDurationMs(event.duration_ms)}
+                      </small>
+                    </summary>
+                    <dl className="metrics-grid">
+                      <MetricField
+                        label="Workflow stage"
+                        value={sentenceCaseIdentifier(
+                          event.workflow_stage || "none",
+                        )}
+                      />
+                      <MetricField
+                        label="Tokens"
+                        value={formatNumber(totalTokens)}
+                      />
+                      <MetricField
+                        label="Prompt"
+                        value={formatNumber(event.prompt_tokens)}
+                      />
+                      <MetricField
+                        label="Generated"
+                        value={formatNumber(event.generated_tokens)}
+                      />
+                      {event.prompt_cache
+                        ? (
+                          <>
+                            <MetricField
+                              label="Cache reused"
+                              value={formatNumber(
+                                event.prompt_cache.cached_tokens,
+                              )}
+                            />
+                            <MetricField
+                              label="Fresh prompt"
+                              value={formatNumber(
+                                event.prompt_cache.prefilled_tokens,
+                              )}
+                            />
+                            {event.prompt_cache.miss_reason
+                              ? (
+                                <MetricField
+                                  label="Cache miss"
+                                  value={sentenceCaseIdentifier(
+                                    event.prompt_cache.miss_reason,
+                                  )}
+                                />
+                              )
+                              : null}
+                          </>
+                        )
+                        : null}
+                      {event.energy_joules !== undefined
+                        ? (
+                          <MetricField
+                            label="Energy"
+                            value={formatEnergy(event.energy_joules)}
+                          />
+                        )
+                        : null}
+                      {event.native
+                        ? (
+                          <>
+                            <MetricField
+                              label="Model"
+                              value={event.native.model_family}
+                            />
+                            <MetricField
+                              label="Prefill"
+                              value={`${
+                                event.native.prefill_tokens_per_second.toFixed(
+                                  1,
+                                )
+                              } tok/s`}
+                            />
+                            <MetricField
+                              label="Decode"
+                              value={`${
+                                event.native.decode_tokens_per_second.toFixed(1)
+                              } tok/s`}
+                            />
+                            {event.native.constraint_terminal_state
+                              ? (
+                                <MetricField
+                                  label="Constraint result"
+                                  value={sentenceCaseIdentifier(
+                                    event.native.constraint_terminal_state,
+                                  )}
+                                />
+                              )
+                              : null}
+                          </>
+                        )
+                        : null}
+                    </dl>
+                  </details>
+                );
+              })}
+            </div>
+          </MetricsDialog>
+        )
+        : null}
+    </>
+  );
+}
+
+function InferenceDetails({
+  event,
+  activityProfile,
+}: {
+  event: Extract<AgentEvent, { type: "llm_invocation" }>;
+  activityProfile?: string;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const longPressTimer = useRef<number | undefined>(undefined);
+  const profile = event.profile || activityProfile || "build";
+  const teammate = profileName(profile);
+  const totalTokens = event.prompt_tokens + event.generated_tokens;
+
+  const cancelLongPress = () => {
+    if (longPressTimer.current !== undefined) {
+      window.clearTimeout(longPressTimer.current);
+      longPressTimer.current = undefined;
+    }
+  };
+
+  useEffect(() => cancelLongPress, []);
+
+  return (
+    <>
+      <article
+        className="inference-marker"
+        aria-label={`${teammate} model inference ${event.step}`}
+        onPointerDown={(pointerEvent) => {
+          if (pointerEvent.pointerType === "mouse") return;
+          cancelLongPress();
+          longPressTimer.current = window.setTimeout(() => {
+            setIsOpen(true);
+            longPressTimer.current = undefined;
+          }, 550);
+        }}
+        onPointerUp={cancelLongPress}
+        onPointerCancel={cancelLongPress}
+        onPointerLeave={cancelLongPress}
+        onContextMenu={(contextMenuEvent) => contextMenuEvent.preventDefault()}
+      >
+        <span>
+          {teammate} used the model · {formatHumanDurationMs(event.duration_ms)}
+        </span>
+        <button
+          className="inference-info-button"
+          type="button"
+          aria-label={`View inference ${event.step} details`}
+          onPointerDown={(pointerEvent) => pointerEvent.stopPropagation()}
+          onClick={() => setIsOpen(true)}
+        >
+          <i className="bi bi-info-circle" aria-hidden="true"></i>
+        </button>
+      </article>
+
+      {isOpen
+        ? (
+          <MetricsDialog
+            eyebrow="Inference details"
+            title={`${teammate} · step ${event.step}`}
+            closeLabel="Close inference details"
+            onClose={() => setIsOpen(false)}
+          >
+            <dl className="metrics-grid">
+              <MetricField
+                label="Purpose"
+                value={sentenceCaseIdentifier(
+                  event.purpose || "unclassified",
+                )}
+              />
+              <MetricField
+                label="Workflow stage"
+                value={sentenceCaseIdentifier(event.workflow_stage || "none")}
+              />
+              <MetricField
+                label="Duration"
+                value={formatHumanDurationMs(event.duration_ms)}
+              />
+              <MetricField
+                label="Tokens"
+                value={formatNumber(totalTokens)}
+              />
+              <MetricField
+                label="Prompt"
+                value={formatNumber(event.prompt_tokens)}
+              />
+              <MetricField
+                label="Generated"
+                value={formatNumber(event.generated_tokens)}
+              />
+              {event.energy_joules !== undefined
+                ? (
+                  <MetricField
+                    label="Energy"
+                    value={`${formatEnergy(event.energy_joules)}${
+                      event.average_power_watts === undefined
+                        ? ""
+                        : ` at ${formatPower(event.average_power_watts)}`
+                    }`}
+                  />
+                )
+                : null}
+            </dl>
+
+            {event.prompt_cache
+              ? (
+                <section className="metrics-section">
+                  <h3>Prompt cache</h3>
+                  <dl className="metrics-grid">
+                    <MetricField
+                      label="Source"
+                      value={sentenceCaseIdentifier(
+                        event.prompt_cache.source,
+                      )}
+                    />
+                    <MetricField
+                      label="Reused"
+                      value={formatNumber(event.prompt_cache.cached_tokens)}
+                    />
+                    <MetricField
+                      label="Fresh"
+                      value={formatNumber(
+                        event.prompt_cache.prefilled_tokens,
+                      )}
+                    />
+                    {event.prompt_cache.miss_reason
+                      ? (
+                        <MetricField
+                          label="Miss reason"
+                          value={sentenceCaseIdentifier(
+                            event.prompt_cache.miss_reason,
+                          )}
+                        />
+                      )
+                      : null}
+                    {event.prompt_cache.lookup_detail
+                      ? (
+                        <MetricField
+                          label="Lookup"
+                          value={sentenceCaseIdentifier(
+                            event.prompt_cache.lookup_detail,
+                          )}
+                        />
+                      )
+                      : null}
+                    {event.prompt_cache.root
+                      ? (
+                        <MetricField
+                          label="Stable root"
+                          value={`${
+                            formatNumber(
+                              event.prompt_cache.root.reused_tokens,
+                            )
+                          } of ${
+                            formatNumber(event.prompt_cache.root.tokens)
+                          } tokens · ${
+                            sentenceCaseIdentifier(
+                              event.prompt_cache.root.authority_class,
+                            )
+                          }`}
+                        />
+                      )
+                      : null}
+                  </dl>
+                </section>
+              )
+              : null}
+
+            {event.native
+              ? (
+                <section className="metrics-section">
+                  <h3>Local runtime</h3>
+                  <dl className="metrics-grid">
+                    <MetricField
+                      label="Model family"
+                      value={event.native.model_family}
+                    />
+                    <MetricField
+                      label="Prefill"
+                      value={`${
+                        formatNumber(event.native.fresh_prefill_tokens)
+                      } tokens · ${
+                        event.native.prefill_tokens_per_second.toFixed(1)
+                      } tok/s`}
+                    />
+                    <MetricField
+                      label="Decode"
+                      value={`${
+                        formatNumber(event.native.decode_tokens)
+                      } tokens · ${
+                        event.native.decode_tokens_per_second.toFixed(1)
+                      } tok/s`}
+                    />
+                    <MetricField
+                      label="Strategy"
+                      value={sentenceCaseIdentifier(
+                        event.native.expert_strategy,
+                      )}
+                    />
+                    {event.native.refill
+                      ? (
+                        <MetricField
+                          label="Refill timing"
+                          value={`lookup ${event.native.refill.cache_lookup_wall_ms} ms · disk ${event.native.refill.disk_read_decode_wall_ms} ms · validate ${event.native.refill.cpu_state_validation_allocation_wall_ms} ms · hydrate ${event.native.refill.state_hydration_wall_ms} ms · suffix ${event.native.refill.fresh_suffix_prefill_wall_ms} ms · snapshot ${event.native.refill.snapshot_capture_wall_ms} ms · queue ${event.native.refill.persistence_queue_wall_ms} ms`}
+                        />
+                      )
+                      : null}
+                  </dl>
+                </section>
+              )
+              : null}
+          </MetricsDialog>
+        )
+        : null}
+    </>
+  );
+}
+
+function SessionMetricsDetails({
+  event,
+}: {
+  event: Extract<AgentEvent, { type: "session_metrics" }>;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const longPressTimer = useRef<number | undefined>(undefined);
+  const totalTokens = event.prompt_tokens + event.generated_tokens;
+  const totalEnergyJoules = metricEnergyJoules(event);
+  const totalRuntimeMs = metricRuntimeMs(event);
+  const coverage = event.energy_coverage === undefined
+    ? "Unknown"
+    : `${Math.round(event.energy_coverage * 100)}%`;
+  const hasMeasurementMetadata = (event.wall_runtime_ms ?? 0) > 0 ||
+    event.total_energy_joules !== undefined ||
+    event.energy_source !== undefined;
+  const hasCachePersistence =
+    (event.cache_persistence_queued_checkpoints ?? 0) > 0 ||
+    (event.cache_persistence_failures ?? 0) > 0;
+
+  const cancelLongPress = () => {
+    if (longPressTimer.current !== undefined) {
+      window.clearTimeout(longPressTimer.current);
+      longPressTimer.current = undefined;
+    }
+  };
+
+  useEffect(() => cancelLongPress, []);
+
+  return (
+    <>
+      <article
+        className="session-correction session-metrics-summary"
+        aria-label="Session runtime summary"
+        onPointerDown={(pointerEvent) => {
+          if (pointerEvent.pointerType === "mouse") return;
+          cancelLongPress();
+          longPressTimer.current = window.setTimeout(() => {
+            setIsOpen(true);
+            longPressTimer.current = undefined;
+          }, 550);
+        }}
+        onPointerUp={cancelLongPress}
+        onPointerCancel={cancelLongPress}
+        onPointerLeave={cancelLongPress}
+        onContextMenu={(contextMenuEvent) => contextMenuEvent.preventDefault()}
+      >
+        <span>
+          {funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)}
+          {totalEnergyJoules === undefined && event.energy_exclusive === false
+            ? " Power estimate unavailable."
+            : null}
+        </span>
+        <button
+          className="inference-info-button"
+          type="button"
+          aria-label="View session runtime details"
+          onPointerDown={(pointerEvent) => pointerEvent.stopPropagation()}
+          onClick={() => setIsOpen(true)}
+        >
+          <i className="bi bi-info-circle" aria-hidden="true"></i>
+        </button>
+        {event.timestamp_ms
+          ? <time>{formatEventTime(event.timestamp_ms)}</time>
+          : null}
+      </article>
+
+      {isOpen
+        ? (
+          <MetricsDialog
+            eyebrow="Runtime details"
+            title="Session totals"
+            closeLabel="Close session runtime details"
+            onClose={() => setIsOpen(false)}
+          >
+            <dl className="metrics-grid">
+              <MetricField
+                label="Duration"
+                value={formatHumanDurationMs(totalRuntimeMs)}
+              />
+              <MetricField label="Tokens" value={formatNumber(totalTokens)} />
+              <MetricField
+                label="Model calls"
+                value={formatNumber(event.llm_invocations)}
+              />
+              <MetricField
+                label="Tool calls"
+                value={formatNumber(event.tool_calls)}
+              />
+              <MetricField
+                label="Prompt"
+                value={formatNumber(event.prompt_tokens)}
+              />
+              <MetricField
+                label="Generated"
+                value={formatNumber(event.generated_tokens)}
+              />
+            </dl>
+
+            {totalEnergyJoules !== undefined
+              ? (
+                <section className="metrics-section">
+                  <h3>Energy</h3>
+                  <dl className="metrics-grid">
+                    <MetricField
+                      label="Total"
+                      value={formatEnergy(totalEnergyJoules)}
+                    />
+                    <MetricField
+                      label="Average power"
+                      value={formatPower(event.average_power_watts)}
+                    />
+                    <MetricField
+                      label="Model inference"
+                      value={formatEnergy(event.llm_energy_joules)}
+                    />
+                    <MetricField
+                      label="Tools"
+                      value={formatEnergy(event.tool_energy_joules)}
+                    />
+                    {hasMeasurementMetadata
+                      ? (
+                        <>
+                          <MetricField
+                            label="Gross device energy"
+                            value={formatEnergy(event.gross_energy_joules)}
+                          />
+                          <MetricField
+                            label="After adjustment"
+                            value={formatEnergy(event.adjusted_energy_joules)}
+                          />
+                          <MetricField label="Coverage" value={coverage} />
+                          <MetricField
+                            label="Source"
+                            value={sentenceCaseIdentifier(
+                              event.energy_source || "unknown",
+                            )}
+                          />
+                          <MetricField
+                            label="Excluded"
+                            value={[
+                              event.display_energy_excluded
+                                ? "Measured display"
+                                : null,
+                              event.idle_baseline_applied
+                                ? "Idle device baseline"
+                                : null,
+                            ].filter(Boolean).join(", ") || "None available"}
+                          />
+                          <MetricField
+                            label="Estimate"
+                            value={event.energy_complete === false
+                              ? "Partial or changed source"
+                              : "Complete"}
+                          />
+                          {event.energy_exclusive === false
+                            ? (
+                              <MetricField
+                                label="Attribution"
+                                value="Shared system meter; task-only attribution unavailable"
+                              />
+                            )
+                            : null}
+                        </>
+                      )
+                      : null}
+                  </dl>
+                </section>
+              )
+              : null}
+
+            {hasCachePersistence
+              ? (
+                <section className="metrics-section">
+                  <h3>Cache persistence</h3>
+                  <dl className="metrics-grid">
+                    <MetricField
+                      label="Checkpoints"
+                      value={`${
+                        formatNumber(
+                          event.cache_persistence_completed_checkpoints ?? 0,
+                        )
+                      } of ${
+                        formatNumber(
+                          event.cache_persistence_queued_checkpoints ?? 0,
+                        )
+                      }`}
+                    />
+                    <MetricField
+                      label="Duration"
+                      value={`${
+                        formatNumber(
+                          event.cache_persistence_wall_ms ?? 0,
+                        )
+                      } ms`}
+                    />
+                    <MetricField
+                      label="Failures"
+                      value={formatNumber(
+                        event.cache_persistence_failures ?? 0,
+                      )}
+                    />
+                  </dl>
+                </section>
+              )
+              : null}
+          </MetricsDialog>
+        )
+        : null}
+    </>
+  );
+}
+
 export function MessageBubble({
   envelope,
   activityProfile,
@@ -764,7 +1539,6 @@ export function MessageBubble({
           <div className="message-container">
             <div className="author-line">
               <strong>You</strong>
-              <span>Session request</span>
               <time>{formatEventTime(e.timestamp_ms)}</time>
             </div>
             <div className="bubble user-bubble">
@@ -779,7 +1553,6 @@ export function MessageBubble({
 
     case "model_loading":
     case "step_started": {
-      const sd = e.nesting_depth || 0;
       const label = e.type === "model_loading"
         ? "Loading model"
         : `Working step ${e.step} of ${e.max_steps}`;
@@ -787,7 +1560,6 @@ export function MessageBubble({
       return (
         <article
           className="message-row assistant-message compact typing-row"
-          style={{ marginLeft: `${sd}rem` }}
           aria-label={label}
         >
           <div className="bot-avatar typing-avatar">
@@ -807,7 +1579,6 @@ export function MessageBubble({
         <AssistantMessageRow
           profile={e.profile}
           timestampMs={e.timestamp_ms}
-          nestingDepth={e.nesting_depth || 0}
         >
           <RichText content={e.content} />
         </AssistantMessageRow>
@@ -842,15 +1613,7 @@ export function MessageBubble({
       );
 
     case "workflow_blocked":
-      return (
-        <article className="session-error" aria-label="Workflow blocked">
-          <strong>Delivery needs help</strong>
-          <span>{e.reason}</span>
-          {e.timestamp_ms
-            ? <time>{formatEventTime(e.timestamp_ms)}</time>
-            : null}
-        </article>
-      );
+      return <WorkflowBlockedNotice event={e} />;
 
     case "workflow_evidence_invalidated":
       return (
@@ -912,12 +1675,8 @@ export function MessageBubble({
       return null;
 
     case "sub_agent_started":
-      const saDepth = e.nesting_depth || 0;
       return (
-        <article
-          className="message-row assistant-message compact"
-          style={{ marginLeft: `${saDepth}rem` }}
-        >
+        <article className="message-row assistant-message compact">
           <div className="bot-avatar">
             <img src={getAvatarForProfile(e.profile)} alt={e.profile} />
           </div>
@@ -931,12 +1690,8 @@ export function MessageBubble({
       );
 
     case "sub_agent_finished":
-      const sfDepth = e.nesting_depth || 0;
       return (
-        <article
-          className="message-row assistant-message compact"
-          style={{ marginLeft: `${sfDepth}rem` }}
-        >
+        <article className="message-row assistant-message compact">
           <div className="bot-avatar">
             <i className="bi bi-stars"></i>
           </div>
@@ -949,12 +1704,8 @@ export function MessageBubble({
       );
 
     case "diff":
-      const dd = e.nesting_depth || 0;
       return (
-        <article
-          className="message-row assistant-message diff-message"
-          style={{ marginLeft: `${dd}rem` }}
-        >
+        <article className="message-row assistant-message diff-message">
           <div className="bot-avatar">
             <i className="bi bi-stars"></i>
           </div>
@@ -980,68 +1731,13 @@ export function MessageBubble({
         <AssistantMessageRow
           profile={e.profile}
           timestampMs={e.timestamp_ms}
-          nestingDepth={e.nesting_depth || 0}
         >
           <RichText content={e.content} />
         </AssistantMessageRow>
       );
 
     case "llm_invocation":
-      return (
-        <article
-          className="session-correction"
-          aria-label={`Model inference step ${e.step}`}
-        >
-          <span>
-            Model inference {e.step}
-            {e.purpose ? ` (${e.purpose.replaceAll("_", " ")})` : ""} ·{" "}
-            {formatHumanDurationMs(e.duration_ms)} ·{" "}
-            {formatNumber(e.prompt_tokens + e.generated_tokens)} tokens
-            {e.prompt_cache
-              ? ` · ${formatNumber(e.prompt_cache.cached_tokens)} cached, ${
-                formatNumber(e.prompt_cache.prefilled_tokens)
-              } prefilled (${e.prompt_cache.source.replaceAll("_", " ")})` +
-                (e.prompt_cache.miss_reason
-                  ? ` · miss: ${
-                    e.prompt_cache.miss_reason.replaceAll("_", " ")
-                  }`
-                  : "") +
-                (e.prompt_cache.lookup_detail
-                  ? ` · detail: ${
-                    e.prompt_cache.lookup_detail.replaceAll("_", " ")
-                  }`
-                  : "") +
-                (e.prompt_cache.root
-                  ? ` · root ${
-                    formatNumber(e.prompt_cache.root.reused_tokens)
-                  }/${formatNumber(e.prompt_cache.root.tokens)} (${
-                    e.prompt_cache.root.authority_class.replaceAll("_", " ")
-                  })`
-                  : "")
-              : ""}
-            {e.native
-              ? ` · prefill ${
-                e.native.prefill_command_kind.replaceAll("_", " ")
-              }` +
-                (e.native.prefill_command_reason
-                  ? ` (${e.native.prefill_command_reason.replaceAll("_", " ")})`
-                  : "")
-              : ""}
-            {e.native?.refill
-              ? ` · refill lookup ${e.native.refill.cache_lookup_wall_ms}, disk ${e.native.refill.disk_read_decode_wall_ms}, validate/allocate ${e.native.refill.cpu_state_validation_allocation_wall_ms}, hydrate ${e.native.refill.state_hydration_wall_ms}, suffix ${e.native.refill.fresh_suffix_prefill_wall_ms}, snapshot ${e.native.refill.snapshot_capture_wall_ms}, queue ${e.native.refill.persistence_queue_wall_ms} ms`
-              : ""}
-            {e.energy_joules !== undefined
-              ? ` · ${formatEnergy(e.energy_joules)}`
-              : ""}
-            {e.average_power_watts !== undefined
-              ? ` at ${formatPower(e.average_power_watts)}`
-              : ""}
-          </span>
-          {e.timestamp_ms
-            ? <time>{formatEventTime(e.timestamp_ms)}</time>
-            : null}
-        </article>
-      );
+      return <InferenceDetails event={e} activityProfile={activityProfile} />;
 
     case "executor_started":
     case "task_plan_accepted":
@@ -1059,144 +1755,52 @@ export function MessageBubble({
     case "final_grace":
       return null;
 
-    case "session_metrics": {
-      const totalTokens = e.prompt_tokens + e.generated_tokens;
-      const totalEnergyJoules = metricEnergyJoules(e);
-      const totalRuntimeMs = metricRuntimeMs(e);
-      const coverage = e.energy_coverage === undefined
-        ? undefined
-        : `${Math.round(e.energy_coverage * 100)}%`;
-      const hasMeasurementMetadata = (e.wall_runtime_ms ?? 0) > 0 ||
-        e.total_energy_joules !== undefined || e.energy_source !== undefined;
-      return (
-        <article className="session-correction" aria-label="Session metrics">
-          <span>
-            {funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)}
-            {totalEnergyJoules !== undefined
-              ? (
-                <details>
-                  <summary>Power-estimate details</summary>
-                  <div>
-                    Average incremental power:{" "}
-                    {formatPower(e.average_power_watts)}
-                  </div>
-                  {hasMeasurementMetadata
-                    ? (
-                      <>
-                        <div>
-                          Gross device energy:{" "}
-                          {formatEnergy(e.gross_energy_joules)}
-                        </div>
-                        <div>
-                          After display adjustment:{" "}
-                          {formatEnergy(e.adjusted_energy_joules)}
-                        </div>
-                        <div>Measurement coverage: {coverage ?? "Unknown"}</div>
-                        <div>
-                          Source:{" "}
-                          {e.energy_source?.replaceAll("_", " ") ?? "Unknown"}
-                        </div>
-                        <div>
-                          Exclusions: {[
-                            e.display_energy_excluded
-                              ? "measured display"
-                              : null,
-                            e.idle_baseline_applied
-                              ? "idle device baseline"
-                              : null,
-                          ].filter(Boolean).join(", ") || "none available"}
-                        </div>
-                      </>
-                    )
-                    : null}
-                  <div>
-                    Model inference: {formatEnergy(e.llm_energy_joules)}
-                  </div>
-                  <div>Tools: {formatEnergy(e.tool_energy_joules)}</div>
-                  {hasMeasurementMetadata && e.energy_complete === false
-                    ? (
-                      <div>
-                        Estimate is partial or changed source during the task.
-                      </div>
-                    )
-                    : null}
-                  {hasMeasurementMetadata && e.energy_exclusive === false
-                    ? (
-                      <div>
-                        Another pb process held the system meter; task
-                        attribution is unavailable.
-                      </div>
-                    )
-                    : null}
-                </details>
-              )
-              : null}
-            {totalEnergyJoules === undefined && e.energy_exclusive === false
-              ? " Power estimate unavailable: the system meter is unsupported or already in use."
-              : null}
-            {(e.cache_persistence_queued_checkpoints ?? 0) > 0 ||
-                (e.cache_persistence_failures ?? 0) > 0
-              ? ` Cache persistence: ${
-                formatNumber(e.cache_persistence_completed_checkpoints ?? 0)
-              }/${
-                formatNumber(e.cache_persistence_queued_checkpoints ?? 0)
-              } checkpoints in ${
-                formatNumber(e.cache_persistence_wall_ms ?? 0)
-              } ms; ${
-                formatNumber(e.cache_persistence_failures ?? 0)
-              } failures.`
-              : null}
-          </span>
-          {e.timestamp_ms
-            ? <time>{formatEventTime(e.timestamp_ms)}</time>
-            : null}
-        </article>
-      );
-    }
+    case "session_metrics":
+      return <SessionMetricsDetails event={e} />;
 
-    case "session_summary":
-      const ssd = e.nesting_depth || 0;
+    case "session_summary": {
+      const hasSummary = Boolean(e.summary?.trim());
+      const commitLines = trustedSessionSummaryCommitLines(
+        e.commits,
+        evidenceEvents,
+      );
+      const hasChanges = Boolean(e.diff_stat?.trim() || e.diff?.trim());
+      if (!hasSummary && commitLines.length === 0 && !hasChanges) return null;
       return (
-        <article
-          className="message-row assistant-message compact"
-          style={{ marginLeft: `${ssd}rem` }}
-        >
-          <div className="bot-avatar">
-            <i className="bi bi-stars"></i>
+        <article className="message-row assistant-message compact delivery-summary">
+          <div className="bot-avatar delivery-avatar">
+            <i className="bi bi-box-seam" aria-hidden="true"></i>
           </div>
           <div className="bubble thought-bubble">
-            <p>
-              Session complete <code>{e.branch}</code>
-            </p>
-            {e.summary?.trim()
+            <strong className="feedback-heading">Delivery summary</strong>
+            {hasSummary ? <RichText content={e.summary!.trim()} /> : null}
+            {commitLines.length > 0
               ? (
-                <>
-                  <strong>Summary</strong>
-                  <pre className="small result-pre">{e.summary}</pre>
-                </>
-              )
-              : null}
-            {e.commits?.trim()
-              ? (
-                <>
-                  <strong>Commits</strong>
-                  <pre className="small result-pre">{e.commits}</pre>
-                </>
+                <section className="delivery-commits">
+                  <strong>Commits from this delivery</strong>
+                  <ul>
+                    {commitLines.map((line) => (
+                      <li key={line}>
+                        <code>{line}</code>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
               )
               : null}
             {e.diff_stat?.trim()
               ? (
-                <>
-                  <strong>Diff stat from main</strong>
+                <section className="delivery-changes">
+                  <strong>Changes</strong>
                   <pre className="small result-pre">{e.diff_stat}</pre>
-                </>
+                </section>
               )
               : null}
             {e.diff?.trim()
               ? (
                 <details className="transcript-diff">
                   <summary className="transcript-diff-header">
-                    <span>Diff from main</span>
+                    <span>View changes</span>
                   </summary>
                   <div className="transcript-diff-body">
                     <DiffView diff={e.diff} />
@@ -1207,6 +1811,7 @@ export function MessageBubble({
           </div>
         </article>
       );
+    }
 
     case "error":
       return <ErrorEventBubble event={e} />;
@@ -1214,86 +1819,6 @@ export function MessageBubble({
     default:
       return null;
   }
-}
-
-function activityLabel(envelope: EventEnvelope): string | undefined {
-  const event = envelope.event;
-  switch (event.type) {
-    case "started":
-      return "Session started";
-    case "tool_call":
-      return `${teamActorPresentation(event.actor).name} started ${
-        TOOL_FRIENDLY_NAMES[event.tool] || event.tool
-      }`;
-    case "tool_result":
-      return "Tool result received";
-    case "controller_observation":
-      return `${
-        teamActorPresentation(event.actor || workflowStewardActor()).name
-      } ${
-        event.receipt.operation === "read_file" ? "read" : "inspected"
-      } ${event.receipt.path}`;
-    case "controller_closure":
-      return `${
-        teamActorPresentation(event.actor || workflowStewardActor()).name
-      } closed no-change work`;
-    case "controller_mutation":
-      return `${
-        teamActorPresentation(event.actor || workflowStewardActor()).name
-      } deleted ${event.receipt.path}`;
-    case "user_question":
-      return "Waiting for an answer";
-    case "user_answer":
-      return "Answer received";
-    case "user_message":
-      return "Message sent to running agent";
-    case "user_message_applied":
-      return "Running agent received message";
-    case "final":
-      return "Response completed";
-    case "session_summary":
-      return "Session completed";
-    case "error":
-      return "Error reported";
-    default:
-      return undefined;
-  }
-}
-
-export function SessionActivity({ events }: { events: EventEnvelope[] }) {
-  const items = events
-    .map((envelope) => ({
-      label: activityLabel(envelope),
-      timestampMs: "timestamp_ms" in envelope.event
-        ? envelope.event.timestamp_ms
-        : undefined,
-    }))
-    .filter(
-      (item): item is { label: string; timestampMs: number | undefined } =>
-        Boolean(item.label),
-    )
-    .slice(-8);
-
-  if (items.length === 0) {
-    return (
-      <p className="drawer-empty-copy">
-        Activity will appear as the session progresses.
-      </p>
-    );
-  }
-
-  return (
-    <ol className="session-activity-list">
-      {items.map((item, index) => (
-        <li key={`${item.label}-${index}`}>
-          <span>{item.label}</span>
-          {item.timestampMs
-            ? <time>{formatEventTime(item.timestampMs)}</time>
-            : null}
-        </li>
-      ))}
-    </ol>
-  );
 }
 
 export function SessionCard({
