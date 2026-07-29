@@ -57,7 +57,9 @@ The active stage controls which tools are visible and which structured submissio
 workflow. Planning and review use current repository evidence and do not expose prior model-session
 summaries as a substitute for inspecting the project. When pb has already identified an existing
 path relevant to the task, planning must name an executable change instead of deferring file
-discovery to implementation.
+discovery to implementation. For a larger matching file, pb can show the planner and plan reviewer
+a freshly checked task-focused excerpt up front. They may request a specific missing line range,
+but cannot spend the stage walking the whole file through generic continuation links.
 
 The accepted delivery plan appears in the main session transcript with its requirements,
 implementation steps, target paths, and acceptance facts. A reviewer verdict is additional chat

@@ -72,6 +72,7 @@ const MAX_GLOB_RESULTS: usize = 200;
 // vocabulary is seeded from task-relevant repository paths and refreshed by exact local discovery
 // results, so the native collar never needs the whole repository path set in one tool schema.
 const MAX_PLANNING_PATH_CANDIDATES: usize = 32;
+const MAX_CONTROLLER_TASK_OBSERVATIONS: usize = 1;
 const MAX_WEB_SEARCH_RESULTS: usize = 8;
 const MAX_WEB_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_WEB_RESULT_CHARS: usize = 20_000;
@@ -7174,6 +7175,25 @@ fn run_agent_steps(
                 });
                 messages.push(correction_chat_message(summary, message));
             }
+        }
+        if matches!(
+            args.workflow_stage,
+            Some(
+                crate::workflow::WorkflowStage::Planning
+                    | crate::workflow::WorkflowStage::PlanRevision
+                    | crate::workflow::WorkflowStage::PlanReview
+            )
+        ) {
+            let _ = maybe_inject_controller_task_observations(
+                generator,
+                args,
+                workspace_root,
+                &available_tools,
+                &gate_state,
+                messages,
+                nesting_depth,
+                sink,
+            )?;
         }
         if args.workflow_stage == Some(crate::workflow::WorkflowStage::CodeReview) {
             let _ = maybe_inject_controller_review_observations(
@@ -18156,6 +18176,129 @@ fn controller_contract_observations_close_stage(
     Ok(true)
 }
 
+fn build_controller_task_observations(
+    args: &AgentRequest,
+    workspace_root: &Path,
+    gate_state: &RefCell<GateState>,
+) -> Result<Vec<PreparedControllerObservation>> {
+    if !args.observation_rendering.is_controller()
+        || args.repository_less
+        || !matches!(
+            args.workflow_stage,
+            Some(
+                crate::workflow::WorkflowStage::Planning
+                    | crate::workflow::WorkflowStage::PlanRevision
+                    | crate::workflow::WorkflowStage::PlanReview
+            )
+        )
+    {
+        return Ok(Vec::new());
+    }
+    let stage = args
+        .workflow_stage
+        .expect("task observation requires a planning or plan-review stage");
+    let snapshot = crate::workspace::ContentSnapshot::capture(workspace_root)?;
+    let mut candidates = Vec::new();
+    for path in task_relevant_existing_paths(&args.task, &snapshot)
+        .into_iter()
+        .take(MAX_CONTROLLER_TASK_OBSERVATIONS)
+    {
+        if gate_state
+            .borrow()
+            .stage_evidence
+            .controller_observations
+            .iter()
+            .any(|receipt| receipt.stage == stage && receipt.path == path)
+        {
+            continue;
+        }
+        let Some(candidate) = build_controller_path_read_observation(
+            args,
+            &path,
+            crate::workflow::PlannedChange::Modify,
+            crate::workflow::WorkUnitState::EvidenceNeeded,
+            None,
+            workspace_root,
+            None,
+        )?
+        else {
+            continue;
+        };
+        candidates.push(candidate);
+    }
+    Ok(candidates)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_inject_controller_task_observations(
+    generator: &mut dyn CompletionEngine,
+    args: &AgentRequest,
+    workspace_root: &Path,
+    available_tools: &[BuiltInToolSchema],
+    gate_state: &RefCell<GateState>,
+    messages: &mut Vec<ChatMessage>,
+    nesting_depth: usize,
+    sink: &mut dyn EventSink,
+) -> Result<bool> {
+    let candidates = build_controller_task_observations(args, workspace_root, gate_state)?;
+    if candidates.is_empty()
+        || !controller_observations_survive_preflight(
+            generator,
+            args,
+            messages,
+            available_tools,
+            &candidates,
+        )?
+        || !controller_observations_are_current(workspace_root, &candidates)?
+    {
+        return Ok(false);
+    }
+    {
+        let mut gate = gate_state.borrow_mut();
+        for candidate in &candidates {
+            gate.read_paths.insert(candidate.receipt.path.clone());
+            gate.read_content_fingerprints.insert(
+                candidate.receipt.path.clone(),
+                candidate.receipt.content_sha256.clone(),
+            );
+        }
+        gate.stage_evidence
+            .merge(crate::workflow::StageEvidenceBundle {
+                entries: candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.stage_entry.clone())
+                    .collect(),
+                controller_observations: candidates
+                    .iter()
+                    .map(|candidate| candidate.receipt.clone())
+                    .collect(),
+                ..crate::workflow::StageEvidenceBundle::default()
+            })?;
+    }
+    for candidate in candidates {
+        messages.extend(candidate.prompt_messages);
+        sink.emit(AgentEvent::ControllerObservation {
+            receipt: candidate.receipt,
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(args.profile),
+            nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+            timestamp_ms: Some(now_millis()),
+        });
+    }
+    let summary = "Task-focused repository evidence";
+    let message = "The controller already supplied current task-relevant bytes from the strongest matching existing path. Do not reread that file wholesale or follow a generic continuation through unrelated code. Submit the stage artifact when this evidence is sufficient; if one concrete fact is missing, request only its bounded line range.";
+    sink.emit(AgentEvent::Correction {
+        message: message.to_string(),
+        summary: summary.to_string(),
+        actor: crate::events::TeamActor::workflow_steward(),
+        assisting_profile: Some(args.profile),
+        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+        timestamp_ms: Some(now_millis()),
+    });
+    messages.push(correction_chat_message(summary, message));
+    Ok(true)
+}
+
 fn build_controller_review_observations(
     args: &AgentRequest,
     workspace_root: &Path,
@@ -18635,30 +18778,48 @@ fn build_controller_read_observation(
     workspace_root: &Path,
     diagnostic_feedback: Option<&str>,
 ) -> Result<Option<PreparedControllerObservation>> {
+    build_controller_path_read_observation(
+        args,
+        &unit.path,
+        unit.operation,
+        unit.state,
+        Some(&unit.id),
+        workspace_root,
+        diagnostic_feedback,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_controller_path_read_observation(
+    args: &AgentRequest,
+    path: &str,
+    operation: crate::workflow::PlannedChange,
+    state: crate::workflow::WorkUnitState,
+    work_unit_id: Option<&str>,
+    workspace_root: &Path,
+    diagnostic_feedback: Option<&str>,
+) -> Result<Option<PreparedControllerObservation>> {
     use crate::workflow::{
         ControllerObservationAuthority, ControllerObservationOperation,
         ControllerObservationOrigin, ObservationCoverage, ObservationRange, PlannedChange,
         WorkUnitState,
     };
 
-    let controller_read_is_applicable = match unit.state {
+    let controller_read_is_applicable = match state {
         WorkUnitState::EvidenceNeeded => {
-            matches!(
-                unit.operation,
-                PlannedChange::Modify | PlannedChange::Delete
-            )
+            matches!(operation, PlannedChange::Modify | PlannedChange::Delete)
         }
         // A planned create becomes an existing, fingerprinted repair target after its first
         // successful write. Let the controller provide the same truthful current-byte
         // observation used for planned modifications instead of spending an LLM turn on a
         // deterministic read.
-        WorkUnitState::DiagnosticFailed => !matches!(unit.operation, PlannedChange::Delete),
+        WorkUnitState::DiagnosticFailed => !matches!(operation, PlannedChange::Delete),
         _ => false,
     };
     if !args.observation_rendering.is_controller() || !controller_read_is_applicable {
         return Ok(None);
     }
-    let Ok(resolved) = resolve_workspace_entry_path(workspace_root, &unit.path, true) else {
+    let Ok(resolved) = resolve_workspace_entry_path(workspace_root, path, true) else {
         return Ok(None);
     };
     let Ok(metadata) = std::fs::symlink_metadata(&resolved) else {
@@ -18679,7 +18840,7 @@ fn build_controller_read_observation(
         return Ok(None);
     };
     let snapshot = crate::workspace::ContentSnapshot::capture(workspace_root)?;
-    let Some(path_content) = snapshot.paths.get(&unit.path) else {
+    let Some(path_content) = snapshot.paths.get(path) else {
         return Ok(None);
     };
     let result_budget = agent_context::tool_result_char_budget(
@@ -18690,7 +18851,7 @@ fn build_controller_read_observation(
         .split_inclusive('\n')
         .count()
         .max(usize::from(!text.is_empty()));
-    let full_result = render_bounded_read_file(&unit.path, text, 1, None, result_budget);
+    let full_result = render_bounded_read_file(path, text, 1, None, result_budget);
     let full_coverage = !full_result.contains("[read_file continuation]")
         && !full_result.contains("(no complete line fits the current read-result budget)");
     let full_ranges = if text.is_empty() {
@@ -18704,27 +18865,27 @@ fn build_controller_read_observation(
     } else {
         Vec::new()
     };
-    let (coverage, result, included_ranges) =
-        if full_coverage && text.len() <= crate::workflow::MAX_STAGE_EVIDENCE_ENTRY_BYTES {
-            (ObservationCoverage::Full, full_result, full_ranges)
-        } else if unit.operation == PlannedChange::Modify {
-            let windows = if unit.state == WorkUnitState::DiagnosticFailed {
-                diagnostic_line_windows(&unit.path, diagnostic_feedback, total_lines)
-            } else {
-                task_line_windows(&args.task, text, total_lines)
-            };
-            if windows.is_empty() {
-                return Ok(None);
-            }
-            let (result, ranges) =
-                render_controller_file_ranges(&unit.path, text, &windows, result_budget);
-            if ranges.is_empty() {
-                return Ok(None);
-            }
-            (ObservationCoverage::Ranges, result, ranges)
+    let (coverage, result, included_ranges) = if full_coverage
+        && text.len() <= crate::workflow::MAX_STAGE_EVIDENCE_ENTRY_BYTES
+    {
+        (ObservationCoverage::Full, full_result, full_ranges)
+    } else if operation == PlannedChange::Modify {
+        let windows = if state == WorkUnitState::DiagnosticFailed {
+            diagnostic_line_windows(path, diagnostic_feedback, total_lines)
         } else {
-            return Ok(None);
+            task_line_windows(&args.task, text, total_lines)
         };
+        if windows.is_empty() {
+            return Ok(None);
+        }
+        let (result, ranges) = render_controller_file_ranges(path, text, &windows, result_budget);
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        (ObservationCoverage::Ranges, result, ranges)
+    } else {
+        return Ok(None);
+    };
     let result = append_workflow_content_fingerprint(
         args,
         ControllerObservationOperation::ReadFile.as_str(),
@@ -18739,8 +18900,8 @@ fn build_controller_read_observation(
     let action_material = format!(
         "read_file\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         args.workflow_stage,
-        unit.id,
-        unit.path,
+        work_unit_id.unwrap_or("task-relevant"),
+        path,
         snapshot.fingerprint,
         path_content.fingerprint,
         crate::environment_lock::sha256(&bytes),
@@ -18748,11 +18909,11 @@ fn build_controller_read_observation(
         included_range_material
     );
     let action_id = format!("{:x}", Sha256::digest(action_material.as_bytes()));
-    let arguments = json!({"path": unit.path});
+    let arguments = json!({"path": path});
     let stage_entry = (coverage == ObservationCoverage::Full)
         .then(|| {
             crate::workflow::StageEvidenceEntry::complete_file(
-                unit.path.clone(),
+                path.to_string(),
                 path_content.fingerprint.clone(),
                 snapshot.fingerprint.clone(),
                 args.workflow_stage
@@ -18777,9 +18938,9 @@ fn build_controller_read_observation(
         stage: args
             .workflow_stage
             .expect("controller observation requires workflow stage"),
-        work_unit_id: Some(unit.id.clone()),
+        work_unit_id: work_unit_id.map(str::to_string),
         operation: ControllerObservationOperation::ReadFile,
-        path: unit.path.clone(),
+        path: path.to_string(),
         workspace_fingerprint: snapshot.fingerprint,
         path_fingerprint: path_content.fingerprint.clone(),
         content_sha256: crate::environment_lock::sha256(&bytes),
@@ -19276,6 +19437,12 @@ fn run_tool(
             };
             let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
             let end = arguments.get("end").and_then(Value::as_u64);
+            ensure_read_is_not_redundant_with_controller_ranges(
+                context.gate_state,
+                path,
+                start,
+                end.map(|value| value as usize),
+            )?;
             let resolved = resolve_workspace_path(workspace_root, path, true).map_err(|error| {
                 anyhow!(
                     "failed to resolve path '{path}': {error:#}{}",
@@ -21404,6 +21571,27 @@ fn ensure_file_was_read(
             "read-before-write gate lacks content evidence for '{path}': call read_file on this file before editing"
         ),
     }
+}
+
+fn ensure_read_is_not_redundant_with_controller_ranges(
+    gate_state: &RefCell<GateState>,
+    path: &str,
+    start: usize,
+    end: Option<usize>,
+) -> Result<()> {
+    if start != 1 || end.is_some() {
+        return Ok(());
+    }
+    let state = gate_state.borrow();
+    let Some(receipt) = state.controller_observation_for_path(path) else {
+        return Ok(());
+    };
+    if receipt.coverage != crate::workflow::ObservationCoverage::Ranges {
+        return Ok(());
+    }
+    bail!(
+        "the controller already supplied current task-relevant ranges from '{path}'; do not reread the whole file or chase its generic continuation. If a specific fact is absent, call read_file with explicit start and end lines for only that bounded range"
+    )
 }
 
 fn ensure_edit_within_controller_observation(
@@ -25163,6 +25351,91 @@ mod tests {
             Some("webui/src/pages/ProjectsPage.tsx")
         );
         assert!(candidates.len() <= MAX_PLANNING_PATH_CANDIDATES);
+    }
+
+    #[test]
+    fn planning_and_plan_review_preload_task_focused_ranges_without_a_contract() {
+        let repo = init_contract_test_repo();
+        std::fs::create_dir_all(repo.path().join("webui/src/pages")).unwrap();
+        let content = (1..=2_000)
+            .map(|line| {
+                if line == 1_000 {
+                    "const branchPicker = project.branch;".to_string()
+                } else {
+                    format!("const value_{line} = {line};")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            repo.path().join("webui/src/pages/ProjectsPage.tsx"),
+            content,
+        )
+        .unwrap();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.task = "Remove the branch selector from the project page".to_string();
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Planning);
+        request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
+
+        let planning = build_controller_task_observations(
+            &request,
+            repo.path(),
+            &RefCell::new(GateState::default()),
+        )
+        .unwrap();
+        assert_eq!(planning.len(), 1);
+        assert_eq!(planning[0].receipt.path, "webui/src/pages/ProjectsPage.tsx");
+        assert_eq!(
+            planning[0].receipt.coverage,
+            crate::workflow::ObservationCoverage::Ranges
+        );
+        assert!(planning[0].receipt.work_unit_id.is_none());
+        assert!(
+            planning[0].prompt_messages[0]
+                .content
+                .contains("branchPicker")
+        );
+
+        let gate = RefCell::new(GateState {
+            read_content_fingerprints: HashMap::from([(
+                "webui/src/pages/ProjectsPage.tsx".to_string(),
+                planning[0].receipt.content_sha256.clone(),
+            )]),
+            stage_evidence: crate::workflow::StageEvidenceBundle {
+                controller_observations: vec![planning[0].receipt.clone()],
+                ..crate::workflow::StageEvidenceBundle::default()
+            },
+            ..GateState::default()
+        });
+        let error = ensure_read_is_not_redundant_with_controller_ranges(
+            &gate,
+            "webui/src/pages/ProjectsPage.tsx",
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("do not reread the whole file"));
+        ensure_read_is_not_redundant_with_controller_ranges(
+            &gate,
+            "webui/src/pages/ProjectsPage.tsx",
+            980,
+            Some(1_020),
+        )
+        .unwrap();
+
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanReview);
+        let review = build_controller_task_observations(
+            &request,
+            repo.path(),
+            &RefCell::new(GateState::default()),
+        )
+        .unwrap();
+        assert_eq!(review.len(), 1);
+        assert_eq!(
+            review[0].receipt.stage,
+            crate::workflow::WorkflowStage::PlanReview
+        );
+        assert_ne!(review[0].receipt.action_id, planning[0].receipt.action_id);
     }
 
     #[test]
@@ -29679,6 +29952,36 @@ the next imagined action"#;
         assert!(!plan_tools.contains(&"run_command".to_string()));
         assert!(!plan_tools.contains(&"write_file".to_string()));
         assert!(!plan_tools.contains(&"git_commit".to_string()));
+
+        let accepted_plan = delivery_plan(
+            Some(("game.js", crate::workflow::PlannedChange::Modify)),
+            Vec::new(),
+        );
+        let mut review_request = request.clone();
+        review_request.workflow_plan_identity =
+            Some((accepted_plan.id.clone(), accepted_plan.sha256.clone()));
+        let review = crate::workflow::StageContract::strict(
+            crate::workflow::WorkflowStage::PlanReview,
+            limits,
+            512,
+        )
+        .unwrap();
+        let review_outcome = run_scripted_stage(
+            &review_request,
+            &review,
+            stage_context(),
+            vec![ScriptedCompletion {
+                content: plan_review_submission(&accepted_plan),
+                truncated: false,
+            }],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let review_tools = &review_outcome.generation_tool_names[0];
+        assert!(review_tools.contains(&"submit_plan_review".to_string()));
+        assert!(review_tools.contains(&"read_file".to_string()));
+        assert!(!review_tools.contains(&"session_changes".to_string()));
 
         let mut narrowed_request = request.clone();
         narrowed_request.workflow_tool_exclusions = vec!["read_file".to_string()];

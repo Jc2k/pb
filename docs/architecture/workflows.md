@@ -170,6 +170,11 @@ implementation step. This keeps the schema bounded independently of repository s
 prevents a near-miss path spelling from consuming a rejected planning turn. The harness projects the
 groups back to the durable ordered `PlanPath` artifact before validation. Preserved legacy array
 submissions remain readable, but new native generation uses the grouped contract.
+For controller-block runs, planning, plan revision, and plan review also receive one freshly
+fingerprinted task-focused excerpt from the strongest matching existing path. A range observation
+does not pretend to cover the whole file: the model can request a specific missing line range, but
+an unbounded reread of the same file is rejected so generic continuation hints cannot consume the
+stage budget by walking unrelated code.
 If a non-native or preserved submission still names an absent Modify or Delete path, live validation
 keeps the plan rejected and adds up to three extension-compatible, edit-distance-ranked existing
 paths when a close name exists. Suggestions are fallback guidance only: pb never silently rewrites a
