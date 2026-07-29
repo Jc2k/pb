@@ -54,7 +54,10 @@ pb queue "Implement the accepted retry behavior" --workdir /path/to/project
 Delivery moves through enforced stages: planning, independent plan review, implementation,
 configured checks, independent code review, bounded repair when necessary, and a managed commit.
 The active stage controls which tools are visible and which structured submission can advance the
-workflow.
+workflow. Planning and review use current repository evidence and do not expose prior model-session
+summaries as a substitute for inspecting the project. When pb has already identified an existing
+path relevant to the task, planning must name an executable change instead of deferring file
+discovery to implementation.
 
 The accepted delivery plan appears in the main session transcript with its requirements,
 implementation steps, target paths, and acceptance facts. A reviewer verdict is additional chat

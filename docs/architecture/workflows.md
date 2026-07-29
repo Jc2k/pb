@@ -164,7 +164,9 @@ The model-facing plan schema groups each step's paths by Create, Modify, and Del
 free repository-relative name. Modify and Delete are native-collar constrained to at most 32 exact
 existing paths selected from task-relevant repository names, contract/current evidence, and exact
 local glob/search/read results. With no candidate, those arrays are constrained empty until local
-discovery establishes one. This keeps the schema bounded independently of repository size and
+discovery establishes one. When the controller's baseline snapshot already has a task-relevant
+existing candidate, a pathless plan is rejected as deferred discovery rather than accepted as an
+implementation step. This keeps the schema bounded independently of repository size and
 prevents a near-miss path spelling from consuming a rejected planning turn. The harness projects the
 groups back to the durable ordered `PlanPath` artifact before validation. Preserved legacy array
 submissions remain readable, but new native generation uses the grouped contract.
@@ -192,7 +194,9 @@ model or controller to invent task scope.
 
 A review profile receives focused evidence in a fresh context and either accepts the plan or
 returns actionable findings. Rejection returns the workflow to bounded plan revision. The reviewer
-does not inherit mutation authority.
+does not inherit mutation authority. Strict planning and review stages also exclude the legacy
+`session_changes` summary tool: invocation-local model summaries are not repository evidence and
+cannot help satisfy a typed plan or review gate.
 
 pb projects the accepted plan ID and digest into the submitted review rather than asking the local
 model to transcribe controller-owned identity. Every required assessment kind remains mandatory.

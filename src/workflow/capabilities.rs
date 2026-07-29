@@ -196,8 +196,11 @@ impl StageCapabilities {
 
     pub fn allows_tool(self, tool: &str) -> bool {
         match tool {
-            "read_file" | "glob" | "ripgrep" | "search" | "git_log" | "session_changes"
-            | "memory_search" | "memory_read" => self.repository_read,
+            "read_file" | "glob" | "ripgrep" | "search" | "git_log" | "memory_search"
+            | "memory_read" => self.repository_read,
+            // Strict stages have durable plan, evidence, and checkpoint state. Invocation-local
+            // model summaries are neither repository evidence nor a workflow authority source.
+            "session_changes" => false,
             "inspect_change" => {
                 self.repository_read && self.terminal_action == TerminalActionKind::SubmitCodeReview
             }
@@ -271,6 +274,7 @@ mod tests {
         assert!(!plan.allows_tool("run_command"));
         assert!(!plan.allows_tool("apply_patch"));
         assert!(!plan.allows_tool("session_title"));
+        assert!(!plan.allows_tool("session_changes"));
 
         let review = StageCapabilities::for_stage(WorkflowStage::CodeReview);
         assert!(review.allows_tool("inspect_change"));
@@ -278,6 +282,7 @@ mod tests {
         assert!(!review.allows_tool("submit_plan"));
         assert!(!review.allows_tool("run_command"));
         assert!(!review.allows_tool("session_title"));
+        assert!(!review.allows_tool("session_changes"));
 
         assert!(StageCapabilities::discuss().allows_tool("session_title"));
     }

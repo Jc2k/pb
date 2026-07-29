@@ -12867,7 +12867,7 @@ fn run_delivery_workflow(
             let reason = if stage_outcome.termination_reason == TerminationReason::GateLoop {
                 format!(
                     "{} stopped making progress in the {stage:?} stage and reached a deterministic repeat limit; Trinity preserved the repository and stopped this pass before another duplicate action ran",
-                    args.profile.teammate_first_name()
+                    contract.profile.teammate_first_name()
                 )
             } else {
                 format!(
@@ -21344,6 +21344,24 @@ fn validate_plan_contract_paths(
             );
         }
     }
+    let explicitly_forbids_mutation = request.contract.as_ref().is_some_and(|contract| {
+        contract.mutation == crate::harness_contract::MutationRequirement::Forbidden
+    });
+    if planned_paths.is_empty() && !explicitly_forbids_mutation {
+        let relevant_paths = request
+            .repository_context
+            .as_ref()
+            .map(|repository| {
+                task_relevant_existing_paths(&request.task, &repository.task_baseline.content)
+            })
+            .unwrap_or_default();
+        if !relevant_paths.is_empty() {
+            bail!(
+                "delivery plan cannot defer repository discovery: the controller already found task-relevant existing path candidate(s): {}. Inspect a candidate if needed, then submit an executable modify/delete plan",
+                relevant_paths.join(", ")
+            );
+        }
+    }
     ensure_contract_paths_allowed(request, planned_paths)
 }
 
@@ -26505,6 +26523,7 @@ the next imagined action"#;
                 .to_string()
                 .contains("forbids planned")
         );
+        validate_plan_contract_paths(&request, &no_change.artifact).unwrap();
 
         request.contract = Some(crate::harness_contract::AgentContract {
             version: 1,
@@ -26528,6 +26547,34 @@ the next imagined action"#;
                 .unwrap_err()
                 .to_string()
                 .contains("acceptance[].check_ids to select check(s): logic")
+        );
+    }
+
+    #[test]
+    fn delivery_plan_cannot_defer_discovery_when_the_controller_found_a_relevant_path() {
+        let repo = init_contract_test_repo();
+        std::fs::create_dir_all(repo.path().join("webui/src/pages")).unwrap();
+        std::fs::write(
+            repo.path().join("webui/src/pages/ProjectsPage.tsx"),
+            "export function ProjectsPage() {}\n",
+        )
+        .unwrap();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.task = "Remove the branch selector from the project page of the web UI".to_string();
+        request.repository_context =
+            Some(crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap());
+        let no_paths = delivery_plan(None, Vec::new());
+
+        let error = validate_plan_contract_paths(&request, &no_paths.artifact).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot defer repository discovery")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("webui/src/pages/ProjectsPage.tsx")
         );
     }
 
@@ -29628,6 +29675,7 @@ the next imagined action"#;
         let plan_tools = &plan_outcome.generation_tool_names[0];
         assert!(plan_tools.contains(&"submit_plan".to_string()));
         assert!(plan_tools.contains(&"read_file".to_string()));
+        assert!(!plan_tools.contains(&"session_changes".to_string()));
         assert!(!plan_tools.contains(&"run_command".to_string()));
         assert!(!plan_tools.contains(&"write_file".to_string()));
         assert!(!plan_tools.contains(&"git_commit".to_string()));
