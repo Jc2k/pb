@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { PageShell } from "../components/PageShell";
 import { IntentControl } from "../components/IntentControl";
 import { GoalStartSheet } from "../components/GoalStartSheet";
+import { VoiceInputButton } from "../components/VoiceInputButton";
 import {
   AttachmentButton,
   ImageAttachments,
@@ -26,6 +27,7 @@ export function HomePage() {
   const [intent, setIntent] = useState<ComposerMode>("discuss");
   const [goalOpen, setGoalOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [voiceInputActive, setVoiceInputActive] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
   const [filter, setFilter] = useState<SessionFilter>("all");
   const { sessions, projects } = useProjectSessionData();
@@ -115,6 +117,7 @@ export function HomePage() {
                 rows={4}
                 placeholder="Describe the work…"
                 aria-label="Describe the work"
+                readOnly={voiceInputActive}
               />
               <ImageAttachments images={images} setImages={setImages} />
               <div className="composer-actions">
@@ -168,10 +171,16 @@ export function HomePage() {
                 </div>
                 <div className="chat-submit-actions">
                   <AttachmentButton setImages={setImages} images={images} />
+                  <VoiceInputButton
+                    value={task}
+                    onValueChange={setTask}
+                    disabled={isSubmitting}
+                    onActiveChange={setVoiceInputActive}
+                  />
                   <button
                     className="btn btn-primary send-btn"
                     type="submit"
-                    disabled={!task.trim() || isSubmitting}
+                    disabled={!task.trim() || isSubmitting || voiceInputActive}
                     aria-label="Start home session"
                   >
                     <i className="bi bi-arrow-up"></i>

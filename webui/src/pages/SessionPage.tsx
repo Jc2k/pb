@@ -13,6 +13,7 @@ import {
 import { GoalModeBanner } from "../components/GoalModeBanner";
 import { GoalPlanReview } from "../components/GoalPlanReview";
 import { GoalStartSheet } from "../components/GoalStartSheet";
+import { VoiceInputButton } from "../components/VoiceInputButton";
 import { goalStageLabel } from "../lib/goalUtils";
 import { SCROLL_THRESHOLD } from "../lib/constants";
 import {
@@ -53,6 +54,7 @@ export function SessionPage() {
   const [editAfterPause, setEditAfterPause] = useState(false);
   const [goalBusy, setGoalBusy] = useState(false);
   const [answer, setAnswer] = useState("");
+  const [voiceInputActive, setVoiceInputActive] = useState(false);
   const [shareMessage, setShareMessage] = useState("");
   const [taskRecoveryBusy, setTaskRecoveryBusy] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
@@ -527,6 +529,7 @@ export function SessionPage() {
                           actor={grouped.actor}
                           assistingProfile={grouped.assistingProfile}
                           inferenceEvents={grouped.inferenceEvents}
+                          reasoningEvents={grouped.reasoningEvents}
                           toolCalls={grouped.toolCalls}
                           toolResults={grouped.toolResults}
                           controllerActions={grouped.controllerActions}
@@ -712,6 +715,7 @@ export function SessionPage() {
                   placeholder="Message the running agent…"
                   aria-label="Message the running agent"
                   maxLength={8000}
+                  readOnly={voiceInputActive}
                 />
                 {runningMessageError
                   ? (
@@ -721,10 +725,15 @@ export function SessionPage() {
                   )
                   : null}
               </div>
+              <VoiceInputButton
+                value={runningMessage}
+                onValueChange={setRunningMessage}
+                onActiveChange={setVoiceInputActive}
+              />
               <button
                 className="btn btn-primary rounded-circle"
                 type="submit"
-                disabled={!runningMessage.trim()}
+                disabled={!runningMessage.trim() || voiceInputActive}
                 aria-label="Send message to running agent"
                 title="Picked up at the next agent loop"
               >
@@ -768,11 +777,18 @@ export function SessionPage() {
                       value={answer}
                       onChange={(e) => setAnswer(e.target.value)}
                       placeholder="Answer the planning question…"
+                      aria-label="Answer the planning question"
+                      readOnly={voiceInputActive}
+                    />
+                    <VoiceInputButton
+                      value={answer}
+                      onValueChange={setAnswer}
+                      onActiveChange={setVoiceInputActive}
                     />
                     <button
                       className="btn btn-warning rounded-circle"
                       type="submit"
-                      disabled={!answer.trim()}
+                      disabled={!answer.trim() || voiceInputActive}
                     >
                       <i className="bi bi-check-lg"></i>
                     </button>
@@ -814,11 +830,18 @@ export function SessionPage() {
                 value={followUp}
                 onChange={(e) => setFollowUp(e.target.value)}
                 placeholder="Follow-up task…"
+                aria-label="Follow-up task"
+                readOnly={voiceInputActive}
+              />
+              <VoiceInputButton
+                value={followUp}
+                onValueChange={setFollowUp}
+                onActiveChange={setVoiceInputActive}
               />
               <button
                 className="btn btn-primary rounded-circle"
                 type="submit"
-                disabled={!followUp.trim()}
+                disabled={!followUp.trim() || voiceInputActive}
               >
                 <i className="bi bi-arrow-up"></i>
               </button>

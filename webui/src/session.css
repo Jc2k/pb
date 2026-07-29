@@ -816,6 +816,22 @@ article.user div.message-container {
     display: grid;
     gap: 0.45rem;
 }
+.action-run-notes {
+    margin-bottom: 0.15rem;
+    padding: 0.55rem 0.65rem;
+    border-radius: 10px;
+    background: #f8fafc;
+    color: #475569;
+    font-size: 0.76rem;
+}
+.action-run-notes > strong {
+    display: block;
+    margin-bottom: 0.25rem;
+    color: #334155;
+}
+.action-run-notes p:last-child {
+    margin-bottom: 0;
+}
 .tool-item {
     display: grid;
     grid-template-columns: 22px minmax(0, 1fr) auto;
@@ -1142,6 +1158,13 @@ article.user div.message-container {
     display: grid;
     place-items: center;
     flex: 0 0 42px;
+}
+
+.composer .voice-input-button {
+    width: 42px;
+    height: 42px;
+    flex-basis: 42px;
+    box-shadow: none;
 }
 
 .running-message-field {
@@ -1581,6 +1604,7 @@ article.user div.message-container {
 }
 
 .goal-field > span,
+.goal-field > label,
 .goal-field legend {
     width: auto;
     margin: 0;

@@ -22,6 +22,27 @@ A discussion may also offer a read-only Goal proposal. The proposal does not sta
 You can review and edit it in the Goal setup sheet. The internal Auto intent may ask pb to create a
 Goal for the exact current turn, but the resulting milestone plan still waits for your approval.
 
+### Speak a prompt
+
+**Shipped where the browser supports the Web Speech API.** Prompt composers on the home and project
+pages, running-session messages, planning answers, follow-up Tasks, and Goal objectives include a
+microphone button. Press it and speak normally: interim words appear live in the same controlled
+field. Submission stays disabled while the microphone is active. Press stop—or let the browser end
+the utterance—to turn the last visible preview into ordinary editable, submittable text. Pressing the
+microphone again appends another utterance instead of replacing text already in the field.
+
+pb creates a fresh browser recognizer for every recording and permits only one prompt control to own
+the microphone. Hiding or leaving the page, closing a sheet, changing composer state, or unmounting
+the control aborts both active and recently stopped browser sessions. This prevents a stale callback
+or an animated panel transition from stranding the microphone and blocking the next recording. A
+browser without speech recognition simply omits the button; typing remains unchanged.
+
+The browser owns speech capture and recognition. pb requests on-device recognition when the browser
+exposes that option, never records or stores audio, and receives only the live text placed in the
+prompt field. Browsers without an on-device implementation may use their configured speech service,
+which can send audio outside pb; using the microphone is therefore an explicit browser-managed
+network and permission choice.
+
 ## Build
 
 Use **Build** when the desired outcome is a repository change. A queue task is already explicit:
@@ -46,16 +67,28 @@ current contents into the first planning turn automatically. The transcript labe
 automatic controller observations. If a file or the bounded context is unsuitable, pb simply leaves
 the normal read tool available.
 
+During planning, new paths and existing paths have different controls. Create paths remain ordinary
+repository-relative names. Modify and Delete choices come from a small, per-turn list of exact
+existing paths assembled from the task, trusted path evidence, and successful local discovery. The
+generation collar therefore prevents small filename typos without putting the repository's entire
+path list into every schema. If the intended existing file is not in that list, the planner must use
+glob, search, or read first; the next turn incorporates those exact results.
+
 During implementation, pb exposes one accepted-plan file operation at a time and inserts that
-controller-owned target into the action before validation. Consecutive new files do not share one
-model output budget. If constrained generation reaches a file-payload boundary well before its token
+controller-owned target into the action before validation. For a large existing text file, pb can
+also place a few task-relevant, fingerprinted line windows into context and allow only an edit whose
+old text is inside those windows. If no confident task anchor exists, the normal read flow remains
+available. A failed path lookup can show similarly named existing files, but pb never silently
+changes the requested path. Consecutive new files do not share one model output budget. If
+constrained generation reaches a file-payload boundary well before its token
 ceiling, pb retries once with more string room at the same token limit; real token exhaustion instead
 gets one smaller complete-file retry. Neither case writes a partial file.
 
 With FlashMoe, supported source files also have a generation-time completion gate. Rust, Python,
 TypeScript/TSX, JavaScript/JSX, HTML, and CSS mutations cannot finish or execute unless the exact
-virtual file is valid under pb's pinned syntax parser. Existing files still need a current full-file
-read. `apply_patch` uses exact hunk offsets, counts, and context and accepts only pb's canonical text
+virtual file is valid under pb's pinned syntax parser. Existing files still need current exact read
+authority, either complete-file evidence or a fingerprinted controller range that contains the edit.
+`apply_patch` uses exact hunk offsets, counts, and context and accepts only pb's canonical text
 patch form; stale, recount-dependent, rename/copy, mode-changing, timestamped, quoted-path, binary,
 or syntax-breaking patches fail without falling back to a looser parser. For real local backends,
 Rust and Python additionally have narrow native semantic layers prepared before inference and
@@ -147,8 +180,12 @@ separate activity feed. A simple request that skipped model-based Task partition
 empty zero-call planning disclosure above the transcript.
 
 Standalone model-inference rows show the responsible teammate and elapsed time. When the same
-teammate makes consecutive tool-only calls, the transcript folds them into one collapsed action run
-with one avatar and name; chat, user input, stage changes, and Trinity feedback start a new run.
+teammate makes consecutive tool-directed calls, the transcript folds them and their intermediate
+notes into one collapsed action run with one avatar and name; the notes remain available when the
+run is expanded. Chat, user input, stage changes, and material Trinity feedback start a new run.
+Internal turn-credit accounting stays out of chat, and a repeat-limit failure is explained by
+Trinity instead of appearing again as an unattached red error. When the repeat stop and delivery
+outcome are adjacent, Trinity presents them together while the stored evidence keeps both causes.
 On a pointer device, hover reveals a fixed-size information button that does not move or reflow the
 row; click it to open aggregate and per-call metrics. Touch devices show the action-run button and
 also support long-press on standalone inference rows. The detail sheet presents purpose, token

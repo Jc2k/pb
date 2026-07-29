@@ -27,6 +27,7 @@ import {
 } from "../components/SessionDashboard";
 import { PageShell } from "../components/PageShell";
 import { IntentControl } from "../components/IntentControl";
+import { VoiceInputButton } from "../components/VoiceInputButton";
 import { GoalStartSheet } from "../components/GoalStartSheet";
 import {
   integrationApiError,
@@ -155,6 +156,7 @@ export function ProjectPage() {
   const [goalOpen, setGoalOpen] = useState(false);
   const [branch, setBranch] = useState("main");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [voiceInputActive, setVoiceInputActive] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
   const [filter, setFilter] = useState<SessionFilter>("all");
   const [activeDetailsTab, setActiveDetailsTab] = useState<ProjectDetailsTab>(
@@ -317,6 +319,8 @@ export function ProjectPage() {
                     onChange={(e) => setTask(e.target.value)}
                     rows={3}
                     placeholder="Describe your task or ask a question..."
+                    aria-label="Describe your task or ask a question"
+                    readOnly={voiceInputActive}
                   />
                   <ImageAttachments images={images} setImages={setImages} />
                   <div className="composer-actions">
@@ -357,10 +361,17 @@ export function ProjectPage() {
                     </div>
                     <div className="chat-submit-actions">
                       <AttachmentButton setImages={setImages} images={images} />
+                      <VoiceInputButton
+                        value={task}
+                        onValueChange={setTask}
+                        disabled={isSubmitting}
+                        onActiveChange={setVoiceInputActive}
+                      />
                       <button
                         className="btn btn-primary send-btn"
                         type="submit"
-                        disabled={!task.trim() || isSubmitting}
+                        disabled={!task.trim() || isSubmitting ||
+                          voiceInputActive}
                         aria-label="Start project chat"
                       >
                         <i className="bi bi-arrow-up"></i>

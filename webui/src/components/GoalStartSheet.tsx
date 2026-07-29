@@ -4,6 +4,7 @@ import type {
   GoalContinuationPolicy,
   ProjectEntry,
 } from "../types";
+import { VoiceInputButton } from "./VoiceInputButton";
 
 interface GoalStartSheetProps {
   open: boolean;
@@ -66,6 +67,7 @@ export function GoalStartSheet({
     GOAL_BUDGET_PRESETS.standard,
   );
   const [submitting, setSubmitting] = useState(false);
+  const [voiceInputActive, setVoiceInputActive] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -141,16 +143,26 @@ export function GoalStartSheet({
           </button>
         </header>
 
-        <label className="goal-field">
-          <span>Objective</span>
-          <textarea
-            className="form-control"
-            rows={3}
-            value={objective}
-            onChange={(event) => setObjective(event.target.value)}
-            autoFocus
-          />
-        </label>
+        <div className="goal-field">
+          <label htmlFor="goal-objective">Objective</label>
+          <div className="voice-prompt-field">
+            <textarea
+              id="goal-objective"
+              className="form-control"
+              rows={3}
+              value={objective}
+              onChange={(event) => setObjective(event.target.value)}
+              readOnly={voiceInputActive}
+              autoFocus
+            />
+            <VoiceInputButton
+              value={objective}
+              onValueChange={setObjective}
+              disabled={submitting}
+              onActiveChange={setVoiceInputActive}
+            />
+          </div>
+        </div>
 
         {!sessionId && !workdir
           ? (
@@ -359,7 +371,7 @@ export function GoalStartSheet({
           <button
             className="btn btn-primary"
             type="button"
-            disabled={submitting || !objective.trim() ||
+            disabled={submitting || voiceInputActive || !objective.trim() ||
               (!sessionId && !selectedWorkdir)}
             onClick={() => void submit()}
           >

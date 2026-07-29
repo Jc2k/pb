@@ -219,6 +219,7 @@ export function ActionGroupBubble({
   actor,
   assistingProfile,
   inferenceEvents,
+  reasoningEvents,
   toolCalls,
   toolResults,
   controllerActions,
@@ -226,6 +227,7 @@ export function ActionGroupBubble({
   actor?: import("../types").TeamActor;
   assistingProfile?: string;
   inferenceEvents: EventEnvelope[];
+  reasoningEvents: EventEnvelope[];
   toolCalls: EventEnvelope[];
   toolResults: EventEnvelope[];
   controllerActions: EventEnvelope[];
@@ -357,7 +359,26 @@ export function ActionGroupBubble({
             </i>
           </button>
           <div className={`collapse${isOpen ? " show" : ""}`} id={collapseId}>
-            <div className="tool-list">{controllerItems}{toolItems}</div>
+            <div className="tool-list">
+              {reasoningEvents.length > 0
+                ? (
+                  <div className="action-run-notes">
+                    <strong>Notes from this run</strong>
+                    {reasoningEvents.map((envelope, index) =>
+                      envelope.event.type === "reasoning"
+                        ? (
+                          <RichText
+                            key={index}
+                            content={envelope.event.content}
+                          />
+                        )
+                        : null
+                    )}
+                  </div>
+                )
+                : null}
+              {controllerItems}{toolItems}
+            </div>
           </div>
         </div>
       </div>
@@ -533,12 +554,16 @@ function ErrorEventBubble({
 
 function CorrectionNotice({
   event,
+  fallbackProfile,
 }: {
   event: Extract<AgentEvent, { type: "correction" }>;
+  fallbackProfile?: string;
 }) {
   const teammate = teamActorPresentation(event.actor || workflowStewardActor());
   const assistedName = event.assisting_profile
     ? profileName(event.assisting_profile)
+    : fallbackProfile
+    ? profileName(fallbackProfile)
     : event.message.includes("Planning")
     ? profileName("plan")
     : "the model";
@@ -546,18 +571,25 @@ function CorrectionNotice({
       "Workflow artifact validation failed" ||
     /^submit_(?:plan|plan_review|implementation|code_review) tool call was not executed successfully$/
       .test(event.summary || "");
-  const artifactLabel = event.assisting_profile === "build"
+  const isRepeatedAction = event.summary === "Repeated tool call blocked" ||
+    event.summary?.includes("repeated the same action") === true;
+  const assistedProfile = event.assisting_profile || fallbackProfile;
+  const artifactLabel = assistedProfile === "build"
     ? "implementation report"
-    : event.assisting_profile === "review"
+    : assistedProfile === "review"
     ? "review"
     : "plan";
   const headline = isArtifactValidation
     ? `${assistedName}’s ${artifactLabel} needs a correction`
+    : isRepeatedAction
+    ? `${assistedName} got stuck repeating the same action`
     : (event.summary || "I left some feedback").trim();
   const message = isArtifactValidation
     ? `${
       validationProblem(event.message)
     } I sent it back with guidance before the team continued.`
+    : isRepeatedAction
+    ? `I blocked the duplicate before it ran. The repeat limit was reached, so this pass stopped instead of spending another model turn on the same action.`
     : `I noticed a problem in ${assistedName}’s current step and sent back clear guidance before the team continued.`;
   const technicalDetail = prettyTechnicalDetail(event.message);
 
@@ -597,16 +629,56 @@ function CorrectionNotice({
 
 function WorkflowBlockedNotice({
   event,
+  envelope,
+  events,
 }: {
   event: Extract<AgentEvent, { type: "workflow_blocked" }>;
+  envelope: EventEnvelope;
+  events: EventEnvelope[];
 }) {
   const teammate = teamActorPresentation(workflowStewardActor());
+  const eventIndex = events.indexOf(envelope);
+  const recentEvents = events.slice(
+    Math.max(0, eventIndex - 5),
+    eventIndex < 0 ? 0 : eventIndex,
+  );
+  const repeatedAction = [...recentEvents]
+    .reverse()
+    .find((candidate) =>
+      candidate.event.type === "correction" &&
+      (candidate.event.summary === "Repeated tool call blocked" ||
+        candidate.event.summary?.includes("repeated the same action") === true)
+    );
+  let recentProfile: string | undefined;
+  for (let index = recentEvents.length - 1; index >= 0; index--) {
+    const candidate = recentEvents[index].event;
+    if (candidate.type === "llm_invocation" || candidate.type === "reasoning") {
+      recentProfile = candidate.profile;
+      break;
+    }
+    if (candidate.type === "tool_call" && candidate.actor?.kind === "agent") {
+      recentProfile = candidate.actor.id;
+      break;
+    }
+  }
+  const repeatedProfile = repeatedAction?.event.type === "correction"
+    ? repeatedAction.event.assisting_profile || recentProfile
+    : recentProfile;
+  const repeatedName = repeatedProfile ? profileName(repeatedProfile) : "A teammate";
   const planningFailure = event.outcome === "plan_rejected" ||
     event.reason.toLowerCase().includes("planning submission");
+  const gitControlChanged = event.reason.includes("changed Git control state");
+  const repeatLimit = event.reason.includes("deterministic repeat limit");
   const message = planningFailure
     ? `${
       validationProblem(event.reason)
     } Dade’s plan was still missing those pieces after three attempts, so I paused this pass instead of sending unclear work to the rest of the team.`
+    : gitControlChanged && repeatedAction
+    ? `${repeatedName} got stuck repeating the same action, so I blocked the duplicate before it ran. The repository’s Git state also changed during the pass; I preserved the content and stopped before committing or overwriting somebody else’s work.`
+    : gitControlChanged
+    ? "The repository’s Git state changed while the team was working. I preserved the content and stopped before committing or overwriting somebody else’s work."
+    : repeatLimit
+    ? event.reason
     : "I stopped this delivery at a safe boundary because the team needs help before it can continue.";
 
   return (
@@ -631,7 +703,13 @@ function WorkflowBlockedNotice({
           <p>{message}</p>
           <details>
             <summary>Technical details</summary>
-            <pre>{prettyTechnicalDetail(event.reason)}</pre>
+            <pre>
+              {prettyTechnicalDetail(
+                repeatedAction?.event.type === "correction"
+                  ? `${repeatedAction.event.message}\n${event.reason}`
+                  : event.reason,
+              )}
+            </pre>
           </details>
         </div>
       </div>
@@ -1531,6 +1609,28 @@ export function MessageBubble({
   evidenceEvents?: EventEnvelope[];
 }) {
   const e = envelope.event;
+  const nearestPriorProfile = () => {
+    const eventIndex = evidenceEvents.indexOf(envelope);
+    const prior = evidenceEvents.slice(0, eventIndex < 0 ? 0 : eventIndex);
+    for (let index = prior.length - 1; index >= 0; index--) {
+      const candidate = prior[index].event;
+      if (
+        candidate.type === "llm_invocation" ||
+        candidate.type === "reasoning" ||
+        candidate.type === "final" ||
+        candidate.type === "started"
+      ) {
+        return candidate.profile;
+      }
+      if (
+        candidate.type === "tool_call" &&
+        candidate.actor?.kind === "agent"
+      ) {
+        return candidate.actor.id;
+      }
+    }
+    return activityProfile;
+  };
 
   switch (e.type) {
     case "started":
@@ -1613,7 +1713,13 @@ export function MessageBubble({
       );
 
     case "workflow_blocked":
-      return <WorkflowBlockedNotice event={e} />;
+      return (
+        <WorkflowBlockedNotice
+          event={e}
+          envelope={envelope}
+          events={evidenceEvents}
+        />
+      );
 
     case "workflow_evidence_invalidated":
       return (
@@ -1629,7 +1735,12 @@ export function MessageBubble({
       );
 
     case "correction":
-      return <CorrectionNotice event={e} />;
+      return (
+        <CorrectionNotice
+          event={e}
+          fallbackProfile={nearestPriorProfile()}
+        />
+      );
 
     case "team_message":
       return <TeamMessageBubble envelope={envelope} events={evidenceEvents} />;

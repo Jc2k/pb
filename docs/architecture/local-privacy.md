@@ -32,6 +32,14 @@ the HTTP socket through launchd and Bonjour; a direct development server creates
 native DNS-SD registration. That advertisement reveals the service's presence on the local network
 but does not send repository or task content by itself.
 
+Optional web voice input is browser-owned rather than a pb audio pipeline. The reusable prompt
+control uses the browser's Web Speech API, asks for on-device processing when that implementation
+exposes the option, and writes interim and final text into the same local controlled prompt field.
+pb receives only that text and does not record, upload, persist, or replay microphone audio. A
+browser without on-device speech recognition may use its configured remote speech service; pressing
+the microphone is therefore an explicit browser permission and possible non-local edge rather than
+part of pb's local core. Unsupported browsers do not render the control.
+
 Inference acceleration is local as well. llama.cpp keeps a live exact-prefix context during an
 agent run and stores byte-budgeted restartable state under the platform cache root. FlashMoe keeps
 loaded model/Metal runtimes in a bounded idle pool, holds safe prompt, generated-head, and shared
@@ -174,12 +182,23 @@ no hosted scheduler, telemetry, remote persistence, or publication edge.
 ```text
 model/update downloads ────────────────→ registries and GitHub releases
 public research tool ──────────────────→ search/fetch service
+optional browser voice input ──────────→ browser-configured speech service
 remote MCP tool ───────────────────────→ configured provider
 container service with egress ─────────→ external network
 future publication approval ───────────→ source-control provider
 ```
 
 Each edge exists for a distinct reason and should carry the minimum data it needs.
+
+### Browser speech input
+
+Voice input is opt-in for each utterance. The browser owns microphone permission, capture,
+recognition, language support, and any speech-service transport. pb requests local processing where
+the browser exposes it, but does not claim that all Web Speech implementations are offline. No audio
+crosses pb's HTTP API or enters session storage; only the transcript the browser places in the prompt
+can be submitted through the ordinary local task API. Stopping, hiding, navigating away, or
+unmounting explicitly releases the recognition object, and a later recording starts with a fresh
+object so a browser-held session cannot silently survive into another prompt.
 
 ### Downloads
 

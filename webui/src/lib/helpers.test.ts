@@ -305,6 +305,61 @@ Deno.test("groupActionEvents leaves an inference visible when it produces chat t
   equal((grouped[1] as EventEnvelope).event.type, "reasoning");
 });
 
+Deno.test("groupActionEvents folds tool-directed reasoning into the expanded teammate run", () => {
+  const actor = { kind: "agent" as const, id: "build" };
+  const events: EventEnvelope[] = [
+    {
+      version: "1",
+      event: {
+        type: "llm_invocation",
+        step: 1,
+        profile: "build",
+        duration_ms: 1000,
+        prompt_tokens: 100,
+        generated_tokens: 10,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "reasoning",
+        content: "I will inspect the exact target first.",
+        profile: "build",
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "tool_call",
+        tool: "read_file",
+        arguments: { path: "webui/src/pages/ProjectsPage.tsx" },
+        call_id: "one",
+        actor,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "tool_result",
+        tool: "read_file",
+        result: "source",
+        call_id: "one",
+        actor,
+      },
+    },
+  ];
+
+  const grouped = groupActionEvents(events);
+  equal(grouped.length, 1);
+  const run = grouped[0];
+  if (!("type" in run) || run.type !== "action_group") {
+    throw new Error("expected one action run");
+  }
+  equal(run.inferenceEvents.length, 1);
+  equal(run.reasoningEvents.length, 1);
+  equal(run.toolCalls.length, 1);
+});
+
 Deno.test("groupActionEvents correlates reordered identical tools across intervening messages", () => {
   const actor = { kind: "agent" as const, id: "build" };
   const callA: EventEnvelope = {

@@ -518,3 +518,61 @@ Deno.test("errorSummary prefers explicit error summaries", () => {
     "Invalid pb JSON action on step 10/12",
   );
 });
+
+Deno.test("terminal repeat errors stay in evidence but collapse into Trinity feedback in chat", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "v1",
+      event: {
+        type: "correction",
+        summary: "Repeated tool call detected",
+        message: "Choose another action.",
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "build",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "correction",
+        summary: "Kate repeated the same action",
+        message: "The duplicate was blocked.",
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "build",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "error",
+        summary: "Kate reached the repeat limit",
+        message: "No further model turn ran.",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "workflow_blocked",
+        workflow_id: "workflow-1",
+        outcome: "commit_blocked",
+        reason: "model stage Implementing changed Git control state (HEAD)",
+      },
+    },
+  ];
+
+  const visible = chatEventsWithOnlyLatestStep(events);
+  deepEqual(visible.map((event) => event.event.type), ["workflow_blocked"]);
+});
+
+Deno.test("work-unit progress credits do not split adjacent action runs", () => {
+  const visible = chatEventsWithOnlyLatestStep([{
+    version: "v1",
+    event: {
+      type: "correction",
+      summary: "Work-unit progress earned one bounded turn",
+      message: "Internal bounded turn accounting.",
+      actor: { kind: "automation", id: "trinity" },
+    },
+  }]);
+  deepEqual(visible, []);
+});

@@ -143,6 +143,18 @@ Strict delivery does not expose `session_title`: the original task is already th
 fallback, so cosmetic rewriting cannot consume a planning inference. Planning guidance requires
 local evidence before naming an existing path and reserves public web research for genuinely
 external or current facts rather than repository-local file discovery.
+The model-facing plan schema groups each step's paths by Create, Modify, and Delete. Create remains a
+free repository-relative name. Modify and Delete are native-collar constrained to at most 32 exact
+existing paths selected from task-relevant repository names, contract/current evidence, and exact
+local glob/search/read results. With no candidate, those arrays are constrained empty until local
+discovery establishes one. This keeps the schema bounded independently of repository size and
+prevents a near-miss path spelling from consuming a rejected planning turn. The harness projects the
+groups back to the durable ordered `PlanPath` artifact before validation. Preserved legacy array
+submissions remain readable, but new native generation uses the grouped contract.
+If a non-native or preserved submission still names an absent Modify or Delete path, live validation
+keeps the plan rejected and adds up to three extension-compatible, edit-distance-ranked existing
+paths when a close name exists. Suggestions are fallback guidance only: pb never silently rewrites a
+model-authored target.
 
 For a trusted contract, pb may place the exact current contents of existing small UTF-8
 `allowed_paths` directly into the planning context. Each automatic read is bound to the workspace,
@@ -579,8 +591,13 @@ Legacy events use a bounded tool/actor fallback only when both sides lack an id,
 outcome remains unknown rather than being displayed as success.
 
 An exact active small-file observation may satisfy read-before-write only while its current
-fingerprint and complete prompt bytes remain valid. A failed-diagnostic range permits only an edit
-whose old text lies wholly inside an included byte window. Fresh review inspection is injected only
+fingerprint and complete prompt bytes remain valid. For an oversized UTF-8 Modify work unit, pb may
+instead select a small set of task-relevant line windows using exact or one-edit task-term matches.
+It admits those windows only when a rare or multi-term match provides a useful anchor, records their
+exact byte hashes, and exposes only target-bound `edit_file`; the edit's old text must lie wholly
+inside an included byte window. A failed-diagnostic range has the same edit boundary and is selected
+from exact diagnostic locations. When no confident task window exists, the ordinary model-driven
+read path remains available. Fresh review inspection is injected only
 when every required changed path fits, and the reviewer still authors assessments, findings, and
 verdict. Optional completion fields on a successful final mutation remain model-authored. Automatic
 deletion is intrinsic but limited to a unique tracked, clean, unchanged, bounded plan deletion with
@@ -602,9 +619,15 @@ presentation over typed events; it never changes a controller event into a model
 claims that a model requested an automatic action.
 
 The web transcript treats stored execution detail as progressive disclosure. A standalone
-inference keeps a stable one-line marker. Consecutive tool-only inferences by the same teammate are
-presented as one collapsed action run with one avatar and author line; stage changes, teammate chat,
-user messages, and Trinity feedback remain explicit boundaries. A fixed-size information affordance
+inference keeps a stable one-line marker. Consecutive tool-directed inferences by the same teammate,
+including their intermediate reasoning notes, are presented as one collapsed action run with one
+avatar and author line; the notes remain available inside the expanded run. Stage changes, teammate
+chat, user messages, and material Trinity feedback remain explicit boundaries. Internal bounded-turn
+accounting does not split a run. A terminal repeat-limit error remains durable evidence but is not
+rendered as a second actorless red card when Trinity's terminal delivery feedback already explains
+it; an adjacent workflow stop is combined into that same feedback card without merging the
+underlying durable causes.
+A fixed-size information affordance
 opens aggregate and per-call metrics without changing line layout. The session runtime summary uses
 the same labelled metric sheet. Harness artifact corrections render as Trinity
 feedback with human-readable context and expandable technical detail. Controller closure checkpoints

@@ -5,6 +5,7 @@ import type {
   GoalContinuationPolicy,
   GoalCriterionInput,
 } from "../types";
+import { VoiceInputButton } from "./VoiceInputButton";
 
 interface Props {
   goal: GoalCheckpoint;
@@ -24,6 +25,7 @@ export function GoalAmendmentSheet({ goal, onClose, onSubmitted }: Props) {
   );
   const [budget, setBudget] = useState<GoalBudget>(goal.run.budget);
   const [busy, setBusy] = useState(false);
+  const [voiceInputActive, setVoiceInputActive] = useState(false);
   const submit = async () => {
     setBusy(true);
     try {
@@ -80,15 +82,25 @@ export function GoalAmendmentSheet({ goal, onClose, onSubmitted }: Props) {
             ? "Updating the draft generates a new plan digest. No repository work starts until you approve it."
             : "Completed milestones and their evidence remain unchanged. pb will review a new plan for unfinished work."}
         </p>
-        <label className="goal-field">
-          <span>Objective</span>
-          <textarea
-            className="form-control"
-            rows={3}
-            value={objective}
-            onChange={(event) => setObjective(event.target.value)}
-          />
-        </label>
+        <div className="goal-field">
+          <label htmlFor="goal-amend-objective">Objective</label>
+          <div className="voice-prompt-field">
+            <textarea
+              id="goal-amend-objective"
+              className="form-control"
+              rows={3}
+              value={objective}
+              onChange={(event) => setObjective(event.target.value)}
+              readOnly={voiceInputActive}
+            />
+            <VoiceInputButton
+              value={objective}
+              onValueChange={setObjective}
+              disabled={busy}
+              onActiveChange={setVoiceInputActive}
+            />
+          </div>
+        </div>
         <fieldset className="goal-field">
           <legend>Done when</legend>
           {criteria.map((criterion, index) => (
@@ -187,7 +199,7 @@ export function GoalAmendmentSheet({ goal, onClose, onSubmitted }: Props) {
           <button
             className="btn btn-primary"
             type="button"
-            disabled={busy || !objective.trim() ||
+            disabled={busy || voiceInputActive || !objective.trim() ||
               criteria.some((criterion) => !criterion.text.trim())}
             onClick={() => void submit()}
           >

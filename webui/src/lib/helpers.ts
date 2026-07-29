@@ -66,6 +66,7 @@ export type ActionGroup = {
   actor?: TeamActor;
   assistingProfile?: string;
   inferenceEvents: EventEnvelope[];
+  reasoningEvents: EventEnvelope[];
   toolCalls: EventEnvelope[];
   toolResults: EventEnvelope[];
   controllerActions: EventEnvelope[];
@@ -110,7 +111,9 @@ export function groupActionEvents(
   let currentToolResults: EventEnvelope[] = [];
   let currentControllerActions: EventEnvelope[] = [];
   let currentInferenceEvents: EventEnvelope[] = [];
+  let currentReasoningEvents: EventEnvelope[] = [];
   let pendingInferenceEvents: EventEnvelope[] = [];
+  let pendingReasoningEvents: EventEnvelope[] = [];
   let pendingInferenceActor: TeamActor | undefined;
   let currentActor: TeamActor | undefined;
   let currentAssistingProfile: string | undefined;
@@ -120,7 +123,9 @@ export function groupActionEvents(
       currentToolResults.length > 0 || currentControllerActions.length > 0;
     if (!hasActions) {
       grouped.push(...currentInferenceEvents);
+      grouped.push(...currentReasoningEvents);
       currentInferenceEvents = [];
+      currentReasoningEvents = [];
       currentActor = undefined;
       currentAssistingProfile = undefined;
       return;
@@ -130,6 +135,7 @@ export function groupActionEvents(
       actor: currentActor,
       assistingProfile: currentAssistingProfile,
       inferenceEvents: [...currentInferenceEvents],
+      reasoningEvents: [...currentReasoningEvents],
       toolCalls: [...currentToolCalls],
       toolResults: [...currentToolResults],
       controllerActions: [...currentControllerActions],
@@ -138,6 +144,7 @@ export function groupActionEvents(
     currentToolResults = [];
     currentControllerActions = [];
     currentInferenceEvents = [];
+    currentReasoningEvents = [];
     currentActor = undefined;
     currentAssistingProfile = undefined;
   };
@@ -149,8 +156,9 @@ export function groupActionEvents(
     const hasActions = currentToolCalls.length > 0 ||
       currentToolResults.length > 0 || currentControllerActions.length > 0 ||
       currentInferenceEvents.length > 0;
+    const hasReasoning = currentReasoningEvents.length > 0;
     if (
-      hasActions &&
+      (hasActions || hasReasoning) &&
       (teamActorKey(currentActor) !== teamActorKey(actor) ||
         currentAssistingProfile !== assistingProfile)
     ) flush();
@@ -158,7 +166,8 @@ export function groupActionEvents(
       currentToolResults.length === 0 &&
       currentControllerActions.length === 0 &&
       currentInferenceEvents.length === 0;
-    if (groupIsEmpty) {
+    const groupHasNoReasoning = currentReasoningEvents.length === 0;
+    if (groupIsEmpty && groupHasNoReasoning) {
       currentActor = actor;
       currentAssistingProfile = assistingProfile;
     }
@@ -168,7 +177,9 @@ export function groupActionEvents(
     if (pendingInferenceEvents.length === 0) return;
     flush();
     grouped.push(...pendingInferenceEvents);
+    grouped.push(...pendingReasoningEvents);
     pendingInferenceEvents = [];
+    pendingReasoningEvents = [];
     pendingInferenceActor = undefined;
   };
 
@@ -181,6 +192,18 @@ export function groupActionEvents(
         ? { kind: "agent" as const, id: event.event.profile }
         : undefined;
       pendingInferenceEvents.push(event);
+    } else if (event.event.type === "reasoning") {
+      const reasoningActor = { kind: "agent" as const, id: event.event.profile };
+      if (
+        pendingInferenceEvents.length > 0 &&
+        teamActorKey(pendingInferenceActor) === teamActorKey(reasoningActor)
+      ) {
+        pendingReasoningEvents.push(event);
+      } else {
+        flushPendingInferences();
+        flush();
+        grouped.push(event);
+      }
     } else if (event.event.type === "tool_call") {
       const actor = event.event.actor;
       if (
@@ -191,7 +214,9 @@ export function groupActionEvents(
       }
       beginOrSwitchGroup(actor);
       currentInferenceEvents.push(...pendingInferenceEvents);
+      currentReasoningEvents.push(...pendingReasoningEvents);
       pendingInferenceEvents = [];
+      pendingReasoningEvents = [];
       pendingInferenceActor = undefined;
       currentToolCalls.push(event);
     } else if (event.event.type === "tool_result") {
@@ -241,6 +266,7 @@ export function groupActionEvents(
   flush();
   if (pendingInferenceEvents.length > 0) {
     grouped.push(...pendingInferenceEvents);
+    grouped.push(...pendingReasoningEvents);
   }
 
   return grouped;

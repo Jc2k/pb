@@ -468,6 +468,8 @@ function isHiddenChatEvent(event: EventEnvelope): boolean {
   ].includes(event.event.summary || "");
   const internalCheckpoint = event.event.type === "correction" &&
     event.event.summary === "Workflow closure checkpoint";
+  const internalProgressCredit = event.event.type === "correction" &&
+    event.event.summary === "Work-unit progress earned one bounded turn";
   return event.event.type === "sub_agent_started" ||
     event.event.type === "sub_agent_finished" ||
     event.event.type === "user_message_applied" ||
@@ -477,7 +479,21 @@ function isHiddenChatEvent(event: EventEnvelope): boolean {
     event.event.type === "handoff_summary" ||
     event.event.type === "final_grace" ||
     handoffCorrection ||
-    internalCheckpoint;
+    internalCheckpoint ||
+    internalProgressCredit;
+}
+
+function isRepeatedToolCorrection(event: EventEnvelope): boolean {
+  return event.event.type === "correction" &&
+    (event.event.summary === "Repeated tool call detected" ||
+      event.event.summary === "Repeated tool call blocked" ||
+      event.event.summary?.includes("repeated the same action") === true);
+}
+
+function isTerminalToolLoopError(event: EventEnvelope): boolean {
+  return event.event.type === "error" &&
+    (event.event.summary === "Deterministic tool loop" ||
+      event.event.summary?.includes("reached the repeat limit") === true);
 }
 
 function isTransientActivityEvent(event: EventEnvelope): boolean {
@@ -535,6 +551,35 @@ export function chatEventsWithOnlyLatestStep(
   const lastVisibleIndex = chatEvents.length - 1;
   return chatEvents.filter((event, index) => {
     if (isTransientActivityEvent(event) && index !== lastVisibleIndex) {
+      return false;
+    }
+    if (
+      event.event.type === "correction" &&
+      event.event.summary === "Repeated tool call detected" &&
+      chatEvents.slice(index + 1, index + 5).some(isRepeatedToolCorrection)
+    ) {
+      return false;
+    }
+    if (
+      event.event.type === "correction" &&
+      isRepeatedToolCorrection(event) &&
+      event.event.summary !== "Repeated tool call detected" &&
+      chatEvents.slice(index + 1, index + 4).some((later) =>
+        later.event.type === "workflow_blocked"
+      )
+    ) {
+      // Terminal delivery feedback combines the repeat stop with the workflow outcome so Trinity
+      // does not appear as two adjacent cards for one stopped pass.
+      return false;
+    }
+    if (
+      isTerminalToolLoopError(event) &&
+      chatEvents.slice(Math.max(0, index - 2), index).some(
+        isRepeatedToolCorrection,
+      )
+    ) {
+      // The preceding Trinity correction owns the user-facing explanation. Keep the typed error
+      // in stored evidence and the details view, but do not render a second actorless red card.
       return false;
     }
     if (
