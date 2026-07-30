@@ -432,6 +432,11 @@ Not every project needs every file. `pb init` creates or preserves the environme
 strict-workflow, durable-Goal, and Task-decomposition foundations, plus `.pb/python.toml` for a
 detected Python project.
 
+Documented repository guard commands are discovered as local affected checks. Commands found in a
+GitHub workflow run from the repository root, duplicate documentation is collapsed, and specialized
+web, documentation, and Python-oracle tasks run only when their inputs are affected. Their documented
+order is retained for reporting, but one guard is not treated as a dependency of every later guard.
+
 ## Task decomposition policy
 
 **Shipped policy; Build partitioning is on by default.** `.pb/tasks.toml` is a versioned, hashed ceiling document for

@@ -387,7 +387,18 @@ fn stable_topological_checks(
         ordered.push(id.to_string());
         Ok(())
     }
-    for id in selected {
+    let mut selected_ids = selected.iter().collect::<Vec<_>>();
+    selected_ids.sort_by(|left, right| {
+        let canonical_index = |id: &str| {
+            id.strip_prefix("canonical-guard-")
+                .and_then(|index| index.parse::<usize>().ok())
+        };
+        match (canonical_index(left), canonical_index(right)) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => left.cmp(right),
+        }
+    });
+    for id in selected_ids {
         visit(
             id,
             graph,
@@ -1081,6 +1092,33 @@ mod tests {
         let plan = plan_checks_for_paths(&graph, Vec::new()).unwrap();
         assert!(plan.is_no_change());
         assert_eq!(plan.checks, vec!["worker-test"]);
+    }
+
+    #[test]
+    fn independent_canonical_guards_keep_numeric_document_order() {
+        let mut graph = graph();
+        let template = graph.checks["shared-test"].clone();
+        graph.checks = [1, 2, 10]
+            .into_iter()
+            .map(|index| {
+                let id = format!("canonical-guard-{index}");
+                let mut check = template.clone();
+                check.id = id.clone();
+                check.label = id.clone();
+                (id, check)
+            })
+            .collect();
+
+        let plan = plan_checks_for_paths(&graph, vec!["shared/input.txt".to_string()]).unwrap();
+
+        assert_eq!(
+            plan.checks,
+            vec![
+                "canonical-guard-1",
+                "canonical-guard-2",
+                "canonical-guard-10"
+            ]
+        );
     }
 
     #[test]

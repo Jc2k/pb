@@ -322,6 +322,13 @@ The harness selects affected configured checks and records their current results
 checks cannot be replaced by an arbitrary command that happens to exit successfully. A mutation
 after a check makes older evidence stale.
 
+Repository inspection also turns documented guard commands into affected checks. Commands read
+from GitHub workflow files retain repository-root shell semantics and deduplicate with the same
+command documented elsewhere. Canonical guards keep their declared display order without pretending
+that every earlier command is an execution dependency. Web, documentation, and Python-oracle tasks
+carry distinct input scopes, so an unrelated unavailable tool cannot fail a delivery that did not
+touch its inputs; explicitly configured acceptance checks remain authoritative.
+
 For a failed check, pb compares its bounded diagnostic text only with the exact current task paths.
 Paths named as complete diagnostic tokens are listed as repair focus, so a local model can inspect
 the implicated files first. The hint is not evidence, does not narrow or expand mutation authority,

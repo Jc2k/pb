@@ -721,6 +721,8 @@ fn discover_python(
 enum CommandKind {
     Cargo,
     Web,
+    Docs,
+    PythonOracle,
     Go,
     Python,
     Other,
@@ -765,7 +767,6 @@ fn apply_canonical_commands(repo_root: &Path, commands: &[String], graph: &mut W
             || (kinds.contains(&CommandKind::Python) && id.starts_with("python.")))
     });
 
-    let mut previous = None;
     for (index, command) in commands.iter().enumerate() {
         let kind = command_kind(command);
         let components = graph
@@ -774,16 +775,31 @@ fn apply_canonical_commands(repo_root: &Path, commands: &[String], graph: &mut W
             .filter(|id| component_matches_kind(id, kind))
             .cloned()
             .collect::<Vec<_>>();
-        let components = if components.is_empty() {
+        let components = if components.is_empty()
+            && !matches!(kind, CommandKind::Docs | CommandKind::PythonOracle)
+        {
             graph.components.keys().cloned().collect()
         } else {
             components
         };
-        let mut inputs = components
-            .iter()
-            .filter_map(|id| graph.components.get(id))
-            .flat_map(|component| component.include.iter().cloned())
-            .collect::<Vec<_>>();
+        let mut inputs = match kind {
+            CommandKind::Docs => vec![
+                "book.toml".to_string(),
+                "docs/**".to_string(),
+                "scripts/check-docs.ts".to_string(),
+            ],
+            CommandKind::PythonOracle => vec![
+                "deno.json".to_string(),
+                "deno.lock".to_string(),
+                "scripts/python-semantic-oracle.ts".to_string(),
+                "scripts/python-semantic-oracle.test.ts".to_string(),
+            ],
+            _ => components
+                .iter()
+                .filter_map(|id| graph.components.get(id))
+                .flat_map(|component| component.include.iter().cloned())
+                .collect::<Vec<_>>(),
+        };
         if kind == CommandKind::Cargo {
             for workspace in graph.cargo_workspaces.values() {
                 inputs.push(workspace.manifest_path.clone());
@@ -818,16 +834,25 @@ fn apply_canonical_commands(repo_root: &Path, commands: &[String], graph: &mut W
                     .then(|| "webui/dist/**".to_string())
                     .into_iter()
                     .collect(),
-                depends_on: previous.into_iter().collect(),
+                depends_on: Vec::new(),
                 timeout_seconds: 600,
             },
         );
-        previous = Some(id);
     }
 }
 
 fn command_kind(command: &str) -> CommandKind {
-    let command = command.trim_start();
+    let command = command
+        .rsplit_once("&&")
+        .map(|(_, command)| command)
+        .unwrap_or(command)
+        .trim_start();
+    if command.contains("test:docs") || command.starts_with("mdbook ") {
+        return CommandKind::Docs;
+    }
+    if command.contains("python-oracle") {
+        return CommandKind::PythonOracle;
+    }
     if command.starts_with("cargo ") {
         CommandKind::Cargo
     } else if command.starts_with("deno ")
@@ -850,6 +875,7 @@ fn component_matches_kind(id: &str, kind: CommandKind) -> bool {
     match kind {
         CommandKind::Cargo => id.starts_with("cargo."),
         CommandKind::Web => id.starts_with("deno.") || id.starts_with("node."),
+        CommandKind::Docs | CommandKind::PythonOracle => false,
         CommandKind::Go => id.starts_with("go."),
         CommandKind::Python => id.starts_with("python."),
         CommandKind::Other => true,
@@ -1137,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_guards_replace_inferred_checks_and_preserve_order() {
+    fn canonical_guards_are_affected_scoped_and_preserve_order_without_false_dependencies() {
         let repo = tempfile::tempdir().unwrap();
         package(repo.path(), ".", "app", "");
         write(
@@ -1161,6 +1187,9 @@ mod tests {
             caches: Vec::new(),
             guard_commands: vec![
                 "deno task build:web".to_string(),
+                "deno task test:web".to_string(),
+                "deno task test:docs".to_string(),
+                "deno task test:python-oracle".to_string(),
                 "cargo test --all-targets".to_string(),
             ],
             prepared_image: None,
@@ -1169,14 +1198,14 @@ mod tests {
         };
 
         let graph = discover_workspace(repo.path(), Some(&environment)).unwrap();
-        assert_eq!(graph.checks.len(), 2);
+        assert_eq!(graph.checks.len(), 5);
         assert_eq!(
             graph.checks["canonical-guard-1"].command,
             environment.guard_commands[0]
         );
         assert_eq!(
             graph.checks["canonical-guard-2"].depends_on,
-            vec!["canonical-guard-1"]
+            Vec::<String>::new()
         );
         assert_eq!(
             graph.checks["canonical-guard-1"].trigger,
@@ -1186,5 +1215,63 @@ mod tests {
             graph.checks["canonical-guard-1"].outputs,
             vec!["webui/dist/**"]
         );
+        assert_eq!(
+            graph.checks["canonical-guard-3"].inputs,
+            vec!["book.toml", "docs/**", "scripts/check-docs.ts"]
+        );
+        assert!(graph.checks["canonical-guard-3"].components.is_empty());
+
+        let web_plan =
+            crate::checks::plan_checks_for_paths(&graph, vec!["webui/src/App.tsx".to_string()])
+                .unwrap();
+        assert_eq!(
+            web_plan.checks,
+            vec!["canonical-guard-1", "canonical-guard-2"]
+        );
+    }
+
+    #[test]
+    fn documented_guards_deduplicate_workflow_commands_and_skip_unaffected_tools() {
+        let repo = tempfile::tempdir().unwrap();
+        package(repo.path(), ".", "app", "");
+        write(
+            repo.path(),
+            "deno.json",
+            r#"{"tasks":{"build:web":"echo build","test:web":"echo test","test:docs":"mdbook build"}}"#,
+        );
+        write(
+            repo.path(),
+            "webui/src/App.tsx",
+            "export const app = true;\n",
+        );
+        write(
+            repo.path(),
+            "AGENTS.md",
+            "- `deno task build:web`\n- `deno task test:web`\n- `deno task test:docs`\n- `cargo test --all-targets`\n",
+        );
+        write(
+            repo.path(),
+            ".github/workflows/checks.yml",
+            "jobs:\n  checks:\n    steps:\n      - run: deno task build:web\n      - run: deno task test:web\n      - run: deno task test:docs\n      - run: cargo test --all-targets\n",
+        );
+
+        let graph = discover_workspace(repo.path(), None).unwrap();
+        assert_eq!(graph.checks.len(), 4);
+        assert!(
+            graph
+                .checks
+                .values()
+                .all(|check| check.depends_on.is_empty())
+        );
+
+        let plan =
+            crate::checks::plan_checks_for_paths(&graph, vec!["webui/src/App.tsx".to_string()])
+                .unwrap();
+        let commands = plan
+            .checks
+            .iter()
+            .map(|id| graph.checks[id].command.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(commands, vec!["deno task build:web", "deno task test:web"]);
     }
 }

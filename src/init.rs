@@ -1584,7 +1584,8 @@ fn extract_documented_command(line: &str) -> Option<String> {
 
 fn normalize_command(root: &Path, source: &Path, command: &str) -> String {
     let parent = source.parent().unwrap_or(root);
-    if parent == root || command.starts_with("cd ") {
+    let workflow_root = root.join(".github").join("workflows");
+    if parent == root || parent == workflow_root || command.starts_with("cd ") {
         return command.to_string();
     }
     if let Ok(rel) = parent.strip_prefix(root)
@@ -2325,6 +2326,25 @@ Run `npm test` before commit.",
         assert!(!info.prefers_container_backend);
         assert!(!info.prefers_local_backend);
         assert!(suggest_scout_environment(dir.path(), &info).is_none());
+    }
+
+    #[test]
+    fn github_workflow_commands_keep_repository_root_semantics_and_deduplicate() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            ".github/workflows/checks.yml",
+            "name: checks\njobs:\n  test:\n    steps:\n      - run: deno task test:web\n",
+        );
+        write(
+            dir.path(),
+            "AGENTS.md",
+            "Required check: `deno task test:web`\n",
+        );
+
+        let info = inspect(dir.path()).unwrap();
+
+        assert_eq!(info.documented_guard_commands, vec!["deno task test:web"]);
     }
 
     #[test]
