@@ -5855,7 +5855,114 @@ fn html_opening_tag_name(line: &str) -> Option<&str> {
     (end > 0).then_some(&rest[..end])
 }
 
-fn configure_control_removal_diagnostic_edit_candidates(
+fn source_line_span(line_starts: &[usize], text_len: usize, line: usize) -> (usize, usize) {
+    let start = line_starts[line];
+    let end = line_starts.get(line + 1).copied().unwrap_or(text_len);
+    (start, end)
+}
+
+fn diagnostic_markup_span(
+    text: &str,
+    line_starts: &[usize],
+    line: usize,
+    task: &str,
+    receipt: &crate::workflow::ControllerObservationReceipt,
+    limit: usize,
+) -> Option<(usize, usize)> {
+    let mut enclosing = None;
+    for opening_line in (line.saturating_sub(32)..=line).rev() {
+        let (opening_start, opening_end) = source_line_span(line_starts, text.len(), opening_line);
+        let opening = &text[opening_start..opening_end];
+        let Some(tag) = html_opening_tag_name(opening) else {
+            continue;
+        };
+        if opening.contains("/>") || task_line_windows(task, opening, 1).is_empty() {
+            continue;
+        }
+        let closing = format!("</{tag}>");
+        let Some(closing_line) =
+            (line..line.saturating_add(64).min(line_starts.len())).find(|candidate| {
+                let (start, end) = source_line_span(line_starts, text.len(), *candidate);
+                text[start..end].contains(&closing)
+            })
+        else {
+            continue;
+        };
+        let (_, closing_end) = source_line_span(line_starts, text.len(), closing_line);
+        if closing_end.saturating_sub(opening_start) <= limit
+            && diagnostic_edit_candidate_within_observation(receipt, opening_start, closing_end)
+        {
+            // Keep walking outward. The largest task-named enclosing control removes its complete
+            // visual shell instead of leaving an empty label or decoration.
+            enclosing = Some((opening_start, closing_end));
+        }
+    }
+    enclosing
+}
+
+fn diagnostic_conditional_span(
+    text: &str,
+    line_starts: &[usize],
+    line: usize,
+    task: &str,
+    receipt: &crate::workflow::ControllerObservationReceipt,
+    limit: usize,
+) -> Option<(usize, usize)> {
+    for opening_line in (line.saturating_sub(16)..=line).rev() {
+        let (opening_start, opening_end) = source_line_span(line_starts, text.len(), opening_line);
+        let opening = text[opening_start..opening_end].trim();
+        if !opening.starts_with('{') || !opening.contains("&& (") {
+            continue;
+        }
+        let Some(closing_line) =
+            (line..line.saturating_add(32).min(line_starts.len())).find(|candidate| {
+                let (start, end) = source_line_span(line_starts, text.len(), *candidate);
+                text[start..end].contains(")}")
+            })
+        else {
+            continue;
+        };
+        let (_, closing_end) = source_line_span(line_starts, text.len(), closing_line);
+        let candidate = &text[opening_start..closing_end];
+        let directly_named = opening_line == line;
+        if closing_end.saturating_sub(opening_start) <= limit
+            && (directly_named
+                || !task_line_windows(task, candidate, candidate.lines().count().max(1)).is_empty())
+            && diagnostic_edit_candidate_within_observation(receipt, opening_start, closing_end)
+        {
+            return Some((opening_start, closing_end));
+        }
+    }
+    None
+}
+
+fn diagnostic_prior_anchor_span(
+    text: &str,
+    line_starts: &[usize],
+    receipt: &crate::workflow::ControllerObservationReceipt,
+    diagnostic_lines: &BTreeSet<usize>,
+) -> Option<(usize, usize)> {
+    let first_diagnostic_start = diagnostic_lines
+        .iter()
+        .next()
+        .map(|line| source_line_span(line_starts, text.len(), line.saturating_sub(1)).0)?;
+    receipt
+        .included_ranges
+        .iter()
+        .filter(|range| range.end_byte <= first_diagnostic_start)
+        .max_by_key(|range| range.end_byte)
+        .and_then(|range| {
+            (0..line_starts.len()).rev().find_map(|line| {
+                let (start, end) = source_line_span(line_starts, text.len(), line);
+                (start >= range.start_byte
+                    && end <= range.end_byte
+                    && !text[start..end].trim().is_empty())
+                .then_some((start, end))
+            })
+        })
+}
+
+fn configure_diagnostic_edit_candidates(
     tools: &mut [BuiltInToolSchema],
     workspace_root: &Path,
     unit: &crate::workflow::WorkUnit,
@@ -5867,10 +5974,6 @@ fn configure_control_removal_diagnostic_edit_candidates(
         || receipt.coverage != crate::workflow::ObservationCoverage::Ranges
         || receipt.path != unit.path
     {
-        return Ok(0);
-    }
-    let protected = removed_control_state_identifiers(feedback, task);
-    if protected.is_empty() {
         return Ok(0);
     }
     let Some(edit) = tools.iter_mut().find(|tool| tool.name == "edit_file") else {
@@ -5889,6 +5992,11 @@ fn configure_control_removal_diagnostic_edit_candidates(
         MAX_READ_FILE_BYTES,
         "diagnostic edit candidate target",
     )?;
+    let total_lines = text.lines().count().max(usize::from(!text.is_empty()));
+    let diagnostic_lines = diagnostic_line_numbers(&unit.path, feedback, total_lines);
+    if diagnostic_lines.is_empty() {
+        return Ok(0);
+    }
     let mut line_starts = vec![0usize];
     line_starts.extend(
         text.match_indices('\n')
@@ -5900,62 +6008,35 @@ fn configure_control_removal_diagnostic_edit_candidates(
         (start, end)
     };
     let mut candidates = Vec::<String>::new();
-    for identifier in &protected {
-        for (offset, _) in text.match_indices(identifier) {
-            let before = text[..offset].chars().next_back();
-            let end = offset.saturating_add(identifier.len());
-            let after = text[end..].chars().next();
-            let is_identifier_char = |character: char| {
-                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
-            };
-            if before.is_some_and(is_identifier_char) || after.is_some_and(is_identifier_char) {
-                continue;
+    for diagnostic_line in &diagnostic_lines {
+        let line = diagnostic_line.saturating_sub(1);
+        let span =
+            diagnostic_conditional_span(&text, &line_starts, line, task, receipt, old_text_limit)
+                .or_else(|| {
+                    diagnostic_markup_span(&text, &line_starts, line, task, receipt, old_text_limit)
+                })
+                .unwrap_or_else(|| line_span(line));
+        let (start, end) = span;
+        if end > start
+            && end.saturating_sub(start) <= old_text_limit
+            && diagnostic_edit_candidate_within_observation(receipt, start, end)
+        {
+            let candidate = text[start..end].to_string();
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
             }
-            let line = line_starts
-                .partition_point(|start| *start <= offset)
-                .saturating_sub(1);
-            let mut enclosing = None::<(usize, usize)>;
-            for opening_line in (line.saturating_sub(32)..=line).rev() {
-                let (opening_start, opening_end) = line_span(opening_line);
-                let opening = &text[opening_start..opening_end];
-                let Some(tag) = html_opening_tag_name(opening) else {
-                    continue;
-                };
-                if opening.contains("/>") || task_line_windows(task, opening, 1).is_empty() {
-                    continue;
-                }
-                let closing = format!("</{tag}>");
-                let Some(closing_line) = (line..line.saturating_add(64).min(line_starts.len()))
-                    .find(|candidate| {
-                        let (start, end) = line_span(*candidate);
-                        text[start..end].contains(&closing)
-                    })
-                else {
-                    continue;
-                };
-                let (_, closing_end) = line_span(closing_line);
-                if closing_end.saturating_sub(opening_start) <= old_text_limit
-                    && diagnostic_edit_candidate_within_observation(
-                        receipt,
-                        opening_start,
-                        closing_end,
-                    )
-                {
-                    // Keep walking outward. The largest task-named enclosing control removes its
-                    // complete visual shell instead of leaving an empty label or decoration.
-                    enclosing = Some((opening_start, closing_end));
-                }
-            }
-            let (start, end) = enclosing.unwrap_or_else(|| line_span(line));
-            if end > start
-                && end.saturating_sub(start) <= old_text_limit
-                && diagnostic_edit_candidate_within_observation(receipt, start, end)
-            {
-                let candidate = text[start..end].to_string();
-                if !candidates.contains(&candidate) {
-                    candidates.push(candidate);
-                }
-            }
+        }
+    }
+    let missing = missing_identifiers(feedback);
+    let protected = removed_control_state_identifiers(feedback, task);
+    if !missing.is_empty()
+        && protected.is_empty()
+        && let Some((start, end)) =
+            diagnostic_prior_anchor_span(&text, &line_starts, receipt, &diagnostic_lines)
+    {
+        let anchor = text[start..end].to_string();
+        if !candidates.contains(&anchor) {
+            candidates.push(anchor);
         }
     }
     candidates.sort_by_key(|candidate| (candidate.len(), candidate.clone()));
@@ -5968,7 +6049,7 @@ fn configure_control_removal_diagnostic_edit_candidates(
     if let Some(property) = edit.input_schema.pointer_mut("/properties/old_text") {
         property["enum"] = json!(candidates);
         property["description"] = json!(format!(
-            "Choose one of {count} compact controller-derived exact current snippets that contains a failed control-state caller. Do not invent a declaration or anchor. For a visible caller, remove the enclosing task-named control block; for a non-UI caller, replace the listed statement with a stable value."
+            "Choose one of {count} compact controller-derived exact current snippets for the located diagnostic. Do not invent or select an unrelated anchor. A genuine missing-name repair may also offer one preceding declaration anchor; a visible control caller is represented by its complete task-named markup block."
         ));
     }
     edit.description.push_str(
@@ -7977,7 +8058,7 @@ fn run_agent_steps(
                     &receipt,
                     retained_prior_anchor,
                 );
-                configure_control_removal_diagnostic_edit_candidates(
+                configure_diagnostic_edit_candidates(
                     &mut scoped_tools,
                     workspace_root,
                     unit,
@@ -19599,13 +19680,13 @@ fn maybe_inject_controller_review_observations(
     Ok(true)
 }
 
-fn diagnostic_line_windows(
+fn diagnostic_line_numbers(
     path: &str,
     feedback: Option<&str>,
     total_lines: usize,
-) -> Vec<(usize, usize)> {
+) -> BTreeSet<usize> {
     let Some(feedback) = feedback else {
-        return Vec::new();
+        return BTreeSet::new();
     };
     let escaped = regex::escape(path);
     let patterns = [
@@ -19627,7 +19708,15 @@ fn diagnostic_line_windows(
             }
         }
     }
-    let mut windows = lines
+    lines
+}
+
+fn diagnostic_line_windows(
+    path: &str,
+    feedback: Option<&str>,
+    total_lines: usize,
+) -> Vec<(usize, usize)> {
+    let mut windows = diagnostic_line_numbers(path, feedback, total_lines)
         .into_iter()
         .map(|line| {
             (
@@ -20324,7 +20413,7 @@ fn maybe_inject_controller_read_observation(
         &candidate.receipt,
         candidate.retained_prior_anchor,
     );
-    configure_control_removal_diagnostic_edit_candidates(
+    configure_diagnostic_edit_candidates(
         &mut candidate_tools,
         workspace_root,
         &candidate_unit,
@@ -27657,8 +27746,12 @@ the next imagined action"#;
         }];
         let mut tools = all_builtin_tool_specs();
         apply_mutation_payload_limit(&mut tools, 2_048);
-        let feedback = "Cannot find name 'branch'.\nCannot find name 'setBranch'.";
-        let count = configure_control_removal_diagnostic_edit_candidates(
+        let feedback = concat!(
+            "game.js:2: Cannot find name 'branch'.\n",
+            "game.js:7: Cannot find name 'branch'.\n",
+            "game.js:8: Cannot find name 'setBranch'.",
+        );
+        let count = configure_diagnostic_edit_candidates(
             &mut tools,
             repo.path(),
             &unit,
@@ -27702,7 +27795,7 @@ the next imagined action"#;
         unit.state = crate::workflow::WorkUnitState::MutationReady;
         let mut ordinary_tools = all_builtin_tool_specs();
         assert_eq!(
-            configure_control_removal_diagnostic_edit_candidates(
+            configure_diagnostic_edit_candidates(
                 &mut ordinary_tools,
                 repo.path(),
                 &unit,
@@ -27722,6 +27815,154 @@ the next imagined action"#;
                 .pointer("/properties/old_text/enum")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn located_jsx_repair_excludes_unrelated_retained_declaration_anchor() {
+        let repo = init_contract_test_repo();
+        let text = concat!(
+            "export function ProjectPage() {\n",
+            "  const defaultBranch = \"main\";\n",
+            "  return (\n",
+            "    {project && (\n",
+            "      {/* Branch selector removed */}              )}\n",
+            "  );\n",
+            "}\n",
+        );
+        std::fs::write(repo.path().join("game.js"), text).unwrap();
+        let unit = crate::workflow::WorkUnit {
+            id: "path:0".to_string(),
+            plan_step_id: "step".to_string(),
+            contributing_step_ids: Vec::new(),
+            operation: crate::workflow::PlannedChange::Modify,
+            path: "game.js".to_string(),
+            baseline_path_fingerprint: Some("before".to_string()),
+            invocation_path_fingerprint: Some("before".to_string()),
+            current_path_fingerprint: Some("after".to_string()),
+            adopted: false,
+            state: crate::workflow::WorkUnitState::DiagnosticRepairReady,
+        };
+        let declaration_end = text.find("  return").unwrap();
+        let mut receipt =
+            test_controller_receipt(crate::workflow::ObservationRendering::ControllerBlock);
+        receipt.path = unit.path.clone();
+        receipt.coverage = crate::workflow::ObservationCoverage::Ranges;
+        receipt.observed_bytes = text.len();
+        receipt.included_ranges = vec![
+            crate::workflow::ObservationRange {
+                start_byte: 0,
+                end_byte: declaration_end,
+                sha256: format!("{:x}", Sha256::digest(&text.as_bytes()[..declaration_end])),
+            },
+            crate::workflow::ObservationRange {
+                start_byte: declaration_end,
+                end_byte: text.len(),
+                sha256: format!("{:x}", Sha256::digest(&text.as_bytes()[declaration_end..])),
+            },
+        ];
+        let mut tools = all_builtin_tool_specs();
+        apply_mutation_payload_limit(&mut tools, 2_048);
+        assert_eq!(
+            configure_diagnostic_edit_candidates(
+                &mut tools,
+                repo.path(),
+                &unit,
+                &receipt,
+                Some("game.js:4: Type '{} | undefined' is not assignable to ReactNode"),
+                "Remove the branch selector from the project page",
+            )
+            .unwrap(),
+            1
+        );
+        let candidates = tools
+            .iter()
+            .find(|tool| tool.name == "edit_file")
+            .unwrap()
+            .input_schema
+            .pointer("/properties/old_text/enum")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(
+            candidates,
+            &vec![json!(concat!(
+                "    {project && (\n",
+                "      {/* Branch selector removed */}              )}\n",
+            ))]
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.as_str().unwrap().contains("defaultBranch"))
+        );
+    }
+
+    #[test]
+    fn missing_name_repair_keeps_one_exact_preceding_insertion_anchor() {
+        let repo = init_contract_test_repo();
+        let text = concat!(
+            "export function ProjectPage() {\n",
+            "  useProjectFinishNotifications();\n",
+            "\n",
+            "  send({\n",
+            "    branch: defaultBranch,\n",
+            "  });\n",
+            "}\n",
+        );
+        std::fs::write(repo.path().join("game.js"), text).unwrap();
+        let unit = crate::workflow::WorkUnit {
+            id: "path:0".to_string(),
+            plan_step_id: "step".to_string(),
+            contributing_step_ids: Vec::new(),
+            operation: crate::workflow::PlannedChange::Modify,
+            path: "game.js".to_string(),
+            baseline_path_fingerprint: Some("before".to_string()),
+            invocation_path_fingerprint: Some("before".to_string()),
+            current_path_fingerprint: Some("after".to_string()),
+            adopted: false,
+            state: crate::workflow::WorkUnitState::DiagnosticRepairReady,
+        };
+        let caller_start = text.find("  send").unwrap();
+        let mut receipt =
+            test_controller_receipt(crate::workflow::ObservationRendering::ControllerBlock);
+        receipt.path = unit.path.clone();
+        receipt.coverage = crate::workflow::ObservationCoverage::Ranges;
+        receipt.observed_bytes = text.len();
+        receipt.included_ranges = vec![
+            crate::workflow::ObservationRange {
+                start_byte: 0,
+                end_byte: caller_start,
+                sha256: format!("{:x}", Sha256::digest(&text.as_bytes()[..caller_start])),
+            },
+            crate::workflow::ObservationRange {
+                start_byte: caller_start,
+                end_byte: text.len(),
+                sha256: format!("{:x}", Sha256::digest(&text.as_bytes()[caller_start..])),
+            },
+        ];
+        let mut tools = all_builtin_tool_specs();
+        apply_mutation_payload_limit(&mut tools, 2_048);
+        assert_eq!(
+            configure_diagnostic_edit_candidates(
+                &mut tools,
+                repo.path(),
+                &unit,
+                &receipt,
+                Some("game.js:5: Cannot find name 'defaultBranch'."),
+                "Remove the branch selector from the project page",
+            )
+            .unwrap(),
+            2
+        );
+        let candidates = tools
+            .iter()
+            .find(|tool| tool.name == "edit_file")
+            .unwrap()
+            .input_schema
+            .pointer("/properties/old_text/enum")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(candidates.contains(&json!("    branch: defaultBranch,\n")));
+        assert!(candidates.contains(&json!("  useProjectFinishNotifications();\n")));
     }
 
     #[test]

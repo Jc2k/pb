@@ -287,12 +287,14 @@ For control-removal tasks, missing value/setter diagnostics explicitly forbid re
 interactive state: UI callers are removed while non-UI consumers receive a stable replacement. The
 same paired missing identifiers are rejected at the `edit_file` execution boundary if a repair tries
 to reintroduce them under different syntax, so ignored prose guidance cannot restore a no-op control.
-For a ranged repair of that exact failure class, the native `old_text` collar is narrowed to at most
-eight compact, current snippets containing the failed callers. These are extracted only from the
-controller-observed ranges and prefer a complete task-named markup control over an isolated JSX
-attribute. This is a per-diagnostic choice set, not an exhaustive repository-path or edit schema: an
-invented declaration or stale anchor is structurally unavailable without listing repository
-permutations.
+For any ranged repair with located diagnostics, the native `old_text` collar is narrowed to at most
+eight compact, current snippets derived from the exact failing lines. These are extracted only from
+the controller-observed ranges, prefer the smallest meaningful conditional or complete task-named
+markup control over an isolated JSX attribute, and exclude unrelated retained context. A genuine
+missing-name diagnostic may add one exact preceding declaration anchor for insertion; a paired
+value/setter removal never does. This is a per-diagnostic choice set, not an exhaustive
+repository-path or edit schema: an invented declaration, unrelated edit, or stale anchor is
+structurally unavailable without listing repository permutations.
 Before injecting that observation, pb removes superseded controller bytes and the prior mutation
 call/result for the same path from the model prompt; their durable events and gate effects remain
 recorded, but stale text cannot compete with the current file in the next repair inference. The
