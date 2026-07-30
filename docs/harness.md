@@ -448,7 +448,8 @@ structurally impossible instead of spending a turn and rejecting it only after g
 completed explicit excerpt has no continuation into the remainder of the file.
 After a partial mutation recovered from a constraint dead-end, pb discards the pre-mutation
 controller ranges and observes the current target again before another teammate inference. That
-continuation is restricted to `edit_file`; the rejected multi-hunk patch grammar is not re-entered.
+continuation is restricted to a capped target `read_file` excerpt or `edit_file`; the rejected
+multi-hunk patch grammar is not re-entered.
 
 Creation units execute one controller-bound path per model action, so an unknown multi-file payload
 cannot consume the turn before the first accepted-plan path is complete. One real content/evidence

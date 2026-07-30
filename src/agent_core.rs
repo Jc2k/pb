@@ -5768,8 +5768,8 @@ fn scope_tools_to_partial_recovery_continuation(
     {
         return;
     }
-    tools.retain(|tool| tool.name == "edit_file");
-    if let Some(edit) = tools.first_mut() {
+    tools.retain(|tool| matches!(tool.name.as_str(), "read_file" | "edit_file"));
+    if let Some(edit) = tools.iter_mut().find(|tool| tool.name == "edit_file") {
         edit.description.push_str(
             " A previous constraint recovery already made one useful replacement on this path. Continue from the fresh controller bytes with one smallest exact replacement; do not restart a multi-hunk patch.",
         );
@@ -7829,6 +7829,10 @@ fn run_agent_steps(
         let progress_before_action = progress_state(workspace_root, &gate_state)?;
         let defer_ranged_read = active_work_unit.as_ref().is_some_and(|unit| {
             unit.state == crate::workflow::WorkUnitState::MutationReady
+                && !gate_state
+                    .borrow()
+                    .pending_work_unit_continuations
+                    .contains(&unit.path)
                 && gate_state
                     .borrow()
                     .controller_observation_for_path(&unit.path)
@@ -26455,6 +26459,19 @@ mod tests {
         assert!(!output_requests_read_before_mutation(
             "I can make the bounded edit now. <tool_call>{\"name\":\"apply_patch\""
         ));
+
+        let gate = GateState {
+            pending_work_unit_continuations: BTreeSet::from([unit.path.clone()]),
+            ..GateState::default()
+        };
+        scope_tools_to_partial_recovery_continuation(&mut tools, &unit, &gate);
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "edit_file"]
+        );
     }
 
     #[test]
