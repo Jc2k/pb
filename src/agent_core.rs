@@ -7625,7 +7625,7 @@ fn run_agent_steps(
                     })
                     .unwrap_or_default();
                 let diagnostic_strategy =
-                    missing_identifier_repair_guidance(diagnostic_feedback.as_deref())
+                    missing_identifier_repair_guidance(diagnostic_feedback.as_deref(), &args.task)
                         .map(|guidance| format!(" {guidance}"))
                         .unwrap_or_default();
                 let instruction = match (unit.operation, unit.state) {
@@ -19382,7 +19382,7 @@ fn diagnostic_line_windows(
     merged
 }
 
-fn missing_identifier_repair_guidance(feedback: Option<&str>) -> Option<String> {
+fn missing_identifier_repair_guidance(feedback: Option<&str>, task: &str) -> Option<String> {
     let feedback = feedback?;
     let mut names = BTreeSet::new();
     for remainder in feedback.split("Cannot find name '").skip(1) {
@@ -19395,8 +19395,16 @@ fn missing_identifier_repair_guidance(feedback: Option<&str>) -> Option<String> 
     if names.is_empty() {
         return None;
     }
+    let task = task.to_ascii_lowercase();
+    let removes_control = ["remove", "delete"].iter().any(|term| task.contains(term))
+        && ["selector", "dropdown", "control", "input"]
+            .iter()
+            .any(|term| task.contains(term));
+    let removal_strategy = removes_control.then_some(
+        " This task removes an interactive control: do not recreate the removed value/setter state. Remove its remaining UI callers and give any non-UI downstream consumer a stable replacement.",
+    ).unwrap_or_default();
     Some(format!(
-        "The current checks show surviving callers of missing identifier(s): {}. Repair the definition or replace it with a compatible stable value when the removed user control previously supplied it; do not delete unrelated callers merely to silence the diagnostics. The accepted plan's wording does not authorize a compile regression. If the latest ranges show only callers, use the bounded read tool around the component or function declaration area to obtain one current insertion anchor.",
+        "The current checks show surviving callers of missing identifier(s): {}. Repair the definition or replace it with a compatible stable value when the removed user control previously supplied it; do not delete unrelated callers merely to silence the diagnostics.{removal_strategy} The accepted plan's wording does not authorize a compile regression. If the latest ranges show only callers, use the bounded read tool around the component or function declaration area to obtain one current insertion anchor.",
         names.into_iter().collect::<Vec<_>>().join(", ")
     ))
 }
@@ -19431,7 +19439,9 @@ fn prior_repair_context_window(
                 .count()
                 .saturating_add(1)
                 .min(total_lines);
-            (end_line < first_diagnostic_line).then_some((start_line, end_line))
+            let preceding_end = end_line.min(first_diagnostic_line.saturating_sub(1));
+            (start_line < first_diagnostic_line && start_line <= preceding_end)
+                .then_some((start_line, preceding_end))
         })
         .max_by_key(|(_, end)| *end)
         .map(|(start, end)| (start.max(end.saturating_sub(39)), end))
@@ -27282,13 +27292,42 @@ the next imagined action"#;
         );
 
         assert_eq!(windows, vec![(20, 51), (68, 92)]);
-        let guidance = missing_identifier_repair_guidance(Some(
-            "Cannot find name 'answer'.\nCannot find name 'answer'.",
-        ))
+        let guidance = missing_identifier_repair_guidance(
+            Some("Cannot find name 'answer'.\nCannot find name 'answer'."),
+            "Remove the answer selector",
+        )
         .unwrap();
         assert!(guidance.contains("answer"));
         assert!(guidance.contains("stable value"));
         assert!(guidance.contains("does not authorize a compile regression"));
+        assert!(guidance.contains("do not recreate the removed value/setter state"));
+
+        let overlapping_text = (1..=240)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let overlapping_start = overlapping_text
+            .lines()
+            .take(144)
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+        let overlapping_end = overlapping_text
+            .lines()
+            .take(204)
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+        prior.included_ranges = vec![crate::workflow::ObservationRange {
+            start_byte: overlapping_start,
+            end_byte: overlapping_end,
+            sha256: "e".repeat(64),
+        }];
+        let overlapping = diagnostic_repair_line_windows(
+            "game.ts",
+            Some("game.ts:191:7 Cannot find name 'answer'."),
+            &overlapping_text,
+            240,
+            Some(&prior),
+        );
+        assert_eq!(overlapping, vec![(145, 203)]);
     }
 
     #[test]

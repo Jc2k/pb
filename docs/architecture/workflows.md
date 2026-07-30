@@ -273,13 +273,17 @@ When the current diagnostic evidence contains only bounded ranges, the repair tu
 for cases where diagnostics show callers but omit the declaration or insertion area. Whole-file
 replacement and arbitrary patch tools are omitted because the controller cannot authorize their
 unseen context; a useful partial edit earns a fresh ranged turn for any remaining diagnostic. Each
-fresh diagnostic observation also re-reads one nearest preceding range from the prior observation,
-which commonly retains the current declaration area without replaying stale bytes. Before injecting
-that observation, pb removes superseded controller bytes and the prior mutation call/result for the
-same path from the model prompt; their durable events and gate effects remain recorded, but stale
-text cannot compete with the current file in the next repair inference. The repair schema makes
-`old_text` structurally non-empty, while its correction defines the safe insertion idiom: `new_text`
-preserves a current anchor while adding adjacent text. Empty-match insertion remains unavailable.
+fresh diagnostic observation also re-reads one nearest preceding range from the prior observation.
+If that range overlaps the first diagnostic window, pb retains its fresh pre-diagnostic prefix rather
+than discarding the whole range; this keeps a nearby declaration area without replaying stale bytes.
+For control-removal tasks, missing value/setter diagnostics explicitly forbid recreating the removed
+interactive state: UI callers are removed while non-UI consumers receive a stable replacement.
+Before injecting that observation, pb removes superseded controller bytes and the prior mutation
+call/result for the same path from the model prompt; their durable events and gate effects remain
+recorded, but stale text cannot compete with the current file in the next repair inference. The
+repair schema makes `old_text` structurally non-empty, while its correction defines the safe
+insertion idiom: `new_text` preserves a current anchor while adding adjacent text. Empty-match
+insertion remains unavailable.
 If an `apply_patch` or `replace_file` generation reaches a native constraint dead end before forming
 an executable call, its one bounded recovery switches to the smaller `edit_file` operation when
 available. This keeps a large observed file from retrying a whole-file construction that cannot fit

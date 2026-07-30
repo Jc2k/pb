@@ -995,8 +995,11 @@ edit. Inline completion also runs diagnostic-eligible checks before handoff; fai
 exact output into target-bound repair, where controller-selected line windows replace whole-file
 rediscovery and `request_replan` is withheld for the already-authorized diagnostic path. Range-only
 repair keeps `old_text` structurally non-empty, refreshes one nearest preceding observation window
-to retain a likely declaration anchor, and exposes only a line-centered capped read when the
-diagnostic windows still show callers without the insertion area.
+to retain a likely declaration anchor (including the fresh prefix of a range that overlaps the first
+diagnostic), and exposes only a line-centered capped read when the diagnostic windows still show
+callers without the insertion area. When a removed control leaves missing value/setter callers, the
+repair guidance forbids recreating that state and distinguishes removable UI callers from non-UI
+consumers that need a stable replacement.
 
 Recoverable structured-action failures are emitted as Trinity corrections rather than parallel
 generic error events. The error outcome remains durable when retries are exhausted, but the session
