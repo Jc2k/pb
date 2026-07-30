@@ -597,12 +597,15 @@ authoritative. Identical replacements and edits fail without emitting a diff or 
 existing evidence.
 
 Contract checks marked `diagnostic_eligible` run automatically after the queue is structurally
-complete. Preview results are fingerprint-bound feedback only: they never enter selected-check
-evidence and all required checks run again in the authoritative checking stage. A failed preview
-can reopen only an exact current task path named as a complete diagnostic token. Earlier read
-evidence for that path is invalidated; after a fresh complete read, repair uses a bounded replace or
-edit even when the original plan operation created the file. A missing diagnostic target requires a
-replan. The preview command must preserve repository content and Git control state.
+complete. When workspace discovery selected an affected project type-check or web check, pb may
+also run at most one of those high-signal checks as an early preview even without contract opt-in;
+it is capped at 60 seconds. Preview results are fingerprint-bound feedback only: they never enter
+selected-check evidence and all required checks run again in the authoritative checking stage. A
+failed preview can reopen only an exact current task path named as a complete diagnostic token.
+Earlier read evidence for that path is invalidated; the repair controller supplies current focused
+diagnostic ranges and exposes only path-bound mutation tools for that observed repair. A missing
+diagnostic target requires a replan. The preview command must preserve repository content and Git
+control state.
 
 Proactive LSP diagnostics run immediately before these configured diagnostic previews. A syntax
 pass is intentionally narrow during partial implementation; a settled pass includes every
@@ -625,6 +628,12 @@ them only after the mutation succeeds. At code review, pb similarly projects the
 while the fresh reviewer owns assessments, findings, and verdict. Existing artifact validators still
 reject missing steps, paths outside the plan, stale state, incomplete work, or unsupported review
 conclusions.
+
+When a constrained mutation branch becomes irreparable, an `edit_file` recovery is treated as one
+bounded replacement rather than proof that the path-level work unit is complete. Its retry schema
+omits inline completion, and pb reopens and re-observes the unit before allowing closure. This is
+true both for an `apply_patch`-to-`edit_file` fallback and for an `edit_file` retry after the same
+constraint dead end.
 
 ### Deterministic controller actions
 

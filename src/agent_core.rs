@@ -47,7 +47,7 @@ use crate::agent_repository::{self, ChangeManifest, RepositoryBrief};
 use crate::agent_tool_errors::{self, ToolFailureReason};
 use crate::checks::{
     CheckEvidenceLedger, EvidenceSource, WorkspaceCheckRuntime, check_evidence_is_current,
-    plan_checks_with_required,
+    plan_checks, plan_checks_with_required,
 };
 use crate::container;
 use crate::energy::{self, EnergyEstimate};
@@ -5656,6 +5656,26 @@ fn scope_tools_to_controller_observation(
     unit: &crate::workflow::WorkUnit,
     receipt: &crate::workflow::ControllerObservationReceipt,
 ) -> bool {
+    if unit.state == crate::workflow::WorkUnitState::DiagnosticRepairReady
+        && receipt.path == unit.path
+    {
+        // The controller already supplied the exact current diagnostic windows for this repair.
+        // Re-exposing read_file here invites the model to rediscover the same path instead of
+        // applying the bounded fix. The existing work-unit scope has already limited this turn to
+        // path-bound mutation tools.
+        tools.retain(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "replace_file" | "edit_file" | "apply_patch"
+            )
+        });
+        for tool in tools.iter_mut() {
+            tool.description.push_str(
+                " The controller already supplied current diagnostic evidence for this path; repair it directly without another read.",
+            );
+        }
+        return false;
+    }
     if receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
         scope_tools_to_ranged_work_unit(tools, available_tools);
         return false;
@@ -11468,6 +11488,14 @@ fn bounded_mutation_retry_action_error(
     None
 }
 
+fn recovery_mutation_requires_follow_up(
+    rejected_tool: &str,
+    recovery_tool: &str,
+    constraint_dead_end: bool,
+) -> bool {
+    recovery_tool != rejected_tool || constraint_dead_end && recovery_tool == "edit_file"
+}
+
 fn stable_hash(value: &(impl Hash + ?Sized)) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -11760,15 +11788,22 @@ fn run_work_unit_diagnostic_previews(
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<Option<String>> {
-    let Some(contract) = args.contract.as_ref() else {
+    if !ledger.structurally_complete() {
         return Ok(None);
-    };
-    let checks = contract
-        .checks
+    }
+    let mut checks = args
+        .contract
         .iter()
+        .flat_map(|contract| contract.checks.iter())
         .filter(|check| check.diagnostic_eligible)
+        .cloned()
         .collect::<Vec<_>>();
-    if checks.is_empty() || !ledger.structurally_complete() {
+    if let Some(check) = discovered_diagnostic_preview_check(args)?
+        && !checks.iter().any(|candidate| candidate.id == check.id)
+    {
+        checks.push(check);
+    }
+    if checks.is_empty() {
         return Ok(None);
     }
     let current = crate::workspace::ContentSnapshot::capture(workspace_root)?;
@@ -11786,7 +11821,7 @@ fn run_work_unit_diagnostic_previews(
     let control_before = git_control_state(workspace_root)?;
     let mut failed = Vec::new();
     let mut focused_paths = BTreeSet::new();
-    for check in checks {
+    for check in &checks {
         let output = backend.exec_check(check, workspace_root)?;
         let success = output.exit_status == 0 && !output.timed_out && !output.cancelled;
         sink.emit(AgentEvent::CheckResult {
@@ -11820,7 +11855,7 @@ fn run_work_unit_diagnostic_previews(
                 "{} (status {}): {}",
                 check.id,
                 output.exit_status,
-                output.output.trim()
+                compact_check_failure_output(&output.output)
             ));
         }
     }
@@ -11861,6 +11896,67 @@ fn run_work_unit_diagnostic_previews(
             failed.join("\n")
         )))
     }
+}
+
+const DISCOVERED_DIAGNOSTIC_PREVIEW_TIMEOUT_SECONDS: u64 = 60;
+
+fn discovered_diagnostic_preview_check(
+    args: &AgentRequest,
+) -> Result<Option<crate::harness_contract::AgentCheckContract>> {
+    let (Some(graph), Some(repository)) = (
+        args.workspace_graph.as_ref(),
+        args.repository_context.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let plan = plan_checks(graph, repository)?;
+    let selected = plan
+        .checks
+        .iter()
+        .filter_map(|check_id| graph.checks.get(check_id))
+        .filter(|check| {
+            graph
+                .executors
+                .get(&check.executor)
+                .is_some_and(|executor| executor.kind == crate::workspace::ExecutorKind::Project)
+        })
+        .filter_map(|check| {
+            let descriptor =
+                format!("{} {} {}", check.id, check.label, check.command).to_ascii_lowercase();
+            let priority = if [
+                "typecheck",
+                "type-check",
+                "type_check",
+                "deno check",
+                " tsc",
+                "test:web",
+                "test:webui",
+                "check:web",
+                "lint:web",
+            ]
+            .iter()
+            .any(|needle| descriptor.contains(needle))
+            {
+                0
+            } else {
+                return None;
+            };
+            Some((priority, check.id.clone(), check))
+        })
+        .min_by_key(|(priority, id, _)| (*priority, id.clone()))
+        .map(|(_, _, check)| check);
+    Ok(
+        selected.map(|check| crate::harness_contract::AgentCheckContract {
+            id: check.id.clone(),
+            command: check.command.clone(),
+            cwd: check.cwd.clone(),
+            required: false,
+            diagnostic_eligible: true,
+            timeout_seconds: check
+                .timeout_seconds
+                .min(DISCOVERED_DIAGNOSTIC_PREVIEW_TIMEOUT_SECONDS),
+        }),
+    )
 }
 
 fn record_progress_warning(
@@ -13623,40 +13719,49 @@ fn failed_check_support_material(
         .collect::<BTreeSet<_>>();
     let mut support_paths = BTreeSet::new();
     for failure in failures {
-        for token in failure.output.replace('\\', "/").split(|character: char| {
-            character.is_whitespace()
-                || matches!(
-                    character,
-                    ':' | '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
-                )
-        }) {
-            if token.is_empty() || token == "file" {
-                continue;
-            }
-            let candidate = Path::new(token);
-            if !candidate.is_absolute() && !token.starts_with("./") && !token.contains('/') {
-                continue;
-            }
-            let Ok(resolved) = resolve_workspace_path(&canonical_root, token, true) else {
-                continue;
-            };
-            let Ok(relative) = resolved.strip_prefix(&canonical_root) else {
-                continue;
-            };
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            if relative.starts_with(".git/") || changed_paths.contains(relative.as_str()) {
-                continue;
-            }
-            let Ok(metadata) = std::fs::symlink_metadata(&resolved) else {
-                continue;
-            };
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.len() > MAX_DIAGNOSTIC_SUPPORT_FILE_BYTES
+        for line in failure.output.replace('\\', "/").lines() {
+            let trimmed = line.trim_start();
+            if ["Check ", "Download ", "Initialize ", "Task "]
+                .iter()
+                .any(|prefix| trimmed.starts_with(prefix))
             {
                 continue;
             }
-            support_paths.insert(relative);
+            for token in line.split(|character: char| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        ':' | '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                    )
+            }) {
+                if token.is_empty() || token == "file" {
+                    continue;
+                }
+                let candidate = Path::new(token);
+                if !candidate.is_absolute() && !token.starts_with("./") && !token.contains('/') {
+                    continue;
+                }
+                let Ok(resolved) = resolve_workspace_path(&canonical_root, token, true) else {
+                    continue;
+                };
+                let Ok(relative) = resolved.strip_prefix(&canonical_root) else {
+                    continue;
+                };
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if relative.starts_with(".git/") || changed_paths.contains(relative.as_str()) {
+                    continue;
+                }
+                let Ok(metadata) = std::fs::symlink_metadata(&resolved) else {
+                    continue;
+                };
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || metadata.len() > MAX_DIAGNOSTIC_SUPPORT_FILE_BYTES
+                {
+                    continue;
+                }
+                support_paths.insert(relative);
+            }
         }
     }
 
@@ -13689,6 +13794,54 @@ fn failed_check_support_material(
         ));
     }
     rendered
+}
+
+fn failed_check_feedback_details(failures: &[crate::checks::CheckFailureSummary]) -> String {
+    let mut details = failures
+        .iter()
+        .filter(|failure| failure.skip_reason.is_none())
+        .map(|failure| {
+            format!(
+                "- {} (exit {}, timed_out={}): {}",
+                failure.check_id,
+                failure.exit_status,
+                failure.timed_out,
+                compact_check_failure_output(&failure.output)
+            )
+        })
+        .collect::<Vec<_>>();
+    let skipped = failures
+        .iter()
+        .filter(|failure| failure.skip_reason.is_some())
+        .count();
+    if skipped > 0 {
+        details.push(format!(
+            "- {skipped} dependent check(s) were skipped after an earlier failure."
+        ));
+    }
+    details.join("\n")
+}
+
+fn compact_check_failure_output(output: &str) -> String {
+    let mut compact = String::new();
+    let mut previous_blank = false;
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        if ["Check ", "Download ", "Initialize ", "Task "]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+        {
+            continue;
+        }
+        let blank = trimmed.is_empty();
+        if blank && (compact.is_empty() || previous_blank) {
+            continue;
+        }
+        compact.push_str(line.trim_end());
+        compact.push('\n');
+        previous_blank = blank;
+    }
+    truncate_chars(compact.trim(), 4_000)
 }
 
 fn run_delivery_checks(
@@ -13820,23 +13973,13 @@ fn run_delivery_checks(
     {
         return Ok(None);
     }
-    let failure_details = summary
+    let direct_failures = summary
         .failures
         .iter()
-        .map(|failure| {
-            format!(
-                "- {} (exit {}, timed_out={}): {}",
-                failure.check_id,
-                failure.exit_status,
-                failure.timed_out,
-                failure
-                    .skip_reason
-                    .as_deref()
-                    .unwrap_or(failure.output.trim())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .filter(|failure| failure.skip_reason.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let failure_details = failed_check_feedback_details(&summary.failures);
     let changed_paths = run
         .repository
         .task_baseline
@@ -13844,7 +13987,7 @@ fn run_delivery_checks(
         .changed_paths(&content_after);
     let diagnostic_paths = failed_check_repair_paths(
         &changed_paths,
-        &summary.failures,
+        &direct_failures,
         contract.map(|contract| contract.allowed_paths.as_slice()),
     );
     let diagnostic_focus = if diagnostic_paths.is_empty() {
@@ -13856,7 +13999,7 @@ fn run_delivery_checks(
         )
     };
     let diagnostic_support =
-        failed_check_support_material(workspace_root, &changed_paths, &summary.failures);
+        failed_check_support_material(workspace_root, &changed_paths, &direct_failures);
     let feedback = format!("{failure_details}{diagnostic_focus}{diagnostic_support}");
     if run.work_units.is_initialized() && !diagnostic_paths.is_empty() {
         let diagnostic_path_set = diagnostic_paths.iter().collect::<BTreeSet<_>>();
@@ -16868,11 +17011,17 @@ fn generate_and_parse_action_with_retries(
                         .filter(|schema| schema.name == recovery_tool)
                         .cloned()
                         .collect::<Vec<_>>();
-                    if recovery_tool != tool {
+                    if recovery_mutation_requires_follow_up(
+                        tool,
+                        recovery_tool,
+                        constraint_dead_end,
+                    ) {
                         // A smaller single-replacement fallback cannot truthfully prove that a
-                        // rejected multi-hunk patch completed the whole path-level work unit. Keep
+                        // rejected mutation completed the whole path-level work unit. This also
+                        // applies when an edit_file constraint branch retries edit_file: the first
+                        // valid replacement may represent only one of several required hunks. Keep
                         // completion out of this recovery call so the next bounded turn can observe
-                        // the new bytes and finish the remaining hunks explicitly.
+                        // the new bytes and finish the remaining work explicitly.
                         configure_inline_completion_schema(&mut constrained_tools, false);
                         if let Some(path) = target_path.as_deref().or(bound_mutation_path) {
                             gate_state
@@ -26575,6 +26724,7 @@ the next imagined action"#;
 
         receipt.observed_bytes = 4;
         unit.state = crate::workflow::WorkUnitState::DiagnosticRepairReady;
+        receipt.coverage = crate::workflow::ObservationCoverage::Ranges;
         let mut repair_tools = all_builtin_tool_specs();
         apply_mutation_payload_limit(&mut repair_tools, 1_024);
         scope_tools_to_work_unit(&mut repair_tools, &unit, true);
@@ -26584,11 +26734,17 @@ the next imagined action"#;
             &unit,
             &receipt,
         ));
+        assert!(!repair_tools.iter().any(|tool| tool.name == "read_file"));
         assert!(repair_tools.iter().any(|tool| tool.name == "edit_file"));
+        assert!(repair_tools.iter().all(|tool| {
+            tool.description
+                .contains("controller already supplied current diagnostic evidence")
+        }));
 
         unit.state = crate::workflow::WorkUnitState::MutationReady;
         unit.path = "lib.rs".to_string();
         receipt.path = "lib.rs".to_string();
+        receipt.coverage = crate::workflow::ObservationCoverage::Full;
         let mut rust_tools = all_builtin_tool_specs();
         apply_mutation_payload_limit(&mut rust_tools, 1_024);
         scope_tools_to_work_unit(&mut rust_tools, &unit, true);
@@ -27645,11 +27801,13 @@ the next imagined action"#;
         let repo = init_contract_test_repo();
         std::fs::create_dir_all(repo.path().join("tests")).unwrap();
         let support = repo.path().join("tests/component_test.tsx");
+        let unrelated = repo.path().join("tests/unrelated_test.tsx");
         std::fs::write(
             &support,
             "assert(html.includes('class=\"alert alert--error\"'));\n",
         )
         .unwrap();
+        std::fs::write(&unrelated, "throw new Error('not diagnostic context');\n").unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(outside.path(), "private outside evidence\n").unwrap();
         let failures = vec![crate::checks::CheckFailureSummary {
@@ -27657,7 +27815,8 @@ the next imagined action"#;
             exit_status: 1,
             timed_out: false,
             output: format!(
-                "at file://{}:14:3\nat file://{}:1:1",
+                "Check {}\nat file://{}:14:3\nat file://{}:1:1",
+                unrelated.display(),
                 support.display(),
                 outside.path().display()
             ),
@@ -27674,6 +27833,43 @@ the next imagined action"#;
         assert!(material.contains("alert alert--error"));
         assert!(material.contains("grants no mutation, check, review, or completion evidence"));
         assert!(!material.contains("private outside evidence"));
+        assert!(!material.contains("unrelated_test.tsx"));
+        assert!(!material.contains("not diagnostic context"));
+    }
+
+    #[test]
+    fn failed_check_feedback_collapses_dependency_skips() {
+        let details = failed_check_feedback_details(&[
+            crate::checks::CheckFailureSummary {
+                check_id: "typecheck".to_string(),
+                exit_status: 1,
+                timed_out: false,
+                output: "Task test:web deno test webui/src\nCheck webui/src/Noise.test.tsx\nsrc/App.tsx:12: missing name"
+                    .to_string(),
+                skip_reason: None,
+            },
+            crate::checks::CheckFailureSummary {
+                check_id: "test".to_string(),
+                exit_status: 125,
+                timed_out: false,
+                output: String::new(),
+                skip_reason: Some("dependency failure: typecheck".to_string()),
+            },
+            crate::checks::CheckFailureSummary {
+                check_id: "docs".to_string(),
+                exit_status: 125,
+                timed_out: false,
+                output: String::new(),
+                skip_reason: Some("dependency failure: test".to_string()),
+            },
+        ]);
+
+        assert!(details.contains("typecheck (exit 1"));
+        assert!(!details.contains("Noise.test.tsx"));
+        assert!(!details.contains("Task test:web"));
+        assert!(details.contains("2 dependent check(s) were skipped"));
+        assert!(!details.contains("dependency failure:"));
+        assert!(!details.contains("- test"));
     }
 
     #[test]
@@ -28130,6 +28326,67 @@ the next imagined action"#;
     }
 
     #[test]
+    fn discovered_typecheck_previews_inline_completion_without_contract_opt_in() {
+        let repo = init_contract_test_repo();
+        let repository =
+            crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
+        let plan = delivery_plan(
+            Some(("alpha.txt", crate::workflow::PlannedChange::Create)),
+            Vec::new(),
+        );
+        std::fs::write(repo.path().join("alpha.txt"), "broken\n").unwrap();
+        let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
+        let mut ledger = crate::workflow::WorkUnitLedger::from_plan(
+            &plan.id,
+            &plan.sha256,
+            &plan.artifact,
+            &repository.task_baseline.content,
+            &repository.invocation_baseline.content,
+            &current,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(ledger.structurally_complete());
+        let graph = crate::workspace::WorkspaceGraph::legacy(&[
+            "echo 'alpha.txt: type error'; false # typecheck".to_string(),
+        ]);
+        let expected_check_id = graph.checks.keys().next().unwrap().clone();
+        let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        request.repository_context = Some(repository);
+        request.workspace_graph = Some(graph);
+        request.contract = None;
+        let backend = CommandBackend::Local {
+            workspace_root: repo.path().to_path_buf(),
+        };
+        let gate = RefCell::new(GateState::default());
+        let mut events = Vec::new();
+
+        let feedback = run_work_unit_diagnostic_previews(
+            &request,
+            Some(&backend),
+            &mut ledger,
+            &gate,
+            repo.path(),
+            0,
+            &mut |event| events.push(event),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(feedback.contains("alpha.txt"));
+        assert_eq!(ledger.active().unwrap().path, "alpha.txt");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CheckResult {
+                check_id,
+                source: Some(source),
+                ..
+            } if check_id == &expected_check_id && source == "diagnostic_preview"
+        )));
+    }
+
+    #[test]
     fn inline_completion_runs_diagnostics_before_closing_a_partial_mutation() {
         let repo = init_contract_test_repo();
         let original = "const branch = 'main';\nconst defaultBranch = branch;\n";
@@ -28144,7 +28401,7 @@ the next imagined action"#;
             crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
         let plan = delivery_plan(
             Some(("alpha.txt", crate::workflow::PlannedChange::Modify)),
-            vec!["preview".to_string()],
+            Vec::new(),
         );
         let current = crate::workspace::ContentSnapshot::capture(repo.path()).unwrap();
         let ledger = crate::workflow::WorkUnitLedger::from_plan(
@@ -28189,20 +28446,16 @@ the next imagined action"#;
         request.workflow_work_units = Some(ledger);
         request.workflow_stage_evidence = Some(stage_evidence);
         request.repository_context = Some(repository);
+        request.workspace_graph = Some(crate::workspace::WorkspaceGraph::legacy(&[
+            "! grep -Hn branch alpha.txt # typecheck".to_string(),
+        ]));
         request.max_steps = 2;
         request.contract = Some(crate::harness_contract::AgentContract {
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Required,
             allowed_paths: vec!["alpha.txt".to_string()],
             work_unit_guidance: BTreeMap::new(),
-            checks: vec![crate::harness_contract::AgentCheckContract {
-                id: "preview".to_string(),
-                command: "! grep -Hn branch alpha.txt".to_string(),
-                cwd: ".".to_string(),
-                required: true,
-                diagnostic_eligible: true,
-                timeout_seconds: 2,
-            }],
+            checks: Vec::new(),
             commit: crate::harness_contract::HarnessCommitContract::default(),
             review: crate::harness_contract::HarnessReviewContract::default(),
             workspace_clean: false,
@@ -33047,6 +33300,25 @@ the next imagined action"#;
                     && message.contains("same 256-token ceiling")
                     && message.contains("exact original target recovered.txt")
         )));
+    }
+
+    #[test]
+    fn constraint_dead_end_edit_recovery_cannot_close_the_work_unit_inline() {
+        assert!(recovery_mutation_requires_follow_up(
+            "edit_file",
+            "edit_file",
+            true
+        ));
+        assert!(recovery_mutation_requires_follow_up(
+            "apply_patch",
+            "edit_file",
+            true
+        ));
+        assert!(!recovery_mutation_requires_follow_up(
+            "edit_file",
+            "edit_file",
+            false
+        ));
     }
 
     #[test]

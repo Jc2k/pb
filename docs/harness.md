@@ -543,8 +543,10 @@ Automatic observations include an explicit `pb_defect`, `model_limitation`, `exp
 workspaces, and an unfinished run are P2/P3 observations rather than P0/P1 defects. P0/P1 is
 reserved for severe, evidenced pb failures that require immediate supervisor action.
 Successful active-work-unit guidance, unique progress credit, and passing diagnostic previews are
-positive control evidence. A failing preview remains a model limitation and never receives check,
-review, commit, or completion credit.
+positive control evidence. In addition to explicitly eligible contract checks, pb can preview at
+most one affected discovered project type-check or web check before accepting inline completion;
+the preview is capped at 60 seconds. A failing preview remains a model limitation and never
+receives check, review, commit, or completion credit.
 
 The automatic missing-commit observation applies only to a `ready` delivery. Engine errors,
 exhausted repairs, failed checks, and other incomplete outcomes retain their actual terminal cause
