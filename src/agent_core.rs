@@ -5742,14 +5742,20 @@ fn scope_tools_to_controller_observation(
     {
         // The controller already supplied the exact current diagnostic windows for this repair.
         // Re-exposing read_file here invites the model to rediscover the same path instead of
-        // applying the bounded fix. The existing work-unit scope has already limited this turn to
-        // path-bound mutation tools.
-        tools.retain(|tool| {
-            matches!(
-                tool.name.as_str(),
-                "replace_file" | "edit_file" | "apply_patch"
-            )
-        });
+        // applying the bounded fix. A range-only observation also cannot authorize a whole-file
+        // replacement or prove arbitrary patch context, so expose only the exact replacement tool
+        // that the executor can actually honor. A useful partial repair earns another bounded turn
+        // with fresh ranges for any remaining diagnostic.
+        if receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
+            tools.retain(|tool| tool.name == "edit_file");
+        } else {
+            tools.retain(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "replace_file" | "edit_file" | "apply_patch"
+                )
+            });
+        }
         for tool in tools.iter_mut() {
             tool.description.push_str(
                 " The controller already supplied current diagnostic evidence for this path; repair it directly without another read.",
@@ -7605,10 +7611,22 @@ fn run_agent_steps(
                         "Harness diagnostic repair unit {}: read the complete current bytes of {} again. Evidence collected before the failed diagnostic was invalidated. The latest preview may list multiple failed checks; after this read, repair every listed failure together instead of fixing only the first one.{}",
                         unit.id, unit.path, diagnostic_obligations
                     ),
-                    (_, crate::workflow::WorkUnitState::DiagnosticRepairReady) => format!(
-                        "Harness diagnostic repair unit {}: repair only {} with a target-bound mutation tool. Address every failure from the latest diagnostic in one mutation; apply_patch can carry separated hunks when bounded ranges are shown. A partial repair consumes another evidence-and-repair cycle. This repair authority does not reopen any other accepted-plan path. Do not request replan when this exact path can satisfy the listed failures.{}",
-                        unit.id, unit.path, diagnostic_obligations
-                    ),
+                    (_, crate::workflow::WorkUnitState::DiagnosticRepairReady) => {
+                        let repair_shape = if gate_state
+                            .borrow()
+                            .controller_observation_for_path(&unit.path)
+                            .is_some_and(|receipt| {
+                                receipt.coverage == crate::workflow::ObservationCoverage::Ranges
+                            }) {
+                            "Use edit_file for the smallest exact replacement inside one supplied range. If failures span multiple supplied ranges, fix one range now; useful progress earns a fresh bounded turn for the remainder."
+                        } else {
+                            "Address every failure from the latest diagnostic in one mutation; apply_patch can carry separated hunks. A partial repair consumes another evidence-and-repair cycle."
+                        };
+                        format!(
+                            "Harness diagnostic repair unit {}: repair only {} with a target-bound mutation tool. {repair_shape} This repair authority does not reopen any other accepted-plan path. Do not request replan when this exact path can satisfy the listed failures.{}",
+                            unit.id, unit.path, diagnostic_obligations
+                        )
+                    }
                     (
                         crate::workflow::PlannedChange::Create,
                         crate::workflow::WorkUnitState::MutationReady,
@@ -26897,7 +26915,13 @@ the next imagined action"#;
             &receipt,
         ));
         assert!(!repair_tools.iter().any(|tool| tool.name == "read_file"));
-        assert!(repair_tools.iter().any(|tool| tool.name == "edit_file"));
+        assert_eq!(
+            repair_tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["edit_file"]
+        );
         assert!(repair_tools.iter().all(|tool| {
             tool.description
                 .contains("controller already supplied current diagnostic evidence")

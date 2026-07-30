@@ -266,6 +266,10 @@ gate. Diagnostic-eligible checks run before the inline completion can close the 
 preview reopens only the exact diagnosed task path and keeps the edit; a passing preview permits the
 completion without a bookkeeping-only model turn. An invalid object does not roll back or misreport
 the successful mutation; the ordinary bounded submission path stays available on the next turn.
+When the current diagnostic evidence contains only bounded ranges, the repair turn exposes only an
+exact `edit_file` replacement inside those ranges. Whole-file replacement and arbitrary patch tools
+are omitted because the controller cannot authorize their unseen context; a useful partial edit
+earns a fresh ranged turn for any remaining diagnostic.
 If an `apply_patch` or `replace_file` generation reaches a native constraint dead end before forming
 an executable call, its one bounded recovery switches to the smaller `edit_file` operation when
 available. This keeps a large observed file from retrying a whole-file construction that cannot fit
