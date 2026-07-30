@@ -28638,9 +28638,11 @@ the next imagined action"#;
                 .iter()
                 .any(|(_, profile)| **profile == Some(AgentProfile::Review))
         );
-        assert!(controller_observations.iter().any(|(_, profile)| {
-            **profile == Some(AgentProfile::Build)
-        }));
+        assert!(
+            controller_observations
+                .iter()
+                .any(|(_, profile)| { **profile == Some(AgentProfile::Build) })
+        );
         assert!(!events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolCall { tool, .. }

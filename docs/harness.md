@@ -137,9 +137,13 @@ pb harness agent --workspace-config /absolute/path/workspace.toml \
 ```
 
 The file is parsed, validated, and normalized before model loading. Its canonical source path,
-SHA-256, and executor policy are recorded in run metadata. Without it, the harness uses a
-synthetic repository-wide component and local project executor. Workspace configuration defines
-how work is checked; the v1 contract remains the separate source of task-specific acceptance facts.
+SHA-256, and executor policy are recorded in run metadata. Without it, the harness loads repository
+workspace configuration when present and otherwise discovers manifests, components, executors, and
+checks from the isolated workspace before model loading. This matches ordinary delivery check
+selection: a changed path automatically runs its affected discovered checks even when the model did
+not copy check IDs into the plan. An explicit `--workspace-config` remains authoritative and skips
+discovery. Workspace configuration defines how work is checked; the v1 contract remains the
+separate source of task-specific acceptance facts.
 
 An empty `allowed_paths` list means unrestricted paths. Otherwise built-in write tools reject a
 path outside the list before mutation, while `run_command` and final validation detect indirect

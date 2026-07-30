@@ -696,6 +696,21 @@ fn load_goal_context(path: &Path) -> Result<crate::goal::GoalModelBrief> {
     Ok(goal)
 }
 
+fn resolve_harness_workspace_graph(
+    workspace: &Path,
+    trusted_workspace_graph: Option<crate::workspace::WorkspaceGraph>,
+    contract: Option<&crate::harness_contract::AgentContract>,
+) -> Result<crate::workspace::WorkspaceGraph> {
+    let base = match trusted_workspace_graph {
+        Some(graph) => graph,
+        None => crate::workspace::WorkspaceGraph::load_or_discover(workspace, None)?,
+    };
+    contract
+        .map(|contract| contract.compile_workspace_graph(base.clone()))
+        .transpose()
+        .map(|compiled| compiled.unwrap_or(base))
+}
+
 pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     if args.task.trim().is_empty() {
         bail!("harness agent task must not be empty");
@@ -790,13 +805,11 @@ pub fn run_agent_task(args: HarnessAgentArgs) -> Result<()> {
     let turn_max_tokens_cap = args.max_tokens;
     let repository_context = harness_repository_context(&layout)?;
     let prior_check_evidence = load_check_evidence(&layout.events)?;
-    let base_workspace_graph =
-        trusted_workspace_graph.unwrap_or_else(|| crate::workspace::WorkspaceGraph::legacy(&[]));
-    let workspace_graph = contract
-        .as_ref()
-        .map(|contract| contract.compile_workspace_graph(base_workspace_graph.clone()))
-        .transpose()?
-        .unwrap_or(base_workspace_graph);
+    let workspace_graph = resolve_harness_workspace_graph(
+        &layout.workspace,
+        trusted_workspace_graph,
+        contract.as_ref(),
+    )?;
     let resumed_workflow = load_resumable_workflow_checkpoint(&layout.workflow_checkpoint)?;
     if let Some(checkpoint) = resumed_workflow.as_ref()
         && checkpoint.run.task != args.task
@@ -2955,6 +2968,44 @@ mod tests {
             require_git_success(&layout.workspace, &["log", "-1", "--pretty=%s"]).unwrap(),
             "chore: initialize harness workspace"
         );
+    }
+
+    #[test]
+    fn default_harness_workspace_graph_discovers_repository_checks() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("run");
+        let layout = prepare_scratch(Some(&root)).unwrap();
+        std::fs::create_dir_all(layout.workspace.join("webui/src/pages")).unwrap();
+        std::fs::write(
+            layout.workspace.join("deno.json"),
+            r#"{"tasks":{"build:web":"echo build","test:web":"echo test"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            layout.workspace.join("webui/src/pages/ProjectsPage.tsx"),
+            "export const projectPage = true;\n",
+        )
+        .unwrap();
+
+        let discovered = resolve_harness_workspace_graph(&layout.workspace, None, None).unwrap();
+        let plan = crate::checks::plan_checks_for_paths(
+            &discovered,
+            vec!["webui/src/pages/ProjectsPage.tsx".to_string()],
+        )
+        .unwrap();
+        let commands = plan
+            .checks
+            .iter()
+            .map(|id| discovered.checks[id].command.as_str())
+            .collect::<Vec<_>>();
+        assert!(commands.contains(&"deno task 'build:web'"));
+        assert!(commands.contains(&"deno task 'test:web'"));
+
+        let explicit = crate::workspace::WorkspaceGraph::legacy(&[]);
+        let resolved =
+            resolve_harness_workspace_graph(&layout.workspace, Some(explicit.clone()), None)
+                .unwrap();
+        assert_eq!(resolved, explicit);
     }
 
     #[test]
