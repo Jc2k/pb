@@ -1001,7 +1001,11 @@ was retained; otherwise the repair turn is mutation-only. When a removed control
 value/setter callers, the
 repair guidance forbids recreating that state and distinguishes removable UI callers from non-UI
 consumers that need a stable replacement. `edit_file` also rejects a repair payload that
-reintroduces the paired missing value/setter identifiers during that removal task.
+reintroduces the paired missing value/setter identifiers during that removal task. On a ranged
+repair for this failure class, `old_text` is collar-constrained to at most eight compact exact
+snippets from the current observed ranges. Markup callers prefer their complete task-named control
+block, so the model cannot spend another turn inventing an absent declaration or leave an empty
+selector shell. This bounded diagnostic enum is not a repository-wide path schema.
 
 Recoverable structured-action failures are emitted as Trinity corrections rather than parallel
 generic error events. The error outcome remains durable when retries are exhausted, but the session
