@@ -299,7 +299,10 @@ close can turn a cut-off payload into an executable mutation. Structural whitesp
 strings is capped at 32 bytes at each position, including before a required tool marker, so a model
 cannot consume its generation allowance by emitting whitespace after entering the constrained tool
 envelope; valid lower-ranked structural tokens remain reachable through the existing vocabulary
-widening. Incremental JSON strings admit only valid escapes; a trailing backslash or partial
+widening. Qwen constrained sampling also rejects the continuation of a repeated 16-token n-gram;
+this terminates short punctuation cycles that remain prefix-valid after a malformed mutation instead
+of decoding them to the full turn cap, while leaving ordinary shorter code repetition available.
+Incremental JSON strings admit only valid escapes; a trailing backslash or partial
 four-digit Unicode escape may await more bytes, while an illegal escape, invalid Unicode digit, or
 escaped control character is rejected immediately. This prevents a malformed property-name prefix
 from remaining artificially open until the generated-token ceiling. The agent controller sees a

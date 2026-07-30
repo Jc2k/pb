@@ -19394,25 +19394,86 @@ fn diagnostic_line_windows(
     merged
 }
 
-fn missing_identifier_repair_guidance(feedback: Option<&str>, task: &str) -> Option<String> {
-    let feedback = feedback?;
+fn missing_identifiers(feedback: Option<&str>) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    for remainder in feedback.split("Cannot find name '").skip(1) {
+    for remainder in feedback
+        .unwrap_or_default()
+        .split("Cannot find name '")
+        .skip(1)
+    {
         if let Some((name, _)) = remainder.split_once('\'')
             && !name.is_empty()
         {
             names.insert(name.to_string());
         }
     }
+    names
+}
+
+fn task_removes_interactive_control(task: &str) -> bool {
+    let task = task.to_ascii_lowercase();
+    ["remove", "delete"].iter().any(|term| task.contains(term))
+        && ["selector", "dropdown", "control", "input"]
+            .iter()
+            .any(|term| task.contains(term))
+}
+
+fn removed_control_state_identifiers(feedback: Option<&str>, task: &str) -> BTreeSet<String> {
+    if !task_removes_interactive_control(task) {
+        return BTreeSet::new();
+    }
+    let names = missing_identifiers(feedback);
+    let mut paired = BTreeSet::new();
+    for setter in names.iter().filter(|name| name.starts_with("set")) {
+        let suffix = &setter[3..];
+        let mut chars = suffix.chars();
+        let Some(first) = chars.next() else {
+            continue;
+        };
+        let value = first.to_lowercase().chain(chars).collect::<String>();
+        if names.contains(&value) {
+            paired.insert(value);
+            paired.insert(setter.clone());
+        }
+    }
+    paired
+}
+
+fn text_contains_identifier(text: &str, identifier: &str) -> bool {
+    text.match_indices(identifier).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let end = start.saturating_add(identifier.len());
+        let after = text[end..].chars().next();
+        let is_identifier_char =
+            |character: char| character.is_ascii_alphanumeric() || matches!(character, '_' | '$');
+        before.is_none_or(|character| !is_identifier_char(character))
+            && after.is_none_or(|character| !is_identifier_char(character))
+    })
+}
+
+fn removed_control_reintroduction_feedback(
+    feedback: Option<&str>,
+    task: &str,
+    new_text: &str,
+) -> Option<String> {
+    let reintroduced = removed_control_state_identifiers(feedback, task)
+        .into_iter()
+        .filter(|identifier| text_contains_identifier(new_text, identifier))
+        .collect::<Vec<_>>();
+    (!reintroduced.is_empty()).then(|| {
+        format!(
+            "the active removal repair cannot reintroduce deleted control state identifier(s): {}. Remove the remaining UI callers and use a distinct stable value for non-UI behavior",
+            reintroduced.join(", ")
+        )
+    })
+}
+
+fn missing_identifier_repair_guidance(feedback: Option<&str>, task: &str) -> Option<String> {
+    let names = missing_identifiers(feedback);
     if names.is_empty() {
         return None;
     }
-    let task = task.to_ascii_lowercase();
-    let removes_control = ["remove", "delete"].iter().any(|term| task.contains(term))
-        && ["selector", "dropdown", "control", "input"]
-            .iter()
-            .any(|term| task.contains(term));
-    let removal_strategy = removes_control.then_some(
+    let removal_strategy = task_removes_interactive_control(task).then_some(
         " This task removes an interactive control: do not recreate the removed value/setter state. Remove its remaining UI callers and give any non-UI downstream consumer a stable replacement.",
     ).unwrap_or_default();
     Some(format!(
@@ -20646,6 +20707,17 @@ fn run_tool(
                 .get("new_text")
                 .and_then(Value::as_str)
                 .context("edit_file requires string argument: new_text")?;
+            let reintroduction_feedback = {
+                let gate = context.gate_state.borrow();
+                removed_control_reintroduction_feedback(
+                    gate.diagnostic_failure_feedback.as_deref(),
+                    &context.request.task,
+                    new_text,
+                )
+            };
+            if let Some(feedback) = reintroduction_feedback {
+                bail!(feedback);
+            }
 
             ensure_contract_paths_allowed(context.request, [path])?;
             let resolved = resolve_workspace_path(workspace_root, path, true)?;
@@ -27343,7 +27415,7 @@ the next imagined action"#;
 
         assert_eq!(windows, vec![(20, 51), (68, 92)]);
         let guidance = missing_identifier_repair_guidance(
-            Some("Cannot find name 'answer'.\nCannot find name 'answer'."),
+            Some("Cannot find name 'answer'.\nCannot find name 'setAnswer'."),
             "Remove the answer selector",
         )
         .unwrap();
@@ -27351,6 +27423,31 @@ the next imagined action"#;
         assert!(guidance.contains("stable value"));
         assert!(guidance.contains("does not authorize a compile regression"));
         assert!(guidance.contains("do not recreate the removed value/setter state"));
+        let removal_feedback = "Cannot find name 'answer'.\nCannot find name 'setAnswer'.";
+        assert!(
+            removed_control_reintroduction_feedback(
+                Some(removal_feedback),
+                "Remove the answer selector",
+                "const answer = 'yes'; const setAnswer = () => {};",
+            )
+            .is_some()
+        );
+        assert!(
+            removed_control_reintroduction_feedback(
+                Some(removal_feedback),
+                "Remove the answer selector",
+                "const defaultAnswer = 'yes';",
+            )
+            .is_none()
+        );
+        assert!(
+            removed_control_reintroduction_feedback(
+                Some(removal_feedback),
+                "Improve the answer selector",
+                "const answer = 'yes';",
+            )
+            .is_none()
+        );
 
         let overlapping_text = (1..=240)
             .map(|line| format!("line {line}\n"))

@@ -15,7 +15,10 @@ use super::types::{ChatTool, NativeToolConstraintMode};
 
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
-const CONSTRAINED_NO_REPEAT_NGRAM: usize = 32;
+// Constrained mutation failures tend to collapse into short punctuation cycles while remaining
+// syntactically prefix-valid. Sixteen tokens is long enough for ordinary code repetition but stops
+// those forced structural tails well before they consume an entire model turn.
+const CONSTRAINED_NO_REPEAT_NGRAM: usize = 16;
 const MAX_STRUCTURAL_WHITESPACE_BYTES: usize = 32;
 pub(crate) const MAX_COLLAR_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_COLLAR_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -2344,11 +2347,21 @@ mod tests {
 
     #[test]
     fn constrained_generation_blocks_only_the_repeated_ngram_continuation() {
-        let mut tokens = (0..40).collect::<Vec<u32>>();
-        tokens.extend(8..39);
-        let forbidden = repeated_ngram_forbidden_tokens(&tokens, 32);
-        assert_eq!(forbidden, BTreeSet::from([39]));
+        let mut tokens = (0..24).collect::<Vec<u32>>();
+        tokens.extend(8..23);
+        let forbidden = repeated_ngram_forbidden_tokens(&tokens, CONSTRAINED_NO_REPEAT_NGRAM);
+        assert_eq!(forbidden, BTreeSet::from([23]));
         assert!(repeated_ngram_forbidden_tokens(&tokens, 1).is_empty());
+
+        let punctuation_cycle = [1, 2, 3, 4]
+            .into_iter()
+            .cycle()
+            .take(CONSTRAINED_NO_REPEAT_NGRAM * 2)
+            .collect::<Vec<_>>();
+        assert!(
+            !repeated_ngram_forbidden_tokens(&punctuation_cycle, CONSTRAINED_NO_REPEAT_NGRAM,)
+                .is_empty()
+        );
     }
 
     #[test]

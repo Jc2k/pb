@@ -278,7 +278,9 @@ fresh diagnostic observation also re-reads one nearest preceding range from the 
 If that range overlaps the first diagnostic window, pb retains its fresh pre-diagnostic prefix rather
 than discarding the whole range; this keeps a nearby declaration area without replaying stale bytes.
 For control-removal tasks, missing value/setter diagnostics explicitly forbid recreating the removed
-interactive state: UI callers are removed while non-UI consumers receive a stable replacement.
+interactive state: UI callers are removed while non-UI consumers receive a stable replacement. The
+same paired missing identifiers are rejected at the `edit_file` execution boundary if a repair tries
+to reintroduce them under different syntax, so ignored prose guidance cannot restore a no-op control.
 Before injecting that observation, pb removes superseded controller bytes and the prior mutation
 call/result for the same path from the model prompt; their durable events and gate effects remain
 recorded, but stale text cannot compete with the current file in the next repair inference. The
@@ -671,6 +673,10 @@ Recoverable and deterministic model-control failures remain typed in the termina
 conversation stream attributes their visible explanation to Trinity. Parse retries, repeat/no-
 progress stops, and bounded step exhaustion do not also emit a generic error card, avoiding a red
 system block followed by duplicate steward feedback for the same failure.
+
+FlashMoe's Qwen constrained sampler rejects a repeated 16-token continuation. This bounds malformed
+punctuation tails that remain structurally prefix-valid after an invalid mutation, allowing the
+existing compact recovery path to run without spending the rest of the inference budget.
 
 ### Deterministic controller actions
 

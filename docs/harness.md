@@ -1000,7 +1000,8 @@ diagnostic). A line-centered capped read remains exposed only when no fresh prio
 was retained; otherwise the repair turn is mutation-only. When a removed control leaves missing
 value/setter callers, the
 repair guidance forbids recreating that state and distinguishes removable UI callers from non-UI
-consumers that need a stable replacement.
+consumers that need a stable replacement. `edit_file` also rejects a repair payload that
+reintroduces the paired missing value/setter identifiers during that removal task.
 
 Recoverable structured-action failures are emitted as Trinity corrections rather than parallel
 generic error events. The error outcome remains durable when retries are exhausted, but the session
@@ -1010,6 +1011,9 @@ guidance names those current functions instead of prematurely directing the mode
 stage-submission tool. Deterministic repeat, no-progress, parse, and bounded-step stops follow the
 same presentation rule: their typed terminal outcome remains machine-readable while Trinity gives
 the single visible team explanation and names the active teammate when useful.
+
+Qwen native-tool generation rejects repeated 16-token continuations so a malformed, prefix-valid
+punctuation tail reaches bounded recovery instead of consuming the full generation allowance.
 
 Direct bounded runs now derive every instruction from the actual allowlist. A restricted prompt
 never orders an unexposed setup, command, review, or commit tool. When those general discovery
