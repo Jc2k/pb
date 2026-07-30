@@ -5495,6 +5495,28 @@ fn configure_plan_path_candidates(tools: &mut [BuiltInToolSchema], candidates: &
     }
 }
 
+fn configure_plan_review_check_candidates(tools: &mut [BuiltInToolSchema], check_ids: &[String]) {
+    let Some(properties) = tools
+        .iter_mut()
+        .find(|tool| tool.name == "submit_plan_review")
+        .and_then(|tool| {
+            tool.input_schema
+                .pointer_mut("/properties/challenges/items/properties/evidence/items/properties")
+        })
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if check_ids.is_empty() {
+        properties.remove("check_id");
+    } else if let Some(check_id) = properties.get_mut("check_id") {
+        check_id["enum"] = json!(check_ids);
+        check_id["description"] = json!(
+            "Optional exact configured workspace check id. Omit this field for repository-path or line evidence."
+        );
+    }
+}
+
 fn replan_supported_for_work_unit(
     contract_allowed_paths: Option<&[String]>,
     unit: &crate::workflow::WorkUnit,
@@ -7493,6 +7515,14 @@ fn run_agent_steps(
                 &mut scoped_tools,
                 &gate_state.borrow().planning_path_candidates,
             );
+        }
+        if args.workflow_stage == Some(crate::workflow::WorkflowStage::PlanReview) {
+            let check_ids = args
+                .workspace_graph
+                .as_ref()
+                .map(|graph| graph.checks.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            configure_plan_review_check_candidates(&mut scoped_tools, &check_ids);
         }
         let terminal_tools = terminal_submission_only
             .then(|| {
@@ -16646,16 +16676,25 @@ fn generate_and_parse_action_with_retries(
                 if !mutation_retry_used && let Some(tool) = truncated_mutation {
                     mutation_retry_used = true;
                     let payload_limited = failure.hit_mutation_payload_limit(tools);
+                    let recovery_tool = if constraint_dead_end
+                        && tool == "apply_patch"
+                        && tools.iter().any(|schema| schema.name == "edit_file")
+                    {
+                        "edit_file"
+                    } else {
+                        tool
+                    };
                     retry_reason = Some(if payload_limited {
                         AgentRetryReason::ExpandedMutationAfterPayloadLimit
                     } else {
                         AgentRetryReason::CompactMutationAfterTruncation
                     });
                     let target_path = truncated_native_mutation_path(&failure.output);
-                    mutation_retry_constraint = Some((tool.to_string(), target_path.clone()));
+                    mutation_retry_constraint =
+                        Some((recovery_tool.to_string(), target_path.clone()));
                     let mut constrained_tools = tools
                         .iter()
-                        .filter(|schema| schema.name == tool)
+                        .filter(|schema| schema.name == recovery_tool)
                         .cloned()
                         .collect::<Vec<_>>();
                     let ordinary_chars = exposed_mutation_payload_limit(tools)
@@ -16719,8 +16758,8 @@ fn generate_and_parse_action_with_retries(
                             "Retrying an irreparable constrained mutation",
                             "Constrained mutation branch recovery",
                             format!(
-                                "The candidate-only {tool} branch reached a point where no vocabulary token could produce a valid continuation after {} generated tokens. The incomplete call was preserved for diagnosis and was not executed. Retry {tool} once from a fresh model invocation with one complete, structurally and semantically valid payload under {target_chars} characters and within the same {max_tokens}-token ceiling.{target_instruction} Prefer the smallest direct change and avoid repeating the rejected construction.",
-                                failure.generated_tokens
+                                "The candidate-only {tool} branch reached a point where no vocabulary token could produce a valid continuation after {} generated tokens. The incomplete call was preserved for diagnosis and was not executed. Use {recovery_tool} once from a fresh model invocation with one complete, structurally and semantically valid payload under {target_chars} characters and within the same {max_tokens}-token ceiling.{target_instruction} Prefer the smallest direct change and do not repeat the rejected {tool} construction.",
+                                failure.generated_tokens,
                             ),
                         )
                     } else {
@@ -20405,6 +20444,15 @@ fn run_tool(
             >(&projected, "review")?;
             review.validate_digest()?;
             review.artifact.validate_disposition()?;
+            let graph = context
+                .request
+                .workspace_graph
+                .as_ref()
+                .context("submit_plan_review requires a normalized workspace graph")?;
+            let read_paths = context.gate_state.borrow().read_paths.clone();
+            review
+                .artifact
+                .validate_observed_evidence(graph, &read_paths)?;
             accept_stage_artifact_submission(
                 context.gate_state,
                 crate::workflow::StageSubmission::PlanReview { review },
@@ -25495,6 +25543,42 @@ mod tests {
                 Some(&json!(0))
             );
         }
+        crate::inference::flashmoe::validate_native_tool_schema(schema).unwrap();
+    }
+
+    #[test]
+    fn plan_review_evidence_check_ids_are_exact_or_absent() {
+        let mut tools = all_builtin_tool_specs();
+        configure_plan_review_check_candidates(
+            &mut tools,
+            &["web:test".to_string(), "web:typecheck".to_string()],
+        );
+        let schema = &tools
+            .iter()
+            .find(|tool| tool.name == "submit_plan_review")
+            .unwrap()
+            .input_schema;
+        assert_eq!(
+            schema.pointer(
+                "/properties/challenges/items/properties/evidence/items/properties/check_id/enum"
+            ),
+            Some(&json!(["web:test", "web:typecheck"]))
+        );
+        crate::inference::flashmoe::validate_native_tool_schema(schema).unwrap();
+
+        configure_plan_review_check_candidates(&mut tools, &[]);
+        let schema = &tools
+            .iter()
+            .find(|tool| tool.name == "submit_plan_review")
+            .unwrap()
+            .input_schema;
+        assert!(
+            schema
+                .pointer(
+                    "/properties/challenges/items/properties/evidence/items/properties/check_id"
+                )
+                .is_none()
+        );
         crate::inference::flashmoe::validate_native_tool_schema(schema).unwrap();
     }
 
@@ -32536,6 +32620,51 @@ the next imagined action"#;
     }
 
     #[test]
+    fn irreparable_patch_branch_recovers_with_a_smaller_edit_operation() {
+        let tmp = init_contract_test_repo();
+        std::fs::write(tmp.path().join("game.js"), "const branch = 'main';\n").unwrap();
+        let mut request = test_agent_request(AgentProfile::Build, 256);
+        request.max_steps = 1;
+        request.turn_max_tokens_cap = Some(256);
+        request.workflow_action_first_turn = true;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                ScriptedCompletion {
+                    content: format!(
+                        "{SCRIPTED_CONSTRAINT_DEAD_END_PREFIX}<tool_call>{{\"name\":\"apply_patch\",\"arguments\":{{\"patch\":\"diff --git"
+                    ),
+                    truncated: true,
+                },
+                tool_completion(
+                    "edit_file",
+                    json!({
+                        "path": "game.js",
+                        "old_text": "const branch = 'main';\n",
+                        "new_text": ""
+                    }),
+                ),
+            ],
+            tmp.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["edit_file".to_string()]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { summary, message, .. }
+                if summary == "Retrying an irreparable constrained mutation"
+                    && message.contains("Use edit_file once")
+                    && message.contains("do not repeat the rejected apply_patch")
+        )));
+    }
+
+    #[test]
     fn payload_bound_mutation_gets_one_larger_retry_at_the_same_token_ceiling() {
         let tmp = init_contract_test_repo();
         let mut request = test_agent_request(AgentProfile::Build, 256);
@@ -33061,6 +33190,84 @@ the next imagined action"#;
             AgentEvent::ToolResult { tool, result, .. }
                 if tool == "submit_plan_review"
                     && result.contains("set the corresponding assessment to concern or fail")
+        )));
+    }
+
+    #[test]
+    fn invalid_plan_review_evidence_retries_in_place_without_erasing_the_verdict() {
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Review, repo.path());
+        request.max_steps = 2;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanReview);
+        request.workflow_plan_identity = Some(("plan-1".to_string(), "digest-1".to_string()));
+        let assessments = crate::workflow::REQUIRED_PLAN_ASSESSMENTS
+            .into_iter()
+            .map(|kind| {
+                json!({
+                    "kind": kind,
+                    "status": if kind == crate::workflow::PlanAssessmentKind::ComponentImpact {
+                        "fail"
+                    } else {
+                        "pass"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let review = |id: &str, evidence: Value| {
+            tool_completion(
+                "submit_plan_review",
+                json!({
+                    "id": id,
+                    "assessments": assessments,
+                    "challenges": [{
+                        "id": "challenge-1",
+                        "severity": "p1",
+                        "requirement_ids": ["r1"],
+                        "description": "The plan leaves a dependent value undefined.",
+                        "evidence": [evidence]
+                    }],
+                    "verdict": "revise"
+                }),
+            )
+        };
+        let mut events = Vec::new();
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                review(
+                    "review-invalid",
+                    json!({"check_id":"evidence-1","description":"Observed source line"}),
+                ),
+                review(
+                    "review-valid",
+                    json!({"description":"Observed source line"}),
+                ),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        let crate::workflow::StageSubmission::PlanReview { review } =
+            outcome.workflow_submission.unwrap()
+        else {
+            panic!("expected a plan review submission");
+        };
+        assert_eq!(
+            review.artifact.verdict,
+            crate::workflow::ReviewVerdict::Revise
+        );
+        assert_eq!(review.artifact.challenges.len(), 1);
+        assert_eq!(
+            outcome.generation_tool_names[1],
+            vec!["submit_plan_review".to_string()]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, result, .. }
+                if tool == "submit_plan_review"
+                    && result.contains("undeclared property 'check_id'")
         )));
     }
 

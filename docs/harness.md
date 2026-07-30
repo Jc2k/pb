@@ -963,6 +963,12 @@ on a dedicated bounded runtime thread, including when the harness itself is alre
 a model-requested web action therefore cannot panic the owning agent runtime through nested
 `block_on`.
 
+Plan-review evidence check IDs are constrained to exact configured check names and observed-evidence
+validation happens inside `submit_plan_review`. A typo therefore returns terminal-tool feedback in
+the same review context rather than discarding honest reviewer findings during an outer stage retry.
+For implementation, a native constraint dead end while forming `apply_patch` gets one fresh
+`edit_file` recovery instead of retrying the identical irreparable patch construction.
+
 Direct bounded runs now derive every instruction from the actual allowlist. A restricted prompt
 never orders an unexposed setup, command, review, or commit tool. When those general discovery
 tools are absent, the prompt includes at most 32 sorted top-level repository paths, each capped at

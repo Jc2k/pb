@@ -226,6 +226,11 @@ inside the live review turn. A malformed disposition therefore returns tool feed
 discarding the reviewer's conversation or repository reads, and the next turn exposes only the
 corrected terminal action. The outer workflow still validates accepted-plan identity, requirement
 references, and observed-path evidence before accepting the artifact.
+Observed-evidence validation also runs at that live tool boundary. Plan-review check references are
+native-collar constrained to exact configured workspace check IDs, or the field is removed when no
+checks exist; source path and line evidence must omit `check_id`. An invalid evidence label therefore
+receives an in-context terminal retry while preserving the critic's verdict and findings instead of
+restarting a fresh critic that could silently reverse them.
 The critic need not re-read a task path merely to confirm code that the plan proposes to change when
 the task, exact plan, bounded repository brief, and carried evidence already support every structural
 assessment. Any repository fact it does cite must still come from current carried or model-read
@@ -256,6 +261,10 @@ validates the completion against the resulting repository fingerprint and ordina
 gate. A valid object closes implementation without a bookkeeping-only model turn. An invalid object
 does not roll back or misreport the successful mutation; the ordinary bounded submission path stays
 available on the next turn.
+If an `apply_patch` generation reaches a native constraint dead end before forming an executable
+call, its one bounded recovery switches to the smaller `edit_file` operation when available. The
+recovery cannot repeat the same irreparable patch branch; later turns can apply additional separated
+edits under the same work-unit and read-before-write authority.
 
 When a configured language server supports a changed accepted task path, pb proactively requests
 diagnostics without waiting for the model to choose an LSP tool. While implementation is still in
