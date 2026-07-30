@@ -446,6 +446,9 @@ missing fact, its single recovery turn exposes only `read_file` with one center 
 forty surrounding lines on each side. This compact generated schema makes a whole-file read
 structurally impossible instead of spending a turn and rejecting it only after generation. A
 completed explicit excerpt has no continuation into the remainder of the file.
+Planning likewise withholds an initial `read_file` when task-focused controller ranges are already
+present in the prompt, so the teammate submits from those bytes instead of first requesting them
+again.
 After a partial mutation recovered from a constraint dead-end, pb discards the pre-mutation
 controller ranges and observes the current target again before another teammate inference. That
 continuation is restricted to a capped target `read_file` excerpt or `edit_file`; the rejected

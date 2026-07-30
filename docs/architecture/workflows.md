@@ -172,7 +172,9 @@ groups back to the durable ordered `PlanPath` artifact before validation. Preser
 submissions remain readable, but new native generation uses the grouped contract.
 For controller-block runs, planning, plan revision, and plan review also receive one freshly
 fingerprinted task-focused excerpt from the strongest matching existing path. A range observation
-does not pretend to cover the whole file: the model can request a specific missing line range, but
+does not pretend to cover the whole file. The initial planning turn treats the included task-focused
+bytes as its read and withholds a redundant `read_file`; a later recovery can request a specific
+missing line range, but
 an unbounded reread of the same file is rejected so generic continuation hints cannot consume the
 stage budget by walking unrelated code.
 Once plan revision has concrete repository work-unit paths, its tool surface drops public web

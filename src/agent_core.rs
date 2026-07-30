@@ -5776,6 +5776,29 @@ fn scope_tools_to_partial_recovery_continuation(
     }
 }
 
+fn controller_task_ranges_make_initial_read_redundant(
+    args: &AgentRequest,
+    gate_state: &GateState,
+) -> bool {
+    let Some(
+        stage @ (crate::workflow::WorkflowStage::Planning
+        | crate::workflow::WorkflowStage::PlanRevision),
+    ) = args.workflow_stage
+    else {
+        return false;
+    };
+    gate_state
+        .stage_evidence
+        .controller_observations
+        .iter()
+        .any(|receipt| {
+            receipt.stage == stage
+                && receipt.work_unit_id.is_none()
+                && receipt.included_in_prompt
+                && receipt.coverage == crate::workflow::ObservationCoverage::Ranges
+        })
+}
+
 fn active_unit_can_inline_completion(
     ledger: &crate::workflow::WorkUnitLedger,
     unit: &crate::workflow::WorkUnit,
@@ -7827,19 +7850,21 @@ fn run_agent_steps(
             workflow_completion_enable_thinking(args, step, suppress_thinking, terminal_only_turn)
                 && generator.supports_thinking()?;
         let progress_before_action = progress_state(workspace_root, &gate_state)?;
-        let defer_ranged_read = active_work_unit.as_ref().is_some_and(|unit| {
-            unit.state == crate::workflow::WorkUnitState::MutationReady
-                && !gate_state
-                    .borrow()
-                    .pending_work_unit_continuations
-                    .contains(&unit.path)
-                && gate_state
-                    .borrow()
-                    .controller_observation_for_path(&unit.path)
-                    .is_some_and(|receipt| {
-                        receipt.coverage == crate::workflow::ObservationCoverage::Ranges
-                    })
-        });
+        let defer_ranged_read =
+            controller_task_ranges_make_initial_read_redundant(args, &gate_state.borrow())
+                || active_work_unit.as_ref().is_some_and(|unit| {
+                    unit.state == crate::workflow::WorkUnitState::MutationReady
+                        && !gate_state
+                            .borrow()
+                            .pending_work_unit_continuations
+                            .contains(&unit.path)
+                        && gate_state
+                            .borrow()
+                            .controller_observation_for_path(&unit.path)
+                            .is_some_and(|receipt| {
+                                receipt.coverage == crate::workflow::ObservationCoverage::Ranges
+                            })
+                });
         let generated = match generate_and_parse_action_with_retries(
             generator,
             text_backend,
@@ -26145,6 +26170,10 @@ mod tests {
             },
             ..GateState::default()
         });
+        assert!(controller_task_ranges_make_initial_read_redundant(
+            &request,
+            &gate.borrow()
+        ));
         let error = ensure_read_is_not_redundant_with_controller_ranges(
             &gate,
             "webui/src/pages/ProjectsPage.tsx",
