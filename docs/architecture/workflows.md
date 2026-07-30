@@ -152,8 +152,10 @@ fallback, so cosmetic rewriting cannot consume a planning inference. Planning gu
 local evidence before naming an existing path and reserves public web research for genuinely
 external or current facts rather than repository-local file discovery. Removal plans are prompted
 to account for state, imports, derived values, payload fields, and tests that can become obsolete
-when a visible control disappears. The fresh plan critic receives the corresponding component-impact
-check and is told to challenge markup-only removal plans that leave ambiguous behavior.
+when a visible control disappears. A control's downstream behavior is not implicitly removed: a
+still-consumed derived value needs a stable replacement or an explicit transition for every caller.
+The fresh plan critic receives the corresponding component-impact check and is told to challenge
+markup-only removals, deleted declarations with unexplained callers, and ambiguous behavior.
 
 Accepted plan and plan-review artifacts remain in the workflow summary projection. The web
 transcript renders the latest accepted plan at its acceptance event with requirements, steps, paths,
@@ -266,15 +268,18 @@ gate. Diagnostic-eligible checks run before the inline completion can close the 
 preview reopens only the exact diagnosed task path and keeps the edit; a passing preview permits the
 completion without a bookkeeping-only model turn. An invalid object does not roll back or misreport
 the successful mutation; the ordinary bounded submission path stays available on the next turn.
-When the current diagnostic evidence contains only bounded ranges, the repair turn exposes only an
-exact `edit_file` replacement inside those ranges. Whole-file replacement and arbitrary patch tools
-are omitted because the controller cannot authorize their unseen context; a useful partial edit
-earns a fresh ranged turn for any remaining diagnostic. Before injecting that fresh observation, pb
-removes superseded controller bytes and the prior mutation call/result for the same path from the
-model prompt; their durable events and gate effects remain recorded, but stale text cannot compete
-with the current file in the next repair inference. The repair schema and correction also define the
-safe insertion idiom: `old_text` is a non-empty current anchor and `new_text` preserves that anchor
-while adding adjacent text. Empty-match insertion remains unavailable.
+When the current diagnostic evidence contains only bounded ranges, the repair turn exposes exact
+`edit_file` replacement inside those ranges plus one line-centered, capped `read_file` escape hatch
+for cases where diagnostics show callers but omit the declaration or insertion area. Whole-file
+replacement and arbitrary patch tools are omitted because the controller cannot authorize their
+unseen context; a useful partial edit earns a fresh ranged turn for any remaining diagnostic. Each
+fresh diagnostic observation also re-reads one nearest preceding range from the prior observation,
+which commonly retains the current declaration area without replaying stale bytes. Before injecting
+that observation, pb removes superseded controller bytes and the prior mutation call/result for the
+same path from the model prompt; their durable events and gate effects remain recorded, but stale
+text cannot compete with the current file in the next repair inference. The repair schema makes
+`old_text` structurally non-empty, while its correction defines the safe insertion idiom: `new_text`
+preserves a current anchor while adding adjacent text. Empty-match insertion remains unavailable.
 If an `apply_patch` or `replace_file` generation reaches a native constraint dead end before forming
 an executable call, its one bounded recovery switches to the smaller `edit_file` operation when
 available. This keeps a large observed file from retrying a whole-file construction that cannot fit
@@ -656,6 +661,11 @@ bounded replacement rather than proof that the path-level work unit is complete.
 omits inline completion, and pb reopens and re-observes the unit before allowing closure. This is
 true both for an `apply_patch`-to-`edit_file` fallback and for an `edit_file` retry after the same
 constraint dead end.
+
+Recoverable and deterministic model-control failures remain typed in the terminal outcome, but the
+conversation stream attributes their visible explanation to Trinity. Parse retries, repeat/no-
+progress stops, and bounded step exhaustion do not also emit a generic error card, avoiding a red
+system block followed by duplicate steward feedback for the same failure.
 
 ### Deterministic controller actions
 

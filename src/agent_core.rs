@@ -4757,7 +4757,7 @@ fn all_builtin_tool_specs() -> Vec<BuiltInToolSchema> {
             mutation_schema_with_inline_completion(object_schema(
                 [
                     string_property("path", "Project-relative file path to edit."),
-                    string_property("old_text", "Exact text to replace."),
+                    non_empty_string_property("old_text", "Non-empty exact text to replace."),
                     string_property("new_text", "Replacement text."),
                 ],
                 ["path", "old_text", "new_text"],
@@ -5402,6 +5402,16 @@ fn string_property(name: &'static str, description: &'static str) -> (&'static s
     )
 }
 
+fn non_empty_string_property(
+    name: &'static str,
+    description: &'static str,
+) -> (&'static str, Value) {
+    (
+        name,
+        json!({ "type": "string", "description": description, "minLength": 1 }),
+    )
+}
+
 const NATIVE_ACTION_RESERVE_TOKENS: i32 = 192;
 const MUTATION_PAYLOAD_CHARS_PER_TOKEN: usize = 4;
 
@@ -5741,14 +5751,16 @@ fn scope_tools_to_controller_observation(
         && receipt.path == unit.path
     {
         // The controller already supplied the exact current diagnostic windows for this repair.
-        // Re-exposing read_file here invites the model to rediscover the same path instead of
-        // applying the bounded fix. A range-only observation also cannot authorize a whole-file
-        // replacement or prove arbitrary patch context, so expose only the exact replacement tool
-        // that the executor can actually honor. A useful partial repair earns another bounded turn
-        // with fresh ranges for any remaining diagnostic.
+        // A range-only observation cannot authorize whole-file replacement or prove arbitrary
+        // patch context. Keep edit_file plus only a line-centered, capped read escape hatch: some
+        // diagnostics show callers but omit the declaration area required for a safe insertion.
+        // A useful partial repair earns another bounded turn with fresh ranges for any remainder.
         let ranged_repair = receipt.coverage == crate::workflow::ObservationCoverage::Ranges;
         if ranged_repair {
-            tools.retain(|tool| tool.name == "edit_file");
+            // Diagnostics can identify a use without including the declaration area needed for a
+            // safe insertion. Keep one explicitly bounded read escape hatch beside edit_file so a
+            // model cannot ask for or receive the whole file merely to obtain that anchor.
+            scope_tools_to_ranged_work_unit(tools, available_tools);
         } else {
             tools.retain(|tool| {
                 matches!(
@@ -5758,11 +5770,18 @@ fn scope_tools_to_controller_observation(
             });
         }
         for tool in tools.iter_mut() {
-            tool.description.push_str(if ranged_repair {
-                " The controller already supplied current diagnostic evidence for this path; repair it directly without another read. old_text must be a non-empty exact fragment copied from the latest supplied range. To insert text, replace one existing anchor with that same anchor plus the insertion in new_text; never use empty old_text. Preserve all unrelated current bytes exactly."
-            } else {
-                " The controller already supplied current diagnostic evidence for this path; repair it directly without another read."
-            });
+            let extra = match (ranged_repair, tool.name.as_str()) {
+                (true, "edit_file") => {
+                    " The controller already supplied current diagnostic evidence for this path; repair directly when it contains a safe anchor. old_text is structurally non-empty and must be an exact fragment copied from the latest supplied range. To insert text, replace one existing anchor with that same anchor plus the insertion in new_text. Preserve all unrelated current bytes exactly."
+                }
+                (true, "read_file") => {
+                    " Use this only when the diagnostic ranges show callers but omit the declaration or insertion anchor; request one center line near that declaration and then edit the fresh bounded excerpt on the next turn."
+                }
+                _ => {
+                    " The controller already supplied current diagnostic evidence for this path; repair it directly without another read."
+                }
+            };
+            tool.description.push_str(extra);
         }
         return false;
     }
@@ -6301,6 +6320,7 @@ struct GateState {
     diagnostic_preview_fingerprint: Option<String>,
     diagnostic_failed_paths: BTreeSet<String>,
     diagnostic_failure_feedback: Option<String>,
+    diagnostic_prior_observations: HashMap<String, crate::workflow::ControllerObservationReceipt>,
     inline_diagnostic_failure_pending: bool,
     recovery_mutation_continuations: BTreeSet<String>,
     pending_work_unit_continuations: BTreeSet<String>,
@@ -7595,9 +7615,8 @@ fn run_agent_steps(
             });
         if announced != announced_work_unit {
             if let Some(unit) = active_work_unit.as_ref() {
-                let diagnostic_obligations = gate_state
-                    .borrow()
-                    .diagnostic_failure_feedback
+                let diagnostic_feedback = gate_state.borrow().diagnostic_failure_feedback.clone();
+                let diagnostic_obligations = diagnostic_feedback
                     .as_deref()
                     .map(|feedback| {
                         format!(
@@ -7605,6 +7624,10 @@ fn run_agent_steps(
                         )
                     })
                     .unwrap_or_default();
+                let diagnostic_strategy =
+                    missing_identifier_repair_guidance(diagnostic_feedback.as_deref())
+                        .map(|guidance| format!(" {guidance}"))
+                        .unwrap_or_default();
                 let instruction = match (unit.operation, unit.state) {
                     (_, crate::workflow::WorkUnitState::EvidenceNeeded) => format!(
                         "Harness work unit {}: observe the complete current bytes of {} with read_file before its {:?} mutation can become eligible.",
@@ -7621,12 +7644,12 @@ fn run_agent_steps(
                             .is_some_and(|receipt| {
                                 receipt.coverage == crate::workflow::ObservationCoverage::Ranges
                             }) {
-                            "Use edit_file for the smallest exact replacement inside one supplied range. old_text must be a non-empty exact fragment copied from the latest range. To insert text, replace one existing anchor with that same anchor plus the insertion in new_text; never use empty old_text. Preserve unrelated current bytes exactly. If failures span multiple supplied ranges, fix one range now; useful progress earns a fresh bounded turn for the remainder."
+                            "Use edit_file for the smallest exact replacement inside one supplied range. old_text is structurally non-empty and must be an exact fragment copied from the latest range. To insert text, replace one existing anchor with that same anchor plus the insertion in new_text. If the required declaration anchor is absent, use the exposed line-centered bounded read once instead of guessing or rereading the file. Preserve unrelated current bytes exactly. If failures span multiple supplied ranges, fix one range now; useful progress earns a fresh bounded turn for the remainder."
                         } else {
                             "Address every failure from the latest diagnostic in one mutation; apply_patch can carry separated hunks. A partial repair consumes another evidence-and-repair cycle."
                         };
                         format!(
-                            "Harness diagnostic repair unit {}: repair only {} with a target-bound mutation tool. {repair_shape} This repair authority does not reopen any other accepted-plan path. Do not request replan when this exact path can satisfy the listed failures.{}",
+                            "Harness diagnostic repair unit {}: repair only {} with a target-bound tool. {repair_shape}{diagnostic_strategy} This repair authority does not reopen any other accepted-plan path. Do not request replan when this exact path can satisfy the listed failures.{}",
                             unit.id, unit.path, diagnostic_obligations
                         )
                     }
@@ -7992,16 +8015,6 @@ fn run_agent_steps(
                     },
                     max_steps = effective_max_steps
                 );
-                let parse_message = format!(
-                    "{parse_summary}: {error}\n\n{}",
-                    rejected_completion_diagnostic(&output, finish_reason),
-                );
-                sink.emit(AgentEvent::Error {
-                    message: parse_message,
-                    summary: parse_summary.clone(),
-                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                    timestamp_ms: Some(now_millis()),
-                });
                 messages.push(ChatMessage::text("assistant", output.clone()));
 
                 let mut error_msg = if let Some(required) =
@@ -8013,6 +8026,7 @@ fn run_agent_steps(
                         repeated_parse_failures,
                         repeated_failure_limit,
                         required,
+                        generation_tools.iter().any(|tool| tool.name == required),
                         terminal_submission_only,
                     )
                 } else {
@@ -8044,16 +8058,6 @@ fn run_agent_steps(
                         "\n\nYour capped output already attempted {required}. On the next turn, call only the provided {required} function with the smallest structurally valid, minified argument object. Consolidate related requirements, steps, assessments, and evidence instead of repeating them. Emit no reasoning or prose."
                     ));
                 }
-                sink.emit(AgentEvent::Correction {
-                    message: error_msg.clone(),
-                    summary: parse_summary.clone(),
-                    actor: crate::events::TeamActor::workflow_steward(),
-                    assisting_profile: Some(args.profile),
-                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                    timestamp_ms: Some(now_millis()),
-                });
-                messages.push(correction_chat_message(&parse_summary, &error_msg));
-
                 if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES
                     || repeated_parse_failures >= repeated_failure_limit
                 {
@@ -8068,9 +8072,11 @@ fn run_agent_steps(
                             "model produced {consecutive_parse_failures} consecutive unparsable structured actions; stopping to avoid an infinite retry loop. Last parse error: {error}"
                         )
                     };
-                    sink.emit(AgentEvent::Error {
+                    sink.emit(AgentEvent::Correction {
                         message: retry_limit_message,
-                        summary: "Parse retry limit reached".to_string(),
+                        summary: "Teammate action retries exhausted".to_string(),
+                        actor: crate::events::TeamActor::workflow_steward(),
+                        assisting_profile: Some(args.profile),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -8084,6 +8090,16 @@ fn run_agent_steps(
                         gate_state: gate_state.into_inner(),
                     });
                 }
+
+                sink.emit(AgentEvent::Correction {
+                    message: error_msg.clone(),
+                    summary: parse_summary.clone(),
+                    actor: crate::events::TeamActor::workflow_steward(),
+                    assisting_profile: Some(args.profile),
+                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                    timestamp_ms: Some(now_millis()),
+                });
+                messages.push(correction_chat_message(&parse_summary, &error_msg));
 
                 step += 1;
                 continue;
@@ -8547,20 +8563,14 @@ fn run_agent_steps(
                     deterministic_failures.record(DeterministicFailureKind::ToolLoop, signature)
                 });
                 if loop_check.blocked {
-                    record_blocked_tool_loop(
-                        &output,
-                        &loop_check.feedback,
-                        args.profile,
-                        nesting_depth,
-                        messages,
-                        sink,
-                    );
                     if loop_failure_count.is_some_and(|count| count >= MAX_IDENTICAL_GATE_FAILURES)
                     {
                         let (summary, message) = deterministic_tool_loop_error(args.profile);
-                        sink.emit(AgentEvent::Error {
+                        sink.emit(AgentEvent::Correction {
                             message,
                             summary,
+                            actor: crate::events::TeamActor::workflow_steward(),
+                            assisting_profile: Some(args.profile),
                             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                             timestamp_ms: Some(now_millis()),
                         });
@@ -8574,6 +8584,14 @@ fn run_agent_steps(
                             gate_state: gate_state.into_inner(),
                         });
                     }
+                    record_blocked_tool_loop(
+                        &output,
+                        &loop_check.feedback,
+                        args.profile,
+                        nesting_depth,
+                        messages,
+                        sink,
+                    );
                     step += 1;
                     continue;
                 }
@@ -8585,12 +8603,6 @@ fn run_agent_steps(
                 )? {
                     messages.push(ChatMessage::text("assistant", output.clone()));
                     record_progress_warning(&feedback, nesting_depth, messages, sink);
-                    sink.emit(AgentEvent::Error {
-                        message: feedback,
-                        summary: "No-progress tool loop".to_string(),
-                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                        timestamp_ms: Some(now_millis()),
-                    });
                     return Ok(StepRunOutcome {
                         reached_final: false,
                         contract_status: incomplete_contract_status(args),
@@ -8700,12 +8712,6 @@ fn run_agent_steps(
                 }
                 if let ProgressDecision::Block(feedback) = &progress_decision {
                     record_progress_warning(feedback, nesting_depth, messages, sink);
-                    sink.emit(AgentEvent::Error {
-                        message: feedback.clone(),
-                        summary: "No-progress tool loop".to_string(),
-                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                        timestamp_ms: Some(now_millis()),
-                    });
                     return Ok(StepRunOutcome {
                         reached_final: false,
                         contract_status: incomplete_contract_status(args),
@@ -8753,20 +8759,14 @@ fn run_agent_steps(
                     deterministic_failures.record(DeterministicFailureKind::ToolLoop, signature)
                 });
                 if loop_check.blocked {
-                    record_blocked_tool_loop(
-                        &output,
-                        &loop_check.feedback,
-                        args.profile,
-                        nesting_depth,
-                        messages,
-                        sink,
-                    );
                     if loop_failure_count.is_some_and(|count| count >= MAX_IDENTICAL_GATE_FAILURES)
                     {
                         let (summary, message) = deterministic_tool_loop_error(args.profile);
-                        sink.emit(AgentEvent::Error {
+                        sink.emit(AgentEvent::Correction {
                             message,
                             summary,
+                            actor: crate::events::TeamActor::workflow_steward(),
+                            assisting_profile: Some(args.profile),
                             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                             timestamp_ms: Some(now_millis()),
                         });
@@ -8780,6 +8780,14 @@ fn run_agent_steps(
                             gate_state: gate_state.into_inner(),
                         });
                     }
+                    record_blocked_tool_loop(
+                        &output,
+                        &loop_check.feedback,
+                        args.profile,
+                        nesting_depth,
+                        messages,
+                        sink,
+                    );
                     step += 1;
                     continue;
                 }
@@ -8791,12 +8799,6 @@ fn run_agent_steps(
                 )? {
                     messages.push(ChatMessage::text("assistant", output.clone()));
                     record_progress_warning(&feedback, nesting_depth, messages, sink);
-                    sink.emit(AgentEvent::Error {
-                        message: feedback,
-                        summary: "No-progress tool loop".to_string(),
-                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                        timestamp_ms: Some(now_millis()),
-                    });
                     return Ok(StepRunOutcome {
                         reached_final: false,
                         contract_status: incomplete_contract_status(args),
@@ -8903,12 +8905,6 @@ fn run_agent_steps(
                 }
                 if let ProgressDecision::Block(feedback) = &progress_decision {
                     record_progress_warning(feedback, nesting_depth, messages, sink);
-                    sink.emit(AgentEvent::Error {
-                        message: feedback.clone(),
-                        summary: "No-progress tool loop".to_string(),
-                        nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                        timestamp_ms: Some(now_millis()),
-                    });
                     return Ok(StepRunOutcome {
                         reached_final: false,
                         contract_status: incomplete_contract_status(args),
@@ -9070,12 +9066,14 @@ fn run_agent_steps(
         step += 1;
     }
 
-    let message = format!(
-        "The agent reached the step limit ({effective_max_steps}) before producing a final response."
-    );
-    sink.emit(AgentEvent::Error {
-        summary: "Step limit reached".to_string(),
-        message,
+    let first_name = args.profile.teammate_first_name();
+    sink.emit(AgentEvent::Correction {
+        summary: format!("{first_name} reached the bounded step limit"),
+        message: format!(
+            "{first_name} did not complete this pass within {effective_max_steps} bounded steps, so Trinity stopped it safely instead of spending more inference."
+        ),
+        actor: crate::events::TeamActor::workflow_steward(),
+        assisting_profile: Some(args.profile),
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
@@ -11720,16 +11718,20 @@ fn workflow_parse_failure_feedback(
     repeated_failures: usize,
     max_failures: usize,
     required_terminal_tool: &str,
+    terminal_tool_exposed: bool,
     terminal_submission_only: bool,
 ) -> String {
     let next_action = if terminal_submission_only {
         format!(
             "The evidence step is already complete. Call only the provided {required_terminal_tool} function with its declared argument schema; do not start another read or search."
         )
-    } else {
+    } else if terminal_tool_exposed {
         format!(
             "Call an allowed evidence tool if more inspection is required. Otherwise call the provided {required_terminal_tool} function with its declared argument schema."
         )
+    } else {
+        "Call exactly one currently exposed native function with its declared argument schema. The stage submission function is not available until the active work unit is complete."
+            .to_string()
     };
     let mut feedback = format!(
         "Structured action parsing error after attempt {consecutive_failures}/{max_failures}: {error}\n\n\
@@ -11943,6 +11945,19 @@ fn mark_work_unit_diagnostic_failed(
     ledger.mark_diagnostic_failed(focused_paths.iter().cloned(), current)?;
     {
         let mut gate = gate_state.borrow_mut();
+        for path in focused_paths {
+            if let Some(receipt) = gate
+                .stage_evidence
+                .controller_observations
+                .iter()
+                .rev()
+                .find(|receipt| receipt.path == *path)
+                .cloned()
+            {
+                gate.diagnostic_prior_observations
+                    .insert(path.clone(), receipt);
+            }
+        }
         gate.stage_evidence
             .entries
             .retain(|entry| !focused_paths.contains(&entry.path));
@@ -12069,6 +12084,9 @@ fn run_work_unit_diagnostic_previews(
     gate.diagnostic_failed_paths = focused_paths.clone();
     gate.diagnostic_failure_feedback =
         (!failed.is_empty()).then(|| truncate_chars(&failed.join("\n"), 4_000));
+    if failed.is_empty() {
+        gate.diagnostic_prior_observations.clear();
+    }
     drop(gate);
     if failed.is_empty() {
         Ok(Some(
@@ -14524,12 +14542,12 @@ fn run_delivery_commit(
 const PLAN_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan function exactly once with arguments shaped as:
 {"id":"plan-1","summary":"...","requirements":[{"id":"r1","description":"...","source":"user"}],"steps":[{"id":"s1","requirement_ids":["r1"],"paths":{"create":["path/to/new-file.ext"],"modify":[],"delete":[]},"description":"..."}],"acceptance":[{"id":"a1","requirement_ids":["r1"],"check_ids":["required-check-id"],"description":"..."}]}
-Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Each step groups paths into create, modify, and delete arrays. Create paths are new repository-relative names. Modify and delete paths are native-collar constrained to a bounded set of existing paths selected from task-relevant repository structure and exact local discovery results; if the intended path is absent, use glob, ripgrep/search, or read_file before submitting instead of spelling a guess. For repository-local file, symbol, and component discovery, use those local tools rather than public web search; use public research only when the task genuinely depends on external or current facts absent from the repository. For removal work, inspect the containing code and make the plan account for state, imports, derived values, payload fields, and tests that would become unused or behaviorally ambiguous when the visible control or feature disappears. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Consolidate one path's intended transition within a step: create final contents rather than planning a redundant later modify, and use modify rather than delete-then-create replacement. Every requirement must appear in a step and acceptance fact. When the harness names projected contract check ids, leave those ids out of check_ids; pb will add them deterministically after submission. Include only additional configured check ids selected by the plan. Use [] for component_ids or check_ids when there are no additional ids. Do not return the arguments as prose or a final action."#;
+Use the native function-call interface described by the system tool schema. If this model runtime cannot emit native function calls, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. Keep the argument object compact and do not pretty-print it: consolidate related task features into the fewest honest requirements, steps, and acceptance facts that provide complete coverage. Each step groups paths into create, modify, and delete arrays. Create paths are new repository-relative names. Modify and delete paths are native-collar constrained to a bounded set of existing paths selected from task-relevant repository structure and exact local discovery results; if the intended path is absent, use glob, ripgrep/search, or read_file before submitting instead of spelling a guess. For repository-local file, symbol, and component discovery, use those local tools rather than public web search; use public research only when the task genuinely depends on external or current facts absent from the repository. For removal work, inspect the containing code and make the plan account for state, imports, derived values, payload fields, and tests that would become unused or behaviorally ambiguous when the visible control or feature disappears. Removing a control does not implicitly remove the downstream behavior it configured: when a derived value still feeds payloads or child components, plan an explicit stable replacement or account for every consumer instead of merely deleting its declaration. Every path is relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Contract allowed_paths are authoritative when supplied. Consolidate one path's intended transition within a step: create final contents rather than planning a redundant later modify, and use modify rather than delete-then-create replacement. Every requirement must appear in a step and acceptance fact. When the harness names projected contract check ids, leave those ids out of check_ids; pb will add them deterministically after submission. Include only additional configured check ids selected by the plan. Use [] for component_ids or check_ids when there are no additional ids. Do not return the arguments as prose or a final action."#;
 
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan_review function exactly once with arguments shaped as:
 {"id":"plan-review-1","assessments":[{"kind":"requirement_coverage","status":"pass"},{"kind":"architecture","status":"pass"},{"kind":"component_impact","status":"pass"},{"kind":"test_strategy","status":"pass"},{"kind":"failure_modes","status":"pass"},{"kind":"assumptions","status":"pass"}],"challenges":[],"verdict":"pass"}
-pb supplies the exact accepted plan id and digest. Assessments contain only kind and status; do not repeat explanations or evidence there. Put each concern's specific explanation and any observed evidence once in challenges, where every cited repository path must have current review evidence. Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]}, set verdict to revise, and set at least one corresponding assessment status to concern or fail. Never request revision while every assessment is pass. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, every assessment must pass and there must be no p0/p1 challenge. For repository-local evidence, use local repository tools rather than public web search. Do not return prose or a final action."#;
+pb supplies the exact accepted plan id and digest. Assessments contain only kind and status; do not repeat explanations or evidence there. Put each concern's specific explanation and any observed evidence once in challenges, where every cited repository path must have current review evidence. Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]}, set verdict to revise, and set at least one corresponding assessment status to concern or fail. Never request revision while every assessment is pass. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, every assessment must pass and there must be no p0/p1 challenge. For removal plans, a declaration named for deletion must not retain unexplained callers: challenge the plan unless it preserves the downstream behavior with a stable replacement or explicitly updates every consumer. For repository-local evidence, use local repository tools rather than public web search. Do not return prose or a final action."#;
 
 const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
 When the plan creates a missing file, call write_file with arguments such as {"path":"path/to/file.ext","content":"exact contents"}. Never call write_file for a path that already exists. For an existing file, use the exact target-bound tools exposed on the current turn. pb may inject complete bytes or a task-relevant bounded byte range and expose edit_file immediately; in that case edit only text visible in the supplied observation. If read_file is exposed, call read_file as one turn for the target. Follow any read_file continuation from next_line instead of restarting at line 1, and do not claim you can write while the current schema still exposes only read_file. After pb returns sufficient real contents, call replace_file in a later turn when it is exposed, or use the exposed target-bound edit_file action. Paths are relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Use the native function-call interface described by the system tool schema. If native calls are unavailable, use exactly one compatibility action with no markdown or surrounding prose, for example {"type":"tool_call","tool":"write_file","arguments":{"path":"...","content":"..."}}, {"type":"tool_call","tool":"read_file","arguments":{"path":"..."}}, or {"type":"tool_call","tool":"replace_file","arguments":{"path":"...","content":"..."}}. Never return an argument object by itself. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
@@ -14805,7 +14823,7 @@ fn delivery_stage_context(
             let plan_json = serde_json::to_string_pretty(plan)?;
             Ok(StageContext {
                 system_prompt: stable_workflow_stage_system_prompt(
-                    "You are a fresh-context adversarial plan critic. You did not receive the planner transcript or conclusions. Exact complete-file evidence carried and revalidated by the harness counts as observed repository bytes in this stage; use read-only tools for anything absent or partial. Challenge requirement coverage, architecture, component impact, test strategy, failure modes, and assumptions, then end only with submit_plan_review. For removal work, trace the removed feature through its state, imports, derived values, payloads, and tests; challenge a plan that removes only visible markup while leaving ambiguous or obsolete behavior. Do not invent a blocker when the plan is sound, but a pass with a P0/P1 challenge is invalid. Every repository path cited as evidence must be present in the current carried bundle or read in this invocation.",
+                    "You are a fresh-context adversarial plan critic. You did not receive the planner transcript or conclusions. Exact complete-file evidence carried and revalidated by the harness counts as observed repository bytes in this stage; use read-only tools for anything absent or partial. Challenge requirement coverage, architecture, component impact, test strategy, failure modes, and assumptions, then end only with submit_plan_review. For removal work, trace the removed feature through its state, imports, derived values, payloads, and tests. Removing visible input state does not authorize removing a derived value that still has callers: require either a stable replacement preserving downstream behavior or an explicit update to every consumer. Challenge plans that remove only markup, delete a still-used declaration, or leave behavior ambiguous. Do not invent a blocker when the plan is sound, but a pass with a P0/P1 challenge is invalid. Every repository path cited as evidence must be present in the current carried bundle or read in this invocation.",
                     PLAN_REVIEW_SUBMISSION_GUIDANCE,
                 ),
                 user_prompt: format!(
@@ -19051,6 +19069,7 @@ fn build_controller_task_observations(
             None,
             workspace_root,
             None,
+            None,
         )?
         else {
             continue;
@@ -19363,6 +19382,88 @@ fn diagnostic_line_windows(
     merged
 }
 
+fn missing_identifier_repair_guidance(feedback: Option<&str>) -> Option<String> {
+    let feedback = feedback?;
+    let mut names = BTreeSet::new();
+    for remainder in feedback.split("Cannot find name '").skip(1) {
+        if let Some((name, _)) = remainder.split_once('\'')
+            && !name.is_empty()
+        {
+            names.insert(name.to_string());
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The current checks show surviving callers of missing identifier(s): {}. Repair the definition or replace it with a compatible stable value when the removed user control previously supplied it; do not delete unrelated callers merely to silence the diagnostics. The accepted plan's wording does not authorize a compile regression. If the latest ranges show only callers, use the bounded read tool around the component or function declaration area to obtain one current insertion anchor.",
+        names.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+}
+
+fn prior_repair_context_window(
+    text: &str,
+    prior: Option<&crate::workflow::ControllerObservationReceipt>,
+    diagnostic_windows: &[(usize, usize)],
+    total_lines: usize,
+) -> Option<(usize, usize)> {
+    let prior = prior.filter(|receipt| {
+        receipt.coverage == crate::workflow::ObservationCoverage::Ranges
+            && !receipt.included_ranges.is_empty()
+    })?;
+    let first_diagnostic_line = diagnostic_windows.first().map(|window| window.0)?;
+    let bytes = text.as_bytes();
+    prior
+        .included_ranges
+        .iter()
+        .filter_map(|range| {
+            let start_byte = range.start_byte.min(bytes.len());
+            let end_byte = range.end_byte.min(bytes.len()).max(start_byte);
+            let start_line = bytes[..start_byte]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                .saturating_add(1)
+                .min(total_lines);
+            let end_line = bytes[..end_byte]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                .saturating_add(1)
+                .min(total_lines);
+            (end_line < first_diagnostic_line).then_some((start_line, end_line))
+        })
+        .max_by_key(|(_, end)| *end)
+        .map(|(start, end)| (start.max(end.saturating_sub(39)), end))
+}
+
+fn diagnostic_repair_line_windows(
+    path: &str,
+    feedback: Option<&str>,
+    text: &str,
+    total_lines: usize,
+    prior: Option<&crate::workflow::ControllerObservationReceipt>,
+) -> Vec<(usize, usize)> {
+    let diagnostic = diagnostic_line_windows(path, feedback, total_lines);
+    let Some(prior) = prior_repair_context_window(text, prior, &diagnostic, total_lines) else {
+        return diagnostic;
+    };
+    let mut windows = Vec::with_capacity(diagnostic.len().saturating_add(1));
+    windows.push(prior);
+    windows.extend(diagnostic);
+    let mut merged = Vec::<(usize, usize)>::new();
+    for (start, end) in windows {
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1.saturating_add(1)
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
 fn task_line_windows(task: &str, text: &str, total_lines: usize) -> Vec<(usize, usize)> {
     fn useful_task_term(term: &str) -> bool {
         term.len() >= 4
@@ -19603,11 +19704,28 @@ fn render_controller_file_ranges(
     (output, ranges)
 }
 
+#[cfg(test)]
 fn build_controller_read_observation(
     args: &AgentRequest,
     unit: &crate::workflow::WorkUnit,
     workspace_root: &Path,
     diagnostic_feedback: Option<&str>,
+) -> Result<Option<PreparedControllerObservation>> {
+    build_controller_read_observation_with_prior(
+        args,
+        unit,
+        workspace_root,
+        diagnostic_feedback,
+        None,
+    )
+}
+
+fn build_controller_read_observation_with_prior(
+    args: &AgentRequest,
+    unit: &crate::workflow::WorkUnit,
+    workspace_root: &Path,
+    diagnostic_feedback: Option<&str>,
+    prior_observation: Option<&crate::workflow::ControllerObservationReceipt>,
 ) -> Result<Option<PreparedControllerObservation>> {
     build_controller_path_read_observation(
         args,
@@ -19617,6 +19735,7 @@ fn build_controller_read_observation(
         Some(&unit.id),
         workspace_root,
         diagnostic_feedback,
+        prior_observation,
     )
 }
 
@@ -19629,6 +19748,7 @@ fn build_controller_path_read_observation(
     work_unit_id: Option<&str>,
     workspace_root: &Path,
     diagnostic_feedback: Option<&str>,
+    prior_observation: Option<&crate::workflow::ControllerObservationReceipt>,
 ) -> Result<Option<PreparedControllerObservation>> {
     use crate::workflow::{
         ControllerObservationAuthority, ControllerObservationOperation,
@@ -19702,7 +19822,13 @@ fn build_controller_path_read_observation(
         (ObservationCoverage::Full, full_result, full_ranges)
     } else if operation == PlannedChange::Modify {
         let windows = if state == WorkUnitState::DiagnosticFailed {
-            diagnostic_line_windows(path, diagnostic_feedback, total_lines)
+            diagnostic_repair_line_windows(
+                path,
+                diagnostic_feedback,
+                text,
+                total_lines,
+                prior_observation,
+            )
         } else {
             task_line_windows(&args.task, text, total_lines)
         };
@@ -19807,8 +19933,22 @@ fn maybe_inject_controller_read_observation(
     nesting_depth: usize,
     sink: &mut dyn EventSink,
 ) -> Result<bool> {
-    let Some(candidate) =
-        build_controller_read_observation(args, unit, workspace_root, diagnostic_feedback)?
+    let prior_observation = (unit.state == crate::workflow::WorkUnitState::DiagnosticFailed)
+        .then(|| {
+            let gate = gate_state.borrow();
+            gate.diagnostic_prior_observations
+                .get(&unit.path)
+                .cloned()
+                .or_else(|| gate.controller_observation_for_path(&unit.path).cloned())
+        })
+        .flatten();
+    let Some(candidate) = build_controller_read_observation_with_prior(
+        args,
+        unit,
+        workspace_root,
+        diagnostic_feedback,
+        prior_observation.as_ref(),
+    )?
     else {
         return Ok(false);
     };
@@ -26085,7 +26225,9 @@ mod tests {
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("native-collar constrained"));
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("For removal work"));
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("state, imports, derived values"));
+        assert!(PLAN_SUBMISSION_GUIDANCE.contains("stable replacement"));
         assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("submit_plan_review"));
+        assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("unexplained callers"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("exact current content fingerprint"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Never imitate pb's transcript"));
         assert!(
@@ -26398,6 +26540,10 @@ mod tests {
         assert_eq!(
             schema("edit_file").pointer("/properties/old_text/maxLength"),
             Some(&json!(limit / 2))
+        );
+        assert_eq!(
+            schema("edit_file").pointer("/properties/old_text/minLength"),
+            Some(&json!(1))
         );
         assert!(
             schema("edit_file")
@@ -26984,26 +27130,32 @@ the next imagined action"#;
             &unit,
             &receipt,
         ));
-        assert!(!repair_tools.iter().any(|tool| tool.name == "read_file"));
         assert_eq!(
             repair_tools
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["edit_file"]
+            vec!["read_file", "edit_file"]
         );
-        assert!(repair_tools.iter().all(|tool| {
-            tool.description
-                .contains("controller already supplied current diagnostic evidence")
-        }));
-        assert!(
-            repair_tools[0]
-                .description
-                .contains("never use empty old_text")
+        let read = repair_tools
+            .iter()
+            .find(|tool| tool.name == "read_file")
+            .unwrap();
+        assert_eq!(
+            read.input_schema.pointer("/required"),
+            Some(&json!(["line"]))
         );
         assert!(
-            repair_tools[0]
-                .description
+            read.description
+                .contains("omit the declaration or insertion anchor")
+        );
+        let edit = repair_tools
+            .iter()
+            .find(|tool| tool.name == "edit_file")
+            .unwrap();
+        assert!(edit.input_schema.pointer("/properties/old_text/minLength") == Some(&json!(1)));
+        assert!(
+            edit.description
                 .contains("Preserve all unrelated current bytes exactly")
         );
 
@@ -27095,6 +27247,48 @@ the next imagined action"#;
         assert_eq!(projected.len(), 2);
         assert_eq!(projected[0].content, task.content);
         assert_eq!(projected[1].content, other_observation.content);
+    }
+
+    #[test]
+    fn diagnostic_repair_keeps_one_fresh_preceding_anchor_window() {
+        let text = (1..=120)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let start = text
+            .lines()
+            .take(19)
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+        let end = text
+            .lines()
+            .take(50)
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+        let mut prior =
+            test_controller_receipt(crate::workflow::ObservationRendering::ControllerBlock);
+        prior.coverage = crate::workflow::ObservationCoverage::Ranges;
+        prior.included_ranges = vec![crate::workflow::ObservationRange {
+            start_byte: start,
+            end_byte: end,
+            sha256: "d".repeat(64),
+        }];
+
+        let windows = diagnostic_repair_line_windows(
+            "game.ts",
+            Some("game.ts:80:7 Cannot find name 'answer'."),
+            &text,
+            120,
+            Some(&prior),
+        );
+
+        assert_eq!(windows, vec![(20, 51), (68, 92)]);
+        let guidance = missing_identifier_repair_guidance(Some(
+            "Cannot find name 'answer'.\nCannot find name 'answer'.",
+        ))
+        .unwrap();
+        assert!(guidance.contains("answer"));
+        assert!(guidance.contains("stable value"));
+        assert!(guidance.contains("does not authorize a compile regression"));
     }
 
     #[test]
@@ -28629,7 +28823,15 @@ the next imagined action"#;
         let backend = CommandBackend::Local {
             workspace_root: repo.path().to_path_buf(),
         };
-        let gate = RefCell::new(GateState::default());
+        let mut observed_gate = GateState::default();
+        let mut prior_observation =
+            test_controller_receipt(crate::workflow::ObservationRendering::ControllerBlock);
+        prior_observation.path = "alpha.txt".to_string();
+        observed_gate
+            .stage_evidence
+            .controller_observations
+            .push(prior_observation.clone());
+        let gate = RefCell::new(observed_gate);
         let mut events = Vec::new();
         let feedback = run_work_unit_diagnostic_previews(
             &request,
@@ -28645,6 +28847,16 @@ the next imagined action"#;
         assert!(feedback.contains("alpha.txt"));
         assert_eq!(ledger.active().unwrap().path, "alpha.txt");
         assert!(gate.borrow().named_check_evidence.is_empty());
+        assert_eq!(
+            gate.borrow().diagnostic_prior_observations.get("alpha.txt"),
+            Some(&prior_observation)
+        );
+        assert!(
+            gate.borrow()
+                .stage_evidence
+                .controller_observations
+                .is_empty()
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::CheckResult { source: Some(source), .. }
@@ -33220,10 +33432,14 @@ the next imagined action"#;
         assert_eq!(outcome.remaining_completions, 1);
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::Error { message, .. }
-                if message.contains("finish_reason=max_tokens")
-                    && message.contains("{not-json")
+            AgentEvent::Correction { message, .. }
+                if message.contains("{not-json")
         )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. }))
+        );
     }
 
     #[test]
@@ -33269,10 +33485,15 @@ the next imagined action"#;
         )));
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::Error { message, .. }
+            AgentEvent::Correction { message, .. }
                 if message.contains("equivalent unparsable structured action 3 times")
                     && message.contains("without workspace or evidence progress")
         )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. }))
+        );
     }
 
     #[test]
@@ -33938,9 +34159,14 @@ the next imagined action"#;
         assert!(!tmp.path().join("repeat.txt").exists());
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::Error { message, .. }
+            AgentEvent::Correction { message, .. }
                 if message.contains("equivalent unparsable structured action 2 times")
         )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. }))
+        );
     }
 
     #[test]
@@ -33976,10 +34202,15 @@ the next imagined action"#;
         assert!(!tmp.path().join("styles.css").exists());
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::Error { message, .. }
+            AgentEvent::Correction { message, .. }
                 if message.contains("restricted to path \"game.js\"")
                     && message.contains("returned path \"styles.css\"")
         )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. }))
+        );
     }
 
     #[test]
@@ -35194,7 +35425,8 @@ the next imagined action"#;
 
     #[test]
     fn workflow_parse_failure_feedback_uses_only_the_native_tool_dialect() {
-        let feedback = workflow_parse_failure_feedback("cut off", 1, 1, 3, "submit_plan", false);
+        let feedback =
+            workflow_parse_failure_feedback("cut off", 1, 1, 3, "submit_plan", true, false);
 
         assert!(feedback.contains("native function-call interface"));
         assert!(feedback.contains("provided submit_plan function"));
@@ -35202,9 +35434,22 @@ the next imagined action"#;
         assert!(!feedback.contains("Valid forms:"));
 
         let terminal_only =
-            workflow_parse_failure_feedback("cut off", 1, 1, 3, "submit_plan", true);
+            workflow_parse_failure_feedback("cut off", 1, 1, 3, "submit_plan", true, true);
         assert!(terminal_only.contains("evidence step is already complete"));
         assert!(terminal_only.contains("Call only the provided submit_plan"));
+
+        let mutation_only = workflow_parse_failure_feedback(
+            "cut off",
+            1,
+            1,
+            3,
+            "submit_implementation",
+            false,
+            false,
+        );
+        assert!(mutation_only.contains("currently exposed native function"));
+        assert!(mutation_only.contains("stage submission function is not available"));
+        assert!(!mutation_only.contains("provided submit_implementation"));
     }
 
     #[test]
@@ -35396,8 +35641,8 @@ the next imagined action"#;
         assert_eq!(outcome.remaining_completions, 1);
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::Error { summary, message, .. }
-                if summary == "No-progress tool loop"
+            AgentEvent::Correction { summary, message, .. }
+                if summary == "No-progress tool outcome detected"
                     && message.contains("known to be empty")
         )));
     }
@@ -35443,10 +35688,11 @@ the next imagined action"#;
             AgentEvent::Correction { summary, .. }
                 if summary == "No-progress tool outcome detected"
         )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::Error { summary, .. } if summary == "No-progress tool loop"
-        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. }))
+        );
     }
 
     #[test]
@@ -35622,8 +35868,8 @@ the next imagined action"#;
         assert_eq!(outcome.remaining_completions, 1);
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::Error { summary, message, .. }
-                if summary == "No-progress tool loop"
+            AgentEvent::Correction { summary, message, .. }
+                if summary == "No-progress tool outcome detected"
                     && message.contains("deterministic cache replay")
         )));
     }

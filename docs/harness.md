@@ -993,7 +993,19 @@ recovery instead of retrying the identical irreparable patch construction. That 
 cannot close the path-level work unit: pb re-observes the result and exposes the remaining bounded
 edit. Inline completion also runs diagnostic-eligible checks before handoff; failures carry their
 exact output into target-bound repair, where controller-selected line windows replace whole-file
-rediscovery and `request_replan` is withheld for the already-authorized diagnostic path.
+rediscovery and `request_replan` is withheld for the already-authorized diagnostic path. Range-only
+repair keeps `old_text` structurally non-empty, refreshes one nearest preceding observation window
+to retain a likely declaration anchor, and exposes only a line-centered capped read when the
+diagnostic windows still show callers without the insertion area.
+
+Recoverable structured-action failures are emitted as Trinity corrections rather than parallel
+generic error events. The error outcome remains durable when retries are exhausted, but the session
+stream presents one team-appropriate explanation instead of a red error block followed by duplicate
+steward feedback. When the active work unit exposes only mutation or bounded-read functions, retry
+guidance names those current functions instead of prematurely directing the model to the hidden
+stage-submission tool. Deterministic repeat, no-progress, parse, and bounded-step stops follow the
+same presentation rule: their typed terminal outcome remains machine-readable while Trinity gives
+the single visible team explanation and names the active teammate when useful.
 
 Direct bounded runs now derive every instruction from the actual allowlist. A restricted prompt
 never orders an unexposed setup, command, review, or commit tool. When those general discovery

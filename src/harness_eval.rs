@@ -3425,6 +3425,7 @@ fn summarize_fixture(
                 AgentEvent::Correction { summary, .. }
                     if summary == "Repeated tool call blocked"
                         || summary.ends_with("repeated the same action")
+                        || summary.ends_with("reached the repeat limit")
             )
         })
         .count();
