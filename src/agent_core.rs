@@ -5600,12 +5600,45 @@ fn scope_tools_to_ranged_work_unit(
         }
         tools.insert(0, read_tool);
     }
+    if let Some(read_tool) = tools.iter_mut().find(|tool| tool.name == "read_file") {
+        constrain_read_to_explicit_range(
+            read_tool,
+            " The controller already supplied task-relevant ranges for the active accepted-plan path. Supply explicit start and end lines only when one specific missing excerpt is necessary; a whole-file read is not available.",
+        );
+    }
     tools.retain(|tool| {
         matches!(
             tool.name.as_str(),
             "read_file" | "edit_file" | "apply_patch" | "request_replan"
         )
     });
+}
+
+fn constrain_read_to_explicit_range(tool: &mut BuiltInToolSchema, description: &str) {
+    if let Some(required) = tool
+        .input_schema
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+    {
+        required.retain(|field| field.as_str() != Some("path"));
+        for field in ["start", "end"] {
+            if !required
+                .iter()
+                .any(|required| required.as_str() == Some(field))
+            {
+                required.push(json!(field));
+            }
+        }
+    }
+    for field in ["start", "end"] {
+        if let Some(property) = tool
+            .input_schema
+            .pointer_mut(&format!("/properties/{field}"))
+        {
+            property["minimum"] = json!(1);
+        }
+    }
+    tool.description.push_str(description);
 }
 
 fn prefer_atomic_replace_for_small_python_observation(
@@ -11364,30 +11397,8 @@ fn output_requests_read_before_mutation(output: &str) -> bool {
 
 fn bounded_read_recovery_tool(tools: &[BuiltInToolSchema]) -> Option<BuiltInToolSchema> {
     let mut tool = tools.iter().find(|tool| tool.name == "read_file")?.clone();
-    {
-        let required = tool
-            .input_schema
-            .get_mut("required")
-            .and_then(Value::as_array_mut)?;
-        required.retain(|field| field.as_str() != Some("path"));
-        for field in ["start", "end"] {
-            if !required
-                .iter()
-                .any(|required| required.as_str() == Some(field))
-            {
-                required.push(json!(field));
-            }
-        }
-    }
-    for field in ["start", "end"] {
-        if let Some(property) = tool
-            .input_schema
-            .pointer_mut(&format!("/properties/{field}"))
-        {
-            property["minimum"] = json!(1);
-        }
-    }
-    tool.description.push_str(
+    constrain_read_to_explicit_range(
+        &mut tool,
         " Recovery is bound to the active accepted-plan path. Supply explicit start and end lines for one missing bounded excerpt; a whole-file reread is not available.",
     );
     Some(tool)
@@ -26329,12 +26340,12 @@ mod tests {
             vec!["read_file", "edit_file", "apply_patch", "request_replan"]
         );
         let read = tools.iter().find(|tool| tool.name == "read_file").unwrap();
+        assert_eq!(read.input_schema["required"], json!(["start", "end"]));
+        assert_eq!(read.input_schema["properties"]["start"]["minimum"], 1);
+        assert_eq!(read.input_schema["properties"]["end"]["minimum"], 1);
         assert!(
-            !read.input_schema["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|field| field == "path")
+            read.description
+                .contains("a whole-file read is not available")
         );
 
         let recovery = bounded_read_recovery_tool(&tools).unwrap();

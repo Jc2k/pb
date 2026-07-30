@@ -663,8 +663,9 @@ instead select a small set of task-relevant line windows using exact, identifier
 or narrow UI-control synonym matches. It admits those windows only when a rare or multi-term match
 provides a useful anchor, records their exact byte hashes, and exposes target-bound `edit_file` and
 canonical `apply_patch`. It also retains target-bound `read_file` as a narrow escape hatch: the
-model must provide explicit start and end lines for a missing fact, while whole-file and generic
-continuation reads are rejected. If constrained mutation generation stops after the teammate says
+native schema requires explicit start and end lines for a missing fact, so a whole-file call cannot
+consume an inference before being rejected; generic continuation reads are also rejected. If
+constrained mutation generation stops after the teammate says
 such evidence is missing, Trinity gives the next recovery invocation only this bounded-read shape
 instead of forcing another attempt at the same incomplete mutation. Planning and plan-review reads
 never arm an implementation mutation merely because their hashes are still current: read authority
