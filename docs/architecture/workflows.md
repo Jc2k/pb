@@ -266,11 +266,12 @@ gate. Diagnostic-eligible checks run before the inline completion can close the 
 preview reopens only the exact diagnosed task path and keeps the edit; a passing preview permits the
 completion without a bookkeeping-only model turn. An invalid object does not roll back or misreport
 the successful mutation; the ordinary bounded submission path stays available on the next turn.
-If an `apply_patch` generation reaches a native constraint dead end before forming an executable
-call, its one bounded recovery switches to the smaller `edit_file` operation when available. The
-recovery cannot repeat the same irreparable patch branch and cannot claim inline completion. pb
-re-observes the changed path, then exposes another bounded mutation turn for the remaining separated
-edits under the same work-unit and read-before-write authority.
+If an `apply_patch` or `replace_file` generation reaches a native constraint dead end before forming
+an executable call, its one bounded recovery switches to the smaller `edit_file` operation when
+available. This keeps a large observed file from retrying a whole-file construction that cannot fit
+the bounded repair payload. The recovery cannot repeat the same irreparable branch and cannot claim
+inline completion. pb re-observes the changed path, then exposes another bounded mutation turn for
+the remaining separated edits under the same work-unit and read-before-write authority.
 
 When a configured language server supports a changed accepted task path, pb proactively requests
 diagnostics without waiting for the model to choose an LSP tool. While implementation is still in

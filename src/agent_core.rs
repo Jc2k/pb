@@ -11646,6 +11646,21 @@ fn recovery_mutation_requires_follow_up(
     recovery_tool != rejected_tool || constraint_dead_end && recovery_tool == "edit_file"
 }
 
+fn constraint_dead_end_recovery_tool<'a>(
+    rejected_tool: &'a str,
+    constraint_dead_end: bool,
+    edit_file_available: bool,
+) -> &'a str {
+    if constraint_dead_end
+        && edit_file_available
+        && matches!(rejected_tool, "apply_patch" | "replace_file")
+    {
+        "edit_file"
+    } else {
+        rejected_tool
+    }
+}
+
 fn stable_hash(value: &(impl Hash + ?Sized)) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -17151,14 +17166,11 @@ fn generate_and_parse_action_with_retries(
                 if !mutation_retry_used && let Some(tool) = truncated_mutation {
                     mutation_retry_used = true;
                     let payload_limited = failure.hit_mutation_payload_limit(tools);
-                    let recovery_tool = if constraint_dead_end
-                        && tool == "apply_patch"
-                        && tools.iter().any(|schema| schema.name == "edit_file")
-                    {
-                        "edit_file"
-                    } else {
-                        tool
-                    };
+                    let recovery_tool = constraint_dead_end_recovery_tool(
+                        tool,
+                        constraint_dead_end,
+                        tools.iter().any(|schema| schema.name == "edit_file"),
+                    );
                     retry_reason = Some(if payload_limited {
                         AgentRetryReason::ExpandedMutationAfterPayloadLimit
                     } else {
@@ -33469,6 +33481,22 @@ the next imagined action"#;
 
     #[test]
     fn constraint_dead_end_edit_recovery_cannot_close_the_work_unit_inline() {
+        assert_eq!(
+            constraint_dead_end_recovery_tool("replace_file", true, true),
+            "edit_file"
+        );
+        assert_eq!(
+            constraint_dead_end_recovery_tool("apply_patch", true, true),
+            "edit_file"
+        );
+        assert_eq!(
+            constraint_dead_end_recovery_tool("replace_file", false, true),
+            "replace_file"
+        );
+        assert_eq!(
+            constraint_dead_end_recovery_tool("replace_file", true, false),
+            "replace_file"
+        );
         assert!(recovery_mutation_requires_follow_up(
             "edit_file",
             "edit_file",
@@ -33487,7 +33515,7 @@ the next imagined action"#;
     }
 
     #[test]
-    fn irreparable_patch_branch_recovers_with_a_smaller_edit_operation() {
+    fn irreparable_whole_file_branch_recovers_with_a_smaller_edit_operation() {
         let tmp = init_contract_test_repo();
         let original = "const branch = 'main';\nconst defaultBranch = branch;\n";
         std::fs::write(tmp.path().join("game.js"), original).unwrap();
@@ -33541,7 +33569,7 @@ the next imagined action"#;
             vec![
                 ScriptedCompletion {
                     content: format!(
-                        "{SCRIPTED_CONSTRAINT_DEAD_END_PREFIX}<tool_call>{{\"name\":\"apply_patch\",\"arguments\":{{\"patch\":\"diff --git"
+                        "{SCRIPTED_CONSTRAINT_DEAD_END_PREFIX}<tool_call>{{\"name\":\"replace_file\",\"arguments\":{{\"path\":\"game.js\",\"content\":\"const"
                     ),
                     truncated: true,
                 },
@@ -33608,7 +33636,7 @@ the next imagined action"#;
             AgentEvent::Correction { summary, message, .. }
                 if summary == "Retrying an irreparable constrained mutation"
                     && message.contains("Use edit_file once")
-                    && message.contains("do not repeat the rejected apply_patch")
+                    && message.contains("do not repeat the rejected replace_file")
         )));
         let after_first_edit_sha =
             crate::environment_lock::sha256("const defaultBranch = branch;\n".as_bytes());
