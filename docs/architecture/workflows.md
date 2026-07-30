@@ -220,6 +220,12 @@ Assessment entries contain only their dimension and status. A concern or failure
 specific explanation and evidence once in the corresponding typed challenge, and cited repository
 evidence remains freshness-validated. Older checkpoints with assessment-local detail remain
 readable, but new native submissions cannot generate that duplicate prose.
+When a blocking review sends the workflow to plan revision, pb likewise projects the exact
+outstanding blocking challenge IDs into the revised artifact. The IDs are removed from the model's
+native submission schema for that turn: the planner must revise the substance shown in the prompt,
+while controller-owned resolution bookkeeping cannot be omitted, mistyped, duplicated, or used to
+spend another inference. The workflow engine still rejects any persisted or non-projected revision
+that does not account for every blocker.
 The deterministic validator rejects internally inconsistent reviews: a passing verdict cannot
 contain a concern or failed assessment, and a revision verdict needs both a blocking challenge and
 a corresponding concern or failed assessment. A blocker must describe a defect in the proposed

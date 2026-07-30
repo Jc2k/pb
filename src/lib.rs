@@ -1413,6 +1413,7 @@ async fn run_serve() -> Result<()> {
         workflow_expected_content_fingerprint: None,
         workflow_plan_identity: None,
         workflow_plan_paths: Vec::new(),
+        workflow_plan_revision_challenge_ids: Vec::new(),
         workflow_action_first_turn: false,
         workflow_creation_path_order: Vec::new(),
         workflow_work_units: None,

@@ -348,6 +348,11 @@ independent repository-read authority; a challenged plan revision also returns t
 planning. This prevents a local model from spending another invocation rereading bytes pb just
 supplied without converting controller evidence into a review verdict.
 
+During challenged plan revision, the harness removes `resolved_challenge_ids` from the native
+submission schema and projects the exact outstanding blocking IDs into the artifact after the model
+submits its revised substance. The workflow engine retains its full blocker check, but an otherwise
+useful revision cannot lose an inference by omitting or misspelling controller-owned IDs.
+
 Fresh code review receives a changed-path manifest capped at 16,000 characters, selected check IDs, and bounded check
 evidence instead of a complete diff followed by duplicate complete current files. Each manifest
 entry states added, modified, deleted, or renamed status; prior path when applicable; text, binary,

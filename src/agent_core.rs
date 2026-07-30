@@ -564,6 +564,11 @@ pub struct AgentRequest {
     /// it grants no mutation authority.
     #[serde(skip)]
     pub(crate) workflow_plan_paths: Vec<String>,
+    /// Harness-owned blocking plan-review challenge ids. During PlanRevision these are projected
+    /// into the submitted artifact, so the model revises the substance without copying controller-
+    /// known bookkeeping identifiers. Persisted/API requests cannot mark a challenge resolved.
+    #[serde(skip)]
+    pub(crate) workflow_plan_revision_challenge_ids: Vec<String>,
     /// Harness-owned hint for a first implementation turn whose accepted plan contains only
     /// creation of currently missing paths. This is calculated from the validated plan and
     /// current workspace, never accepted from persisted input.
@@ -5548,6 +5553,33 @@ fn configure_plan_review_check_candidates(tools: &mut [BuiltInToolSchema], check
     }
 }
 
+fn configure_plan_revision_submission(tools: &mut [BuiltInToolSchema], challenge_ids: &[String]) {
+    if challenge_ids.is_empty() {
+        return;
+    }
+    let Some(tool) = tools.iter_mut().find(|tool| tool.name == "submit_plan") else {
+        return;
+    };
+    if let Some(properties) = tool
+        .input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.remove("resolved_challenge_ids");
+    }
+    if let Some(required) = tool
+        .input_schema
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+    {
+        required.retain(|field| field.as_str() != Some("resolved_challenge_ids"));
+    }
+    tool.description.push_str(&format!(
+        " The harness will project the {} exact outstanding blocking challenge id(s) after this call; revise the plan substance for every challenge shown in the prompt and do not emit resolved_challenge_ids.",
+        challenge_ids.len()
+    ));
+}
+
 fn replan_supported_for_work_unit(
     contract_allowed_paths: Option<&[String]>,
     unit: &crate::workflow::WorkUnit,
@@ -7997,6 +8029,12 @@ fn run_agent_steps(
                 .map(|graph| graph.checks.keys().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             configure_plan_review_check_candidates(&mut scoped_tools, &check_ids);
+        }
+        if args.workflow_stage == Some(crate::workflow::WorkflowStage::PlanRevision) {
+            configure_plan_revision_submission(
+                &mut scoped_tools,
+                &args.workflow_plan_revision_challenge_ids,
+            );
         }
         let terminal_tools = terminal_submission_only
             .then(|| {
@@ -11539,6 +11577,40 @@ fn project_plan_review_submission(arguments: &Value, request: &AgentRequest) -> 
     Ok(projected)
 }
 
+fn project_plan_revision_challenges(arguments: &Value, request: &AgentRequest) -> Result<Value> {
+    if request.workflow_stage != Some(crate::workflow::WorkflowStage::PlanRevision) {
+        return Ok(arguments.clone());
+    }
+    if request.workflow_plan_revision_challenge_ids.is_empty() {
+        bail!("PlanRevision has no harness-owned blocking challenge ids to resolve");
+    }
+    let mut projected = arguments.clone();
+    let object = projected
+        .as_object_mut()
+        .context("submit_plan arguments must be an object")?;
+    let challenge_ids = json!(request.workflow_plan_revision_challenge_ids);
+    if let Some(legacy_plan) = object.get_mut("plan") {
+        match legacy_plan {
+            Value::Object(plan) => {
+                plan.insert("resolved_challenge_ids".to_string(), challenge_ids);
+            }
+            Value::String(encoded) => {
+                let mut decoded = serde_json::from_str::<Value>(encoded)
+                    .context("submit_plan legacy plan string must contain JSON")?;
+                decoded
+                    .as_object_mut()
+                    .context("submit_plan legacy plan string must contain an object")?
+                    .insert("resolved_challenge_ids".to_string(), challenge_ids);
+                *encoded = serde_json::to_string(&decoded)?;
+            }
+            _ => bail!("submit_plan legacy plan must be an object or JSON string"),
+        }
+    } else {
+        object.insert("resolved_challenge_ids".to_string(), challenge_ids);
+    }
+    Ok(projected)
+}
+
 fn append_workflow_content_fingerprint(
     args: &AgentRequest,
     tool: &str,
@@ -13527,6 +13599,23 @@ fn run_delivery_workflow(
                     .collect()
             })
             .unwrap_or_default();
+        stage_args.workflow_plan_revision_challenge_ids =
+            if stage == crate::workflow::WorkflowStage::PlanRevision {
+                run.plan_review
+                    .as_ref()
+                    .map(|review| {
+                        review
+                            .artifact
+                            .challenges
+                            .iter()
+                            .filter(|challenge| challenge.severity.is_blocking())
+                            .map(|challenge| challenge.id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
         stage_args.workflow_repair_feedback = repair_context.clone();
         let stage_outcome = {
             let mut checkpointing_sink = WorkflowCheckpointingSink {
@@ -21449,6 +21538,7 @@ fn run_tool(
                 arguments,
                 &context.gate_state.borrow().planning_path_candidates,
             )?;
+            let projected = project_plan_revision_challenges(&projected, context.request)?;
             let (plan, normalized_json_string) = parse_submission_artifact(&projected, "plan")?;
             let (plan, projected_check_ids) =
                 project_contract_plan_checks(plan, context.request.contract.as_ref())?;
@@ -26157,6 +26247,7 @@ mod tests {
             workflow_expected_content_fingerprint: None,
             workflow_plan_identity: None,
             workflow_plan_paths: Vec::new(),
+            workflow_plan_revision_challenge_ids: Vec::new(),
             workflow_action_first_turn: false,
             workflow_creation_path_order: Vec::new(),
             workflow_work_units: None,
@@ -26578,6 +26669,46 @@ mod tests {
             );
         }
         crate::inference::flashmoe::validate_native_tool_schema(schema).unwrap();
+    }
+
+    #[test]
+    fn plan_revision_projects_blocking_challenge_ids_as_controller_bookkeeping() {
+        let challenge_ids = vec!["challenge-default-branch".to_string()];
+        let mut tools = all_builtin_tool_specs();
+        configure_plan_revision_submission(&mut tools, &challenge_ids);
+        let schema = &tools
+            .iter()
+            .find(|tool| tool.name == "submit_plan")
+            .unwrap()
+            .input_schema;
+        assert!(
+            schema
+                .pointer("/properties/resolved_challenge_ids")
+                .is_none()
+        );
+        assert!(
+            !schema
+                .pointer("/required")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .any(|field| field.as_str() == Some("resolved_challenge_ids"))
+        );
+        crate::inference::flashmoe::validate_native_tool_schema(schema).unwrap();
+
+        let repo = init_contract_test_repo();
+        let mut request = workflow_request(AgentProfile::Plan, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanRevision);
+        request.workflow_plan_revision_challenge_ids = challenge_ids.clone();
+        let projected = project_plan_revision_challenges(
+            &json!({"id": "plan-2", "summary": "Preserve a stable default branch"}),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(
+            projected.get("resolved_challenge_ids"),
+            Some(&json!(challenge_ids))
+        );
     }
 
     #[test]
@@ -29752,18 +29883,23 @@ the next imagined action"#;
         let original_artifact: crate::workflow::PlanArtifact =
             serde_json::from_value(original_value["arguments"]["plan"].clone()).unwrap();
         let original = crate::workflow::ArtifactEnvelope::new("plan-1", original_artifact).unwrap();
-        let mut revised_artifact = original.artifact.clone();
-        revised_artifact.resolved_challenge_ids = vec!["challenge-1".to_string()];
-        revised_artifact.steps[0].paths = vec![crate::workflow::PlanPath {
+        let mut submitted_revision = original.artifact.clone();
+        submitted_revision.steps[0].paths = vec![crate::workflow::PlanPath {
             path: "existing.txt".to_string(),
             change: crate::workflow::PlannedChange::Modify,
         }];
+        let mut accepted_revision = submitted_revision.clone();
+        accepted_revision.resolved_challenge_ids = vec!["challenge-1".to_string()];
         let revised =
-            crate::workflow::ArtifactEnvelope::new("plan-2", revised_artifact.clone()).unwrap();
+            crate::workflow::ArtifactEnvelope::new("plan-2", accepted_revision.clone()).unwrap();
+        let mut revised_arguments = serde_json::to_value(submitted_revision).unwrap();
+        let revised_arguments = revised_arguments.as_object_mut().unwrap();
+        revised_arguments.remove("resolved_challenge_ids");
+        revised_arguments.insert("id".to_string(), json!("plan-2"));
         let revised_submission = json!({
             "type": "tool_call",
             "tool": "submit_plan",
-            "arguments": {"id": "plan-2", "plan": revised_artifact}
+            "arguments": revised_arguments
         })
         .to_string();
         let mut generator = ScriptedCompletionEngine {
@@ -29814,10 +29950,23 @@ the next imagined action"#;
 
         assert_eq!(
             outcome.checkpoint.run.stage,
-            crate::workflow::WorkflowStage::Implementing
+            crate::workflow::WorkflowStage::Implementing,
+            "{:#?}",
+            outcome.checkpoint.run
         );
         assert_eq!(outcome.checkpoint.run.counters.plan_cycles, 1);
         assert_eq!(outcome.checkpoint.run.plan.as_ref().unwrap().id, "plan-2");
+        assert_eq!(
+            outcome
+                .checkpoint
+                .run
+                .plan
+                .as_ref()
+                .unwrap()
+                .artifact
+                .resolved_challenge_ids,
+            vec!["challenge-1"]
+        );
         assert_eq!(generator.generation_tool_names.len(), 4);
         assert_eq!(
             events
@@ -39128,6 +39277,7 @@ the next imagined action"#;
             workflow_expected_content_fingerprint: None,
             workflow_plan_identity: None,
             workflow_plan_paths: Vec::new(),
+            workflow_plan_revision_challenge_ids: Vec::new(),
             workflow_action_first_turn: false,
             workflow_creation_path_order: Vec::new(),
             workflow_work_units: None,
@@ -39216,6 +39366,7 @@ the next imagined action"#;
             workflow_expected_content_fingerprint: None,
             workflow_plan_identity: None,
             workflow_plan_paths: Vec::new(),
+            workflow_plan_revision_challenge_ids: Vec::new(),
             workflow_action_first_turn: false,
             workflow_creation_path_order: Vec::new(),
             workflow_work_units: None,
