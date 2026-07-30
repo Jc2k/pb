@@ -5746,7 +5746,8 @@ fn scope_tools_to_controller_observation(
         // replacement or prove arbitrary patch context, so expose only the exact replacement tool
         // that the executor can actually honor. A useful partial repair earns another bounded turn
         // with fresh ranges for any remaining diagnostic.
-        if receipt.coverage == crate::workflow::ObservationCoverage::Ranges {
+        let ranged_repair = receipt.coverage == crate::workflow::ObservationCoverage::Ranges;
+        if ranged_repair {
             tools.retain(|tool| tool.name == "edit_file");
         } else {
             tools.retain(|tool| {
@@ -5757,9 +5758,11 @@ fn scope_tools_to_controller_observation(
             });
         }
         for tool in tools.iter_mut() {
-            tool.description.push_str(
-                " The controller already supplied current diagnostic evidence for this path; repair it directly without another read.",
-            );
+            tool.description.push_str(if ranged_repair {
+                " The controller already supplied current diagnostic evidence for this path; repair it directly without another read. old_text must be a non-empty exact fragment copied from the latest supplied range. To insert text, replace one existing anchor with that same anchor plus the insertion in new_text; never use empty old_text. Preserve all unrelated current bytes exactly."
+            } else {
+                " The controller already supplied current diagnostic evidence for this path; repair it directly without another read."
+            });
         }
         return false;
     }
@@ -7618,7 +7621,7 @@ fn run_agent_steps(
                             .is_some_and(|receipt| {
                                 receipt.coverage == crate::workflow::ObservationCoverage::Ranges
                             }) {
-                            "Use edit_file for the smallest exact replacement inside one supplied range. If failures span multiple supplied ranges, fix one range now; useful progress earns a fresh bounded turn for the remainder."
+                            "Use edit_file for the smallest exact replacement inside one supplied range. old_text must be a non-empty exact fragment copied from the latest range. To insert text, replace one existing anchor with that same anchor plus the insertion in new_text; never use empty old_text. Preserve unrelated current bytes exactly. If failures span multiple supplied ranges, fix one range now; useful progress earns a fresh bounded turn for the remainder."
                         } else {
                             "Address every failure from the latest diagnostic in one mutation; apply_patch can carry separated hunks. A partial repair consumes another evidence-and-repair cycle."
                         };
@@ -26993,6 +26996,16 @@ the next imagined action"#;
             tool.description
                 .contains("controller already supplied current diagnostic evidence")
         }));
+        assert!(
+            repair_tools[0]
+                .description
+                .contains("never use empty old_text")
+        );
+        assert!(
+            repair_tools[0]
+                .description
+                .contains("Preserve all unrelated current bytes exactly")
+        );
 
         unit.state = crate::workflow::WorkUnitState::MutationReady;
         unit.path = "lib.rs".to_string();
