@@ -662,14 +662,15 @@ fingerprint and complete prompt bytes remain valid. For an oversized UTF-8 Modif
 instead select a small set of task-relevant line windows using exact, identifier-aware, one-edit,
 or narrow UI-control synonym matches. It admits those windows only when a rare or multi-term match
 provides a useful anchor, records their exact byte hashes, and exposes target-bound `edit_file` and
-canonical `apply_patch`. It also retains target-bound `read_file` as a narrow escape hatch: the
-native schema requires one center line and caps the optional surrounding context at forty lines on
-each side. This keeps the schema compact while making a whole-file call structurally impossible,
-instead of spending an inference only to reject an overbroad range; generic continuation reads are
-also rejected. A completed explicit excerpt does not advertise a continuation into the rest of the
-file; continuation metadata appears only when the excerpt itself exceeded the result budget. If
-constrained mutation generation stops after the teammate says
-such evidence is missing, Trinity gives the next recovery invocation only this bounded-read shape
+canonical `apply_patch`. The first ranged implementation turn is mutation-only: `read_file` remains
+hidden while the controller-provided bytes are already actionable. If constrained mutation stops
+after the teammate explicitly names a missing fact, Trinity gives one recovery invocation only a
+target-bound `read_file` shape. Its native schema requires one center line and caps the optional
+surrounding context at forty lines on each side. This keeps the schema compact while making a
+whole-file call structurally impossible instead of spending an inference only to reject an
+overbroad range; generic continuation reads are also rejected. A completed explicit excerpt does
+not advertise a continuation into the rest of the file; continuation metadata appears only when
+the excerpt itself exceeded the result budget. This recovery happens
 instead of forcing another attempt at the same incomplete mutation. Planning and plan-review reads
 never arm an implementation mutation merely because their hashes are still current: read authority
 is stage-bound, so implementation receives a fresh controller observation or performs its own read

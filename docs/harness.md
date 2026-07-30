@@ -440,10 +440,12 @@ cannot select a different authorized path and would discard current review/check
 changing authority. Multi-path or contract-free work, uncovered failures without a unique contract
 target, and `blocked_for_replan` filesystem transitions retain the existing replan route.
 
-For a ranged controller observation, any remaining `read_file` escape hatch requires one center
-line and permits at most forty surrounding lines on each side. This compact generated schema makes
-a whole-file read structurally impossible instead of spending a turn and rejecting it only after
-generation. A completed explicit excerpt has no continuation into the remainder of the file.
+For a ranged controller observation, the initial implementation turn hides `read_file` and exposes
+the controller-authorized mutation directly. If a constrained mutation explicitly reports one
+missing fact, its single recovery turn exposes only `read_file` with one center line and at most
+forty surrounding lines on each side. This compact generated schema makes a whole-file read
+structurally impossible instead of spending a turn and rejecting it only after generation. A
+completed explicit excerpt has no continuation into the remainder of the file.
 
 Creation units execute one controller-bound path per model action, so an unknown multi-file payload
 cannot consume the turn before the first accepted-plan path is complete. One real content/evidence

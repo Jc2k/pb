@@ -7575,7 +7575,7 @@ fn run_agent_steps(
                                 receipt.coverage
                                     == crate::workflow::ObservationCoverage::Ranges
                             })
-                            .then_some(" The controller showed bounded ranges rather than the complete file. Treat those ranges as your current read and mutate now when they contain the necessary bytes. If one concrete fact is absent, call target-bound read_file with its center line and optional capped context for only that missing excerpt; a whole-file reread is structurally unavailable. apply_patch can update several separated hunks, but every old-side hunk must remain wholly inside observed ranges. The accepted Modify authority covers requirement-related supporting code throughout this same path: multiple distant hunks are not a scope change and do not justify replanning. Request replan only when satisfying the user actually requires another path or change type.")
+                            .then_some(" The controller showed bounded ranges rather than the complete file. Treat those ranges as your current read and mutate now when they contain the necessary bytes. The initial turn is mutation-only. If constrained mutation genuinely cannot form and your reasoning names one concrete missing fact, Trinity can expose one target-bound excerpt recovery with a center line and capped context; a whole-file reread is structurally unavailable. apply_patch can update several separated hunks, but every old-side hunk must remain wholly inside observed ranges. The accepted Modify authority covers requirement-related supporting code throughout this same path: multiple distant hunks are not a scope change and do not justify replanning. Request replan only when satisfying the user actually requires another path or change type.")
                             .unwrap_or_default();
                         format!(
                             "Harness work unit {}: perform only the target-bound {:?} mutation for {}. The observed target fingerprint remains the write authority.{ranged_guidance}",
@@ -7803,6 +7803,15 @@ fn run_agent_steps(
             workflow_completion_enable_thinking(args, step, suppress_thinking, terminal_only_turn)
                 && generator.supports_thinking()?;
         let progress_before_action = progress_state(workspace_root, &gate_state)?;
+        let defer_ranged_read = active_work_unit.as_ref().is_some_and(|unit| {
+            unit.state == crate::workflow::WorkUnitState::MutationReady
+                && gate_state
+                    .borrow()
+                    .controller_observation_for_path(&unit.path)
+                    .is_some_and(|receipt| {
+                        receipt.coverage == crate::workflow::ObservationCoverage::Ranges
+                    })
+        });
         let generated = match generate_and_parse_action_with_retries(
             generator,
             text_backend,
@@ -7821,6 +7830,7 @@ fn run_agent_steps(
             run_budget,
             usize::from(closure_checkpoint.is_some()),
             active_work_unit.as_ref().map(|unit| unit.path.as_str()),
+            defer_ranged_read,
         ) {
             Ok(generated) => generated,
             Err(error) => {
@@ -16728,6 +16738,7 @@ fn generate_and_parse_action_with_retries(
     run_budget: &RefCell<RunBudget>,
     closure_checkpoints: usize,
     bound_mutation_path: Option<&str>,
+    defer_ranged_read: bool,
 ) -> Result<std::result::Result<(String, AgentAction), ParseFailure>> {
     let mut max_tokens = boosted_max_tokens(args);
     let mut attempt_enable_thinking = enable_thinking;
@@ -16737,12 +16748,22 @@ fn generate_and_parse_action_with_retries(
     let mut cap_growth_used = false;
     let mut mutation_retry_used = false;
     let mut mutation_retry_constraint: Option<(String, Option<String>)> = None;
+    let initial_tools = defer_ranged_read.then(|| {
+        tools
+            .iter()
+            .filter(|tool| tool.name != "read_file")
+            .cloned()
+            .collect::<Vec<_>>()
+    });
 
     loop {
         let mut request = args.clone();
         request.max_tokens = run_budget.borrow().next_model_max_tokens(max_tokens)?;
         let prompt_messages = retry_messages.as_deref().unwrap_or(messages);
-        let attempt_tools = retry_tools.as_deref().unwrap_or(tools);
+        let attempt_tools = retry_tools
+            .as_deref()
+            .or(initial_tools.as_deref())
+            .unwrap_or(tools);
         // Establish immutable semantic worlds before prompt work, budget reservation, durable
         // invocation accounting, or backend entry. Cargo/rust-analyzer and Python project loading
         // can be slow; neither is performed from token sampling or after the model has started this
@@ -29579,7 +29600,7 @@ the next imagined action"#;
             outcome.checkpoint.run
         );
         assert_eq!(generator.generation_tool_names.len(), 4);
-        assert!(generator.generation_tool_names[2].contains(&"read_file".to_string()));
+        assert!(!generator.generation_tool_names[2].contains(&"read_file".to_string()));
         assert!(generator.generation_tool_names[2].contains(&"edit_file".to_string()));
         assert!(!events.iter().any(|event| matches!(
             event,
@@ -29694,6 +29715,7 @@ the next imagined action"#;
             "{:#?}\nevents: {events:#?}",
             outcome.checkpoint.run
         );
+        assert!(!generator.generation_tool_names[2].contains(&"read_file".to_string()));
         assert_eq!(generator.generation_tool_names[3], vec!["read_file"]);
         assert!(events.iter().any(|event| matches!(
             event,
