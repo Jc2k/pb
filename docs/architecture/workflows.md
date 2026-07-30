@@ -175,6 +175,13 @@ fingerprinted task-focused excerpt from the strongest matching existing path. A 
 does not pretend to cover the whole file: the model can request a specific missing line range, but
 an unbounded reread of the same file is rejected so generic continuation hints cannot consume the
 stage budget by walking unrelated code.
+Once plan revision has concrete repository work-unit paths, its tool surface drops public web
+research: the revision must answer the critic from the accepted plan and current local evidence,
+not begin an unrelated external evidence chain. Configured LSP tools are likewise exposed for a
+file-scoped workflow only when their declared language IDs support at least one accepted task path.
+Document-scoped LSP calls repeat that language check before lazy server startup, so a Rust analyzer
+cannot consume time or service resources for a TypeScript path even if a caller bypasses model-facing
+tool exposure.
 If a non-native or preserved submission still names an absent Modify or Delete path, live validation
 keeps the plan rejected and adds up to three extension-compatible, edit-distance-ranked existing
 paths when a close name exists. Suggestions are fallback guidance only: pb never silently rewrites a

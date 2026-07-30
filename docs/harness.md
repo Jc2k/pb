@@ -956,6 +956,13 @@ plan-review or code-review terminal precondition is current, ordinary turns expo
 plus the stage's focused evidence tools. This removes unrelated discovery, network, memory, and
 delegation schemas without granting terminal eligibility or weakening the executor-side check.
 
+A challenged plan revision with concrete work-unit paths also excludes public web tools and LSP
+tools whose configured language IDs do not match any accepted path. Document-scoped LSP execution
+rechecks the path language before starting a lazy provider. Built-in web tools run their async client
+on a dedicated bounded runtime thread, including when the harness itself is already inside Tokio;
+a model-requested web action therefore cannot panic the owning agent runtime through nested
+`block_on`.
+
 Direct bounded runs now derive every instruction from the actual allowlist. A restricted prompt
 never orders an unexposed setup, command, review, or commit tool. When those general discovery
 tools are absent, the prompt includes at most 32 sorted top-level repository paths, each capped at

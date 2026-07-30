@@ -274,6 +274,22 @@ impl LspToolRegistry {
     pub fn tool(&self, name: &str) -> Option<&LspToolSpec> {
         self.tools.get(name)
     }
+
+    pub fn tool_supports_path(&self, name: &str, path: &str) -> bool {
+        self.tool(name)
+            .and_then(|spec| self.servers.get(&spec.server_name))
+            .is_some_and(|config| lsp_config_supports_path(config, Path::new(path)))
+    }
+
+    pub fn tool_supports_any_path<'a>(
+        &self,
+        name: &str,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        paths
+            .into_iter()
+            .any(|path| self.tool_supports_path(name, path))
+    }
 }
 
 impl ProjectLspConfig {
@@ -589,6 +605,15 @@ fn call_tool_with_diagnostic_timeout(
         .with_context(|| format!("unknown LSP tool: {tool_name}"))?;
     if let Some(error) = &spec.status_error {
         bail!(error.clone());
+    }
+    if spec.operation != LspOperation::WorkspaceSymbols {
+        let path = string_arg(arguments, "path")?;
+        if !registry.tool_supports_path(tool_name, path) {
+            bail!(
+                "LSP server '{}' does not support the language of path '{path}'",
+                spec.server_name
+            );
+        }
     }
     let session = registry
         .sessions
@@ -2705,6 +2730,15 @@ fn language_id_for_path(path: &Path, configured: &[String]) -> String {
         .unwrap_or_else(|| inferred.unwrap_or("plaintext").to_string())
 }
 
+fn lsp_config_supports_path(config: &LspServerConfig, path: &Path) -> bool {
+    inferred_language_id(path).is_some_and(|language_id| {
+        config
+            .language_ids
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(language_id))
+    })
+}
+
 fn inferred_language_id(path: &Path) -> Option<&'static str> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("rs") => Some("rust"),
@@ -2829,6 +2863,36 @@ mod tests {
 
         assert!(registry.tool("lsp_rust_diagnostics").is_some());
         assert!(registry.sessions["rust"].lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn document_tools_reject_unsupported_languages_before_server_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = discover_tools(
+            BTreeMap::from([(
+                "rust-analyzer".to_string(),
+                LspServerConfig {
+                    command: Some("/definitely/missing/pb-lsp".to_string()),
+                    language_ids: vec!["rust".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            directory.path(),
+        );
+
+        assert!(registry.tool_supports_path("lsp_rust_analyzer_references", "src/lib.rs"));
+        assert!(!registry.tool_supports_path("lsp_rust_analyzer_references", "webui/src/App.tsx"));
+        let error = call_tool(
+            &registry,
+            directory.path(),
+            "lsp_rust_analyzer_references",
+            &json!({"path":"webui/src/App.tsx","line":1,"character":1}),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("does not support the language"), "{error}");
+        assert!(registry.sessions["rust-analyzer"].lock().unwrap().is_none());
     }
 
     #[test]

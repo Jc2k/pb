@@ -6962,6 +6962,25 @@ fn run_agent_steps(
             workflow_tool_allowed(&tool.name, capabilities, mcp_registry, lsp_registry)
                 && capability_tool_available_in_context(&tool.name, args)
         });
+        let workflow_paths = args
+            .workflow_work_units
+            .as_ref()
+            .map(|ledger| {
+                ledger
+                    .units
+                    .iter()
+                    .map(|unit| unit.path.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        available_tools.retain(|tool| {
+            workflow_tool_relevant_to_paths(
+                &tool.name,
+                args.workflow_stage,
+                &workflow_paths,
+                lsp_registry,
+            )
+        });
         if args.intent == Some(crate::workflow::TurnIntent::Discuss) {
             available_tools
                 .retain(|tool| tool.name != "start_delivery" && tool.name != "start_goal");
@@ -20957,6 +20976,26 @@ fn workflow_tool_allowed(
     capabilities.allows_tool(tool)
 }
 
+fn workflow_tool_relevant_to_paths(
+    tool: &str,
+    stage: Option<crate::workflow::WorkflowStage>,
+    paths: &[&str],
+    lsp_registry: &LspToolRegistry,
+) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+    if stage == Some(crate::workflow::WorkflowStage::PlanRevision)
+        && matches!(tool, "web_search" | "web_fetch")
+    {
+        return false;
+    }
+    if lsp_registry.tool(tool).is_some() {
+        return lsp_registry.tool_supports_any_path(tool, paths.iter().copied());
+    }
+    true
+}
+
 fn exact_workspace_check_id(request: &AgentRequest, command: &str) -> Option<String> {
     request.workspace_graph.as_ref().and_then(|graph| {
         graph
@@ -24167,24 +24206,20 @@ fn skill_score(skill: &SkillMetadata, terms: &[&str]) -> usize {
 
 fn block_on_tool<F>(future: F) -> Result<String>
 where
-    F: Future<Output = Result<String>>,
+    F: Future<Output = Result<String>> + Send,
 {
-    tool_runtime()?.block_on(future)
-}
-
-fn tool_runtime() -> Result<&'static tokio::runtime::Runtime> {
-    static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
-        OnceLock::new();
-    match RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to start runtime for web tool")
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(runtime) => Ok(runtime),
-        Err(error) => Err(anyhow!(error.clone())),
-    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to start runtime for web tool")?
+                    .block_on(future)
+            })
+            .join()
+            .map_err(|_| anyhow!("web tool runtime thread panicked"))?
+    })
 }
 
 async fn run_web_search(query: &str) -> Result<String> {
@@ -37860,6 +37895,60 @@ the next imagined action"#;
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn file_scoped_plan_revision_excludes_unrelated_network_and_lsp_tools() {
+        let registry = lsp::discover_tools(
+            BTreeMap::from([(
+                "rust-analyzer".to_string(),
+                crate::lsp::LspServerConfig {
+                    command: Some("rust-analyzer".to_string()),
+                    language_ids: vec!["rust".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            Path::new("."),
+        );
+        let paths = ["webui/src/pages/ProjectsPage.tsx"];
+
+        assert!(!workflow_tool_relevant_to_paths(
+            "web_search",
+            Some(crate::workflow::WorkflowStage::PlanRevision),
+            &paths,
+            &registry,
+        ));
+        assert!(!workflow_tool_relevant_to_paths(
+            "lsp_rust_analyzer_references",
+            Some(crate::workflow::WorkflowStage::PlanRevision),
+            &paths,
+            &registry,
+        ));
+        assert!(workflow_tool_relevant_to_paths(
+            "ripgrep",
+            Some(crate::workflow::WorkflowStage::PlanRevision),
+            &paths,
+            &registry,
+        ));
+        assert!(workflow_tool_relevant_to_paths(
+            "web_search",
+            Some(crate::workflow::WorkflowStage::Planning),
+            &[],
+            &registry,
+        ));
+    }
+
+    #[test]
+    fn web_tool_runtime_can_be_driven_from_an_existing_async_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result =
+            runtime.block_on(async { block_on_tool(async { Ok("async-safe".to_string()) }) });
+
+        assert_eq!(result.unwrap(), "async-safe");
     }
 
     #[test]
