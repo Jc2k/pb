@@ -447,7 +447,8 @@ forty surrounding lines on each side. This compact generated schema makes a whol
 structurally impossible instead of spending a turn and rejecting it only after generation. A
 completed explicit excerpt has no continuation into the remainder of the file.
 After a partial mutation recovered from a constraint dead-end, pb discards the pre-mutation
-controller ranges and observes the current target again before another teammate inference.
+controller ranges and observes the current target again before another teammate inference. That
+continuation is restricted to `edit_file`; the rejected multi-hunk patch grammar is not re-entered.
 
 Creation units execute one controller-bound path per model action, so an unknown multi-file payload
 cannot consume the turn before the first accepted-plan path is complete. One real content/evidence

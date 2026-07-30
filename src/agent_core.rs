@@ -5757,6 +5757,25 @@ fn scope_tools_to_controller_observation(
     prefer_atomic_replace_for_small_python_observation(tools, unit, receipt)
 }
 
+fn scope_tools_to_partial_recovery_continuation(
+    tools: &mut Vec<BuiltInToolSchema>,
+    unit: &crate::workflow::WorkUnit,
+    gate_state: &GateState,
+) {
+    if !gate_state
+        .pending_work_unit_continuations
+        .contains(&unit.path)
+    {
+        return;
+    }
+    tools.retain(|tool| tool.name == "edit_file");
+    if let Some(edit) = tools.first_mut() {
+        edit.description.push_str(
+            " A previous constraint recovery already made one useful replacement on this path. Continue from the fresh controller bytes with one smallest exact replacement; do not restart a multi-hunk patch.",
+        );
+    }
+}
+
 fn active_unit_can_inline_completion(
     ledger: &crate::workflow::WorkUnitLedger,
     unit: &crate::workflow::WorkUnit,
@@ -7687,6 +7706,11 @@ fn run_agent_steps(
                     receipt,
                 );
             }
+            scope_tools_to_partial_recovery_continuation(
+                &mut scoped_tools,
+                unit,
+                &gate_state.borrow(),
+            );
         } else if work_units.is_some() {
             scoped_tools.retain(|tool| {
                 matches!(
@@ -33497,12 +33521,7 @@ the next imagined action"#;
         );
         assert_eq!(
             outcome.generation_tool_names[2],
-            vec![
-                "replace_file".to_string(),
-                "edit_file".to_string(),
-                "apply_patch".to_string(),
-                "request_replan".to_string()
-            ]
+            vec!["edit_file".to_string()]
         );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("game.js")).unwrap(),

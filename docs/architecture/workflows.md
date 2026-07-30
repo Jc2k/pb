@@ -677,7 +677,8 @@ is stage-bound, so implementation receives a fresh controller observation or per
 before the work unit becomes mutation-ready. This keeps the bytes that authorize a write present in
 the same teammate context that performs it. A partial constraint-recovery edit also invalidates its
 old controller ranges, forcing fresh current bytes before the next inference instead of letting a
-repair repeat an already-applied hunk. An edit's old text and every
+repair repeat an already-applied hunk. That bounded continuation exposes only an exact edit, so it
+cannot restart the multi-hunk patch branch that already proved irreparable. An edit's old text and every
 patch hunk's complete old-side range must lie
 wholly inside an included byte window. A range-bound patch may carry separated hunks, but the
 generation collar and executor both bind every hunk to the active accepted-plan path; it cannot use
