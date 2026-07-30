@@ -5606,12 +5606,7 @@ fn scope_tools_to_ranged_work_unit(
             " The controller already supplied task-relevant ranges for the active accepted-plan path. When one specific missing excerpt is necessary, name its center line and optionally request at most 40 surrounding lines on each side; a whole-file read is not available.",
         );
     }
-    tools.retain(|tool| {
-        matches!(
-            tool.name.as_str(),
-            "read_file" | "edit_file" | "request_replan"
-        )
-    });
+    tools.retain(|tool| matches!(tool.name.as_str(), "read_file" | "edit_file"));
 }
 
 const MAX_RANGED_READ_CONTEXT_LINES: u64 = 40;
@@ -26450,7 +26445,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["read_file", "edit_file", "request_replan"]);
+        assert_eq!(names, vec!["read_file", "edit_file"]);
         let read = tools.iter().find(|tool| tool.name == "read_file").unwrap();
         assert_eq!(read.input_schema["required"], json!(["line"]));
         assert!(read.input_schema["properties"].get("start").is_none());

@@ -454,7 +454,8 @@ controller ranges and observes the current target again before another teammate 
 continuation is restricted to a capped target `read_file` excerpt or `edit_file`; the rejected
 multi-hunk patch grammar is not re-entered.
 Range-observed modification turns use that same bounded read/exact-edit surface from their first
-inference. `apply_patch` remains available when the controller supplied full-file evidence.
+inference. `apply_patch` remains available when the controller supplied full-file evidence, and
+`request_replan` returns only when current evidence proves the accepted path or operation insufficient.
 
 Creation units execute one controller-bound path per model action, so an unknown multi-file payload
 cannot consume the turn before the first accepted-plan path is complete. One real content/evidence

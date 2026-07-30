@@ -682,9 +682,9 @@ old controller ranges, forcing fresh current bytes before the next inference ins
 repair repeat an already-applied hunk. That bounded continuation exposes only a capped target excerpt
 and an exact edit, so it cannot restart the multi-hunk patch branch that already proved irreparable.
 An edit's old text must lie wholly inside an included byte window. Range-observed work units expose
-only capped reads and exact edits; whole-file replacement and multi-hunk patching require full-file
-controller evidence. This trades one bounded replacement at a time for a much smaller native collar
-search space. A work-unit observation is retained whenever it survives the real
+only capped reads and exact edits; whole-file replacement, multi-hunk patching, and replanning are
+withheld while the accepted path remains sufficient. This trades one bounded replacement at a time
+for a much smaller native collar search space. A work-unit observation is retained whenever it survives the real
 context preflight; the lower prompt-share heuristic is reserved for optional multi-file planning
 and review batches. This avoids falling back from a viable range to an impossible complete-file
 read on a large accepted target. A failed-diagnostic range has the same edit boundary and is
