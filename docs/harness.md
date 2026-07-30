@@ -966,8 +966,14 @@ a model-requested web action therefore cannot panic the owning agent runtime thr
 Plan-review evidence check IDs are constrained to exact configured check names and observed-evidence
 validation happens inside `submit_plan_review`. A typo therefore returns terminal-tool feedback in
 the same review context rather than discarding honest reviewer findings during an outer stage retry.
-For implementation, a native constraint dead end while forming `apply_patch` gets one fresh
-`edit_file` recovery instead of retrying the identical irreparable patch construction.
+Fresh task-focused observations that cover every existing proposed plan path make the review turn
+terminal-only, preventing generic file pagination while preserving a blocking verdict. For
+implementation, a native constraint dead end while forming `apply_patch` gets one fresh `edit_file`
+recovery instead of retrying the identical irreparable patch construction. That smaller recovery
+cannot close the path-level work unit: pb re-observes the result and exposes the remaining bounded
+edit. Inline completion also runs diagnostic-eligible checks before handoff; failures carry their
+exact output into target-bound repair, where controller-selected line windows replace whole-file
+rediscovery and `request_replan` is withheld for the already-authorized diagnostic path.
 
 Direct bounded runs now derive every instruction from the actual allowlist. A restricted prompt
 never orders an unexposed setup, command, review, or commit tool. When those general discovery

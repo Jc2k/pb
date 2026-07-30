@@ -235,11 +235,13 @@ The critic need not re-read a task path merely to confirm code that the plan pro
 the task, exact plan, bounded repository brief, and carried evidence already support every structural
 assessment. Any repository fact it does cite must still come from current carried or model-read
 evidence.
-For a trusted contract, when fresh controller observations cover every existing allowed path and
-survive the same prompt-capacity and fingerprint checks used by planning, plan review exposes only
-`submit_plan_review` for that turn. The critic can still reject the plan; a resulting plan revision
-gets ordinary read tools. If any allowed path is unobserved, partial, stale, unsafe, or displaced by
-prompt preflight, plan review keeps its ordinary evidence tools.
+When fresh controller observations cover every existing path in the exact proposed plan and survive
+the same prompt-capacity and fingerprint checks used by planning, plan review exposes only
+`submit_plan_review` for that turn. Trusted contract-path coverage provides the same closure. The
+critic can still reject the plan; a resulting plan revision gets ordinary read tools. If any proposed
+existing path is unobserved, stale, unsafe, or displaced by prompt preflight, plan review keeps its
+ordinary evidence tools. Bounded range observations count only for their exact bytes and remain
+valid review evidence; they do not become complete-file mutation evidence.
 Once the deterministic submission precondition is current, the turn exposes only the plan-review
 terminal and focused repository evidence tools.
 
@@ -258,12 +260,14 @@ artifact that identifies what changed and the evidence it produced. It never rec
 On the final unfinished controller-owned work unit, every mutation schema requires an inline
 implementation-completion object. pb executes and records the mutation first, then independently
 validates the completion against the resulting repository fingerprint and ordinary implementation
-gate. A valid object closes implementation without a bookkeeping-only model turn. An invalid object
-does not roll back or misreport the successful mutation; the ordinary bounded submission path stays
-available on the next turn.
+gate. Diagnostic-eligible checks run before the inline completion can close the work unit. A failed
+preview reopens only the exact diagnosed task path and keeps the edit; a passing preview permits the
+completion without a bookkeeping-only model turn. An invalid object does not roll back or misreport
+the successful mutation; the ordinary bounded submission path stays available on the next turn.
 If an `apply_patch` generation reaches a native constraint dead end before forming an executable
 call, its one bounded recovery switches to the smaller `edit_file` operation when available. The
-recovery cannot repeat the same irreparable patch branch; later turns can apply additional separated
+recovery cannot repeat the same irreparable patch branch and cannot claim inline completion. pb
+re-observes the changed path, then exposes another bounded mutation turn for the remaining separated
 edits under the same work-unit and read-before-write authority.
 
 When a configured language server supports a changed accepted task path, pb proactively requests
@@ -272,7 +276,10 @@ progress, the syntax pass admits only error-severity diagnostics identified as p
 failures, avoiding expected semantic noise from half-finished code. Once the work-unit ledger is
 structurally complete, pb ensures the current content version has received a settled pass before a
 direct handoff or final-grace path; unchanged versions are deduplicated. That pass admits current
-error diagnostics. A blocking result reopens only its exact current task paths for repair. It does
+error diagnostics. A blocking result reopens only its exact current task paths for repair. Failed
+check output is carried into a fresh repair stage so controller observations select the cited line
+windows rather than forcing whole-file pagination. Once those exact diagnostic bytes are available,
+the repair turn stays mutation-bound and cannot escape into a redundant replan. It does
 not replace the checking stage, including for supported paths beyond the bounded pass selection.
 
 Settled evidence is workspace-epoch scoped, not merely file-version scoped. Any content mutation
