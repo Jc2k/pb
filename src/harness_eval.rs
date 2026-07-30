@@ -1553,7 +1553,16 @@ fn execute_workflow_assertion_tail(
                         "submit_implementation",
                         serde_json::json!({
                             "id": implementation.id,
-                            "implementation": implementation.artifact,
+                            "steps": implementation.artifact.steps.iter().map(|step| {
+                                serde_json::json!({
+                                    "step_id": step.step_id,
+                                    "status": step.status,
+                                    "summary": step.summary,
+                                })
+                            }).collect::<Vec<_>>(),
+                            "summary": implementation.artifact.summary,
+                            "semantic_commit_type": "feat",
+                            "semantic_commit_description": "deliver workflow fixture",
                         }),
                     ),
                     workflow_tool_completion(

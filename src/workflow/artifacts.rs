@@ -778,17 +778,45 @@ fn validate_repository_path(field: &str, raw: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_semantic_subject(subject: &str) -> Result<()> {
+pub(crate) fn is_semantic_commit_subject(subject: &str) -> bool {
     let subject = subject.trim();
-    let Some((kind, description)) = subject.split_once(':') else {
-        bail!("semantic commit subject must use '<type>: <description>'");
+    if subject.is_empty() || subject.contains('\n') {
+        return false;
+    }
+    let Some((kind, description)) = subject.split_once(": ") else {
+        return false;
     };
-    if !matches!(
-        kind,
-        "feat" | "fix" | "docs" | "test" | "refactor" | "chore" | "perf" | "build" | "ci"
-    ) || description.trim().is_empty()
-    {
-        bail!("semantic commit subject has an unsupported type or empty description");
+    if description.trim().is_empty() {
+        return false;
+    }
+
+    let kind = kind.strip_suffix('!').unwrap_or(kind);
+    let commit_type = match kind.split_once('(') {
+        Some((commit_type, scope)) if scope.ends_with(')') && scope.len() > 1 => commit_type,
+        Some(_) => return false,
+        None => kind,
+    };
+    matches!(
+        commit_type,
+        "feat"
+            | "fix"
+            | "chore"
+            | "docs"
+            | "refactor"
+            | "test"
+            | "perf"
+            | "build"
+            | "ci"
+            | "style"
+            | "revert"
+    )
+}
+
+fn validate_semantic_subject(subject: &str) -> Result<()> {
+    if !is_semantic_commit_subject(subject) {
+        bail!(
+            "semantic commit subject must use a supported Conventional Commit form '<type>[(scope)][!]: <description>'"
+        );
     }
     Ok(())
 }
@@ -998,6 +1026,26 @@ mod tests {
             semantic_commit_subject: "fix: implement accepted change".to_string(),
         };
         implementation.validate(&plan).unwrap();
+
+        let mut scoped = implementation.clone();
+        scoped.semantic_commit_subject =
+            "feat(webui): remove the project branch selector".to_string();
+        scoped.validate(&plan).unwrap();
+
+        let mut breaking = implementation.clone();
+        breaking.semantic_commit_subject =
+            "fix(workflow)!: align implementation closure".to_string();
+        breaking.validate(&plan).unwrap();
+
+        let mut malformed = implementation.clone();
+        malformed.semantic_commit_subject = "feature: unsupported type".to_string();
+        assert!(
+            malformed
+                .validate(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("supported Conventional Commit")
+        );
 
         let mut oversized = implementation.clone();
         oversized.summary = "x".repeat(MAX_IMPLEMENTATION_SUMMARY_CHARS + 1);

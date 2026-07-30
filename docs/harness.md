@@ -52,10 +52,11 @@ small-file observations may seed read-before-write evidence; failed-diagnostic r
 only edits wholly inside the included byte windows. Fresh review inspection is all-or-none and
 never supplies assessments or a verdict. A successful final mutation can carry optional
 model-authored completion fields, while a controller no-change close is limited to structurally
-empty, mutation-forbidden work. Inline completion exposes only the model-owned step status and
-bounded accounting text: summaries are limited to 1,024 characters and the semantic commit subject
-to 200. Plan identity, fingerprints, touched paths, and the no-change fact are projected from trusted
-current state only after the mutation succeeds.
+empty, mutation-forbidden work. Inline completion exposes only the model-owned step status, summaries
+limited to 1,024 characters, a constrained Conventional Commit type, and a bounded non-empty commit
+description. Plan identity, fingerprints, touched paths, the no-change fact, and the final subject are
+projected from trusted current state only after the mutation succeeds; pb assembles and validates the
+subject within its 200-character limit.
 
 After a planned create succeeds, an exact-path diagnostic failure makes that file an existing repair
 target. The controller can inject its current bounded bytes and read-before-write receipt directly,

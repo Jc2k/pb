@@ -5085,6 +5085,17 @@ fn bounded_workflow_string_schema(maximum: usize, allow_empty: bool) -> Value {
     schema
 }
 
+fn semantic_commit_type_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "feat", "fix", "chore", "docs", "refactor", "test", "perf", "build", "ci",
+            "style", "revert", "none"
+        ],
+        "description": "Conventional Commit type. Use none only for a genuine no-change result.",
+    })
+}
+
 fn evidence_reference_schema() -> Value {
     json!({
         "type": "object",
@@ -5272,13 +5283,14 @@ fn implementation_submission_schema() -> Value {
                     false,
                 ),
                 "no_change": {"type": "boolean", "description": "Optional compatibility field; pb derives this from the task delta."},
-                "semantic_commit_subject": bounded_workflow_string_schema(
-                    crate::workflow::MAX_SEMANTIC_COMMIT_SUBJECT_CHARS,
-                    true,
+                "semantic_commit_type": semantic_commit_type_schema(),
+                "semantic_commit_description": bounded_workflow_string_schema(
+                    crate::workflow::MAX_SEMANTIC_COMMIT_SUBJECT_CHARS - "refactor: ".len(),
+                    false,
                 ),
             },
             "required": [
-                "steps", "summary", "semantic_commit_subject"
+                "steps", "summary", "semantic_commit_type", "semantic_commit_description"
             ],
             "additionalProperties": false,
         }),
@@ -11126,6 +11138,25 @@ fn project_implementation_submission(
     let object = projected
         .as_object_mut()
         .context("submit_implementation arguments must be an object")?;
+    if !object.contains_key("semantic_commit_subject") {
+        let commit_type = object
+            .remove("semantic_commit_type")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .context("submit_implementation requires semantic_commit_type")?;
+        let description = object
+            .remove("semantic_commit_description")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .context("submit_implementation requires semantic_commit_description")?;
+        let subject = if commit_type == "none" {
+            String::new()
+        } else {
+            format!("{commit_type}: {}", description.trim())
+        };
+        object.insert("semantic_commit_subject".to_string(), json!(subject));
+    } else {
+        object.remove("semantic_commit_type");
+        object.remove("semantic_commit_description");
+    }
     object.insert("plan_id".to_string(), json!(ledger.plan_id));
     object.insert("plan_sha256".to_string(), json!(ledger.plan_sha256));
     object.insert(
@@ -14468,8 +14499,8 @@ const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
 When the plan creates a missing file, call write_file with arguments such as {"path":"path/to/file.ext","content":"exact contents"}. Never call write_file for a path that already exists. For an existing file, use the exact target-bound tools exposed on the current turn. pb may inject complete bytes or a task-relevant bounded byte range and expose edit_file immediately; in that case edit only text visible in the supplied observation. If read_file is exposed, call read_file as one turn for the target. Follow any read_file continuation from next_line instead of restarting at line 1, and do not claim you can write while the current schema still exposes only read_file. After pb returns sufficient real contents, call replace_file in a later turn when it is exposed, or use the exposed target-bound edit_file action. Paths are relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Use the native function-call interface described by the system tool schema. If native calls are unavailable, use exactly one compatibility action with no markdown or surrounding prose, for example {"type":"tool_call","tool":"write_file","arguments":{"path":"...","content":"..."}}, {"type":"tool_call","tool":"read_file","arguments":{"path":"..."}}, or {"type":"tool_call","tool":"replace_file","arguments":{"path":"...","content":"..."}}. Never return an argument object by itself. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
 One action ends the current turn. After closing a compatibility JSON object, stop generating immediately. Never imitate pb's transcript or invent later tool results: do not output `Tool calls:`, `[tool]`, or `[assistant]`, and do not act as though a file changed until pb returns the real tool result and content fingerprint. When the final mutation schema exposes the required completion field, put the same model-authored implementation accounting object there; pb executes the mutation first, projects structural facts only after success, and ignores or rejects premature completion without pretending the mutation failed.
 After the last work unit is structurally complete, call the provided submit_implementation function exactly once with arguments shaped as:
-{"id":"implementation-1","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","summary":"..."}],"summary":"...","semantic_commit_subject":"feat: concise semantic subject"}
-pb supplies the accepted plan id and digest, exact current content fingerprint, actual task-delta paths for each named step, and no-change judgment. Do not copy or invent those harness-owned fields. Call submit_implementation natively or use exactly {"type":"tool_call","tool":"submit_implementation","arguments":<the argument object above>} with no markdown or surrounding prose. For a genuine no-change result, use status no_change and an empty semantic_commit_subject. Do not return an argument object, prose, or a final action."#;
+{"id":"implementation-1","steps":[{"step_id":"<each accepted step id exactly once>","status":"completed","summary":"..."}],"summary":"...","semantic_commit_type":"feat","semantic_commit_description":"concise semantic description"}
+pb supplies the accepted plan id and digest, exact current content fingerprint, actual task-delta paths, no-change judgment, and the final Conventional Commit subject assembled from the typed commit fields. Do not copy or invent those harness-owned fields. Call submit_implementation natively or use exactly {"type":"tool_call","tool":"submit_implementation","arguments":<the argument object above>} with no markdown or surrounding prose. For a genuine no-change result, use status no_change, semantic_commit_type none, and a short description of why no repository change was needed. Do not return an argument object, prose, or a final action."#;
 
 const CODE_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_code_review function exactly once with arguments shaped as:
@@ -14777,7 +14808,7 @@ fn delivery_stage_context(
             let creation_path_order = plan_creation_path_order(&plan.artifact);
             Ok(StageContext {
                 system_prompt: stable_workflow_stage_system_prompt(
-                    "You are the implementation or repair stage of a harness-controlled delivery workflow. Implement exactly the accepted plan through the single harness-selected work unit and target-bound tools exposed on each turn. A submit_implementation call only reports completed accepted steps; it never performs edits. pb projects plan identity, current content fingerprint, actual task-delta paths, and the no-change judgment. You remain responsible for truthful step status, summaries, and a semantic commit subject. You cannot commit. If the accepted plan is materially wrong, call request_replan; otherwise finish only with submit_implementation after every work unit is structurally complete.",
+                    "You are the implementation or repair stage of a harness-controlled delivery workflow. Implement exactly the accepted plan through the single harness-selected work unit and target-bound tools exposed on each turn. A submit_implementation call only reports completed accepted steps; it never performs edits. pb projects plan identity, current content fingerprint, actual task-delta paths, the no-change judgment, and the final Conventional Commit subject from your typed commit kind and description. You remain responsible for truthful step status and summaries. You cannot commit. If the accepted plan is materially wrong, call request_replan; otherwise finish only with submit_implementation after every work unit is structurally complete.",
                     IMPLEMENTATION_SUBMISSION_GUIDANCE,
                 ),
                 user_prompt: format!(
@@ -25140,37 +25171,7 @@ fn git_checkout_branch(name: &str, workdir: &Path) -> Result<()> {
 }
 
 pub(crate) fn is_semantic_commit_message(message: &str) -> bool {
-    let message = message.trim();
-    if message.is_empty() || message.contains('\n') {
-        return false;
-    }
-    let Some((kind, description)) = message.split_once(": ") else {
-        return false;
-    };
-    if description.trim().is_empty() {
-        return false;
-    }
-
-    let kind = kind.strip_suffix('!').unwrap_or(kind);
-    let commit_type = match kind.split_once('(') {
-        Some((commit_type, scope)) if scope.ends_with(')') && scope.len() > 1 => commit_type,
-        Some(_) => return false,
-        None => kind,
-    };
-    matches!(
-        commit_type,
-        "feat"
-            | "fix"
-            | "chore"
-            | "docs"
-            | "refactor"
-            | "test"
-            | "perf"
-            | "build"
-            | "ci"
-            | "style"
-            | "revert"
-    )
+    crate::workflow::is_semantic_commit_subject(message)
 }
 
 fn git_log_recent(workdir: &Path, n: usize) -> Result<String> {
@@ -25919,9 +25920,18 @@ mod tests {
             Some(&json!(crate::workflow::MAX_IMPLEMENTATION_SUMMARY_CHARS))
         );
         assert_eq!(
+            schema("submit_implementation").pointer("/properties/semantic_commit_type/enum"),
+            Some(&json!([
+                "feat", "fix", "chore", "docs", "refactor", "test", "perf", "build", "ci", "style",
+                "revert", "none"
+            ]))
+        );
+        assert_eq!(
             schema("submit_implementation")
-                .pointer("/properties/semantic_commit_subject/maxLength"),
-            Some(&json!(crate::workflow::MAX_SEMANTIC_COMMIT_SUBJECT_CHARS))
+                .pointer("/properties/semantic_commit_description/maxLength"),
+            Some(&json!(
+                crate::workflow::MAX_SEMANTIC_COMMIT_SUBJECT_CHARS - "refactor: ".len()
+            ))
         );
         let inline_completion = schema("edit_file")
             .pointer("/properties/completion")
@@ -28172,7 +28182,8 @@ the next imagined action"#;
                             "summary": "created both files"
                         }],
                         "summary": "created exact pair",
-                        "semantic_commit_subject": "feat: create exact pair"
+                        "semantic_commit_type": "feat",
+                        "semantic_commit_description": "create exact pair"
                     }),
                 ),
             ],
@@ -28296,7 +28307,8 @@ the next imagined action"#;
                             "summary": "removed legacy marker and updated documentation"
                         }],
                         "summary": "completed the bounded delete and modify units",
-                        "semantic_commit_subject": "fix: remove legacy workflow marker"
+                        "semantic_commit_type": "fix",
+                        "semantic_commit_description": "remove legacy workflow marker"
                     }),
                 ),
             ],
@@ -28384,7 +28396,8 @@ the next imagined action"#;
                     "summary": "added tests"
                 }],
                 "summary": "completed formatter work",
-                "semantic_commit_subject": "feat: complete formatter helpers"
+                "semantic_commit_type": "feat",
+                "semantic_commit_description": "complete formatter helpers"
             }),
             &request,
             repo.path(),
@@ -28392,6 +28405,12 @@ the next imagined action"#;
         .unwrap();
         assert_eq!(projected["plan_id"], plan.id);
         assert_eq!(projected["plan_sha256"], plan.sha256);
+        assert_eq!(
+            projected["semantic_commit_subject"],
+            "feat: complete formatter helpers"
+        );
+        assert!(projected.get("semantic_commit_type").is_none());
+        assert!(projected.get("semantic_commit_description").is_none());
         assert_eq!(
             projected["steps"][0]["touched_paths"],
             json!(["formatter.mjs", "formatter.test.mjs"])
@@ -28578,7 +28597,8 @@ the next imagined action"#;
                 "summary": "removed the obsolete branch selector state"
             }],
             "summary": "removed obsolete branch state",
-            "semantic_commit_subject": "fix: remove obsolete branch state"
+            "semantic_commit_type": "fix",
+            "semantic_commit_description": "remove obsolete branch state"
         });
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
@@ -28729,7 +28749,8 @@ the next imagined action"#;
                             "summary": "repaired the diagnosed file"
                         }],
                         "summary": "repaired the diagnosed file",
-                        "semantic_commit_subject": "fix: repair diagnosed file"
+                        "semantic_commit_type": "fix",
+                        "semantic_commit_description": "repair diagnosed file"
                     }),
                 ),
             ],
@@ -29310,7 +29331,12 @@ the next imagined action"#;
                     }],
                     "summary": if no_change { "The requested state already holds" } else { "Implemented the accepted plan" },
                     "no_change": no_change,
-                    "semantic_commit_subject": if no_change { "" } else { "feat: deliver requested behavior" }
+                    "semantic_commit_type": if no_change { "none" } else { "feat" },
+                    "semantic_commit_description": if no_change {
+                        "no repository change was required"
+                    } else {
+                        "deliver requested behavior"
+                    }
                 }
             }
         })
@@ -29494,7 +29520,8 @@ the next imagined action"#;
                 "summary": "Updated the exact accepted path."
             }],
             "summary": "Implemented the accepted answer update.",
-            "semantic_commit_subject": "fix: correct exported answer"
+            "semantic_commit_type": "fix",
+            "semantic_commit_description": "correct exported answer"
         });
         let (outcome, generator, events) = run_scripted_delivery_workflow(
             &request,
@@ -29639,7 +29666,8 @@ the next imagined action"#;
                 "summary": "Removed the accepted branch selector line."
             }],
             "summary": "Removed the project branch selector.",
-            "semantic_commit_subject": "fix: remove project branch selector"
+            "semantic_commit_type": "fix",
+            "semantic_commit_description": "remove project branch selector"
         });
 
         let (outcome, generator, events) = run_scripted_delivery_workflow(
@@ -29748,7 +29776,8 @@ the next imagined action"#;
                 "summary": "Removed the accepted branch selector line."
             }],
             "summary": "Removed the project branch selector.",
-            "semantic_commit_subject": "fix: remove project branch selector"
+            "semantic_commit_type": "fix",
+            "semantic_commit_description": "remove project branch selector"
         });
 
         let (outcome, generator, events) = run_scripted_delivery_workflow(
@@ -31651,7 +31680,8 @@ the next imagined action"#;
                 "summary": "Removed the branch selector."
             }],
             "summary": "Removed the project branch selector.",
-            "semantic_commit_subject": "fix: remove project branch selector"
+            "semantic_commit_type": "fix",
+            "semantic_commit_description": "remove project branch selector"
         });
 
         let (outcome, generator, events) = run_scripted_delivery_workflow(
@@ -33537,7 +33567,8 @@ the next imagined action"#;
                                 "summary": "Removed both obsolete branch declarations."
                             }],
                             "summary": "Removed the obsolete branch declarations.",
-                            "semantic_commit_subject": "fix: remove obsolete branch declarations"
+                            "semantic_commit_type": "fix",
+                            "semantic_commit_description": "remove obsolete branch declarations"
                         }
                     }),
                 ),

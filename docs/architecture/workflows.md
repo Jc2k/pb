@@ -622,9 +622,12 @@ server/path target.
 
 At implementation submission, pb projects the accepted plan identity/digest, current content
 fingerprint, actual task-delta paths per named plan step, and no-change fact. The model still accounts
-for every step and owns status, summaries, and the proposed semantic commit subject. Implementation
-and per-step summaries are limited to 1,024 characters, and the semantic subject to 200 characters,
-in both the exposed schema and artifact validator. A final mutation's inline completion schema omits
+for every step and owns status, summaries, and the semantic commit type and description. Implementation
+and per-step summaries are limited to 1,024 characters, and the assembled semantic subject to 200 characters.
+The model-facing collar exposes an enum commit type and bounded non-empty description; pb assembles
+the unscoped subject rather than asking the model to reproduce a free-form convention. Restored and
+compatibility artifacts share one validator with the managed commit boundary, including support for
+optional scopes and breaking-change markers. A final mutation's inline completion schema omits
 the controller-owned identity, fingerprint, touched-path, and no-change fields entirely; pb projects
 them only after the mutation succeeds. At code review, pb similarly projects the checked fingerprint
 while the fresh reviewer owns assessments, findings, and verdict. Existing artifact validators still
