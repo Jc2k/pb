@@ -295,6 +295,11 @@ missing-name diagnostic may add one exact preceding declaration anchor for inser
 value/setter removal never does. This is a per-diagnostic choice set, not an exhaustive
 repository-path or edit schema: an invented declaration, unrelated edit, or stale anchor is
 structurally unavailable without listing repository permutations.
+When paired missing value/setter diagnostics leave one uniquely identified task-named markup
+control, the replacement is also collar-constrained to the empty string. The teammate can delete
+that remaining control but cannot spend a long action inventing a substitute UI. A workflow
+inference with exactly one exposed action uses native tool-required generation and stops as soon as
+that complete call closes; prose-only output is not a valid alternative action for that turn.
 Before injecting that observation, pb removes superseded controller bytes and the prior mutation
 call/result for the same path from the model prompt; their durable events and gate effects remain
 recorded, but stale text cannot compete with the current file in the next repair inference. The

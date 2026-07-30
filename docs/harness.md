@@ -1014,6 +1014,11 @@ excluded. A genuine missing-name repair may add one exact preceding insertion an
 value/setter removal does not. The model therefore cannot spend another turn inventing an absent
 declaration, select an unrelated good declaration, or leave an empty selector shell. This bounded
 diagnostic enum is not a repository-wide path schema.
+If paired missing value/setter diagnostics reduce that choice to one task-named markup control,
+`new_text` is also constrained to the empty string: the recovery can only delete the obsolete
+control, not redesign it. Any workflow inference with exactly one exposed action is native
+tool-required and stops after the complete call, preventing a prose-only or trailing-token pass
+from consuming a work-unit step.
 
 Recoverable structured-action failures are emitted as Trinity corrections rather than parallel
 generic error events. The error outcome remains durable when retries are exhausted, but the session

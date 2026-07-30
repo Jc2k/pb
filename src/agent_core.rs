@@ -5910,14 +5910,20 @@ fn diagnostic_conditional_span(
 ) -> Option<(usize, usize)> {
     for opening_line in (line.saturating_sub(16)..=line).rev() {
         let (opening_start, opening_end) = source_line_span(line_starts, text.len(), opening_line);
-        let opening = text[opening_start..opening_end].trim();
+        let opening_line_text = &text[opening_start..opening_end];
+        let opening = opening_line_text.trim();
         if !opening.starts_with('{') || !opening.contains("&& (") {
             continue;
         }
+        let opening_indent = opening_line_text.len() - opening_line_text.trim_start().len();
         let Some(closing_line) =
             (line..line.saturating_add(32).min(line_starts.len())).find(|candidate| {
                 let (start, end) = source_line_span(line_starts, text.len(), *candidate);
-                text[start..end].contains(")}")
+                let candidate_line = &text[start..end];
+                let trimmed = candidate_line.trim();
+                let indent = candidate_line.len() - candidate_line.trim_start().len();
+                (trimmed == ")}" && indent <= opening_indent)
+                    || (trimmed.contains("{/*") && trimmed.ends_with(")}"))
             })
         else {
             continue;
@@ -6045,6 +6051,14 @@ fn configure_diagnostic_edit_candidates(
     if candidates.is_empty() {
         return Ok(0);
     }
+    let deletion_only_control_repair = !protected.is_empty()
+        && candidates.len() == 1
+        && protected
+            .iter()
+            .all(|identifier| text_contains_identifier(&candidates[0], identifier))
+        && candidates[0].lines().any(|line| {
+            html_opening_tag_name(line).is_some() && !task_line_windows(task, line, 1).is_empty()
+        });
     let count = candidates.len();
     if let Some(property) = edit.input_schema.pointer_mut("/properties/old_text") {
         property["enum"] = json!(candidates);
@@ -6052,9 +6066,22 @@ fn configure_diagnostic_edit_candidates(
             "Choose one of {count} compact controller-derived exact current snippets for the located diagnostic. Do not invent or select an unrelated anchor. A genuine missing-name repair may also offer one preceding declaration anchor; a visible control caller is represented by its complete task-named markup block."
         ));
     }
+    if deletion_only_control_repair
+        && let Some(property) = edit.input_schema.pointer_mut("/properties/new_text")
+    {
+        property["enum"] = json!([""]);
+        property["description"] = json!(
+            "This exact current block is the remaining task-named interactive control whose paired value/setter state was removed. Delete it with the only permitted replacement, the empty string."
+        );
+    }
     edit.description.push_str(
         " The native collar restricts old_text to a compact set of exact current diagnostic snippets; choose one and supply only its replacement.",
     );
+    if deletion_only_control_repair {
+        edit.description.push_str(
+            " The one remaining snippet is the task-named interactive control, so new_text is collar-constrained to deletion instead of a substitute control.",
+        );
+    }
     Ok(count)
 }
 
@@ -16610,13 +16637,13 @@ fn llama_chat_request(
         .workflow_stage
         .and_then(workflow_terminal_tool_name)
         .filter(|terminal| tools.iter().any(|tool| tool.name == *terminal));
-    let terminal_tool_names = workflow_terminal
+    let singleton_workflow_action =
+        (args.workflow_stage.is_some() && tools.len() == 1).then(|| tools[0].name.as_str());
+    let terminal_tool_names = singleton_workflow_action
+        .or(workflow_terminal)
         .map(|terminal| vec![terminal.to_string()])
         .unwrap_or_default();
-    let tool_constraint_mode = if args.workflow_stage.is_some()
-        && tools.len() == 1
-        && workflow_terminal.is_some_and(|terminal| tools[0].name == terminal)
-    {
+    let tool_constraint_mode = if singleton_workflow_action.is_some() {
         crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
     } else if args.workflow_stage.is_some() && !tools.is_empty() {
         crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed
@@ -17089,24 +17116,21 @@ fn flashmoe_structured_request_with_required_tool(
         .workflow_stage
         .and_then(workflow_terminal_tool_name)
         .filter(|terminal| tools.iter().any(|tool| tool.name == *terminal));
+    let singleton_workflow_action =
+        (args.workflow_stage.is_some() && tools.len() == 1).then(|| tools[0].name.as_str());
     let terminal_tool_names = required_tool_name
+        .or(singleton_workflow_action)
         .or(workflow_terminal)
         .map(|terminal| vec![terminal.to_string()])
         .unwrap_or_default();
-    let tool_constraint_mode = if required_tool_name.is_some()
-        || (args.workflow_stage.is_some()
-            && tools.len() == 1
-            && args
-                .workflow_stage
-                .and_then(workflow_terminal_tool_name)
-                .is_some_and(|terminal| tools[0].name == terminal))
-    {
-        crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
-    } else if args.workflow_stage.is_some() && !tools.is_empty() {
-        crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed
-    } else {
-        crate::inference::flashmoe::NativeToolConstraintMode::Auto
-    };
+    let tool_constraint_mode =
+        if required_tool_name.is_some() || singleton_workflow_action.is_some() {
+            crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
+        } else if args.workflow_stage.is_some() && !tools.is_empty() {
+            crate::inference::flashmoe::NativeToolConstraintMode::ToolsAllowed
+        } else {
+            crate::inference::flashmoe::NativeToolConstraintMode::Auto
+        };
     let root_constraint_mode = match tool_constraint_mode {
         crate::inference::flashmoe::NativeToolConstraintMode::Auto if tools.is_empty() => {
             crate::inference::StageRootConstraintMode::None
@@ -27371,7 +27395,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_native_requests_require_terminal_tools_only_on_terminal_turns() {
+    fn strict_native_requests_require_singleton_workflow_actions() {
         let mut request = test_agent_request(AgentProfile::Review, 512);
         request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanReview);
         let messages = vec![ChatMessage::text("user", "review")];
@@ -27405,6 +27429,31 @@ mod tests {
             terminal_request.terminal_tool_names,
             vec!["submit_plan_review"]
         );
+
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
+        let edit_tool = all_builtin_tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "edit_file")
+            .unwrap();
+        let mutation_request = flashmoe_structured_request(
+            &request,
+            &messages,
+            std::slice::from_ref(&edit_tool),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            mutation_request.tool_constraint_mode,
+            crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
+        );
+        assert_eq!(mutation_request.terminal_tool_names, vec!["edit_file"]);
+        let llama_request =
+            llama_chat_request(&request, &messages, std::slice::from_ref(&edit_tool)).unwrap();
+        assert_eq!(
+            llama_request.tool_constraint_mode,
+            crate::inference::flashmoe::NativeToolConstraintMode::ToolRequired
+        );
+        assert_eq!(llama_request.terminal_tool_names, vec!["edit_file"]);
     }
 
     #[test]
@@ -27894,6 +27943,89 @@ the next imagined action"#;
                 .iter()
                 .any(|candidate| candidate.as_str().unwrap().contains("defaultBranch"))
         );
+    }
+
+    #[test]
+    fn unique_removed_control_repair_only_permits_deletion() {
+        let repo = init_contract_test_repo();
+        let text = concat!(
+            "export function ProjectPage() {\n",
+            "  const defaultBranch = \"main\";\n",
+            "  return (\n",
+            "    {project && (\n",
+            "      <label className=\"branch-picker\">\n",
+            "        <select\n",
+            "          value={branch}\n",
+            "          onChange={(event) => setBranch(event.target.value)}\n",
+            "        >\n",
+            "          <option>main</option>\n",
+            "        </select>\n",
+            "      </label>\n",
+            "    )}\n",
+            "  );\n",
+            "}\n",
+        );
+        std::fs::write(repo.path().join("game.js"), text).unwrap();
+        let unit = crate::workflow::WorkUnit {
+            id: "path:0".to_string(),
+            plan_step_id: "step".to_string(),
+            contributing_step_ids: Vec::new(),
+            operation: crate::workflow::PlannedChange::Modify,
+            path: "game.js".to_string(),
+            baseline_path_fingerprint: Some("before".to_string()),
+            invocation_path_fingerprint: Some("before".to_string()),
+            current_path_fingerprint: Some("after".to_string()),
+            adopted: false,
+            state: crate::workflow::WorkUnitState::DiagnosticRepairReady,
+        };
+        let mut receipt =
+            test_controller_receipt(crate::workflow::ObservationRendering::ControllerBlock);
+        receipt.path = unit.path.clone();
+        receipt.coverage = crate::workflow::ObservationCoverage::Ranges;
+        receipt.observed_bytes = text.len();
+        receipt.included_ranges = vec![crate::workflow::ObservationRange {
+            start_byte: 0,
+            end_byte: text.len(),
+            sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+        }];
+        let mut tools = all_builtin_tool_specs();
+        apply_mutation_payload_limit(&mut tools, 2_048);
+        assert_eq!(
+            configure_diagnostic_edit_candidates(
+                &mut tools,
+                repo.path(),
+                &unit,
+                &receipt,
+                Some(concat!(
+                    "game.js:7: Cannot find name 'branch'.\n",
+                    "game.js:8: Cannot find name 'setBranch'.",
+                )),
+                "Remove the branch selector from the project page",
+            )
+            .unwrap(),
+            1
+        );
+        let edit = tools.iter().find(|tool| tool.name == "edit_file").unwrap();
+        assert_eq!(
+            edit.input_schema.pointer("/properties/old_text/enum"),
+            Some(&json!([concat!(
+                "    {project && (\n",
+                "      <label className=\"branch-picker\">\n",
+                "        <select\n",
+                "          value={branch}\n",
+                "          onChange={(event) => setBranch(event.target.value)}\n",
+                "        >\n",
+                "          <option>main</option>\n",
+                "        </select>\n",
+                "      </label>\n",
+                "    )}\n",
+            )]))
+        );
+        assert_eq!(
+            edit.input_schema.pointer("/properties/new_text/enum"),
+            Some(&json!([""]))
+        );
+        agent_tool_errors::validate_supported_schema(&edit.input_schema).unwrap();
     }
 
     #[test]
