@@ -11221,6 +11221,15 @@ fn mutation_result_with_inline_completion(
         } else if gate.recovery_mutation_continuations.remove(path) {
             gate.pending_work_unit_continuations
                 .insert(path.to_string());
+            gate.stage_evidence
+                .entries
+                .retain(|entry| entry.path != path);
+            gate.stage_evidence
+                .controller_observations
+                .retain(|receipt| receipt.path != path);
+            gate.read_paths.remove(path);
+            gate.read_content_fingerprints.remove(path);
+            gate.contract_read_evidence.remove(path);
         }
     }
     inline_implementation_completion_disposition(arguments, context, sink)
@@ -33519,6 +33528,18 @@ the next imagined action"#;
                     && message.contains("Use edit_file once")
                     && message.contains("do not repeat the rejected apply_patch")
         )));
+        let after_first_edit_sha =
+            crate::environment_lock::sha256("const defaultBranch = branch;\n".as_bytes());
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ControllerObservation { receipt, .. }
+                    if receipt.path == "game.js"
+                        && receipt.stage == crate::workflow::WorkflowStage::Implementing
+                        && receipt.content_sha256 == after_first_edit_sha
+            )),
+            "partial recovery must refresh current controller bytes before the follow-up edit"
+        );
     }
 
     #[test]
