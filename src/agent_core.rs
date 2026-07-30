@@ -18613,6 +18613,67 @@ fn controller_observation_survives_preflight(
     }))
 }
 
+fn project_fresh_diagnostic_messages(
+    messages: &[ChatMessage],
+    target_path: &str,
+) -> Vec<ChatMessage> {
+    let mut removed_call_ids = HashSet::new();
+    for message in messages {
+        if message.role != "assistant" {
+            continue;
+        }
+        for call in &message.tool_calls {
+            let targets_active_path = call
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .is_none_or(|path| path == target_path);
+            if mutation_tool(&call.tool)
+                && targets_active_path
+                && let Some(id) = call.id.as_ref()
+            {
+                removed_call_ids.insert(id.clone());
+            }
+        }
+    }
+    let observation_path_marker = format!("; path={target_path};");
+    messages
+        .iter()
+        .filter(|message| {
+            let stale_controller_observation =
+                message.prompt_tool_result.as_ref().is_some_and(|metadata| {
+                    metadata.actual_origin.as_deref() == Some("controller")
+                }) && message.content.contains(&observation_path_marker);
+            if stale_controller_observation {
+                return false;
+            }
+            if message.role == "assistant"
+                && message.tool_calls.iter().any(|call| {
+                    mutation_tool(&call.tool)
+                        && call
+                            .arguments
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .is_none_or(|path| path == target_path)
+                })
+            {
+                return false;
+            }
+            if message.role == "tool"
+                && message.name.as_deref().is_some_and(mutation_tool)
+                && message
+                    .tool_call_id
+                    .as_ref()
+                    .is_none_or(|id| removed_call_ids.contains(id))
+            {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
 fn controller_observations_survive_preflight(
     generator: &mut dyn CompletionEngine,
     args: &AgentRequest,
@@ -19772,10 +19833,13 @@ fn maybe_inject_controller_read_observation(
         &candidate_unit,
         &candidate.receipt,
     );
+    let projected_messages = (unit.state == crate::workflow::WorkUnitState::DiagnosticFailed)
+        .then(|| project_fresh_diagnostic_messages(messages, &unit.path));
+    let preflight_messages = projected_messages.as_deref().unwrap_or(messages.as_slice());
     if !controller_observation_survives_preflight(
         generator,
         args,
-        messages,
+        preflight_messages,
         &candidate_tools,
         &candidate,
     )? {
@@ -19804,6 +19868,9 @@ fn maybe_inject_controller_read_observation(
                 controller_observations: vec![candidate.receipt.clone()],
                 ..crate::workflow::StageEvidenceBundle::default()
             })?;
+    }
+    if let Some(projected_messages) = projected_messages {
+        *messages = projected_messages;
     }
     messages.extend(candidate.prompt_messages);
     sink.emit(AgentEvent::ControllerObservation {
@@ -26963,6 +27030,58 @@ the next imagined action"#;
             metadata.prompt_representation.as_deref(),
             Some("controller_block")
         );
+    }
+
+    #[test]
+    fn fresh_diagnostic_observation_supersedes_stale_target_interactions() {
+        let target = "webui/src/pages/ProjectsPage.tsx";
+        let task = ChatMessage::text("user", "Remove the branch selector");
+        let stale_observation = ChatMessage::context_receipt(
+            format!(
+                "pb controller observation (actual_origin=controller; action_id=old; operation=read_file; path={target}; coverage=ranges):\nstale bytes"
+            ),
+            PromptToolResultMetadata {
+                actual_origin: Some("controller".to_string()),
+                observation_action_id: Some("old".to_string()),
+                ..PromptToolResultMetadata::default()
+            },
+        );
+        let mutation = ChatMessage::assistant_with_tool_calls(
+            "remove the state",
+            vec![AgentToolCall {
+                id: Some("edit-1".to_string()),
+                tool: "edit_file".to_string(),
+                arguments: json!({}),
+            }],
+        );
+        let mutation_result = ChatMessage::tool_result(
+            "edit_file".to_string(),
+            Some("edit-1".to_string()),
+            "updated target".to_string(),
+        );
+        let other_observation = ChatMessage::context_receipt(
+            "pb controller observation (actual_origin=controller; action_id=other; operation=read_file; path=other.ts; coverage=ranges):\nother bytes".to_string(),
+            PromptToolResultMetadata {
+                actual_origin: Some("controller".to_string()),
+                observation_action_id: Some("other".to_string()),
+                ..PromptToolResultMetadata::default()
+            },
+        );
+
+        let projected = project_fresh_diagnostic_messages(
+            &[
+                task.clone(),
+                stale_observation,
+                mutation,
+                mutation_result,
+                other_observation.clone(),
+            ],
+            target,
+        );
+
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0].content, task.content);
+        assert_eq!(projected[1].content, other_observation.content);
     }
 
     #[test]

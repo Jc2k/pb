@@ -269,7 +269,10 @@ the successful mutation; the ordinary bounded submission path stays available on
 When the current diagnostic evidence contains only bounded ranges, the repair turn exposes only an
 exact `edit_file` replacement inside those ranges. Whole-file replacement and arbitrary patch tools
 are omitted because the controller cannot authorize their unseen context; a useful partial edit
-earns a fresh ranged turn for any remaining diagnostic.
+earns a fresh ranged turn for any remaining diagnostic. Before injecting that fresh observation, pb
+removes superseded controller bytes and the prior mutation call/result for the same path from the
+model prompt; their durable events and gate effects remain recorded, but stale text cannot compete
+with the current file in the next repair inference.
 If an `apply_patch` or `replace_file` generation reaches a native constraint dead end before forming
 an executable call, its one bounded recovery switches to the smaller `edit_file` operation when
 available. This keeps a large observed file from retrying a whole-file construction that cannot fit
