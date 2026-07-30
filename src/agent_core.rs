@@ -5601,9 +5601,9 @@ fn scope_tools_to_ranged_work_unit(
         tools.insert(0, read_tool);
     }
     if let Some(read_tool) = tools.iter_mut().find(|tool| tool.name == "read_file") {
-        constrain_read_to_explicit_range(
+        constrain_read_to_bounded_excerpt(
             read_tool,
-            " The controller already supplied task-relevant ranges for the active accepted-plan path. Supply explicit start and end lines only when one specific missing excerpt is necessary; a whole-file read is not available.",
+            " The controller already supplied task-relevant ranges for the active accepted-plan path. When one specific missing excerpt is necessary, name its center line and optionally request at most 40 surrounding lines on each side; a whole-file read is not available.",
         );
     }
     tools.retain(|tool| {
@@ -5614,31 +5614,72 @@ fn scope_tools_to_ranged_work_unit(
     });
 }
 
-fn constrain_read_to_explicit_range(tool: &mut BuiltInToolSchema, description: &str) {
+const MAX_RANGED_READ_CONTEXT_LINES: u64 = 40;
+
+fn constrain_read_to_bounded_excerpt(tool: &mut BuiltInToolSchema, description: &str) {
     if let Some(required) = tool
         .input_schema
         .get_mut("required")
         .and_then(Value::as_array_mut)
     {
-        required.retain(|field| field.as_str() != Some("path"));
-        for field in ["start", "end"] {
-            if !required
-                .iter()
-                .any(|required| required.as_str() == Some(field))
-            {
-                required.push(json!(field));
-            }
-        }
+        required.retain(|field| {
+            !matches!(
+                field.as_str(),
+                Some("path" | "start" | "end" | "line" | "context_lines")
+            )
+        });
+        required.push(json!("line"));
     }
-    for field in ["start", "end"] {
-        if let Some(property) = tool
-            .input_schema
-            .pointer_mut(&format!("/properties/{field}"))
-        {
-            property["minimum"] = json!(1);
-        }
+    if let Some(properties) = tool
+        .input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.remove("start");
+        properties.remove("end");
+        properties.insert(
+            "line".to_string(),
+            json!({
+                "type": "integer",
+                "description": "One 1-indexed center line for the missing excerpt.",
+                "minimum": 1,
+            }),
+        );
+        properties.insert(
+            "context_lines".to_string(),
+            json!({
+                "type": "integer",
+                "description": "Optional surrounding lines on each side; defaults to 40 and cannot exceed 40.",
+                "minimum": 1,
+                "maximum": MAX_RANGED_READ_CONTEXT_LINES,
+            }),
+        );
     }
     tool.description.push_str(description);
+}
+
+fn requested_read_range(arguments: &Value) -> (usize, Option<usize>) {
+    if let Some(line) = arguments.get("line").and_then(Value::as_u64) {
+        let line = usize::try_from(line).unwrap_or(usize::MAX).max(1);
+        let context = arguments
+            .get("context_lines")
+            .and_then(Value::as_u64)
+            .unwrap_or(MAX_RANGED_READ_CONTEXT_LINES)
+            .min(MAX_RANGED_READ_CONTEXT_LINES);
+        let context = usize::try_from(context).unwrap_or(usize::MAX);
+        return (
+            line.saturating_sub(context).max(1),
+            Some(line.saturating_add(context)),
+        );
+    }
+
+    (
+        arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize,
+        arguments
+            .get("end")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+    )
 }
 
 fn prefer_atomic_replace_for_small_python_observation(
@@ -7534,7 +7575,7 @@ fn run_agent_steps(
                                 receipt.coverage
                                     == crate::workflow::ObservationCoverage::Ranges
                             })
-                            .then_some(" The controller showed bounded ranges rather than the complete file. Treat those ranges as your current read and mutate now when they contain the necessary bytes. If one concrete fact is absent, call target-bound read_file with explicit start and end lines for only that missing range; a whole-file reread is rejected. apply_patch can update several separated hunks, but every old-side hunk must remain wholly inside observed ranges. The accepted Modify authority covers requirement-related supporting code throughout this same path: multiple distant hunks are not a scope change and do not justify replanning. Request replan only when satisfying the user actually requires another path or change type.")
+                            .then_some(" The controller showed bounded ranges rather than the complete file. Treat those ranges as your current read and mutate now when they contain the necessary bytes. If one concrete fact is absent, call target-bound read_file with its center line and optional capped context for only that missing excerpt; a whole-file reread is structurally unavailable. apply_patch can update several separated hunks, but every old-side hunk must remain wholly inside observed ranges. The accepted Modify authority covers requirement-related supporting code throughout this same path: multiple distant hunks are not a scope change and do not justify replanning. Request replan only when satisfying the user actually requires another path or change type.")
                             .unwrap_or_default();
                         format!(
                             "Harness work unit {}: perform only the target-bound {:?} mutation for {}. The observed target fingerprint remains the write authority.{ranged_guidance}",
@@ -11397,9 +11438,9 @@ fn output_requests_read_before_mutation(output: &str) -> bool {
 
 fn bounded_read_recovery_tool(tools: &[BuiltInToolSchema]) -> Option<BuiltInToolSchema> {
     let mut tool = tools.iter().find(|tool| tool.name == "read_file")?.clone();
-    constrain_read_to_explicit_range(
+    constrain_read_to_bounded_excerpt(
         &mut tool,
-        " Recovery is bound to the active accepted-plan path. Supply explicit start and end lines for one missing bounded excerpt; a whole-file reread is not available.",
+        " Recovery is bound to the active accepted-plan path. Name one center line for the missing excerpt and optionally request at most 40 surrounding lines on each side; a whole-file reread is not available.",
     );
     Some(tool)
 }
@@ -16934,7 +16975,7 @@ fn generate_and_parse_action_with_retries(
                     retry_reason = Some(AgentRetryReason::BoundedReadAfterMutationDeadEnd);
                     retry_tools = Some(vec![read_tool]);
                     cap_growth_used = true;
-                    let instruction = "The attempted mutation stopped before forming a valid call, and the teammate explicitly said one more file excerpt was needed. The accepted-plan target is already fixed. Call only read_file now with explicit start and end line numbers for the smallest missing range; do not retry the mutation or request the whole file in this recovery turn.";
+                    let instruction = "The attempted mutation stopped before forming a valid call, and the teammate explicitly said one more file excerpt was needed. The accepted-plan target is already fixed. Call only read_file now with one center line and optional capped context for the smallest missing excerpt; do not retry the mutation or request the whole file in this recovery turn.";
                     sink.emit(AgentEvent::Correction {
                         message: instruction.to_string(),
                         summary: "Requesting missing bounded evidence".to_string(),
@@ -19812,9 +19853,9 @@ fn render_bounded_read_file(
         next_line = index + 2;
     }
 
-    if next_line <= lines.len() {
-        let suggested_end = next_line.saturating_add(199).min(lines.len());
-        let omitted_lines = lines.len().saturating_sub(next_line).saturating_add(1);
+    if next_line <= end_line {
+        let suggested_end = next_line.saturating_add(199).min(end_line);
+        let omitted_lines = end_line.saturating_sub(next_line).saturating_add(1);
         if output.is_empty() {
             output.push_str("(no complete line fits the current read-result budget)\n");
         }
@@ -20014,13 +20055,12 @@ fn run_tool(
             let Some(path) = arguments.get("path").and_then(Value::as_str) else {
                 bail!("read_file requires string argument: path");
             };
-            let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
-            let end = arguments.get("end").and_then(Value::as_u64);
+            let (start, end) = requested_read_range(arguments);
             ensure_read_is_not_redundant_with_controller_ranges(
                 context.gate_state,
                 path,
                 start,
-                end.map(|value| value as usize),
+                end,
             )?;
             let resolved = resolve_workspace_path(workspace_root, path, true).map_err(|error| {
                 anyhow!(
@@ -20038,7 +20078,7 @@ fn run_tool(
             record_read_path_evidence(path, &read_sha256, context)?;
 
             if let Some(end) = end
-                && (end as usize) < start
+                && end < start
             {
                 return Ok("(no content in requested range)".to_string());
             }
@@ -20046,21 +20086,9 @@ fn run_tool(
                 context.request.ctx_size as usize,
                 usize::try_from(boosted_max_tokens(context.request).max(1)).unwrap_or(usize::MAX),
             );
-            let rendered = render_bounded_read_file(
-                path,
-                &text,
-                start,
-                end.map(|value| value as usize),
-                result_budget,
-            );
+            let rendered = render_bounded_read_file(path, &text, start, end, result_budget);
             record_complete_read_file_stage_evidence(
-                path,
-                &text,
-                start,
-                end.map(|value| value as usize),
-                &rendered,
-                arguments,
-                context,
+                path, &text, start, end, &rendered, arguments, context,
             )?;
             Ok(rendered)
         }
@@ -22203,7 +22231,7 @@ fn ensure_read_is_not_redundant_with_controller_ranges(
         return Ok(());
     }
     bail!(
-        "the controller already supplied current task-relevant ranges from '{path}'; do not reread the whole file or chase its generic continuation. If a specific fact is absent, call read_file with explicit start and end lines for only that bounded range"
+        "the controller already supplied current task-relevant ranges from '{path}'; do not reread the whole file or chase its generic continuation. If a specific fact is absent, call read_file with one center line and optional capped context for only that bounded excerpt"
     )
 }
 
@@ -26340,23 +26368,32 @@ mod tests {
             vec!["read_file", "edit_file", "apply_patch", "request_replan"]
         );
         let read = tools.iter().find(|tool| tool.name == "read_file").unwrap();
-        assert_eq!(read.input_schema["required"], json!(["start", "end"]));
-        assert_eq!(read.input_schema["properties"]["start"]["minimum"], 1);
-        assert_eq!(read.input_schema["properties"]["end"]["minimum"], 1);
+        assert_eq!(read.input_schema["required"], json!(["line"]));
+        assert!(read.input_schema["properties"].get("start").is_none());
+        assert!(read.input_schema["properties"].get("end").is_none());
+        assert_eq!(read.input_schema["properties"]["line"]["minimum"], 1);
+        assert_eq!(
+            read.input_schema["properties"]["context_lines"]["maximum"],
+            MAX_RANGED_READ_CONTEXT_LINES
+        );
         assert!(
             read.description
                 .contains("a whole-file read is not available")
         );
 
         let recovery = bounded_read_recovery_tool(&tools).unwrap();
-        assert_eq!(recovery.input_schema["required"], json!(["start", "end"]));
+        assert_eq!(recovery.input_schema["required"], json!(["line"]));
         assert_eq!(
-            recovery.input_schema["properties"]["start"]["minimum"],
-            json!(1)
+            recovery.input_schema["properties"]["context_lines"]["maximum"],
+            json!(MAX_RANGED_READ_CONTEXT_LINES)
         );
         assert_eq!(
-            recovery.input_schema["properties"]["end"]["minimum"],
-            json!(1)
+            requested_read_range(&json!({"line": 500, "context_lines": 12})),
+            (488, Some(512))
+        );
+        assert_eq!(
+            requested_read_range(&json!({"line": 10, "context_lines": 500})),
+            (1, Some(50))
         );
         assert!(output_requests_read_before_mutation(
             "I need to read the file first. <tool_call>{\"name\":\"apply_patch\""
@@ -29634,7 +29671,7 @@ the next imagined action"#;
                     ),
                     truncated: true,
                 },
-                tool_completion("read_file", json!({"start": 995, "end": 1_005})),
+                tool_completion("read_file", json!({"line": 1_000, "context_lines": 5})),
                 tool_completion(
                     "edit_file",
                     json!({
@@ -29662,15 +29699,15 @@ the next imagined action"#;
             event,
             AgentEvent::Correction { summary, message, .. }
                 if summary == "Requesting missing bounded evidence"
-                    && message.contains("explicit start and end")
+                    && message.contains("center line")
         )));
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolCall { tool, arguments, .. }
                 if tool == "read_file"
                     && arguments["path"] == "game.js"
-                    && arguments["start"] == 995
-                    && arguments["end"] == 1_005
+                    && arguments["line"] == 1_000
+                    && arguments["context_lines"] == 5
         )));
         assert!(events.iter().any(|event| matches!(
             event,
@@ -38470,17 +38507,19 @@ the next imagined action"#;
     }
 
     #[test]
-    fn ranged_read_reports_that_the_file_continues_past_an_explicit_end() {
+    fn ranged_read_stops_at_an_explicit_end_without_advertising_the_rest() {
         let text = (1..=900)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
         let result = render_bounded_read_file("large.txt", &text, 396, Some(595), 16_000);
         assert!(result.starts_with("396: line 396\n"));
-        assert!(result.contains("[read_file continuation]"));
-        assert!(result.contains("next_line=596"));
-        assert!(result.contains(r#""start":596"#));
-        assert!(result.contains(r#""end":795"#));
+        assert!(result.ends_with("595: line 595\n"));
+        assert!(!result.contains("[read_file continuation]"));
+
+        let truncated = render_bounded_read_file("large.txt", &text, 396, Some(595), 160);
+        assert!(truncated.contains("[read_file continuation]"));
+        assert!(truncated.contains(r#""end":595"#));
     }
 
     #[test]
