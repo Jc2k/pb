@@ -537,6 +537,24 @@ impl StageEvidenceBundle {
         )
     }
 
+    pub fn mutation_evidence_paths_for_stage(
+        &self,
+        stage: WorkflowStage,
+    ) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter(move |entry| entry.source_stage == stage)
+            .map(|entry| entry.path.as_str())
+            .chain(
+                self.controller_observations
+                    .iter()
+                    .filter(move |receipt| {
+                        receipt.stage == stage && receipt.permits_read_before_write()
+                    })
+                    .map(|receipt| receipt.path.as_str()),
+            )
+    }
+
     pub fn prompt_json(&self) -> Result<String> {
         let entries = self
             .entries
@@ -706,6 +724,18 @@ mod tests {
         assert_eq!(
             restored.mutation_evidence_paths().collect::<Vec<_>>(),
             vec!["small.txt"]
+        );
+        assert_eq!(
+            restored
+                .mutation_evidence_paths_for_stage(WorkflowStage::Implementing)
+                .collect::<Vec<_>>(),
+            vec!["small.txt"]
+        );
+        assert!(
+            restored
+                .mutation_evidence_paths_for_stage(WorkflowStage::PlanReview)
+                .next()
+                .is_none()
         );
 
         std::fs::write(repo.path().join("small.txt"), "changed\n").unwrap();

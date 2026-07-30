@@ -634,7 +634,11 @@ canonical `apply_patch`. It also retains target-bound `read_file` as a narrow es
 model must provide explicit start and end lines for a missing fact, while whole-file and generic
 continuation reads are rejected. If constrained mutation generation stops after the teammate says
 such evidence is missing, Trinity gives the next recovery invocation only this bounded-read shape
-instead of forcing another attempt at the same incomplete mutation. An edit's old text and every
+instead of forcing another attempt at the same incomplete mutation. Planning and plan-review reads
+never arm an implementation mutation merely because their hashes are still current: read authority
+is stage-bound, so implementation receives a fresh controller observation or performs its own read
+before the work unit becomes mutation-ready. This keeps the bytes that authorize a write present in
+the same teammate context that performs it. An edit's old text and every
 patch hunk's complete old-side range must lie
 wholly inside an included byte window. A range-bound patch may carry separated hunks, but the
 generation collar and executor both bind every hunk to the active accepted-plan path; it cannot use

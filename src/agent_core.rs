@@ -7048,7 +7048,10 @@ fn run_agent_steps(
             let exact_evidence_paths = gate_state
                 .borrow()
                 .stage_evidence
-                .mutation_evidence_paths()
+                .mutation_evidence_paths_for_stage(
+                    args.workflow_stage
+                        .expect("work-unit reconciliation requires a workflow stage"),
+                )
                 .map(str::to_string)
                 .collect::<BTreeSet<_>>();
             ledger.reconcile(&current, &exact_evidence_paths)?;
@@ -7077,6 +7080,8 @@ fn run_agent_steps(
                         &gate_state,
                         &current,
                         &pass.blocking_paths,
+                        args.workflow_stage
+                            .expect("diagnostic failure requires a workflow stage"),
                     )?;
                     {
                         let mut gate = gate_state.borrow_mut();
@@ -7143,7 +7148,10 @@ fn run_agent_steps(
             let evidence_paths = gate_state
                 .borrow()
                 .stage_evidence
-                .mutation_evidence_paths()
+                .mutation_evidence_paths_for_stage(
+                    args.workflow_stage
+                        .expect("controller deletion requires a workflow stage"),
+                )
                 .map(str::to_string)
                 .collect::<BTreeSet<_>>();
             ledger.reconcile(&current, &evidence_paths)?;
@@ -7172,7 +7180,10 @@ fn run_agent_steps(
                 let evidence_paths = gate_state
                     .borrow()
                     .stage_evidence
-                    .mutation_evidence_paths()
+                    .mutation_evidence_paths_for_stage(
+                        args.workflow_stage
+                            .expect("controller observation requires a workflow stage"),
+                    )
                     .map(str::to_string)
                     .collect::<BTreeSet<_>>();
                 ledger.reconcile(&current, &evidence_paths)?;
@@ -10861,7 +10872,12 @@ fn inline_implementation_completion_disposition(
             .gate_state
             .borrow()
             .stage_evidence
-            .mutation_evidence_paths()
+            .mutation_evidence_paths_for_stage(
+                context
+                    .request
+                    .workflow_stage
+                    .expect("inline completion requires a workflow stage"),
+            )
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
         ledger.reconcile(&current, &evidence_paths)?;
@@ -11499,6 +11515,7 @@ fn mark_work_unit_diagnostic_failed(
     gate_state: &RefCell<GateState>,
     current: &crate::workspace::ContentSnapshot,
     focused_paths: &BTreeSet<String>,
+    stage: crate::workflow::WorkflowStage,
 ) -> Result<()> {
     if focused_paths.is_empty() {
         return Ok(());
@@ -11521,7 +11538,7 @@ fn mark_work_unit_diagnostic_failed(
     let exact_evidence_paths = gate_state
         .borrow()
         .stage_evidence
-        .mutation_evidence_paths()
+        .mutation_evidence_paths_for_stage(stage)
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
     ledger.reconcile(current, &exact_evidence_paths)?;
@@ -11611,7 +11628,14 @@ fn run_work_unit_diagnostic_previews(
         bail!("diagnostic preview mutated the controlled workspace");
     }
     if !focused_paths.is_empty() {
-        mark_work_unit_diagnostic_failed(ledger, gate_state, &current, &focused_paths)?;
+        mark_work_unit_diagnostic_failed(
+            ledger,
+            gate_state,
+            &current,
+            &focused_paths,
+            args.workflow_stage
+                .expect("diagnostic preview requires a workflow stage"),
+        )?;
     }
     let mut gate = gate_state.borrow_mut();
     gate.diagnostic_preview_fingerprint = Some(current.fingerprint);
@@ -14081,7 +14105,7 @@ fn workflow_terminal_readiness(
         if let Some(mut ledger) = args.workflow_work_units.clone() {
             let exact_evidence_paths = gate_state
                 .stage_evidence
-                .mutation_evidence_paths()
+                .mutation_evidence_paths_for_stage(stage)
                 .map(str::to_string)
                 .collect::<BTreeSet<_>>();
             ledger.reconcile(&current_snapshot, &exact_evidence_paths)?;
@@ -14407,7 +14431,7 @@ fn current_stage_evidence_paths(
     Ok(run
         .stage_evidence
         .current(workspace_root)?
-        .mutation_evidence_paths()
+        .mutation_evidence_paths_for_stage(run.stage)
         .map(str::to_string)
         .collect())
 }
@@ -27482,7 +27506,7 @@ the next imagined action"#;
                     "legacy.txt".to_string(),
                     current.paths["legacy.txt"].fingerprint.clone(),
                     current.fingerprint.clone(),
-                    crate::workflow::WorkflowStage::Planning,
+                    crate::workflow::WorkflowStage::Implementing,
                     "read_file".to_string(),
                     "legacy-args".to_string(),
                     "obsolete\n".to_string(),
@@ -27493,7 +27517,7 @@ the next imagined action"#;
                     "README.md".to_string(),
                     current.paths["README.md"].fingerprint.clone(),
                     current.fingerprint.clone(),
-                    crate::workflow::WorkflowStage::Planning,
+                    crate::workflow::WorkflowStage::Implementing,
                     "read_file".to_string(),
                     "readme-args".to_string(),
                     "legacy workflow\n".to_string(),
@@ -27652,6 +27676,7 @@ the next imagined action"#;
         .unwrap();
         assert!(ledger.structurally_complete());
         let mut request = workflow_request(AgentProfile::Build, repo.path());
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::Implementing);
         request.contract = Some(crate::harness_contract::AgentContract {
             version: 1,
             mutation: crate::harness_contract::MutationRequirement::Required,
@@ -28585,7 +28610,7 @@ the next imagined action"#;
                 .iter()
                 .filter(|event| matches!(event, AgentEvent::ControllerObservation { .. }))
                 .count(),
-            3
+            4
         );
         let controller_observations = events
             .iter()
@@ -28598,7 +28623,7 @@ the next imagined action"#;
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(controller_observations.len(), 3);
+        assert_eq!(controller_observations.len(), 4);
         assert!(controller_observations.iter().all(|(actor, _)| matches!(
             actor,
             crate::events::TeamActor::Automation(crate::events::AutomationActor::Trinity)
@@ -28613,6 +28638,9 @@ the next imagined action"#;
                 .iter()
                 .any(|(_, profile)| **profile == Some(AgentProfile::Review))
         );
+        assert!(controller_observations.iter().any(|(_, profile)| {
+            **profile == Some(AgentProfile::Build)
+        }));
         assert!(!events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolCall { tool, .. }
@@ -28623,6 +28651,8 @@ the next imagined action"#;
     #[test]
     fn large_modify_work_unit_receives_an_editable_controller_range_without_a_read_turn() {
         let repo = init_contract_test_repo();
+        let path = "webui/src/pages/ProjectsPage.tsx";
+        std::fs::create_dir_all(repo.path().join("webui/src/pages")).unwrap();
         let before = (1..=2_000)
             .map(|line| {
                 if line == 1_000 {
@@ -28633,8 +28663,8 @@ the next imagined action"#;
             })
             .collect::<Vec<_>>()
             .join("\n");
-        std::fs::write(repo.path().join("game.js"), &before).unwrap();
-        git_run(&["add", "game.js"], repo.path()).unwrap();
+        std::fs::write(repo.path().join(path), &before).unwrap();
+        git_run(&["add", path], repo.path()).unwrap();
         git_run(
             &["commit", "-m", "test: add large controller fixture"],
             repo.path(),
@@ -28643,11 +28673,11 @@ the next imagined action"#;
         let repository =
             crate::workspace::RepositoryContext::capture(repo.path(), repo.path()).unwrap();
         let plan = delivery_plan(
-            Some(("game.js", crate::workflow::PlannedChange::Modify)),
+            Some((path, crate::workflow::PlannedChange::Modify)),
             Vec::new(),
         );
         let after = before.replace("const branchSelector = project.branch;", "");
-        let reviewed_fingerprint = fingerprint_with_file_content(repo.path(), "game.js", &after);
+        let reviewed_fingerprint = fingerprint_with_file_content(repo.path(), path, &after);
         let mut request = workflow_request(AgentProfile::Build, repo.path());
         request.ctx_size = 32_768;
         request.task = "Remove the branch selector from the project page".to_string();
@@ -28655,6 +28685,7 @@ the next imagined action"#;
         request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
         let mut contract = normalized_test_contract("true");
         contract.checks.clear();
+        contract.allowed_paths = vec![path.to_string()];
         request.contract = Some(contract);
         let completion = json!({
             "id": "implementation-inline-large",
@@ -28706,9 +28737,27 @@ the next imagined action"#;
             event,
             AgentEvent::ControllerObservation { receipt, .. }
                 if receipt.stage == crate::workflow::WorkflowStage::Implementing
-                    && receipt.path == "game.js"
+                    && receipt.path == path
                     && receipt.coverage == crate::workflow::ObservationCoverage::Ranges
         )));
+        let observed_stages = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ControllerObservation { receipt, .. } if receipt.path == path => {
+                    Some(receipt.stage)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            observed_stages,
+            BTreeSet::from([
+                crate::workflow::WorkflowStage::Planning,
+                crate::workflow::WorkflowStage::PlanReview,
+                crate::workflow::WorkflowStage::Implementing,
+                crate::workflow::WorkflowStage::CodeReview,
+            ])
+        );
     }
 
     #[test]

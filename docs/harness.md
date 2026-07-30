@@ -323,6 +323,11 @@ read-before-write gate, and persists a complete stage-evidence entry. A stage ne
 path observation twice. Missing, symlinked, binary, partial, changed, oversized, or displaced files
 are skipped so the model can use the ordinary read tool.
 
+Read-before-write authority is consumed only in its source stage. In particular, planning or plan
+review evidence cannot make an implementation work unit mutation-ready without a fresh
+implementation-stage observation or read. This prevents a current but no-longer-visible review
+excerpt from authorizing a write in the next teammate's context.
+
 Checkpointed evidence retains its complete controller receipts, hashes, sizes, source stage/tool,
 and ordering. Model prompts receive only a compact path/content projection after pb revalidates the
 current path hash. When isolated plan review will receive eligible contract-path bytes as fresh
