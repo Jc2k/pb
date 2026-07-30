@@ -996,8 +996,9 @@ exact output into target-bound repair, where controller-selected line windows re
 rediscovery and `request_replan` is withheld for the already-authorized diagnostic path. Range-only
 repair keeps `old_text` structurally non-empty, refreshes one nearest preceding observation window
 to retain a likely declaration anchor (including the fresh prefix of a range that overlaps the first
-diagnostic), and exposes only a line-centered capped read when the diagnostic windows still show
-callers without the insertion area. When a removed control leaves missing value/setter callers, the
+diagnostic). A line-centered capped read remains exposed only when no fresh prior declaration anchor
+was retained; otherwise the repair turn is mutation-only. When a removed control leaves missing
+value/setter callers, the
 repair guidance forbids recreating that state and distinguishes removable UI callers from non-UI
 consumers that need a stable replacement.
 

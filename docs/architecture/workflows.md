@@ -269,8 +269,9 @@ preview reopens only the exact diagnosed task path and keeps the edit; a passing
 completion without a bookkeeping-only model turn. An invalid object does not roll back or misreport
 the successful mutation; the ordinary bounded submission path stays available on the next turn.
 When the current diagnostic evidence contains only bounded ranges, the repair turn exposes exact
-`edit_file` replacement inside those ranges plus one line-centered, capped `read_file` escape hatch
-for cases where diagnostics show callers but omit the declaration or insertion area. Whole-file
+`edit_file` replacement inside those ranges. A line-centered, capped `read_file` escape hatch remains
+only when diagnostics show callers and the controller could not retain a prior declaration or
+insertion area; when a fresh prior anchor is present, the repair turn is mutation-only. Whole-file
 replacement and arbitrary patch tools are omitted because the controller cannot authorize their
 unseen context; a useful partial edit earns a fresh ranged turn for any remaining diagnostic. Each
 fresh diagnostic observation also re-reads one nearest preceding range from the prior observation.

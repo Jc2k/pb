@@ -5746,21 +5746,27 @@ fn scope_tools_to_controller_observation(
     available_tools: &[BuiltInToolSchema],
     unit: &crate::workflow::WorkUnit,
     receipt: &crate::workflow::ControllerObservationReceipt,
+    retained_prior_anchor: bool,
 ) -> bool {
     if unit.state == crate::workflow::WorkUnitState::DiagnosticRepairReady
         && receipt.path == unit.path
     {
         // The controller already supplied the exact current diagnostic windows for this repair.
         // A range-only observation cannot authorize whole-file replacement or prove arbitrary
-        // patch context. Keep edit_file plus only a line-centered, capped read escape hatch: some
-        // diagnostics show callers but omit the declaration area required for a safe insertion.
-        // A useful partial repair earns another bounded turn with fresh ranges for any remainder.
+        // patch context. When the controller retained a fresh declaration-area anchor, mutation is
+        // sufficient and a read would only invite rediscovery. Otherwise keep edit_file plus one
+        // line-centered, capped read escape hatch. A useful partial repair earns another bounded
+        // turn with fresh ranges for any remainder.
         let ranged_repair = receipt.coverage == crate::workflow::ObservationCoverage::Ranges;
         if ranged_repair {
-            // Diagnostics can identify a use without including the declaration area needed for a
-            // safe insertion. Keep one explicitly bounded read escape hatch beside edit_file so a
-            // model cannot ask for or receive the whole file merely to obtain that anchor.
-            scope_tools_to_ranged_work_unit(tools, available_tools);
+            if retained_prior_anchor {
+                tools.retain(|tool| tool.name == "edit_file");
+            } else {
+                // Diagnostics can identify a use without including the declaration area needed for
+                // a safe insertion. Keep one explicitly bounded read escape hatch beside edit_file
+                // so a model cannot ask for or receive the whole file merely to obtain that anchor.
+                scope_tools_to_ranged_work_unit(tools, available_tools);
+            }
         } else {
             tools.retain(|tool| {
                 matches!(
@@ -6321,6 +6327,7 @@ struct GateState {
     diagnostic_failed_paths: BTreeSet<String>,
     diagnostic_failure_feedback: Option<String>,
     diagnostic_prior_observations: HashMap<String, crate::workflow::ControllerObservationReceipt>,
+    diagnostic_anchor_paths: BTreeSet<String>,
     inline_diagnostic_failure_pending: bool,
     recovery_mutation_continuations: BTreeSet<String>,
     pending_work_unit_continuations: BTreeSet<String>,
@@ -7769,16 +7776,17 @@ fn run_agent_steps(
                     .is_some_and(|ledger| active_unit_can_inline_completion(ledger, unit))
                     && args.observation_rendering.is_controller(),
             );
-            if let Some(receipt) = gate_state
-                .borrow()
-                .controller_observation_for_path(&unit.path)
             {
-                let _ = scope_tools_to_controller_observation(
-                    &mut scoped_tools,
-                    &available_tools,
-                    unit,
-                    receipt,
-                );
+                let gate = gate_state.borrow();
+                if let Some(receipt) = gate.controller_observation_for_path(&unit.path) {
+                    let _ = scope_tools_to_controller_observation(
+                        &mut scoped_tools,
+                        &available_tools,
+                        unit,
+                        receipt,
+                        gate.diagnostic_anchor_paths.contains(&unit.path),
+                    );
+                }
             }
             scope_tools_to_partial_recovery_continuation(
                 &mut scoped_tools,
@@ -12086,6 +12094,7 @@ fn run_work_unit_diagnostic_previews(
         (!failed.is_empty()).then(|| truncate_chars(&failed.join("\n"), 4_000));
     if failed.is_empty() {
         gate.diagnostic_prior_observations.clear();
+        gate.diagnostic_anchor_paths.clear();
     }
     drop(gate);
     if failed.is_empty() {
@@ -18548,6 +18557,7 @@ struct PreparedControllerObservation {
     receipt: crate::workflow::ControllerObservationReceipt,
     prompt_messages: Vec<ChatMessage>,
     stage_entry: Option<crate::workflow::StageEvidenceEntry>,
+    retained_prior_anchor: bool,
 }
 
 fn controller_observation_metadata(
@@ -18872,6 +18882,7 @@ fn build_controller_contract_observations(
             receipt,
             prompt_messages,
             stage_entry: Some(stage_entry),
+            retained_prior_anchor: false,
         });
     }
     Ok(candidates)
@@ -19261,6 +19272,7 @@ fn build_controller_review_observations(
             receipt,
             prompt_messages,
             stage_entry: None,
+            retained_prior_anchor: false,
         });
     }
     Ok(candidates)
@@ -19812,6 +19824,14 @@ fn build_controller_path_read_observation(
         .split_inclusive('\n')
         .count()
         .max(usize::from(!text.is_empty()));
+    let retained_prior_anchor = state == WorkUnitState::DiagnosticFailed
+        && prior_repair_context_window(
+            text,
+            prior_observation,
+            &diagnostic_line_windows(path, diagnostic_feedback, total_lines),
+            total_lines,
+        )
+        .is_some();
     let full_result = render_bounded_read_file(path, text, 1, None, result_budget);
     let full_coverage = !full_result.contains("[read_file continuation]")
         && !full_result.contains("(no complete line fits the current read-result budget)");
@@ -19927,6 +19947,7 @@ fn build_controller_path_read_observation(
         receipt,
         prompt_messages,
         stage_entry,
+        retained_prior_anchor,
     }))
 }
 
@@ -19985,6 +20006,7 @@ fn maybe_inject_controller_read_observation(
         available_tools,
         &candidate_unit,
         &candidate.receipt,
+        candidate.retained_prior_anchor,
     );
     let projected_messages = (unit.state == crate::workflow::WorkUnitState::DiagnosticFailed)
         .then(|| project_fresh_diagnostic_messages(messages, &unit.path));
@@ -20013,6 +20035,12 @@ fn maybe_inject_controller_read_observation(
                 candidate.receipt.path.clone(),
                 git_worktree_content_fingerprint(workspace_root)?,
             );
+        }
+        if candidate.retained_prior_anchor {
+            gate.diagnostic_anchor_paths
+                .insert(candidate.receipt.path.clone());
+        } else {
+            gate.diagnostic_anchor_paths.remove(&candidate.receipt.path);
         }
         let entries = candidate.stage_entry.clone().into_iter().collect();
         gate.stage_evidence
@@ -27104,6 +27132,7 @@ the next imagined action"#;
             &available_tools,
             &unit,
             &receipt,
+            false,
         ));
         assert!(!tools.iter().any(|tool| tool.name == "read_file"));
         assert!(!tools.iter().any(|tool| tool.name == "edit_file"));
@@ -27125,6 +27154,7 @@ the next imagined action"#;
             &available_tools,
             &unit,
             &receipt,
+            false,
         ));
         assert!(large_tools.iter().any(|tool| tool.name == "edit_file"));
 
@@ -27139,6 +27169,7 @@ the next imagined action"#;
             &available_tools,
             &unit,
             &receipt,
+            false,
         ));
         assert_eq!(
             repair_tools
@@ -27169,6 +27200,24 @@ the next imagined action"#;
                 .contains("Preserve all unrelated current bytes exactly")
         );
 
+        let mut anchored_repair_tools = all_builtin_tool_specs();
+        apply_mutation_payload_limit(&mut anchored_repair_tools, 1_024);
+        scope_tools_to_work_unit(&mut anchored_repair_tools, &unit, true);
+        assert!(!scope_tools_to_controller_observation(
+            &mut anchored_repair_tools,
+            &available_tools,
+            &unit,
+            &receipt,
+            true,
+        ));
+        assert_eq!(
+            anchored_repair_tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["edit_file"]
+        );
+
         unit.state = crate::workflow::WorkUnitState::MutationReady;
         unit.path = "lib.rs".to_string();
         receipt.path = "lib.rs".to_string();
@@ -27181,6 +27230,7 @@ the next imagined action"#;
             &available_tools,
             &unit,
             &receipt,
+            false,
         ));
         assert!(rust_tools.iter().any(|tool| tool.name == "edit_file"));
     }
