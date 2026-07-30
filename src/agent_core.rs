@@ -31603,7 +31603,7 @@ the next imagined action"#;
     }
 
     #[test]
-    fn large_modify_work_unit_applies_separated_hunks_only_from_controller_ranges() {
+    fn large_modify_work_unit_applies_exact_edit_from_controller_ranges() {
         let repo = init_contract_test_repo();
         let mut lines = (1..=2_000)
             .map(|line| format!("const value_{line} = {line};"))
@@ -31630,7 +31630,7 @@ the next imagined action"#;
         let after = lines
             .into_iter()
             .enumerate()
-            .filter(|(index, _)| !matches!(*index, 149 | 275 | 276 | 277 | 510))
+            .filter(|(index, _)| !matches!(*index, 275 | 276 | 277))
             .map(|(_, line)| line)
             .collect::<Vec<_>>()
             .join("\n");
@@ -31643,30 +31643,12 @@ the next imagined action"#;
         let mut contract = normalized_test_contract("true");
         contract.checks.clear();
         request.contract = Some(contract);
-        let patch = concat!(
-            "--- a/game.js\n",
-            "+++ b/game.js\n",
-            "@@ -149,3 +149,2 @@\n",
-            " const value_149 = 149;\n",
-            "-const [branch, setBranch] = useState('main');\n",
-            " const value_151 = 151;\n",
-            "@@ -275,5 +274,2 @@\n",
-            " const value_275 = 275;\n",
-            "-<label htmlFor=\"branch-picker\">Base branch</label>\n",
-            "-<select id=\"branch-picker\" value={branch}>\n",
-            "-</select>\n",
-            " const value_279 = 279;\n",
-            "@@ -510,3 +506,2 @@\n",
-            " const value_510 = 510;\n",
-            "-<Meta label=\"Default branch\" value={defaultBranch} />\n",
-            " const value_512 = 512;\n",
-        );
         let completion = json!({
-            "id": "implementation-inline-multi-hunk",
+            "id": "implementation-inline-exact-edit",
             "steps": [{
                 "step_id": "step-delivery",
                 "status": "completed",
-                "summary": "Removed the branch selector and its supporting state."
+                "summary": "Removed the branch selector."
             }],
             "summary": "Removed the project branch selector.",
             "semantic_commit_subject": "fix: remove project branch selector"
@@ -31679,8 +31661,17 @@ the next imagined action"#;
                 text_completion(plan_envelope_submission(&plan)),
                 text_completion(plan_review_submission(&plan)),
                 tool_completion(
-                    "apply_patch",
-                    json!({"patch": patch, "completion": completion}),
+                    "edit_file",
+                    json!({
+                        "path": "game.js",
+                        "old_text": concat!(
+                            "<label htmlFor=\"branch-picker\">Base branch</label>\n",
+                            "<select id=\"branch-picker\" value={branch}>\n",
+                            "</select>\n"
+                        ),
+                        "new_text": "",
+                        "completion": completion
+                    }),
                 ),
                 text_completion(code_review_submission(
                     &reviewed_fingerprint,
@@ -31700,7 +31691,10 @@ the next imagined action"#;
             std::fs::read_to_string(repo.path().join("game.js")).unwrap(),
             after
         );
-        assert!(generator.generation_tool_names[2].contains(&"apply_patch".to_string()));
+        assert_eq!(
+            generator.generation_tool_names[2],
+            vec!["edit_file".to_string()]
+        );
         assert!(!events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolCall { tool, .. } if tool == "read_file"
@@ -31708,7 +31702,7 @@ the next imagined action"#;
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult { tool, result, .. }
-                if tool == "apply_patch" && result.contains("inline_completion=accepted")
+                if tool == "edit_file" && result.contains("inline_completion=accepted")
         )));
     }
 
