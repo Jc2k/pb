@@ -5609,7 +5609,7 @@ fn scope_tools_to_ranged_work_unit(
     tools.retain(|tool| {
         matches!(
             tool.name.as_str(),
-            "read_file" | "edit_file" | "apply_patch" | "request_replan"
+            "read_file" | "edit_file" | "request_replan"
         )
     });
 }
@@ -7617,7 +7617,7 @@ fn run_agent_steps(
                                 receipt.coverage
                                     == crate::workflow::ObservationCoverage::Ranges
                             })
-                            .then_some(" The controller showed bounded ranges rather than the complete file. Treat those ranges as your current read and mutate now when they contain the necessary bytes. The initial turn is mutation-only. If constrained mutation genuinely cannot form and your reasoning names one concrete missing fact, Trinity can expose one target-bound excerpt recovery with a center line and capped context; a whole-file reread is structurally unavailable. apply_patch can update several separated hunks, but every old-side hunk must remain wholly inside observed ranges. The accepted Modify authority covers requirement-related supporting code throughout this same path: multiple distant hunks are not a scope change and do not justify replanning. Request replan only when satisfying the user actually requires another path or change type.")
+                            .then_some(" The controller showed bounded ranges rather than the complete file. Treat those ranges as your current read and make one smallest exact edit now when they contain the necessary bytes. The initial turn is mutation-only. If one concrete missing fact is genuinely absent, Trinity can expose one target-bound excerpt recovery with a center line and capped context; a whole-file reread is structurally unavailable. Continue distant requirement-related edits as bounded exact replacements on this same accepted path rather than constructing a multi-hunk patch or requesting replan.")
                             .unwrap_or_default();
                         format!(
                             "Harness work unit {}: perform only the target-bound {:?} mutation for {}. The observed target fingerprint remains the write authority.{ranged_guidance}",
@@ -26450,10 +26450,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["read_file", "edit_file", "apply_patch", "request_replan"]
-        );
+        assert_eq!(names, vec!["read_file", "edit_file", "request_replan"]);
         let read = tools.iter().find(|tool| tool.name == "read_file").unwrap();
         assert_eq!(read.input_schema["required"], json!(["line"]));
         assert!(read.input_schema["properties"].get("start").is_none());
