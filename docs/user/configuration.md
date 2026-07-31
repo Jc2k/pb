@@ -17,7 +17,8 @@ pb config set model.profile build
 
 The user configuration file is `<config-dir>/pb/config.toml`. It covers:
 
-- web listen address, port, Unix socket path, and the macOS work-queue sleep preference;
+- web listen address, port, Unix socket path, Tailscale HTTPS access, and the macOS work-queue
+  sleep preference;
 - model identifier, directory, context, sampling, and resource defaults;
 - intrinsic deterministic controller-action safety policy;
 - storage roots and inference session-cache policy;
@@ -43,6 +44,42 @@ fallback uses the numeric user ID rather than the mutable `USER` environment var
 
 pb-owned workspaces, leases, and managed cache records use the platform-local data directory by
 default. Set `storage.state_dir` to a non-empty absolute path to relocate them.
+
+## Secure access through Tailscale
+
+**Shipped.** On a Mac with Tailscale installed and connected, **Settings → Secure remote access**
+can create and maintain a tailnet-only HTTPS address for pb. This is the recommended remote path
+for Safari voice input because browser microphone APIs require a secure context. The control shows
+the resulting URL and offers open, copy, repair, and disable actions. If the tailnet requires a
+one-time Tailscale Serve approval, pb shows the exact approval link and waits; the user does not
+need to construct or remember a `tailscale serve` command.
+
+pb publishes exactly one device-level Tailscale Serve HTTPS port, defaulting to the configured
+`web.port`, and proxies it to `http://127.0.0.1:<web.port>`. It inspects the current Serve
+configuration before every change. A different endpoint on that HTTPS port is reported as a
+conflict and is never overwritten. Disabling removes the endpoint only when its target still
+matches pb; pb never runs a global Serve reset, enables Funnel, changes tailnet ACLs, or calls the
+Tailscale administration API. An explicitly enabled endpoint is reconciled when the pb service
+starts.
+
+The corresponding typed values are:
+
+```bash
+pb config get web.tailscale.enabled
+pb config get web.tailscale.https_port
+pb config set web.tailscale.https_port 8443
+```
+
+Use the Settings control to enable or disable access immediately. Changing
+`web.tailscale.enabled` with `pb config set` changes the desired startup state; restart or refresh
+the pb service to reconcile it. Tailscale must still be installed, signed in, and permitted by the
+tailnet owner. A non-default port appears in the URL.
+
+Tailscale access does not close a separately configured LAN listener. If `web.listen` is
+non-loopback, Settings warns that the unauthenticated HTTP route remains reachable. Set
+`web.listen` to `127.0.0.1` and refresh the installed service if the Tailscale HTTPS address should
+be the only remote route. Tailnet membership and Tailscale access rules are the access boundary;
+pb does not yet add application login or consume Tailscale identity headers.
 
 ## Deterministic controller actions
 

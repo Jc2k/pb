@@ -121,6 +121,24 @@ pub struct WebConfig {
     pub socket_path: Option<PathBuf>,
     /// Prevent idle system sleep while the work queue is actively processing.
     pub prevent_sleep_while_working: Option<bool>,
+    /// Optional pb-owned HTTPS publication through the local Tailscale client.
+    #[serde(skip_serializing_if = "TailscaleWebConfig::is_empty")]
+    pub tailscale: TailscaleWebConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TailscaleWebConfig {
+    /// Desired integration state. Enabling is always an explicit user action.
+    pub enabled: Option<bool>,
+    /// Tailnet-only HTTPS port owned by pb in Tailscale Serve.
+    pub https_port: Option<u16>,
+}
+
+impl TailscaleWebConfig {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.https_port.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -198,6 +216,10 @@ impl UserConfig {
                 .web
                 .prevent_sleep_while_working
                 .map(|value| value.to_string()),
+            "web.tailscale.enabled" => self.web.tailscale.enabled.map(|value| value.to_string()),
+            "web.tailscale.https_port" => {
+                self.web.tailscale.https_port.map(|value| value.to_string())
+            }
             "model.model" => self.model.model.clone(),
             "model.model_dir" => self.model.model_dir.as_ref().map(|path| display_path(path)),
             "model.workdir" => self.model.workdir.as_ref().map(|path| display_path(path)),
@@ -264,6 +286,10 @@ impl UserConfig {
             "web.socket_path" => self.web.socket_path = Some(PathBuf::from(value)),
             "web.prevent_sleep_while_working" => {
                 self.web.prevent_sleep_while_working = Some(parse_value(key, value)?)
+            }
+            "web.tailscale.enabled" => self.web.tailscale.enabled = Some(parse_value(key, value)?),
+            "web.tailscale.https_port" => {
+                self.web.tailscale.https_port = Some(parse_positive(key, value)?)
             }
             "model.model" => self.model.model = Some(value.to_string()),
             "model.model_dir" => self.model.model_dir = Some(PathBuf::from(value)),
@@ -343,6 +369,17 @@ impl UserConfig {
         self.web
             .prevent_sleep_while_working
             .unwrap_or(cfg!(target_os = "macos"))
+    }
+
+    pub fn effective_tailscale_enabled(&self) -> bool {
+        self.web.tailscale.enabled.unwrap_or(false)
+    }
+
+    pub fn effective_tailscale_https_port(&self) -> u16 {
+        self.web
+            .tailscale
+            .https_port
+            .unwrap_or_else(|| self.effective_web_port())
     }
 
     pub fn effective_model(&self) -> String {
@@ -500,6 +537,7 @@ impl UserConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        validate_optional_positive("web.tailscale.https_port", self.web.tailscale.https_port)?;
         validate_optional_absolute_path("storage.state_dir", self.storage.state_dir.as_deref())?;
         validate_optional_absolute_path("storage.cache_dir", self.storage.cache_dir.as_deref())?;
         validate_optional_positive(
@@ -641,7 +679,7 @@ where
 
 fn bail_unknown_key<T>(key: &str) -> Result<T> {
     bail!(
-        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, memory.personal_repo, storage.state_dir, storage.cache_dir, inference.llamacpp_session_cache_enabled, inference.llamacpp_session_cache_max_bytes, inference.flashmoe_session_cache_enabled, inference.flashmoe_session_cache_max_bytes, flashmoe.memory_sessions, flashmoe.memory_prompt_root_max_bytes, flashmoe.resident_models, flashmoe.idle_seconds. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, source_container_image, verified_manifest_digest, container_runtime, args, env, working_directory, capabilities, and disabled fields. MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, secret_env, and operator-audited read_only_tools. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, source_container_image, verified_manifest_digest, container_runtime, args, env, working_directory, language_ids, initialization_options, workspace_access, network_access, cache_ids, semantic_enforcement, and disabled fields"
+        "unknown config key '{key}'; supported keys: web.listen, web.port, web.socket_path, web.prevent_sleep_while_working, web.tailscale.enabled, web.tailscale.https_port, model.model, model.model_dir, model.workdir, model.max_steps, model.max_tokens, model.ctx_size, model.threads, model.threads_batch, model.gpu_layers, model.temperature, model.profile, model.top_k, model.seed, memory.personal_repo, storage.state_dir, storage.cache_dir, inference.llamacpp_session_cache_enabled, inference.llamacpp_session_cache_max_bytes, inference.flashmoe_session_cache_enabled, inference.flashmoe_session_cache_max_bytes, flashmoe.memory_sessions, flashmoe.memory_prompt_root_max_bytes, flashmoe.resident_models, flashmoe.idle_seconds. MCP servers are configured in TOML as [mcp.servers.<name>] tables with command, url, container_image, source_container_image, verified_manifest_digest, container_runtime, args, env, working_directory, capabilities, and disabled fields. MCP capabilities default-deny workspace and network access and can declare workspace, network, cache_ids, secret_env, and operator-audited read_only_tools. LSP servers are configured in TOML as [lsp.servers.<name>] tables with command, container_image, source_container_image, verified_manifest_digest, container_runtime, args, env, working_directory, language_ids, initialization_options, workspace_access, network_access, cache_ids, semantic_enforcement, and disabled fields"
     )
 }
 
@@ -666,6 +704,8 @@ mod tests {
         config
             .set("web.prevent_sleep_while_working", "false")
             .unwrap();
+        config.set("web.tailscale.enabled", "true").unwrap();
+        config.set("web.tailscale.https_port", "8443").unwrap();
         config.set("model.temperature", "0.7").unwrap();
         config.set("model.profile", "review").unwrap();
         config.save_to_path(&path).unwrap();
@@ -680,8 +720,22 @@ mod tests {
             loaded.get("web.prevent_sleep_while_working").unwrap(),
             Some("false".to_string())
         );
+        assert_eq!(
+            loaded.get("web.tailscale.enabled").unwrap(),
+            Some("true".to_string())
+        );
+        assert_eq!(loaded.effective_tailscale_https_port(), 8443);
         assert_eq!(loaded.model.temperature, Some(0.7));
         assert_eq!(loaded.model.profile, Some(AgentProfile::Review));
+    }
+
+    #[test]
+    fn default_tailscale_config_is_off_and_not_serialized() {
+        let config = UserConfig::default();
+        assert!(!config.effective_tailscale_enabled());
+        assert_eq!(config.effective_tailscale_https_port(), 8311);
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(!serialized.contains("tailscale"));
     }
 
     #[test]

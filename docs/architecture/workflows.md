@@ -45,6 +45,15 @@ Workflow stage capabilities, accepted-plan scope, checks, review, commit ownersh
 budgets, and publication authority remain controller-owned; user conversation content alone cannot
 mutate or widen those state machines.
 
+### Operator-owned service access
+
+**Shipped.** Secure remote web access is outside the model workflow. The Settings surface can ask
+the local Tailscale client to create or remove one exact tailnet-only HTTPS mapping, and a typed
+user preference can reconcile an explicitly enabled mapping at pb service startup. Neither
+conversation nor delivery tools receive this authority. The controller inspects ownership before
+mutation, preserves any conflict, and never treats a repository instruction or model response as
+approval to reset Serve configuration, enable Funnel, or change tailnet policy.
+
 ## Delivery
 
 Delivery is a harness-owned state machine:

@@ -379,6 +379,11 @@ pub struct UpdateWebSettingsRequest {
     pub prevent_sleep_while_working: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTailscaleSettingsRequest {
+    pub enabled: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
     id: u64,
@@ -456,6 +461,8 @@ struct AppState {
     projects: Arc<Mutex<Vec<ProjectEntry>>>,
     project_usage: Arc<Mutex<HashMap<String, ProjectUsageStats>>>,
     sleep_prevention: Arc<StdMutex<SleepPrevention>>,
+    tailscale: Arc<StdMutex<crate::tailscale::TailscaleIntegration>>,
+    web_listen: String,
 }
 
 impl AppState {
@@ -552,6 +559,12 @@ pub async fn run_server_with_ready(
         sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(
             user_config.effective_prevent_sleep_while_working(),
         ))),
+        tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+            args.port,
+            user_config.effective_tailscale_https_port(),
+            user_config.effective_tailscale_enabled(),
+        ))),
+        web_listen: args.host.clone(),
     };
 
     let app = Router::new()
@@ -626,6 +639,10 @@ pub async fn run_server_with_ready(
             patch(update_project_notifications),
         )
         .route("/api/settings", get(get_settings).patch(update_settings))
+        .route(
+            "/api/settings/tailscale",
+            get(get_tailscale_settings).patch(update_tailscale_settings),
+        )
         .route("/api/status", get(status))
         .route("/api/current-user.png", get(crate::user::avatar_png))
         .route("/api/current-user", get(crate::user::user_info))
@@ -635,7 +652,8 @@ pub async fn run_server_with_ready(
         .route("/{*path}", get(static_asset))
         .with_state((state.clone(), defaults.clone()));
 
-    if let Err(err) = spawn_unix_rpc_server(args.socket_path.clone(), state, defaults).await {
+    if let Err(err) = spawn_unix_rpc_server(args.socket_path.clone(), state.clone(), defaults).await
+    {
         notify_ready(&mut ready, Err(err.to_string()));
         return Err(err);
     }
@@ -669,6 +687,27 @@ pub async fn run_server_with_ready(
             crate::http_listener::BONJOUR_SERVICE_TYPE
         );
     }
+    let tailscale = Arc::clone(&state.tailscale);
+    let web_listen = state.web_listen.clone();
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || {
+            tailscale
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .reconcile(&web_listen)
+        })
+        .await
+        {
+            Ok(status) if status.enabled && !status.active => {
+                eprintln!(
+                    "pb Tailscale access needs attention: {}",
+                    status.error.as_deref().unwrap_or("endpoint is not active")
+                );
+            }
+            Err(error) => eprintln!("pb Tailscale reconciliation task failed: {error}"),
+            _ => {}
+        }
+    });
     notify_ready(&mut ready, Ok(bound_addr));
     axum::serve(acquired.listener, app).await?;
     Ok(())
@@ -3122,6 +3161,95 @@ async fn update_settings(
     }
 
     Ok(Json(web_settings_snapshot(&state)))
+}
+
+async fn get_tailscale_settings(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<crate::tailscale::TailscaleStatus>, IntegrationApiError> {
+    let tailscale = Arc::clone(&state.tailscale);
+    let web_listen = state.web_listen.clone();
+    tokio::task::spawn_blocking(move || {
+        tailscale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .status(&web_listen)
+    })
+    .await
+    .map(Json)
+    .map_err(|error| {
+        IntegrationApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to inspect Tailscale: {error}"),
+        )
+    })
+}
+
+async fn update_tailscale_settings(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Json(req): Json<UpdateTailscaleSettingsRequest>,
+) -> Result<Json<crate::tailscale::TailscaleStatus>, IntegrationApiError> {
+    let tailscale = Arc::clone(&state.tailscale);
+    let web_listen = state.web_listen.clone();
+    let enabled = req.enabled;
+    let result = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut tailscale = tailscale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_enabled = tailscale.enabled();
+        let previous_status = tailscale.status(&web_listen);
+        let https_port = tailscale.https_port();
+        let status = if enabled {
+            tailscale.enable(&web_listen)?
+        } else {
+            tailscale.disable(&web_listen)?
+        };
+
+        if let Err(persist_error) = crate::config::UserConfig::mutate(|config| {
+            config.web.tailscale.enabled = Some(enabled);
+            config.web.tailscale.https_port = Some(https_port);
+            Ok(())
+        }) {
+            let rollback = if enabled && !previous_status.active {
+                tailscale.disable(&web_listen).map(|_| ())
+            } else if !enabled && previous_status.active {
+                tailscale.enable(&web_listen).map(|_| ())
+            } else {
+                tailscale.set_enabled(previous_enabled);
+                Ok(())
+            };
+            tailscale.set_enabled(previous_enabled);
+            return match rollback {
+                Ok(()) => Err(persist_error.context(
+                    "Tailscale changed successfully, but pb could not save the setting; the Tailscale change was rolled back",
+                )),
+                Err(rollback_error) => Err(persist_error.context(format!(
+                    "Tailscale changed successfully, but pb could not save the setting; rollback also failed: {rollback_error:#}"
+                ))),
+            };
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|error| {
+        IntegrationApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Tailscale settings task failed: {error}"),
+        )
+    })?;
+
+    result.map(Json).map_err(|error| {
+        let message = format!("{error:#}");
+        let status = if message.contains("already has a different Serve endpoint")
+            || message.contains("not owned by pb")
+        {
+            StatusCode::CONFLICT
+        } else if message.contains("not installed") || message.contains("not connected") {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        IntegrationApiError::new(status, message)
+    })
 }
 
 fn web_settings_snapshot(state: &AppState) -> WebSettingsResponse {
@@ -5728,6 +5856,10 @@ mod workflow_tests {
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
         };
 
         let response = send_session_message(
@@ -5931,6 +6063,10 @@ mod workflow_tests {
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
         };
         let list = session_list_snapshot(&state).await;
         assert_eq!(list.len(), 1);
@@ -5987,6 +6123,10 @@ mod workflow_tests {
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
         };
         std::fs::write(repo.path().join("in-progress.txt"), "preserve me\n").unwrap();
 
@@ -6069,6 +6209,10 @@ mod workflow_tests {
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
         };
 
         assert!(
@@ -6122,6 +6266,10 @@ mod workflow_tests {
             }])),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
         };
         let response = start_goal_inner(
             state.clone(),
@@ -6183,6 +6331,10 @@ mod workflow_tests {
             }])),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
         };
         let defaults = request(repo.path());
         let started = start_goal_inner(

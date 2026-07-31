@@ -32,6 +32,20 @@ the HTTP socket through launchd and Bonjour; a direct development server creates
 native DNS-SD registration. That advertisement reveals the service's presence on the local network
 but does not send repository or task content by itself.
 
+An explicitly enabled Tailscale integration adds a second, tailnet-only route to the same embedded
+web UI. pb asks the local Tailscale client to terminate HTTPS and proxy one exact device Serve port
+to pb's loopback HTTP port. Requests and responses then cross the requesting device's Tailscale
+connection and can contain the same prompts, task history, repository-derived output, and controls
+as local web use. pb does not upload those contents to a separate pb service, but Tailscale remains
+an external network and trust boundary. Tailnet policy and membership, rather than pb application
+authentication, determine who can reach the address.
+
+HTTPS certificate issuance can publish the selected `*.ts.net` machine name to public Certificate
+Transparency logs, as described by
+[Tailscale's HTTPS documentation](https://tailscale.com/kb/1153/enabling-https). pb exposes the URL
+only after the local client reports the exact endpoint active. It does not persist Tailscale account
+identity, node keys, or administration credentials.
+
 Optional web voice input is browser-owned rather than a pb audio pipeline. The reusable prompt
 control uses the browser's Web Speech API, asks for on-device processing when that implementation
 exposes the option, and writes interim and final text into the same local controlled prompt field.
@@ -183,6 +197,7 @@ no hosted scheduler, telemetry, remote persistence, or publication edge.
 model/update downloads ────────────────→ registries and GitHub releases
 public research tool ──────────────────→ search/fetch service
 optional browser voice input ──────────→ browser-configured speech service
+optional Tailscale HTTPS access ───────→ authorized tailnet peers
 remote MCP tool ───────────────────────→ configured provider
 container service with egress ─────────→ external network
 future publication approval ───────────→ source-control provider
@@ -199,6 +214,16 @@ crosses pb's HTTP API or enters session storage; only the transcript the browser
 can be submitted through the ordinary local task API. Stopping, hiding, navigating away, or
 unmounting explicitly releases the recognition object, and a later recording starts with a fresh
 object so a browser-held session cannot silently survive into another prompt.
+
+### Tailscale web access
+
+Tailscale access is an explicit durable user preference, off by default. Status inspection calls
+only the local client. Enabling or startup reconciliation can request an HTTPS certificate and
+create one tailnet Serve mapping; disabling removes only a mapping whose port and loopback target
+still match pb. A conflicting mapping is preserved. pb does not reset other Serve configuration,
+enable public Funnel access, edit ACLs, or use the tailnet administration API. Installation,
+sign-in, device approval, Serve approval, tailnet policy, and Tailscale's own control-plane metadata
+remain owned by Tailscale and the tailnet administrator.
 
 ### Downloads
 

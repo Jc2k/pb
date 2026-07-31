@@ -1,8 +1,12 @@
 import { equal, ok } from "node:assert/strict";
+import { createElement } from "react";
+import { renderToString } from "react-dom/server";
 import {
   formatRuntime,
   formatUsageValue,
+  SESSION_ROW_BATCH_SIZE,
   sessionCounts,
+  SessionRows,
 } from "./SessionDashboard.tsx";
 import type { SessionItem } from "../types/index.ts";
 
@@ -44,6 +48,30 @@ Deno.test("usage formatters match dashboard display units", () => {
   equal(formatRuntime(8_040_000), "2h 14m");
 });
 
+Deno.test("session rows reveal long histories in bounded batches", () => {
+  const sessions = Array.from(
+    { length: SESSION_ROW_BATCH_SIZE + 2 },
+    (_, index) => ({
+      ...session("completed"),
+      session_id: `session-${index}`,
+      title: `Session ${index}`,
+    }),
+  );
+  const html = renderToString(createElement(SessionRows, {
+    sessions,
+    emptyText: "No sessions",
+    onOpenSession: () => {},
+  }));
+  const readableHtml = html.replaceAll("<!-- -->", "");
+
+  equal(
+    html.match(/class="session-row project-session-row"/g)?.length,
+    SESSION_ROW_BATCH_SIZE,
+  );
+  ok(readableHtml.includes("Show 2 more sessions"));
+  ok(readableHtml.includes("2 remaining"));
+});
+
 Deno.test("home workspace keeps primary actions focused across breakpoints", async () => {
   const page = await Deno.readTextFile("webui/src/pages/HomePage.tsx");
   const css = await Deno.readTextFile("webui/src/app.css");
@@ -53,6 +81,8 @@ Deno.test("home workspace keeps primary actions focused across breakpoints", asy
   ok(page.includes('className="quick-action-row secondary-quick-actions"'));
   ok(page.includes('placeholder="Describe the work…"'));
   ok(css.includes(".home-composer-card .secondary-quick-actions"));
+  ok(css.includes(".project-detail-wrap .quick-actions"));
+  ok(css.includes("overflow-x: visible;"));
   ok(css.includes(".sidebar .nav-pills .nav-link.active"));
   ok(css.includes("background: rgba(0, 122, 255, 0.09);"));
 });

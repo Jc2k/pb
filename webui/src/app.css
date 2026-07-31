@@ -145,8 +145,8 @@ body {
 }
 
 .btn-icon {
-    width: 38px;
-    height: 38px;
+    width: 44px;
+    height: 44px;
     display: grid;
     place-items: center;
     border: 1px solid var(--line);
@@ -320,6 +320,8 @@ body {
 
 .project-main {
     gap: 5px;
+    min-height: 44px;
+    align-content: center;
 }
 
 .project-main strong {
@@ -730,6 +732,29 @@ body {
   backdrop-filter: none;
 }
 
+.session-list-more {
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
+    border: 0;
+    border-top: 1px solid var(--line-soft);
+    background: #f8fbff;
+    color: var(--blue);
+    font-size: 0.88rem;
+    font-weight: 700;
+    text-align: left;
+}
+
+.session-list-more small {
+    color: var(--text-soft);
+    font-size: 0.74rem;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
 .task-editor textarea {
   background: linear-gradient(
     180deg,
@@ -858,6 +883,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
+  min-height: 44px;
   margin-bottom: 1rem;
   color: var(--blue);
   font-weight: 700;
@@ -1613,15 +1639,16 @@ body {
     min-height: 72px;
   }
 
-  .quick-actions .btn {
-    min-height: 38px;
+  .quick-actions .btn,
+  .intent-option {
+    min-height: 44px;
     padding: 0.46rem 0.7rem;
     font-size: 0.78rem;
   }
 
   .send-btn {
-    width: 42px;
-    height: 42px;
+    width: 44px;
+    height: 44px;
   }
 
   .status-filter {
@@ -1630,7 +1657,7 @@ body {
   }
 
   .filter-chip {
-    min-height: 32px;
+    min-height: 44px;
     padding: 0.36rem 0.58rem;
     font-size: 0.74rem;
   }
@@ -1719,6 +1746,8 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.65rem;
+  min-height: 44px;
+  padding-block: 0.35rem;
   border: 0;
   background: transparent;
   color: #6b7280;
@@ -1786,6 +1815,96 @@ body {
   color: #b42318 !important;
 }
 
+.tailscale-settings-card {
+  padding: 1.45rem 1.55rem;
+}
+
+.tailscale-settings-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.tailscale-settings-heading > div {
+  min-width: 0;
+}
+
+.tailscale-state-badge {
+  flex: 0 0 auto;
+  padding: 0.38rem 0.68rem;
+  border-radius: 999px;
+  background: #eef2f7;
+  color: #4b5870;
+  font-size: 0.76rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.tailscale-settings-card.is-active .tailscale-state-badge {
+  background: #e7f8f1;
+  color: #087b56;
+}
+
+.tailscale-settings-card.is-authorization_required .tailscale-state-badge,
+.tailscale-settings-card.is-needs_repair .tailscale-state-badge {
+  background: #fff5dc;
+  color: #8b5e00;
+}
+
+.tailscale-settings-card.is-conflict .tailscale-state-badge,
+.tailscale-settings-card.is-error .tailscale-state-badge {
+  background: #fff0ee;
+  color: #b42318;
+}
+
+.tailscale-setting-detail {
+  margin-top: 1rem !important;
+  font-weight: 700;
+}
+
+.tailscale-address {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 0.8rem;
+  color: #075cbd;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.86rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.tailscale-lan-warning {
+  margin-top: 0.9rem !important;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid #f1d694;
+  border-radius: 11px;
+  background: #fffaeb;
+  color: #744d00 !important;
+  line-height: 1.45;
+}
+
+.tailscale-lan-warning code {
+  color: inherit;
+}
+
+.tailscale-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 1.15rem;
+}
+
+.tailscale-settings-actions .btn {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  font-weight: 750;
+}
+
 .notification-switch:disabled {
   cursor: not-allowed;
   opacity: 0.55;
@@ -1794,6 +1913,26 @@ body {
 .settings-loading {
   padding: 1.35rem 1.55rem;
   color: #59677f;
+}
+
+@media (max-width: 575.98px) {
+  .tailscale-settings-card {
+    padding: 1.2rem;
+  }
+
+  .tailscale-settings-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .tailscale-settings-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .tailscale-settings-actions .btn {
+    width: 100%;
+  }
 }
 
 .mcp-store-card {
@@ -2082,8 +2221,8 @@ body {
   }
 
   .mcp-icon-btn {
-    width: 36px;
-    height: 36px;
+    width: 44px;
+    height: 44px;
   }
 
   .integration-modal-backdrop {
@@ -2414,6 +2553,7 @@ textarea {
 
 .mobile-topbar .brand {
   padding: 0;
+  min-height: 44px;
 }
 
 .tablet-nav {
@@ -2531,6 +2671,11 @@ textarea {
     min-width: 0;
   }
 
+  .project-detail-wrap .quick-actions {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+
   .chat-submit-actions {
     margin-left: auto;
   }
@@ -2574,6 +2719,16 @@ textarea {
     padding: 0.75rem max(0.75rem, env(safe-area-inset-right))
       calc(0.75rem + env(safe-area-inset-bottom))
       max(0.75rem, env(safe-area-inset-left));
+  }
+}
+
+@media (max-width: 991.98px) {
+  :is(
+    input:not([type="checkbox"]):not([type="radio"]),
+    select,
+    textarea
+  ) {
+    font-size: 1rem;
   }
 }
 

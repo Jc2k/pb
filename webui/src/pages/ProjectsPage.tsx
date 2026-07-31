@@ -121,12 +121,9 @@ export function ProjectsPage() {
                     >
                       <i className="bi bi-gear"></i>
                     </Link>
-                    <Link
-                      className="chevron text-decoration-none"
-                      to={`/projects/${encodeURIComponent(project.name)}`}
-                    >
+                    <span className="chevron" aria-hidden="true">
                       ›
-                    </Link>
+                    </span>
                   </div>
                 );
               })
@@ -400,6 +397,7 @@ export function ProjectPage() {
               sessions={visibleSessions}
               defaultBranch={defaultBranch}
               emptyText="No sessions match this filter."
+              paginationKey={filter}
               onOpenSession={(session) =>
                 navigate(`/sessions/${session.session_id}`)}
             />

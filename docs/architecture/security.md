@@ -380,6 +380,7 @@ resolved versioned namespace; it never targets the storage root itself.
 | Unmatched policy call | Allowed. Add explicit rules for operations that need deny or approval behavior. |
 | Public research and remote MCP | Data can leave the machine when the tool is invoked. URL validation and read-only tool classification are not confidentiality proofs about the remote service. |
 | Web listener | Loopback by default. A non-loopback listener is not automatically protected by authentication or TLS and is advertised through Bonjour for wake-on-HTTP. |
+| Tailscale web access | Explicit and off by default. pb may manage one exact tailnet-only Serve HTTPS port through the local Tailscale client. It preflights the existing mapping, proxies only to pb's loopback port, preserves conflicts, and never resets Serve, enables Funnel, edits ACLs, or uses an admin credential. Tailnet access rules are the authentication boundary; pb does not yet validate Tailscale identity headers or add application-layer authorization. A separately enabled non-loopback HTTP listener remains exposed. |
 | Container runtime | Isolation depends on the selected runtime and host configuration. Persistent images/caches remain outside the ephemeral resource lifecycle. |
 | Publication | Local Ready evidence does not authorize a push, pull request, merge, or provider-side mutation. |
 | Goal automatic continuation | Explicit per-Goal user authority inside snapshotted totals. It does not approve new paths, integrations, network access, policy prompts, or publication. |

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type {
   ProjectUsageStats,
   SessionAttachment,
@@ -7,6 +8,8 @@ import { projectName, relativeTime, sessionTitle } from "../lib/helpers";
 import { formatEnergy } from "../lib/energy";
 
 export type SessionFilter = "all" | SessionItem["status"];
+
+export const SESSION_ROW_BATCH_SIZE = 6;
 
 export function sessionCounts(
   sessions: SessionItem[],
@@ -88,16 +91,25 @@ export function UsageMetrics(
         </span>
         <span>
           <small>Estimated task energy</small>
-          <strong>{formatEnergy(
-            usage.energy_joules ?? (usage.energy_kwh == null ? undefined : usage.energy_kwh * 3_600_000),
-          )}</strong>
+          <strong>
+            {formatEnergy(
+              usage.energy_joules ?? (usage.energy_kwh == null
+                ? undefined
+                : usage.energy_kwh * 3_600_000),
+            )}
+          </strong>
           <em className="today-usage">
             Today: {formatEnergy(
               todaysUsage.energy_joules ??
-                (todaysUsage.energy_kwh == null ? undefined : todaysUsage.energy_kwh * 3_600_000),
+                (todaysUsage.energy_kwh == null
+                  ? undefined
+                  : todaysUsage.energy_kwh * 3_600_000),
             )}
           </em>
-          <em>Whole-device estimate; display and idle baseline excluded when measured</em>
+          <em>
+            Whole-device estimate; display and idle baseline excluded when
+            measured
+          </em>
         </span>
       </div>
       <div className="metric-row">
@@ -175,42 +187,79 @@ export function SessionRows({
   defaultBranch = "main",
   emptyText,
   onOpenSession,
+  paginationKey = "default",
 }: {
   sessions: SessionItem[];
   defaultBranch?: string;
   emptyText: string;
   onOpenSession: (session: SessionItem) => void;
+  paginationKey?: string;
 }) {
+  const [pagination, setPagination] = useState({
+    key: paginationKey,
+    count: SESSION_ROW_BATCH_SIZE,
+  });
+  const visibleCount = pagination.key === paginationKey
+    ? pagination.count
+    : SESSION_ROW_BATCH_SIZE;
+  const visibleSessions = sessions.slice(0, visibleCount);
+  const remaining = Math.max(0, sessions.length - visibleSessions.length);
+
   return (
     <div className="session-list card soft-card">
       {sessions.length === 0
         ? <div className="empty-session-row">{emptyText}</div>
-        : sessions.map((session, index) => (
-          <button
-            key={session.session_id}
-            className="session-row project-session-row"
-            type="button"
-            onClick={() => onOpenSession(session)}
-          >
-            <span className={`session-icon ${iconTone(session.status, index)}`}>
-              <i className={statusIcon(session.status)}></i>
-            </span>
-            <span className="session-main">
-              <strong>{sessionTitle(session)}</strong>
-              <small>
-                {projectName(session.workdir)} <i className="bi bi-git"></i>
-                {" "}
-                {session.branch || defaultBranch}
-              </small>
-            </span>
-            <span className={`state-pill ${session.status}`}>
-              <i className={statusIcon(session.status)}></i>{" "}
-              {statusLabel(session)}
-            </span>
-            <time>{relativeTime(session.updated_at_ms)}</time>
-            <i className="bi bi-chevron-right row-chevron"></i>
-          </button>
-        ))}
+        : (
+          <>
+            {visibleSessions.map((session, index) => (
+              <button
+                key={session.session_id}
+                className="session-row project-session-row"
+                type="button"
+                onClick={() => onOpenSession(session)}
+              >
+                <span
+                  className={`session-icon ${iconTone(session.status, index)}`}
+                >
+                  <i className={statusIcon(session.status)}></i>
+                </span>
+                <span className="session-main">
+                  <strong>{sessionTitle(session)}</strong>
+                  <small>
+                    {projectName(session.workdir)} <i className="bi bi-git"></i>
+                    {" "}
+                    {session.branch || defaultBranch}
+                  </small>
+                </span>
+                <span className={`state-pill ${session.status}`}>
+                  <i className={statusIcon(session.status)}></i>{" "}
+                  {statusLabel(session)}
+                </span>
+                <time>{relativeTime(session.updated_at_ms)}</time>
+                <i className="bi bi-chevron-right row-chevron"></i>
+              </button>
+            ))}
+            {remaining > 0
+              ? (
+                <button
+                  className="session-list-more"
+                  type="button"
+                  onClick={() =>
+                    setPagination({
+                      key: paginationKey,
+                      count: visibleCount + SESSION_ROW_BATCH_SIZE,
+                    })}
+                >
+                  <span>
+                    Show {Math.min(SESSION_ROW_BATCH_SIZE, remaining)}{" "}
+                    more sessions
+                  </span>
+                  <small>{remaining} remaining</small>
+                </button>
+              )
+              : null}
+          </>
+        )}
     </div>
   );
 }

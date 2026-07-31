@@ -22,6 +22,13 @@ A discussion may also offer a read-only Goal proposal. The proposal does not sta
 You can review and edit it in the Goal setup sheet. The internal Auto intent may ask pb to create a
 Goal for the exact current turn, but the resulting milestone plan still waits for your approval.
 
+### Browse session history
+
+**Shipped.** The home and project pages show the six most recent matching sessions first. Use
+**Show more sessions** to reveal the next batch without making a long history dominate the page.
+Changing the status filter starts that filtered history from its first batch again. No sessions are
+deleted or hidden from the filter totals.
+
 ### Speak a prompt
 
 **Shipped where the browser supports the Web Speech API.** Prompt composers on the home and project
@@ -36,6 +43,13 @@ the microphone. Hiding or leaving the page, closing a sheet, changing composer s
 the control aborts both active and recently stopped browser sessions. This prevents a stale callback
 or an animated panel transition from stranding the microphone and blocking the next recording. A
 browser without speech recognition simply omits the button; typing remains unchanged.
+
+Safari also requires the page itself to be a secure context before it exposes microphone capture.
+`http://localhost:8311` qualifies on the Mac that runs pb, but a plain LAN URL such as
+`http://mac-name.local:8311` does not qualify on another Mac or iPhone. On the host Mac, open
+**Settings → Secure remote access** to let pb create a private Tailscale HTTPS address, then use the
+shown address from the other tailnet device. pb checks, repairs, and removes only its own Serve
+endpoint, so routine use does not require managing Tailscale commands.
 
 The browser owns speech capture and recognition. pb requests on-device recognition when the browser
 exposes that option, never records or stores audio, and receives only the live text placed in the

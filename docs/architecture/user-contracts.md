@@ -388,6 +388,14 @@ review-comment handling, and merges are outside the current delivery contract. T
 promise to stop at the external boundary until a separate approval-bearing publication workflow
 exists.
 
+Web-service exposure is a separate user-owned contract. Tailscale HTTPS access is disabled by
+default and can be enabled immediately only through the Settings action or reconciled from an
+explicit typed user preference at service startup. This authority belongs to the user-facing
+service controller, not to a model, repository instruction, Build, Goal, or integration tool. pb
+may inspect and change only its exact HTTPS port-to-loopback mapping. A conflicting endpoint is a
+visible terminal condition for that action, not permission to overwrite, reset, make the service
+public with Funnel, or alter tailnet policy.
+
 ## The practical promise
 
 pb should always be able to answer four questions without asking you to trust the model's memory:

@@ -462,8 +462,9 @@ export function SessionPage() {
         <header className="session-header">
           <button
             type="button"
-            className="btn btn-link d-xl-none p-0 text-body"
+            className="btn btn-link d-xl-none p-0 text-body session-back-button"
             onClick={() => navigate("/")}
+            aria-label="Back to sessions"
           >
             <i className="bi bi-chevron-left fs-4"></i>
           </button>

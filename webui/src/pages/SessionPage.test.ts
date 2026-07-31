@@ -189,7 +189,7 @@ Deno.test("paused session composer keeps resume action at intrinsic width", asyn
   ok(actionRule.includes("margin-left: auto;"));
   ok(actionRule.includes("white-space: nowrap;"));
   const iconRule = cssRule(css, ".composer > .btn.rounded-circle");
-  ok(iconRule.includes("flex: 0 0 42px;"));
+  ok(iconRule.includes("flex: 0 0 44px;"));
   ok(!css.includes(".composer .btn {"));
 });
 
@@ -245,6 +245,7 @@ Deno.test("final assistant messages use profile avatars", async () => {
 
 Deno.test("session page respects iPhone safe areas and prevents horizontal overflow", async () => {
   const css = await Deno.readTextFile("webui/src/session.css");
+  const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
 
   ok(css.includes("max-width: 100vw;"));
   ok(css.includes("overflow-x: hidden;"));
@@ -253,6 +254,12 @@ Deno.test("session page respects iPhone safe areas and prevents horizontal overf
   ok(css.includes("env(safe-area-inset-right)"));
   ok(css.includes(".message-container"));
   ok(css.includes("overflow-wrap: anywhere;"));
+  ok(
+    /\.session-layout\.has-work-drawer\s*\{\s*grid-template-columns:\s*minmax\(0,\s*1fr\);/s
+      .test(css),
+  );
+  ok(css.includes(".session-back-button"));
+  ok(page.includes('aria-label="Back to sessions"'));
   const preRule = cssRule(css, ".bubble pre");
   ok(preRule.includes("max-width: 100%;"));
   ok(preRule.includes("overflow: auto;"));

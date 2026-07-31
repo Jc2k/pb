@@ -207,6 +207,7 @@ export function HomePage() {
             <SessionRows
               sessions={visibleSessions}
               emptyText="No sessions match this filter."
+              paginationKey={filter}
               onOpenSession={(session) =>
                 navigate(`/sessions/${session.session_id}`)}
             />

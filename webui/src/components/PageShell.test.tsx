@@ -34,6 +34,8 @@ Deno.test("responsive shell accounts for device safe areas and stable route chan
   ok(css.includes(".workspace-wrap"));
   ok(css.includes(".projects-index-wrap > .hero-section"));
   ok(css.includes(".mobile-nav"));
+  ok(css.includes(":is("));
+  ok(css.includes('input:not([type="checkbox"]):not([type="radio"])'));
   ok(sessionCss.includes("height: 100dvh"));
   ok(app.includes("<RouteReset />"));
 });

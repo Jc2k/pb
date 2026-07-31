@@ -87,6 +87,14 @@
     color: #344054;
 }
 
+.session-back-button {
+    width: 44px;
+    height: 44px;
+    display: inline-grid;
+    flex: 0 0 44px;
+    place-items: center;
+}
+
 .session-header-action:hover:not(:disabled) {
     border-color: rgba(0, 122, 255, 0.3);
     color: var(--user);
@@ -1218,17 +1226,17 @@ article.user div.message-container {
 }
 
 .composer > .btn.rounded-circle {
-    width: 42px;
-    height: 42px;
+    width: 44px;
+    height: 44px;
     display: grid;
     place-items: center;
-    flex: 0 0 42px;
+    flex: 0 0 44px;
 }
 
 .composer .voice-input-button {
-    width: 42px;
-    height: 42px;
-    flex-basis: 42px;
+    width: 44px;
+    height: 44px;
+    flex-basis: 44px;
     box-shadow: none;
 }
 
@@ -1254,6 +1262,10 @@ article.user div.message-container {
 
     .session-layout {
         grid-template-columns: 1fr;
+    }
+
+    .session-layout.has-work-drawer {
+        grid-template-columns: minmax(0, 1fr);
     }
 
     .session-header {
