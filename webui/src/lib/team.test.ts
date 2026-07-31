@@ -1,7 +1,9 @@
 /// <reference lib="deno.ns" />
 import { deepEqual, equal } from "node:assert/strict";
 import {
+  profileAccentClass,
   profilePresentation,
+  teamActorAccentClass,
   teamActorPresentation,
   workflowStewardActor,
 } from "./team.ts";
@@ -27,4 +29,18 @@ Deno.test("legacy actorless tool actions remain unattributed", () => {
   const legacy = teamActorPresentation();
   equal(legacy.name, "Agent");
   equal(legacy.provenance, "Legacy");
+});
+
+Deno.test("team message accents follow profile avatar palettes", () => {
+  equal(profileAccentClass("review"), "teammate-review");
+  equal(profileAccentClass("unknown"), "teammate-neutral");
+  equal(
+    teamActorAccentClass({ kind: "agent", id: "build" }),
+    "teammate-message teammate-build",
+  );
+  equal(
+    teamActorAccentClass(workflowStewardActor()),
+    "teammate-message trinity-message",
+  );
+  equal(teamActorAccentClass(), "");
 });

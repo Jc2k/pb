@@ -71,6 +71,20 @@ export type ActionGroup = {
   controllerActions: EventEnvelope[];
 };
 
+export type ChatPresentationItem = {
+  item: EventEnvelope | ActionGroup;
+  showIdentity: boolean;
+  timeDividerMs?: number;
+};
+
+export const CHAT_TIME_GAP_MS = 5 * 60 * 1000;
+
+export function isActionGroup(
+  item: EventEnvelope | ActionGroup,
+): item is ActionGroup {
+  return "type" in item && item.type === "action_group";
+}
+
 export function toolEventsMatch(
   call: EventEnvelope,
   result: EventEnvelope,
@@ -112,6 +126,7 @@ export function groupActionEvents(
   let currentInferenceEvents: EventEnvelope[] = [];
   let pendingInferenceEvents: EventEnvelope[] = [];
   let pendingInferenceActor: TeamActor | undefined;
+  let pendingInferenceHasOutput = false;
   let currentActor: TeamActor | undefined;
   let currentAssistingProfile: string | undefined;
 
@@ -167,9 +182,10 @@ export function groupActionEvents(
   const flushPendingInferences = () => {
     if (pendingInferenceEvents.length === 0) return;
     flush();
-    grouped.push(...pendingInferenceEvents);
+    if (pendingInferenceHasOutput) grouped.push(...pendingInferenceEvents);
     pendingInferenceEvents = [];
     pendingInferenceActor = undefined;
+    pendingInferenceHasOutput = false;
   };
 
   for (let i = 0; i < events.length; i++) {
@@ -181,10 +197,14 @@ export function groupActionEvents(
         ? { kind: "agent" as const, id: event.event.profile }
         : undefined;
       pendingInferenceEvents.push(event);
-    } else if (event.event.type === "reasoning") {
-      flushPendingInferences();
+    } else if (
+      event.event.type === "reasoning" ||
+      event.event.type === "final" ||
+      event.event.type === "user_question"
+    ) {
       flush();
       grouped.push(event);
+      pendingInferenceHasOutput = pendingInferenceEvents.length > 0;
     } else if (event.event.type === "tool_call") {
       const actor = event.event.actor;
       if (
@@ -197,6 +217,7 @@ export function groupActionEvents(
       currentInferenceEvents.push(...pendingInferenceEvents);
       pendingInferenceEvents = [];
       pendingInferenceActor = undefined;
+      pendingInferenceHasOutput = false;
       currentToolCalls.push(event);
     } else if (event.event.type === "tool_result") {
       const currentMatch = currentToolCalls.some((call) =>
@@ -243,11 +264,88 @@ export function groupActionEvents(
   }
 
   flush();
-  if (pendingInferenceEvents.length > 0) {
+  if (pendingInferenceEvents.length > 0 && pendingInferenceHasOutput) {
     grouped.push(...pendingInferenceEvents);
   }
 
   return grouped;
+}
+
+function chatItemTimestamp(
+  item: EventEnvelope | ActionGroup,
+): number | undefined {
+  if (isActionGroup(item)) {
+    const timestamps = [
+      ...item.inferenceEvents,
+      ...item.toolCalls,
+      ...item.controllerActions,
+    ].flatMap((envelope) =>
+      "timestamp_ms" in envelope.event && envelope.event.timestamp_ms
+        ? [envelope.event.timestamp_ms]
+        : []
+    );
+    return timestamps.length > 0 ? Math.min(...timestamps) : undefined;
+  }
+  return "timestamp_ms" in item.event ? item.event.timestamp_ms : undefined;
+}
+
+function chatItemSpeakerKey(
+  item: EventEnvelope | ActionGroup,
+): string | undefined {
+  if (isActionGroup(item)) {
+    return item.actor ? teamActorKey(item.actor) : undefined;
+  }
+
+  const event = item.event;
+  switch (event.type) {
+    case "started":
+    case "user_answer":
+    case "user_message":
+      return "user:local";
+    case "reasoning":
+    case "final":
+    case "user_question":
+      return `agent:${event.profile}`;
+    case "correction":
+    case "workflow_blocked":
+      return "automation:trinity";
+    case "team_message":
+      return teamActorKey(event.actor);
+    case "workflow_artifact_accepted":
+      return event.artifact_kind === "plan" ? "agent:plan" : undefined;
+    case "session_summary":
+      return "system:delivery";
+    case "tool_call":
+    case "tool_result":
+      return event.actor ? teamActorKey(event.actor) : undefined;
+    default:
+      return undefined;
+  }
+}
+
+export function buildChatPresentation(
+  items: (EventEnvelope | ActionGroup)[],
+): ChatPresentationItem[] {
+  let lastSpeakerKey: string | undefined;
+  let lastTimestampMs: number | undefined;
+
+  return items.map((item) => {
+    const speakerKey = chatItemSpeakerKey(item);
+    const timestampMs = chatItemTimestamp(item);
+    const presentation = {
+      item,
+      showIdentity: speakerKey === undefined || speakerKey !== lastSpeakerKey,
+      timeDividerMs:
+        timestampMs !== undefined && lastTimestampMs !== undefined &&
+          timestampMs - lastTimestampMs >= CHAT_TIME_GAP_MS
+          ? timestampMs
+          : undefined,
+    };
+
+    if (speakerKey !== undefined) lastSpeakerKey = speakerKey;
+    if (timestampMs !== undefined) lastTimestampMs = timestampMs;
+    return presentation;
+  });
 }
 
 export function projectSettingsPath(projectName: string): string {
@@ -402,6 +500,14 @@ export function formatEventTime(timestamp_ms?: number): string {
     return `at ${timeStr}`;
   }
   return date.toLocaleDateString();
+}
+
+export function formatTranscriptTime(timestampMs?: number): string {
+  if (!timestampMs) return "";
+  return new Date(timestampMs).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 export function formatStartTime(timestamp: number): string {

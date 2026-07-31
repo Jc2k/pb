@@ -29,6 +29,13 @@ pub(crate) enum ProgressDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProgressPreflightDecision {
+    Continue,
+    Redirect(String),
+    Block(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FailedOutcome {
     signature: String,
     call_fingerprint: String,
@@ -49,12 +56,12 @@ impl ProgressGuard {
         tool_family: &str,
         call_fingerprint: &str,
         state: ProgressState,
-    ) -> Option<String> {
+    ) -> ProgressPreflightDecision {
         if self.state.as_ref() != Some(&state) {
             self.failures.clear();
             self.warned = false;
             self.state = Some(state);
-            return None;
+            return ProgressPreflightDecision::Continue;
         }
         let repeated_cache_replay = self.failures.back().is_some_and(|previous| {
             tool_family == "repository_read"
@@ -62,13 +69,24 @@ impl ProgressGuard {
                     .is_some_and(|request| read_request(call_fingerprint) == Some(request))
         });
         if repeated_cache_replay {
-            return Some(format!(
+            return ProgressPreflightDecision::Block(format!(
                 "No-progress guard blocked an exact read that just returned a deterministic cache replay on the unchanged file. Previous outcome: {}. The blocked call consumed no tool runtime and earned no new evidence. {}",
                 self.failures
                     .back()
                     .map(|failure| failure.summary.as_str())
                     .unwrap_or("the exact read was already replayed from cache"),
                 alternatives_for_family(tool_family),
+            ));
+        }
+        let repeated_missing_target_read = self.failures.back().is_some_and(|previous| {
+            tool_family == "repository_read"
+                && call_fingerprint.starts_with("read_file:path:")
+                && previous.call_fingerprint == call_fingerprint
+                && previous.summary == "failure:read_file:requested target was not found"
+        });
+        if repeated_missing_target_read {
+            return ProgressPreflightDecision::Redirect(format!(
+                "No-progress guard blocked an identical read_file call after the unchanged path was deterministically reported missing. The blocked call consumed no tool runtime. Do not retry that path; locate the symbol or path with one repository search, use existing evidence, or report the blocker truthfully."
             ));
         }
         if self.failures.len() < 2 {
@@ -78,16 +96,18 @@ impl ProgressGuard {
                         prior_empty_read_path(&previous.call_fingerprint) == Some(path)
                     })
             });
-            return repeated_known_empty_read.then(|| {
-                format!(
+            return if repeated_known_empty_read {
+                ProgressPreflightDecision::Block(format!(
                     "No-progress guard blocked a repeated read range already known to be empty on the unchanged file. Previous outcome: {}. The blocked call consumed no tool runtime and earned no new evidence. {}",
                     self.failures
                         .back()
                         .map(|failure| failure.summary.as_str())
                         .unwrap_or("the requested range contained no content"),
                     alternatives_for_family(tool_family),
-                )
-            });
+                ))
+            } else {
+                ProgressPreflightDecision::Continue
+            };
         }
         let previous = &self.failures[self.failures.len() - 1];
         let before_previous = &self.failures[self.failures.len() - 2];
@@ -97,14 +117,14 @@ impl ProgressGuard {
         let alternating_call = before_previous.call_fingerprint == call_fingerprint
             && previous.call_fingerprint != call_fingerprint;
         if !same_outcome_edit && !alternating_call {
-            return None;
+            return ProgressPreflightDecision::Continue;
         }
         let pattern = if alternating_call {
             "an A-B-A call cycle"
         } else {
             "two equivalent unchanged failures"
         };
-        Some(format!(
+        ProgressPreflightDecision::Block(format!(
             "No-progress guard blocked this call before execution after {pattern}. Previous outcome: {}. The blocked call consumed no tool runtime and made no repository change. {}",
             previous.summary,
             alternatives_for_family(tool_family),
@@ -237,7 +257,10 @@ fn normalized_outcome_summary(tool: &str, success: bool, result: &str) -> String
         "required read evidence is missing"
     } else if lower.contains("not available") {
         "tool or executor is unavailable"
-    } else if lower.contains("not found") {
+    } else if lower.contains("not found")
+        || lower.contains("no such file or directory")
+        || lower.contains("failed to resolve path")
+    {
         "requested target was not found"
     } else if lower.contains("timed out") || lower.contains("timeout") {
         "tool execution timed out"
@@ -322,18 +345,17 @@ mod tests {
             guard.record(failed("execution", "b", "state-1")),
             ProgressDecision::Warn(_)
         ));
-        assert!(
-            guard
-                .preflight(
-                    "execution",
-                    "a",
-                    ProgressState {
-                        workspace_fingerprint: "state-1".to_string(),
-                        evidence_fingerprint: "state-1".to_string(),
-                    },
-                )
-                .is_some()
-        );
+        assert!(matches!(
+            guard.preflight(
+                "execution",
+                "a",
+                ProgressState {
+                    workspace_fingerprint: "state-1".to_string(),
+                    evidence_fingerprint: "state-1".to_string(),
+                },
+            ),
+            ProgressPreflightDecision::Block(_)
+        ));
     }
 
     #[test]
@@ -351,17 +373,16 @@ mod tests {
             guard.record(failed("workspace_edit", "stale", "state-2")),
             ProgressDecision::Continue
         );
-        assert!(
-            guard
-                .preflight(
-                    "workspace_edit",
-                    "stale",
-                    ProgressState {
-                        workspace_fingerprint: "state-2".to_string(),
-                        evidence_fingerprint: "state-2".to_string(),
-                    },
-                )
-                .is_none()
+        assert_eq!(
+            guard.preflight(
+                "workspace_edit",
+                "stale",
+                ProgressState {
+                    workspace_fingerprint: "state-2".to_string(),
+                    evidence_fingerprint: "state-2".to_string(),
+                },
+            ),
+            ProgressPreflightDecision::Continue
         );
     }
 
@@ -380,22 +401,61 @@ mod tests {
         replay.call_fingerprint = "read_file:cache_replay:path-hash:arguments-hash".to_string();
         assert_eq!(guard.record(replay), ProgressDecision::Continue);
 
-        assert!(
-            guard
-                .preflight(
-                    "repository_read",
-                    "read_file:path:path-hash:arguments-hash",
-                    state.clone(),
-                )
-                .is_some()
-        );
+        assert!(matches!(
+            guard.preflight(
+                "repository_read",
+                "read_file:path:path-hash:arguments-hash",
+                state.clone(),
+            ),
+            ProgressPreflightDecision::Block(_)
+        ));
         assert_eq!(
             guard.preflight(
                 "repository_read",
                 "read_file:path:path-hash:different-range",
                 state,
             ),
-            None
+            ProgressPreflightDecision::Continue
+        );
+    }
+
+    #[test]
+    fn identical_missing_read_is_redirected_before_a_second_execution() {
+        let state = ProgressState {
+            workspace_fingerprint: "state-1".to_string(),
+            evidence_fingerprint: "state-1".to_string(),
+        };
+        let call = "read_file:path:missing-path-hash:arguments-hash";
+        let (outcome_fingerprint, outcome_summary) = outcome_identity(
+            "read_file",
+            false,
+            "failed to resolve path webui/src/components/Missing.tsx: No such file or directory",
+        );
+        let mut guard = ProgressGuard::default();
+        assert_eq!(
+            guard.record(ProgressObservation {
+                tool_family: "repository_read".to_string(),
+                call_fingerprint: call.to_string(),
+                outcome_fingerprint,
+                outcome_summary,
+                success: false,
+                state: state.clone(),
+            }),
+            ProgressDecision::Continue
+        );
+
+        assert!(matches!(
+            guard.preflight("repository_read", call, state.clone()),
+            ProgressPreflightDecision::Redirect(message)
+                if message.contains("blocked an identical read_file call")
+        ));
+        assert_eq!(
+            guard.preflight(
+                "repository_read",
+                "read_file:path:discovered-path-hash:arguments-hash",
+                state,
+            ),
+            ProgressPreflightDecision::Continue
         );
     }
 
@@ -419,7 +479,7 @@ mod tests {
                     evidence_fingerprint: "state-1".to_string(),
                 },
             ),
-            None
+            ProgressPreflightDecision::Continue
         );
     }
 
@@ -433,11 +493,10 @@ mod tests {
         let mut observation = failed("repository_read", "empty", "state-1");
         observation.call_fingerprint = "read_file:known_empty:path-hash".to_string();
         assert_eq!(guard.record(observation), ProgressDecision::Continue);
-        assert!(
-            guard
-                .preflight("repository_read", "read_file:known_empty:path-hash", state,)
-                .is_some()
-        );
+        assert!(matches!(
+            guard.preflight("repository_read", "read_file:known_empty:path-hash", state,),
+            ProgressPreflightDecision::Block(_)
+        ));
     }
 
     #[test]
@@ -463,17 +522,16 @@ mod tests {
             guard.record(failed("workspace_edit", &second.0, "state")),
             ProgressDecision::Warn(_)
         ));
-        assert!(
-            guard
-                .preflight(
-                    "workspace_edit",
-                    "third-varied-call",
-                    ProgressState {
-                        workspace_fingerprint: "state".to_string(),
-                        evidence_fingerprint: "state".to_string(),
-                    },
-                )
-                .is_some()
-        );
+        assert!(matches!(
+            guard.preflight(
+                "workspace_edit",
+                "third-varied-call",
+                ProgressState {
+                    workspace_fingerprint: "state".to_string(),
+                    evidence_fingerprint: "state".to_string(),
+                },
+            ),
+            ProgressPreflightDecision::Block(_)
+        ));
     }
 }

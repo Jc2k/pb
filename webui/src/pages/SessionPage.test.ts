@@ -110,6 +110,8 @@ Deno.test("strict workflow stages and outcomes use compact truthful labels", () 
   equal(workflowOutcomeLabel("no_change"), "No code changes");
   equal(workflowOutcomeLabel("review_failed"), "Needs another pass");
   equal(workflowOutcomeLabel("contract_unsatisfied"), "Needs another pass");
+  equal(workflowOutcomeLabel("step_limit"), "Needs another pass");
+  equal(workflowOutcomeLabel("engine_error"), "Needs another pass");
   equal(workflowOutcomeLabel("commit_blocked"), "Needs help");
   equal(workflowOutcomeLabel("cancelled"), "Cancelled — work preserved");
   equal(workflowProgressLabel("ready", "ready"), "Ready");
@@ -193,23 +195,47 @@ Deno.test("paused session composer keeps resume action at intrinsic width", asyn
   ok(!css.includes(".composer .btn {"));
 });
 
-Deno.test("session corrections render as truthful steward messages", async () => {
+Deno.test("session corrections render as direct steward chat with progressive detail", async () => {
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
   const css = await Deno.readTextFile("webui/src/session.css");
   const types = await Deno.readTextFile("webui/src/types/index.ts");
+  const utils = await Deno.readTextFile("webui/src/lib/sessionUtils.ts");
 
   ok(types.includes('type: "correction"'));
   ok(component.includes('case "correction"'));
   ok(component.includes("function CorrectionNotice"));
   ok(component.includes("workflowStewardActor()"));
   ok(component.includes("Correction from ${teammate.name}"));
-  ok(component.includes("needs a correction"));
-  ok(component.includes("I sent it back with guidance"));
+  ok(component.includes("trinityCorrectionCopy("));
+  ok(!component.includes("I noticed a problem in ${assistedName}"));
+  ok(
+    utils.includes('normalizedSummary === "Task-focused repository evidence"'),
+  );
+  ok(utils.includes("toolFailureFeedback(detail, teammateName)"));
+  ok(component.includes("function TechnicalDetailsBubble"));
+  ok(component.includes("technical-detail-button"));
+  ok(component.includes("window.setTimeout"));
   ok(component.includes("Technical details"));
   ok(component.includes("function WorkflowBlockedNotice"));
-  ok(component.includes("Delivery paused safely"));
+  ok(component.includes("your review—and this delivery—are now on hold"));
+  ok(component.includes("start a follow-up task here"));
+  ok(component.includes('fetch("/api/current-user"'));
+  ok(component.includes("Task hold message from ${teammate.name}"));
+  ok(component.includes("Request from ${teammate.name} to the current user"));
+  ok(!component.includes("Delivery not completed"));
+  ok(!component.includes("Your next step"));
+  ok(!component.includes("terminal-next-step"));
   ok(component.includes('className="action-origin"'));
+  ok(component.includes("chat-event-message"));
+  ok(component.includes("trinity-message"));
+  ok(component.includes("<RichText content={copy.message} />"));
   ok(css.includes(".correction-bubble"));
+  ok(css.includes("--trinity-accent:"));
+  ok(css.includes(".teammate-message .thought-bubble"));
+  ok(css.includes(".teammate-message.chat-event-message"));
+  ok(!css.includes(".trinity-message .team-avatar"));
+  ok(css.includes(".technical-detail-surface:hover .technical-detail-button"));
+  ok(!css.includes(".terminal-next-step"));
 });
 
 Deno.test("accepted delivery plans and reviewer prose stay visible in chat", async () => {
@@ -219,6 +245,8 @@ Deno.test("accepted delivery plans and reviewer prose stay visible in chat", asy
 
   ok(component.includes("function DeliveryPlanCard"));
   ok(component.includes('"Review invalidated"'));
+  ok(component.includes('"Review incomplete"'));
+  ok(component.includes("reviewEndedIncomplete"));
   ok(component.includes("What it must achieve"));
   ok(component.includes("Implementation"));
   ok(component.includes("Done when"));
@@ -226,6 +254,30 @@ Deno.test("accepted delivery plans and reviewer prose stay visible in chat", asy
   ok(page.includes("workflow={session.workflow}"));
   ok(!component.includes("Notes from this run"));
   ok(!helpers.includes("reasoningEvents:"));
+});
+
+Deno.test("session chat groups speakers and reveals useful message times", async () => {
+  const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+  const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+  const css = await Deno.readTextFile("webui/src/session.css");
+
+  ok(page.includes("buildChatPresentation("));
+  ok(page.includes('event.pointerType !== "touch"'));
+  ok(page.includes('showMessageTimes ? " show-message-times"'));
+  ok(component.includes('" speaker-continuation"'));
+  ok(component.includes("function MessageTime"));
+  ok(css.includes(".chat-time-divider"));
+  ok(css.includes(".show-message-times .message-time"));
+  ok(css.includes(".speaker-continuation > .bot-avatar"));
+});
+
+Deno.test("assistant and Trinity prose share safe inline Markdown rendering", async () => {
+  const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+
+  ok(component.includes("parseInlineRichText(content)"));
+  ok(component.includes('className="rich-text-inline-code"'));
+  ok(component.includes("<RichText content={e.content} />"));
+  ok(component.includes("<RichText content={copy.message} />"));
 });
 
 Deno.test("final assistant messages use profile avatars", async () => {
@@ -286,6 +338,14 @@ Deno.test("session metrics stay compact while inference details remain available
     component.indexOf("function SessionMetricsDetails"),
     component.indexOf("export function MessageBubble"),
   );
+  const actionGroup = component.slice(
+    component.indexOf("export function ActionGroupBubble"),
+    component.indexOf("export function ActionDrawerItem"),
+  );
+  const actionInferenceDetails = component.slice(
+    component.indexOf("function ActionInferenceDetails"),
+    component.indexOf("function InferenceDetails"),
+  );
 
   ok(types.includes("power_summary?: string"));
   ok(
@@ -298,7 +358,16 @@ Deno.test("session metrics stay compact while inference details remain available
   ok(component.includes('case "llm_invocation"'));
   ok(types.includes('"task_partitioning"'));
   ok(types.includes('"workflow_recovery"'));
-  ok(inferenceDetails.includes("used the model"));
+  ok(inferenceDetails.includes("worked for"));
+  ok(!inferenceDetails.includes("used the model"));
+  ok(actionInferenceDetails.includes("worked for"));
+  ok(actionGroup.includes("Predicted"));
+  ok(actionGroup.includes("trinity-prediction-glyph"));
+  ok(actionGroup.includes("tool-strip-copy"));
+  ok(
+    actionGroup.indexOf("<ActionInferenceDetails") >
+      actionGroup.indexOf('className="bubble thought-bubble action-bubble"'),
+  );
   ok(inferenceDetails.includes("View inference ${event.step} details"));
   ok(component.includes('role="dialog"'));
   ok(inferenceDetails.includes("window.setTimeout"));
@@ -338,6 +407,12 @@ Deno.test("session metrics stay compact while inference details remain available
   ok(runtimeDetails.includes("<MetricsDialog"));
   ok(!runtimeDetails.includes("<details>"));
   ok(runtimeDetails.includes("event.cache_persistence_completed_checkpoints"));
+  ok(runtimeDetails.includes("How pb helped"));
+  ok(runtimeDetails.includes("Potential turns avoided"));
+  ok(runtimeDetails.includes("not a counterfactual saving"));
+  ok(runtimeDetails.includes("harnessEfficiencyStats(evidenceEvents)"));
+  ok(inferenceDetails.includes('label="Candidates filtered"'));
+  ok(actionInferenceDetails.includes('label="Control collar filtered"'));
   ok(!component.includes("<strong>Power</strong>"));
   ok(!component.includes("{e.power_summary"));
   ok(!component.includes('<i className="bi bi-speedometer2"></i>'));
@@ -351,6 +426,18 @@ Deno.test("session metrics stay compact while inference details remain available
   ok(infoRule.includes("position: absolute;"));
   ok(infoRule.includes("opacity: 0;"));
   ok(css.includes(".session-metrics-summary:hover .inference-info-button"));
+});
+
+Deno.test("terminal Trinity feedback hands an on-hold task from teammate to user", async () => {
+  const component = await Deno.readTextFile("webui/src/components/Session.tsx");
+
+  ok(component.includes("${repeatedFirstName}, \\`"));
+  ok(component.includes("your review—and this delivery—are now on hold"));
+  ok(component.includes("@${currentUsername}, can you ${userRequest}?"));
+  ok(component.includes("restart this delivery with the current files"));
+  ok(component.includes("restore the missing prerequisite"));
+  ok(component.includes("start a follow-up task here"));
+  ok(!component.includes("Choose **Build** below"));
 });
 
 Deno.test("session workspace prioritizes chat and shows work details only when useful", async () => {
@@ -388,7 +475,7 @@ Deno.test("session workspace prioritizes chat and shows work details only when u
   ok(component.includes('className="transcript-diff"'));
   ok(
     css.includes(
-      ".assistant-transcript > .message-container > .thought-bubble",
+      ".chat-event-message > .message-container > .thought-bubble",
     ),
   );
   ok(css.includes(".transcript-diff-body"));

@@ -203,7 +203,12 @@ Trinity Walker, the team steward, owns automatic reads, changed-path inspection,
 no-change closure, corrections, and handoff work. Each action also says **Model** or **Harness**, so
 the friendlier character metaphor does not hide provenance. Reads show their full or bounded-range
 coverage; deletion states that the path was tracked and Git-recoverable. The terminal uses the same
-character-first attribution and provenance.
+character-first attribution and provenance. Trinity-owned rows use one consistent lilac identity
+accent while retaining the same neutral message surfaces as the rest of the team; her avatar has no
+extra outline. Other teammates use the same narrow accent and tinted provenance label in a colour
+drawn from their avatar background. A stars glyph and a **Predicted…** action label call out
+repository reads or inspections Trinity completed ahead of the next model call. Action bubbles keep
+only the primary action, optional compact summary, and disclosure control visible until expanded.
 
 The work drawer appears only when a session has a Goal, recorded actions, or a managed plan. Actions
 use a compact chronological row instead of repeating the teammate identity already established in
@@ -211,19 +216,39 @@ the transcript, and the drawer starts collapsed. Routine lifecycle activity is n
 separate activity feed. A simple request that skipped model-based Task partitioning does not add an
 empty zero-call planning disclosure above the transcript.
 
-Standalone model-inference rows show the responsible teammate and elapsed time. When the same
-teammate makes consecutive tool-directed calls, the transcript folds the actions into one collapsed
-run with one avatar and name. Model prose remains visible as ordinary teammate chat and ends the
-action run; it is never moved into the action disclosure merely because a tool submission follows.
-User input, stage changes, and material Trinity feedback also start a new run.
-Internal turn-credit accounting stays out of chat, and a repeat-limit failure is explained by
-Trinity instead of appearing again as an unattached red error. When the repeat stop and delivery
-outcome are adjacent, Trinity presents them together while the stored evidence keeps both causes.
+Model timing appears immediately below the work it measures. A text-only model turn places the
+elapsed-time row after its prose; a tool-directed turn places the elapsed time under its collapsed
+action run. A model call that produces no visible prose or action does not create a detached timing
+row. When the same teammate makes consecutive tool-directed calls, the transcript folds the actions
+into one collapsed run with one avatar and name. Model prose remains visible as ordinary teammate
+chat; it is never moved into the action disclosure merely because a tool submission follows. Model
+prose, accepted delivery plans, Trinity feedback, and delivery summaries use the same chat-row width
+and responsive card treatment, so their author and content remain readable on narrow screens.
+Consecutive messages from the same teammate form one visual run: the avatar, name, and role appear at
+the start and return when another speaker intervenes. A time divider appears after a five-minute gap.
+On touch screens, pull the transcript to the left to reveal the exact time beside every message until
+you release it. Model and Trinity prose render headings, lists, fenced code, emphasis, and inline
+code; single-tilde file paths from local models are treated as inline code too. User input, stage
+changes, and material Trinity feedback also start a new run. Internal turn-credit accounting stays
+out of chat, and a repeat-limit failure is explained by Trinity instead of appearing again as an
+unattached red error. When the repeat stop and delivery outcome are adjacent, Trinity presents one
+conversational handoff while the stored evidence keeps both causes. If the repeated action produced
+the same failure twice, chat keeps the first explanation and the second teammate action, then
+suppresses the stale duplicate explanations around the terminal outcome. Trinity closes the pass
+with two ordinary chat bubbles: she first tells the responsible teammate what went wrong and that
+their task is on hold, then addresses you by your local username and asks for the follow-up context or
+recovery action the team needs. There is no separate terminal-status badge inside the transcript.
 On a pointer device, hover reveals a fixed-size information button that does not move or reflow the
 row; click it to open aggregate and per-call metrics. Touch devices show the action-run button and
 also support long-press on standalone inference rows. The detail sheet presents purpose, token
 counts, energy, prompt-cache work, and native-runtime timings as labelled fields. The session's
-runtime total uses the same interaction instead of an expandable block in the transcript. A
+runtime total uses the same interaction instead of an expandable block in the transcript. When
+Trinity completed eligible repository actions early, the summary counts them and reports up to that
+many potentially avoided model turns. This is deliberately an upper bound; the UI does not claim to
+know the counterfactual model trajectory, and the displayed energy remains measured session use
+rather than energy saved. The detail sheet also calls out duplicate or dependent actions prevented
+before execution, no-progress loops stopped, and invalid generation candidates filtered by the
+control collar. Candidate counts are not presented as blocked tool calls. A
 zero-reuse call retains the backend's reason—such as a cold session, changed
 prompt, unavailable stable prefix, unreadable cache, required context reset, disabled cache, or an
 unsupported runtime path. When a stable root is available, the stored diagnostic retains its reused
@@ -232,7 +257,19 @@ counts rather than prompt or repository text.
 
 Harness validation feedback appears as a message from Trinity. The message identifies which
 teammate's artifact needs another pass and explains the problem in ordinary language; raw validation
-data stays behind **Technical details**, and internal closure checkpoints do not appear in chat.
+data stays out of the normal transcript. On a pointer device, hover reveals its information button;
+on a touch device, long-press the feedback to open **Technical details**. Tool failures name the
+failed action, summarize the actionable cause without exposing the temporary workspace path, and
+tell the teammate to correct the action, choose another action, or report the blocker. Internal
+closure checkpoints do not appear in chat. Trinity's visible sentence is derived from the event that
+caused it: proactively supplied repository evidence is described as code Trinity already found and
+inspected, while invalid artifacts, failed tools, repeated actions, diagnostics, and terminal pauses
+each explain their own concrete cause. The visible wording describes ordinary teammate actions such
+as reading the relevant lines; it does not expose prompt context or tell a teammate to ask the
+harness for code. A message that asks for action addresses the responsible teammate in second
+person, so both its owner and requested next step remain clear. A terminal session never leaves an
+accepted plan labelled **Awaiting review**: it reports an incomplete, cancelled, invalidated, or
+completed review state as appropriate.
 Delivery summaries list only commits and changes made after the session's captured repository
 baseline, so earlier repository history is not presented as work from the current delivery. Older
 strict-workflow sessions show their stored commit list only when they also contain a successful commit
@@ -247,6 +284,11 @@ title fallback instead of spending a model call on cosmetic title rewriting. A s
 inconsistent plan-review verdict is rejected inside the same live review turn, preserving the
 reviewer's reads and restricting the correction turn to the review submission rather than starting
 another evidence pass.
+If a plan reviewer reads a path that does not exist, pb marks that exact read as non-retryable and
+will not run it again unchanged. The next review turn is deliberately small: the reviewer can submit
+a revision challenge from the evidence already collected, or use one repository search to find the
+actual symbol or path before continuing. This recovery still consumes the session's normal bounded
+review budget.
 
 If repository content changes while a read-only plan or code review is running, pb keeps the review
 bound to its earlier exact snapshot and stops before implementation or commit. The session names the

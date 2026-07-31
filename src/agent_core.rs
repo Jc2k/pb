@@ -40,8 +40,8 @@ use std::time::Instant;
 use crate::agent_closure::{ClosureCheckpoint, ToolExposureState};
 use crate::agent_context::{self, ContextLimitError, PreparedPrompt, PromptMeasurement};
 use crate::agent_progress::{
-    ProgressDecision, ProgressGuard, ProgressObservation, ProgressState, outcome_identity,
-    tool_family,
+    ProgressDecision, ProgressGuard, ProgressObservation, ProgressPreflightDecision, ProgressState,
+    outcome_identity, tool_family,
 };
 use crate::agent_repository::{self, ChangeManifest, RepositoryBrief};
 use crate::agent_tool_errors::{self, ToolFailureReason};
@@ -5553,6 +5553,26 @@ fn configure_plan_review_check_candidates(tools: &mut [BuiltInToolSchema], check
     }
 }
 
+fn configure_plan_review_missing_target_recovery(tools: &mut Vec<BuiltInToolSchema>) {
+    tools.retain(|tool| {
+        matches!(
+            tool.name.as_str(),
+            "submit_plan_review" | "search" | "ripgrep" | "glob"
+        )
+    });
+    for tool in tools {
+        match tool.name.as_str() {
+            "submit_plan_review" => tool.description.push_str(
+                " Recovery turn after a missing repository path: if the evidence already proves a plan defect, submit a revise verdict now instead of seeking more evidence.",
+            ),
+            "search" | "ripgrep" | "glob" => tool.description.push_str(
+                " This is the one bounded recovery search after a missing path; locate the actual symbol or path and do not repeat or guess the failed path.",
+            ),
+            _ => {}
+        }
+    }
+}
+
 fn configure_plan_revision_submission(tools: &mut [BuiltInToolSchema], challenge_ids: &[String]) {
     if challenge_ids.is_empty() {
         return;
@@ -7453,6 +7473,7 @@ fn run_agent_steps(
     let mut tool_loop_guard = ToolLoopGuard::default();
     let mut progress_guard = ProgressGuard::default();
     let mut terminal_submission_only = false;
+    let mut plan_review_missing_target_recovery = false;
     let mut suppress_thinking = false;
     let mut work_units = args.workflow_work_units.clone();
     let mut announced_work_unit: Option<(String, crate::workflow::WorkUnitState)> = None;
@@ -8137,6 +8158,11 @@ fn run_agent_steps(
                 .map(|graph| graph.checks.keys().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             configure_plan_review_check_candidates(&mut scoped_tools, &check_ids);
+        }
+        let plan_review_missing_target_recovery_turn = plan_review_missing_target_recovery
+            && args.workflow_stage == Some(crate::workflow::WorkflowStage::PlanReview);
+        if plan_review_missing_target_recovery_turn {
+            configure_plan_review_missing_target_recovery(&mut scoped_tools);
         }
         if args.workflow_stage == Some(crate::workflow::WorkflowStage::PlanRevision) {
             configure_plan_revision_submission(
@@ -8915,23 +8941,32 @@ fn run_agent_steps(
                     step += 1;
                     continue;
                 }
-                if let Some(feedback) = preflight_tool_progress(
+                match preflight_tool_progress(
                     &mut progress_guard,
                     &calls,
                     workspace_root,
                     &gate_state,
                 )? {
-                    messages.push(ChatMessage::text("assistant", output.clone()));
-                    record_progress_warning(&feedback, nesting_depth, messages, sink);
-                    return Ok(StepRunOutcome {
-                        reached_final: false,
-                        contract_status: incomplete_contract_status(args),
-                        verified_completed: false,
-                        termination_reason: TerminationReason::GateLoop,
-                        final_content: None,
-                        metrics,
-                        gate_state: gate_state.into_inner(),
-                    });
+                    ProgressPreflightDecision::Continue => {}
+                    ProgressPreflightDecision::Redirect(feedback) => {
+                        messages.push(ChatMessage::text("assistant", output.clone()));
+                        record_progress_warning(&feedback, nesting_depth, messages, sink);
+                        step = step.saturating_add(1);
+                        continue;
+                    }
+                    ProgressPreflightDecision::Block(feedback) => {
+                        messages.push(ChatMessage::text("assistant", output.clone()));
+                        record_progress_warning(&feedback, nesting_depth, messages, sink);
+                        return Ok(StepRunOutcome {
+                            reached_final: false,
+                            contract_status: incomplete_contract_status(args),
+                            verified_completed: false,
+                            termination_reason: TerminationReason::GateLoop,
+                            final_content: None,
+                            metrics,
+                            gate_state: gate_state.into_inner(),
+                        });
+                    }
                 }
                 let execution_tools =
                     execution_tools_for_recovery(generation_tools, &calls, &gate_state.borrow());
@@ -8967,6 +9002,11 @@ fn run_agent_steps(
                 if progress_outcomes.iter().any(|outcome| outcome.success) {
                     deterministic_failures.clear(DeterministicFailureKind::Parse);
                 }
+                plan_review_missing_target_recovery = next_plan_review_missing_target_recovery(
+                    plan_review_missing_target_recovery,
+                    plan_review_missing_target_recovery_turn,
+                    &progress_outcomes,
+                );
                 if review_terminal_attempt && gate_state.borrow().workflow_submission.is_none() {
                     // A review terminal call that failed structural prevalidation needs corrected
                     // arguments, not another evidence chain. Keep the live transcript and bind the
@@ -9111,23 +9151,32 @@ fn run_agent_steps(
                     step += 1;
                     continue;
                 }
-                if let Some(feedback) = preflight_tool_progress(
+                match preflight_tool_progress(
                     &mut progress_guard,
                     &calls,
                     workspace_root,
                     &gate_state,
                 )? {
-                    messages.push(ChatMessage::text("assistant", output.clone()));
-                    record_progress_warning(&feedback, nesting_depth, messages, sink);
-                    return Ok(StepRunOutcome {
-                        reached_final: false,
-                        contract_status: incomplete_contract_status(args),
-                        verified_completed: false,
-                        termination_reason: TerminationReason::GateLoop,
-                        final_content: None,
-                        metrics,
-                        gate_state: gate_state.into_inner(),
-                    });
+                    ProgressPreflightDecision::Continue => {}
+                    ProgressPreflightDecision::Redirect(feedback) => {
+                        messages.push(ChatMessage::text("assistant", output.clone()));
+                        record_progress_warning(&feedback, nesting_depth, messages, sink);
+                        step = step.saturating_add(1);
+                        continue;
+                    }
+                    ProgressPreflightDecision::Block(feedback) => {
+                        messages.push(ChatMessage::text("assistant", output.clone()));
+                        record_progress_warning(&feedback, nesting_depth, messages, sink);
+                        return Ok(StepRunOutcome {
+                            reached_final: false,
+                            contract_status: incomplete_contract_status(args),
+                            verified_completed: false,
+                            termination_reason: TerminationReason::GateLoop,
+                            final_content: None,
+                            metrics,
+                            gate_state: gate_state.into_inner(),
+                        });
+                    }
                 }
                 let execution_tools =
                     execution_tools_for_recovery(generation_tools, &calls, &gate_state.borrow());
@@ -9163,6 +9212,11 @@ fn run_agent_steps(
                 if progress_outcomes.iter().any(|outcome| outcome.success) {
                     deterministic_failures.clear(DeterministicFailureKind::Parse);
                 }
+                plan_review_missing_target_recovery = next_plan_review_missing_target_recovery(
+                    plan_review_missing_target_recovery,
+                    plan_review_missing_target_recovery_turn,
+                    &progress_outcomes,
+                );
                 if review_terminal_attempt && gate_state.borrow().workflow_submission.is_none() {
                     terminal_submission_only = true;
                 }
@@ -10386,6 +10440,33 @@ struct ToolOutcomeSummary {
     success: bool,
 }
 
+fn missing_target_read_outcome(outcome: &ToolOutcomeSummary) -> bool {
+    outcome.tool == "read_file"
+        && !outcome.success
+        && serde_json::from_str::<agent_tool_errors::ToolFailureEnvelope>(
+            semantic_tool_result_payload(&outcome.result),
+        )
+        .is_ok_and(|failure| failure.reason_code == ToolFailureReason::TargetNotFound)
+}
+
+fn next_plan_review_missing_target_recovery(
+    current: bool,
+    recovery_turn: bool,
+    outcomes: &[ToolOutcomeSummary],
+) -> bool {
+    if outcomes.iter().any(missing_target_read_outcome) {
+        return true;
+    }
+    if recovery_turn
+        && outcomes.iter().any(|outcome| {
+            outcome.success && matches!(outcome.tool.as_str(), "search" | "ripgrep" | "glob")
+        })
+    {
+        return false;
+    }
+    current
+}
+
 fn tool_outcome_succeeded(tool: &str, transport_success: bool, result: &str) -> bool {
     if !transport_success {
         return false;
@@ -11274,6 +11355,12 @@ fn execute_tool_calls(
                 && result.contains("read-before-write gate blocked write")
             {
                 "Call read_file(path) now, wait for the real result, then retry this edit tool in a later turn with its valid signature."
+            } else if tool == "read_file" && reason == ToolFailureReason::TargetNotFound {
+                if env.args.workflow_stage == Some(crate::workflow::WorkflowStage::PlanReview) {
+                    "This review path does not exist. Do not retry or guess it. If the evidence already proves the plan incomplete, call submit_plan_review with verdict revise; otherwise use the next bounded repository search to locate the actual symbol or path."
+                } else {
+                    "This path does not exist. Do not retry the identical call. Locate the actual symbol or path with a repository search, choose a different action, or report the blocker truthfully."
+                }
             } else {
                 "Use the valid signature to correct the call, choose a different exposed action, or report the blocker truthfully."
             };
@@ -11284,7 +11371,9 @@ fn execute_tool_calls(
                 &result,
                 !matches!(
                     reason,
-                    ToolFailureReason::PolicyDenied | ToolFailureReason::ApprovalDenied
+                    ToolFailureReason::TargetNotFound
+                        | ToolFailureReason::PolicyDenied
+                        | ToolFailureReason::ApprovalDenied
                 ),
                 suggested_next_action,
                 false,
@@ -12205,18 +12294,17 @@ fn preflight_tool_progress(
     calls: &[AgentToolCall],
     workspace_root: &Path,
     gate_state: &RefCell<GateState>,
-) -> Result<Option<String>> {
+) -> Result<ProgressPreflightDecision> {
     let state = progress_state(workspace_root, gate_state)?;
     for call in calls {
         let call_fingerprint =
             progress_call_fingerprint(&call.tool, &call.arguments, None, workspace_root, false);
-        if let Some(feedback) =
-            guard.preflight(&tool_family(&call.tool), &call_fingerprint, state.clone())
-        {
-            return Ok(Some(feedback));
+        let decision = guard.preflight(&tool_family(&call.tool), &call_fingerprint, state.clone());
+        if decision != ProgressPreflightDecision::Continue {
+            return Ok(decision);
         }
     }
-    Ok(None)
+    Ok(ProgressPreflightDecision::Continue)
 }
 
 fn record_tool_progress(
@@ -14919,7 +15007,7 @@ Use the native function-call interface described by the system tool schema. If t
 const PLAN_REVIEW_SUBMISSION_GUIDANCE: &str = r#"
 Required terminal action: call the provided submit_plan_review function exactly once with arguments shaped as:
 {"id":"plan-review-1","assessments":[{"kind":"requirement_coverage","status":"pass"},{"kind":"architecture","status":"pass"},{"kind":"component_impact","status":"pass"},{"kind":"test_strategy","status":"pass"},{"kind":"failure_modes","status":"pass"},{"kind":"assumptions","status":"pass"}],"challenges":[],"verdict":"pass"}
-pb supplies the exact accepted plan id and digest. Assessments contain only kind and status; do not repeat explanations or evidence there. Put each concern's specific explanation and any observed evidence once in challenges, where every cited repository path must have current review evidence. Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]}, set verdict to revise, and set at least one corresponding assessment status to concern or fail. Never request revision while every assessment is pass. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, every assessment must pass and there must be no p0/p1 challenge. For removal plans, a declaration named for deletion must not retain unexplained callers: challenge the plan unless it preserves the downstream behavior with a stable replacement or explicitly updates every consumer. For repository-local evidence, use local repository tools rather than public web search. Do not return prose or a final action."#;
+pb supplies the exact accepted plan id and digest. Assessments contain only kind and status; do not repeat explanations or evidence there. Put each concern's specific explanation and any observed evidence once in challenges, where every cited repository path must have current review evidence. Use the native function-call interface described by the system tool schema. If native calls are unavailable, emit exactly one compatibility action shaped as {"type":"tool_call","tool":"submit_plan_review","arguments":<the argument object above>} with no markdown or surrounding prose; never return an argument object by itself. For revise, use a challenge shaped exactly as {"id":"challenge-1","severity":"p1","requirement_ids":["r1"],"description":"...","evidence":[]}, set verdict to revise, and set at least one corresponding assessment status to concern or fail. Never request revision while every assessment is pass. The field is severity with lowercase p1, not kind, and observed evidence belongs in evidence using the declared evidence-reference schema. For pass, every assessment must pass and there must be no p0/p1 challenge. For removal plans, a declaration named for deletion must not retain unexplained callers: challenge the plan unless it preserves the downstream behavior with a stable replacement or explicitly updates every consumer. If read_file reports target_not_found, do not retry or guess that path: submit revise when existing evidence already proves the omission, or use the one bounded recovery search to locate the actual symbol or path. For repository-local evidence, use local repository tools rather than public web search. Do not return prose or a final action."#;
 
 const IMPLEMENTATION_SUBMISSION_GUIDANCE: &str = r#"
 When the plan creates a missing file, call write_file with arguments such as {"path":"path/to/file.ext","content":"exact contents"}. Never call write_file for a path that already exists. For an existing file, use the exact target-bound tools exposed on the current turn. pb may inject complete bytes or a task-relevant bounded byte range and expose edit_file immediately; in that case edit only text visible in the supplied observation. If read_file is exposed, call read_file as one turn for the target. Follow any read_file continuation from next_line instead of restarting at line 1, and do not claim you can write while the current schema still exposes only read_file. After pb returns sufficient real contents, call replace_file in a later turn when it is exposed, or use the exposed target-bound edit_file action. Paths are relative to the workspace root: use index.html, not repo/index.html, and never add a literal repo/ prefix. Use the native function-call interface described by the system tool schema. If native calls are unavailable, use exactly one compatibility action with no markdown or surrounding prose, for example {"type":"tool_call","tool":"write_file","arguments":{"path":"...","content":"..."}}, {"type":"tool_call","tool":"read_file","arguments":{"path":"..."}}, or {"type":"tool_call","tool":"replace_file","arguments":{"path":"...","content":"..."}}. Never return an argument object by itself. There is no run_edit tool. If the run_command escape hatch is genuinely needed, its sole required argument is {"cmd":"shell command"}.
@@ -26716,6 +26804,7 @@ mod tests {
         assert!(PLAN_SUBMISSION_GUIDANCE.contains("stable replacement"));
         assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("submit_plan_review"));
         assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("unexplained callers"));
+        assert!(PLAN_REVIEW_SUBMISSION_GUIDANCE.contains("one bounded recovery search"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("exact current content fingerprint"));
         assert!(IMPLEMENTATION_SUBMISSION_GUIDANCE.contains("Never imitate pb's transcript"));
         assert!(
@@ -26735,6 +26824,69 @@ mod tests {
             assert!(guidance.contains("compatibility action"));
             assert!(!guidance.contains("return exactly one pb tool-call JSON object"));
         }
+    }
+
+    #[test]
+    fn missing_plan_review_path_scopes_one_recovery_turn() {
+        let mut tools = all_builtin_tool_specs();
+        configure_plan_review_missing_target_recovery(&mut tools);
+
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["glob", "ripgrep", "search", "submit_plan_review"])
+        );
+        assert!(
+            tools
+                .iter()
+                .find(|tool| tool.name == "submit_plan_review")
+                .unwrap()
+                .description
+                .contains("submit a revise verdict now")
+        );
+        assert!(
+            tools
+                .iter()
+                .filter(|tool| tool.name != "submit_plan_review")
+                .all(|tool| tool.description.contains("one bounded recovery search"))
+        );
+    }
+
+    #[test]
+    fn target_not_found_read_arms_recovery_until_a_search_succeeds() {
+        let missing = ToolOutcomeSummary {
+            tool: "read_file".to_string(),
+            call_fingerprint: "read_file:path:missing:args".to_string(),
+            result: agent_tool_errors::render_tool_failure(
+                ToolFailureReason::TargetNotFound,
+                "read_file",
+                "No such file or directory",
+                false,
+                None,
+                None,
+                "Locate the actual path.",
+            ),
+            success: false,
+        };
+        assert!(next_plan_review_missing_target_recovery(
+            false,
+            false,
+            &[missing]
+        ));
+
+        let search = ToolOutcomeSummary {
+            tool: "search".to_string(),
+            call_fingerprint: "search:symbol".to_string(),
+            result: "webui/src/components/SessionDashboard.tsx:185".to_string(),
+            success: true,
+        };
+        assert!(!next_plan_review_missing_target_recovery(
+            true,
+            true,
+            &[search]
+        ));
     }
 
     #[test]
@@ -35563,6 +35715,80 @@ the next imagined action"#;
     }
 
     #[test]
+    fn missing_plan_review_read_gets_one_search_or_revision_recovery_turn() {
+        let repo = init_contract_test_repo();
+        std::fs::write(
+            repo.path().join("actual.rs"),
+            "pub fn project_overview() {}\n",
+        )
+        .unwrap();
+        let mut request = workflow_request(AgentProfile::Review, repo.path());
+        request.max_steps = 3;
+        request.workflow_stage = Some(crate::workflow::WorkflowStage::PlanReview);
+        request.workflow_plan_identity = Some(("plan-1".to_string(), "digest-1".to_string()));
+        let assessments = crate::workflow::REQUIRED_PLAN_ASSESSMENTS
+            .into_iter()
+            .map(|kind| {
+                json!({
+                    "kind": kind,
+                    "status": if kind == crate::workflow::PlanAssessmentKind::ComponentImpact {
+                        "fail"
+                    } else {
+                        "pass"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let submission = tool_completion(
+            "submit_plan_review",
+            json!({
+                "id": "review-recovered",
+                "assessments": assessments,
+                "challenges": [{
+                    "id": "challenge-1",
+                    "severity": "p1",
+                    "requirement_ids": ["r1"],
+                    "description": "The plan omits a task-relevant consumer.",
+                    "evidence": []
+                }],
+                "verdict": "revise"
+            }),
+        );
+
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({"path": "guessed.rs"})),
+                tool_completion("search", json!({"pattern": "project_overview"})),
+                submission,
+            ],
+            repo.path(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let crate::workflow::StageSubmission::PlanReview { review } =
+            outcome.workflow_submission.unwrap()
+        else {
+            panic!("expected a plan review submission");
+        };
+        assert_eq!(
+            review.artifact.verdict,
+            crate::workflow::ReviewVerdict::Revise
+        );
+        assert_eq!(outcome.tool_calls, 3);
+        assert_eq!(
+            outcome.generation_tool_names[1]
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["glob", "ripgrep", "search", "submit_plan_review"])
+        );
+        assert!(!outcome.generation_tool_names[1].contains(&"read_file".to_string()));
+        assert!(outcome.generation_tool_names[2].contains(&"submit_plan_review".to_string()));
+    }
+
+    #[test]
     fn invalid_plan_review_evidence_retries_in_place_without_erasing_the_verdict() {
         let repo = init_contract_test_repo();
         let mut request = workflow_request(AgentProfile::Review, repo.path());
@@ -36574,7 +36800,7 @@ the next imagined action"#;
             .fingerprint;
         let mut request = test_agent_request(AgentProfile::Scout, 256);
         request.max_steps = 5;
-        let repeated = tool_completion("read_file", json!({"path": "missing.txt"}));
+        let repeated = tool_completion("ripgrep", json!({"pattern": "[", "path": "."}));
         let outcome = run_scripted_agent_steps(
             &request,
             vec![
@@ -36652,6 +36878,42 @@ the next imagined action"#;
         assert!(!tool_outcome_succeeded("run_check", true, &failed));
         assert!(tool_outcome_succeeded("run_command", true, &passed));
         assert!(!tool_outcome_succeeded("run_command", false, &passed));
+    }
+
+    #[test]
+    fn identical_missing_read_is_not_executed_twice() {
+        let repo = init_contract_test_repo();
+        let mut request = test_agent_request(AgentProfile::Scout, 256);
+        request.max_steps = 3;
+        let mut events = Vec::new();
+        let outcome = run_scripted_agent_steps(
+            &request,
+            vec![
+                tool_completion("read_file", json!({"path": "missing.txt"})),
+                tool_completion("read_file", json!({"path": "missing.txt"})),
+                scripted_final("reported the unresolved missing path"),
+            ],
+            repo.path(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(outcome.reached_final);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(outcome.llm_invocations, 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolResult { tool, .. } if tool == "read_file"))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Correction { summary, message, .. }
+                if summary == "No-progress tool outcome detected"
+                    && message.contains("blocked an identical read_file call")
+        )));
     }
 
     #[test]

@@ -2,6 +2,8 @@
 import { equal } from "node:assert/strict";
 import type { EventEnvelope } from "../types/index";
 import {
+  buildChatPresentation,
+  CHAT_TIME_GAP_MS,
   getAvatarForProfile,
   groupActionEvents,
   handoffNotificationTitle,
@@ -12,6 +14,68 @@ import {
   toolResultForCall,
   usageStatsForToday,
 } from "./helpers.ts";
+
+Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "1",
+      event: {
+        type: "reasoning",
+        content: "First thought",
+        profile: "review",
+        timestamp_ms: 1_000,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "llm_invocation",
+        step: 1,
+        profile: "review",
+        duration_ms: 500,
+        prompt_tokens: 10,
+        generated_tokens: 5,
+        timestamp_ms: 2_000,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "final",
+        content: "Same speaker",
+        profile: "review",
+        timestamp_ms: 3_000,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "correction",
+        message: "Specific guidance",
+        summary: "Repeated tool call detected",
+        actor: { kind: "automation", id: "trinity" },
+        timestamp_ms: 3_000 + CHAT_TIME_GAP_MS,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "correction",
+        message: "More specific guidance",
+        summary: "No-progress tool outcome detected",
+        actor: { kind: "automation", id: "trinity" },
+        timestamp_ms: 4_000 + CHAT_TIME_GAP_MS,
+      },
+    },
+  ];
+
+  const presentation = buildChatPresentation(events);
+  equal(presentation[0].showIdentity, true);
+  equal(presentation[2].showIdentity, false);
+  equal(presentation[3].showIdentity, true);
+  equal(presentation[3].timeDividerMs, 3_000 + CHAT_TIME_GAP_MS);
+  equal(presentation[4].showIdentity, false);
+});
 
 Deno.test("sessionTitle prefers a trimmed title and falls back to the task", () => {
   equal(
@@ -277,7 +341,7 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
   equal((grouped[1] as EventEnvelope).event.type, "correction");
 });
 
-Deno.test("groupActionEvents leaves an inference visible when it produces chat text", () => {
+Deno.test("groupActionEvents places inference timing after chat-only model work", () => {
   const inference: EventEnvelope = {
     version: "1",
     event: {
@@ -297,12 +361,51 @@ Deno.test("groupActionEvents leaves an inference visible when it produces chat t
       profile: "review",
     },
   };
+  const final: EventEnvelope = {
+    version: "1",
+    event: {
+      type: "final",
+      content: "The issue is confirmed.",
+      profile: "review",
+    },
+  };
 
-  const grouped = groupActionEvents([inference, reasoning]);
+  const grouped = groupActionEvents([inference, reasoning, final]);
 
-  equal(grouped.length, 2);
-  equal((grouped[0] as EventEnvelope).event.type, "llm_invocation");
-  equal((grouped[1] as EventEnvelope).event.type, "reasoning");
+  equal(grouped.length, 3);
+  equal((grouped[0] as EventEnvelope).event.type, "reasoning");
+  equal((grouped[1] as EventEnvelope).event.type, "final");
+  equal((grouped[2] as EventEnvelope).event.type, "llm_invocation");
+});
+
+Deno.test("groupActionEvents hides timing when a model call produced no visible work", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "1",
+      event: {
+        type: "llm_invocation",
+        step: 4,
+        profile: "review",
+        duration_ms: 30_000,
+        prompt_tokens: 100,
+        generated_tokens: 10,
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "correction",
+        summary: "Repeated tool call detected",
+        message: "The duplicate action was blocked.",
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "review",
+      },
+    },
+  ];
+
+  const grouped = groupActionEvents(events);
+  equal(grouped.length, 1);
+  equal((grouped[0] as EventEnvelope).event.type, "correction");
 });
 
 Deno.test("groupActionEvents keeps teammate reasoning visible before its action run", () => {
@@ -350,14 +453,13 @@ Deno.test("groupActionEvents keeps teammate reasoning visible before its action 
   ];
 
   const grouped = groupActionEvents(events);
-  equal(grouped.length, 3);
-  equal((grouped[0] as EventEnvelope).event.type, "llm_invocation");
-  equal((grouped[1] as EventEnvelope).event.type, "reasoning");
-  const run = grouped[2];
+  equal(grouped.length, 2);
+  equal((grouped[0] as EventEnvelope).event.type, "reasoning");
+  const run = grouped[1];
   if (!("type" in run) || run.type !== "action_group") {
     throw new Error("expected one action run");
   }
-  equal(run.inferenceEvents.length, 0);
+  equal(run.inferenceEvents.length, 1);
   equal(run.toolCalls.length, 1);
   equal(run.toolResults.length, 1);
 });

@@ -88,7 +88,11 @@ pub(crate) fn classify_error(message: &str) -> ToolFailureReason {
     let lower = message.to_ascii_lowercase();
     if lower.contains("must read") || lower.contains("without reading") {
         ToolFailureReason::ReadRequired
-    } else if lower.contains("not found") || lower.contains("does not exist") {
+    } else if lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("no such file or directory")
+        || lower.contains("failed to resolve path")
+    {
         ToolFailureReason::TargetNotFound
     } else if lower.contains("cancelled by user") || lower.contains("canceled by user") {
         ToolFailureReason::Cancelled
@@ -605,6 +609,16 @@ mod tests {
         assert_eq!(
             classify_error("run_command cancelled by user"),
             ToolFailureReason::Cancelled
+        );
+    }
+
+    #[test]
+    fn missing_files_have_a_deterministic_target_not_found_reason() {
+        assert_eq!(
+            classify_error(
+                "failed to resolve path webui/src/components/SessionRows.tsx: No such file or directory"
+            ),
+            ToolFailureReason::TargetNotFound
         );
     }
 

@@ -78,6 +78,20 @@ export function profileJobTitle(profile: string): string {
   return profilePresentation(profile).role;
 }
 
+export function profileAccentClass(profile: string): string {
+  return [
+      "plan",
+      "build",
+      "review",
+      "scout",
+      "explore",
+      "research",
+      "ask",
+    ].includes(profile)
+    ? `teammate-${profile}`
+    : "teammate-neutral";
+}
+
 export function teamActorPresentation(
   actor?: TeamActor,
 ): TeamPresentation {
@@ -100,6 +114,16 @@ export function teamActorPresentation(
 
 export function teamActorKey(actor?: TeamActor): string {
   return actor ? `${actor.kind}:${actor.id}` : "legacy:unknown";
+}
+
+export function teamActorAccentClass(actor?: TeamActor): string {
+  if (actor?.kind === "automation") {
+    return "teammate-message trinity-message";
+  }
+  if (actor?.kind === "agent") {
+    return `teammate-message ${profileAccentClass(actor.id)}`;
+  }
+  return "";
 }
 
 export function workflowStewardActor(): TeamActor {

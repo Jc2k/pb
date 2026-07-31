@@ -311,7 +311,28 @@ but the durable event continues to record controller origin, the assisting profi
 Model-requested actions are attributed to that profile's character. The presentation labels these
 origins **Model** and **Harness**; actorless legacy tool events remain labelled **Legacy** instead of
 acquiring a guessed character. Harness validation messages summarize the teammate mistake in plain
-language and keep the durable structured evidence behind expandable technical detail.
+language and keep the durable structured evidence in a hover-information or touch-long-press detail
+sheet. The ordinary message does not expose temporary workspace paths. Trinity's visible copy is
+event-specific: proactive evidence says which code Trinity inspected, and failures say which
+artifact, tool, repeated action, diagnostic, or terminal condition needs attention. Visible copy does
+not expose prompt/context transfer or tell a teammate to ask the harness for repository lines.
+Generic claims that Trinity "noticed a problem" are not used as a substitute for the durable cause.
+When Trinity requests a next action, the visible message directly addresses the responsible teammate
+rather than describing that person in the third person. Once the workflow has ended, the responsible
+teammate no longer receives an impossible call to action. Trinity instead gives the teammate a final
+conversational explanation and says their task is on hold. A second ordinary Trinity bubble addresses
+the local user by username and asks for the available restart, resume, or follow-up context. No
+terminal-status badge interrupts the chat. Stale repeat-control and duplicate failure corrections
+immediately before that terminal handoff are suppressed while the first failure explanation and
+intervening teammate action remain. Trinity's lilac identity accent is applied consistently to
+provenance, information affordances, and a narrow message/action edge while her avatar remains
+unoutlined. Other named teammates use the same neutral-surface treatment with an accent based on
+their avatar background. Controller observations are labelled as predicted early repository work
+with distinct provenance. Session efficiency copy may count those admitted observations and state an
+equal upper bound on potentially avoided model turns, but it must not claim measured inference or
+energy savings without a counterfactual run. Control-collar statistics describe rejected generation
+candidates, and deterministic repeat or dependency gates describe prevented actions separately;
+neither count is allowed to masquerade as the other.
 In strict delivery and acceptance contracts, named check evidence comes only from `run_check(id)`;
 a similar `run_command` or `run_task` result is diagnostic evidence, not an acceptance receipt. A
 restored legacy/direct request may still route an exact configured guard command through the check
@@ -333,6 +354,11 @@ include the session turn, survive result reordering and worker failure without l
 tool identity, and typed outcomes distinguish success, execution failure, validation or
 policy rejection, timeout, cancellation, and deterministic cache replay. Older events without these
 additive fields stay readable and are shown as unknown rather than upgraded to success.
+Missing repository paths are a typed `target_not_found` failure rather than a generic retryable
+execution error. pb does not execute an unchanged identical read twice. During plan review, the next
+bounded turn offers either the structured review submission or one local discovery action, so the
+reviewer can challenge the plan from evidence already held or locate the real symbol without
+guessing another path.
 
 Automatic LSP failures are fail-open only with respect to this advisory pre-check: Trinity records
 the incomplete evidence and the normal configured checks remain authoritative. Current blocking

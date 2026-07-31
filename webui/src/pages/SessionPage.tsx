@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Aside } from "../Aside";
 import type {
@@ -22,8 +23,11 @@ import { VoiceInputButton } from "../components/VoiceInputButton";
 import { goalStageLabel } from "../lib/goalUtils";
 import { SCROLL_THRESHOLD } from "../lib/constants";
 import {
+  buildChatPresentation,
   formatStartTime,
+  formatTranscriptTime,
   groupActionEvents,
+  isActionGroup,
   isControllerActionEvent,
   sessionPageDocumentTitle,
   sessionTitle,
@@ -105,9 +109,11 @@ export function SessionPage() {
   const [taskRecoveryBusy, setTaskRecoveryBusy] = useState(false);
   const [workflowRecoveryBusy, setWorkflowRecoveryBusy] = useState(false);
   const [workflowRecoveryError, setWorkflowRecoveryError] = useState("");
+  const [showMessageTimes, setShowMessageTimes] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
+  const messageTimePullStartRef = useRef<{ x: number; y: number } | null>(null);
 
   const openEvents = (id: string) => {
     if (sourceRef.current) sourceRef.current.close();
@@ -356,6 +362,29 @@ export function SessionPage() {
       el.scrollTop + el.clientHeight >= el.scrollHeight - SCROLL_THRESHOLD;
   };
 
+  const beginMessageTimePull = (event: ReactPointerEvent<HTMLElement>) => {
+    if (event.pointerType !== "touch") return;
+    messageTimePullStartRef.current = { x: event.clientX, y: event.clientY };
+  };
+
+  const updateMessageTimePull = (event: ReactPointerEvent<HTMLElement>) => {
+    const start = messageTimePullStartRef.current;
+    if (!start || event.pointerType !== "touch") return;
+    const horizontalDistance = event.clientX - start.x;
+    const verticalDistance = event.clientY - start.y;
+    if (
+      horizontalDistance < -28 &&
+      Math.abs(horizontalDistance) > Math.abs(verticalDistance)
+    ) {
+      setShowMessageTimes(true);
+    }
+  };
+
+  const endMessageTimePull = () => {
+    messageTimePullStartRef.current = null;
+    setShowMessageTimes(false);
+  };
+
   useEffect(() => {
     if (atBottomRef.current && chatRef.current) {
       chatRef.current.scrollTop = chatRef.current.scrollHeight;
@@ -576,7 +605,18 @@ export function SessionPage() {
             showWorkDrawer ? " has-work-drawer" : ""
           }`}
         >
-          <main className="chat-stream" ref={chatRef} onScroll={onChatScroll}>
+          <main
+            className={`chat-stream${
+              showMessageTimes ? " show-message-times" : ""
+            }`}
+            ref={chatRef}
+            onScroll={onChatScroll}
+            onPointerDown={beginMessageTimePull}
+            onPointerMove={updateMessageTimePull}
+            onPointerUp={endMessageTimePull}
+            onPointerCancel={endMessageTimePull}
+            onPointerLeave={endMessageTimePull}
+          >
             {events.length === 0
               ? (
                 <InitialUserMessage
@@ -585,29 +625,46 @@ export function SessionPage() {
                 />
               )
               : (
-                groupActionEvents(chatEventsWithOnlyLatestStep(events)).map(
-                  (grouped, i) => {
-                    if ("type" in grouped && grouped.type === "action_group") {
-                      return (
+                buildChatPresentation(
+                  groupActionEvents(chatEventsWithOnlyLatestStep(events)),
+                ).map(
+                  ({ item: grouped, showIdentity, timeDividerMs }, i) => {
+                    const row = isActionGroup(grouped)
+                      ? (
                         <ActionGroupBubble
-                          key={i}
                           actor={grouped.actor}
                           assistingProfile={grouped.assistingProfile}
                           inferenceEvents={grouped.inferenceEvents}
                           toolCalls={grouped.toolCalls}
                           toolResults={grouped.toolResults}
                           controllerActions={grouped.controllerActions}
+                          showIdentity={showIdentity}
+                        />
+                      )
+                      : (
+                        <MessageBubble
+                          envelope={grouped as EventEnvelope}
+                          activityProfile={latestAssistantProfile(events)}
+                          evidenceEvents={events}
+                          workflow={session.workflow}
+                          showIdentity={showIdentity}
                         />
                       );
-                    }
                     return (
-                      <MessageBubble
-                        key={i}
-                        envelope={grouped as EventEnvelope}
-                        activityProfile={latestAssistantProfile(events)}
-                        evidenceEvents={events}
-                        workflow={session.workflow}
-                      />
+                      <Fragment key={i}>
+                        {timeDividerMs
+                          ? (
+                            <div className="chat-time-divider" role="separator">
+                              <time
+                                dateTime={new Date(timeDividerMs).toISOString()}
+                              >
+                                {formatTranscriptTime(timeDividerMs)}
+                              </time>
+                            </div>
+                          )
+                          : null}
+                        {row}
+                      </Fragment>
                     );
                   },
                 )
@@ -1106,6 +1163,13 @@ export function workflowOutcomeLabel(outcome?: string): string {
     case "review_failed":
     case "repair_cycles_exhausted":
     case "contract_unsatisfied":
+    case "plan_rejected":
+    case "plan_cycles_exhausted":
+    case "step_limit":
+    case "invocation_limit":
+    case "token_limit":
+    case "context_limit":
+    case "engine_error":
       return "Needs another pass";
     case "executor_unavailable":
     case "commit_blocked":

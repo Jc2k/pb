@@ -1,5 +1,5 @@
 /// <reference lib="deno.ns" />
-import { deepEqual, equal } from "node:assert/strict";
+import { deepEqual, equal, ok } from "node:assert/strict";
 import type { EventEnvelope } from "../types/index";
 import {
   buildActionTimeline,
@@ -7,9 +7,252 @@ import {
   chatEventsWithOnlyLatestStep,
   errorSummary,
   getToolDetail,
+  harnessEfficiencyStats,
   latestAssistantProfile,
+  toolFailureFeedback,
+  trinityCorrectionCopy,
   trustedSessionSummaryCommitLines,
 } from "./sessionUtils.ts";
+
+Deno.test("harness efficiency uses durable help and prevention evidence", () => {
+  const events: EventEnvelope[] = [
+    {
+      version: "1",
+      event: {
+        type: "controller_observation",
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "review",
+        receipt: {
+          version: 1,
+          action_id: "observe-1",
+          actual_origin: "controller",
+          prompt_representation: "controller_block",
+          stage: "code_review",
+          operation: "inspect_change",
+          path: "src/lib.rs",
+          workspace_fingerprint: "workspace",
+          path_fingerprint: "path",
+          content_sha256: "content",
+          coverage: "full",
+          observed_bytes: 10,
+          prompt_bytes: 10,
+          included_ranges: [],
+          included_in_prompt: true,
+          authority_effects: ["review_coverage"],
+        },
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "llm_invocation",
+        step: 1,
+        duration_ms: 100,
+        prompt_tokens: 10,
+        generated_tokens: 2,
+        native: {
+          fresh_prefill_tokens: 10,
+          cached_tokens: 0,
+          prefill_wall_ms: 50,
+          prefill_tokens_per_second: 200,
+          prefill_metal_commands: 1,
+          prefill_host_upload_bytes: 0,
+          prefill_host_readback_bytes: 0,
+          decode_tokens: 2,
+          decode_wall_ms: 50,
+          decode_tokens_per_second: 40,
+          model_family: "test",
+          expert_strategy: "test",
+          prefill_command_kind: "test",
+          thinking_enabled: false,
+          rejected_constraint_candidates: 7,
+          mutation_constraint_rejections: { invalid_syntax: 3 },
+        },
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "correction",
+        summary: "Repeated tool call blocked",
+        message: "duplicate",
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "correction",
+        summary: "Dependent tool batch rejected",
+        message: "dependent",
+      },
+    },
+    {
+      version: "1",
+      event: {
+        type: "correction",
+        summary: "No-progress tool outcome detected",
+        message: "loop",
+      },
+    },
+  ];
+
+  deepEqual(harnessEfficiencyStats(events), {
+    proactiveActions: 1,
+    proactiveReads: 0,
+    proactiveInspections: 1,
+    collarCandidatesFiltered: 7,
+    mutationCandidatesFiltered: 3,
+    duplicateActionsPrevented: 1,
+    dependentBatchesPrevented: 1,
+    noProgressLoopsStopped: 1,
+  });
+});
+
+Deno.test("tool failures become direct teammate guidance without leaking workspace paths", () => {
+  equal(
+    toolFailureFeedback(
+      JSON.stringify({
+        type: "tool_failure",
+        tool: "read_file",
+        message:
+          "failed to resolve path 'webui/src/components/SessionRows.tsx': failed to resolve path /private/tmp/workspace/webui/src/components/SessionRows.tsx: No such file or directory (os error 2)",
+      }),
+      "Eugene Belford",
+    ),
+    "Eugene, your call to the `read_file` tool was not executed successfully. `webui/src/components/SessionRows.tsx` does not exist. Fix the mistake, choose a different action, or report the blocker.",
+  );
+
+  equal(toolFailureFeedback("plain correction", "Eugene Belford"), null);
+});
+
+Deno.test("Trinity corrections explain the specific event in human language", () => {
+  deepEqual(
+    trinityCorrectionCopy(
+      "Task-focused repository evidence",
+      "technical controller guidance",
+      "Dade Murphy",
+      "plan",
+    ),
+    {
+      message:
+        "Dade, I found the task-relevant code and pulled out the strongest matching sections. Use them to finish the plan. If one concrete fact is still missing, read only the relevant lines instead of rereading the whole file.",
+    },
+  );
+  deepEqual(
+    trinityCorrectionCopy(
+      "Eugene reached the repeat limit",
+      "deterministic stop",
+      "Eugene Belford",
+      "review",
+    ),
+    {
+      message:
+        "Eugene, you repeated the same action after guidance, so I blocked the duplicate before you spent more time on it. Choose a different approach or report the blocker.",
+    },
+  );
+  deepEqual(
+    trinityCorrectionCopy(
+      "Retrying",
+      "legacy correction",
+      "Kate Libby",
+      "implementation report",
+    ),
+    {
+      headline: "Retrying",
+      message: "legacy correction",
+    },
+  );
+  deepEqual(
+    trinityCorrectionCopy(
+      "Active accepted-plan work unit",
+      "technical target",
+      "Kate Libby",
+      "implementation report",
+    ),
+    {
+      message:
+        "Kate, I picked the next item from the accepted plan and confirmed exactly which file operation it needs. Complete only that item before moving on.",
+    },
+  );
+  deepEqual(
+    trinityCorrectionCopy(
+      "Harness diagnostic preview",
+      "technical diagnostics",
+      "Kate Libby",
+      "implementation report",
+    ),
+    {
+      message:
+        "Kate, I ran an early diagnostic check and found issues you should account for while you complete the current work item.",
+    },
+  );
+});
+
+Deno.test("Trinity correction families keep distinct user-facing explanations", () => {
+  const cases = [
+    [
+      "using host execution for an Apple-only component",
+      "running that part directly on the Mac",
+    ],
+    ["Workflow stage submission required", "prose reply will not complete"],
+    ["Teammate action retries exhausted", "valid action"],
+    ["Kate reached the bounded step limit", "step limit"],
+    [
+      "Automatic language-server diagnostics need repair",
+      "automatic diagnostics found issues",
+    ],
+    ["Cancellation requested", "Cancellation is requested"],
+  ] as const;
+
+  for (const [summary, expected] of cases) {
+    const copy = trinityCorrectionCopy(
+      summary,
+      "technical controller detail",
+      "Kate Libby",
+      "implementation report",
+    );
+    ok(copy.message.includes(expected), `${summary}: ${copy.message}`);
+  }
+});
+
+Deno.test("Trinity guidance describes teammate actions instead of prompt plumbing", () => {
+  const messages = [
+    trinityCorrectionCopy(
+      "Task-focused repository evidence",
+      "controller detail",
+      "Eugene Belford",
+      "review",
+    ).message,
+    trinityCorrectionCopy(
+      "Requesting missing bounded evidence",
+      "controller detail",
+      "Kate Libby",
+      "implementation report",
+    ).message,
+    trinityCorrectionCopy(
+      "Eugene reached the repeat limit",
+      "controller detail",
+      "Eugene Belford",
+      "review",
+    ).message,
+  ];
+
+  for (const message of messages) {
+    for (
+      const plumbing of [
+        "your context",
+        "ask for",
+        "model turn",
+        "inference",
+        "thinking disabled",
+        "bounded read",
+      ]
+    ) {
+      ok(!message.includes(plumbing), `${plumbing}: ${message}`);
+    }
+  }
+  ok(messages[0].includes("read only the relevant lines"));
+});
 
 Deno.test("buildActionTimeline preserves chronology and actor provenance", () => {
   const events: EventEnvelope[] = [
@@ -535,10 +778,38 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       version: "v1",
       event: {
         type: "correction",
-        summary: "Kate repeated the same action",
+        summary: "Eugene reached the repeat limit",
         message: "The duplicate was blocked.",
         actor: { kind: "automation", id: "trinity" },
-        assisting_profile: "build",
+        assisting_profile: "review",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "correction",
+        summary: "Repeated tool call detected",
+        message: "Use a different action.",
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "review",
+      },
+    },
+    ...Array.from({ length: 6 }, (_, index): EventEnvelope => ({
+      version: "v1",
+      event: {
+        type: "step_started",
+        step: index + 3,
+        max_steps: 8,
+      },
+    })),
+    {
+      version: "v1",
+      event: {
+        type: "correction",
+        summary: "Eugene reached the repeat limit",
+        message: "The final duplicate was blocked before execution.",
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "review",
       },
     },
     {
@@ -562,6 +833,79 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
 
   const visible = chatEventsWithOnlyLatestStep(events);
   deepEqual(visible.map((event) => event.event.type), ["workflow_blocked"]);
+});
+
+Deno.test("a repeated failed action keeps one explanation and one terminal outcome", () => {
+  const failedRead = JSON.stringify({
+    type: "tool_failure",
+    tool: "read_file",
+    message: "failed to resolve path 'webui/src/components/SessionRows.tsx'",
+  });
+  const repeatedFailedRead = JSON.stringify({
+    type: "tool_failure",
+    tool: "read_file",
+    message:
+      "failed to resolve path 'webui/src/components/SessionRows.tsx': attempt 2",
+    action_id: "read-2",
+  });
+  const events: EventEnvelope[] = [
+    {
+      version: "v1",
+      event: {
+        type: "tool_call",
+        tool: "read_file",
+        arguments: { path: "webui/src/components/SessionRows.tsx" },
+        actor: { kind: "agent", id: "review" },
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "correction",
+        summary: "read_file failed",
+        message: failedRead,
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "review",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "tool_call",
+        tool: "read_file",
+        arguments: { path: "webui/src/components/SessionRows.tsx" },
+        actor: { kind: "agent", id: "review" },
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "correction",
+        summary: "read_file tool call was not executed successfully",
+        message: repeatedFailedRead,
+        actor: { kind: "automation", id: "trinity" },
+        assisting_profile: "review",
+      },
+    },
+    {
+      version: "v1",
+      event: {
+        type: "workflow_blocked",
+        workflow_id: "workflow-1",
+        outcome: "step_limit",
+        reason:
+          "Eugene stopped making progress and reached a deterministic repeat limit.",
+      },
+    },
+  ];
+
+  const visible = chatEventsWithOnlyLatestStep(events);
+  deepEqual(visible.map((event) => event.event.type), [
+    "tool_call",
+    "correction",
+    "tool_call",
+    "workflow_blocked",
+  ]);
 });
 
 Deno.test("no-progress loop errors collapse into the terminal Trinity message", () => {

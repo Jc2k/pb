@@ -26,6 +26,73 @@ export interface ActionTimelineItem {
   result?: EventEnvelope;
 }
 
+export interface HarnessEfficiencyStats {
+  proactiveActions: number;
+  proactiveReads: number;
+  proactiveInspections: number;
+  collarCandidatesFiltered: number;
+  mutationCandidatesFiltered: number;
+  duplicateActionsPrevented: number;
+  dependentBatchesPrevented: number;
+  noProgressLoopsStopped: number;
+}
+
+export function harnessEfficiencyStats(
+  events: EventEnvelope[],
+): HarnessEfficiencyStats {
+  const stats: HarnessEfficiencyStats = {
+    proactiveActions: 0,
+    proactiveReads: 0,
+    proactiveInspections: 0,
+    collarCandidatesFiltered: 0,
+    mutationCandidatesFiltered: 0,
+    duplicateActionsPrevented: 0,
+    dependentBatchesPrevented: 0,
+    noProgressLoopsStopped: 0,
+  };
+
+  for (const envelope of events) {
+    const event = envelope.event;
+    if (
+      event.type === "controller_observation" &&
+      event.receipt.included_in_prompt
+    ) {
+      stats.proactiveActions += 1;
+      if (event.receipt.operation === "read_file") {
+        stats.proactiveReads += 1;
+      } else {
+        stats.proactiveInspections += 1;
+      }
+      continue;
+    }
+
+    if (event.type === "llm_invocation" && event.native) {
+      stats.collarCandidatesFiltered += Math.max(
+        0,
+        event.native.rejected_constraint_candidates || 0,
+      );
+      stats.mutationCandidatesFiltered += Object.values(
+        event.native.mutation_constraint_rejections || {},
+      ).reduce((total, count) => total + Math.max(0, count), 0);
+      continue;
+    }
+
+    if (event.type !== "correction") continue;
+    if (
+      event.summary === "Repeated tool call detected" ||
+      event.summary === "Repeated tool call blocked"
+    ) {
+      stats.duplicateActionsPrevented += 1;
+    } else if (event.summary === "Dependent tool batch rejected") {
+      stats.dependentBatchesPrevented += 1;
+    } else if (event.summary === "No-progress tool outcome detected") {
+      stats.noProgressLoopsStopped += 1;
+    }
+  }
+
+  return stats;
+}
+
 export type TodoStatus = "pending" | "in_progress" | "completed" | "blocked";
 
 export interface TodoTask {
@@ -44,6 +111,366 @@ export const TODO_STATUS_LABELS: Record<TodoStatus, string> = {
   completed: "Completed",
   blocked: "Blocked",
 };
+
+type ToolFailureDetail = {
+  type?: unknown;
+  tool?: unknown;
+  message?: unknown;
+};
+
+export function toolFailureFeedback(
+  detail: string,
+  teammateName: string,
+): string | null {
+  let failure: ToolFailureDetail;
+  try {
+    failure = JSON.parse(detail) as ToolFailureDetail;
+  } catch {
+    return null;
+  }
+
+  if (
+    failure.type !== "tool_failure" || typeof failure.tool !== "string" ||
+    !failure.tool.trim()
+  ) {
+    return null;
+  }
+
+  const firstName = teammateName.trim().split(/\s+/, 1)[0] || "Teammate";
+  const failureMessage = typeof failure.message === "string"
+    ? failure.message
+    : "";
+  const missingPath = failureMessage.match(/failed to resolve path '([^']+)'/)
+    ?.[1];
+  const problem = missingPath
+    ? `\`${missingPath}\` does not exist.`
+    : /permission denied/i.test(failureMessage)
+    ? "The requested resource could not be accessed."
+    : "The action failed before it returned a result.";
+
+  return `${firstName}, your call to the \`${failure.tool}\` tool was not executed successfully. ${problem} Fix the mistake, choose a different action, or report the blocker.`;
+}
+
+export type TrinityCorrectionCopy = {
+  headline?: string;
+  message: string;
+};
+
+function correctionExcerpt(detail: string): string | null {
+  const trimmed = detail.trim();
+  if (!trimmed || trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return null;
+  }
+  const firstParagraph = trimmed.split(/\n\s*\n/, 1)[0]
+    .replace(/(?:\/private)?\/tmp\/[^\s,;:)]+/g, "the temporary workspace")
+    .replace(/\/Users\/[^/\s]+\/[^\s,;:)]+/g, "the workspace")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (firstParagraph.length <= 360) return firstParagraph;
+  const sentenceEnd = firstParagraph.lastIndexOf(". ", 340);
+  const end = sentenceEnd >= 120 ? sentenceEnd + 1 : 340;
+  return `${firstParagraph.slice(0, end).trimEnd()}…`;
+}
+
+export function artifactValidationProblem(message: string): string {
+  const lower = message.toLowerCase();
+  if (
+    lower.includes("requires non-empty requirements, steps, and acceptance")
+  ) {
+    return "The plan was missing its requirements, implementation steps, and acceptance checks.";
+  }
+  if (lower.includes("requirements") && lower.includes("acceptance")) {
+    return "The plan did not include all of the required planning and acceptance information.";
+  }
+  if (lower.includes("fingerprint")) {
+    return "The submission described an older version of the workspace, so it was not safe to accept.";
+  }
+  if (
+    lower.includes("revision") && lower.includes("every assessment passes")
+  ) {
+    return "The review asked for changes but marked every review area as passing.";
+  }
+  return "The submission did not match the delivery structure the team needs to continue safely.";
+}
+
+export function trinityCorrectionCopy(
+  summary: string | undefined,
+  detail: string,
+  teammateName: string,
+  artifactLabel: string,
+): TrinityCorrectionCopy {
+  const firstName = teammateName.trim().split(/\s+/, 1)[0] || "Teammate";
+  const normalizedSummary = summary?.trim() || "";
+  const isArtifactValidation = normalizedSummary ===
+      "Workflow artifact validation failed" ||
+    /^submit_(?:plan|plan_review|implementation|code_review) tool call was not executed successfully$/
+      .test(normalizedSummary);
+  if (isArtifactValidation) {
+    return {
+      headline: `${teammateName}’s ${artifactLabel} needs another pass`,
+      message: `${
+        artifactValidationProblem(detail)
+      } I sent it back so you can correct the submission before the team continues.`,
+    };
+  }
+
+  const toolFailure = toolFailureFeedback(detail, teammateName);
+  if (toolFailure) return { message: toolFailure };
+
+  if (normalizedSummary === "Task-focused repository evidence") {
+    return {
+      message:
+        `${firstName}, I found the task-relevant code and pulled out the strongest matching sections. Use them to finish the ${artifactLabel}. If one concrete fact is still missing, read only the relevant lines instead of rereading the whole file.`,
+    };
+  }
+
+  if (
+    normalizedSummary.includes("contract planning evidence") ||
+    normalizedSummary.includes("contract review evidence") ||
+    normalizedSummary.includes("proposed-path review evidence")
+  ) {
+    return {
+      message:
+        `${firstName}, I rechecked the exact code this stage depends on. You have enough evidence now—finish the ${artifactLabel} instead of rereading broad sections of the repository.`,
+    };
+  }
+
+  if (normalizedSummary === "Active accepted-plan work unit") {
+    return {
+      message:
+        `${firstName}, I picked the next item from the accepted plan and confirmed exactly which file operation it needs. Complete only that item before moving on.`,
+    };
+  }
+
+  if (normalizedSummary === "Next accepted-plan creation work unit") {
+    return {
+      message:
+        `${firstName}, the next planned file does not exist yet. Create it now with one complete write, then move on to the next item.`,
+    };
+  }
+
+  if (normalizedSummary.includes("using host execution")) {
+    return {
+      message:
+        "This task includes an Apple-only component, so I’m running that part directly on the Mac while keeping the rest of the session isolated.",
+    };
+  }
+
+  if (normalizedSummary.includes("CPU-only llama.cpp fallback")) {
+    return {
+      message:
+        "The preferred model runtime was unavailable, so I’m using the CPU-only model fallback for this session. Responses may take longer.",
+    };
+  }
+
+  if (normalizedSummary.includes("reached the repeat limit")) {
+    return {
+      message:
+        `${firstName}, you repeated the same action after guidance, so I blocked the duplicate before you spent more time on it. Choose a different approach or report the blocker.`,
+    };
+  }
+
+  if (
+    normalizedSummary === "Repeated tool call detected" ||
+    normalizedSummary === "Repeated tool call blocked" ||
+    normalizedSummary.includes("repeated the same action")
+  ) {
+    const repeatedTool = detail.match(/-\s+([A-Za-z_][\w-]*) with args/)?.[1];
+    return {
+      message: repeatedTool
+        ? `${firstName}, you repeated the same \`${repeatedTool}\` call, so I blocked the duplicate before it ran. Change the path or action, or report that you are blocked.`
+        : `${firstName}, you repeated the same action, so I blocked the duplicate before it ran. Change approach or report that you are blocked.`,
+    };
+  }
+
+  if (normalizedSummary === "No-progress tool outcome detected") {
+    return {
+      message:
+        `${firstName}, that action returned the same outcome without adding new evidence. I stopped the loop; choose an action that changes the work or report the blocker.`,
+    };
+  }
+
+  if (normalizedSummary === "Dependent tool batch rejected") {
+    return {
+      message:
+        `${firstName}, those tool calls depend on one another, so I did not run them as one batch. Run the prerequisite first, wait for its result, then submit the dependent action.`,
+    };
+  }
+
+  if (normalizedSummary === "Workflow stage submission required") {
+    return {
+      message:
+        `${firstName}, a prose reply will not complete this stage. Submit the ${artifactLabel} in the required format so the team can continue.`,
+    };
+  }
+
+  if (
+    normalizedSummary === "Teammate action retries exhausted" ||
+    normalizedSummary.includes("Parse retry limit")
+  ) {
+    return {
+      message:
+        `${firstName}, your reply still did not form a valid action after several retries, so I stopped the pass instead of letting it loop. Start again with one small, complete action.`,
+    };
+  }
+
+  if (
+    normalizedSummary.includes("Invalid pb JSON action") ||
+    normalizedSummary.toLowerCase().includes("unparsable")
+  ) {
+    return {
+      message:
+        `${firstName}, that reply was not a valid action, so nothing ran. Retry with one complete tool call or finish the stage in the required format.`,
+    };
+  }
+
+  if (normalizedSummary.includes("reached the bounded step limit")) {
+    return {
+      message:
+        `${firstName}, you reached this pass’s step limit before completing the work, so I stopped it instead of letting it run in circles. Continue with a tighter next action or report the blocker.`,
+    };
+  }
+
+  if (normalizedSummary === "Advisory budget exhausted") {
+    return {
+      message:
+        "I skipped the optional step-limit review because its advisory budget was already used. The main work and repository were left unchanged.",
+    };
+  }
+
+  if (normalizedSummary === "Requesting missing bounded evidence") {
+    return {
+      message:
+        `${firstName}, the edit stopped before it became a valid action because one small file excerpt is still missing. Read only the lines around that detail, then retry the edit.`,
+    };
+  }
+
+  if (normalizedSummary.includes("truncated action")) {
+    return {
+      message:
+        `${firstName}, the action was cut off before it became valid, so nothing ran. Try again once with one concise, complete tool call.`,
+    };
+  }
+
+  if (
+    normalizedSummary.includes("mutation recovery") ||
+    normalizedSummary.includes("compact atomic mutation") ||
+    normalizedSummary.includes("constrained mutation")
+  ) {
+    return {
+      message:
+        `${firstName}, the edit was incomplete and was not executed. I’m giving you one fresh attempt for the smallest complete change; do not repeat the rejected payload.`,
+    };
+  }
+
+  if (normalizedSummary === "Run cancelled") {
+    return {
+      message:
+        "This run was cancelled. I preserved the repository and the evidence collected so far.",
+    };
+  }
+
+  if (normalizedSummary === "Goal pausing") {
+    return {
+      message:
+        "I’m pausing the goal at a safe checkpoint before anyone starts another action.",
+    };
+  }
+
+  if (normalizedSummary === "Cancellation requested") {
+    return {
+      message:
+        "Cancellation is requested. I’m preserving the repository and the workflow evidence while the current work stops safely.",
+    };
+  }
+
+  if (normalizedSummary === "Restarting delivery from current files") {
+    return {
+      message:
+        "I kept the earlier plan and review in the transcript, accepted the project’s current files as the new baseline, and started a fresh planning pass.",
+    };
+  }
+
+  if (normalizedSummary === "Retrying Task planning") {
+    return {
+      message:
+        "I’m retrying task planning from the preserved repository state. No files or commits change until the new workflow begins delivery.",
+    };
+  }
+
+  if (normalizedSummary === "Running as one Build") {
+    return {
+      message:
+        "I’m keeping the repository as-is and retrying this request as one Build task instead of splitting it into several tasks.",
+    };
+  }
+
+  if (normalizedSummary === "Tool not available") {
+    return {
+      message:
+        `${firstName}, that tool is not available in this stage, so the action did not run. Choose one of the available actions or report the blocker.`,
+    };
+  }
+
+  if (normalizedSummary.includes("Task requirements remain")) {
+    return {
+      message:
+        `${firstName}, the handoff still leaves part of the user’s request unfinished. I sent the missing requirements back for one focused repair pass.`,
+    };
+  }
+
+  if (normalizedSummary === "Handoff executor unavailable") {
+    return {
+      message:
+        "I could not run the final handoff checks because their executor is unavailable. I preserved the work so the checks can be retried when it returns.",
+    };
+  }
+
+  if (normalizedSummary === "Handoff commit blocked") {
+    return {
+      message:
+        "The final commit was blocked, so I left the completed changes uncommitted and preserved the handoff evidence for review.",
+    };
+  }
+
+  if (
+    normalizedSummary.startsWith("Agent terminated:") ||
+    normalizedSummary.startsWith("Final grace terminated:")
+  ) {
+    return {
+      message:
+        `${firstName}, your pass ended before it produced a usable result. I preserved every completed action and stopped at the current safe boundary.`,
+    };
+  }
+
+  if (normalizedSummary === "Harness diagnostic preview") {
+    return {
+      message:
+        `${firstName}, I ran an early diagnostic check and found issues you should account for while you complete the current work item.`,
+    };
+  }
+
+  if (normalizedSummary.toLowerCase().includes("diagnostic")) {
+    return {
+      message:
+        `${firstName}, the automatic diagnostics found issues that need repair before this stage can continue. Fix the reported problems, then retry the handoff.`,
+    };
+  }
+
+  const excerpt = correctionExcerpt(detail);
+  if (excerpt) {
+    return {
+      headline: normalizedSummary || undefined,
+      message: excerpt,
+    };
+  }
+
+  return {
+    headline: normalizedSummary || "Trinity update",
+    message:
+      `${firstName}, I could not summarize this safely without losing the exact cause. Check the technical details before choosing your next action.`,
+  };
+}
 
 export function getToolDetail(
   toolCall: EventEnvelope,
@@ -488,7 +915,8 @@ function isRepeatedToolCorrection(event: EventEnvelope): boolean {
     (event.event.summary === "Repeated tool call detected" ||
       event.event.summary === "Repeated tool call blocked" ||
       event.event.summary === "No-progress tool outcome detected" ||
-      event.event.summary?.includes("repeated the same action") === true);
+      event.event.summary?.includes("repeated the same action") === true ||
+      event.event.summary?.includes("reached the repeat limit") === true);
 }
 
 function isTerminalToolLoopError(event: EventEnvelope): boolean {
@@ -496,6 +924,84 @@ function isTerminalToolLoopError(event: EventEnvelope): boolean {
     (event.event.summary === "Deterministic tool loop" ||
       event.event.summary === "No-progress tool loop" ||
       event.event.summary?.includes("reached the repeat limit") === true);
+}
+
+function repeatsEarlierCorrectionAfterAction(
+  events: EventEnvelope[],
+  index: number,
+): boolean {
+  const current = events[index]?.event;
+  if (current?.type !== "correction") return false;
+  const failureIdentity = (
+    correction: Extract<AgentEvent, { type: "correction" }>,
+  ) => {
+    try {
+      const detail = JSON.parse(correction.message) as ToolFailureDetail;
+      if (
+        detail.type !== "tool_failure" || typeof detail.tool !== "string" ||
+        typeof detail.message !== "string"
+      ) return undefined;
+      const failedPath = detail.message.match(
+        /failed to resolve path '([^']+)'/,
+      )
+        ?.[1];
+      return failedPath
+        ? `${detail.tool}:missing:${failedPath}`
+        : `${detail.tool}:${detail.message}`;
+    } catch {
+      return undefined;
+    }
+  };
+  const currentFailure = failureIdentity(current);
+  const precedingToolCall = (beforeIndex: number) => {
+    for (let toolIndex = beforeIndex - 1; toolIndex >= 0; toolIndex--) {
+      const candidate = events[toolIndex];
+      if (candidate.event.type === "tool_call") return candidate;
+    }
+    return undefined;
+  };
+  const currentCall = precedingToolCall(index);
+  if (currentCall?.event.type !== "tool_call") return false;
+  for (let priorIndex = index - 1; priorIndex >= 0; priorIndex--) {
+    const prior = events[priorIndex].event;
+    const sameCorrection = prior.type === "correction" &&
+      (prior.summary === current.summary ||
+        (currentFailure !== undefined &&
+          failureIdentity(prior) === currentFailure));
+    if (sameCorrection && prior.type === "correction") {
+      const priorCall = precedingToolCall(priorIndex);
+      if (
+        priorCall?.event.type === "tool_call" &&
+        priorCall.event.tool === currentCall.event.tool &&
+        JSON.stringify(priorCall.event.arguments) ===
+          JSON.stringify(currentCall.event.arguments)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function reachesWorkflowBlockBeforeMoreVisibleWork(
+  events: EventEnvelope[],
+  index: number,
+): boolean {
+  for (let laterIndex = index + 1; laterIndex < events.length; laterIndex++) {
+    const later = events[laterIndex].event;
+    if (later.type === "workflow_blocked") return true;
+    if (
+      later.type === "tool_call" || later.type === "reasoning" ||
+      later.type === "final" || later.type === "team_message" ||
+      later.type === "user_message" || later.type === "user_answer" ||
+      later.type === "started" || later.type === "controller_mutation" ||
+      later.type === "controller_observation" ||
+      later.type === "controller_closure"
+    ) {
+      return false;
+    }
+  }
+  return false;
 }
 
 function isTransientActivityEvent(event: EventEnvelope): boolean {
@@ -558,17 +1064,25 @@ export function chatEventsWithOnlyLatestStep(
     if (
       event.event.type === "correction" &&
       event.event.summary === "Repeated tool call detected" &&
-      chatEvents.slice(index + 1, index + 5).some(isRepeatedToolCorrection)
+      reachesWorkflowBlockBeforeMoreVisibleWork(chatEvents, index)
     ) {
+      return false;
+    }
+    if (
+      event.event.type === "correction" &&
+      repeatsEarlierCorrectionAfterAction(chatEvents, index) &&
+      reachesWorkflowBlockBeforeMoreVisibleWork(chatEvents, index)
+    ) {
+      // Keep the first actionable explanation and the repeated model action, then let the terminal
+      // Trinity message own the outcome. Repeating the same failure card immediately before that
+      // outcome makes it look as if Trinity spoke twice without intervening work.
       return false;
     }
     if (
       event.event.type === "correction" &&
       isRepeatedToolCorrection(event) &&
       event.event.summary !== "Repeated tool call detected" &&
-      chatEvents.slice(index + 1, index + 4).some((later) =>
-        later.event.type === "workflow_blocked"
-      )
+      reachesWorkflowBlockBeforeMoreVisibleWork(chatEvents, index)
     ) {
       // Terminal delivery feedback combines the repeat stop with the workflow outcome so Trinity
       // does not appear as two adjacent cards for one stopped pass.

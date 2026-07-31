@@ -9,6 +9,7 @@ import type {
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "../lib/constants";
 import {
   formatEventTime,
+  formatTranscriptTime,
   getAvatarForProfile,
   projectName,
   relativeTime,
@@ -16,15 +17,22 @@ import {
   toolResultForCall,
 } from "../lib/helpers";
 import {
+  artifactValidationProblem,
   errorSummary,
   getToolDetail,
+  harnessEfficiencyStats,
   profileJobTitle,
   profileName,
   TODO_STATUS_LABELS,
+  trinityCorrectionCopy,
   trustedSessionSummaryCommitLines,
 } from "../lib/sessionUtils";
-import type { ActionTimelineItem, TodoTask } from "../lib/sessionUtils";
-import { parseRichText } from "../lib/richText";
+import type {
+  ActionTimelineItem,
+  HarnessEfficiencyStats,
+  TodoTask,
+} from "../lib/sessionUtils";
+import { parseInlineRichText, parseRichText } from "../lib/richText";
 import {
   formatEnergy,
   formatPower,
@@ -32,7 +40,12 @@ import {
   metricEnergyJoules,
   metricRuntimeMs,
 } from "../lib/energy";
-import { teamActorPresentation, workflowStewardActor } from "../lib/team";
+import {
+  profileAccentClass,
+  teamActorAccentClass,
+  teamActorPresentation,
+  workflowStewardActor,
+} from "../lib/team";
 
 function formatHumanDurationMs(ms?: number): string {
   if (ms === undefined) return "an unknown amount of time";
@@ -70,27 +83,6 @@ function prettyTechnicalDetail(value: string): string {
   }
 }
 
-function validationProblem(message: string): string {
-  const lower = message.toLowerCase();
-  if (
-    lower.includes("requires non-empty requirements, steps, and acceptance")
-  ) {
-    return "The plan was missing its requirements, implementation steps, and acceptance checks.";
-  }
-  if (lower.includes("requirements") && lower.includes("acceptance")) {
-    return "The plan did not include all of the required planning and acceptance information.";
-  }
-  if (lower.includes("fingerprint")) {
-    return "The submission described an older version of the workspace, so it was not safe to accept.";
-  }
-  if (
-    lower.includes("revision") && lower.includes("every assessment passes")
-  ) {
-    return "The review asked for changes but marked every review area as passing.";
-  }
-  return "The submission did not match the delivery structure the team needs to continue safely.";
-}
-
 function funEnergySummary(
   runtimeMs: number,
   tokens: number,
@@ -111,6 +103,64 @@ function funEnergySummary(
   }.`;
 }
 
+function trinityAssistanceSummary(
+  stats: HarnessEfficiencyStats,
+): string | null {
+  if (stats.proactiveActions === 0) return null;
+  const actionLabel = stats.proactiveReads === stats.proactiveActions
+    ? stats.proactiveActions === 1 ? "repository read" : "repository reads"
+    : stats.proactiveInspections === stats.proactiveActions
+    ? stats.proactiveActions === 1
+      ? "changed-path inspection"
+      : "changed-path inspections"
+    : "repository checks";
+  return `Trinity predicted and completed ${stats.proactiveActions} ${actionLabel} early, potentially avoiding up to ${stats.proactiveActions} extra model ${
+    stats.proactiveActions === 1 ? "turn" : "turns"
+  }.`;
+}
+
+function mutationCandidateCount(
+  event: Extract<AgentEvent, { type: "llm_invocation" }>,
+): number {
+  return Object.values(event.native?.mutation_constraint_rejections || {})
+    .reduce((total, count) => total + Math.max(0, count), 0);
+}
+
+function InlineRichText({ content }: { content: string }) {
+  return (
+    <>
+      {parseInlineRichText(content).map((part, index) => {
+        switch (part.type) {
+          case "code":
+            return (
+              <code className="rich-text-inline-code" key={index}>
+                {part.text}
+              </code>
+            );
+          case "strong":
+            return <strong key={index}>{part.text}</strong>;
+          case "emphasis":
+            return <em key={index}>{part.text}</em>;
+          case "text":
+            return <Fragment key={index}>{part.text}</Fragment>;
+        }
+      })}
+    </>
+  );
+}
+
+function MessageTime({ timestampMs }: { timestampMs?: number }) {
+  if (!timestampMs) return null;
+  return (
+    <time
+      className="message-time"
+      dateTime={new Date(timestampMs).toISOString()}
+    >
+      {formatTranscriptTime(timestampMs)}
+    </time>
+  );
+}
+
 function RichText({ content }: { content: string }) {
   const blocks = parseRichText(content);
 
@@ -122,13 +172,19 @@ function RichText({ content }: { content: string }) {
             const Heading = `h${
               block.level + 2
             }` as keyof React.JSX.IntrinsicElements;
-            return <Heading key={index}>{block.text}</Heading>;
+            return (
+              <Heading key={index}>
+                <InlineRichText content={block.text} />
+              </Heading>
+            );
           }
           case "unordered_list":
             return (
               <ul key={index}>
                 {block.items.map((item, itemIndex) => (
-                  <li key={itemIndex}>{item}</li>
+                  <li key={itemIndex}>
+                    <InlineRichText content={item} />
+                  </li>
                 ))}
               </ul>
             );
@@ -136,7 +192,9 @@ function RichText({ content }: { content: string }) {
             return (
               <ol key={index}>
                 {block.items.map((item, itemIndex) => (
-                  <li key={itemIndex}>{item}</li>
+                  <li key={itemIndex}>
+                    <InlineRichText content={item} />
+                  </li>
                 ))}
               </ol>
             );
@@ -152,7 +210,7 @@ function RichText({ content }: { content: string }) {
               <p key={index}>
                 {block.lines.map((line, lineIndex) => (
                   <Fragment key={lineIndex}>
-                    {line}
+                    <InlineRichText content={line} />
                     {lineIndex < block.lines.length - 1 ? <br /> : null}
                   </Fragment>
                 ))}
@@ -189,6 +247,7 @@ function controllerActionPresentation(event: AgentEvent): {
   label: string;
   detail: string;
   icon: string;
+  anticipated?: boolean;
 } | null {
   switch (event.type) {
     case "controller_observation":
@@ -196,12 +255,15 @@ function controllerActionPresentation(event: AgentEvent): {
         label: `${
           event.receipt.operation === "read_file" ? "Read" : "Inspected"
         } ${event.receipt.path}`,
-        detail: event.receipt.coverage === "full"
-          ? `${event.receipt.observed_bytes.toLocaleString()} bytes · full coverage`
-          : `${event.receipt.observed_bytes.toLocaleString()} bytes · bounded ranges`,
+        detail: `Done early · ${
+          event.receipt.coverage === "full"
+            ? `${event.receipt.observed_bytes.toLocaleString()} bytes · full coverage`
+            : `${event.receipt.observed_bytes.toLocaleString()} bytes · bounded ranges`
+        }`,
         icon: event.receipt.operation === "read_file"
           ? "bi bi-file-earmark-text"
           : "bi bi-search",
+        anticipated: true,
       };
     case "controller_closure":
       return {
@@ -227,6 +289,7 @@ export function ActionGroupBubble({
   toolCalls,
   toolResults,
   controllerActions,
+  showIdentity = true,
 }: {
   actor?: import("../types").TeamActor;
   assistingProfile?: string;
@@ -234,6 +297,7 @@ export function ActionGroupBubble({
   toolCalls: EventEnvelope[];
   toolResults: EventEnvelope[];
   controllerActions: EventEnvelope[];
+  showIdentity?: boolean;
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const collapseId = useId();
@@ -241,6 +305,8 @@ export function ActionGroupBubble({
   if (toolCalls.length === 0 && controllerActions.length === 0) return null;
 
   const teammate = teamActorPresentation(actor);
+  const isTrinity = actor?.kind === "automation";
+  const accentClass = teamActorAccentClass(actor);
 
   const toolItems = toolCalls
     .map((e, i) => {
@@ -277,7 +343,9 @@ export function ActionGroupBubble({
     return (
       <div
         key={`automatic-${index}`}
-        className="tool-item success automatic-action"
+        className={`tool-item success automatic-action${
+          presentation.anticipated ? " anticipated-action" : ""
+        }`}
       >
         <i className={presentation.icon}></i>
         <span className="action-label">
@@ -316,7 +384,33 @@ export function ActionGroupBubble({
   const assisting = assistingProfile
     ? profileName(assistingProfile)
     : undefined;
-  const actionSummary = actionCount === 1
+  const proactiveObservations = controllerActions.filter((envelope) =>
+    envelope.event.type === "controller_observation"
+  );
+  const isProactiveRun = toolCalls.length === 0 &&
+    proactiveObservations.length === controllerActions.length &&
+    proactiveObservations.length > 0;
+  const proactiveReads =
+    proactiveObservations.filter((envelope) =>
+      envelope.event.type === "controller_observation" &&
+      envelope.event.receipt.operation === "read_file"
+    ).length;
+  const proactiveActionLabel = proactiveReads === proactiveObservations.length
+    ? proactiveObservations.length === 1
+      ? "repository read"
+      : "repository reads"
+    : proactiveReads === 0
+    ? proactiveObservations.length === 1
+      ? "change inspection"
+      : "change inspections"
+    : "repository checks";
+  const actionSummary = isProactiveRun
+    ? `Predicted ${
+      proactiveObservations.length === 1 ? "a" : proactiveObservations.length
+    } ${proactiveActionLabel}${
+      assisting ? ` for ${assisting.split(/\s+/, 1)[0]}` : ""
+    }`
+    : actionCount === 1
     ? actionNames
     : actor?.kind === "automation"
     ? `${actionCount} harness actions${assisting ? ` for ${assisting}` : ""}`
@@ -327,7 +421,11 @@ export function ActionGroupBubble({
     : undefined;
 
   return (
-    <article className="bot message-row assistant-message compact tool-message">
+    <article
+      className={`bot message-row assistant-message compact tool-message${
+        accentClass ? ` ${accentClass}` : ""
+      }${showIdentity ? "" : " speaker-continuation"}`}
+    >
       <div className="bot-avatar action-avatar">
         <img src={teammate.avatar} alt={teammate.name} />
       </div>
@@ -336,10 +434,6 @@ export function ActionGroupBubble({
           <strong>{teammate.name}</strong>
           <span>{teammate.role}</span>
           <span className="action-origin">{teammate.provenance}</span>
-          <ActionInferenceDetails
-            events={inferenceEvents}
-            teammate={teammate.name}
-          />
           {timestampMs ? <time>{formatEventTime(timestampMs)}</time> : null}
         </div>
         <div className="bubble thought-bubble action-bubble">
@@ -350,11 +444,20 @@ export function ActionGroupBubble({
             aria-controls={collapseId}
             type="button"
           >
-            <span>
-              <i className="bi bi-lightning-charge"></i> {actionSummary}
-            </span>
-            <span className="tool-names">
-              {actionCount > 1 ? actionNames : ""}
+            <span className="tool-strip-copy">
+              <i
+                className={isProactiveRun
+                  ? "bi bi-stars trinity-prediction-glyph"
+                  : "bi bi-lightning-charge"}
+                aria-hidden="true"
+              >
+              </i>
+              <span>
+                <strong>{actionSummary}</strong>
+                {actionCount > 1
+                  ? <small className="tool-names">{actionNames}</small>
+                  : null}
+              </span>
             </span>
             <i
               className={`bi bi-chevron-down${isOpen ? "" : " collapsed"}`}
@@ -368,7 +471,12 @@ export function ActionGroupBubble({
             </div>
           </div>
         </div>
+        <ActionInferenceDetails
+          events={inferenceEvents}
+          teammate={teammate.name}
+        />
       </div>
+      <MessageTime timestampMs={timestampMs} />
     </article>
   );
 }
@@ -542,9 +650,11 @@ function ErrorEventBubble({
 function CorrectionNotice({
   event,
   fallbackProfile,
+  showIdentity = true,
 }: {
   event: Extract<AgentEvent, { type: "correction" }>;
   fallbackProfile?: string;
+  showIdentity?: boolean;
 }) {
   const teammate = teamActorPresentation(event.actor || workflowStewardActor());
   const assistedName = event.assisting_profile
@@ -554,35 +664,25 @@ function CorrectionNotice({
     : event.message.includes("Planning")
     ? profileName("plan")
     : "the model";
-  const isArtifactValidation = event.summary ===
-      "Workflow artifact validation failed" ||
-    /^submit_(?:plan|plan_review|implementation|code_review) tool call was not executed successfully$/
-      .test(event.summary || "");
-  const isRepeatedAction = event.summary === "Repeated tool call blocked" ||
-    event.summary?.includes("repeated the same action") === true;
   const assistedProfile = event.assisting_profile || fallbackProfile;
   const artifactLabel = assistedProfile === "build"
     ? "implementation report"
     : assistedProfile === "review"
     ? "review"
     : "plan";
-  const headline = isArtifactValidation
-    ? `${assistedName}’s ${artifactLabel} needs a correction`
-    : isRepeatedAction
-    ? `${assistedName} got stuck repeating the same action`
-    : (event.summary || "I left some feedback").trim();
-  const message = isArtifactValidation
-    ? `${
-      validationProblem(event.message)
-    } I sent it back with guidance before the team continued.`
-    : isRepeatedAction
-    ? `I blocked the duplicate before it ran. The repeat limit was reached, so this pass stopped instead of spending another model turn on the same action.`
-    : `I noticed a problem in ${assistedName}’s current step and sent back clear guidance before the team continued.`;
+  const copy = trinityCorrectionCopy(
+    event.summary,
+    event.message,
+    assistedName,
+    artifactLabel,
+  );
   const technicalDetail = prettyTechnicalDetail(event.message);
 
   return (
     <article
-      className="bot message-row assistant-message compact correction-message"
+      className={`bot message-row assistant-message compact correction-message chat-event-message teammate-message trinity-message${
+        showIdentity ? "" : " speaker-continuation"
+      }`}
       aria-label={`Correction from ${teammate.name}`}
     >
       <div className="bot-avatar team-avatar">
@@ -597,19 +697,19 @@ function CorrectionNotice({
             ? <time>{formatEventTime(event.timestamp_ms)}</time>
             : null}
         </div>
-        <div className="bubble thought-bubble correction-bubble">
-          <strong className="feedback-heading">{headline}</strong>
-          <p>{message}</p>
-          {technicalDetail
-            ? (
-              <details>
-                <summary>Technical details</summary>
-                <pre>{technicalDetail}</pre>
-              </details>
-            )
+        <TechnicalDetailsBubble
+          className="correction-bubble"
+          detail={technicalDetail}
+          title={`${teammate.name} correction evidence`}
+          teammateName={teammate.name}
+        >
+          {copy.headline
+            ? <strong className="feedback-heading">{copy.headline}</strong>
             : null}
-        </div>
+          <RichText content={copy.message} />
+        </TechnicalDetailsBubble>
       </div>
+      <MessageTime timestampMs={event.timestamp_ms} />
     </article>
   );
 }
@@ -618,27 +718,30 @@ function WorkflowBlockedNotice({
   event,
   envelope,
   events,
+  showIdentity = true,
 }: {
   event: Extract<AgentEvent, { type: "workflow_blocked" }>;
   envelope: EventEnvelope;
   events: EventEnvelope[];
+  showIdentity?: boolean;
 }) {
   const teammate = teamActorPresentation(workflowStewardActor());
   const eventIndex = events.indexOf(envelope);
-  const recentEvents = events.slice(
-    Math.max(0, eventIndex - 5),
-    eventIndex < 0 ? 0 : eventIndex,
-  );
+  const priorEvents = events.slice(0, eventIndex < 0 ? 0 : eventIndex);
+  const recentEvents = priorEvents.slice(-5);
   const repeatedAction = [...recentEvents]
     .reverse()
     .find((candidate) =>
       candidate.event.type === "correction" &&
-      (candidate.event.summary === "Repeated tool call blocked" ||
-        candidate.event.summary?.includes("repeated the same action") === true)
+      (candidate.event.summary === "Repeated tool call detected" ||
+        candidate.event.summary === "Repeated tool call blocked" ||
+        candidate.event.summary?.includes("repeated the same action") ===
+          true ||
+        candidate.event.summary?.includes("reached the repeat limit") === true)
     );
   let recentProfile: string | undefined;
-  for (let index = recentEvents.length - 1; index >= 0; index--) {
-    const candidate = recentEvents[index].event;
+  for (let index = priorEvents.length - 1; index >= 0; index--) {
+    const candidate = priorEvents[index].event;
     if (candidate.type === "llm_invocation" || candidate.type === "reasoning") {
       recentProfile = candidate.profile;
       break;
@@ -654,6 +757,27 @@ function WorkflowBlockedNotice({
   const repeatedName = repeatedProfile
     ? profileName(repeatedProfile)
     : "A teammate";
+  const repeatedFirstName = repeatedName.split(/\s+/, 1)[0];
+  const planningFirstName = profileName("plan").split(/\s+/, 1)[0];
+  const priorToolCalls = priorEvents.filter((candidate) =>
+    candidate.event.type === "tool_call"
+  );
+  const latestToolCall = priorToolCalls.at(-1)?.event;
+  const repeatedToolCall = latestToolCall?.type === "tool_call" &&
+      priorToolCalls.slice(0, -1).some((candidate) =>
+        candidate.event.type === "tool_call" &&
+        candidate.event.tool === latestToolCall.tool &&
+        JSON.stringify(candidate.event.arguments) ===
+          JSON.stringify(latestToolCall.arguments)
+      )
+    ? latestToolCall
+    : undefined;
+  const repeatedPath = repeatedToolCall?.arguments &&
+      typeof repeatedToolCall.arguments === "object" &&
+      "path" in repeatedToolCall.arguments &&
+      typeof repeatedToolCall.arguments.path === "string"
+    ? repeatedToolCall.arguments.path
+    : undefined;
   const planningFailure = event.outcome === "plan_rejected" ||
     event.reason.toLowerCase().includes("planning submission");
   const gitControlChanged = event.reason.includes("changed Git control state");
@@ -661,53 +785,108 @@ function WorkflowBlockedNotice({
     "repository content changed while the read-only",
   );
   const repeatLimit = event.reason.includes("deterministic repeat limit");
-  const message = planningFailure
-    ? `${
-      validationProblem(event.reason)
-    } Dade’s plan was still missing those pieces after three attempts, so I paused this pass instead of sending unclear work to the rest of the team.`
+  const executorUnavailable = event.outcome === "executor_unavailable";
+  const needsCurrentFilesRestart = gitControlChanged ||
+    repositoryContentChanged || event.outcome === "commit_blocked";
+  const [currentUsername, setCurrentUsername] = useState<string>();
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch("/api/current-user", { signal: controller.signal })
+      .then((response) => response.ok ? response.json() : null)
+      .then((currentUser: { username?: string } | null) => {
+        const username = currentUser?.username?.trim();
+        if (username) setCurrentUsername(username);
+      })
+      .catch((error) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          console.debug("Could not address the current user by name", error);
+        }
+      });
+    return () => controller.abort();
+  }, []);
+
+  const teammateMessage = planningFailure
+    ? `${planningFirstName}, your plan was rejected after three attempts. ${
+      artifactValidationProblem(event.reason)
+    } Nothing changed, and this delivery is now on hold.`
     : gitControlChanged && repeatedAction
-    ? `${repeatedName} got stuck repeating the same action, so I blocked the duplicate before it ran. The repository’s Git state also changed during the pass; I preserved the content and stopped before committing or overwriting somebody else’s work.`
+    ? `${repeatedFirstName}, you repeated the same action while the repository’s Git state was changing. I blocked the duplicate and put this delivery on hold so we would not commit or overwrite somebody else’s work.`
     : gitControlChanged
-    ? "The repository’s Git state changed while the team was working. I preserved the content and stopped before committing or overwriting somebody else’s work."
+    ? "Team, I put this delivery on hold because the repository’s Git state changed during the pass. I preserved the current files so we would not commit or overwrite somebody else’s work."
     : repositoryContentChanged
-    ? `The project changed while ${repeatedName} was reviewing an earlier snapshot. I kept the review tied to those exact files and stopped before implementation. Restart with the current files to make a fresh plan without overwriting the newer work.`
+    ? "Team, I put this delivery on hold because the project changed while you were reviewing an earlier snapshot. I kept that review tied to its exact files rather than risk overwriting the newer work."
     : repeatLimit
-    ? event.reason
-    : "I stopped this delivery at a safe boundary because the team needs help before it can continue.";
+    ? repeatedPath
+      ? `${repeatedFirstName}, \`${repeatedPath}\` does not exist. You tried to read it again after I flagged that, then repeated the same action once more. I blocked that last attempt, so your review—and this delivery—are now on hold.`
+      : `${repeatedFirstName}, you repeated the same action after I flagged the failure. I blocked the duplicate, so your task—and this delivery—are now on hold.`
+    : executorUnavailable
+    ? "Team, this delivery is on hold because a required executor is unavailable. I preserved the current work so you can continue once that prerequisite is restored."
+    : "Team, I put this delivery on hold at a safe boundary because the reported problem needs a different approach.";
+  const userRequest = needsCurrentFilesRestart
+    ? "restart this delivery with the current files so the team can plan against the right project state"
+    : executorUnavailable
+    ? "restore the missing prerequisite, then resume this delivery"
+    : "start a follow-up task here and add any context that could help the team find a different way forward";
+  const userMessage = currentUsername
+    ? `@${currentUsername}, can you ${userRequest}?`
+    : `Can you ${userRequest}?`;
 
   return (
-    <article
-      className="bot message-row assistant-message workflow-feedback"
-      aria-label={`Delivery feedback from ${teammate.name}`}
-    >
-      <div className="bot-avatar team-avatar">
-        <img src={teammate.avatar} alt={teammate.name} />
-      </div>
-      <div className="message-container">
-        <div className="author-line">
-          <strong>{teammate.name}</strong>
-          <span>{teammate.role}</span>
-          <span className="action-origin">{teammate.provenance}</span>
-          {event.timestamp_ms
-            ? <time>{formatEventTime(event.timestamp_ms)}</time>
-            : null}
+    <>
+      <article
+        className={`bot message-row assistant-message workflow-feedback chat-event-message teammate-message trinity-message${
+          showIdentity ? "" : " speaker-continuation"
+        }`}
+        aria-label={`Task hold message from ${teammate.name}`}
+      >
+        <div className="bot-avatar team-avatar">
+          <img src={teammate.avatar} alt={teammate.name} />
         </div>
-        <div className="bubble thought-bubble correction-bubble">
-          <span className="handoff-state">Delivery paused safely</span>
-          <p>{message}</p>
-          <details>
-            <summary>Technical details</summary>
-            <pre>
-              {prettyTechnicalDetail(
-                repeatedAction?.event.type === "correction"
-                  ? `${repeatedAction.event.message}\n${event.reason}`
-                  : event.reason,
-              )}
-            </pre>
-          </details>
+        <div className="message-container">
+          <div className="author-line">
+            <strong>{teammate.name}</strong>
+            <span>{teammate.role}</span>
+            <span className="action-origin">{teammate.provenance}</span>
+            {event.timestamp_ms
+              ? <time>{formatEventTime(event.timestamp_ms)}</time>
+              : null}
+          </div>
+          <TechnicalDetailsBubble
+            className="correction-bubble"
+            detail={prettyTechnicalDetail(
+              repeatedAction?.event.type === "correction"
+                ? `${repeatedAction.event.message}\n${event.reason}`
+                : event.reason,
+            )}
+            title="Why this task is on hold"
+            teammateName={teammate.name}
+          >
+            <RichText content={teammateMessage} />
+          </TechnicalDetailsBubble>
         </div>
-      </div>
-    </article>
+        <MessageTime timestampMs={event.timestamp_ms} />
+      </article>
+      <article
+        className="bot message-row assistant-message workflow-feedback chat-event-message teammate-message trinity-message speaker-continuation"
+        aria-label={`Request from ${teammate.name} to the current user`}
+      >
+        <div className="bot-avatar team-avatar" aria-hidden="true">
+          <img src={teammate.avatar} alt="" />
+        </div>
+        <div className="message-container">
+          <div className="author-line">
+            <strong>{teammate.name}</strong>
+            <span>{teammate.role}</span>
+            <span className="action-origin">{teammate.provenance}</span>
+          </div>
+          <div className="bubble thought-bubble correction-bubble">
+            <RichText content={userMessage} />
+          </div>
+        </div>
+        <MessageTime timestampMs={event.timestamp_ms} />
+      </article>
+    </>
   );
 }
 
@@ -728,6 +907,7 @@ export function InitialUserMessage(
       <div className="user-avatar">
         <img src="/api/current-user.png" alt="Current user" />
       </div>
+      <MessageTime timestampMs={timestampMs} />
     </article>
   );
 }
@@ -736,6 +916,7 @@ type AssistantMessageRowProps = {
   profile: string;
   timestampMs?: number;
   compact?: boolean;
+  showIdentity?: boolean;
   children: React.ReactNode;
 };
 
@@ -743,12 +924,15 @@ function AssistantMessageRow({
   profile,
   timestampMs,
   compact = false,
+  showIdentity = true,
   children,
 }: AssistantMessageRowProps) {
   return (
     <article
-      className={`bot message-row assistant-message assistant-transcript${
-        compact ? " compact" : ""
+      className={`bot message-row assistant-message assistant-transcript chat-event-message teammate-message ${
+        profileAccentClass(profile)
+      }${compact ? " compact" : ""}${
+        showIdentity ? "" : " speaker-continuation"
       }`}
     >
       <div className="bot-avatar">
@@ -764,6 +948,7 @@ function AssistantMessageRow({
           {children}
         </div>
       </div>
+      <MessageTime timestampMs={timestampMs} />
     </article>
   );
 }
@@ -771,9 +956,11 @@ function AssistantMessageRow({
 function DeliveryPlanCard({
   workflow,
   timestampMs,
+  showIdentity = true,
 }: {
   workflow: WorkflowSummary;
   timestampMs?: number;
+  showIdentity?: boolean;
 }) {
   const envelope = workflow.plan;
   if (!envelope) return null;
@@ -784,16 +971,24 @@ function DeliveryPlanCard({
     workflow.stage === "blocked" &&
     workflow.paused_stage === "plan_review" &&
     workflow.blocked_reason?.includes("repository content changed");
+  const reviewEndedIncomplete = !reviewMatchesPlan &&
+    ["failed", "blocked", "cancelled"].includes(workflow.stage);
   const reviewLabel = reviewMatchesPlan
     ? review?.verdict === "pass"
       ? `${profileName("review")} reviewed`
       : "Changes requested"
     : reviewWasInvalidated
     ? "Review invalidated"
+    : reviewEndedIncomplete
+    ? workflow.stage === "cancelled" ? "Review cancelled" : "Review incomplete"
     : "Awaiting review";
 
   return (
-    <AssistantMessageRow profile="plan" timestampMs={timestampMs}>
+    <AssistantMessageRow
+      profile="plan"
+      timestampMs={timestampMs}
+      showIdentity={showIdentity}
+    >
       <section className="delivery-plan" aria-label="Delivery plan">
         <div className="delivery-plan-heading">
           <span className="handoff-state">Delivery plan</span>
@@ -803,6 +998,8 @@ function DeliveryPlanCard({
                 ? "bi bi-check2-circle"
                 : reviewWasInvalidated
                 ? "bi bi-exclamation-circle"
+                : reviewEndedIncomplete
+                ? "bi bi-dash-circle"
                 : "bi bi-hourglass-split"}
               aria-hidden="true"
             >
@@ -810,12 +1007,16 @@ function DeliveryPlanCard({
             {reviewLabel}
           </span>
         </div>
-        <strong className="feedback-heading">{plan.summary}</strong>
+        <strong className="feedback-heading">
+          <InlineRichText content={plan.summary} />
+        </strong>
         <section>
           <h3>What it must achieve</h3>
           <ul>
             {plan.requirements.map((requirement) => (
-              <li key={requirement.id}>{requirement.description}</li>
+              <li key={requirement.id}>
+                <InlineRichText content={requirement.description} />
+              </li>
             ))}
           </ul>
         </section>
@@ -824,7 +1025,9 @@ function DeliveryPlanCard({
           <ol>
             {plan.steps.map((step) => (
               <li key={step.id}>
-                <span>{step.description}</span>
+                <span>
+                  <InlineRichText content={step.description} />
+                </span>
                 {step.paths.length > 0
                   ? (
                     <div className="delivery-plan-paths">
@@ -844,7 +1047,9 @@ function DeliveryPlanCard({
           <h3>Done when</h3>
           <ul>
             {plan.acceptance.map((acceptance) => (
-              <li key={acceptance.id}>{acceptance.description}</li>
+              <li key={acceptance.id}>
+                <InlineRichText content={acceptance.description} />
+              </li>
             ))}
           </ul>
         </section>
@@ -873,13 +1078,16 @@ function handoffOutcomeLabel(outcome?: string): string {
 function TeamMessageBubble({
   envelope,
   events,
+  showIdentity = true,
 }: {
   envelope: EventEnvelope;
   events: EventEnvelope[];
+  showIdentity?: boolean;
 }) {
   const event = envelope.event;
   if (event.type !== "team_message") return null;
   const teammate = teamActorPresentation(event.actor);
+  const accentClass = teamActorAccentClass(event.actor);
 
   const index = events.indexOf(envelope);
   const priorEvents = events.slice(0, index < 0 ? events.length : index);
@@ -920,7 +1128,9 @@ function TeamMessageBubble({
 
   return (
     <article
-      className={`bot message-row assistant-message team-message tone-${event.tone}`}
+      className={`bot message-row assistant-message team-message chat-event-message tone-${event.tone}${
+        accentClass ? ` ${accentClass}` : ""
+      }${showIdentity ? "" : " speaker-continuation"}`}
     >
       <div className="bot-avatar team-avatar">
         <img src={teammate.avatar} alt={teammate.name} />
@@ -938,7 +1148,7 @@ function TeamMessageBubble({
           <span className="handoff-state">
             {handoffOutcomeLabel(summary?.outcome)}
           </span>
-          <p>{event.message}</p>
+          <RichText content={event.message} />
           {hasEvidence
             ? (
               <details className="handoff-evidence">
@@ -1011,6 +1221,7 @@ function TeamMessageBubble({
             : null}
         </div>
       </div>
+      <MessageTime timestampMs={event.timestamp_ms} />
     </article>
   );
 }
@@ -1079,6 +1290,87 @@ function MetricsDialog({
   );
 }
 
+function TechnicalDetailsBubble({
+  className,
+  detail,
+  title,
+  teammateName,
+  children,
+}: {
+  className?: string;
+  detail: string;
+  title: string;
+  teammateName: string;
+  children: React.ReactNode;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const longPressTimer = useRef<number | undefined>(undefined);
+  const hasDetail = Boolean(detail.trim());
+
+  const cancelLongPress = () => {
+    if (longPressTimer.current !== undefined) {
+      window.clearTimeout(longPressTimer.current);
+      longPressTimer.current = undefined;
+    }
+  };
+
+  useEffect(() => cancelLongPress, []);
+
+  return (
+    <>
+      <div
+        className={`bubble thought-bubble ${className || ""}${
+          hasDetail ? " technical-detail-surface" : ""
+        }`.trim()}
+        onPointerDown={hasDetail
+          ? (pointerEvent) => {
+            if (pointerEvent.pointerType === "mouse") return;
+            cancelLongPress();
+            longPressTimer.current = window.setTimeout(() => {
+              setIsOpen(true);
+              longPressTimer.current = undefined;
+            }, 550);
+          }
+          : undefined}
+        onPointerUp={hasDetail ? cancelLongPress : undefined}
+        onPointerCancel={hasDetail ? cancelLongPress : undefined}
+        onPointerLeave={hasDetail ? cancelLongPress : undefined}
+        onContextMenu={hasDetail
+          ? (contextMenuEvent) => contextMenuEvent.preventDefault()
+          : undefined}
+      >
+        {children}
+        {hasDetail
+          ? (
+            <button
+              className="inference-info-button technical-detail-button"
+              type="button"
+              aria-label={`View technical details from ${teammateName}`}
+              onPointerDown={(pointerEvent) => pointerEvent.stopPropagation()}
+              onClick={() => setIsOpen(true)}
+            >
+              <i className="bi bi-info-circle" aria-hidden="true"></i>
+            </button>
+          )
+          : null}
+      </div>
+
+      {hasDetail && isOpen
+        ? (
+          <MetricsDialog
+            eyebrow="Technical details"
+            title={title}
+            closeLabel="Close technical details"
+            onClose={() => setIsOpen(false)}
+          >
+            <pre className="technical-detail-content">{detail}</pre>
+          </MetricsDialog>
+        )
+        : null}
+    </>
+  );
+}
+
 function ActionInferenceDetails({
   events,
   teammate,
@@ -1100,19 +1392,31 @@ function ActionInferenceDetails({
     (total, event) => total + event.prompt_tokens + event.generated_tokens,
     0,
   );
+  const teammateFirstName = teammate.split(/\s+/, 1)[0];
 
   return (
     <>
-      <button
-        className="inference-info-button action-run-info"
-        type="button"
-        aria-label={`View ${inferences.length} model call detail${
-          inferences.length === 1 ? "" : "s"
-        } for ${teammate}`}
-        onClick={() => setIsOpen(true)}
+      <div
+        className="inference-marker action-inference-marker"
+        aria-label={`${teammate} model work summary`}
       >
-        <i className="bi bi-info-circle" aria-hidden="true"></i>
-      </button>
+        <span>
+          {teammateFirstName} worked for {formatHumanDurationMs(durationMs)}
+          {inferences.length > 1
+            ? ` across ${inferences.length} model calls`
+            : ""}
+        </span>
+        <button
+          className="inference-info-button action-run-info"
+          type="button"
+          aria-label={`View ${inferences.length} model call detail${
+            inferences.length === 1 ? "" : "s"
+          } for ${teammate}`}
+          onClick={() => setIsOpen(true)}
+        >
+          <i className="bi bi-info-circle" aria-hidden="true"></i>
+        </button>
+      </div>
       {isOpen
         ? (
           <MetricsDialog
@@ -1226,10 +1530,33 @@ function ActionInferenceDetails({
                             {event.native.constraint_terminal_state
                               ? (
                                 <MetricField
-                                  label="Constraint result"
+                                  label="Control collar result"
                                   value={sentenceCaseIdentifier(
                                     event.native.constraint_terminal_state,
                                   )}
+                                />
+                              )
+                              : null}
+                            {event.native.rejected_constraint_candidates > 0
+                              ? (
+                                <MetricField
+                                  label="Control collar filtered"
+                                  value={`${
+                                    formatNumber(
+                                      event.native
+                                        .rejected_constraint_candidates,
+                                    )
+                                  } invalid output candidates`}
+                                />
+                              )
+                              : null}
+                            {mutationCandidateCount(event) > 0
+                              ? (
+                                <MetricField
+                                  label="Mutation candidates"
+                                  value={`${
+                                    formatNumber(mutationCandidateCount(event))
+                                  } stopped before sampling`}
                                 />
                               )
                               : null}
@@ -1259,6 +1586,7 @@ function InferenceDetails({
   const longPressTimer = useRef<number | undefined>(undefined);
   const profile = event.profile || activityProfile || "build";
   const teammate = profileName(profile);
+  const teammateFirstName = teammate.split(/\s+/, 1)[0];
   const totalTokens = event.prompt_tokens + event.generated_tokens;
 
   const cancelLongPress = () => {
@@ -1289,7 +1617,8 @@ function InferenceDetails({
         onContextMenu={(contextMenuEvent) => contextMenuEvent.preventDefault()}
       >
         <span>
-          {teammate} used the model · {formatHumanDurationMs(event.duration_ms)}
+          {teammateFirstName} worked for{" "}
+          {formatHumanDurationMs(event.duration_ms)}
         </span>
         <button
           className="inference-info-button"
@@ -1446,6 +1775,48 @@ function InferenceDetails({
                         event.native.expert_strategy,
                       )}
                     />
+                    {event.native.tool_constraint_mode
+                      ? (
+                        <MetricField
+                          label="Control collar"
+                          value={sentenceCaseIdentifier(
+                            event.native.tool_constraint_mode,
+                          )}
+                        />
+                      )
+                      : null}
+                    {event.native.rejected_constraint_candidates > 0
+                      ? (
+                        <MetricField
+                          label="Candidates filtered"
+                          value={`${
+                            formatNumber(
+                              event.native.rejected_constraint_candidates,
+                            )
+                          } invalid output candidates`}
+                        />
+                      )
+                      : null}
+                    {mutationCandidateCount(event) > 0
+                      ? (
+                        <MetricField
+                          label="Mutation candidates"
+                          value={`${
+                            formatNumber(mutationCandidateCount(event))
+                          } stopped before sampling`}
+                        />
+                      )
+                      : null}
+                    {event.native.constraint_terminal_state
+                      ? (
+                        <MetricField
+                          label="Collar result"
+                          value={sentenceCaseIdentifier(
+                            event.native.constraint_terminal_state,
+                          )}
+                        />
+                      )
+                      : null}
                     {event.native.refill
                       ? (
                         <MetricField
@@ -1467,8 +1838,10 @@ function InferenceDetails({
 
 function SessionMetricsDetails({
   event,
+  evidenceEvents,
 }: {
   event: Extract<AgentEvent, { type: "session_metrics" }>;
+  evidenceEvents: EventEnvelope[];
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const longPressTimer = useRef<number | undefined>(undefined);
@@ -1484,6 +1857,13 @@ function SessionMetricsDetails({
   const hasCachePersistence =
     (event.cache_persistence_queued_checkpoints ?? 0) > 0 ||
     (event.cache_persistence_failures ?? 0) > 0;
+  const efficiency = harnessEfficiencyStats(evidenceEvents);
+  const assistanceSummary = trinityAssistanceSummary(efficiency);
+  const preventedActions = efficiency.duplicateActionsPrevented +
+    efficiency.dependentBatchesPrevented;
+  const hasHarnessEfficiency = efficiency.proactiveActions > 0 ||
+    efficiency.collarCandidatesFiltered > 0 || preventedActions > 0 ||
+    efficiency.noProgressLoopsStopped > 0;
 
   const cancelLongPress = () => {
     if (longPressTimer.current !== undefined) {
@@ -1512,11 +1892,21 @@ function SessionMetricsDetails({
         onPointerLeave={cancelLongPress}
         onContextMenu={(contextMenuEvent) => contextMenuEvent.preventDefault()}
       >
-        <span>
-          {funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)}
-          {totalEnergyJoules === undefined && event.energy_exclusive === false
-            ? " Power estimate unavailable."
+        <span className="session-metrics-copy">
+          {assistanceSummary
+            ? (
+              <span className="trinity-efficiency-summary">
+                <i className="bi bi-stars" aria-hidden="true"></i>
+                <span>{assistanceSummary}</span>
+              </span>
+            )
             : null}
+          <span>
+            {funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)}
+            {totalEnergyJoules === undefined && event.energy_exclusive === false
+              ? " Power estimate unavailable."
+              : null}
+          </span>
         </span>
         <button
           className="inference-info-button"
@@ -1563,6 +1953,90 @@ function SessionMetricsDetails({
                 value={formatNumber(event.generated_tokens)}
               />
             </dl>
+
+            {hasHarnessEfficiency
+              ? (
+                <section className="metrics-section trinity-efficiency-section">
+                  <h3>
+                    <i className="bi bi-stars" aria-hidden="true"></i>
+                    How pb helped
+                  </h3>
+                  <dl className="metrics-grid">
+                    {efficiency.proactiveActions > 0
+                      ? (
+                        <>
+                          <MetricField
+                            label="Trinity acted early"
+                            value={`${
+                              formatNumber(efficiency.proactiveActions)
+                            } repository ${
+                              efficiency.proactiveActions === 1
+                                ? "action"
+                                : "actions"
+                            }`}
+                          />
+                          <MetricField
+                            label="Potential turns avoided"
+                            value={`Up to ${
+                              formatNumber(efficiency.proactiveActions)
+                            }`}
+                          />
+                        </>
+                      )
+                      : null}
+                    {preventedActions > 0
+                      ? (
+                        <MetricField
+                          label="Actions prevented"
+                          value={`${
+                            formatNumber(preventedActions)
+                          } before execution`}
+                        />
+                      )
+                      : null}
+                    {efficiency.noProgressLoopsStopped > 0
+                      ? (
+                        <MetricField
+                          label="Loops stopped"
+                          value={formatNumber(
+                            efficiency.noProgressLoopsStopped,
+                          )}
+                        />
+                      )
+                      : null}
+                    {efficiency.collarCandidatesFiltered > 0
+                      ? (
+                        <MetricField
+                          label="Control collar"
+                          value={`${
+                            formatNumber(
+                              efficiency.collarCandidatesFiltered,
+                            )
+                          } invalid output candidates filtered${
+                            efficiency.mutationCandidatesFiltered > 0
+                              ? `, including ${
+                                formatNumber(
+                                  efficiency.mutationCandidatesFiltered,
+                                )
+                              } mutation candidates`
+                              : ""
+                          }`}
+                        />
+                      )
+                      : null}
+                  </dl>
+                  {efficiency.proactiveActions > 0
+                    ? (
+                      <p className="metrics-note">
+                        Potential turns avoided is an upper bound based on work
+                        Trinity completed before the next model call. Energy is
+                        measured session use, not a counterfactual saving.
+                      </p>
+                    )
+                    : null}
+                </section>
+              )
+              : null}
 
             {totalEnergyJoules !== undefined
               ? (
@@ -1683,11 +2157,13 @@ export function MessageBubble({
   activityProfile,
   evidenceEvents = [],
   workflow,
+  showIdentity = true,
 }: {
   envelope: EventEnvelope;
   activityProfile?: string;
   evidenceEvents?: EventEnvelope[];
   workflow?: WorkflowSummary;
+  showIdentity?: boolean;
 }) {
   const e = envelope.event;
   const nearestPriorProfile = () => {
@@ -1716,7 +2192,11 @@ export function MessageBubble({
   switch (e.type) {
     case "started":
       return (
-        <article className="user message-row user-message">
+        <article
+          className={`user message-row user-message${
+            showIdentity ? "" : " speaker-continuation"
+          }`}
+        >
           <div className="message-container">
             <div className="author-line">
               <strong>You</strong>
@@ -1729,6 +2209,7 @@ export function MessageBubble({
           <div className="user-avatar">
             <img src="/api/current-user.png" alt="Current user" />
           </div>
+          <MessageTime timestampMs={e.timestamp_ms} />
         </article>
       );
 
@@ -1760,6 +2241,7 @@ export function MessageBubble({
         <AssistantMessageRow
           profile={e.profile}
           timestampMs={e.timestamp_ms}
+          showIdentity={showIdentity}
         >
           <RichText content={e.content} />
         </AssistantMessageRow>
@@ -1767,14 +2249,21 @@ export function MessageBubble({
 
     case "user_question":
       return (
-        <AssistantMessageRow profile={e.profile} timestampMs={e.timestamp_ms}>
+        <AssistantMessageRow
+          profile={e.profile}
+          timestampMs={e.timestamp_ms}
+          showIdentity={showIdentity}
+        >
           <div className="assistant-question">
-            <p>{e.question}</p>
+            <RichText content={e.question} />
             {e.choices?.length
               ? (
                 <div className="question-choices">
-                  {e.choices.map((choice) => <span key={choice}>{choice}
-                  </span>)}
+                  {e.choices.map((choice) => (
+                    <span key={choice}>
+                      <InlineRichText content={choice} />
+                    </span>
+                  ))}
                 </div>
               )
               : null}
@@ -1799,6 +2288,7 @@ export function MessageBubble({
           event={e}
           envelope={envelope}
           events={evidenceEvents}
+          showIdentity={showIdentity}
         />
       );
 
@@ -1820,15 +2310,26 @@ export function MessageBubble({
         <CorrectionNotice
           event={e}
           fallbackProfile={nearestPriorProfile()}
+          showIdentity={showIdentity}
         />
       );
 
     case "team_message":
-      return <TeamMessageBubble envelope={envelope} events={evidenceEvents} />;
+      return (
+        <TeamMessageBubble
+          envelope={envelope}
+          events={evidenceEvents}
+          showIdentity={showIdentity}
+        />
+      );
 
     case "user_answer":
       return (
-        <article className="user message-row user-message compact">
+        <article
+          className={`user message-row user-message compact${
+            showIdentity ? "" : " speaker-continuation"
+          }`}
+        >
           <div className="message-container">
             <div className="author-line">
               <strong>You</strong>
@@ -1839,12 +2340,20 @@ export function MessageBubble({
               <p>{e.answer}</p>
             </div>
           </div>
+          <div className="user-avatar">
+            <img src="/api/current-user.png" alt="Current user" />
+          </div>
+          <MessageTime timestampMs={e.timestamp_ms} />
         </article>
       );
 
     case "user_message":
       return (
-        <article className="user message-row user-message compact">
+        <article
+          className={`user message-row user-message compact${
+            showIdentity ? "" : " speaker-continuation"
+          }`}
+        >
           <div className="message-container">
             <div className="author-line">
               <strong>You</strong>
@@ -1860,6 +2369,7 @@ export function MessageBubble({
           <div className="user-avatar">
             <img src="/api/current-user.png" alt="Current user" />
           </div>
+          <MessageTime timestampMs={e.timestamp_ms} />
         </article>
       );
 
@@ -1923,6 +2433,7 @@ export function MessageBubble({
         <AssistantMessageRow
           profile={e.profile}
           timestampMs={e.timestamp_ms}
+          showIdentity={showIdentity}
         >
           <RichText content={e.content} />
         </AssistantMessageRow>
@@ -1934,7 +2445,13 @@ export function MessageBubble({
     case "workflow_artifact_accepted":
       return e.artifact_kind === "plan" &&
           workflow?.plan?.sha256 === e.sha256
-        ? <DeliveryPlanCard workflow={workflow} timestampMs={e.timestamp_ms} />
+        ? (
+          <DeliveryPlanCard
+            workflow={workflow}
+            timestampMs={e.timestamp_ms}
+            showIdentity={showIdentity}
+          />
+        )
         : null;
 
     case "executor_started":
@@ -1953,7 +2470,12 @@ export function MessageBubble({
       return null;
 
     case "session_metrics":
-      return <SessionMetricsDetails event={e} />;
+      return (
+        <SessionMetricsDetails
+          event={e}
+          evidenceEvents={evidenceEvents}
+        />
+      );
 
     case "session_summary": {
       const hasSummary = Boolean(e.summary?.trim());
@@ -1964,48 +2486,60 @@ export function MessageBubble({
       const hasChanges = Boolean(e.diff_stat?.trim() || e.diff?.trim());
       if (!hasSummary && commitLines.length === 0 && !hasChanges) return null;
       return (
-        <article className="message-row assistant-message compact delivery-summary">
+        <article
+          className={`message-row assistant-message compact delivery-summary chat-event-message${
+            showIdentity ? "" : " speaker-continuation"
+          }`}
+        >
           <div className="bot-avatar delivery-avatar">
             <i className="bi bi-box-seam" aria-hidden="true"></i>
           </div>
-          <div className="bubble thought-bubble">
-            <strong className="feedback-heading">Delivery summary</strong>
-            {hasSummary ? <RichText content={e.summary!.trim()} /> : null}
-            {commitLines.length > 0
-              ? (
-                <section className="delivery-commits">
-                  <strong>Commits from this delivery</strong>
-                  <ul>
-                    {commitLines.map((line) => (
-                      <li key={line}>
-                        <code>{line}</code>
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              )
-              : null}
-            {e.diff_stat?.trim()
-              ? (
-                <section className="delivery-changes">
-                  <strong>Changes</strong>
-                  <pre className="small result-pre">{e.diff_stat}</pre>
-                </section>
-              )
-              : null}
-            {e.diff?.trim()
-              ? (
-                <details className="transcript-diff">
-                  <summary className="transcript-diff-header">
-                    <span>View changes</span>
-                  </summary>
-                  <div className="transcript-diff-body">
-                    <DiffView diff={e.diff} />
-                  </div>
-                </details>
-              )
-              : null}
+          <div className="message-container">
+            <div className="author-line">
+              <strong>Delivery summary</strong>
+              {e.timestamp_ms
+                ? <time>{formatEventTime(e.timestamp_ms)}</time>
+                : null}
+            </div>
+            <div className="bubble thought-bubble">
+              {hasSummary ? <RichText content={e.summary!.trim()} /> : null}
+              {commitLines.length > 0
+                ? (
+                  <section className="delivery-commits">
+                    <strong>Commits from this delivery</strong>
+                    <ul>
+                      {commitLines.map((line) => (
+                        <li key={line}>
+                          <code>{line}</code>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                )
+                : null}
+              {e.diff_stat?.trim()
+                ? (
+                  <section className="delivery-changes">
+                    <strong>Changes</strong>
+                    <pre className="small result-pre">{e.diff_stat}</pre>
+                  </section>
+                )
+                : null}
+              {e.diff?.trim()
+                ? (
+                  <details className="transcript-diff">
+                    <summary className="transcript-diff-header">
+                      <span>View changes</span>
+                    </summary>
+                    <div className="transcript-diff-body">
+                      <DiffView diff={e.diff} />
+                    </div>
+                  </details>
+                )
+                : null}
+            </div>
           </div>
+          <MessageTime timestampMs={e.timestamp_ms} />
         </article>
       );
     }

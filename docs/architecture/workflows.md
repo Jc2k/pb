@@ -558,6 +558,15 @@ supplying the hidden fixed path cannot disguise an identical action. An exact de
 cache hit remains fully preserved in durable evidence, but the next prompt receives only a compact
 replay receipt, the required continuation when one exists, and the current fingerprint. Repeating
 that exact read after a replay is blocked before another tool execution.
+An operating-system missing-path result is normalized as `target_not_found`, including
+`failed to resolve path` and `No such file or directory` diagnostics. That exact `read_file` action
+is non-retryable: if a model nevertheless repeats it against unchanged state, the no-progress guard
+blocks the tool before execution and returns a recovery correction without immediately ending the
+stage. In plan review, the first such result narrows the next model turn to `submit_plan_review` or
+one local symbol/path discovery call (`search`, `ripgrep`, or `glob`). Existing evidence can therefore
+produce a `revise` verdict directly; otherwise one successful discovery restores ordinary review
+authority for the following turn. The recovery turn remains inside the existing step, invocation,
+and token budgets and cannot widen repository or mutation authority.
 
 When a model response is truncated before producing a valid action, pb can retry with thinking
 disabled and, within the same global budget, use a larger output cap. A capped native `write_file`
@@ -779,21 +788,58 @@ repeating actor identity in every row. Character attribution is
 presentation over typed events; it never changes a controller event into a model tool call or
 claims that a model requested an automatic action.
 
-The web transcript treats stored execution detail as progressive disclosure. A standalone
-inference keeps a stable one-line marker. Consecutive tool-directed inferences by the same teammate,
-including their intermediate reasoning notes, are presented as one collapsed action run with one
-avatar and author line; the notes remain available inside the expanded run. Stage changes, teammate
-chat, user messages, and material Trinity feedback remain explicit boundaries. Internal bounded-turn
-accounting does not split a run. A terminal repeat-limit error remains durable evidence but is not
-rendered as a second actorless red card when Trinity's terminal delivery feedback already explains
-it; an adjacent workflow stop is combined into that same feedback card without merging the
-underlying durable causes.
-A fixed-size information affordance
-opens aggregate and per-call metrics without changing line layout. The session runtime summary uses
-the same labelled metric sheet. Harness artifact corrections render as Trinity
-feedback with human-readable context and expandable technical detail. Controller closure checkpoints
-remain durable events but are excluded from chat. Terminal session summaries and web delivery
-summaries derive commits and diffs from the task's captured repository baseline rather than an
+The web UI gives every Trinity-owned row the same restrained lilac identity treatment on provenance,
+information affordances, and a narrow surface accent; avatars remain unoutlined. Other named
+teammates use the same treatment with an accent sampled from their avatar background, while every
+content surface stays neutral. Automatic observations use a stars glyph and describe the repository
+read or inspection as predicted and completed early. Collapsed action runs use one primary label,
+one optional secondary action summary, and one disclosure chevron; expanded status and path detail
+do not compete in the normal transcript.
+
+The web transcript treats stored execution detail as progressive disclosure. Inference timing is
+presented after the work it measures: after visible prose for a text-only turn, or beneath the
+collapsed action run for a tool-directed turn. A completed invocation with no visible model output or
+action remains durable evidence but does not create a detached timing row. Consecutive tool-directed
+inferences by the same teammate are presented as one collapsed action run with one avatar and author
+line. Stage changes, teammate chat, user messages, and material Trinity feedback remain explicit
+boundaries. Internal bounded-turn accounting does not split a run. A terminal repeat-limit error
+remains durable evidence but is not rendered as a second actorless red card when Trinity's terminal
+delivery feedback already explains it; an adjacent workflow stop is combined into one conversational
+handoff without merging the underlying durable causes. When the same failed action produced an
+earlier identical correction, the transcript keeps the first explanation and repeated teammate
+action but suppresses stale duplicate corrections before the terminal outcome. The terminal outcome
+renders as two ordinary Trinity messages rather than a status card: the first directly tells the
+responsible teammate what went wrong and that their task is on hold, and the second addresses the
+local user by username with an available follow-up, restart, or resume request. The transcript does
+not use a terminal-status badge or give an ended teammate an actionable next step. A fixed-size
+information affordance opens aggregate and per-call metrics without changing line layout. The
+session runtime summary uses the same labelled metric sheet. When durable controller observations
+were admitted, that summary counts the early repository actions and describes an equal number of
+potentially avoided model turns as an explicit upper bound, not a measured counterfactual. Measured
+runtime, token, and energy totals remain actual session use. The detail sheet separately totals
+deterministic duplicate/batch prevention, no-progress loop stops, and native
+`rejected_constraint_candidates`; the last value is labelled as invalid output candidates filtered
+by the control collar, not as blocked tool calls. Per-inference sheets expose the same collar result
+and filtered-candidate evidence when present. Model prose, accepted plans, Trinity feedback, and
+delivery summaries share one responsive chat-row geometry; narrow screens render each as the same
+full-width card rather than nesting differently sized bubbles. Harness artifact corrections render
+as direct Trinity feedback with an actionable plain-language cause. Their raw controller evidence
+uses the same hover-information and touch-long-press detail sheet instead of an always-visible
+disclosure row. Trinity copy is selected from the durable correction kind: supplied repository
+evidence is presented as code Trinity already inspected, while artifact validation, tool failure,
+repeat prevention, diagnostics, and terminal pauses each have event-specific language. Visible copy
+uses teammate-level actions such as reading lines or retrying an edit rather than exposing
+prompt/context transfer. Guidance during an active teammate turn names that teammate and uses
+second-person language for the problem and next action. Terminal guidance instead addresses the user
+and labels non-completion explicitly. Consecutive rows with the same actor suppress repeated identity
+chrome until another actor speaks. The transcript inserts an absolute-time divider after a
+five-minute gap and a touch pull exposes every row's exact time. Assistant and Trinity prose use the
+same inert Markdown subset, including a compatibility form for tilde-wrapped file paths. Accepted
+plans derive their review badge from both the matching review artifact and terminal workflow state,
+so a failed, blocked, or cancelled workflow cannot remain labelled as awaiting review. Controller
+closure checkpoints remain durable events but are excluded from chat. Terminal session summaries
+and web delivery summaries derive commits and diffs from the task's captured repository baseline
+rather than an
 arbitrary recent-log window. For older strict-workflow summaries that predate this baseline, the web
 UI shows stored commit lines only when the event stream also contains a successful typed commit
 receipt.
