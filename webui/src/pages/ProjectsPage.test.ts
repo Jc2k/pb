@@ -108,24 +108,31 @@ Deno.test("project pages distinguish loading and API failures from empty state",
     Deno.readTextFile("webui/src/lib/hooks.ts"),
   ]);
 
-  ok(page.includes("projectsLoading"));
-  ok(page.includes("projectsError"));
-  ok(page.includes("sessionsLoading"));
-  ok(page.includes("sessionsError"));
+  ok(page.includes("dataLoading"));
+  ok(page.includes("dataError"));
   ok(page.includes("usageLoading"));
   ok(page.includes("usageError"));
   ok(page.includes("submitError"));
-  ok(page.indexOf("projectsLoading") < page.indexOf("Project not found."));
+  ok(page.indexOf("dataLoading") < page.indexOf("Project not found."));
   ok(page.includes("Projects may be out of date"));
   ok(page.includes("Project settings may be out of date"));
   ok(page.includes("Loading project settings"));
-  ok(page.includes("projectsError && projects.length > 0"));
+  ok(page.includes("dataError && projects.length > 0"));
   ok(hooks.includes("Project data request failed"));
   ok(hooks.includes('fetch("/api/project-sessions"'));
   ok(hooks.includes("dataRequest.current.start()"));
   ok(hooks.includes("snapshot.projects"));
   ok(hooks.includes("snapshot.sessions"));
   ok(hooks.includes("window.setInterval(() => void fetchData(), pollMs)"));
+  ok(hooks.includes("dataLoading"));
+  ok(hooks.includes("dataError"));
+  ok(hooks.includes("refresh: fetchData"));
+  ok(!hooks.includes("sessionsLoading"));
+  ok(!hooks.includes("projectsLoading"));
+  ok(!hooks.includes("sessionsError"));
+  ok(!hooks.includes("projectsError"));
+  ok(!hooks.includes("refreshSessions"));
+  ok(!hooks.includes("refreshProjects"));
   ok(!hooks.includes('fetch("/api/sessions"'));
   ok(page.includes("usageRequest.current.start()"));
   ok(page.includes("marketplaceRequest.current.start()"));
@@ -135,4 +142,16 @@ Deno.test("project pages distinguish loading and API failures from empty state",
   ok(page.includes("window.setInterval(() => void fetchProjects(), 5000)"));
   ok(page.includes("encodeURIComponent(project.id)"));
   ok(!page.includes("encodeURIComponent(project.name)"));
+});
+
+Deno.test("project integration mutations apply their authoritative response", async () => {
+  const source = await Deno.readTextFile("webui/src/pages/ProjectsPage.tsx");
+  const mutations = source.slice(
+    source.indexOf("const removeIntegration"),
+    source.indexOf("const cancelIntegration"),
+  );
+
+  equal(mutations.match(/projectMcpIntegrations/g)?.length, 2);
+  equal(mutations.match(/setInstalled\(nextInstalled\)/g)?.length, 2);
+  ok(!mutations.includes("fetchInstalledIntegrations"));
 });

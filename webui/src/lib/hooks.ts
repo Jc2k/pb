@@ -55,10 +55,8 @@ export function useProjectFinishNotifications(
 export function useProjectSessionData(pollMs = 5000) {
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
-  const [sessionsLoading, setSessionsLoading] = useState(true);
-  const [projectsLoading, setProjectsLoading] = useState(true);
-  const [sessionsError, setSessionsError] = useState("");
-  const [projectsError, setProjectsError] = useState("");
+  const [dataLoading, setDataLoading] = useState(true);
+  const [dataError, setDataError] = useState("");
   const dataRequest = useRef(new LatestRequest());
 
   const fetchData = useCallback(async () => {
@@ -76,8 +74,7 @@ export function useProjectSessionData(pollMs = 5000) {
       if (!dataRequest.current.owns(controller)) return;
       setProjects(snapshot.projects);
       setSessions(snapshot.sessions);
-      setProjectsError("");
-      setSessionsError("");
+      setDataError("");
     } catch (error) {
       if (isAbortError(error) || !dataRequest.current.owns(controller)) {
         return;
@@ -85,12 +82,10 @@ export function useProjectSessionData(pollMs = 5000) {
       const message = error instanceof Error
         ? error.message
         : "Project data request failed";
-      setProjectsError(message);
-      setSessionsError(message);
+      setDataError(message);
     } finally {
       if (dataRequest.current.owns(controller)) {
-        setProjectsLoading(false);
-        setSessionsLoading(false);
+        setDataLoading(false);
       }
     }
   }, []);
@@ -109,11 +104,8 @@ export function useProjectSessionData(pollMs = 5000) {
   return {
     sessions,
     projects,
-    sessionsLoading,
-    projectsLoading,
-    sessionsError,
-    projectsError,
-    refreshProjects: fetchData,
-    refreshSessions: fetchData,
+    dataLoading,
+    dataError,
+    refresh: fetchData,
   };
 }

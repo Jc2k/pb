@@ -35,6 +35,8 @@ projection needs an earlier tool call, superseded entry, final/block reason, che
 The browser SSE stream begins with a revisioned session snapshot and sends another snapshot after
 state-changing events. A reconnect cursor that has fallen outside retained history produces an
 explicit history reset instead of silently splicing two non-contiguous transcript windows.
+Every durable lifecycle transition, including queued follow-up and recovery work, publishes a typed
+state event before its mutation response completes; the browser never has to refetch to discover it.
 
 The browser starts repository-backed work with a registered project ID; resolving that identity to a
 display name and filesystem path belongs to the daemon. CLI commands may still supply an explicit
@@ -42,7 +44,8 @@ workdir. Registered projects have durable IDs, so renaming or moving a repositor
 restored sessions or usage from the project page. A single server snapshot refreshes the registry and
 its reconciled session list while project pages remain open.
 Mutating HTTP responses use a typed error code and server-authored message, so the web adapter does
-not infer domain state from bare HTTP status numbers.
+not infer domain state from bare HTTP status numbers. Integration mutations return the full
+authoritative installed collection rather than requiring a second read after a successful write.
 
 ## Component responsibilities
 

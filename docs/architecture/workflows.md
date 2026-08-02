@@ -823,6 +823,8 @@ embedded check/commit evidence for team messages, structured commit summaries, a
 increasing transcript sequence. Session restoration validates every projection against its payload
 and prior history, requires evidence references to resolve exactly once, rejects dangling or forward
 supersession, and admits only unique entry keys in increasing sequence order.
+Lifecycle mutations publish `SessionStateChanged` even when work remains queued behind another
+session, so terminal and browser consumers observe the accepted transition without a REST refresh.
 
 The live event endpoint subscribes before taking its history snapshot, assigns each SSE record the
 durable transcript entry key, and resumes after `Last-Event-ID`. A lagged subscriber is disconnected

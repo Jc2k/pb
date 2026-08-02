@@ -868,32 +868,36 @@ async fn install_project_integration(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<IntegrationInstallRequest>,
-) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
+) -> Result<Json<Vec<InstalledIntegration>>, IntegrationApiError> {
     let project_path = registered_project_path(&state, &id).await?;
-    tokio::task::spawn_blocking(move || integrations::install_project(&project_path, req))
-        .await
-        .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
-        .map(|response| Json(response.installed))
-        .map_err(|error| {
-            IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
-        })
+    tokio::task::spawn_blocking(move || {
+        integrations::install_project(&project_path, req)?;
+        integrations::list_project_installed(&project_path)
+    })
+    .await
+    .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    .map(Json)
+    .map_err(|error| {
+        IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    })
 }
 
 async fn remove_project_integration(
     Path((id, integration_name)): Path<(String, String)>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
+) -> Result<Json<Vec<InstalledIntegration>>, IntegrationApiError> {
     let project_path = registered_project_path(&state, &id).await?;
     tokio::task::spawn_blocking(move || {
         integrations::remove_project(
             &project_path,
             crate::integrations::IntegrationKind::Mcp,
             &integration_name,
-        )
+        )?;
+        integrations::list_project_installed(&project_path)
     })
     .await
     .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
-    .map(|response| Json(response.removed))
+    .map(Json)
     .map_err(|error| {
         IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
     })
@@ -932,26 +936,32 @@ async fn list_global_lsp_integrations()
 
 async fn install_global_lsp_integration(
     Json(req): Json<IntegrationInstallRequest>,
-) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
-    tokio::task::spawn_blocking(move || integrations::install_global_lsp(req))
-        .await
-        .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
-        .map(|response| Json(response.installed))
-        .map_err(|error| {
-            IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
-        })
+) -> Result<Json<Vec<InstalledIntegration>>, IntegrationApiError> {
+    tokio::task::spawn_blocking(move || {
+        integrations::install_global_lsp(req)?;
+        integrations::list_global_lsp_installed()
+    })
+    .await
+    .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    .map(Json)
+    .map_err(|error| {
+        IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    })
 }
 
 async fn remove_global_lsp_integration(
     Path(integration_name): Path<String>,
-) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
-    tokio::task::spawn_blocking(move || integrations::remove_global_lsp(&integration_name))
-        .await
-        .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
-        .map(|response| Json(response.removed))
-        .map_err(|error| {
-            IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
-        })
+) -> Result<Json<Vec<InstalledIntegration>>, IntegrationApiError> {
+    tokio::task::spawn_blocking(move || {
+        integrations::remove_global_lsp(&integration_name)?;
+        integrations::list_global_lsp_installed()
+    })
+    .await
+    .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    .map(Json)
+    .map_err(|error| {
+        IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    })
 }
 
 async fn start_session(
@@ -2441,6 +2451,7 @@ async fn continue_session(
     }
     session.cancel_token.store(false, Ordering::SeqCst);
     session.updated_at_ms = now_millis();
+    publish_session_state_changed(session);
 
     let history = Arc::clone(&session.history);
     let usage_records = Arc::clone(&session.usage_records);
@@ -2685,6 +2696,7 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
     session.updated_at_ms = now_millis();
     session.cancel_token.store(false, Ordering::SeqCst);
     session.request_template = request.clone();
+    publish_session_state_changed(session);
     let branch = session.branch.clone();
     let workdir = session.workdir.clone();
     let history = Arc::clone(&session.history);
@@ -2790,6 +2802,7 @@ fn prepare_blocked_workflow_restart(session: &mut SessionState, session_id: &str
             timestamp_ms: Some(now_millis()),
         },
     );
+    publish_session_state_changed(session);
     Ok(())
 }
 
@@ -2908,6 +2921,7 @@ async fn recover_task_plan(
             timestamp_ms: Some(now_millis()),
         },
     );
+    publish_session_state_changed(session);
     persist_live_session(&id, session);
     drop(sessions);
     dispatch_next_session(state);
@@ -3007,6 +3021,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         session.running = false;
         session.paused = false;
         session.status = SessionStatus::Completed;
+        publish_session_state_changed(session);
     }
     session.updated_at_ms = now_millis();
     let request = session.request_template.clone();
@@ -4236,6 +4251,26 @@ impl EventSink for WebEventSink {
     }
 }
 
+fn publish_session_state_changed(session: &SessionState) {
+    let status = match session.status {
+        SessionStatus::Queued => crate::events::SessionLifecycleStatus::Queued,
+        SessionStatus::Running => crate::events::SessionLifecycleStatus::Running,
+        SessionStatus::Paused => crate::events::SessionLifecycleStatus::Paused,
+        SessionStatus::Completed => crate::events::SessionLifecycleStatus::Completed,
+        SessionStatus::Failed => crate::events::SessionLifecycleStatus::Failed,
+    };
+    publish_event(
+        &session.sender,
+        &session.history,
+        AgentEvent::SessionStateChanged {
+            status,
+            running: session.running,
+            paused: session.paused,
+            timestamp_ms: Some(now_millis()),
+        },
+    );
+}
+
 fn dispatch_next_session(state: AppState) {
     tokio::spawn(async move {
         let (next, working) = {
@@ -4264,16 +4299,7 @@ fn dispatch_next_session(state: AppState) {
                     .accepting_user_messages
                     .store(true, Ordering::SeqCst);
                 session.updated_at_ms = now_millis();
-                publish_event(
-                    &session.sender,
-                    &session.history,
-                    AgentEvent::SessionStateChanged {
-                        status: crate::events::SessionLifecycleStatus::Running,
-                        running: true,
-                        paused: false,
-                        timestamp_ms: Some(now_millis()),
-                    },
-                );
+                publish_session_state_changed(session);
                 (
                     Some((
                         session_id,
@@ -4626,23 +4652,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             session.cancel_token.store(false, Ordering::SeqCst);
             session.pause_token.store(false, Ordering::SeqCst);
             session.status = final_status;
-            let status = match final_status {
-                SessionStatus::Queued => crate::events::SessionLifecycleStatus::Queued,
-                SessionStatus::Running => crate::events::SessionLifecycleStatus::Running,
-                SessionStatus::Paused => crate::events::SessionLifecycleStatus::Paused,
-                SessionStatus::Completed => crate::events::SessionLifecycleStatus::Completed,
-                SessionStatus::Failed => crate::events::SessionLifecycleStatus::Failed,
-            };
-            publish_event(
-                &session.sender,
-                &session.history,
-                AgentEvent::SessionStateChanged {
-                    status,
-                    running: session.running,
-                    paused: session.paused,
-                    timestamp_ms: Some(now_millis()),
-                },
-            );
+            publish_session_state_changed(session);
             persist_session_snapshot(
                 &session_id,
                 &session.request_template,
@@ -6733,6 +6743,43 @@ mod workflow_tests {
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn queued_session_transition_is_published_with_snapshot_semantics() {
+        let mut request = request(std::path::Path::new("."));
+        request.workdir = None;
+        request.branch = None;
+        request.repository_less = true;
+        let persisted = PersistedSession::from_parts(
+            request.session_id.clone(),
+            request,
+            None,
+            None,
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        let (_session_id, mut session) = session_from_persisted(persisted);
+        session.status = SessionStatus::Queued;
+        session.running = false;
+        session.paused = false;
+        let mut receiver = session.sender.subscribe();
+
+        publish_session_state_changed(&session);
+
+        let envelope = receiver.try_recv().unwrap();
+        assert!(envelope.requires_session_snapshot());
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::SessionStateChanged {
+                status: crate::events::SessionLifecycleStatus::Queued,
+                running: false,
+                paused: false,
+                ..
+            }
+        ));
+        assert_eq!(session.history.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

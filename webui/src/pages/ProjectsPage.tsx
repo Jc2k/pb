@@ -54,12 +54,9 @@ export function ProjectsPage() {
   const {
     projects,
     sessions,
-    projectsLoading,
-    sessionsLoading,
-    projectsError,
-    sessionsError,
-    refreshProjects,
-    refreshSessions,
+    dataLoading,
+    dataError,
+    refresh,
   } = useProjectSessionData();
 
   return (
@@ -74,20 +71,20 @@ export function ProjectsPage() {
 
       <section className="sessions-section">
         <div className="project-list session-list list-group">
-          {projectsLoading && projects.length === 0
+          {dataLoading && projects.length === 0
             ? (
               <div className="list-group-item text-secondary small">
                 Loading projects…
               </div>
             )
-            : projectsError && projects.length === 0
+            : dataError && projects.length === 0
             ? (
               <div className="list-group-item text-danger small">
-                <span>{projectsError}</span>{" "}
+                <span>{dataError}</span>{" "}
                 <button
                   type="button"
                   className="btn btn-sm btn-link"
-                  onClick={() => void refreshProjects()}
+                  onClick={() => void refresh()}
                 >
                   Try again
                 </button>
@@ -128,7 +125,7 @@ export function ProjectsPage() {
                         running ? "status-running" : "status-completed"
                       }`}
                     >
-                      {sessionsLoading
+                      {dataLoading
                         ? "Loading sessions…"
                         : `${projectSessions.length} session${
                           projectSessions.length === 1 ? "" : "s"
@@ -150,27 +147,14 @@ export function ProjectsPage() {
               })
             )}
         </div>
-        {projectsError && projects.length > 0 && (
+        {dataError && projects.length > 0 && (
           <div className="alert alert-warning mt-3" role="alert">
-            Projects may be out of date: {projectsError}{" "}
+            Projects may be out of date: {dataError}{" "}
             <button
               type="button"
               className="btn btn-sm btn-link"
               onClick={() =>
-                void refreshProjects()}
-            >
-              Try again
-            </button>
-          </div>
-        )}
-        {sessionsError && !projectsError && (
-          <div className="alert alert-warning mt-3" role="alert">
-            Session counts may be out of date: {sessionsError}{" "}
-            <button
-              type="button"
-              className="btn btn-sm btn-link"
-              onClick={() =>
-                void refreshSessions()}
+                void refresh()}
             >
               Try again
             </button>
@@ -188,6 +172,15 @@ export function nextProjectNotificationPreference(
 ): boolean {
   return !project.notify_on_finish;
 }
+
+function projectMcpIntegrations(
+  entries: InstalledIntegration[],
+): InstalledIntegration[] {
+  return uniqueInstalledIntegrations(
+    entries.filter((entry) => entry.kind === "mcp"),
+  );
+}
+
 export function ProjectPage() {
   const { projectId: encodedProjectId } = useParams<
     { projectId: string }
@@ -196,12 +189,9 @@ export function ProjectPage() {
   const {
     projects,
     sessions,
-    projectsLoading,
-    sessionsLoading,
-    projectsError,
-    sessionsError,
-    refreshProjects,
-    refreshSessions,
+    dataLoading,
+    dataError,
+    refresh,
   } = useProjectSessionData();
   const [task, setTask] = useState("");
   const [intent, setIntent] = useState<ComposerMode>("discuss");
@@ -381,21 +371,21 @@ export function ProjectPage() {
             )}
           </div>
 
-          {project && projectsError && (
+          {project && dataError && (
             <div className="alert alert-warning" role="alert">
-              Project details may be out of date: {projectsError}{" "}
+              Project details may be out of date: {dataError}{" "}
               <button
                 type="button"
                 className="btn btn-sm btn-link"
                 onClick={() =>
-                  void refreshProjects()}
+                  void refresh()}
               >
                 Try again
               </button>
             </div>
           )}
 
-          {projectsLoading && !project
+          {dataLoading && !project
             ? (
               <div className="card soft-card">
                 <div className="card-body text-secondary">
@@ -403,15 +393,15 @@ export function ProjectPage() {
                 </div>
               </div>
             )
-            : projectsError && !project
+            : dataError && !project
             ? (
               <div className="card soft-card">
                 <div className="card-body text-danger">
-                  {projectsError}{" "}
+                  {dataError}{" "}
                   <button
                     type="button"
                     className="btn btn-sm btn-link"
-                    onClick={() => void refreshProjects()}
+                    onClick={() => void refresh()}
                   >
                     Try again
                   </button>
@@ -516,20 +506,7 @@ export function ProjectPage() {
           {project && (
             <section className="sessions-section project-sessions-panel">
               <h2>Project sessions</h2>
-              {sessionsError && !projectsError && (
-                <div className="alert alert-warning" role="alert">
-                  {sessionsError}{" "}
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-link"
-                    onClick={() =>
-                      void refreshSessions()}
-                  >
-                    Try again
-                  </button>
-                </div>
-              )}
-              {sessionsLoading
+              {dataLoading
                 ? <p className="text-secondary small">Loading sessions…</p>
                 : (
                   <>
@@ -839,10 +816,8 @@ export function ProjectSettingsPage() {
           ),
         );
       }
-      const nextInstalled = uniqueInstalledIntegrations(
-        ((await res.json()) as InstalledIntegration[]).filter((entry) =>
-          entry.kind === "mcp"
-        ),
+      const nextInstalled = projectMcpIntegrations(
+        (await res.json()) as InstalledIntegration[],
       );
       if (!installedRequest.current.owns(controller)) return;
       setInstalled(nextInstalled);
@@ -1049,8 +1024,12 @@ export function ProjectSettingsPage() {
           await integrationApiError(res, "Could not remove the integration"),
         );
       }
+      const nextInstalled = projectMcpIntegrations(
+        (await res.json()) as InstalledIntegration[],
+      );
       if (!integrationMutationRequest.current.owns(controller)) return;
-      void fetchInstalledIntegrations();
+      setInstalled(nextInstalled);
+      setInstalledError("");
     } catch (error) {
       if (
         isAbortError(error) ||
@@ -1086,12 +1065,16 @@ export function ProjectSettingsPage() {
           await integrationApiError(res, "Could not install the integration"),
         );
       }
+      const nextInstalled = projectMcpIntegrations(
+        (await res.json()) as InstalledIntegration[],
+      );
       if (!integrationMutationRequest.current.owns(controller)) return;
+      setInstalled(nextInstalled);
+      setInstalledError("");
       invalidateSchemaRequest();
       setPendingInstall(null);
       setConfigSchema(null);
       setSchemaError("");
-      void fetchInstalledIntegrations();
     } catch (error) {
       if (
         isAbortError(error) ||

@@ -180,7 +180,10 @@ export function IntegrationsPage() {
           await integrationApiError(res, "Could not remove the integration"),
         );
       }
-      void fetchInstalledIntegrations();
+      const nextInstalled = uniqueInstalledIntegrations(
+        (await res.json()) as InstalledIntegration[],
+      );
+      setInstalled(nextInstalled);
     } catch (error) {
       setPageError(
         error instanceof Error
@@ -207,11 +210,14 @@ export function IntegrationsPage() {
           await integrationApiError(res, "Could not install the integration"),
         );
       }
+      const nextInstalled = uniqueInstalledIntegrations(
+        (await res.json()) as InstalledIntegration[],
+      );
+      setInstalled(nextInstalled);
       invalidateSchemaRequest();
       setPendingInstall(null);
       setConfigSchema(null);
       setSchemaError("");
-      void fetchInstalledIntegrations();
     } catch (error) {
       setSubmitError(
         error instanceof Error
