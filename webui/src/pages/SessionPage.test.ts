@@ -201,7 +201,7 @@ Deno.test("session corrections render as direct steward chat with progressive de
   ok(component.includes("Technical details"));
   ok(component.includes("function WorkflowBlockedNotice"));
   ok(component.includes('audience === "current_user"'));
-  ok(component.includes('fetch("/api/current-user"'));
+  ok(!component.includes('fetch("/api/current-user"'));
   ok(component.includes("Task hold message from ${teammate.name}"));
   ok(component.includes("Request from ${teammate.name} to the current user"));
   ok(!component.includes("Delivery not completed"));
@@ -416,8 +416,21 @@ Deno.test("terminal Trinity feedback uses server-authored chatter and addresses 
   ok(component.includes("const teammateFeedback = envelope.chatter.find("));
   ok(component.includes("const userFeedback = envelope.chatter.find("));
   ok(component.includes('audience === "current_user"'));
-  ok(component.includes("@${currentUsername}, ${"));
+  ok(component.includes("<RichText content={userFeedback.message} />"));
+  ok(!component.includes("currentUsername"));
   ok(!component.includes("Choose **Build** below"));
+});
+
+Deno.test("session mutations wait for authoritative stream lifecycle effects", async () => {
+  const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+  const mutations = page.slice(
+    page.indexOf("const continueSession"),
+    page.indexOf("const onChatScroll"),
+  );
+
+  ok(!mutations.includes("setSessionRunning"));
+  ok(!mutations.includes('setIntent("discuss")'));
+  equal(page.match(/setSessionRunning/g)?.length, 4);
 });
 
 Deno.test("session workspace prioritizes chat and shows work details only when useful", async () => {

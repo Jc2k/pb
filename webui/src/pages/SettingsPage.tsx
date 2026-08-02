@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PageShell } from "../components/PageShell";
+import { apiErrorMessage } from "../lib/integrationConfig";
 
 export interface WebSettings {
   prevent_sleep_while_working: boolean;
@@ -321,15 +322,6 @@ export function TailscaleAccessControl(
   );
 }
 
-async function responseError(response: Response, fallback: string) {
-  try {
-    const body = (await response.json()) as { error?: string };
-    return body.error || fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 export function SettingsPage() {
   const [settings, setSettings] = useState<WebSettings | null>(null);
   const [saving, setSaving] = useState(false);
@@ -346,7 +338,11 @@ export function SettingsPage() {
   const refreshSettings = async () => {
     const epoch = requestEpoch.current;
     const response = await fetch("/api/settings");
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      throw new Error(
+        await apiErrorMessage(response, "Could not load settings"),
+      );
+    }
     const next = (await response.json()) as WebSettings;
     if (epoch === requestEpoch.current) setSettings(next);
   };
@@ -358,7 +354,11 @@ export function SettingsPage() {
       const epoch = requestEpoch.current;
       try {
         const response = await fetch("/api/settings");
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.ok) {
+          throw new Error(
+            await apiErrorMessage(response, "Could not load settings"),
+          );
+        }
         const next = (await response.json()) as WebSettings;
         if (mounted && epoch === requestEpoch.current) {
           setSettings(next);
@@ -389,7 +389,11 @@ export function SettingsPage() {
     const epoch = tailscaleRequestEpoch.current;
     try {
       const response = await fetch("/api/settings/tailscale");
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        throw new Error(
+          await apiErrorMessage(response, "Could not inspect Tailscale"),
+        );
+      }
       const next = (await response.json()) as TailscaleSettings;
       if (epoch === tailscaleRequestEpoch.current) {
         setTailscale(next);
@@ -434,7 +438,11 @@ export function SettingsPage() {
           prevent_sleep_while_working: !settings.prevent_sleep_while_working,
         }),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        throw new Error(
+          await apiErrorMessage(response, "Could not save setting"),
+        );
+      }
       setSettings((await response.json()) as WebSettings);
     } catch (requestError) {
       setError(
@@ -463,7 +471,7 @@ export function SettingsPage() {
       });
       if (!response.ok) {
         throw new Error(
-          await responseError(response, `HTTP ${response.status}`),
+          await apiErrorMessage(response, "Could not change secure access"),
         );
       }
       setTailscale((await response.json()) as TailscaleSettings);

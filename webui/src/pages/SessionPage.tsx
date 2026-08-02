@@ -6,7 +6,6 @@ import type {
   ComposerMode,
   EventEnvelope,
   SessionDetails,
-  SessionStreamSnapshot,
   WorkflowSummary,
 } from "../types";
 import { IntentControl } from "../components/IntentControl";
@@ -46,6 +45,11 @@ import {
 } from "../lib/sessionUtils";
 import { isAbortError, LatestRequest } from "../lib/hooks";
 import { apiErrorMessage } from "../lib/integrationConfig";
+import {
+  parseEventEnvelopeJson,
+  parseSessionDetailsJson,
+  parseSessionStreamSnapshotJson,
+} from "../lib/eventContract";
 
 export function isNewerThanSnapshot(
   sequence: number,
@@ -193,9 +197,9 @@ export function SessionPage() {
     src.addEventListener("session_snapshot", (message) => {
       if (sourceRef.current !== src) return;
       try {
-        const parsed = JSON.parse(
+        const parsed = parseSessionStreamSnapshotJson(
           (message as MessageEvent<string>).data,
-        ) as SessionStreamSnapshot;
+        );
         applySessionSnapshot(parsed.session, parsed.reset_history);
       } catch (error) {
         console.error(error);
@@ -204,7 +208,7 @@ export function SessionPage() {
     src.onmessage = (msg) => {
       if (sourceRef.current !== src) return;
       try {
-        const parsed = JSON.parse(msg.data) as EventEnvelope;
+        const parsed = parseEventEnvelopeJson(msg.data);
         setEvents((previous) => mergeEventHistory(previous, [parsed]));
         const effect = parsed.transcript.session_effect;
         const sequence = parsed.transcript.sequence;
@@ -271,9 +275,9 @@ export function SessionPage() {
         signal: controller.signal,
       });
       if (!res.ok) {
-        throw new Error(`Session request failed (${res.status})`);
+        throw new Error(await apiErrorMessage(res, "Session request failed"));
       }
-      const details = (await res.json()) as SessionDetails;
+      const details = parseSessionDetailsJson(await res.text());
       if (!sessionRequestRef.current.owns(controller)) return;
       applySessionSnapshot(details);
     } catch (error) {
@@ -316,7 +320,6 @@ export function SessionPage() {
       }
       if (!actionRequestRef.current.owns(controller)) return;
       setFollowUp("");
-      setSessionRunning(false);
     } catch (error) {
       if (isAbortError(error) || !actionRequestRef.current.owns(controller)) {
         return;
@@ -448,7 +451,6 @@ export function SessionPage() {
         );
         return;
       }
-      setSessionRunning(false);
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setWorkflowRecoveryError(
@@ -479,8 +481,6 @@ export function SessionPage() {
         );
         return;
       }
-      setSessionRunning(false);
-      setIntent("discuss");
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setActionError(
@@ -571,7 +571,6 @@ export function SessionPage() {
         return;
       }
       setAnswer("");
-      setSessionRunning(true);
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setActionError(

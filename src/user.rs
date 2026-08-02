@@ -123,6 +123,16 @@ fn current_effective_username() -> Result<String, MacOsUserError> {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn current_username() -> Option<String> {
+    current_effective_username().ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn current_username() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
 fn open_directory_user_record(username: &str) -> Result<Retained<ODRecord>, MacOsUserError> {
     unsafe {
         let mut err: Option<Retained<NSError>> = None;

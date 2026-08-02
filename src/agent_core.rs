@@ -15889,6 +15889,7 @@ fn delivery_terminal_outcome(
                     .blocked_cause
                     .context("terminal workflow has no producer-authored blocked cause")?,
                 reason: detail.clone(),
+                current_user: crate::user::current_username(),
                 timestamp_ms: Some(now_millis()),
             },
             supersedes,

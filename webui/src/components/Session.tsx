@@ -659,30 +659,6 @@ function WorkflowBlockedNotice({
     ({ audience }) => audience === "current_user",
   )!;
   const teammate = teamActorPresentation(teammateFeedback.actor);
-  const [currentUsername, setCurrentUsername] = useState<string>();
-
-  useEffect(() => {
-    const controller = new AbortController();
-    fetch("/api/current-user", { signal: controller.signal })
-      .then((response) => response.ok ? response.json() : null)
-      .then((currentUser: { username?: string } | null) => {
-        const username = currentUser?.username?.trim();
-        if (username) setCurrentUsername(username);
-      })
-      .catch((error) => {
-        if (!(error instanceof DOMException && error.name === "AbortError")) {
-          console.debug("Could not address the current user by name", error);
-        }
-      });
-    return () => controller.abort();
-  }, []);
-
-  const requestMessage = userFeedback.message;
-  const userMessage = currentUsername
-    ? `@${currentUsername}, ${requestMessage.charAt(0).toLocaleLowerCase()}${
-      requestMessage.slice(1)
-    }`
-    : userFeedback.message;
 
   return (
     <>
@@ -729,7 +705,7 @@ function WorkflowBlockedNotice({
             <span className="action-origin">{teammate.provenance}</span>
           </div>
           <div className="bubble thought-bubble correction-bubble">
-            <RichText content={userMessage} />
+            <RichText content={userFeedback.message} />
           </div>
         </div>
         <MessageTime timestampMs={event.timestamp_ms} />

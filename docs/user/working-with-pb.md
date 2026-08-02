@@ -315,19 +315,28 @@ Persisted sessions and their events must use the current v5 schemas. Incompatibl
 notes are skipped during restoration instead of being migrated or shown with guessed attribution.
 The current schema requires every session-state key explicitly, using `null` rather than omission
 for inactive state and rejecting unknown compatibility fields. It stores the session start time,
-Trinity's authored chatter, structured commit summaries, typed check/commit evidence,
+Trinity's complete authored chatter (including the username-addressed request to the local user),
+structured commit summaries, typed check/commit evidence,
 registered-project identity, pending proposals, and Goal
 change requests directly so the terminal and browser show the same team conversation and actions
 without reconstructing them from nearby events. Session snapshots and live events share a monotonic
 revision, preventing a slower snapshot response from reverting a newer title or running state.
 The browser addresses registered projects by durable ID rather than copying their names or filesystem
 paths into session, Goal, usage, notification, or integration requests. The service resolves that ID
-and returns structured failures for invalid or stale mutations. Live effects at or below the accepted snapshot revision are replay,
+and returns structured failures for invalid or stale mutations. Successful browser mutations wait for
+those responses and streams instead of guessing the new lifecycle state. Live effects at or below
+the accepted snapshot revision are replay,
 while the SSE service sends revisioned session snapshots after state-changing events. When a browser
 reconnect cursor is no longer retained, the service marks the snapshot as a history reset rather
-than joining non-contiguous transcript windows. Project pages consume one server-authored registry
-and session snapshot, so projects added or removed through the CLI appear without a browser reload
-and project/session identity cannot drift between separate requests.
+than joining non-contiguous transcript windows. Project pages consume a server-sent registry,
+session, project-usage, and terminal-transition snapshot instead of polling separate endpoints. Each
+service process gives that stream a new identity and monotonic revision, and only the live stream may
+change the browser's accepted process identity, so a delayed HTTP response cannot restore an older
+process after restart. The service records a subscription-specific terminal-transition floor under
+the same publication lock as revisions and retained transitions. Projects added or removed through
+the CLI therefore appear without a browser reload, a session that finishes while the first snapshot
+is being built still produces one finish notification, and project/session identity and usage cannot
+drift between separate requests.
 
 The service records an event before making it live. Terminal reattachment atomically captures
 history and subscribes, recovers a lagged receiver from sequence-numbered history, and drains final

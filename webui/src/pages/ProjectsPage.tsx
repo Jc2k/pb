@@ -189,6 +189,7 @@ export function ProjectPage() {
   const {
     projects,
     sessions,
+    projectUsage,
     dataLoading,
     dataError,
     refresh,
@@ -204,19 +205,20 @@ export function ProjectPage() {
   const [activeDetailsTab, setActiveDetailsTab] = useState<ProjectDetailsTab>(
     "usage",
   );
-  const [usage, setUsage] = useState<ProjectUsageStats>({
-    tokens: 0,
-    runtime_ms: 0,
-    tool_calls: 0,
-  });
-  const [usageLoading, setUsageLoading] = useState(true);
-  const [usageError, setUsageError] = useState("");
-  const usageRequest = useRef(new LatestRequest());
   const startRequest = useRef(new LatestRequest());
   const projectId = encodedProjectId
     ? decodeURIComponent(encodedProjectId)
     : "";
   const project = projects.find((entry) => entry.id === projectId);
+  const usage: ProjectUsageStats = project
+    ? projectUsage[project.id] || {
+      tokens: 0,
+      runtime_ms: 0,
+      tool_calls: 0,
+    }
+    : { tokens: 0, runtime_ms: 0, tool_calls: 0 };
+  const usageLoading = dataLoading && !project;
+  const usageError = dataError;
   const projectSessions = useMemo(
     () =>
       project
@@ -253,47 +255,6 @@ export function ProjectPage() {
     startRequest.current.abort();
     return () => startRequest.current.abort();
   }, [projectId]);
-
-  useEffect(() => {
-    if (!projectId || !project) {
-      usageRequest.current.abort();
-      setUsageLoading(false);
-      return;
-    }
-    setUsageLoading(true);
-    setUsageError("");
-    const fetchUsage = async () => {
-      const controller = usageRequest.current.start();
-      try {
-        const res = await fetch(
-          `/api/projects/${encodeURIComponent(project.id)}/usage`,
-          { signal: controller.signal },
-        );
-        if (!res.ok) {
-          throw new Error(await apiErrorMessage(res, "Usage request failed"));
-        }
-        const nextUsage = (await res.json()) as ProjectUsageStats;
-        if (usageRequest.current.owns(controller)) {
-          setUsage(nextUsage);
-          setUsageError("");
-        }
-      } catch (error) {
-        if (!isAbortError(error) && usageRequest.current.owns(controller)) {
-          setUsageError(
-            error instanceof Error ? error.message : "Usage request failed",
-          );
-        }
-      } finally {
-        if (usageRequest.current.owns(controller)) setUsageLoading(false);
-      }
-    };
-    void fetchUsage();
-    const timer = window.setInterval(() => void fetchUsage(), 5000);
-    return () => {
-      window.clearInterval(timer);
-      usageRequest.current.abort();
-    };
-  }, [projectId, project?.id]);
 
   const startProjectSession = async () => {
     if (!project || !task.trim()) return;
@@ -712,9 +673,13 @@ export function ProjectSettingsPage() {
   const { projectId: encodedProjectId } = useParams<
     { projectId: string }
   >();
-  const [projects, setProjects] = useState<ProjectEntry[]>([]);
-  const [projectsLoading, setProjectsLoading] = useState(true);
-  const [projectsError, setProjectsError] = useState("");
+  const {
+    projects,
+    dataLoading: projectsLoading,
+    dataError: projectsDataError,
+    refresh: fetchProjects,
+  } = useProjectSessionData({ finishNotifications: false });
+  const [projectsMutationError, setProjectsMutationError] = useState("");
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
   const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
   const [pendingInstall, setPendingInstall] = useState<
@@ -742,7 +707,6 @@ export function ProjectSettingsPage() {
     id: number;
     controller?: AbortController;
   }>({ id: 0 });
-  const projectsRequest = useRef(new LatestRequest());
   const marketplaceRequest = useRef(new LatestRequest());
   const installedRequest = useRef(new LatestRequest());
   const invalidateSchemaRequest = () => {
@@ -751,7 +715,6 @@ export function ProjectSettingsPage() {
   };
   useEffect(() => () => {
     invalidateSchemaRequest();
-    projectsRequest.current.abort();
     marketplaceRequest.current.abort();
     installedRequest.current.abort();
     notificationRequest.current.abort();
@@ -761,6 +724,7 @@ export function ProjectSettingsPage() {
     ? decodeURIComponent(encodedProjectId)
     : "";
   const project = projects.find((entry) => entry.id === projectId);
+  const projectsError = projectsMutationError || projectsDataError;
   const integrationError = integrationMutationError || installedError ||
     marketplaceError;
   const filteredMarketplace = marketplace.filter((item) => {
@@ -773,32 +737,6 @@ export function ProjectSettingsPage() {
       );
     return matchesCategory && matchesSearch;
   });
-
-  const fetchProjects = useCallback(async () => {
-    const controller = projectsRequest.current.start();
-    setProjectsLoading(true);
-    try {
-      const res = await fetch("/api/projects", { signal: controller.signal });
-      if (!res.ok) {
-        throw new Error(
-          await apiErrorMessage(res, "Project request failed"),
-        );
-      }
-      const nextProjects = (await res.json()) as ProjectEntry[];
-      if (!projectsRequest.current.owns(controller)) return;
-      setProjects(nextProjects);
-      setProjectsError("");
-    } catch (error) {
-      if (isAbortError(error) || !projectsRequest.current.owns(controller)) {
-        return;
-      }
-      setProjectsError(
-        error instanceof Error ? error.message : "Project request failed",
-      );
-    } finally {
-      if (projectsRequest.current.owns(controller)) setProjectsLoading(false);
-    }
-  }, []);
 
   const fetchInstalledIntegrations = useCallback(async () => {
     if (!project) return;
@@ -835,8 +773,6 @@ export function ProjectSettingsPage() {
   }, [project?.id, project?.path]);
 
   useEffect(() => {
-    void fetchProjects();
-    const projectsTimer = window.setInterval(() => void fetchProjects(), 5000);
     const controller = marketplaceRequest.current.start();
     void fetch("/api/integrations/marketplace", {
       signal: controller.signal,
@@ -871,8 +807,8 @@ export function ProjectSettingsPage() {
             : "Could not load the integration marketplace",
         );
       });
-    return () => window.clearInterval(projectsTimer);
-  }, [fetchProjects]);
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     invalidateSchemaRequest();
@@ -883,6 +819,7 @@ export function ProjectSettingsPage() {
     setSubmitError("");
     setSubmitting(false);
     setIntegrationMutationError("");
+    setProjectsMutationError("");
     setNotificationMutationPending(false);
     notificationRequest.current.abort();
     integrationMutationRequest.current.abort();
@@ -917,16 +854,14 @@ export function ProjectSettingsPage() {
           await apiErrorMessage(res, "Could not update notifications"),
         );
       }
-      const updated = (await res.json()) as ProjectEntry;
+      await res.text();
       if (!notificationRequest.current.owns(controller)) return;
-      setProjects((current) =>
-        current.map((entry) => entry.id === updated.id ? updated : entry)
-      );
+      setProjectsMutationError("");
     } catch (error) {
       if (
         isAbortError(error) || !notificationRequest.current.owns(controller)
       ) return;
-      setProjectsError(
+      setProjectsMutationError(
         error instanceof Error
           ? error.message
           : "Could not update notifications",

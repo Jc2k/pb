@@ -43,6 +43,7 @@ const MAX_HISTORY_EVENTS: usize = 1_000;
 const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
 const MAX_USER_MESSAGE_CHARS: usize = 8_000;
 const MAX_PENDING_USER_MESSAGES: usize = 32;
+const MAX_PROJECT_SESSION_TERMINAL_TRANSITIONS: usize = 256;
 static USER_MESSAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ID_FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -224,8 +225,25 @@ pub struct SessionListItem {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSessionSnapshot {
+    pub stream_id: String,
+    pub revision: u64,
+    pub terminal_transition_floor: u64,
+    pub terminal_transitions: Vec<ProjectSessionTerminalTransition>,
     pub projects: Vec<ProjectEntry>,
     pub sessions: Vec<SessionListItem>,
+    pub project_usage: HashMap<String, ProjectUsageStats>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSessionTerminalTransition {
+    pub entry_key: String,
+    pub revision: u64,
+    pub session_id: String,
+    pub status: SessionStatus,
+    pub task: String,
+    pub title: Option<String>,
+    pub handoff_outcome: Option<HandoffOutcome>,
+    pub project: Option<ProjectEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,6 +383,7 @@ pub struct PendingQuestionView {
 pub struct DeleteSessionResponse {
     pub session_id: String,
     pub deleted: bool,
+    pub cleanup_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,17 +497,151 @@ struct SessionState {
     updated_at_ms: u64,
 }
 
+#[derive(Debug, Default)]
+struct ProjectSessionPublication {
+    terminal_transitions: VecDeque<ProjectSessionTerminalTransition>,
+}
+
 #[derive(Debug, Clone)]
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     projects: Arc<Mutex<Vec<ProjectEntry>>>,
     project_usage: Arc<Mutex<HashMap<String, ProjectUsageStats>>>,
+    project_session_stream_id: Arc<String>,
+    project_session_revision: Arc<AtomicU64>,
+    project_session_publication: Arc<StdMutex<ProjectSessionPublication>>,
+    project_session_sender: broadcast::Sender<u64>,
     sleep_prevention: Arc<StdMutex<SleepPrevention>>,
     tailscale: Arc<StdMutex<crate::tailscale::TailscaleIntegration>>,
     web_listen: String,
 }
 
 impl AppState {
+    fn publish_project_session_update(
+        &self,
+        mut terminal_transition: Option<ProjectSessionTerminalTransition>,
+    ) -> u64 {
+        let mut publication = self
+            .project_session_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let revision = self
+            .project_session_revision
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+            .min(u64::MAX);
+        if let Some(transition) = terminal_transition.as_mut() {
+            transition.revision = revision;
+        }
+        if let Some(transition) = terminal_transition {
+            publication.terminal_transitions.push_back(transition);
+            while publication.terminal_transitions.len() > MAX_PROJECT_SESSION_TERMINAL_TRANSITIONS
+            {
+                publication.terminal_transitions.pop_front();
+            }
+        }
+        let _ = self.project_session_sender.send(revision);
+        revision
+    }
+
+    fn publish_project_session_change(&self) -> u64 {
+        self.publish_project_session_update(None)
+    }
+
+    fn subscribe_project_session_changes(&self) -> (broadcast::Receiver<u64>, u64) {
+        let _publication = self
+            .project_session_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            self.project_session_sender.subscribe(),
+            self.project_session_revision.load(Ordering::SeqCst),
+        )
+    }
+
+    fn project_session_revision_baseline(&self) -> u64 {
+        let _publication = self
+            .project_session_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.project_session_revision.load(Ordering::SeqCst)
+    }
+
+    async fn terminal_transition(
+        &self,
+        session_id: &str,
+        entry_key: String,
+        status: SessionStatus,
+    ) -> Option<ProjectSessionTerminalTransition> {
+        let projects = self.projects.lock().await;
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        let (title, handoff_outcome, _) = session_history_summary(session);
+        let project = session.durable.project.as_ref().and_then(|stored| {
+            projects
+                .iter()
+                .find(|project| project.id == stored.id)
+                .cloned()
+        });
+        Some(ProjectSessionTerminalTransition {
+            entry_key,
+            revision: 0,
+            session_id: session_id.to_string(),
+            status,
+            task: session.task.clone(),
+            title,
+            handoff_outcome,
+            project,
+        })
+    }
+
+    fn watch_session_changes(
+        &self,
+        session_id: String,
+        mut receiver: broadcast::Receiver<EventEnvelope>,
+    ) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(envelope) if envelope.affects_project_session_snapshot() => {
+                        let status = match envelope.event {
+                            AgentEvent::SessionStateChanged {
+                                status: crate::events::SessionLifecycleStatus::Completed,
+                                ..
+                            } => Some(SessionStatus::Completed),
+                            AgentEvent::SessionStateChanged {
+                                status: crate::events::SessionLifecycleStatus::Failed,
+                                ..
+                            } => Some(SessionStatus::Failed),
+                            _ => None,
+                        };
+                        let transition = if let Some(status) = status {
+                            state
+                                .terminal_transition(
+                                    &session_id,
+                                    envelope.transcript.entry_key,
+                                    status,
+                                )
+                                .await
+                        } else {
+                            None
+                        };
+                        state.publish_project_session_update(transition);
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        state.publish_project_session_change();
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     fn update_sleep_prevention_working(&self, working: bool) {
         self.sleep_prevention
             .lock()
@@ -575,10 +728,15 @@ pub async fn run_server_with_ready(
             }
         }
     });
+    let (project_session_sender, _) = broadcast::channel(256);
     let state = AppState {
         sessions: Arc::new(Mutex::new(restored_sessions)),
         projects: Arc::new(Mutex::new(project_entries)),
         project_usage: Arc::new(Mutex::new(project_usage)),
+        project_session_stream_id: Arc::new(new_durable_id("project-session-stream")),
+        project_session_revision: Arc::new(AtomicU64::new(0)),
+        project_session_publication: Arc::new(StdMutex::new(ProjectSessionPublication::default())),
+        project_session_sender,
         sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(
             user_config.effective_prevent_sleep_while_working(),
         ))),
@@ -589,6 +747,23 @@ pub async fn run_server_with_ready(
         ))),
         web_listen: args.host.clone(),
     };
+
+    {
+        let sessions = state.sessions.lock().await;
+        for (session_id, session) in sessions.iter() {
+            state.watch_session_changes(session_id.clone(), session.sender.subscribe());
+        }
+    }
+    let project_watch_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            if let Err(error) = reload_projects(&project_watch_state).await {
+                tracing::warn!(%error, "failed to refresh the project registry");
+            }
+        }
+    });
 
     let app = Router::new()
         .route("/api/sessions", post(start_session).get(list_sessions))
@@ -632,6 +807,7 @@ pub async fn run_server_with_ready(
             post(discard_goal_amendment),
         )
         .route("/api/project-sessions", get(list_project_sessions))
+        .route("/api/project-sessions/events", get(project_session_events))
         .route("/api/projects", get(list_projects))
         .route("/api/projects/{id}/usage", get(get_project_usage))
         .route(
@@ -1117,6 +1293,8 @@ async fn start_session_inner(
         }
         sessions.insert(session_id.clone(), session);
     }
+    state.watch_session_changes(session_id.clone(), sender.subscribe());
+    state.publish_project_session_change();
 
     let empty_history = StdMutex::new(Vec::new());
     persist_session_snapshot(
@@ -1295,6 +1473,7 @@ async fn start_goal_inner(
     let project = named_project
         .map(|(_, project)| project)
         .or_else(|| resolve_session_project(&registered_projects, Some(&workdir)));
+    let session_sender = sender.clone();
     let mut session = SessionState {
         task: objective.clone(),
         title: Some(objective),
@@ -1329,6 +1508,9 @@ async fn start_goal_inner(
     publish_goal_started(&mut session, &checkpoint);
     persist_live_session(&session_id, &session);
     sessions.insert(session_id.clone(), session);
+    drop(sessions);
+    state.watch_session_changes(session_id.clone(), session_sender.subscribe());
+    state.publish_project_session_change();
     Ok(GoalResponse {
         session_id,
         goal_id,
@@ -1448,7 +1630,7 @@ fn publish_goal_started(session: &mut SessionState, checkpoint: &crate::goal::Go
 async fn get_goal(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<crate::goal::GoalCheckpoint>, StatusCode> {
+) -> Result<Json<crate::goal::GoalCheckpoint>, ApiError> {
     let sessions = state.sessions.lock().await;
     sessions
         .values()
@@ -1466,7 +1648,13 @@ async fn get_goal(
                 .cloned()
         })
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "goal_not_found",
+                format!("goal not found: {id}"),
+            )
+        })
 }
 
 async fn approve_goal_plan(
@@ -3289,11 +3477,17 @@ async fn list_sessions(
 async fn get_session(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<SessionDetails>, StatusCode> {
+) -> Result<Json<SessionDetails>, ApiError> {
     session_details_snapshot(&state, &id)
         .await
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                format!("session not found: {id}"),
+            )
+        })
 }
 
 async fn status(
@@ -3334,24 +3528,66 @@ async fn status(
 async fn delete_session(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<DeleteSessionResponse>, StatusCode> {
+) -> Result<Json<DeleteSessionResponse>, ApiError> {
     delete_session_inner(state, &id)
         .await
         .map(Json)
-        .map_err(|_| StatusCode::NOT_FOUND)
+        .map_err(|error| match error {
+            DeleteSessionError::NotFound(message) => {
+                ApiError::new(StatusCode::NOT_FOUND, "session_not_found", message)
+            }
+            DeleteSessionError::Active(message) => {
+                ApiError::new(StatusCode::CONFLICT, "session_active", message)
+            }
+            DeleteSessionError::Internal(error) => ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_delete_failed",
+                error,
+            ),
+        })
 }
 
-async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSessionResponse> {
+#[derive(Debug, thiserror::Error)]
+enum DeleteSessionError {
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
+    Active(String),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+async fn delete_session_inner(
+    state: AppState,
+    id: &str,
+) -> Result<DeleteSessionResponse, DeleteSessionError> {
     let session = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(id) else {
-            anyhow::bail!("session not found: {id}");
+            return Err(DeleteSessionError::NotFound(format!(
+                "session not found: {id}"
+            )));
         };
         if session.status == SessionStatus::Running
             || session.status == SessionStatus::Queued
             || session.pending_question.is_some()
         {
-            anyhow::bail!("session is active: {id}");
+            return Err(DeleteSessionError::Active(format!(
+                "session is active: {id}"
+            )));
+        }
+        let persisted_workdir = session
+            .workdir
+            .clone()
+            .or_else(|| session.request_template.workdir.clone());
+        if let Some(workdir) = persisted_workdir {
+            let session_id = id.to_string();
+            tokio::task::spawn_blocking(move || {
+                session_store::delete_session(&workdir, &session_id)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("session persistence deletion task failed: {error}"))?
+            .map_err(anyhow::Error::from)?;
         }
         sessions.remove(id).expect("session exists")
     };
@@ -3369,19 +3605,51 @@ async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSession
             stats.subtract_metrics(metrics);
         }
     }
-    if let Some(workdir) = session.workdir.or(session.request_template.workdir) {
-        session_store::delete_session(&workdir, id)?;
-    }
-    crate::session_environment::terminate_global_session(id)?;
-    let workspace_manager = crate::session_workspace::WorkspaceManager::persistent()?;
-    if let Some(record) = workspace_manager.find_record_by_session(id)? {
-        workspace_manager.remove(&record, true)?;
+    state.publish_project_session_change();
+    let cleanup_session_id = id.to_string();
+    let cleanup_warnings = match tokio::task::spawn_blocking(move || {
+        cleanup_deleted_session_resources(&cleanup_session_id)
+    })
+    .await
+    {
+        Ok(warnings) => warnings,
+        Err(error) => vec![format!("session resource cleanup task failed: {error}")],
+    };
+    for warning in &cleanup_warnings {
+        tracing::warn!(session_id = id, %warning, "session was deleted with cleanup warnings");
     }
 
     Ok(DeleteSessionResponse {
         session_id: id.to_string(),
         deleted: true,
+        cleanup_warnings,
     })
+}
+
+fn cleanup_deleted_session_resources(id: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Err(error) = crate::session_environment::terminate_global_session(id) {
+        warnings.push(format!(
+            "could not terminate the session environment: {error:#}"
+        ));
+    }
+    match crate::session_workspace::WorkspaceManager::persistent() {
+        Ok(workspace_manager) => match workspace_manager.find_record_by_session(id) {
+            Ok(Some(record)) => {
+                if let Err(error) = workspace_manager.remove(&record, true) {
+                    warnings.push(format!("could not remove the session workspace: {error:#}"));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warnings.push(format!(
+                "could not inspect the session workspace record: {error:#}"
+            )),
+        },
+        Err(error) => warnings.push(format!(
+            "could not initialize session workspace cleanup: {error:#}"
+        )),
+    }
+    warnings
 }
 
 async fn list_projects(
@@ -3407,7 +3675,64 @@ async fn list_project_sessions(
             error,
         )
     })?;
-    Ok(Json(project_session_snapshot(&state).await))
+    let transition_floor = state.project_session_revision_baseline();
+    Ok(Json(
+        project_session_snapshot(&state, transition_floor).await,
+    ))
+}
+
+async fn project_session_events(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+    headers: HeaderMap,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    reload_projects(&state).await.map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "project_registry_unavailable",
+            error,
+        )
+    })?;
+    let (receiver, subscribed_revision) = state.subscribe_project_session_changes();
+    let transition_floor =
+        project_session_last_event_revision(&headers, state.project_session_stream_id.as_str())
+            .map_or(subscribed_revision, |revision| {
+                revision.min(subscribed_revision)
+            });
+    let initial = futures::stream::iter(
+        project_session_snapshot_sse_event(
+            &project_session_snapshot(&state, transition_floor).await,
+        )
+        .map(Ok),
+    );
+    let live_state = state.clone();
+    let live = BroadcastStream::new(receiver).filter_map(move |_| {
+        let state = live_state.clone();
+        async move {
+            project_session_snapshot_sse_event(
+                &project_session_snapshot(&state, transition_floor).await,
+            )
+            .map(Ok)
+        }
+    });
+    Ok(Sse::new(initial.chain(live)).keep_alive(KeepAlive::default()))
+}
+
+fn project_session_last_event_revision(headers: &HeaderMap, stream_id: &str) -> Option<u64> {
+    let value = headers.get("last-event-id")?.to_str().ok()?.trim();
+    let (cursor_stream_id, revision) = value.rsplit_once(':')?;
+    (cursor_stream_id == stream_id)
+        .then(|| revision.parse::<u64>().ok())
+        .flatten()
+}
+
+fn project_session_snapshot_sse_event(snapshot: &ProjectSessionSnapshot) -> Option<Event> {
+    let data = serde_json::to_string(snapshot).ok()?;
+    Some(
+        Event::default()
+            .id(format!("{}:{}", snapshot.stream_id, snapshot.revision))
+            .event("project_session_snapshot")
+            .data(data),
+    )
 }
 
 async fn get_project_usage(
@@ -3471,7 +3796,7 @@ async fn get_settings(
 async fn update_settings(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<UpdateWebSettingsRequest>,
-) -> Result<Json<WebSettingsResponse>, StatusCode> {
+) -> Result<Json<WebSettingsResponse>, ApiError> {
     let previous_enabled = state.sleep_prevention_status().enabled;
     state.update_sleep_prevention_enabled(req.prevent_sleep_while_working);
 
@@ -3484,9 +3809,18 @@ async fn update_settings(
     })
     .await;
 
-    if !matches!(persisted, Ok(Ok(()))) {
+    let persist_error = match persisted {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("{error:#}")),
+        Err(error) => Some(format!("settings persistence task failed: {error}")),
+    };
+    if let Some(error) = persist_error {
         state.update_sleep_prevention_enabled(previous_enabled);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "settings_persist_failed",
+            error,
+        ));
     }
 
     Ok(Json(web_settings_snapshot(&state)))
@@ -5446,7 +5780,7 @@ async fn session_events(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     headers: HeaderMap,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -5455,9 +5789,21 @@ async fn session_events(
         .map(str::to_string);
     let (receiver, replay, covered_keys, snapshot) = {
         let sessions = state.sessions.lock().await;
-        let session = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+        let session = sessions.get(&id).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                format!("session not found: {id}"),
+            )
+        })?;
         let receiver = session.sender.subscribe();
-        let history = session.history.lock().map_err(|_| StatusCode::CONFLICT)?;
+        let history = session.history.lock().map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_history_unavailable",
+                "session history is unavailable",
+            )
+        })?;
         let window = session_replay_window(&history, last_event_id.as_deref());
         let replay = history[window.start..].to_vec();
         let covered_keys = history
@@ -5661,11 +6007,15 @@ async fn handle_rpc_connection(
                 Ok(Json(result)) => {
                     write_rpc_response(reader.get_mut(), request.id, result).await?
                 }
-                Err(status) => {
+                Err(error) => {
                     write_rpc_error(
                         reader.get_mut(),
                         request.id,
-                        format!("goal request failed with HTTP status {}", status.as_u16()),
+                        format!(
+                            "goal request failed with HTTP status {}: {}",
+                            error.status.as_u16(),
+                            error.message
+                        ),
                     )
                     .await?
                 }
@@ -6266,12 +6616,25 @@ fn session_list_items(sessions: &HashMap<String, SessionState>) -> Vec<SessionLi
     items
 }
 
-async fn project_session_snapshot(state: &AppState) -> ProjectSessionSnapshot {
+async fn project_session_snapshot(
+    state: &AppState,
+    terminal_transition_floor: u64,
+) -> ProjectSessionSnapshot {
     let projects = state.projects.lock().await;
     let sessions = state.sessions.lock().await;
+    let project_usage = state.project_usage.lock().await;
+    let publication = state
+        .project_session_publication
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     ProjectSessionSnapshot {
+        stream_id: (*state.project_session_stream_id).clone(),
+        revision: state.project_session_revision.load(Ordering::SeqCst),
+        terminal_transition_floor,
+        terminal_transitions: publication.terminal_transitions.iter().cloned().collect(),
         projects: projects.clone(),
         sessions: session_list_items(&sessions),
+        project_usage: project_usage.clone(),
     }
 }
 
@@ -6305,7 +6668,13 @@ async fn reload_projects(state: &AppState) -> Result<()> {
             session.request_template.workdir = Some(current_path);
         }
     }
+    let changed = *current_projects != projects;
     *current_projects = projects;
+    drop(sessions);
+    drop(current_projects);
+    if changed {
+        state.publish_project_session_change();
+    }
     Ok(())
 }
 
@@ -6571,6 +6940,162 @@ fn publish_event_envelope_linked(
 mod workflow_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn project_session_stream_advances_revision_for_session_events() {
+        let (project_session_sender, _) = broadcast::channel(16);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage: Arc::new(Mutex::new(HashMap::from([(
+                "project-1".to_string(),
+                ProjectUsageStats {
+                    tokens: 7,
+                    ..ProjectUsageStats::default()
+                },
+            )]))),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender,
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
+        };
+        assert!(
+            !EventEnvelope::new(AgentEvent::Final {
+                content: "done".to_string(),
+                profile: AgentProfile::Build,
+                nesting_depth: None,
+                timestamp_ms: None,
+            })
+            .affects_project_session_snapshot()
+        );
+        let (mut changes, transition_floor) = state.subscribe_project_session_changes();
+        assert_eq!(transition_floor, 0);
+        let (session_sender, _) = broadcast::channel(16);
+        state.watch_session_changes("session-1".to_string(), session_sender.subscribe());
+        publish_event(
+            &session_sender,
+            &StdMutex::new(Vec::new()),
+            AgentEvent::SessionTitle {
+                title: "Live title".to_string(),
+                timestamp_ms: None,
+            },
+        );
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), changes.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        let terminal_transition = ProjectSessionTerminalTransition {
+            entry_key: "terminal-entry".to_string(),
+            revision: 0,
+            session_id: "session-1".to_string(),
+            status: SessionStatus::Completed,
+            task: "finish the boundary".to_string(),
+            title: Some("Boundary complete".to_string()),
+            handoff_outcome: Some(HandoffOutcome::Ready),
+            project: None,
+        };
+        assert_eq!(
+            state.publish_project_session_update(Some(terminal_transition)),
+            2
+        );
+        assert_eq!(changes.recv().await.unwrap(), 2);
+
+        let snapshot = project_session_snapshot(&state, transition_floor).await;
+        assert_eq!(snapshot.stream_id, "test-stream");
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.terminal_transition_floor, 0);
+        assert_eq!(snapshot.terminal_transitions.len(), 1);
+        assert_eq!(snapshot.terminal_transitions[0].revision, 2);
+        assert_eq!(snapshot.project_usage["project-1"].tokens, 7);
+        let event = project_session_snapshot_sse_event(&snapshot).unwrap();
+        assert!(format!("{event:?}").contains("project_session_snapshot"));
+    }
+
+    #[test]
+    fn project_session_reconnect_cursor_is_scoped_to_the_server_process() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "stream-a:7".parse().unwrap());
+        assert_eq!(
+            project_session_last_event_revision(&headers, "stream-a"),
+            Some(7)
+        );
+        assert_eq!(
+            project_session_last_event_revision(&headers, "stream-b"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_session_events_publish_explicit_finish_transitions() {
+        let mut request = request(std::path::Path::new("."));
+        request.workdir = None;
+        request.branch = None;
+        request.repository_less = true;
+        let persisted = PersistedSession::from_parts(
+            request.session_id.clone(),
+            request,
+            None,
+            None,
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        let (session_id, session) = session_from_persisted(persisted);
+        let (project_session_sender, _) = broadcast::channel(16);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender,
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
+        };
+        let (mut changes, transition_floor) = state.subscribe_project_session_changes();
+        let sender = {
+            let sessions = state.sessions.lock().await;
+            sessions.get(&session_id).unwrap().sender.clone()
+        };
+        state.watch_session_changes(session_id.clone(), sender.subscribe());
+        {
+            let sessions = state.sessions.lock().await;
+            publish_session_state_changed(sessions.get(&session_id).unwrap());
+        }
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), changes.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        let snapshot = project_session_snapshot(&state, transition_floor).await;
+        assert_eq!(snapshot.terminal_transitions.len(), 1);
+        assert_eq!(
+            snapshot.terminal_transitions[0].status,
+            SessionStatus::Completed
+        );
+        assert_eq!(snapshot.terminal_transitions[0].session_id, session_id);
+        assert!(snapshot.terminal_transitions[0].revision > transition_floor);
+    }
+
     #[test]
     fn user_messages_remain_pending_until_the_agent_loop_applies_them() {
         let queued = EventEnvelope::new(AgentEvent::UserMessage {
@@ -6807,6 +7332,12 @@ mod workflow_tests {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender: broadcast::channel(16).0,
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
             tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
                 8311, 8311, false,
@@ -6851,6 +7382,51 @@ mod workflow_tests {
         )
         .await;
         assert_eq!(rejected.unwrap_err().status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn failed_persisted_delete_keeps_the_authoritative_session() {
+        let not_a_repository = tempfile::tempdir().unwrap();
+        let request = request(not_a_repository.path());
+        let persisted = PersistedSession::from_parts(
+            request.session_id.clone(),
+            request,
+            None,
+            Some(not_a_repository.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        let (session_id, session) = session_from_persisted(persisted);
+        let (project_session_sender, _) = broadcast::channel(16);
+        let mut changes = project_session_sender.subscribe();
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender,
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
+        };
+
+        assert!(matches!(
+            delete_session_inner(state.clone(), &session_id).await,
+            Err(DeleteSessionError::Internal(_))
+        ));
+        assert!(state.sessions.lock().await.contains_key(&session_id));
+        assert!(matches!(
+            changes.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(state.project_session_revision.load(Ordering::SeqCst), 0);
     }
 
     fn request(workdir: &std::path::Path) -> AgentRequest {
@@ -7021,6 +7597,12 @@ mod workflow_tests {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender: broadcast::channel(16).0,
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
             tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
                 8311, 8311, false,
@@ -7090,6 +7672,12 @@ mod workflow_tests {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender: broadcast::channel(16).0,
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
             tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
                 8311, 8311, false,
@@ -7177,6 +7765,12 @@ mod workflow_tests {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender: broadcast::channel(16).0,
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
             tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
                 8311, 8311, false,
@@ -7235,6 +7829,12 @@ mod workflow_tests {
                 notify_on_finish: false,
             }])),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender: broadcast::channel(16).0,
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
             tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
                 8311, 8311, false,
@@ -7302,6 +7902,12 @@ mod workflow_tests {
                 notify_on_finish: false,
             }])),
             project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender: broadcast::channel(16).0,
             sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
             tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
                 8311, 8311, false,

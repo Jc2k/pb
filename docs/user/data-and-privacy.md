@@ -81,7 +81,10 @@ Delete a finished daemon session with `pb queue --delete-session SESSION_ID`. Th
 notes ref, including its active/completed Goal checkpoints, objectives, criteria, amendments, and
 evidence, plus any accepted Task plan, queue state, budgets, child checkpoints, and results. Stopping
 a Goal or Tasks run does not delete or roll back that data; use session deletion when you want the
-persisted record removed. `pb self uninstall --delete-data` removes the installed application together with pb's
+persisted record removed. If that durable record cannot be removed, the session remains listed and
+the command fails. Once the record is removed, the command succeeds; any environment or workspace
+cleanup problems are printed as warnings so the result never claims that a still-visible session was
+deleted or that a deleted session survived. `pb self uninstall --delete-data` removes the installed application together with pb's
 known data, cache, configuration, state, and logs after confirmation. Review project-owned `.pb/`
 files and container runtime storage separately when you need a full project-specific cleanup.
 Set `inference.llamacpp_session_cache_enabled` to `false` if prompt-derived llama.cpp state should

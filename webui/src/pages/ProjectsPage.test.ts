@@ -1,6 +1,10 @@
 /// <reference lib="deno.ns" />
 import { equal, ok } from "node:assert/strict";
-import { LatestRequest } from "../lib/hooks.ts";
+import { LatestRequest, ProjectSessionStreamCursor } from "../lib/hooks.ts";
+import type {
+  ProjectSessionSnapshot,
+  ProjectSessionTerminalTransition,
+} from "../types/index.ts";
 import { nextProjectNotificationPreference } from "./ProjectsPage.tsx";
 
 Deno.test("nextProjectNotificationPreference flips the project notification setting", () => {
@@ -19,6 +23,105 @@ Deno.test("latest request ownership aborts and rejects stale responses", () => {
   requests.abort();
   equal(second.signal.aborted, true);
   equal(requests.owns(second), false);
+});
+
+function terminalTransition(
+  entryKey: string,
+  revision: number,
+): ProjectSessionTerminalTransition {
+  return {
+    entry_key: entryKey,
+    revision,
+    session_id: `session-${entryKey}`,
+    status: "completed",
+    task: "finish the boundary",
+    title: "Boundary complete",
+    handoff_outcome: "ready",
+    project: {
+      id: "project-1",
+      name: "pb",
+      path: "/workspace/pb",
+      notify_on_finish: true,
+    },
+  };
+}
+
+function projectSnapshot(
+  streamId: string,
+  revision: number,
+  terminalTransitionFloor = revision,
+  terminalTransitions: ProjectSessionTerminalTransition[] = [],
+): ProjectSessionSnapshot {
+  return {
+    stream_id: streamId,
+    revision,
+    terminal_transition_floor: terminalTransitionFloor,
+    terminal_transitions: terminalTransitions,
+    projects: [],
+    sessions: [],
+    project_usage: {},
+  };
+}
+
+Deno.test("project stream authority rejects stale process generations", () => {
+  const cursor = new ProjectSessionStreamCursor();
+  equal(
+    cursor.accept(projectSnapshot("process-a", 8), "http")?.applyData,
+    true,
+  );
+  equal(
+    cursor.accept(projectSnapshot("process-b", 1), "stream")?.applyData,
+    true,
+  );
+  equal(cursor.accept(projectSnapshot("process-a", 9), "http"), null);
+  equal(
+    cursor.accept(projectSnapshot("process-b", 2), "http")?.applyData,
+    true,
+  );
+
+  const startup = new ProjectSessionStreamCursor();
+  equal(
+    startup.accept(projectSnapshot("process-b", 1), "http")?.applyData,
+    true,
+  );
+  equal(
+    startup.accept(projectSnapshot("process-a", 4), "stream")?.applyData,
+    true,
+  );
+  equal(
+    startup.accept(projectSnapshot("process-b", 2), "stream")?.applyData,
+    true,
+  );
+  equal(startup.accept(projectSnapshot("process-a", 5), "stream"), null);
+});
+
+Deno.test("project stream consumes only server-authored terminal transitions after its floor", () => {
+  const cursor = new ProjectSessionStreamCursor();
+  const preexisting = terminalTransition("old", 3);
+  const racedWithInitialSnapshot = terminalTransition("fast", 4);
+  const initial = cursor.accept(
+    projectSnapshot("process-a", 4, 3, [
+      preexisting,
+      racedWithInitialSnapshot,
+    ]),
+    "stream",
+  );
+  equal(initial?.terminalTransitions.length, 1);
+  equal(initial?.terminalTransitions[0].entry_key, "fast");
+
+  const duplicate = cursor.accept(
+    projectSnapshot("process-a", 4, 3, [racedWithInitialSnapshot]),
+    "stream",
+  );
+  equal(duplicate?.applyData, false);
+  equal(duplicate?.terminalTransitions.length, 0);
+
+  const afterReconnect = terminalTransition("reconnected", 5);
+  const replay = cursor.accept(
+    projectSnapshot("process-a", 5, 4, [afterReconnect]),
+    "stream",
+  );
+  equal(replay?.terminalTransitions[0].entry_key, "reconnected");
 });
 
 Deno.test("project index uses the shared workspace frame", async () => {
@@ -48,6 +151,7 @@ Deno.test("project pages share live session data and finish notifications", asyn
   const source = await Deno.readTextFile("webui/src/pages/ProjectsPage.tsx");
 
   equal(source.match(/useProjectSessionData\(\)/g)?.length, 2);
+  ok(source.includes("useProjectSessionData({ finishNotifications: false })"));
   ok(source.includes("sessionBelongsToProject(session, project)"));
   ok(!source.includes("session.workdir === project.path"));
   ok(!source.includes("useProjectFinishNotifications"));
@@ -123,7 +227,16 @@ Deno.test("project pages distinguish loading and API failures from empty state",
   ok(hooks.includes("dataRequest.current.start()"));
   ok(hooks.includes("snapshot.projects"));
   ok(hooks.includes("snapshot.sessions"));
-  ok(hooks.includes("window.setInterval(() => void fetchData(), pollMs)"));
+  ok(hooks.includes('new EventSource("/api/project-sessions/events")'));
+  ok(hooks.includes('addEventListener("project_session_snapshot"'));
+  ok(!hooks.includes("    void fetchData();"));
+  ok(hooks.includes("ProjectSessionStreamCursor"));
+  ok(hooks.includes("snapshot.terminal_transitions.filter"));
+  ok(
+    hooks.includes("transition.revision <= snapshot.terminal_transition_floor"),
+  );
+  ok(!hooks.includes("previous !== session.status"));
+  ok(!hooks.includes("setInterval"));
   ok(hooks.includes("dataLoading"));
   ok(hooks.includes("dataError"));
   ok(hooks.includes("refresh: fetchData"));
@@ -134,12 +247,17 @@ Deno.test("project pages distinguish loading and API failures from empty state",
   ok(!hooks.includes("refreshSessions"));
   ok(!hooks.includes("refreshProjects"));
   ok(!hooks.includes('fetch("/api/sessions"'));
-  ok(page.includes("usageRequest.current.start()"));
+  ok(page.includes("projectUsage[project.id]"));
+  ok(
+    !page.includes(
+      "fetch(`/api/projects/${encodeURIComponent(project.id)}/usage`",
+    ),
+  );
   ok(page.includes("marketplaceRequest.current.start()"));
   ok(page.includes("installedRequest.current.start()"));
   ok(page.includes('setInstalledError("")'));
   ok(page.includes('setMarketplaceError("")'));
-  ok(page.includes("window.setInterval(() => void fetchProjects(), 5000)"));
+  ok(!page.includes("setInterval"));
   ok(page.includes("encodeURIComponent(project.id)"));
   ok(!page.includes("encodeURIComponent(project.name)"));
 });

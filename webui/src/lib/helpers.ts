@@ -4,6 +4,7 @@ import type {
   InstalledIntegration,
   MarketplaceIntegration,
   ProjectEntry,
+  ProjectSessionTerminalTransition,
   ProjectUsageStats,
   SessionItem,
   TeamActor,
@@ -361,21 +362,17 @@ export async function ensureNotificationPermission(): Promise<boolean> {
 }
 
 export async function notifySessionFinished(
-  session: SessionItem,
-  projects: ProjectEntry[],
+  transition: ProjectSessionTerminalTransition,
 ) {
-  if (session.status !== "completed" && session.status !== "failed") return;
-  const project = projects.find((entry) =>
-    sessionBelongsToProject(session, entry)
-  );
+  const project = transition.project;
   if (!project?.notify_on_finish) return;
   if (!(await ensureNotificationPermission())) return;
   const title = handoffNotificationTitle(
-    session.handoff_outcome,
-    session.status,
+    transition.handoff_outcome,
+    transition.status,
   );
-  const body = `${project.name}: ${sessionTitle(session)}`;
-  const url = `/sessions/${session.session_id}`;
+  const body = `${project.name}: ${sessionTitle(transition)}`;
+  const url = `/sessions/${transition.session_id}`;
   const registration = await navigator.serviceWorker?.getRegistration?.();
   if (registration?.showNotification) {
     await registration.showNotification(title, {
@@ -383,7 +380,7 @@ export async function notifySessionFinished(
       icon: "/apple-touch-icon.png",
       badge: "/apple-touch-icon.png",
       data: { url },
-      tag: `pb-${session.session_id}-${session.status}`,
+      tag: `pb-${transition.session_id}-${transition.entry_key}`,
     });
     return;
   }

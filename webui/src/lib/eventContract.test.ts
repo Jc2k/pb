@@ -1,5 +1,9 @@
 /// <reference lib="deno.ns" />
-import { deepEqual } from "node:assert/strict";
+import { deepEqual, throws } from "node:assert/strict";
+import {
+  parseEventEnvelopeJson,
+  parseProjectSessionSnapshotJson,
+} from "./eventContract.ts";
 
 function rustEnumVariants(source: string, enumName: string): string[] {
   const declaration = `pub enum ${enumName}`;
@@ -34,6 +38,113 @@ function typescriptEventVariants(source: string): string[] {
     .map((match) => match[1]);
 }
 
+function rustStructFields(source: string, name: string): string[] {
+  const start = source.indexOf(`pub struct ${name}`);
+  if (start < 0) throw new Error(`missing Rust struct ${name}`);
+  const end = source.indexOf("\n}", start);
+  return [
+    ...source.slice(start, end).matchAll(/^    pub ([a-z_][a-z0-9_]*):/gm),
+  ]
+    .map((match) => match[1]);
+}
+
+function typescriptInterfaceFields(source: string, name: string): string[] {
+  const start = source.indexOf(`export interface ${name}`);
+  if (start < 0) throw new Error(`missing TypeScript interface ${name}`);
+  const end = source.indexOf("\n}", start);
+  return [...source.slice(start, end).matchAll(/^  ([a-z_][a-z0-9_]*)\??:/gm)]
+    .map((match) => match[1]);
+}
+
+function rustEventFields(source: string): Map<string, string[]> {
+  const declaration = "pub enum AgentEvent";
+  const start = source.indexOf(declaration);
+  if (start < 0) throw new Error("missing Rust enum AgentEvent");
+  const bodyStart = source.indexOf("{", start);
+  const shapes = new Map<string, string[]>();
+  let depth = 1;
+  let current: string | undefined;
+  for (const line of source.slice(bodyStart + 1).split("\n")) {
+    if (depth === 1) {
+      const variant = line.match(/^    ([A-Z][A-Za-z0-9_]*)\s*\{/)?.[1];
+      if (variant) {
+        current = snakeCase(variant);
+        shapes.set(current, []);
+      }
+    } else if (depth === 2 && current) {
+      const field = line.match(/^        ([a-z_][a-z0-9_]*)\s*:/)?.[1];
+      if (field) shapes.get(current)!.push(field);
+    }
+    depth += (line.match(/\{/g) || []).length;
+    depth -= (line.match(/\}/g) || []).length;
+    if (depth === 1) current = undefined;
+    if (depth === 0) break;
+  }
+  return shapes;
+}
+
+function rustEventOptionalFields(source: string): Map<string, string[]> {
+  const declaration = "pub enum AgentEvent";
+  const start = source.indexOf(declaration);
+  const bodyStart = source.indexOf("{", start);
+  const shapes = new Map<string, string[]>();
+  let depth = 1;
+  let current: string | undefined;
+  for (const line of source.slice(bodyStart + 1).split("\n")) {
+    if (depth === 1) {
+      const variant = line.match(/^    ([A-Z][A-Za-z0-9_]*)\s*\{/)?.[1];
+      if (variant) {
+        current = snakeCase(variant);
+        shapes.set(current, []);
+      }
+    } else if (depth === 2 && current) {
+      const field = line.match(
+        /^        ([a-z_][a-z0-9_]*)\s*:\s*Option</,
+      )?.[1];
+      if (field) shapes.get(current)!.push(field);
+    }
+    depth += (line.match(/\{/g) || []).length;
+    depth -= (line.match(/\}/g) || []).length;
+    if (depth === 1) current = undefined;
+    if (depth === 0) break;
+  }
+  return shapes;
+}
+
+function typescriptEventFields(source: string): Map<string, string[]> {
+  const start = source.indexOf("export type AgentEvent =");
+  const end = source.indexOf("export type TeamActor", start);
+  if (start < 0 || end < 0) throw new Error("missing TypeScript AgentEvent");
+  const shapes = new Map<string, string[]>();
+  for (const block of source.slice(start, end).split("\n  | {").slice(1)) {
+    const typeDeclaration = block.slice(0, block.indexOf(";"));
+    const variants = [...typeDeclaration.matchAll(/"([a-z0-9_]+)"/g)].map(
+      (match) => match[1],
+    );
+    const fields = [...block.matchAll(/^    ([a-z_][a-z0-9_]*)\??\s*:/gm)]
+      .map((match) => match[1])
+      .filter((field) => field !== "type");
+    for (const variant of variants) shapes.set(variant, fields);
+  }
+  return shapes;
+}
+
+function typescriptEventOptionalFields(source: string): Map<string, string[]> {
+  const start = source.indexOf("export type AgentEvent =");
+  const end = source.indexOf("export type TeamActor", start);
+  const shapes = new Map<string, string[]>();
+  for (const block of source.slice(start, end).split("\n  | {").slice(1)) {
+    const typeDeclaration = block.slice(0, block.indexOf(";"));
+    const variants = [...typeDeclaration.matchAll(/"([a-z0-9_]+)"/g)].map(
+      (match) => match[1],
+    );
+    const fields = [...block.matchAll(/^    ([a-z_][a-z0-9_]*)\?\s*:/gm)]
+      .map((match) => match[1]);
+    for (const variant of variants) shapes.set(variant, fields);
+  }
+  return shapes;
+}
+
 function typescriptStringUnion(source: string, typeName: string): string[] {
   const start = source.indexOf(`export type ${typeName} =`);
   if (start < 0) throw new Error(`missing TypeScript type ${typeName}`);
@@ -55,6 +166,26 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
     typescriptEventVariants(types).sort(),
     rustEnumVariants(events, "AgentEvent").map(snakeCase).sort(),
   );
+  const browserFields = typescriptEventFields(types);
+  const serverFields = rustEventFields(events);
+  const browserOptionalFields = typescriptEventOptionalFields(types);
+  const serverOptionalFields = rustEventOptionalFields(events);
+  for (const variant of typescriptEventVariants(types)) {
+    const browser = browserFields.get(variant)?.toSorted();
+    const server = serverFields.get(variant)?.toSorted();
+    if (JSON.stringify(browser) !== JSON.stringify(server)) {
+      throw new Error(
+        `event fields drifted for ${variant}: browser=${
+          JSON.stringify(browser)
+        } server=${JSON.stringify(server)}`,
+      );
+    }
+    deepEqual(
+      browserOptionalFields.get(variant)?.toSorted(),
+      serverOptionalFields.get(variant)?.toSorted(),
+      `event optionality drifted for ${variant}`,
+    );
+  }
 
   const typeProfiles = types
     .slice(
@@ -82,6 +213,7 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       [events, "TranscriptVisibility"],
       [events, "TranscriptKind"],
       [events, "HandoffOutcome"],
+      [events, "TerminationReason"],
       [workflow, "WorkflowStage"],
       [workflow, "WorkflowOutcome"],
       [workflow, "WorkflowBlockCause"],
@@ -116,13 +248,79 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       "usage_records: SessionMetricsSnapshot[]",
       "reset_history: boolean",
       "id: string",
+      "stream_id: string",
+      "terminal_transition_floor: number",
+      "terminal_transitions: ProjectSessionTerminalTransition[]",
       "projects: ProjectEntry[]",
       "sessions: SessionItem[]",
+      "revision: number",
+      "project_usage: Record<string, ProjectUsageStats>",
     ]
   ) {
     if (!types.includes(required)) {
       throw new Error(`missing required v5 event field: ${required}`);
     }
+  }
+});
+
+Deno.test("v5 browser parsing rejects obsolete event envelopes", () => {
+  throws(
+    () => parseEventEnvelopeJson('{"version":"v4"}'),
+    /unsupported event schema 'v4'; expected 'v5'/,
+  );
+});
+
+Deno.test("project snapshot parsing validates terminal transition semantics", () => {
+  const snapshot = {
+    stream_id: "process-a",
+    revision: 2,
+    terminal_transition_floor: 1,
+    terminal_transitions: [{
+      entry_key: "event-2",
+      revision: 2,
+      session_id: "session-1",
+      status: "completed",
+      task: "finish the event boundary",
+      title: "Boundary complete",
+      handoff_outcome: "ready",
+      project: {
+        id: "project-1",
+        name: "pb",
+        path: "/workspace/pb",
+        notify_on_finish: true,
+      },
+    }],
+    projects: [],
+    sessions: [],
+    project_usage: {},
+  };
+  deepEqual(
+    parseProjectSessionSnapshotJson(JSON.stringify(snapshot)),
+    snapshot,
+  );
+  snapshot.terminal_transitions[0].status = "running";
+  throws(
+    () => parseProjectSessionSnapshotJson(JSON.stringify(snapshot)),
+    /status must be completed or failed/,
+  );
+});
+
+Deno.test("Rust and TypeScript collection structs keep exact fields", async () => {
+  const [server, types] = await Promise.all([
+    Deno.readTextFile("src/web.rs"),
+    Deno.readTextFile("webui/src/types/index.ts"),
+  ]);
+  for (
+    const name of [
+      "ProjectSessionSnapshot",
+      "ProjectSessionTerminalTransition",
+    ]
+  ) {
+    deepEqual(
+      typescriptInterfaceFields(types, name).sort(),
+      rustStructFields(server, name).sort(),
+      `${name} fields drifted across the Rust/TypeScript boundary`,
+    );
   }
 });
 
@@ -139,7 +337,12 @@ Deno.test("session and project stream boundaries are server-authored", async () 
       'event("session_snapshot")',
       "reset_history: bool",
       "pub struct ProjectSessionSnapshot",
+      "pub stream_id: String",
+      "pub terminal_transition_floor: u64",
+      "pub terminal_transitions: Vec<ProjectSessionTerminalTransition>",
       'route("/api/project-sessions", get(list_project_sessions))',
+      '"/api/project-sessions/events"',
+      '.event("project_session_snapshot")',
       "pub project_id: Option<String>",
     ]
   ) {
@@ -163,6 +366,14 @@ Deno.test("session and project stream boundaries are server-authored", async () 
   }
   if (!hooks.includes('fetch("/api/project-sessions"')) {
     throw new Error("project pages do not consume the atomic server snapshot");
+  }
+  if (
+    !hooks.includes('new EventSource("/api/project-sessions/events")') ||
+    hooks.includes("setInterval")
+  ) {
+    throw new Error(
+      "project pages do not consume the pushed collection stream",
+    );
   }
   if (
     server.includes("pub refresh: bool") || types.includes("refresh: boolean")
@@ -212,5 +423,39 @@ Deno.test("v5 consumers do not reconstruct omitted server state", async () => {
     throw new Error(
       "v5 energy totals still contain a legacy snapshot fallback",
     );
+  }
+});
+
+Deno.test("web endpoints and consumers preserve structured API failures", async () => {
+  const [server, sessionPage, settingsPage] = await Promise.all([
+    Deno.readTextFile("src/web.rs"),
+    Deno.readTextFile("webui/src/pages/SessionPage.tsx"),
+    Deno.readTextFile("webui/src/pages/SettingsPage.tsx"),
+  ]);
+
+  for (
+    const signature of [
+      ") -> Result<Json<SessionDetails>, ApiError>",
+      ") -> Result<Json<DeleteSessionResponse>, ApiError>",
+      ") -> Result<Json<crate::goal::GoalCheckpoint>, ApiError>",
+      ") -> Result<Json<WebSettingsResponse>, ApiError>",
+      ") -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError>",
+    ]
+  ) {
+    if (!server.includes(signature)) {
+      throw new Error(
+        `endpoint lost its structured error contract: ${signature}`,
+      );
+    }
+  }
+  if (!sessionPage.includes('apiErrorMessage(res, "Session request failed")')) {
+    throw new Error("session page does not render the server API error");
+  }
+  if (
+    settingsPage.includes("responseError") ||
+    settingsPage.includes("`HTTP ${response.status}`") ||
+    !settingsPage.includes("apiErrorMessage")
+  ) {
+    throw new Error("settings page reconstructs API failures locally");
   }
 });

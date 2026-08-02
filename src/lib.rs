@@ -2156,6 +2156,9 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
     if let Some(session_id) = args.delete_session.clone() {
         let deleted = daemon_client::delete_session(&socket_path, session_id).await?;
         println!("deleted session {}", deleted.session_id);
+        for warning in deleted.cleanup_warnings {
+            eprintln!("warning: {warning}");
+        }
         return Ok(());
     }
 

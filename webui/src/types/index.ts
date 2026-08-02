@@ -202,6 +202,7 @@ export type AgentEvent =
     outcome: WorkflowOutcome;
     cause: WorkflowBlockCause;
     reason: string;
+    current_user?: string;
     timestamp_ms?: number;
   }
   | {
@@ -698,13 +699,12 @@ export type AgentEvent =
     reached_final: boolean;
     contract_status: "unspecified" | "unsatisfied" | "satisfied";
     verified_completed: boolean;
-    termination_reason?: string;
+    termination_reason?: TerminationReason;
     handoff_outcome?: HandoffOutcome;
     summary: string;
     power_summary: string;
     diff_stat: string;
     diff: string;
-    nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
@@ -758,6 +758,23 @@ export type WorkflowBlockCause =
   | "repository_content_changed"
   | "deterministic_repeat_limit"
   | "executor_unavailable"
+  | "commit_blocked"
+  | "cancelled";
+
+export type TerminationReason =
+  | "final"
+  | "step_limit"
+  | "gate_loop"
+  | "parse_loop"
+  | "contract_unsatisfied"
+  | "context_limit"
+  | "resource_limit"
+  | "invocation_limit"
+  | "token_limit"
+  | "engine_error"
+  | "checks_failed"
+  | "executor_unavailable"
+  | "repair_exhausted"
   | "commit_blocked"
   | "cancelled";
 
@@ -1493,8 +1510,24 @@ export interface ProjectEntry {
 }
 
 export interface ProjectSessionSnapshot {
+  stream_id: string;
+  revision: number;
+  terminal_transition_floor: number;
+  terminal_transitions: ProjectSessionTerminalTransition[];
   projects: ProjectEntry[];
   sessions: SessionItem[];
+  project_usage: Record<string, ProjectUsageStats>;
+}
+
+export interface ProjectSessionTerminalTransition {
+  entry_key: string;
+  revision: number;
+  session_id: string;
+  status: "completed" | "failed";
+  task: string;
+  title: string | null;
+  handoff_outcome: HandoffOutcome | null;
+  project: ProjectEntry | null;
 }
 
 export interface ProjectUsageStats {

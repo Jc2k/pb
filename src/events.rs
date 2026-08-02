@@ -981,6 +981,8 @@ pub enum AgentEvent {
         outcome: crate::workflow::WorkflowOutcome,
         cause: WorkflowBlockCause,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_user: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -1430,6 +1432,14 @@ impl EventEnvelope {
 
     pub fn requires_session_snapshot(&self) -> bool {
         event_requires_session_snapshot(&self.event)
+    }
+
+    pub(crate) fn affects_project_session_snapshot(&self) -> bool {
+        self.requires_session_snapshot()
+            || matches!(
+                self.event,
+                AgentEvent::SessionTitle { .. } | AgentEvent::SessionMetrics { .. }
+            )
     }
 
     pub(crate) fn assign_sequence(&mut self, sequence: u64) {
@@ -1974,6 +1984,7 @@ impl EventEnvelope {
                 outcome,
                 cause,
                 reason,
+                current_user,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
@@ -1985,6 +1996,7 @@ impl EventEnvelope {
                     outcome,
                     cause,
                     reason,
+                    current_user,
                     timestamp_ms: Some(now),
                 },
             },
@@ -2911,7 +2923,12 @@ fn session_effect_for_event(event: &AgentEvent) -> SessionEffect {
         running,
         reset_intent: matches!(
             event,
-            AgentEvent::Final { .. } | AgentEvent::SessionSummary { .. }
+            AgentEvent::Final { .. }
+                | AgentEvent::SessionSummary { .. }
+                | AgentEvent::SessionStateChanged {
+                    status: SessionLifecycleStatus::Completed | SessionLifecycleStatus::Failed,
+                    ..
+                }
         ),
         title: match event {
             AgentEvent::SessionTitle { title, .. } => Some(title.clone()),
@@ -3329,8 +3346,16 @@ fn chatter_for_event(
             outcome,
             cause,
             reason,
+            current_user,
             ..
-        } => workflow_blocked_chatter(*outcome, *cause, reason, history, supersedes),
+        } => workflow_blocked_chatter(
+            *outcome,
+            *cause,
+            reason,
+            current_user.as_deref(),
+            history,
+            supersedes,
+        ),
         _ => Vec::new(),
     }
 }
@@ -3757,6 +3782,7 @@ fn workflow_blocked_chatter(
     outcome: crate::workflow::WorkflowOutcome,
     cause: WorkflowBlockCause,
     reason: &str,
+    current_user: Option<&str>,
     history: &[EventEnvelope],
     supersedes: &[String],
 ) -> Vec<EventChatter> {
@@ -3862,6 +3888,19 @@ fn workflow_blocked_chatter(
         |(message, _, _)| format!("{message}\n{reason}"),
     );
 
+    let current_user_message = format!("Can you {user_request}?");
+    let current_user_message = current_user
+        .map(str::trim)
+        .filter(|username| !username.is_empty())
+        .map_or(current_user_message.clone(), |username| {
+            let mut characters = current_user_message.chars();
+            let first = characters
+                .next()
+                .map(|character| character.to_lowercase().collect::<String>())
+                .unwrap_or_default();
+            format!("@{username}, {first}{}", characters.as_str())
+        });
+
     vec![
         chatter(
             TeamActor::workflow_steward(),
@@ -3873,7 +3912,7 @@ fn workflow_blocked_chatter(
         chatter(
             TeamActor::workflow_steward(),
             None,
-            format!("Can you {user_request}?"),
+            current_user_message,
             String::new(),
             ChatterAudience::CurrentUser,
         ),
@@ -4724,6 +4763,7 @@ mod tests {
                 outcome: crate::workflow::WorkflowOutcome::ReviewFailed,
                 cause: WorkflowBlockCause::DeterministicRepeatLimit,
                 reason: reason.to_string(),
+                current_user: Some("john".to_string()),
                 timestamp_ms: None,
             },
             vec![correction_entry_key],
@@ -4742,7 +4782,7 @@ mod tests {
         );
         assert_eq!(
             blocked.chatter[1].message,
-            "Can you start a follow-up task here and add any context that could help the team find a different way forward?"
+            "@john, can you start a follow-up task here and add any context that could help the team find a different way forward?"
         );
         assert_eq!(blocked.chatter[1].audience, ChatterAudience::CurrentUser);
     }
@@ -4790,6 +4830,7 @@ mod tests {
             outcome: crate::workflow::WorkflowOutcome::RepairCyclesExhausted,
             cause: WorkflowBlockCause::Other,
             reason: "blocking findings remain".to_string(),
+            current_user: Some("john".to_string()),
             timestamp_ms: None,
         });
         let json = serde_json::to_string(&envelope).unwrap();
@@ -4802,8 +4843,11 @@ mod tests {
                 outcome: crate::workflow::WorkflowOutcome::RepairCyclesExhausted,
                 cause: WorkflowBlockCause::Other,
                 reason,
+                current_user: Some(current_user),
                 timestamp_ms: Some(_),
-            } if workflow_id == "workflow-1" && reason == "blocking findings remain"
+            } if workflow_id == "workflow-1"
+                && reason == "blocking findings remain"
+                && current_user == "john"
         ));
     }
 

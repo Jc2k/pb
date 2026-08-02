@@ -327,8 +327,10 @@ Generic claims that Trinity "noticed a problem" are not used as a substitute for
 When Trinity requests a next action, the visible message directly addresses the responsible teammate
 rather than describing that person in the third person. Once the workflow has ended, the responsible
 teammate no longer receives an impossible call to action. Trinity instead gives the teammate a final
-conversational explanation and says their task is on hold. A second ordinary Trinity bubble addresses
-the local user by username and asks for the available restart, resume, or follow-up context. No
+conversational explanation and says their task is on hold. A second ordinary Trinity bubble is
+authored in the durable event projection, addresses the local user by username, and asks for the
+available restart, resume, or follow-up context. Terminal and web renderers therefore present the
+exact same message without browser-only rewriting. No
 terminal-status badge interrupts the chat. Stale repeat-control and duplicate failure corrections
 immediately before that terminal handoff are suppressed while the first failure explanation and
 intervening teammate action remain. Trinity's lilac identity accent is applied consistently to
@@ -413,6 +415,16 @@ waiting for initial plan approval or final user acceptance remains in that exact
 Stopping a Goal is preservation, not rollback: managed commits, current workspace changes, events,
 and evidence remain. Editing after work begins similarly cannot rewrite completed history; it
 supersedes only unfinished plan material after the replacement digest is approved.
+
+The web collection boundary publishes project, session, usage, and terminal-transition state under
+one process identity and monotonic revision clock. An SSE subscription records its transition floor
+inside that same publication boundary, so work that finishes while the first snapshot is being built
+is still a live transition rather than an indistinguishable completed row. Reconnect cursors are
+scoped to the originating process identity. HTTP snapshots provide manual recovery data only and
+cannot replace the live stream's process generation. Session deletion does not report
+failure after removing the authoritative record: durable-record failure leaves the session intact,
+while later environment or workspace cleanup problems are returned as warnings on a successful
+deletion.
 
 ## Publication contract
 
