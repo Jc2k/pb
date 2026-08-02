@@ -74,3 +74,39 @@ pub enum WorkflowOutcome {
     EngineError,
     Cancelled,
 }
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowBlockCause {
+    #[default]
+    Other,
+    PlanningRejected,
+    GitControlChanged,
+    RepositoryContentChanged,
+    DeterministicRepeatLimit,
+    ExecutorUnavailable,
+    CommitBlocked,
+    Cancelled,
+}
+
+impl WorkflowBlockCause {
+    pub fn classify(outcome: WorkflowOutcome, reason: &str) -> Self {
+        if outcome == WorkflowOutcome::PlanRejected {
+            Self::PlanningRejected
+        } else if outcome == WorkflowOutcome::ExecutorUnavailable {
+            Self::ExecutorUnavailable
+        } else if outcome == WorkflowOutcome::CommitBlocked {
+            Self::CommitBlocked
+        } else if reason.contains("changed Git control state") {
+            Self::GitControlChanged
+        } else if reason.contains("repository content changed while the read-only") {
+            Self::RepositoryContentChanged
+        } else if reason.contains("deterministic repeat limit") {
+            Self::DeterministicRepeatLimit
+        } else if reason.to_lowercase().contains("cancel") {
+            Self::Cancelled
+        } else {
+            Self::Other
+        }
+    }
+}

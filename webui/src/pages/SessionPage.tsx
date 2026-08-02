@@ -38,11 +38,9 @@ import {
   DrawerPanel,
   InitialUserMessage,
   MessageBubble,
-  TodoDrawer,
 } from "../components/Session";
 import {
   buildActionTimeline,
-  buildTodoTasks,
   chatEventsWithOnlyLatestStep,
   latestAssistantProfile,
 } from "../lib/sessionUtils";
@@ -56,9 +54,8 @@ export function workflowRecoveryPresentation(
   action: "resume" | "restart-delivery";
 } {
   if (workflow?.recovery === "restart_from_current_files") {
-    const contentChanged = workflow.blocked_reason?.includes(
-      "repository content changed",
-    );
+    const contentChanged = workflow.blocked_cause ===
+      "repository_content_changed";
     return {
       title: contentChanged
         ? "The project changed during review"
@@ -472,11 +469,10 @@ export function SessionPage() {
   }
 
   const actionTimeline = buildActionTimeline(events);
-  const todoTasks = buildTodoTasks(events);
   const taskPlanningTranscript = session.task_planning_transcript ??
     session.multi_task?.run.planning_transcript;
   const showWorkDrawer = Boolean(
-    session.goal || actionTimeline.length > 0 || todoTasks.length > 0,
+    session.goal || actionTimeline.length > 0,
   );
   const sessionStartMs =
     events.find((event) => event.event.type === "started")?.event
@@ -705,18 +701,6 @@ export function SessionPage() {
                           item={item}
                         />
                       ))}
-                    </DrawerPanel>
-                  )
-                  : null}
-
-                {todoTasks.length > 0
-                  ? (
-                    <DrawerPanel
-                      title="Plan"
-                      icon="bi bi-check2-square"
-                      count={todoTasks.length}
-                    >
-                      <TodoDrawer tasks={todoTasks} />
                     </DrawerPanel>
                   )
                   : null}

@@ -9,6 +9,7 @@ use crate::agent_core::{AgentProfile, SessionAttachment};
 use crate::inference::PromptCacheMissReason;
 pub use crate::inference::StageRootAuthorityClass as PromptRootAuthorityClass;
 use crate::session_store::now_millis;
+pub use crate::workflow::WorkflowBlockCause;
 
 pub const EVENT_SCHEMA_VERSION: &str = "v1";
 
@@ -126,6 +127,145 @@ pub enum TeamMessageTone {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TeamMessagePurpose {
+    #[default]
+    General,
+    HandoffProgress,
+    HandoffOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectionKind {
+    #[default]
+    General,
+    ArtifactValidation,
+    RepositoryEvidence,
+    ContractEvidence,
+    WorkUnit,
+    RuntimeFallback,
+    RepeatedTool,
+    NoProgress,
+    DependentToolBatch,
+    StageSubmission,
+    InvalidAction,
+    StepLimit,
+    AdvisoryBudget,
+    MissingEvidence,
+    TruncatedAction,
+    MutationRecovery,
+    Lifecycle,
+    TaskPlanningRecovery,
+    ToolUnavailable,
+    RequirementsRemain,
+    Handoff,
+    Diagnostics,
+    WorkflowClosure,
+    ToolFailure,
+}
+
+impl CorrectionKind {
+    fn classify(summary: &str, detail: &str) -> Self {
+        let summary = summary.trim();
+        if summary == "Workflow artifact validation failed"
+            || (summary.starts_with("submit_")
+                && summary.ends_with(" tool call was not executed successfully"))
+        {
+            Self::ArtifactValidation
+        } else if serde_json::from_str::<Value>(detail)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("tool_failure")
+        {
+            Self::ToolFailure
+        } else if summary == "Task-focused repository evidence" {
+            Self::RepositoryEvidence
+        } else if summary.contains("contract planning evidence")
+            || summary.contains("contract review evidence")
+            || summary.contains("proposed-path review evidence")
+        {
+            Self::ContractEvidence
+        } else if summary.contains("accepted-plan")
+            || summary == "Work-unit progress earned one bounded turn"
+        {
+            Self::WorkUnit
+        } else if summary.contains("using host execution")
+            || summary.contains("CPU-only llama.cpp fallback")
+        {
+            Self::RuntimeFallback
+        } else if summary == "Repeated tool call detected"
+            || summary == "Repeated tool call blocked"
+            || summary.contains("repeated the same action")
+            || summary.contains("reached the repeat limit")
+        {
+            Self::RepeatedTool
+        } else if summary == "No-progress tool outcome detected" {
+            Self::NoProgress
+        } else if summary == "Dependent tool batch rejected" {
+            Self::DependentToolBatch
+        } else if summary == "Workflow stage submission required" {
+            Self::StageSubmission
+        } else if summary == "Teammate action retries exhausted"
+            || summary.contains("Parse retry limit")
+            || summary.contains("Invalid pb JSON action")
+            || summary.to_lowercase().contains("unparsable")
+        {
+            Self::InvalidAction
+        } else if summary.contains("bounded step limit") {
+            Self::StepLimit
+        } else if summary == "Advisory budget exhausted" {
+            Self::AdvisoryBudget
+        } else if summary == "Requesting missing bounded evidence" {
+            Self::MissingEvidence
+        } else if summary.contains("truncated action") {
+            Self::TruncatedAction
+        } else if summary.contains("mutation recovery")
+            || summary.contains("compact atomic mutation")
+            || summary.contains("constrained mutation")
+            || summary.contains("payload-bound atomic mutation")
+        {
+            Self::MutationRecovery
+        } else if matches!(
+            summary,
+            "Run cancelled" | "Goal pausing" | "Cancellation requested"
+        ) {
+            Self::Lifecycle
+        } else if matches!(
+            summary,
+            "Restarting delivery from current files"
+                | "Retrying Task planning"
+                | "Running as one Build"
+        ) {
+            Self::TaskPlanningRecovery
+        } else if summary == "Tool not available" {
+            Self::ToolUnavailable
+        } else if summary.contains("Task requirements remain") {
+            Self::RequirementsRemain
+        } else if summary.contains("handoff")
+            || summary.starts_with("Agent terminated:")
+            || summary.starts_with("Final grace terminated:")
+            || summary.contains("Completion gate")
+            || summary.contains("Acceptance contract")
+        {
+            Self::Handoff
+        } else if summary.to_lowercase().contains("diagnostic") {
+            Self::Diagnostics
+        } else if summary == "Workflow closure checkpoint" {
+            Self::WorkflowClosure
+        } else {
+            Self::General
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChatterAudience {
     #[default]
     Team,
@@ -150,11 +290,15 @@ pub struct EventChatter {
 pub enum TranscriptVisibility {
     Visible,
     EvidenceOnly,
+    Activity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptKind {
+    Conversation,
+    Activity,
+    Evidence,
     Correction,
     RepeatedToolDetected,
     RepeatedToolCorrection,
@@ -172,6 +316,11 @@ pub enum TranscriptKind {
 pub struct TranscriptMetadata {
     pub visibility: TranscriptVisibility,
     pub kind: TranscriptKind,
+    pub entry_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -858,6 +1007,8 @@ pub enum AgentEvent {
     WorkflowBlocked {
         workflow_id: String,
         outcome: crate::workflow::WorkflowOutcome,
+        #[serde(default)]
+        cause: WorkflowBlockCause,
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
@@ -1050,6 +1201,10 @@ pub enum AgentEvent {
     TeamMessage {
         actor: TeamActor,
         tone: TeamMessageTone,
+        #[serde(default)]
+        purpose: TeamMessagePurpose,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff: Option<HandoffSummary>,
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
@@ -1113,6 +1268,8 @@ pub enum AgentEvent {
     },
     Correction {
         message: String,
+        #[serde(default)]
+        kind: CorrectionKind,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
         #[serde(default = "workflow_steward_actor")]
@@ -1125,14 +1282,14 @@ pub enum AgentEvent {
         timestamp_ms: Option<u64>,
     },
     SubAgentStarted {
-        profile: String,
+        profile: AgentProfile,
         task: String,
         nesting_depth: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
     SubAgentFinished {
-        profile: String,
+        profile: AgentProfile,
         result: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
@@ -1304,7 +1461,8 @@ pub struct EventEnvelope {
 }
 
 impl EventEnvelope {
-    pub fn new(event: AgentEvent) -> Self {
+    pub fn new(mut event: AgentEvent) -> Self {
+        normalize_event_semantics(&mut event);
         let mut envelope = Self {
             version: EVENT_SCHEMA_VERSION.to_string(),
             event,
@@ -1316,8 +1474,9 @@ impl EventEnvelope {
     }
 
     pub fn refresh_projections(&mut self, history: &[EventEnvelope]) {
+        normalize_event_semantics(&mut self.event);
         self.chatter = chatter_for_event(&self.event, history);
-        self.transcript = transcript_metadata_for_event(&self.event, history);
+        self.transcript = Some(transcript_metadata_for_event(&self.event, history));
     }
 
     pub fn with_timestamp(event: AgentEvent) -> Self {
@@ -1694,6 +1853,7 @@ impl EventEnvelope {
             AgentEvent::WorkflowBlocked {
                 workflow_id,
                 outcome,
+                cause,
                 reason,
                 ..
             } => Self {
@@ -1703,6 +1863,7 @@ impl EventEnvelope {
                 event: AgentEvent::WorkflowBlocked {
                     workflow_id,
                     outcome,
+                    cause,
                     reason,
                     timestamp_ms: Some(now),
                 },
@@ -2002,6 +2163,8 @@ impl EventEnvelope {
             AgentEvent::TeamMessage {
                 actor,
                 tone,
+                purpose,
+                handoff,
                 message,
                 detail,
                 evidence_ids,
@@ -2014,6 +2177,8 @@ impl EventEnvelope {
                 event: AgentEvent::TeamMessage {
                     actor,
                     tone,
+                    purpose,
+                    handoff,
                     message,
                     detail,
                     evidence_ids,
@@ -2118,6 +2283,7 @@ impl EventEnvelope {
             },
             AgentEvent::Correction {
                 message,
+                kind,
                 summary,
                 actor,
                 assisting_profile,
@@ -2129,6 +2295,7 @@ impl EventEnvelope {
                 transcript: None,
                 event: AgentEvent::Correction {
                     message,
+                    kind,
                     summary,
                     actor,
                     assisting_profile,
@@ -2396,8 +2563,31 @@ impl EventEnvelope {
                 },
             },
         };
+        normalize_event_semantics(&mut envelope.event);
         envelope.refresh_projections(&[]);
         envelope
+    }
+}
+
+fn normalize_event_semantics(event: &mut AgentEvent) {
+    match event {
+        AgentEvent::Correction {
+            message,
+            kind,
+            summary,
+            ..
+        } if *kind == CorrectionKind::General => {
+            *kind = CorrectionKind::classify(summary, message);
+        }
+        AgentEvent::WorkflowBlocked {
+            outcome,
+            cause,
+            reason,
+            ..
+        } if *cause == WorkflowBlockCause::Other => {
+            *cause = WorkflowBlockCause::classify(*outcome, reason);
+        }
+        _ => {}
     }
 }
 
@@ -2410,67 +2600,107 @@ pub fn refresh_event_projections(events: &mut [EventEnvelope]) {
     }
 }
 
+pub fn hydrate_event_projections(events: &mut [EventEnvelope]) {
+    for index in 0..events.len() {
+        let (history, current_and_rest) = events.split_at_mut(index);
+        let Some(current) = current_and_rest.first_mut() else {
+            continue;
+        };
+        normalize_event_semantics(&mut current.event);
+        let projected_chatter = chatter_for_event(&current.event, history);
+        let projected_transcript = transcript_metadata_for_event(&current.event, history);
+        if current.chatter.is_empty() {
+            current.chatter = projected_chatter;
+        }
+        if current.transcript.is_none() {
+            current.transcript = Some(projected_transcript);
+        }
+    }
+}
+
 fn transcript_metadata_for_event(
     event: &AgentEvent,
     history: &[EventEnvelope],
-) -> Option<TranscriptMetadata> {
+) -> TranscriptMetadata {
     let (visibility, kind, dedupe_key, related_action_key, summary_redundant) = match event {
         AgentEvent::Correction {
-            message, summary, ..
+            message,
+            kind,
+            summary,
+            ..
         } => {
             let visibility = if matches!(
-                summary.as_str(),
-                "Acceptance contract rejected final response"
-                    | "Completion gate blocked final response"
-                    | "The handoff teammate returned failed checks for repair"
-                    | "Workflow closure checkpoint"
-                    | "Work-unit progress earned one bounded turn"
+                kind,
+                CorrectionKind::Handoff
+                    | CorrectionKind::WorkflowClosure
+                    | CorrectionKind::WorkUnit
             ) {
                 TranscriptVisibility::EvidenceOnly
             } else {
                 TranscriptVisibility::Visible
             };
-            let kind = match summary.as_str() {
-                "Acceptance contract rejected final response"
-                | "Completion gate blocked final response"
-                | "The handoff teammate returned failed checks for repair" => {
-                    TranscriptKind::HandoffCorrection
-                }
-                "Workflow closure checkpoint" => TranscriptKind::WorkflowClosureCheckpoint,
-                "Work-unit progress earned one bounded turn" => TranscriptKind::WorkUnitProgress,
-                "Repeated tool call detected" => TranscriptKind::RepeatedToolDetected,
-                "No-progress tool outcome detected" => TranscriptKind::NoProgressCorrection,
-                "Dependent tool batch rejected" => TranscriptKind::DependentToolBatchCorrection,
-                _ if summary == "Repeated tool call blocked"
-                    || summary.contains("repeated the same action")
-                    || summary.contains("reached the repeat limit") =>
-                {
-                    TranscriptKind::RepeatedToolCorrection
-                }
+            let transcript_kind = match kind {
+                CorrectionKind::Handoff => TranscriptKind::HandoffCorrection,
+                CorrectionKind::WorkflowClosure => TranscriptKind::WorkflowClosureCheckpoint,
+                CorrectionKind::WorkUnit => TranscriptKind::WorkUnitProgress,
+                CorrectionKind::RepeatedTool => TranscriptKind::RepeatedToolCorrection,
+                CorrectionKind::NoProgress => TranscriptKind::NoProgressCorrection,
+                CorrectionKind::DependentToolBatch => TranscriptKind::DependentToolBatchCorrection,
                 _ => TranscriptKind::Correction,
             };
             let dedupe_key = correction_dedupe_key(summary, message);
             let related_action_key = dedupe_key
                 .as_ref()
                 .and_then(|_| latest_tool_action_key(history));
-            (visibility, kind, dedupe_key, related_action_key, false)
-        }
-        AgentEvent::Error { summary, .. }
-            if summary == "Deterministic tool loop"
-                || summary == "No-progress tool loop"
-                || summary.contains("reached the repeat limit") =>
-        {
             (
-                TranscriptVisibility::Visible,
-                TranscriptKind::TerminalToolLoopError,
-                None,
-                None,
+                visibility,
+                transcript_kind,
+                dedupe_key,
+                related_action_key,
                 false,
             )
         }
         AgentEvent::WorkflowBlocked { .. } => (
             TranscriptVisibility::Visible,
             TranscriptKind::WorkflowBlocked,
+            None,
+            None,
+            false,
+        ),
+        AgentEvent::StepStarted { .. } | AgentEvent::ModelLoading { .. } => (
+            TranscriptVisibility::Activity,
+            TranscriptKind::Activity,
+            None,
+            None,
+            false,
+        ),
+        AgentEvent::WorkflowArtifactAccepted { artifact_kind, .. } if artifact_kind == "plan" => (
+            TranscriptVisibility::Visible,
+            TranscriptKind::Conversation,
+            None,
+            None,
+            false,
+        ),
+        AgentEvent::Started { .. }
+        | AgentEvent::Reasoning { .. }
+        | AgentEvent::ToolCall { .. }
+        | AgentEvent::ToolResult { .. }
+        | AgentEvent::ControllerObservation { .. }
+        | AgentEvent::ControllerClosure { .. }
+        | AgentEvent::ControllerMutation { .. }
+        | AgentEvent::TeamMessage { .. }
+        | AgentEvent::UserQuestion { .. }
+        | AgentEvent::UserAnswer { .. }
+        | AgentEvent::UserMessage { .. }
+        | AgentEvent::Diff { .. }
+        | AgentEvent::Final { .. }
+        | AgentEvent::LlmInvocation { .. }
+        | AgentEvent::WorkflowChallengeRaised { .. }
+        | AgentEvent::WorkflowEvidenceInvalidated { .. }
+        | AgentEvent::SessionMetrics { .. }
+        | AgentEvent::Error { .. } => (
+            TranscriptVisibility::Visible,
+            TranscriptKind::Conversation,
             None,
             None,
             false,
@@ -2482,15 +2712,356 @@ fn transcript_metadata_for_event(
             None,
             session_summary_is_redundant(summary, history),
         ),
-        _ => return None,
+        _ => (
+            TranscriptVisibility::EvidenceOnly,
+            TranscriptKind::Evidence,
+            None,
+            None,
+            false,
+        ),
     };
-    Some(TranscriptMetadata {
+    let entry_key = event_entry_key(event);
+    TranscriptMetadata {
         visibility,
         kind,
+        entry_key,
+        supersedes: superseded_entry_keys(event, history),
+        tool_summary: tool_summary_for_event(event, history),
         dedupe_key,
         related_action_key,
         summary_redundant,
-    })
+    }
+}
+
+fn event_entry_key(event: &AgentEvent) -> String {
+    let serialized = serde_json::to_vec(event).unwrap_or_default();
+    format!("event:{}", crate::environment_lock::sha256(&serialized))
+}
+
+fn superseded_entry_keys(event: &AgentEvent, history: &[EventEnvelope]) -> Vec<String> {
+    match event {
+        AgentEvent::TeamMessage {
+            actor,
+            purpose: TeamMessagePurpose::HandoffOutcome,
+            ..
+        } => history
+            .iter()
+            .rev()
+            .find_map(|envelope| match &envelope.event {
+                AgentEvent::TeamMessage {
+                    actor: prior_actor,
+                    purpose: TeamMessagePurpose::HandoffProgress,
+                    ..
+                } if prior_actor == actor => envelope
+                    .transcript
+                    .as_ref()
+                    .map(|metadata| metadata.entry_key.clone()),
+                _ => None,
+            })
+            .into_iter()
+            .collect(),
+        AgentEvent::TeamMessage {
+            actor: TeamActor::Automation(_),
+            tone: TeamMessageTone::Info,
+            purpose: TeamMessagePurpose::General,
+            ..
+        } => history
+            .iter()
+            .rev()
+            .find_map(|envelope| match &envelope.event {
+                AgentEvent::TeamMessage {
+                    actor: TeamActor::Automation(_),
+                    tone: TeamMessageTone::Info,
+                    purpose: TeamMessagePurpose::General,
+                    ..
+                } => envelope
+                    .transcript
+                    .as_ref()
+                    .map(|metadata| metadata.entry_key.clone()),
+                _ => None,
+            })
+            .into_iter()
+            .collect(),
+        AgentEvent::WorkflowBlocked { .. } => history
+            .iter()
+            .rev()
+            .take_while(|envelope| {
+                envelope.transcript.as_ref().is_none_or(|metadata| {
+                    metadata.visibility != TranscriptVisibility::Visible
+                        || matches!(
+                            envelope.event,
+                            AgentEvent::Correction { .. } | AgentEvent::Error { .. }
+                        )
+                })
+            })
+            .filter_map(|envelope| match &envelope.event {
+                AgentEvent::Correction { .. } | AgentEvent::Error { .. } => envelope
+                    .transcript
+                    .as_ref()
+                    .map(|metadata| metadata.entry_key.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn tool_summary_for_event(event: &AgentEvent, history: &[EventEnvelope]) -> Option<String> {
+    match event {
+        AgentEvent::ToolCall {
+            tool, arguments, ..
+        } => Some(tool_summary(tool, arguments, None)),
+        AgentEvent::ToolResult {
+            tool,
+            result,
+            call_id,
+            ..
+        } => history.iter().rev().find_map(|envelope| {
+            let AgentEvent::ToolCall {
+                tool: called_tool,
+                arguments,
+                call_id: called_id,
+                ..
+            } = &envelope.event
+            else {
+                return None;
+            };
+            ((call_id.is_some() && call_id == called_id)
+                || (call_id.is_none() && called_tool == tool))
+                .then(|| tool_summary(tool, arguments, Some(result)))
+        }),
+        _ => None,
+    }
+}
+
+fn tool_summary(tool: &str, arguments: &Value, result: Option<&str>) -> String {
+    let string = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    let count = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let scoped = |value: &str, scope: &str, fallback: &str| {
+        let label = if value.is_empty() { fallback } else { value };
+        if scope.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label} · in {scope}")
+        }
+    };
+    match tool {
+        "read_file" | "inspect_change" | "rm" | "write_file" | "replace_file" | "apply_patch" => {
+            let path = string("path");
+            if path.is_empty() {
+                "(no path)".to_string()
+            } else {
+                path.to_string()
+            }
+        }
+        "edit_file" => {
+            let path = string("path");
+            if path.is_empty() {
+                "(no path)".to_string()
+            } else if arguments.get("diff").is_some() {
+                format!("{path} (patch)")
+            } else {
+                path.to_string()
+            }
+        }
+        "glob" => scoped(
+            string("pattern"),
+            if string("path").is_empty() {
+                string("relative_path")
+            } else {
+                string("path")
+            },
+            "(no pattern)",
+        ),
+        "ripgrep" | "search" => scoped(string("pattern"), string("path"), "(no pattern)"),
+        "web_search" => string_or(string("query"), "(no query)"),
+        "web_fetch" => string_or(string("url"), "(no url)"),
+        "run_command" => string_or(string("cmd"), "(no cmd)"),
+        "run_task" | "run_check" => string_or(string("id"), "(no id)"),
+        "session_changes" => {
+            let mut filters = Vec::new();
+            if !string("path").is_empty() {
+                filters.push(format!("File: {}", string("path")));
+            }
+            if !string("commits").is_empty() {
+                filters.push(format!("Commits: {}", string("commits")));
+            }
+            if filters.is_empty() {
+                "Recent sessions and changes".to_string()
+            } else {
+                filters.join(" · ")
+            }
+        }
+        "lsp_proactive_diagnostics" => lsp_tool_summary(arguments, result),
+        "skill_search" => {
+            let query = string("query");
+            match result {
+                None => format!("{query} (pending)"),
+                Some(result) => format!("{query} ({} skills)", result.matches("name: ").count()),
+            }
+        }
+        "skill" => match string("name") {
+            "" => "(no name)".to_string(),
+            "list" => "loaded skills list".to_string(),
+            name => name.to_string(),
+        },
+        "mv" => format!("from {} to {}", string("source"), string("destination")),
+        "git_commit" => string_or(string("message"), "(no message)"),
+        "session_title" => string_or(string("title"), "(no title)"),
+        "memory_search" => string_or(string("query"), "All relevant project memory"),
+        "memory_read" | "memory_supersede" => string_or(string("id"), "(no memory id)"),
+        "memory_propose" => string_or(
+            string("title"),
+            string_or(string("kind"), "New project memory").as_str(),
+        ),
+        "propose_delivery" | "start_delivery" => {
+            string_or(string("task_summary"), "(no delivery summary)")
+        }
+        "propose_goal" | "start_goal" => string_or(string("objective"), "(no goal objective)"),
+        "goal_pause" | "goal_request_budget" | "request_replan" => {
+            string_or(string("reason"), "(no reason)")
+        }
+        "goal_request_amendment" => string_or(string("summary"), "(no change summary)"),
+        "submit_plan" => {
+            let requirements = count("requirements");
+            let steps = count("steps");
+            let acceptance = count("acceptance");
+            if requirements == 0 || steps == 0 || acceptance == 0 {
+                "Incomplete plan · missing required sections".to_string()
+            } else {
+                format!(
+                    "{requirements} requirement{} · {steps} step{} · {acceptance} acceptance check{}",
+                    plural(requirements),
+                    plural(steps),
+                    plural(acceptance)
+                )
+            }
+        }
+        "submit_plan_review" | "submit_code_review" => {
+            let raw = string("verdict").replace('_', " ");
+            let verdict = capitalize_or(&raw, "Review submitted");
+            let concerns = arguments
+                .get("challenges")
+                .or_else(|| arguments.get("findings"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if concerns == 0 {
+                verdict
+            } else {
+                format!("{verdict} · {concerns} finding{}", plural(concerns))
+            }
+        }
+        "submit_implementation" => {
+            let steps = count("steps");
+            format!("{steps} implementation step{}", plural(steps))
+        }
+        "git_revert" => string_or(string("commit"), "(no commit)"),
+        _ => generic_tool_summary(result),
+    }
+}
+
+fn string_or(value: &str, fallback: &str) -> String {
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn capitalize_or(value: &str, fallback: &str) -> String {
+    let mut chars = value.chars();
+    chars.next().map_or_else(
+        || fallback.to_string(),
+        |first| first.to_uppercase().collect::<String>() + chars.as_str(),
+    )
+}
+
+fn generic_tool_summary(result: Option<&str>) -> String {
+    let Some(result) = result else {
+        return "(pending)".to_string();
+    };
+    match serde_json::from_str::<Value>(result) {
+        Ok(Value::Array(items)) => format!("{} items", items.len()),
+        Ok(Value::Object(fields)) => format!("result ({} fields)", fields.len()),
+        _ if result.len() < 80 => result.replace('\n', " "),
+        _ => String::new(),
+    }
+}
+
+fn lsp_tool_summary(arguments: &Value, result: Option<&str>) -> String {
+    let mode = arguments
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("automatic");
+    let requested = arguments
+        .get("paths")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let Some(result) = result else {
+        return format!("{mode} · {requested} file{} (pending)", plural(requested));
+    };
+    let Ok(report) = serde_json::from_str::<Value>(result) else {
+        return format!("{mode} · {requested} file{}", plural(requested));
+    };
+    let count = |name: &str| {
+        report
+            .get(name)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let scanned = count("scanned_paths");
+    let diagnostics = count("diagnostics");
+    let failures = count("failures");
+    let omitted = report
+        .get("omitted_paths")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let deferred = if omitted > 0 {
+        format!(" · {omitted} deferred")
+    } else {
+        String::new()
+    };
+    if report.get("stale").and_then(Value::as_bool) == Some(true) {
+        return format!("{mode} · stale evidence discarded");
+    }
+    if diagnostics > 0 {
+        return format!(
+            "{mode} · {diagnostics} blocking diagnostic{} in {scanned} file{}{deferred}",
+            plural(diagnostics),
+            plural(scanned)
+        );
+    }
+    if failures > 0 {
+        return format!(
+            "{mode} · {scanned}/{requested} files · {failures} server issue{}{deferred}",
+            plural(failures)
+        );
+    }
+    if report.get("complete").and_then(Value::as_bool) != Some(true) {
+        return format!(
+            "{mode} · incomplete evidence · {}/{} server/file targets{deferred}",
+            count("completed_targets"),
+            count("requested_targets")
+        );
+    }
+    if omitted > 0 {
+        return format!("{mode} · {scanned} files{deferred}");
+    }
+    format!("{mode} · {scanned} file{} · clean", plural(scanned))
 }
 
 fn latest_tool_action_key(history: &[EventEnvelope]) -> Option<String> {
@@ -2550,6 +3121,7 @@ fn chatter_for_event(event: &AgentEvent, history: &[EventEnvelope]) -> Vec<Event
     match event {
         AgentEvent::Correction {
             message,
+            kind,
             summary,
             actor,
             assisting_profile,
@@ -2557,13 +3129,17 @@ fn chatter_for_event(event: &AgentEvent, history: &[EventEnvelope]) -> Vec<Event
         } => vec![correction_chatter(
             *actor,
             *assisting_profile,
+            *kind,
             summary,
             message,
             history,
         )],
         AgentEvent::WorkflowBlocked {
-            outcome, reason, ..
-        } => workflow_blocked_chatter(*outcome, reason, history),
+            outcome,
+            cause,
+            reason,
+            ..
+        } => workflow_blocked_chatter(*outcome, *cause, reason, history),
         _ => Vec::new(),
     }
 }
@@ -2614,6 +3190,7 @@ fn chatter(
 fn correction_chatter(
     actor: TeamActor,
     assisting_profile: Option<AgentProfile>,
+    kind: CorrectionKind,
     summary: &str,
     detail: &str,
     history: &[EventEnvelope],
@@ -2632,13 +3209,7 @@ fn correction_chatter(
     };
     let normalized_summary = summary.trim();
 
-    let is_artifact_validation = normalized_summary == "Workflow artifact validation failed"
-        || (normalized_summary.starts_with("submit_")
-            && normalized_summary.ends_with(" tool call was not executed successfully")
-            && ["plan", "plan_review", "implementation", "code_review"]
-                .iter()
-                .any(|tool| normalized_summary.starts_with(&format!("submit_{tool} "))));
-    let (headline, message) = if is_artifact_validation {
+    let (headline, message) = if kind == CorrectionKind::ArtifactValidation {
         (
             Some(format!(
                 "{teammate_name}’s {artifact_label} needs another pass"
@@ -2648,62 +3219,64 @@ fn correction_chatter(
                 artifact_validation_problem(detail)
             ),
         )
-    } else if let Some(feedback) = tool_failure_feedback(detail, teammate_name) {
+    } else if kind == CorrectionKind::ToolFailure
+        && let Some(feedback) = tool_failure_feedback(detail, teammate_name)
+    {
         (None, feedback)
-    } else if normalized_summary == "Task-focused repository evidence" {
+    } else if kind == CorrectionKind::RepositoryEvidence {
         (
             None,
             format!(
                 "{teammate_first_name}, I found the task-relevant code and pulled out the strongest matching sections. Use them to finish the {artifact_label}. If one concrete fact is still missing, read only the relevant lines instead of rereading the whole file."
             ),
         )
-    } else if normalized_summary.contains("contract planning evidence")
-        || normalized_summary.contains("contract review evidence")
-        || normalized_summary.contains("proposed-path review evidence")
-    {
+    } else if kind == CorrectionKind::ContractEvidence {
         (
             None,
             format!(
                 "{teammate_first_name}, I rechecked the exact code this stage depends on. You have enough evidence now—finish the {artifact_label} instead of rereading broad sections of the repository."
             ),
         )
-    } else if normalized_summary == "Active accepted-plan work unit" {
+    } else if kind == CorrectionKind::WorkUnit
+        && normalized_summary == "Active accepted-plan work unit"
+    {
         (
             None,
             format!(
                 "{teammate_first_name}, I picked the next item from the accepted plan and confirmed exactly which file operation it needs. Complete only that item before moving on."
             ),
         )
-    } else if normalized_summary == "Next accepted-plan creation work unit" {
+    } else if kind == CorrectionKind::WorkUnit {
         (
             None,
             format!(
                 "{teammate_first_name}, the next planned file does not exist yet. Create it now with one complete write, then move on to the next item."
             ),
         )
-    } else if normalized_summary.contains("using host execution") {
+    } else if kind == CorrectionKind::RuntimeFallback
+        && normalized_summary.contains("using host execution")
+    {
         (
             None,
             "This task includes an Apple-only component, so I’m running that part directly on the Mac while keeping the rest of the session isolated."
                 .to_string(),
         )
-    } else if normalized_summary.contains("CPU-only llama.cpp fallback") {
+    } else if kind == CorrectionKind::RuntimeFallback {
         (
             None,
             "The preferred model runtime was unavailable, so I’m using the CPU-only model fallback for this session. Responses may take longer."
                 .to_string(),
         )
-    } else if normalized_summary.contains("reached the repeat limit") {
+    } else if kind == CorrectionKind::RepeatedTool
+        && normalized_summary.contains("reached the repeat limit")
+    {
         (
             None,
             format!(
                 "{teammate_first_name}, you repeated the same action after guidance, so I blocked the duplicate before you spent more time on it. Choose a different approach or report the blocker."
             ),
         )
-    } else if normalized_summary == "Repeated tool call detected"
-        || normalized_summary == "Repeated tool call blocked"
-        || normalized_summary.contains("repeated the same action")
-    {
+    } else if kind == CorrectionKind::RepeatedTool {
         let message = repeated_tool_name(detail).map_or_else(
             || {
                 format!(
@@ -2717,29 +3290,30 @@ fn correction_chatter(
             },
         );
         (None, message)
-    } else if normalized_summary == "No-progress tool outcome detected" {
+    } else if kind == CorrectionKind::NoProgress {
         (
             None,
             format!(
                 "{teammate_first_name}, that action returned the same outcome without adding new evidence. I stopped the loop; choose an action that changes the work or report the blocker."
             ),
         )
-    } else if normalized_summary == "Dependent tool batch rejected" {
+    } else if kind == CorrectionKind::DependentToolBatch {
         (
             None,
             format!(
                 "{teammate_first_name}, those tool calls depend on one another, so I did not run them as one batch. Run the prerequisite first, wait for its result, then submit the dependent action."
             ),
         )
-    } else if normalized_summary == "Workflow stage submission required" {
+    } else if kind == CorrectionKind::StageSubmission {
         (
             None,
             format!(
                 "{teammate_first_name}, a prose reply will not complete this stage. Submit the {artifact_label} in the required format so the team can continue."
             ),
         )
-    } else if normalized_summary == "Teammate action retries exhausted"
-        || normalized_summary.contains("Parse retry limit")
+    } else if kind == CorrectionKind::InvalidAction
+        && (normalized_summary == "Teammate action retries exhausted"
+            || normalized_summary.contains("Parse retry limit"))
     {
         (
             None,
@@ -2747,131 +3321,132 @@ fn correction_chatter(
                 "{teammate_first_name}, your reply still did not form a valid action after several retries, so I stopped the pass instead of letting it loop. Start again with one small, complete action."
             ),
         )
-    } else if normalized_summary.contains("Invalid pb JSON action")
-        || normalized_summary.to_lowercase().contains("unparsable")
-    {
+    } else if kind == CorrectionKind::InvalidAction {
         (
             None,
             format!(
                 "{teammate_first_name}, that reply was not a valid action, so nothing ran. Retry with one complete tool call or finish the stage in the required format."
             ),
         )
-    } else if normalized_summary.contains("reached the bounded step limit") {
+    } else if kind == CorrectionKind::StepLimit {
         (
             None,
             format!(
                 "{teammate_first_name}, you reached this pass’s step limit before completing the work, so I stopped it instead of letting it run in circles. Continue with a tighter next action or report the blocker."
             ),
         )
-    } else if normalized_summary == "Advisory budget exhausted" {
+    } else if kind == CorrectionKind::AdvisoryBudget {
         (
             None,
             "I skipped the optional step-limit review because its advisory budget was already used. The main work and repository were left unchanged."
                 .to_string(),
         )
-    } else if normalized_summary == "Requesting missing bounded evidence" {
+    } else if kind == CorrectionKind::MissingEvidence {
         (
             None,
             format!(
                 "{teammate_first_name}, the edit stopped before it became a valid action because one small file excerpt is still missing. Read only the lines around that detail, then retry the edit."
             ),
         )
-    } else if normalized_summary.contains("truncated action") {
+    } else if kind == CorrectionKind::TruncatedAction {
         (
             None,
             format!(
                 "{teammate_first_name}, the action was cut off before it became valid, so nothing ran. Try again once with one concise, complete tool call."
             ),
         )
-    } else if normalized_summary.contains("mutation recovery")
-        || normalized_summary.contains("compact atomic mutation")
-        || normalized_summary.contains("constrained mutation")
-    {
+    } else if kind == CorrectionKind::MutationRecovery {
         (
             None,
             format!(
                 "{teammate_first_name}, the edit was incomplete and was not executed. I’m giving you one fresh attempt for the smallest complete change; do not repeat the rejected payload."
             ),
         )
-    } else if normalized_summary == "Run cancelled" {
+    } else if kind == CorrectionKind::Lifecycle && normalized_summary == "Run cancelled" {
         (
             None,
             "This run was cancelled. I preserved the repository and the evidence collected so far."
                 .to_string(),
         )
-    } else if normalized_summary == "Goal pausing" {
+    } else if kind == CorrectionKind::Lifecycle && normalized_summary == "Goal pausing" {
         (
             None,
             "I’m pausing the goal at a safe checkpoint before anyone starts another action."
                 .to_string(),
         )
-    } else if normalized_summary == "Cancellation requested" {
+    } else if kind == CorrectionKind::Lifecycle {
         (
             None,
             "Cancellation is requested. I’m preserving the repository and the workflow evidence while the current work stops safely."
                 .to_string(),
         )
-    } else if normalized_summary == "Restarting delivery from current files" {
+    } else if kind == CorrectionKind::TaskPlanningRecovery
+        && normalized_summary == "Restarting delivery from current files"
+    {
         (
             None,
             "I kept the earlier plan and review in the transcript, accepted the project’s current files as the new baseline, and started a fresh planning pass."
                 .to_string(),
         )
-    } else if normalized_summary == "Retrying Task planning" {
+    } else if kind == CorrectionKind::TaskPlanningRecovery
+        && normalized_summary == "Retrying Task planning"
+    {
         (
             None,
             "I’m retrying task planning from the preserved repository state. No files or commits change until the new workflow begins delivery."
                 .to_string(),
         )
-    } else if normalized_summary == "Running as one Build" {
+    } else if kind == CorrectionKind::TaskPlanningRecovery {
         (
             None,
             "I’m keeping the repository as-is and retrying this request as one Build task instead of splitting it into several tasks."
                 .to_string(),
         )
-    } else if normalized_summary == "Tool not available" {
+    } else if kind == CorrectionKind::ToolUnavailable {
         (
             None,
             format!(
                 "{teammate_first_name}, that tool is not available in this stage, so the action did not run. Choose one of the available actions or report the blocker."
             ),
         )
-    } else if normalized_summary.contains("Task requirements remain") {
+    } else if kind == CorrectionKind::RequirementsRemain {
         (
             None,
             format!(
                 "{teammate_first_name}, the handoff still leaves part of the user’s request unfinished. I sent the missing requirements back for one focused repair pass."
             ),
         )
-    } else if normalized_summary == "Handoff executor unavailable" {
+    } else if kind == CorrectionKind::Handoff
+        && normalized_summary == "Handoff executor unavailable"
+    {
         (
             None,
             "I could not run the final handoff checks because their executor is unavailable. I preserved the work so the checks can be retried when it returns."
                 .to_string(),
         )
-    } else if normalized_summary == "Handoff commit blocked" {
+    } else if kind == CorrectionKind::Handoff && normalized_summary == "Handoff commit blocked" {
         (
             None,
             "The final commit was blocked, so I left the completed changes uncommitted and preserved the handoff evidence for review."
                 .to_string(),
         )
-    } else if normalized_summary.starts_with("Agent terminated:")
-        || normalized_summary.starts_with("Final grace terminated:")
-    {
+    } else if kind == CorrectionKind::Handoff {
         (
             None,
             format!(
                 "{teammate_first_name}, your pass ended before it produced a usable result. I preserved every completed action and stopped at the current safe boundary."
             ),
         )
-    } else if normalized_summary == "Harness diagnostic preview" {
+    } else if kind == CorrectionKind::Diagnostics
+        && normalized_summary == "Harness diagnostic preview"
+    {
         (
             None,
             format!(
                 "{teammate_first_name}, I ran an early diagnostic check and found issues you should account for while you complete the current work item."
             ),
         )
-    } else if normalized_summary.to_lowercase().contains("diagnostic") {
+    } else if kind == CorrectionKind::Diagnostics {
         (
             None,
             format!(
@@ -3014,6 +3589,7 @@ fn correction_excerpt(detail: &str) -> Option<String> {
 
 fn workflow_blocked_chatter(
     outcome: crate::workflow::WorkflowOutcome,
+    cause: WorkflowBlockCause,
     reason: &str,
     history: &[EventEnvelope],
 ) -> Vec<EventChatter> {
@@ -3021,18 +3597,14 @@ fn workflow_blocked_chatter(
     let repeated_action = recent_history.iter().find_map(|envelope| {
         let AgentEvent::Correction {
             message,
-            summary,
+            kind,
             assisting_profile,
             ..
         } = &envelope.event
         else {
             return None;
         };
-        (summary == "Repeated tool call detected"
-            || summary == "Repeated tool call blocked"
-            || summary.contains("repeated the same action")
-            || summary.contains("reached the repeat limit"))
-        .then_some((message, *assisting_profile))
+        (*kind == CorrectionKind::RepeatedTool).then_some((message, *assisting_profile))
     });
     let recent_profile = history
         .iter()
@@ -3080,16 +3652,20 @@ fn workflow_blocked_chatter(
                 .flatten()
         });
 
-    let planning_failure = outcome == crate::workflow::WorkflowOutcome::PlanRejected
-        || reason.to_lowercase().contains("planning submission");
-    let git_control_changed = reason.contains("changed Git control state");
-    let repository_content_changed =
-        reason.contains("repository content changed while the read-only");
-    let repeat_limit = reason.contains("deterministic repeat limit");
-    let executor_unavailable = outcome == crate::workflow::WorkflowOutcome::ExecutorUnavailable;
-    let needs_current_files_restart = git_control_changed
-        || repository_content_changed
-        || outcome == crate::workflow::WorkflowOutcome::CommitBlocked;
+    let planning_failure = cause == WorkflowBlockCause::PlanningRejected
+        || outcome == crate::workflow::WorkflowOutcome::PlanRejected;
+    let git_control_changed = cause == WorkflowBlockCause::GitControlChanged;
+    let repository_content_changed = cause == WorkflowBlockCause::RepositoryContentChanged;
+    let repeat_limit = cause == WorkflowBlockCause::DeterministicRepeatLimit;
+    let executor_unavailable = cause == WorkflowBlockCause::ExecutorUnavailable
+        || outcome == crate::workflow::WorkflowOutcome::ExecutorUnavailable;
+    let needs_current_files_restart = matches!(
+        cause,
+        WorkflowBlockCause::GitControlChanged
+            | WorkflowBlockCause::RepositoryContentChanged
+            | WorkflowBlockCause::CommitBlocked
+    ) || outcome
+        == crate::workflow::WorkflowOutcome::CommitBlocked;
     let teammate_message = if planning_failure {
         format!(
             "{planning_first_name}, your plan was rejected after three attempts. {} Nothing changed, and this delivery is now on hold.",
@@ -3752,6 +4328,8 @@ mod tests {
         let envelope = EventEnvelope::new(AgentEvent::TeamMessage {
             actor: TeamActor::Automation(AutomationActor::Handoff),
             tone: TeamMessageTone::Warning,
+            purpose: crate::events::TeamMessagePurpose::General,
+            handoff: None,
             message: "The web checks need another pass.".to_string(),
             detail: Some("deno task test:web failed".to_string()),
             evidence_ids: vec!["check:web-test".to_string()],
@@ -3778,6 +4356,7 @@ mod tests {
     #[test]
     fn correction_chatter_is_server_authored_and_round_trips() {
         let envelope = EventEnvelope::new(AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::General,
             message: "technical controller guidance".to_string(),
             summary: "Task-focused repository evidence".to_string(),
             actor: TeamActor::workflow_steward(),
@@ -3787,15 +4366,19 @@ mod tests {
         });
 
         assert_eq!(envelope.chatter.len(), 1);
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::Correction {
+                kind: CorrectionKind::RepositoryEvidence,
+                ..
+            }
+        ));
+        let transcript = envelope.transcript.as_ref().unwrap();
+        assert_eq!(transcript.visibility, TranscriptVisibility::Visible);
+        assert_eq!(transcript.kind, TranscriptKind::Correction);
         assert_eq!(
-            envelope.transcript,
-            Some(TranscriptMetadata {
-                visibility: TranscriptVisibility::Visible,
-                kind: TranscriptKind::Correction,
-                dedupe_key: Some("correction:Task-focused repository evidence".to_string()),
-                related_action_key: None,
-                summary_redundant: false,
-            })
+            transcript.dedupe_key.as_deref(),
+            Some("correction:Task-focused repository evidence")
         );
         assert_eq!(
             envelope.chatter[0].message,
@@ -3814,6 +4397,7 @@ mod tests {
     #[test]
     fn correction_chatter_turns_tool_failures_into_teammate_guidance() {
         let envelope = EventEnvelope::new(AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::General,
             message: serde_json::json!({
                 "type": "tool_failure",
                 "tool": "read_file",
@@ -3866,6 +4450,7 @@ mod tests {
                 timestamp_ms: None,
             }),
             EventEnvelope::new(AgentEvent::Correction {
+                kind: crate::events::CorrectionKind::General,
                 message: "The repeated path still does not exist.".to_string(),
                 summary: "Eugene reached the repeat limit".to_string(),
                 actor: TeamActor::workflow_steward(),
@@ -3884,6 +4469,7 @@ mod tests {
         let mut blocked = EventEnvelope::new(AgentEvent::WorkflowBlocked {
             workflow_id: "workflow-1".to_string(),
             outcome: crate::workflow::WorkflowOutcome::ReviewFailed,
+            cause: WorkflowBlockCause::DeterministicRepeatLimit,
             reason: reason.to_string(),
             timestamp_ms: None,
         });
@@ -3952,6 +4538,7 @@ mod tests {
         let envelope = EventEnvelope::with_timestamp(AgentEvent::WorkflowBlocked {
             workflow_id: "workflow-1".to_string(),
             outcome: crate::workflow::WorkflowOutcome::RepairCyclesExhausted,
+            cause: WorkflowBlockCause::Other,
             reason: "blocking findings remain".to_string(),
             timestamp_ms: None,
         });
@@ -3963,9 +4550,156 @@ mod tests {
             AgentEvent::WorkflowBlocked {
                 workflow_id,
                 outcome: crate::workflow::WorkflowOutcome::RepairCyclesExhausted,
+                cause: WorkflowBlockCause::Other,
                 reason,
                 timestamp_ms: Some(_),
             } if workflow_id == "workflow-1" && reason == "blocking findings remain"
         ));
+    }
+
+    #[test]
+    fn replay_hydration_preserves_persisted_server_projections() {
+        let mut envelope = EventEnvelope::new(AgentEvent::Correction {
+            kind: CorrectionKind::RepositoryEvidence,
+            message: "technical detail".to_string(),
+            summary: "Task-focused repository evidence".to_string(),
+            actor: TeamActor::workflow_steward(),
+            assisting_profile: Some(AgentProfile::Review),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        envelope.chatter = vec![EventChatter {
+            actor: TeamActor::workflow_steward(),
+            tone: TeamMessageTone::Success,
+            headline: Some("Persisted wording".to_string()),
+            message: "This exact authored message must survive replay.".to_string(),
+            detail: None,
+            audience: ChatterAudience::Team,
+        }];
+        envelope.transcript = Some(TranscriptMetadata {
+            visibility: TranscriptVisibility::EvidenceOnly,
+            kind: TranscriptKind::Evidence,
+            entry_key: "persisted-entry".to_string(),
+            supersedes: vec!["older-entry".to_string()],
+            tool_summary: None,
+            dedupe_key: None,
+            related_action_key: None,
+            summary_redundant: false,
+        });
+        let mut events = vec![envelope];
+
+        hydrate_event_projections(&mut events);
+
+        assert_eq!(
+            events[0].chatter[0].headline.as_deref(),
+            Some("Persisted wording")
+        );
+        assert_eq!(
+            events[0]
+                .transcript
+                .as_ref()
+                .map(|metadata| metadata.entry_key.as_str()),
+            Some("persisted-entry")
+        );
+    }
+
+    #[test]
+    fn tool_projection_owns_result_presentation() {
+        let mut events = vec![
+            EventEnvelope::new(AgentEvent::ToolCall {
+                tool: "lsp_proactive_diagnostics".to_string(),
+                arguments: serde_json::json!({
+                    "mode": "settled",
+                    "paths": ["src/lib.rs", "src/main.rs"]
+                }),
+                call_id: Some("lsp-1".to_string()),
+                batch_id: None,
+                actor: Some(TeamActor::workflow_steward()),
+                nesting_depth: None,
+                timestamp_ms: None,
+            }),
+            EventEnvelope::new(AgentEvent::ToolResult {
+                tool: "lsp_proactive_diagnostics".to_string(),
+                result: serde_json::json!({
+                    "scanned_paths": ["src/lib.rs", "src/main.rs"],
+                    "diagnostics": [{"path": "src/lib.rs"}],
+                    "failures": [],
+                    "omitted_paths": 3,
+                    "stale": false
+                })
+                .to_string(),
+                call_id: Some("lsp-1".to_string()),
+                batch_id: None,
+                outcome: Some(ToolOutcome::Failed),
+                actor: Some(TeamActor::workflow_steward()),
+                duration_ms: None,
+                energy_joules: None,
+                energy_kwh: None,
+                average_power_watts: None,
+                energy_shared_calls: None,
+                nesting_depth: None,
+                timestamp_ms: None,
+            }),
+        ];
+
+        refresh_event_projections(&mut events);
+
+        assert_eq!(
+            events[1]
+                .transcript
+                .as_ref()
+                .and_then(|metadata| metadata.tool_summary.as_deref()),
+            Some("settled · 1 blocking diagnostic in 2 files · 3 deferred")
+        );
+    }
+
+    #[test]
+    fn handoff_outcome_explicitly_supersedes_progress() {
+        let summary = HandoffSummary {
+            outcome: HandoffOutcome::Ready,
+            affected_components: vec!["web".to_string()],
+            checks: Vec::new(),
+            commit: None,
+            changed_paths: vec!["webui/src/App.tsx".to_string()],
+            detail: None,
+        };
+        let mut events = vec![
+            EventEnvelope::new(AgentEvent::TeamMessage {
+                actor: TeamActor::workflow_steward(),
+                tone: TeamMessageTone::Info,
+                purpose: TeamMessagePurpose::HandoffProgress,
+                handoff: None,
+                message: "Checking the web app.".to_string(),
+                detail: None,
+                evidence_ids: Vec::new(),
+                nesting_depth: None,
+                timestamp_ms: None,
+            }),
+            EventEnvelope::new(AgentEvent::TeamMessage {
+                actor: TeamActor::workflow_steward(),
+                tone: TeamMessageTone::Success,
+                purpose: TeamMessagePurpose::HandoffOutcome,
+                handoff: Some(summary),
+                message: "The web app is ready.".to_string(),
+                detail: None,
+                evidence_ids: Vec::new(),
+                nesting_depth: None,
+                timestamp_ms: None,
+            }),
+        ];
+
+        refresh_event_projections(&mut events);
+        let progress_key = events[0]
+            .transcript
+            .as_ref()
+            .map(|metadata| metadata.entry_key.clone())
+            .unwrap();
+        assert_eq!(
+            events[1]
+                .transcript
+                .as_ref()
+                .map(|metadata| metadata.supersedes.as_slice()),
+            Some([progress_key].as_slice())
+        );
     }
 }

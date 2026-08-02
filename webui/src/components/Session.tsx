@@ -22,13 +22,11 @@ import {
   harnessEfficiencyStats,
   profileJobTitle,
   profileName,
-  TODO_STATUS_LABELS,
   trustedSessionSummaryCommitLines,
 } from "../lib/sessionUtils";
 import type {
   ActionTimelineItem,
   HarnessEfficiencyStats,
-  TodoTask,
 } from "../lib/sessionUtils";
 import { parseInlineRichText, parseRichText } from "../lib/richText";
 import {
@@ -551,47 +549,6 @@ export function DrawerPanel({
   );
 }
 
-export function TodoDrawer({ tasks }: { tasks: TodoTask[] }) {
-  if (tasks.length === 0) {
-    return (
-      <div className="empty-detail compact">
-        <i className="bi bi-check2-square"></i>
-        <h3>No managed tasks</h3>
-        <p>
-          Todo tool activity will appear here as the agent plans and updates
-          work.
-        </p>
-      </div>
-    );
-  }
-
-  return (
-    <ol className="todo-list">
-      {tasks.map((task) => (
-        <li key={task.id} className={`todo-item ${task.status}`}>
-          <div className="todo-title-row">
-            <span className="todo-id">#{task.id}</span>
-            <span className="todo-status">
-              {TODO_STATUS_LABELS[task.status] || task.status}
-            </span>
-          </div>
-          <strong>{task.title}</strong>
-          {task.description && <p>{task.description}</p>}
-          {task.parent_id ? <small>Parent #{task.parent_id}</small> : null}
-          {task.notes?.length
-            ? (
-              <ul className="todo-notes">
-                {task.notes.map((note, index) => <li key={index}>{note}</li>)}
-              </ul>
-            )
-            : null}
-          {task.timestampMs && <time>{formatEventTime(task.timestampMs)}</time>}
-        </li>
-      ))}
-    </ol>
-  );
-}
-
 function ErrorEventBubble({
   event,
 }: {
@@ -878,7 +835,7 @@ function DeliveryPlanCard({
   const reviewWasInvalidated = !reviewMatchesPlan &&
     workflow.stage === "blocked" &&
     workflow.paused_stage === "plan_review" &&
-    workflow.blocked_reason?.includes("repository content changed");
+    workflow.blocked_cause === "repository_content_changed";
   const reviewEndedIncomplete = !reviewMatchesPlan &&
     ["failed", "blocked", "cancelled"].includes(workflow.stage);
   const reviewLabel = reviewMatchesPlan
@@ -974,6 +931,7 @@ function handoffOutcomeLabel(outcome?: string): string {
       return "No code changes";
     case "checks_failed":
     case "repair_exhausted":
+    case "incomplete":
       return "Needs another pass";
     case "executor_unavailable":
     case "commit_blocked":
@@ -1000,7 +958,6 @@ function TeamMessageBubble({
   const index = events.indexOf(envelope);
   const priorEvents = events.slice(0, index < 0 ? events.length : index);
   const recentPriorEvents = [...priorEvents].reverse();
-  const followingEvents = events.slice(index < 0 ? 0 : index + 1);
   const evidenceIds = new Set(event.evidence_ids || []);
   const checkEvidence = Array.from(evidenceIds)
     .filter((id) => id.startsWith("check:"))
@@ -1021,12 +978,7 @@ function TeamMessageBubble({
       )
     )
     .filter((candidate): candidate is EventEnvelope => Boolean(candidate));
-  const handoff = followingEvents.find((candidate) =>
-    candidate.event.type === "handoff_summary"
-  );
-  const summary = handoff?.event.type === "handoff_summary"
-    ? handoff.event.summary
-    : undefined;
+  const summary = event.handoff;
   const start = events.find((candidate) => candidate.event.type === "started");
   const focusRoot = start?.event.type === "started"
     ? start.event.focus_root
@@ -1053,9 +1005,14 @@ function TeamMessageBubble({
             : null}
         </div>
         <div className="bubble thought-bubble team-bubble">
-          <span className="handoff-state">
-            {handoffOutcomeLabel(summary?.outcome)}
-          </span>
+          {event.purpose === "handoff_progress" ||
+              event.purpose === "handoff_outcome"
+            ? (
+              <span className="handoff-state">
+                {handoffOutcomeLabel(summary?.outcome)}
+              </span>
+            )
+            : null}
           <RichText content={event.message} />
           {hasEvidence
             ? (

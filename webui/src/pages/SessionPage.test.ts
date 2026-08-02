@@ -149,6 +149,7 @@ Deno.test("blocked delivery recovery is reason-aware", () => {
     policy_sha256: "policy",
     blocked_reason:
       "repository content changed while the read-only PlanReview stage was running",
+    blocked_cause: "repository_content_changed",
     recovery: "restart_from_current_files",
   });
   equal(restart.action, "restart-delivery");
@@ -446,7 +447,7 @@ Deno.test("session workspace prioritizes chat and shows work details only when u
   ok(page.includes("showWorkDrawer"));
   ok(page.includes('aria-label="Work details"'));
   ok(page.includes('title="Actions"'));
-  ok(page.includes('title="Plan"'));
+  ok(!page.includes('title="Plan"'));
   ok(!page.includes("Session details"));
   ok(!page.includes('title="Activity"'));
   ok(!page.includes("<SessionActivity events={events} />"));
@@ -500,6 +501,8 @@ Deno.test("handoff feedback renders as a teammate with expandable evidence", asy
   ok(types.includes("handoff_outcome"));
   ok(component.includes("function TeamMessageBubble"));
   ok(component.includes("teamActorPresentation(event.actor)"));
+  ok(component.includes("const summary = event.handoff"));
+  ok(!component.includes("followingEvents.find"));
   ok(component.includes("What I ran"));
   ok(component.includes("check.command"));
   ok(component.includes("summary.affected_components"));

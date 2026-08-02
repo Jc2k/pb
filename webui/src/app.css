@@ -913,30 +913,6 @@ body {
   letter-spacing: -0.08em;
 }
 
-.branch-picker {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.65rem;
-  min-height: 48px;
-  padding: 0.7rem 1rem;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.8);
-  color: #18233b;
-  font-weight: 750;
-  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
-}
-
-.branch-picker select {
-  padding: 0;
-  border: 0;
-  appearance: none;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  outline: 0;
-}
-
 .icon-btn {
   width: 52px;
   height: 52px;
@@ -1343,7 +1319,6 @@ body {
 @media (max-width: 560px) {
   .project-detail-wrap { padding-inline: 0.9rem; }
   .project-heading { align-items: center; margin-bottom: 1rem; }
-  .branch-picker { min-height: 44px; padding-inline: 0.85rem; }
   .icon-btn,
   .send-btn { width: 48px; height: 48px; }
   .composer-card p { font-size: 0.92rem; }
@@ -1401,17 +1376,6 @@ body {
   font-size: clamp(2.25rem, 4.4vw, 3.25rem);
   font-weight: 700;
   letter-spacing: -0.055em;
-}
-
-.branch-picker {
-  min-height: 44px;
-  padding: 0.58rem 0.9rem;
-  border-color: #d9e0ea;
-  border-radius: 10px;
-  background: #fff;
-  font-size: 0.92rem;
-  font-weight: 600;
-  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04);
 }
 
 .icon-btn {

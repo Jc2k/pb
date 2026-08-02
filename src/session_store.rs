@@ -879,6 +879,8 @@ mod tests {
                 EventEnvelope::new(AgentEvent::TeamMessage {
                     actor: crate::events::TeamActor::workflow_steward(),
                     tone: crate::events::TeamMessageTone::Success,
+                    purpose: crate::events::TeamMessagePurpose::General,
+                    handoff: None,
                     message: "Everything affected passed.".to_string(),
                     detail: Some("cargo test --all-targets".to_string()),
                     evidence_ids: vec!["check:rust".to_string()],

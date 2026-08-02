@@ -43,25 +43,10 @@ import {
   uniqueIntegrations,
   usageStatsForToday,
 } from "../lib/helpers";
-import { useProjectFinishNotifications } from "../lib/hooks";
+import { useProjectSessionData } from "../lib/hooks";
 
 export function ProjectsPage() {
-  const [projects, setProjects] = useState<ProjectEntry[]>([]);
-  const [sessions, setSessions] = useState<SessionItem[]>([]);
-
-  const fetchProjects = () =>
-    fetch("/api/projects")
-      .then((res) => (res.ok ? res.json() : []))
-      .then((entries: ProjectEntry[]) => setProjects(entries));
-
-  useEffect(() => {
-    void fetchProjects();
-    void fetch("/api/sessions")
-      .then((res) => (res.ok ? res.json() : []))
-      .then((entries: SessionItem[]) => setSessions(entries));
-  }, []);
-
-  useProjectFinishNotifications(sessions, projects);
+  const { projects, sessions } = useProjectSessionData();
 
   return (
     <PageShell contentClassName="projects-index-wrap">
@@ -146,12 +131,10 @@ export function ProjectPage() {
     { projectName: string }
   >();
   const navigate = useNavigate();
-  const [projects, setProjects] = useState<ProjectEntry[]>([]);
-  const [sessions, setSessions] = useState<SessionItem[]>([]);
+  const { projects, sessions } = useProjectSessionData();
   const [task, setTask] = useState("");
   const [intent, setIntent] = useState<ComposerMode>("discuss");
   const [goalOpen, setGoalOpen] = useState(false);
-  const [branch, setBranch] = useState("main");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [voiceInputActive, setVoiceInputActive] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
@@ -185,25 +168,7 @@ export function ProjectPage() {
   const todaysUsage = useMemo(() => usageStatsForToday(projectSessions), [
     projectSessions,
   ]);
-  const defaultBranch = branch.trim() || "main";
-
-  useProjectFinishNotifications(sessions, projects);
-
-  useEffect(() => {
-    void fetch("/api/projects")
-      .then((res) => (res.ok ? res.json() : []))
-      .then((entries: ProjectEntry[]) => setProjects(entries));
-  }, []);
-
-  useEffect(() => {
-    const fetchSessions = () =>
-      fetch("/api/sessions")
-        .then((res) => (res.ok ? res.json() : []))
-        .then((entries: SessionItem[]) => setSessions(entries));
-    void fetchSessions();
-    const timer = window.setInterval(() => void fetchSessions(), 5000);
-    return () => window.clearInterval(timer);
-  }, []);
+  const latestBranch = projectSessions[0]?.branch || "Managed automatically";
 
   useEffect(() => {
     if (!name) return;
@@ -236,7 +201,6 @@ export function ProjectPage() {
           task: task.trim(),
           intent,
           workdir: project.path,
-          branch: defaultBranch,
           attachments: images,
         }),
       });
@@ -269,21 +233,6 @@ export function ProjectPage() {
           <div className="project-heading">
             <div className="title-row">
               <h1>{project?.name || name || "Project"}</h1>
-              {project && (
-                <label className="branch-picker">
-                  <i className="bi bi-git"></i>
-                  <select
-                    value={branch}
-                    onChange={(e) => setBranch(e.target.value)}
-                    aria-label="Base branch"
-                  >
-                    <option>main</option>
-                    <option>develop</option>
-                    <option>feature/ui-refresh</option>
-                  </select>
-                  <i className="bi bi-chevron-down"></i>
-                </label>
-              )}
             </div>
             {project && (
               <Link
@@ -395,7 +344,6 @@ export function ProjectPage() {
             />
             <SessionRows
               sessions={visibleSessions}
-              defaultBranch={defaultBranch}
               emptyText="No sessions match this filter."
               paginationKey={filter}
               onOpenSession={(session) =>
@@ -444,7 +392,7 @@ export function ProjectPage() {
               {activeDetailsTab === "overview" && (
                 <ProjectOverview
                   currentStatus={projectSessions[0]?.status || "queued"}
-                  defaultBranch={defaultBranch}
+                  latestBranch={latestBranch}
                   lastActive={lastActive}
                   sessionCount={projectSessions.length}
                 />
@@ -474,7 +422,7 @@ export function ProjectPage() {
               <h2>Project overview</h2>
               <ProjectOverview
                 currentStatus={projectSessions[0]?.status || "queued"}
-                defaultBranch={defaultBranch}
+                latestBranch={latestBranch}
                 lastActive={lastActive}
                 sessionCount={projectSessions.length}
               />
@@ -506,9 +454,9 @@ export function ProjectPage() {
 }
 
 function ProjectOverview(
-  { currentStatus, defaultBranch, lastActive, sessionCount }: {
+  { currentStatus, latestBranch, lastActive, sessionCount }: {
     currentStatus: SessionItem["status"];
-    defaultBranch: string;
+    latestBranch: string;
     lastActive: string;
     sessionCount: number;
   },
@@ -522,9 +470,9 @@ function ProjectOverview(
         </strong>
       </div>
       <div>
-        <span>Default branch</span>
+        <span>Latest branch</span>
         <strong>
-          <i className="bi bi-git"></i> {defaultBranch}
+          <i className="bi bi-git"></i> {latestBranch}
         </strong>
       </div>
       <div>

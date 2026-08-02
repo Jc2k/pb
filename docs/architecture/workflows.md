@@ -788,17 +788,20 @@ repeating actor identity in every row. Character attribution is
 presentation over typed events; it never changes a controller event into a model tool call or
 claims that a model requested an automatic action.
 
-The event envelope is also the shared conversational boundary. Rust projects typed correction and
-workflow-stop evidence into ordered `chatter` records containing actor, tone, optional headline,
-plain-language message, technical detail, and explicit team-or-user audience. Stable transcript
-metadata separately declares visibility, event kind, deduplication identity, related action, and
-whether a terminal summary repeats earlier event copy. The daemon persists and replays that
-projection, and restored sessions rebuild it from the durable event history when reading older
-records. Terminal, harness, and web consumers therefore render the same Trinity-authored messages;
+The event envelope is also the shared conversational boundary. Corrections and workflow stops carry
+typed correction kinds and block causes; team messages carry a typed purpose and embed their own
+handoff summary when they report an outcome. Rust projects those events into ordered `chatter`
+records containing actor, tone, optional headline, plain-language message, technical detail, and
+explicit team-or-user audience. Stable transcript metadata separately declares visibility, event
+kind, stable entry identity, explicit supersession, related action, a typed tool-presentation
+summary, and whether a terminal summary repeats earlier event copy. The daemon persists that
+projection as authored. Replay treats persisted projections as authoritative and hydrates only
+fields missing from older records, so a new binary cannot silently rewrite historical teammate
+speech. Terminal, harness, and web consumers therefore render the same Trinity-authored messages;
 the browser owns only visual layout and optional local-username addressing. It does not parse raw
-controller JSON, compare diagnostic summary wording, or correlate raw tool arguments to invent or
-deduplicate teammate speech. Raw event fields remain intact as machine-readable evidence and
-progressive detail.
+controller JSON, compare diagnostic summary wording, scan later events for an unrelated handoff, or
+correlate raw tool arguments to invent or deduplicate teammate speech. Raw event fields remain intact
+as machine-readable evidence and progressive detail.
 
 The web UI gives every Trinity-owned row the same restrained lilac identity treatment on provenance,
 information affordances, and a narrow surface accent; avatars remain unoutlined. Other named

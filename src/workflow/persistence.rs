@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ArtifactEnvelope, PlanArtifact, PlanReviewArtifact, WorkflowOutcome, WorkflowRun, WorkflowStage,
+    ArtifactEnvelope, PlanArtifact, PlanReviewArtifact, WorkflowBlockCause, WorkflowOutcome,
+    WorkflowRun, WorkflowStage,
 };
 
 pub const READY_EVIDENCE_SCHEMA_VERSION: u32 = 1;
@@ -116,6 +117,8 @@ pub struct WorkflowSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_cause: Option<WorkflowBlockCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<WorkflowRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<ArtifactEnvelope<PlanArtifact>>,
@@ -143,6 +146,12 @@ impl From<&WorkflowRun> for WorkflowSummary {
             ready_evidence: run.ready_evidence.clone(),
             paused_stage: run.paused_stage,
             blocked_reason: run.blocked_reason.clone(),
+            blocked_cause: run.blocked_cause.or_else(|| {
+                Some(WorkflowBlockCause::classify(
+                    run.outcome?,
+                    run.blocked_reason.as_deref()?,
+                ))
+            }),
             recovery: match (run.stage, run.outcome) {
                 (WorkflowStage::Blocked, Some(WorkflowOutcome::ExecutorUnavailable)) => {
                     Some(WorkflowRecovery::Resume)

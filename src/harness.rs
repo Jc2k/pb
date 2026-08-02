@@ -3428,6 +3428,7 @@ mod tests {
             });
         }
         sink.emit(AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::General,
             message: "mutation denied".to_string(),
             summary: "Tool not available".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
@@ -3912,6 +3913,8 @@ mod tests {
         sink.emit(AgentEvent::TeamMessage {
             actor: crate::events::TeamActor::workflow_steward(),
             tone: crate::events::TeamMessageTone::Warning,
+            purpose: crate::events::TeamMessagePurpose::General,
+            handoff: None,
             message: "The web check needs attention.".to_string(),
             detail: Some("failed".to_string()),
             evidence_ids: vec!["check:web".to_string()],
@@ -3967,6 +3970,7 @@ mod tests {
         )
         .unwrap();
         sink.emit(AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::General,
             message: "create alpha.txt now".to_string(),
             summary: "Next accepted-plan creation work unit".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
@@ -4030,6 +4034,7 @@ mod tests {
             ),
         ] {
             sink.emit(AgentEvent::Correction {
+                kind: crate::events::CorrectionKind::General,
                 message: message.to_string(),
                 summary: summary.to_string(),
                 actor: crate::events::TeamActor::workflow_steward(),

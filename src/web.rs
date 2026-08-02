@@ -2459,6 +2459,7 @@ fn prepare_blocked_workflow_restart(session: &mut SessionState, session_id: &str
         &session.sender,
         &session.history,
         AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::General,
             message: "I kept the blocked plan and review in the session history, accepted the repository's current files as the new baseline, and started a fresh planning pass."
                 .to_string(),
             summary: "Restarting delivery from current files".to_string(),
@@ -2573,6 +2574,7 @@ async fn recover_task_plan(
         &session.sender,
         &session.history,
         AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::General,
             message: format!(
                 "{action}. Repository state and existing commits remain unchanged until the selected workflow delivers."
             ),
@@ -2622,6 +2624,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         &session.sender,
         &session.history,
         AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::General,
             message: "Cancellation requested. Repository content and workflow evidence will be preserved."
                 .to_string(),
             summary: "Cancellation requested".to_string(),
@@ -5398,7 +5401,7 @@ fn session_from_persisted(mut persisted: PersistedSession) -> (String, SessionSt
     } else {
         std::mem::take(&mut persisted.pending_user_messages)
     };
-    crate::events::refresh_event_projections(&mut persisted.events);
+    crate::events::hydrate_event_projections(&mut persisted.events);
     let history = Arc::new(StdMutex::new(persisted.events));
     let pending_user_messages =
         Arc::new(StdMutex::new(pending_user_messages.into_iter().collect()));

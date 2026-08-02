@@ -14,3 +14,23 @@ Deno.test("project index uses the shared workspace frame", async () => {
   ok(source.includes('<span className="chevron" aria-hidden="true">'));
   ok(!source.includes('className="chevron text-decoration-none"'));
 });
+
+Deno.test("project sessions leave branch selection to the managed workspace", async () => {
+  const source = await Deno.readTextFile("webui/src/pages/ProjectsPage.tsx");
+
+  ok(!source.includes("setBranch"));
+  ok(!source.includes('className="branch-picker"'));
+  ok(!source.includes("feature/ui-refresh"));
+  ok(!source.includes("branch: defaultBranch"));
+  ok(source.includes('projectSessions[0]?.branch || "Managed automatically"'));
+  ok(source.includes("Latest branch"));
+  ok(!source.includes("Default branch"));
+});
+
+Deno.test("project pages share live session data and finish notifications", async () => {
+  const source = await Deno.readTextFile("webui/src/pages/ProjectsPage.tsx");
+
+  equal(source.match(/useProjectSessionData\(\)/g)?.length, 2);
+  ok(!source.includes("useProjectFinishNotifications"));
+  ok(!source.includes('fetch("/api/sessions")'));
+});

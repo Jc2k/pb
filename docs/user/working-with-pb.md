@@ -29,6 +29,10 @@ Goal for the exact current turn, but the resulting milestone plan still waits fo
 Changing the status filter starts that filtered history from its first batch again. No sessions are
 deleted or hidden from the filter totals.
 
+Starting work from a project page leaves branch and managed-workspace selection to pb. The page does
+not offer a synthetic list of branch names. Session rows show the branch reported by pb or identify
+the managed workspace when no branch applies; the overview shows only the latest session's branch.
+
 ### Speak a prompt
 
 **Shipped where the browser supports the Web Speech API.** Prompt composers on the home and project

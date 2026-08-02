@@ -74,6 +74,8 @@ pub fn run_handoff(
         sink.emit(AgentEvent::TeamMessage {
             actor: handoff_actor(),
             tone: TeamMessageTone::Info,
+            purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+            handoff: Some(summary.clone()),
             message: "There’s no repository change to hand off, so I don’t have anything to test or commit."
                 .to_string(),
             detail: None,
@@ -95,6 +97,8 @@ pub fn run_handoff(
         sink.emit(AgentEvent::TeamMessage {
             actor: handoff_actor(),
             tone: TeamMessageTone::Info,
+            purpose: crate::events::TeamMessagePurpose::HandoffProgress,
+            handoff: None,
             message: format!(
                 "I’m checking the affected parts before we wrap this up: {}.",
                 natural_list(&labels)
@@ -128,6 +132,8 @@ pub fn run_handoff(
             sink.emit(AgentEvent::TeamMessage {
                 actor: handoff_actor(),
                 tone: TeamMessageTone::Error,
+                purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+                handoff: Some(summary.clone()),
                 message: format!(
                     "I couldn’t run the affected checks because their environment is unavailable. The team may need help setting it up before we can finish. {detail}"
                 ),
@@ -166,6 +172,8 @@ pub fn run_handoff(
                 sink.emit(AgentEvent::TeamMessage {
                     actor: handoff_actor(),
                     tone: TeamMessageTone::Error,
+                    purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+                    handoff: Some(summary.clone()),
                     message: format!(
                         "Everything affected passed, but I couldn’t create a safe commit. I left the workspace intact: {detail}"
                     ),
@@ -212,6 +220,8 @@ pub fn run_handoff(
         sink.emit(AgentEvent::TeamMessage {
             actor: handoff_actor(),
             tone: TeamMessageTone::Success,
+            purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+            handoff: Some(summary.clone()),
             message,
             detail: None,
             evidence_ids,
@@ -262,6 +272,8 @@ pub fn run_handoff(
     sink.emit(AgentEvent::TeamMessage {
         actor: handoff_actor(),
         tone: TeamMessageTone::Warning,
+        purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+        handoff: Some(summary.clone()),
         message: format!(
             "{} failed. I’ve sent that back to Kate for another pass.",
             natural_list(&failed.iter().map(String::as_str).collect::<Vec<_>>())

@@ -184,13 +184,11 @@ export function SessionFilters(
 
 export function SessionRows({
   sessions,
-  defaultBranch = "main",
   emptyText,
   onOpenSession,
   paginationKey = "default",
 }: {
   sessions: SessionItem[];
-  defaultBranch?: string;
   emptyText: string;
   onOpenSession: (session: SessionItem) => void;
   paginationKey?: string;
@@ -228,7 +226,7 @@ export function SessionRows({
                   <small>
                     {projectName(session.workdir)} <i className="bi bi-git"></i>
                     {" "}
-                    {session.branch || defaultBranch}
+                    {session.branch || "Managed workspace"}
                   </small>
                 </span>
                 <span className={`state-pill ${session.status}`}>

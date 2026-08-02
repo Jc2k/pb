@@ -307,8 +307,12 @@ function chatItemSpeakerKey(
     case "user_question":
       return `agent:${event.profile}`;
     case "correction":
-    case "workflow_blocked":
-      return "automation:trinity";
+      return teamActorKey(event.actor || workflowStewardActor());
+    case "workflow_blocked": {
+      const speaker = item.chatter?.find((entry) => entry.audience === "team")
+        ?.actor;
+      return speaker ? teamActorKey(speaker) : undefined;
+    }
     case "team_message":
       return teamActorKey(event.actor);
     case "workflow_artifact_accepted":

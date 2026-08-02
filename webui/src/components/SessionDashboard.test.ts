@@ -72,6 +72,15 @@ Deno.test("session rows reveal long histories in bounded batches", () => {
   ok(readableHtml.includes("2 remaining"));
 });
 
+Deno.test("session rows never invent a default branch", async () => {
+  const source = await Deno.readTextFile(
+    "webui/src/components/SessionDashboard.tsx",
+  );
+
+  ok(source.includes('session.branch || "Managed workspace"'));
+  ok(!source.includes('defaultBranch = "main"'));
+});
+
 Deno.test("home workspace keeps primary actions focused across breakpoints", async () => {
   const page = await Deno.readTextFile("webui/src/pages/HomePage.tsx");
   const css = await Deno.readTextFile("webui/src/app.css");

@@ -212,6 +212,11 @@ Deno.test("strict workflow summaries require typed commit evidence", () => {
 Deno.test("getToolDetail shows session_title call title", () => {
   const call: EventEnvelope = {
     version: "1",
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      tool_summary: "Wire title tool",
+    },
     event: {
       type: "tool_call",
       tool: "session_title",
@@ -225,6 +230,11 @@ Deno.test("getToolDetail shows session_title call title", () => {
 Deno.test("getToolDetail keeps search scope and summarizes workflow submissions", () => {
   const search: EventEnvelope = {
     version: "1",
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      tool_summary: "branch.*selector · in webui",
+    },
     event: {
       type: "tool_call",
       tool: "search",
@@ -233,6 +243,11 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
   };
   const changes: EventEnvelope = {
     version: "1",
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      tool_summary: "Recent sessions and changes",
+    },
     event: {
       type: "tool_call",
       tool: "session_changes",
@@ -241,6 +256,11 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
   };
   const plan: EventEnvelope = {
     version: "1",
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      tool_summary: "1 requirement · 1 step · 1 acceptance check",
+    },
     event: {
       type: "tool_call",
       tool: "submit_plan",
@@ -253,6 +273,11 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
   };
   const incompletePlan: EventEnvelope = {
     version: "1",
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      tool_summary: "Incomplete plan · missing required sections",
+    },
     event: {
       type: "tool_call",
       tool: "submit_plan",
@@ -284,6 +309,11 @@ Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
   };
   const result: EventEnvelope = {
     version: "1",
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      tool_summary: "settled · 1 blocking diagnostic in 2 files · 3 deferred",
+    },
     event: {
       type: "tool_result",
       tool: "lsp_proactive_diagnostics",
@@ -316,6 +346,11 @@ Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
   };
   const result: EventEnvelope = {
     version: "1",
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      tool_summary: "settled · incomplete evidence · 1/2 server/file targets",
+    },
     event: {
       type: "tool_result",
       tool: "lsp_proactive_diagnostics",
@@ -347,6 +382,11 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
   const events: EventEnvelope[] = [
     {
       version: "1",
+      transcript: {
+        visibility: "visible",
+        kind: "conversation",
+        tool_summary: "Wire title tool",
+      },
       event: {
         type: "tool_call",
         tool: "session_title",
@@ -356,6 +396,11 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
     },
     {
       version: "1",
+      transcript: {
+        visibility: "visible",
+        kind: "conversation",
+        tool_summary: "Wire title tool",
+      },
       event: {
         type: "tool_result",
         tool: "session_title",
@@ -385,6 +430,11 @@ Deno.test("buildToolSummaries shows joules, power, and parallel measurement scop
   const events: EventEnvelope[] = [
     {
       version: "1",
+      transcript: {
+        visibility: "visible",
+        kind: "conversation",
+        tool_summary: "power",
+      },
       event: {
         type: "tool_call",
         tool: "web_search",
@@ -393,6 +443,11 @@ Deno.test("buildToolSummaries shows joules, power, and parallel measurement scop
     },
     {
       version: "1",
+      transcript: {
+        visibility: "visible",
+        kind: "conversation",
+        tool_summary: "power",
+      },
       event: {
         type: "tool_result",
         tool: "web_search",
@@ -426,6 +481,10 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
     },
     {
       version: "1",
+      transcript: {
+        visibility: "activity",
+        kind: "activity",
+      },
       event: {
         type: "model_loading",
         model: "/models/local.gguf",
@@ -434,6 +493,10 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
     },
     {
       version: "1",
+      transcript: {
+        visibility: "activity",
+        kind: "activity",
+      },
       event: {
         type: "step_started",
         step: 1,
@@ -453,6 +516,11 @@ Deno.test("running user messages stay in chat while delivery acknowledgements st
   const events: EventEnvelope[] = [
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "conversation",
+        entry_key: "handoff-progress",
+      },
       event: {
         type: "user_message",
         message_id: "message-1",
@@ -461,6 +529,10 @@ Deno.test("running user messages stay in chat while delivery acknowledgements st
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "evidence_only",
+        kind: "evidence",
+      },
       event: {
         type: "user_message_applied",
         message_id: "message-1",
@@ -590,15 +662,25 @@ Deno.test("handoff progress is replaced by the teammate result while raw evidenc
   const events: EventEnvelope[] = [
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "conversation",
+        entry_key: "handoff-progress",
+      },
       event: {
         type: "team_message",
         actor: { kind: "automation", id: "handoff" },
         tone: "info",
+        purpose: "handoff_progress",
         message: "I’m checking the API tests.",
       },
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "evidence_only",
+        kind: "evidence",
+      },
       event: {
         type: "check_result",
         check_id: "api-test",
@@ -613,10 +695,22 @@ Deno.test("handoff progress is replaced by the teammate result while raw evidenc
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "conversation",
+        supersedes: ["handoff-progress"],
+      },
       event: {
         type: "team_message",
         actor: { kind: "automation", id: "handoff" },
         tone: "warning",
+        purpose: "handoff_outcome",
+        handoff: {
+          outcome: "checks_failed",
+          affected_components: ["api"],
+          checks: [{ check_id: "api-test", status: "failed" }],
+          changed_paths: [],
+        },
         message: "The API tests failed. I sent that back to Kate.",
       },
     },
@@ -650,6 +744,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       transcript: {
         visibility: "visible",
         kind: "repeated_tool_detected",
+        entry_key: "repeat-detected-1",
       },
       event: {
         type: "correction",
@@ -664,6 +759,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       transcript: {
         visibility: "visible",
         kind: "repeated_tool_correction",
+        entry_key: "repeat-correction-1",
       },
       event: {
         type: "correction",
@@ -678,6 +774,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       transcript: {
         visibility: "visible",
         kind: "repeated_tool_detected",
+        entry_key: "repeat-detected-2",
       },
       event: {
         type: "correction",
@@ -689,6 +786,10 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     ...Array.from({ length: 6 }, (_, index): EventEnvelope => ({
       version: "v1",
+      transcript: {
+        visibility: "activity",
+        kind: "activity",
+      },
       event: {
         type: "step_started",
         step: index + 3,
@@ -701,6 +802,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       transcript: {
         visibility: "visible",
         kind: "repeated_tool_correction",
+        entry_key: "repeat-correction-2",
       },
       event: {
         type: "correction",
@@ -715,6 +817,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       transcript: {
         visibility: "visible",
         kind: "terminal_tool_loop_error",
+        entry_key: "repeat-error",
       },
       event: {
         type: "error",
@@ -724,6 +827,17 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "workflow_blocked",
+        supersedes: [
+          "repeat-detected-1",
+          "repeat-correction-1",
+          "repeat-detected-2",
+          "repeat-correction-2",
+          "repeat-error",
+        ],
+      },
       event: {
         type: "workflow_blocked",
         workflow_id: "workflow-1",
@@ -765,6 +879,7 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
       transcript: {
         visibility: "visible",
         kind: "correction",
+        entry_key: "failed-read-1",
         dedupe_key:
           "tool_failure:read_file:missing:webui/src/components/SessionRows.tsx",
         related_action_key: "tool:read_file:same-path",
@@ -791,6 +906,7 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
       transcript: {
         visibility: "visible",
         kind: "correction",
+        entry_key: "failed-read-2",
         dedupe_key:
           "tool_failure:read_file:missing:webui/src/components/SessionRows.tsx",
         related_action_key: "tool:read_file:same-path",
@@ -805,6 +921,11 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "workflow_blocked",
+        supersedes: ["failed-read-2"],
+      },
       event: {
         type: "workflow_blocked",
         workflow_id: "workflow-1",
@@ -831,6 +952,7 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
       transcript: {
         visibility: "visible",
         kind: "no_progress_correction",
+        entry_key: "no-progress",
       },
       event: {
         type: "correction",
@@ -845,6 +967,7 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
       transcript: {
         visibility: "visible",
         kind: "terminal_tool_loop_error",
+        entry_key: "no-progress-error",
       },
       event: {
         type: "error",
@@ -855,6 +978,11 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "workflow_blocked",
+        supersedes: ["no-progress", "no-progress-error"],
+      },
       event: {
         type: "workflow_blocked",
         workflow_id: "workflow-1",

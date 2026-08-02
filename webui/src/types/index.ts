@@ -200,6 +200,7 @@ export type AgentEvent =
     type: "workflow_blocked";
     workflow_id: string;
     outcome: WorkflowOutcome;
+    cause?: WorkflowBlockCause;
     reason: string;
     timestamp_ms?: number;
   }
@@ -220,7 +221,6 @@ export type AgentEvent =
     branch: string;
     attachments?: SessionAttachment[];
     profile: AgentProfile;
-    nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
@@ -387,6 +387,8 @@ export type AgentEvent =
     type: "team_message";
     actor: TeamActor;
     tone: TeamMessageTone;
+    purpose?: TeamMessagePurpose;
+    handoff?: HandoffSummary;
     message: string;
     detail?: string;
     evidence_ids?: string[];
@@ -417,14 +419,12 @@ export type AgentEvent =
     question: string;
     choices?: string[];
     profile: AgentProfile;
-    nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
     type: "user_answer";
     question_id: string;
     answer: string;
-    nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
@@ -441,6 +441,7 @@ export type AgentEvent =
   | {
     type: "correction";
     message: string;
+    kind?: CorrectionKind;
     summary?: string;
     actor?: TeamActor;
     assisting_profile?: AgentProfile;
@@ -451,7 +452,7 @@ export type AgentEvent =
     type: "sub_agent_started";
     profile: AgentProfile;
     task: string;
-    nesting_depth?: number;
+    nesting_depth: number;
     timestamp_ms?: number;
   }
   | {
@@ -700,16 +701,64 @@ export type TeamActor =
 
 export type TeamMessageTone = "info" | "success" | "warning" | "error";
 
+export type TeamMessagePurpose =
+  | "general"
+  | "handoff_progress"
+  | "handoff_outcome";
+
+export type CorrectionKind =
+  | "general"
+  | "artifact_validation"
+  | "repository_evidence"
+  | "contract_evidence"
+  | "work_unit"
+  | "runtime_fallback"
+  | "repeated_tool"
+  | "no_progress"
+  | "dependent_tool_batch"
+  | "stage_submission"
+  | "invalid_action"
+  | "step_limit"
+  | "advisory_budget"
+  | "missing_evidence"
+  | "truncated_action"
+  | "mutation_recovery"
+  | "lifecycle"
+  | "task_planning_recovery"
+  | "tool_unavailable"
+  | "requirements_remain"
+  | "handoff"
+  | "diagnostics"
+  | "workflow_closure"
+  | "tool_failure";
+
+export type WorkflowBlockCause =
+  | "other"
+  | "planning_rejected"
+  | "git_control_changed"
+  | "repository_content_changed"
+  | "deterministic_repeat_limit"
+  | "executor_unavailable"
+  | "commit_blocked"
+  | "cancelled";
+
+export type ChatterAudience = "team" | "current_user";
+
 export interface EventChatter {
   actor: TeamActor;
   tone: TeamMessageTone;
   headline?: string;
   message: string;
   detail?: string;
-  audience: "team" | "current_user";
+  audience: ChatterAudience;
 }
 
+export type TranscriptVisibility = "visible" | "evidence_only" | "activity";
+
 export type TranscriptKind =
+  | "conversation"
+  | "activity"
+  | "evidence"
   | "correction"
   | "repeated_tool_detected"
   | "repeated_tool_correction"
@@ -723,8 +772,11 @@ export type TranscriptKind =
   | "session_summary";
 
 export interface TranscriptMetadata {
-  visibility: "visible" | "evidence_only";
+  visibility: TranscriptVisibility;
   kind: TranscriptKind;
+  entry_key?: string;
+  supersedes?: string[];
+  tool_summary?: string;
   dedupe_key?: string;
   related_action_key?: string;
   summary_redundant?: boolean;
@@ -1257,6 +1309,7 @@ export interface WorkflowSummary {
   ready_evidence?: ReadyEvidenceBundle;
   paused_stage?: WorkflowStage;
   blocked_reason?: string;
+  blocked_cause?: WorkflowBlockCause;
   recovery?: "resume" | "restart_from_current_files";
   plan?: WorkflowArtifactEnvelope<WorkflowPlanArtifact>;
   plan_review?: WorkflowArtifactEnvelope<WorkflowPlanReviewArtifact>;

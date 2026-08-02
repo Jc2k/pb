@@ -2715,6 +2715,7 @@ fn run_agent_inner<S: EventSink>(
     });
     if let Some(message) = environment_authority_notice.clone() {
         sink.emit(AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::RuntimeFallback,
             message,
             summary: "using host execution for an Apple-only component".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
@@ -2786,6 +2787,7 @@ fn run_agent_inner<S: EventSink>(
             Ok((backend, cpu_fallback)) => {
                 if let Some(message) = cpu_fallback {
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::RuntimeFallback,
                         message,
                         summary: "using CPU-only llama.cpp fallback for this session".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -3411,9 +3413,23 @@ fn run_agent_inner<S: EventSink>(
     if handoff_outcome == Some(crate::events::HandoffOutcome::Incomplete)
         && (!reached_final || unexpected_root_mutation)
     {
+        let handoff = crate::events::HandoffSummary {
+            outcome: crate::events::HandoffOutcome::Incomplete,
+            affected_components: Vec::new(),
+            checks: Vec::new(),
+            commit: None,
+            changed_paths: repository_context
+                .as_ref()
+                .map(crate::workspace::RepositoryContext::task_changed_paths)
+                .transpose()?
+                .unwrap_or_default(),
+            detail: Some(format!("termination reason: {termination_reason}")),
+        };
         sink.emit(AgentEvent::TeamMessage {
             actor: crate::events::TeamActor::workflow_steward(),
             tone: crate::events::TeamMessageTone::Warning,
+            purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+            handoff: Some(handoff.clone()),
             message: "The task stopped before handoff.".to_string(),
             detail: Some(format!("termination reason: {termination_reason}")),
             evidence_ids: Vec::new(),
@@ -3421,18 +3437,7 @@ fn run_agent_inner<S: EventSink>(
             timestamp_ms: Some(now_millis()),
         });
         sink.emit(AgentEvent::HandoffSummary {
-            summary: crate::events::HandoffSummary {
-                outcome: crate::events::HandoffOutcome::Incomplete,
-                affected_components: Vec::new(),
-                checks: Vec::new(),
-                commit: None,
-                changed_paths: repository_context
-                    .as_ref()
-                    .map(crate::workspace::RepositoryContext::task_changed_paths)
-                    .transpose()?
-                    .unwrap_or_default(),
-                detail: Some(format!("termination reason: {termination_reason}")),
-            },
+            summary: handoff,
             nesting_depth: None,
             timestamp_ms: Some(now_millis()),
         });
@@ -6815,6 +6820,8 @@ fn run_proactive_lsp_pass(
         sink.emit(AgentEvent::TeamMessage {
             actor: crate::events::TeamActor::workflow_steward(),
             tone: crate::events::TeamMessageTone::Warning,
+            purpose: crate::events::TeamMessagePurpose::General,
+            handoff: None,
             message:
                 "Automatic language-server diagnostics were skipped within their safety bound."
                     .to_string(),
@@ -6956,6 +6963,8 @@ fn run_proactive_lsp_pass(
         sink.emit(AgentEvent::TeamMessage {
             actor,
             tone: crate::events::TeamMessageTone::Warning,
+            purpose: crate::events::TeamMessagePurpose::General,
+            handoff: None,
             message: "Automatic language-server evidence was incomplete; ordinary checks remain authoritative."
                 .to_string(),
             detail: Some(truncate_chars(&details.join("\n"), 4_000)),
@@ -7583,6 +7592,7 @@ fn run_agent_steps(
         }
         if sink.should_cancel() {
             sink.emit(AgentEvent::Correction {
+                kind: crate::events::CorrectionKind::General,
                 message: "The user cancelled this run; repository content and collected evidence are being preserved."
                     .to_string(),
                 summary: "Run cancelled".to_string(),
@@ -7603,6 +7613,7 @@ fn run_agent_steps(
         }
         if sink.should_pause() {
             sink.emit(AgentEvent::Correction {
+                kind: crate::events::CorrectionKind::General,
                 message: "The user requested a goal pause; the current workflow is checkpointing before another model or tool action."
                     .to_string(),
                 summary: "Goal pausing".to_string(),
@@ -7702,6 +7713,7 @@ fn run_agent_steps(
                         gate.diagnostic_failure_feedback = Some(truncate_chars(&feedback, 8_000));
                     }
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: feedback.clone(),
                         summary: "Automatic language-server diagnostics need repair".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -7729,6 +7741,7 @@ fn run_agent_steps(
                 sink,
             )? {
                 sink.emit(AgentEvent::Correction {
+                    kind: crate::events::CorrectionKind::General,
                     message: feedback.clone(),
                     summary: "Harness diagnostic preview".to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -7846,6 +7859,7 @@ fn run_agent_steps(
                     _ => unreachable!("only closeable contract stages reach this branch"),
                 };
                 sink.emit(AgentEvent::Correction {
+                    kind: crate::events::CorrectionKind::General,
                     message: message.to_string(),
                     summary: summary.to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -7885,6 +7899,7 @@ fn run_agent_steps(
                 let summary = "Complete proposed-path review evidence";
                 let message = "Fresh controller observations cover every existing path in the exact proposed plan. Review those task-focused bytes and submit the plan verdict now; repository reads are removed from this turn so generic file pagination cannot replace the actual critique.";
                 sink.emit(AgentEvent::Correction {
+                    kind: crate::events::CorrectionKind::General,
                     message: message.to_string(),
                     summary: summary.to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -8012,6 +8027,7 @@ fn run_agent_steps(
                     instruction
                 };
                 sink.emit(AgentEvent::Correction {
+                    kind: crate::events::CorrectionKind::General,
                     message: instruction.clone(),
                     summary: "Active accepted-plan work unit".to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -8028,6 +8044,7 @@ fn run_agent_steps(
                     "Harness creation work unit: the next missing accepted-plan path is {path}. Create that exact path now with one complete write_file payload within the current allowance."
                 );
                 sink.emit(AgentEvent::Correction {
+                    kind: crate::events::CorrectionKind::General,
                     message: instruction.clone(),
                     summary: "Next accepted-plan creation work unit".to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -8229,6 +8246,7 @@ fn run_agent_steps(
         };
         let closure_messages = closure_checkpoint.as_ref().map(|checkpoint| {
             sink.emit(AgentEvent::Correction {
+                kind: crate::events::CorrectionKind::General,
                 message: checkpoint.clone(),
                 summary: "Workflow closure checkpoint".to_string(),
                 actor: crate::events::TeamActor::workflow_steward(),
@@ -8289,6 +8307,7 @@ fn run_agent_steps(
             Err(error) => {
                 if error.downcast_ref::<PreInferenceCancellation>().is_some() {
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: "The user cancelled this run during pre-inference preparation; repository content and collected evidence are being preserved, and no model invocation was started."
                             .to_string(),
                         summary: "Run cancelled".to_string(),
@@ -8422,6 +8441,7 @@ fn run_agent_steps(
                         )
                     };
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: retry_limit_message,
                         summary: "Teammate action retries exhausted".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -8441,6 +8461,7 @@ fn run_agent_steps(
                 }
 
                 sink.emit(AgentEvent::Correction {
+                    kind: crate::events::CorrectionKind::General,
                     message: error_msg.clone(),
                     summary: parse_summary.clone(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -8504,6 +8525,7 @@ fn run_agent_steps(
                         feedback.push_str(&precondition);
                     }
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: feedback.clone(),
                         summary: "Workflow stage submission required".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -8558,6 +8580,7 @@ fn run_agent_steps(
                         gate.diagnostic_failure_feedback = Some(truncate_chars(&feedback, 8_000));
                         drop(gate);
                         sink.emit(AgentEvent::Correction {
+                            kind: crate::events::CorrectionKind::General,
                             message: feedback.clone(),
                             summary: "Automatic language-server diagnostics blocked handoff"
                                 .to_string(),
@@ -8597,6 +8620,7 @@ fn run_agent_steps(
                         stable_hash(feedback.as_str()),
                     );
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: feedback.clone(),
                         summary: if args.contract.is_some() {
                             "Acceptance contract rejected final response".to_string()
@@ -8613,6 +8637,8 @@ fn run_agent_steps(
                             crate::events::AutomationActor::Trinity,
                         ),
                         tone: crate::events::TeamMessageTone::Warning,
+                        purpose: crate::events::TeamMessagePurpose::General,
+                        handoff: None,
                         message: if args.contract.is_some() {
                             "I can’t hand this back yet. Some task requirements are still missing."
                                 .to_string()
@@ -8687,27 +8713,6 @@ fn run_agent_steps(
                                 } else {
                                     TerminationReason::ChecksFailed
                                 };
-                                sink.emit(AgentEvent::TeamMessage {
-                                    actor: crate::events::TeamActor::Automation(
-                                        crate::events::AutomationActor::Trinity,
-                                    ),
-                                    tone: crate::events::TeamMessageTone::Error,
-                                    message: if failure_count >= MAX_IDENTICAL_GATE_FAILURES {
-                                        "The same checks failed again without a relevant input change, so I’m stopping the handoff loop. This needs another pass."
-                                            .to_string()
-                                    } else {
-                                        "The affected checks still fail and there isn’t another repair turn available. This needs another pass."
-                                            .to_string()
-                                    },
-                                    detail: summary.detail.clone(),
-                                    evidence_ids: summary
-                                        .checks
-                                        .iter()
-                                        .map(|check| format!("check:{}", check.check_id))
-                                        .collect(),
-                                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
-                                    timestamp_ms: Some(now_millis()),
-                                });
                                 let mut exhausted = summary;
                                 exhausted.outcome = if reason == TerminationReason::RepairExhausted
                                 {
@@ -8715,6 +8720,29 @@ fn run_agent_steps(
                                 } else {
                                     crate::events::HandoffOutcome::ChecksFailed
                                 };
+                                sink.emit(AgentEvent::TeamMessage {
+                                    actor: crate::events::TeamActor::Automation(
+                                        crate::events::AutomationActor::Trinity,
+                                    ),
+                                    tone: crate::events::TeamMessageTone::Error,
+                                    purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+                                    handoff: Some(exhausted.clone()),
+                                    message: if failure_count >= MAX_IDENTICAL_GATE_FAILURES {
+                                        "The same checks failed again without a relevant input change, so I’m stopping the handoff loop. This needs another pass."
+                                            .to_string()
+                                    } else {
+                                        "The affected checks still fail and there isn’t another repair turn available. This needs another pass."
+                                            .to_string()
+                                    },
+                                    detail: exhausted.detail.clone(),
+                                    evidence_ids: exhausted
+                                        .checks
+                                        .iter()
+                                        .map(|check| format!("check:{}", check.check_id))
+                                        .collect(),
+                                    nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
+                                    timestamp_ms: Some(now_millis()),
+                                });
                                 sink.emit(AgentEvent::HandoffSummary {
                                     summary: exhausted,
                                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
@@ -8731,6 +8759,7 @@ fn run_agent_steps(
                                 });
                             }
                             sink.emit(AgentEvent::Correction {
+                                kind: crate::events::CorrectionKind::General,
                                 message: feedback.clone(),
                                 summary: "The handoff teammate returned failed checks for repair"
                                     .to_string(),
@@ -8803,7 +8832,21 @@ fn run_agent_steps(
                         )?
                     };
                     if let Some(feedback) = feedback {
+                        let handoff = crate::events::HandoffSummary {
+                            outcome: crate::events::HandoffOutcome::Incomplete,
+                            affected_components: Vec::new(),
+                            checks: Vec::new(),
+                            commit: None,
+                            changed_paths: args
+                                .repository_context
+                                .as_ref()
+                                .map(crate::workspace::RepositoryContext::task_changed_paths)
+                                .transpose()?
+                                .unwrap_or_default(),
+                            detail: Some(feedback.clone()),
+                        };
                         sink.emit(AgentEvent::Correction {
+                            kind: crate::events::CorrectionKind::General,
                             message: feedback.clone(),
                             summary: "Task requirements remain after handoff".to_string(),
                             actor: crate::events::TeamActor::workflow_steward(),
@@ -8816,6 +8859,8 @@ fn run_agent_steps(
                                 crate::events::AutomationActor::Trinity,
                             ),
                             tone: crate::events::TeamMessageTone::Warning,
+                            purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+                            handoff: Some(handoff.clone()),
                             message: "The checks are done, but some task requirements are still missing. This needs another pass."
                                 .to_string(),
                             detail: Some(feedback.clone()),
@@ -8824,19 +8869,7 @@ fn run_agent_steps(
                             timestamp_ms: Some(now_millis()),
                         });
                         sink.emit(AgentEvent::HandoffSummary {
-                            summary: crate::events::HandoffSummary {
-                                outcome: crate::events::HandoffOutcome::Incomplete,
-                                affected_components: Vec::new(),
-                                checks: Vec::new(),
-                                commit: None,
-                                changed_paths: args
-                                    .repository_context
-                                    .as_ref()
-                                    .map(crate::workspace::RepositoryContext::task_changed_paths)
-                                    .transpose()?
-                                    .unwrap_or_default(),
-                                detail: Some(feedback),
-                            },
+                            summary: handoff,
                             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                             timestamp_ms: Some(now_millis()),
                         });
@@ -8916,6 +8949,7 @@ fn run_agent_steps(
                     {
                         let (summary, message) = deterministic_tool_loop_error(args.profile);
                         sink.emit(AgentEvent::Correction {
+                            kind: crate::events::CorrectionKind::RepeatedTool,
                             message,
                             summary,
                             actor: crate::events::TeamActor::workflow_steward(),
@@ -9087,6 +9121,7 @@ fn run_agent_steps(
                 }
                 if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: feedback.clone(),
                         summary: "Repeated tool call detected".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -9126,6 +9161,7 @@ fn run_agent_steps(
                     {
                         let (summary, message) = deterministic_tool_loop_error(args.profile);
                         sink.emit(AgentEvent::Correction {
+                            kind: crate::events::CorrectionKind::RepeatedTool,
                             message,
                             summary,
                             actor: crate::events::TeamActor::workflow_steward(),
@@ -9294,6 +9330,7 @@ fn run_agent_steps(
                 }
                 if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: feedback.clone(),
                         summary: "Repeated tool call detected".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -9330,6 +9367,7 @@ fn run_agent_steps(
                     gate.diagnostic_failure_feedback = Some(truncate_chars(&feedback, 8_000));
                     drop(gate);
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: feedback.clone(),
                         summary: "Automatic language-server diagnostics blocked final grace"
                             .to_string(),
@@ -9445,6 +9483,7 @@ fn run_agent_steps(
 
     let first_name = args.profile.teammate_first_name();
     sink.emit(AgentEvent::Correction {
+        kind: crate::events::CorrectionKind::StepLimit,
         summary: format!("{first_name} reached the bounded step limit"),
         message: format!(
             "{first_name} did not complete this pass within {effective_max_steps} bounded steps, so Trinity stopped it safely instead of spending more inference."
@@ -9820,7 +9859,21 @@ fn run_final_grace(
                     )?
                 };
                 if let Some(feedback) = feedback {
+                    let handoff = crate::events::HandoffSummary {
+                        outcome: crate::events::HandoffOutcome::Incomplete,
+                        affected_components: Vec::new(),
+                        checks: Vec::new(),
+                        commit: None,
+                        changed_paths: args
+                            .repository_context
+                            .as_ref()
+                            .map(crate::workspace::RepositoryContext::task_changed_paths)
+                            .transpose()?
+                            .unwrap_or_default(),
+                        detail: Some(feedback.clone()),
+                    };
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: feedback.clone(),
                         summary: "Task requirements remain after final handoff".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -9833,6 +9886,8 @@ fn run_final_grace(
                             crate::events::AutomationActor::Trinity,
                         ),
                         tone: crate::events::TeamMessageTone::Warning,
+                        purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+                        handoff: Some(handoff.clone()),
                         message: "The checks are done, but some task requirements are still missing. This needs another pass."
                             .to_string(),
                         detail: Some(feedback.clone()),
@@ -9841,19 +9896,7 @@ fn run_final_grace(
                         timestamp_ms: Some(now_millis()),
                     });
                     sink.emit(AgentEvent::HandoffSummary {
-                        summary: crate::events::HandoffSummary {
-                            outcome: crate::events::HandoffOutcome::Incomplete,
-                            affected_components: Vec::new(),
-                            checks: Vec::new(),
-                            commit: None,
-                            changed_paths: args
-                                .repository_context
-                                .as_ref()
-                                .map(crate::workspace::RepositoryContext::task_changed_paths)
-                                .transpose()?
-                                .unwrap_or_default(),
-                            detail: Some(feedback.clone()),
-                        },
+                        summary: handoff,
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -10228,6 +10271,7 @@ fn run_step_limit_monitor(
 ) -> Result<Option<String>> {
     if let Err(error) = run_budget.borrow_mut().reserve_advisory_call() {
         sink.emit(AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::General,
             message: format!("step-limit monitor skipped: {error}"),
             summary: "Advisory budget exhausted".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
@@ -10244,7 +10288,7 @@ fn run_step_limit_monitor(
         args.max_steps
     );
     sink.emit(AgentEvent::SubAgentStarted {
-        profile: AgentProfile::Monitor.as_str().to_string(),
+        profile: AgentProfile::Monitor,
         task: monitor_task.clone(),
         nesting_depth: nesting_depth + 1,
         timestamp_ms: Some(now_millis()),
@@ -10320,7 +10364,7 @@ fn run_step_limit_monitor(
     };
     let result = bounded_sub_agent_result(AgentProfile::Monitor, status, &detail);
     sink.emit(AgentEvent::SubAgentFinished {
-        profile: AgentProfile::Monitor.as_str().to_string(),
+        profile: AgentProfile::Monitor,
         result: result.clone(),
         nesting_depth: Some(nesting_depth + 1),
         timestamp_ms: Some(now_millis()),
@@ -10865,6 +10909,7 @@ fn execute_tool_calls(
             &feedback,
         ));
         sink.emit(AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::General,
             message: feedback,
             summary: "Dependent tool batch rejected".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
@@ -11384,6 +11429,7 @@ fn execute_tool_calls(
         }
         if !success {
             sink.emit(AgentEvent::Correction {
+                kind: crate::events::CorrectionKind::General,
                 message: result.clone(),
                 summary: format!("{} tool call was not executed successfully", tool),
                 actor: crate::events::TeamActor::workflow_steward(),
@@ -11667,6 +11713,7 @@ fn inline_implementation_completion_disposition(
             sink,
         )? {
             sink.emit(AgentEvent::Correction {
+                kind: crate::events::CorrectionKind::General,
                 message: feedback.clone(),
                 summary: "Harness diagnostic preview".to_string(),
                 actor: crate::events::TeamActor::workflow_steward(),
@@ -12363,6 +12410,7 @@ fn grant_work_unit_progress_turn(
     sink.workflow_work_unit_progress_earned(&unit.id)?;
     *effective_max_steps = effective_max_steps.saturating_add(1);
     sink.emit(AgentEvent::Correction {
+        kind: crate::events::CorrectionKind::General,
         message: format!(
             "Harness progress credit: work unit {} produced a new content/evidence transition; one bounded stage turn was earned ({}/4). Failed, repeated, cached, no-op, and bookkeeping actions earn no credit.",
             unit.id,
@@ -12616,6 +12664,7 @@ fn record_progress_warning(
     sink: &mut dyn EventSink,
 ) {
     sink.emit(AgentEvent::Correction {
+        kind: crate::events::CorrectionKind::General,
         message: feedback.to_string(),
         summary: "No-progress tool outcome detected".to_string(),
         actor: crate::events::TeamActor::workflow_steward(),
@@ -12641,6 +12690,7 @@ fn record_blocked_tool_loop(
         "This consecutive duplicate tool action was blocked before execution. Choose a different action.",
     );
     sink.emit(AgentEvent::Correction {
+        kind: crate::events::CorrectionKind::General,
         message: feedback.to_string(),
         summary: format!("{} repeated the same action", profile.teammate_first_name()),
         actor: crate::events::TeamActor::workflow_steward(),
@@ -14188,6 +14238,7 @@ fn run_delivery_workflow(
                     repeated_validation_failures = 1;
                 }
                 sink.emit(AgentEvent::Correction {
+                    kind: crate::events::CorrectionKind::General,
                     message: feedback.clone(),
                     summary: "Workflow artifact validation failed".to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -15671,6 +15722,10 @@ fn delivery_terminal_outcome(
         sink.emit(AgentEvent::WorkflowBlocked {
             workflow_id: checkpoint.run.id.clone(),
             outcome,
+            cause: checkpoint
+                .run
+                .blocked_cause
+                .unwrap_or_else(|| crate::events::WorkflowBlockCause::classify(outcome, &detail)),
             reason: detail.clone(),
             timestamp_ms: Some(now_millis()),
         });
@@ -17600,6 +17655,7 @@ fn generate_and_parse_action_with_retries(
                     cap_growth_used = true;
                     let instruction = "The attempted mutation stopped before forming a valid call, and the teammate explicitly said one more file excerpt was needed. The accepted-plan target is already fixed. Call only read_file now with one center line and optional capped context for the smallest missing excerpt; do not retry the mutation or request the whole file in this recovery turn.";
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: instruction.to_string(),
                         summary: "Requesting missing bounded evidence".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -17641,6 +17697,7 @@ fn generate_and_parse_action_with_retries(
                     }
                     let retry_scope = retry_tools.as_deref().unwrap_or(tools);
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: truncation_action_retry_instruction(args, retry_scope),
                         summary: "Retrying truncated action with thinking disabled".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -17777,6 +17834,7 @@ fn generate_and_parse_action_with_retries(
                         )
                     };
                     sink.emit(AgentEvent::Correction {
+                        kind: crate::events::CorrectionKind::General,
                         message: instruction.clone(),
                         summary: summary.to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -19600,6 +19658,7 @@ fn maybe_inject_controller_task_observations(
     let summary = "Task-focused repository evidence";
     let message = "The controller already supplied current task-relevant bytes from the strongest matching existing path. Do not reread that file wholesale or follow a generic continuation through unrelated code. Submit the stage artifact when this evidence is sufficient; if one concrete fact is missing, request only its bounded line range.";
     sink.emit(AgentEvent::Correction {
+        kind: crate::events::CorrectionKind::General,
         message: message.to_string(),
         summary: summary.to_string(),
         actor: crate::events::TeamActor::workflow_steward(),
@@ -23611,7 +23670,7 @@ fn run_sub_agent(
         .transpose()?;
 
     sink.emit(AgentEvent::SubAgentStarted {
-        profile: profile.as_str().to_string(),
+        profile,
         task: task.to_string(),
         nesting_depth: context.request.sub_agent_depth + 1,
         timestamp_ms: Some(now_millis()),
@@ -23865,7 +23924,7 @@ fn run_sub_agent(
     let result = bounded_sub_agent_result(profile, status, &detail);
 
     sink.emit(AgentEvent::SubAgentFinished {
-        profile: profile.as_str().to_string(),
+        profile,
         result: result.clone(),
         nesting_depth: Some(context.request.sub_agent_depth + 1),
         timestamp_ms: Some(now_millis()),

@@ -138,6 +138,8 @@ pub struct WorkflowRun {
     pub outcome: Option<WorkflowOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_cause: Option<super::WorkflowBlockCause>,
 }
 
 impl WorkflowRun {
@@ -180,6 +182,7 @@ impl WorkflowRun {
             ready_evidence: None,
             outcome: None,
             blocked_reason: None,
+            blocked_cause: None,
         })
     }
 
@@ -570,7 +573,9 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.paused_stage = Some(run.stage);
             run.stage = WorkflowStage::Blocked;
             run.outcome = Some(outcome);
-            run.blocked_reason = Some(required("blocked reason", reason)?);
+            let reason = required("blocked reason", reason)?;
+            run.blocked_cause = Some(super::WorkflowBlockCause::classify(outcome, &reason));
+            run.blocked_reason = Some(reason);
         }
         WorkflowEvent::Failed { outcome, reason } => {
             if matches!(
@@ -582,13 +587,17 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.stage = WorkflowStage::Failed;
             run.paused_stage = None;
             run.outcome = Some(outcome);
-            run.blocked_reason = Some(required("failure reason", reason)?);
+            let reason = required("failure reason", reason)?;
+            run.blocked_cause = Some(super::WorkflowBlockCause::classify(outcome, &reason));
+            run.blocked_reason = Some(reason);
         }
         WorkflowEvent::Cancelled { reason } => {
             run.stage = WorkflowStage::Cancelled;
             run.paused_stage = None;
             run.outcome = Some(WorkflowOutcome::Cancelled);
-            run.blocked_reason = Some(required("cancellation reason", reason)?);
+            let reason = required("cancellation reason", reason)?;
+            run.blocked_cause = Some(super::WorkflowBlockCause::Cancelled);
+            run.blocked_reason = Some(reason);
         }
         WorkflowEvent::Resumed => {
             require_stage(run.stage, &[WorkflowStage::Blocked], "resume workflow")?;
@@ -598,6 +607,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
                 .ok_or_else(|| anyhow::anyhow!("blocked workflow has no resumable prior stage"))?;
             run.outcome = None;
             run.blocked_reason = None;
+            run.blocked_cause = None;
         }
     }
     Ok(run)
