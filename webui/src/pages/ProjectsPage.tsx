@@ -110,7 +110,7 @@ export function ProjectsPage() {
                 ).length;
                 return (
                   <div
-                    key={project.name}
+                    key={project.id}
                     className="project-row session-row list-group-item py-3 px-4"
                   >
                     <div className="session-icon">
@@ -118,7 +118,7 @@ export function ProjectsPage() {
                     </div>
                     <Link
                       className="project-main session-main text-decoration-none text-reset"
-                      to={`/projects/${encodeURIComponent(project.name)}`}
+                      to={`/projects/${encodeURIComponent(project.id)}`}
                     >
                       <strong>{project.name}</strong>
                       <span>{project.path}</span>
@@ -136,7 +136,7 @@ export function ProjectsPage() {
                     </span>
                     <Link
                       className="btn btn-sm btn-icon btn-outline-secondary"
-                      to={projectSettingsPath(project.name)}
+                      to={projectSettingsPath(project.id)}
                       title={`Settings for ${project.name}`}
                       aria-label={`Settings for ${project.name}`}
                     >
@@ -163,7 +163,7 @@ export function ProjectsPage() {
             </button>
           </div>
         )}
-        {sessionsError && (
+        {sessionsError && !projectsError && (
           <div className="alert alert-warning mt-3" role="alert">
             Session counts may be out of date: {sessionsError}{" "}
             <button
@@ -189,8 +189,8 @@ export function nextProjectNotificationPreference(
   return !project.notify_on_finish;
 }
 export function ProjectPage() {
-  const { projectName: encodedProjectName } = useParams<
-    { projectName: string }
+  const { projectId: encodedProjectId } = useParams<
+    { projectId: string }
   >();
   const navigate = useNavigate();
   const {
@@ -223,8 +223,10 @@ export function ProjectPage() {
   const [usageError, setUsageError] = useState("");
   const usageRequest = useRef(new LatestRequest());
   const startRequest = useRef(new LatestRequest());
-  const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
-  const project = projects.find((entry) => entry.name === name);
+  const projectId = encodedProjectId
+    ? decodeURIComponent(encodedProjectId)
+    : "";
+  const project = projects.find((entry) => entry.id === projectId);
   const projectSessions = useMemo(
     () =>
       project
@@ -260,10 +262,10 @@ export function ProjectPage() {
     setActiveDetailsTab("usage");
     startRequest.current.abort();
     return () => startRequest.current.abort();
-  }, [name]);
+  }, [projectId]);
 
   useEffect(() => {
-    if (!name || !project) {
+    if (!projectId || !project) {
       usageRequest.current.abort();
       setUsageLoading(false);
       return;
@@ -274,11 +276,11 @@ export function ProjectPage() {
       const controller = usageRequest.current.start();
       try {
         const res = await fetch(
-          `/api/projects/${encodeURIComponent(name)}/usage`,
+          `/api/projects/${encodeURIComponent(project.id)}/usage`,
           { signal: controller.signal },
         );
         if (!res.ok) {
-          throw new Error(`Usage request failed (${res.status})`);
+          throw new Error(await apiErrorMessage(res, "Usage request failed"));
         }
         const nextUsage = (await res.json()) as ProjectUsageStats;
         if (usageRequest.current.owns(controller)) {
@@ -301,7 +303,7 @@ export function ProjectPage() {
       window.clearInterval(timer);
       usageRequest.current.abort();
     };
-  }, [name, project?.path]);
+  }, [projectId, project?.id]);
 
   const startProjectSession = async () => {
     if (!project || !task.trim()) return;
@@ -319,7 +321,7 @@ export function ProjectPage() {
         body: JSON.stringify({
           task: task.trim(),
           intent,
-          project_name: project.name,
+          project_id: project.id,
           attachments: images,
         }),
         signal: controller.signal,
@@ -366,12 +368,12 @@ export function ProjectPage() {
           </Link>
           <div className="project-heading">
             <div className="title-row">
-              <h1>{project?.name || name || "Project"}</h1>
+              <h1>{project?.name || "Project"}</h1>
             </div>
             {project && (
               <Link
                 className="btn btn-light icon-btn settings-btn"
-                to={projectSettingsPath(project.name)}
+                to={projectSettingsPath(project.id)}
                 aria-label="Project settings"
               >
                 <i className="bi bi-gear"></i>
@@ -514,7 +516,7 @@ export function ProjectPage() {
           {project && (
             <section className="sessions-section project-sessions-panel">
               <h2>Project sessions</h2>
-              {sessionsError && (
+              {sessionsError && !projectsError && (
                 <div className="alert alert-warning" role="alert">
                   {sessionsError}{" "}
                   <button
@@ -645,7 +647,7 @@ export function ProjectPage() {
       <GoalStartSheet
         open={goalOpen}
         initialObjective={task}
-        projectName={project?.name}
+        projectId={project?.id}
         onClose={() => setGoalOpen(false)}
         onStarted={(sessionId) => navigate(`/sessions/${sessionId}`)}
       />
@@ -730,8 +732,8 @@ function ProjectSnapshot(
 }
 
 export function ProjectSettingsPage() {
-  const { projectName: encodedProjectName } = useParams<
-    { projectName: string }
+  const { projectId: encodedProjectId } = useParams<
+    { projectId: string }
   >();
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
@@ -778,8 +780,10 @@ export function ProjectSettingsPage() {
     notificationRequest.current.abort();
     integrationMutationRequest.current.abort();
   }, []);
-  const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
-  const project = projects.find((entry) => entry.name === name);
+  const projectId = encodedProjectId
+    ? decodeURIComponent(encodedProjectId)
+    : "";
+  const project = projects.find((entry) => entry.id === projectId);
   const integrationError = integrationMutationError || installedError ||
     marketplaceError;
   const filteredMarketplace = marketplace.filter((item) => {
@@ -799,7 +803,9 @@ export function ProjectSettingsPage() {
     try {
       const res = await fetch("/api/projects", { signal: controller.signal });
       if (!res.ok) {
-        throw new Error(`Project request failed (${res.status})`);
+        throw new Error(
+          await apiErrorMessage(res, "Project request failed"),
+        );
       }
       const nextProjects = (await res.json()) as ProjectEntry[];
       if (!projectsRequest.current.owns(controller)) return;
@@ -818,11 +824,11 @@ export function ProjectSettingsPage() {
   }, []);
 
   const fetchInstalledIntegrations = useCallback(async () => {
-    if (!name) return;
+    if (!project) return;
     const controller = installedRequest.current.start();
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(name)}/integrations`,
+        `/api/projects/${encodeURIComponent(project.id)}/integrations`,
         { signal: controller.signal },
       );
       if (!res.ok) {
@@ -851,10 +857,11 @@ export function ProjectSettingsPage() {
           : "Could not load installed integrations",
       );
     }
-  }, [name]);
+  }, [project?.id, project?.path]);
 
   useEffect(() => {
     void fetchProjects();
+    const projectsTimer = window.setInterval(() => void fetchProjects(), 5000);
     const controller = marketplaceRequest.current.start();
     void fetch("/api/integrations/marketplace", {
       signal: controller.signal,
@@ -889,6 +896,7 @@ export function ProjectSettingsPage() {
             : "Could not load the integration marketplace",
         );
       });
+    return () => window.clearInterval(projectsTimer);
   }, [fetchProjects]);
 
   useEffect(() => {
@@ -903,7 +911,7 @@ export function ProjectSettingsPage() {
     setNotificationMutationPending(false);
     notificationRequest.current.abort();
     integrationMutationRequest.current.abort();
-  }, [name]);
+  }, [projectId]);
 
   useEffect(() => {
     setInstalled([]);
@@ -921,7 +929,7 @@ export function ProjectSettingsPage() {
     const controller = notificationRequest.current.start();
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(project.name)}/notifications`,
+        `/api/projects/${encodeURIComponent(project.id)}/notifications`,
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
@@ -930,12 +938,14 @@ export function ProjectSettingsPage() {
         },
       );
       if (!res.ok) {
-        throw new Error(`Could not update notifications (${res.status})`);
+        throw new Error(
+          await apiErrorMessage(res, "Could not update notifications"),
+        );
       }
       const updated = (await res.json()) as ProjectEntry;
       if (!notificationRequest.current.owns(controller)) return;
       setProjects((current) =>
-        current.map((entry) => entry.name === updated.name ? updated : entry)
+        current.map((entry) => entry.id === updated.id ? updated : entry)
       );
     } catch (error) {
       if (
@@ -1029,7 +1039,7 @@ export function ProjectSettingsPage() {
     const controller = integrationMutationRequest.current.start();
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(project.name)}/integrations/${
+        `/api/projects/${encodeURIComponent(project.id)}/integrations/${
           encodeURIComponent(item.name)
         }`,
         { method: "DELETE", signal: controller.signal },
@@ -1061,7 +1071,7 @@ export function ProjectSettingsPage() {
     const controller = integrationMutationRequest.current.start();
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(project.name)}/integrations`,
+        `/api/projects/${encodeURIComponent(project.id)}/integrations`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1113,12 +1123,12 @@ export function ProjectSettingsPage() {
     <PageShell>
       <section className="hero-section project-settings-hero">
         <Link
-          to={`/projects/${encodeURIComponent(name)}`}
+          to={`/projects/${encodeURIComponent(projectId)}`}
           className="back-link"
         >
           ← Project
         </Link>
-        <h1>{project?.name || name || "Project"} settings</h1>
+        <h1>{project?.name || "Project"} settings</h1>
       </section>
 
       {projectsLoading && !project

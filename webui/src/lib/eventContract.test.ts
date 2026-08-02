@@ -114,15 +114,66 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       "commits: HandoffCommitSummary[]",
       "started_at_ms: number",
       "usage_records: SessionMetricsSnapshot[]",
+      "reset_history: boolean",
+      "id: string",
+      "projects: ProjectEntry[]",
+      "sessions: SessionItem[]",
     ]
   ) {
     if (!types.includes(required)) {
-      throw new Error(`missing required v4 event field: ${required}`);
+      throw new Error(`missing required v5 event field: ${required}`);
     }
   }
 });
 
-Deno.test("v4 consumers do not reconstruct omitted server state", async () => {
+Deno.test("session and project stream boundaries are server-authored", async () => {
+  const [server, types, sessionPage, hooks] = await Promise.all([
+    Deno.readTextFile("src/web.rs"),
+    Deno.readTextFile("webui/src/types/index.ts"),
+    Deno.readTextFile("webui/src/pages/SessionPage.tsx"),
+    Deno.readTextFile("webui/src/lib/hooks.ts"),
+  ]);
+
+  for (
+    const required of [
+      'event("session_snapshot")',
+      "reset_history: bool",
+      "pub struct ProjectSessionSnapshot",
+      'route("/api/project-sessions", get(list_project_sessions))',
+      "pub project_id: Option<String>",
+    ]
+  ) {
+    if (!server.includes(required)) {
+      throw new Error(`missing server boundary contract: ${required}`);
+    }
+  }
+  for (
+    const required of [
+      "export interface SessionStreamSnapshot",
+      "reset_history: boolean",
+      "export interface ProjectSessionSnapshot",
+    ]
+  ) {
+    if (!types.includes(required)) {
+      throw new Error(`missing browser boundary contract: ${required}`);
+    }
+  }
+  if (!sessionPage.includes('addEventListener("session_snapshot"')) {
+    throw new Error("session page does not consume server snapshots");
+  }
+  if (!hooks.includes('fetch("/api/project-sessions"')) {
+    throw new Error("project pages do not consume the atomic server snapshot");
+  }
+  if (
+    server.includes("pub refresh: bool") || types.includes("refresh: boolean")
+  ) {
+    throw new Error(
+      "session snapshot scheduling leaked into the wire contract",
+    );
+  }
+});
+
+Deno.test("v5 consumers do not reconstruct omitted server state", async () => {
   const [helpers, session, sessionPage, projectsPage, energy] = await Promise
     .all([
       Deno.readTextFile("webui/src/lib/helpers.ts"),
@@ -153,13 +204,13 @@ Deno.test("v4 consumers do not reconstruct omitted server state", async () => {
       sessionPage.includes(workaround) || projectsPage.includes(workaround)
     ) {
       throw new Error(
-        `v4 UI still reconstructs server state with: ${workaround}`,
+        `v5 UI still reconstructs server state with: ${workaround}`,
       );
     }
   }
   if (energy.includes("legacy") || energy.includes("llm_energy_kwh ??")) {
     throw new Error(
-      "v4 energy totals still contain a legacy snapshot fallback",
+      "v5 energy totals still contain a legacy snapshot fallback",
     );
   }
 });

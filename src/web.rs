@@ -87,7 +87,7 @@ pub struct StartSessionRequest {
     pub model: Option<String>,
     pub model_dir: Option<String>,
     #[serde(default)]
-    pub project_name: Option<String>,
+    pub project_id: Option<String>,
     pub workdir: Option<String>,
     pub branch: Option<String>,
     pub max_steps: Option<usize>,
@@ -148,7 +148,7 @@ pub struct StartGoalRequest {
     #[serde(default)]
     pub budget: Option<crate::goal::GoalBudget>,
     #[serde(default)]
-    pub project_name: Option<String>,
+    pub project_id: Option<String>,
     #[serde(default)]
     pub workdir: Option<String>,
     #[serde(default)]
@@ -220,6 +220,12 @@ pub struct SessionListItem {
     pub multi_task: Option<MultiTaskSummary>,
     pub active_multi_task: bool,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSessionSnapshot {
+    pub projects: Vec<ProjectEntry>,
+    pub sessions: Vec<SessionListItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +346,12 @@ pub struct SessionDetails {
     pub pending_goal_proposal: Option<crate::goal::GoalProposal>,
     pub pending_goal_change: Option<PendingGoalChange>,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionStreamSnapshot {
+    session: SessionDetails,
+    reset_history: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,8 +631,9 @@ pub async fn run_server_with_ready(
             "/api/goals/{id}/amendments/{amendment_id}/discard",
             post(discard_goal_amendment),
         )
+        .route("/api/project-sessions", get(list_project_sessions))
         .route("/api/projects", get(list_projects))
-        .route("/api/projects/{name}/usage", get(get_project_usage))
+        .route("/api/projects/{id}/usage", get(get_project_usage))
         .route(
             "/api/integrations/marketplace",
             get(list_marketplace_integrations),
@@ -630,11 +643,11 @@ pub async fn run_server_with_ready(
             get(get_integration_config_schema),
         )
         .route(
-            "/api/projects/{name}/integrations",
+            "/api/projects/{id}/integrations",
             get(list_project_integrations).post(install_project_integration),
         )
         .route(
-            "/api/projects/{name}/integrations/{integration_name}",
+            "/api/projects/{id}/integrations/{integration_name}",
             delete(remove_project_integration),
         )
         .route(
@@ -646,7 +659,7 @@ pub async fn run_server_with_ready(
             delete(remove_global_lsp_integration),
         )
         .route(
-            "/api/projects/{name}/notifications",
+            "/api/projects/{id}/notifications",
             patch(update_project_notifications),
         )
         .route("/api/settings", get(get_settings).patch(update_settings))
@@ -838,17 +851,10 @@ async fn get_integration_config_schema(
 }
 
 async fn list_project_integrations(
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Result<Json<Vec<InstalledIntegration>>, IntegrationApiError> {
-    let project_path = {
-        let projects = state.projects.lock().await;
-        projects
-            .iter()
-            .find(|project| project.name == name)
-            .map(|project| PathBuf::from(&project.path))
-            .ok_or_else(|| IntegrationApiError::new(StatusCode::NOT_FOUND, "project not found"))?
-    };
+    let project_path = registered_project_path(&state, &id).await?;
     tokio::task::spawn_blocking(move || integrations::list_project_installed(&project_path))
         .await
         .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
@@ -859,18 +865,11 @@ async fn list_project_integrations(
 }
 
 async fn install_project_integration(
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<IntegrationInstallRequest>,
 ) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
-    let project_path = {
-        let projects = state.projects.lock().await;
-        projects
-            .iter()
-            .find(|project| project.name == name)
-            .map(|project| PathBuf::from(&project.path))
-            .ok_or_else(|| IntegrationApiError::new(StatusCode::NOT_FOUND, "project not found"))?
-    };
+    let project_path = registered_project_path(&state, &id).await?;
     tokio::task::spawn_blocking(move || integrations::install_project(&project_path, req))
         .await
         .map_err(|error| IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
@@ -881,17 +880,10 @@ async fn install_project_integration(
 }
 
 async fn remove_project_integration(
-    Path((name, integration_name)): Path<(String, String)>,
+    Path((id, integration_name)): Path<(String, String)>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Result<Json<InstalledIntegration>, IntegrationApiError> {
-    let project_path = {
-        let projects = state.projects.lock().await;
-        projects
-            .iter()
-            .find(|project| project.name == name)
-            .map(|project| PathBuf::from(&project.path))
-            .ok_or_else(|| IntegrationApiError::new(StatusCode::NOT_FOUND, "project not found"))?
-    };
+    let project_path = registered_project_path(&state, &id).await?;
     tokio::task::spawn_blocking(move || {
         integrations::remove_project(
             &project_path,
@@ -905,6 +897,26 @@ async fn remove_project_integration(
     .map_err(|error| {
         IntegrationApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
     })
+}
+
+async fn registered_project_path(
+    state: &AppState,
+    id: &str,
+) -> Result<PathBuf, IntegrationApiError> {
+    reload_projects(state).await.map_err(|error| {
+        IntegrationApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to reload project registry: {error:#}"),
+        )
+    })?;
+    state
+        .projects
+        .lock()
+        .await
+        .iter()
+        .find(|project| project.id == id)
+        .map(|project| PathBuf::from(&project.path))
+        .ok_or_else(|| IntegrationApiError::new(StatusCode::NOT_FOUND, "project not found"))
 }
 
 async fn list_global_lsp_integrations()
@@ -963,16 +975,17 @@ async fn start_session_inner(
     if task.is_empty() {
         bail!("session task must not be empty");
     }
-    if req.project_name.is_some() && req.workdir.is_some() {
-        bail!("choose project_name or workdir, not both");
+    if req.project_id.is_some() && req.workdir.is_some() {
+        bail!("choose project_id or workdir, not both");
     }
-    let mut registered_projects = projects::load_projects()?;
+    reload_projects(&state).await?;
+    let mut registered_projects = project_list_snapshot(&state).await;
     let named_project = req
-        .project_name
+        .project_id
         .as_deref()
         .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(|name| registered_session_project(&registered_projects, name))
+        .filter(|id| !id.is_empty())
+        .map(|id| registered_session_project(&registered_projects, id))
         .transpose()?;
 
     let mut request = defaults.clone();
@@ -995,10 +1008,10 @@ async fn start_session_inner(
     if let Some(workdir) = explicit_workdir {
         request.workdir = Some(PathBuf::from(workdir));
         request.repository_less = false;
-    } else if let Some(bootstrap) = maybe_bootstrap_project(&task)? {
+    } else if let Some(bootstrap) = maybe_bootstrap_project(&state, &task).await? {
         request.workdir = Some(bootstrap);
         request.repository_less = false;
-        registered_projects = projects::load_projects()?;
+        registered_projects = project_list_snapshot(&state).await;
     } else {
         request.workdir = None;
         request.repository_less = true;
@@ -1051,7 +1064,6 @@ async fn start_session_inner(
     let project = named_project
         .map(|(_, project)| project)
         .or_else(|| resolve_session_project(&registered_projects, request.workdir.as_deref()));
-    *state.projects.lock().await = registered_projects;
     let durable = DurableSessionProjection {
         project,
         ..DurableSessionProjection::default()
@@ -1146,6 +1158,9 @@ async fn start_goal_inner(
 
     // Snapshot the registry before taking the session lock. Goal activation never waits for a
     // second application lock while it is changing durable session state.
+    if req.project_id.is_some() {
+        reload_projects(&state).await?;
+    }
     let registered_projects = state.projects.lock().await.clone();
     let mut sessions = state.sessions.lock().await;
     let requested_existing_session = req.session_id.is_some();
@@ -1161,7 +1176,7 @@ async fn start_goal_inner(
         if !requested_existing_session {
             bail!("generated session id collision");
         }
-        if req.project_name.is_some() || req.workdir.is_some() {
+        if req.project_id.is_some() || req.workdir.is_some() {
             bail!("an existing session already determines the goal project");
         }
         if session.goal.is_some() || session.running || session.pending_question.is_some() {
@@ -1214,15 +1229,15 @@ async fn start_goal_inner(
         });
     }
 
-    if req.project_name.is_some() && req.workdir.is_some() {
-        bail!("choose project_name or workdir, not both");
+    if req.project_id.is_some() && req.workdir.is_some() {
+        bail!("choose project_id or workdir, not both");
     }
     let named_project = req
-        .project_name
+        .project_id
         .as_deref()
         .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(|name| registered_session_project(&registered_projects, name))
+        .filter(|id| !id.is_empty())
+        .map(|id| registered_session_project(&registered_projects, id))
         .transpose()?;
     let workdir = named_project
         .as_ref()
@@ -1348,6 +1363,7 @@ fn resolve_session_project(
             .is_ok_and(|path| path == workdir)
     }) {
         return Some(SessionProject {
+            id: project.id.clone(),
             name: project.name.clone(),
             path: project.path.clone(),
         });
@@ -1372,6 +1388,7 @@ fn resolve_session_project(
         return None;
     }
     Some(SessionProject {
+        id: project.id.clone(),
         name: project.name.clone(),
         path: project.path.clone(),
     })
@@ -1379,15 +1396,16 @@ fn resolve_session_project(
 
 fn registered_session_project(
     projects: &[ProjectEntry],
-    project_name: &str,
+    project_id: &str,
 ) -> Result<(PathBuf, SessionProject)> {
     let project = projects
         .iter()
-        .find(|project| project.name == project_name)
-        .with_context(|| format!("registered project not found: {project_name}"))?;
+        .find(|project| project.id == project_id)
+        .with_context(|| format!("registered project not found: {project_id}"))?;
     Ok((
         PathBuf::from(&project.path),
         SessionProject {
+            id: project.id.clone(),
             name: project.name.clone(),
             path: project.path.clone(),
         },
@@ -2237,38 +2255,45 @@ fn materialize_attachments(
         .collect()
 }
 
-fn maybe_bootstrap_project(task: &str) -> Result<Option<PathBuf>> {
+async fn maybe_bootstrap_project(state: &AppState, task: &str) -> Result<Option<PathBuf>> {
     let Some(name) = parse_bootstrap_project_name(task) else {
         return Ok(None);
     };
-    let home = dirs::home_dir().context("cannot determine home directory for project bootstrap")?;
-    let projects_dir = home.join("Projects");
-    std::fs::create_dir_all(&projects_dir)
-        .with_context(|| format!("failed to create {}", projects_dir.display()))?;
-    let project_dir = projects_dir.join(&name);
-    if project_dir.exists() {
-        bail!(
-            "bootstrap project already exists: {}",
-            project_dir.display()
-        );
-    }
-    std::fs::create_dir(&project_dir)
-        .with_context(|| format!("failed to create {}", project_dir.display()))?;
-    let output = Command::new("git")
-        .arg("init")
-        .current_dir(&project_dir)
-        .output()
-        .context("failed to run git init for bootstrap project")?;
-    if !output.status.success() {
-        bail!(
-            "git init failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    projects::add_project(AddProjectRequest {
-        name: Some(name),
-        path: project_dir.to_string_lossy().to_string(),
-    })?;
+    let (project_dir, request) = tokio::task::spawn_blocking(move || {
+        let home =
+            dirs::home_dir().context("cannot determine home directory for project bootstrap")?;
+        let projects_dir = home.join("Projects");
+        std::fs::create_dir_all(&projects_dir)
+            .with_context(|| format!("failed to create {}", projects_dir.display()))?;
+        let project_dir = projects_dir.join(&name);
+        if project_dir.exists() {
+            bail!(
+                "bootstrap project already exists: {}",
+                project_dir.display()
+            );
+        }
+        std::fs::create_dir(&project_dir)
+            .with_context(|| format!("failed to create {}", project_dir.display()))?;
+        let output = Command::new("git")
+            .arg("init")
+            .current_dir(&project_dir)
+            .output()
+            .context("failed to run git init for bootstrap project")?;
+        if !output.status.success() {
+            bail!(
+                "git init failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let request = AddProjectRequest {
+            name: Some(name),
+            path: project_dir.to_string_lossy().to_string(),
+        };
+        Ok::<_, anyhow::Error>((project_dir, request))
+    })
+    .await
+    .context("project bootstrap task failed")??;
+    mutate_project_registry(state, move || projects::add_project(request)).await?;
     Ok(Some(project_dir))
 }
 
@@ -3316,16 +3341,16 @@ async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSession
         sessions.remove(id).expect("session exists")
     };
 
-    let project_path = session
+    let project_id = session
         .durable
         .project
         .as_ref()
-        .map(|project| project.path.clone());
+        .map(|project| project.id.clone());
     if let Some(metrics) = &session.metrics
-        && let Some(project_path) = project_path
+        && let Some(project_id) = project_id
     {
         let mut usage = state.project_usage.lock().await;
-        if let Some(stats) = usage.get_mut(&project_path) {
+        if let Some(stats) = usage.get_mut(&project_id) {
             stats.subtract_metrics(metrics);
         }
     }
@@ -3346,42 +3371,79 @@ async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSession
 
 async fn list_projects(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Json<Vec<ProjectEntry>> {
-    Json(project_list_snapshot(&state).await)
+) -> Result<Json<Vec<ProjectEntry>>, ApiError> {
+    reload_projects(&state).await.map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "project_registry_unavailable",
+            error,
+        )
+    })?;
+    Ok(Json(project_list_snapshot(&state).await))
+}
+
+async fn list_project_sessions(
+    State((state, _defaults)): State<(AppState, AgentRequest)>,
+) -> Result<Json<ProjectSessionSnapshot>, ApiError> {
+    reload_projects(&state).await.map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "project_registry_unavailable",
+            error,
+        )
+    })?;
+    Ok(Json(project_session_snapshot(&state).await))
 }
 
 async fn get_project_usage(
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<ProjectUsageStats>, StatusCode> {
-    let path = {
+) -> Result<Json<ProjectUsageStats>, ApiError> {
+    reload_projects(&state).await.map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "project_registry_unavailable",
+            error,
+        )
+    })?;
+    let registered = {
         let projects = state.projects.lock().await;
-        projects
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| entry.path.clone())
-            .ok_or(StatusCode::NOT_FOUND)?
+        projects.iter().any(|entry| entry.id == id)
     };
+    if !registered {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "project_not_found",
+            format!("registered project not found: {id}"),
+        ));
+    }
     let usage = state
         .project_usage
         .lock()
         .await
-        .get(&path)
+        .get(&id)
         .cloned()
         .unwrap_or_default();
     Ok(Json(usage))
 }
 
 async fn update_project_notifications(
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<UpdateProjectNotificationsRequest>,
-) -> Result<Json<ProjectEntry>, StatusCode> {
-    let updated = projects::set_project_notifications(&name, req.notify_on_finish)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-    reload_projects(&state)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+) -> Result<Json<ProjectEntry>, ApiError> {
+    let notify_on_finish = req.notify_on_finish;
+    let updated = mutate_project_registry(&state, move || {
+        projects::set_project_notifications_by_id(&id, notify_on_finish)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "project_notification_update_failed",
+            error,
+        )
+    })?;
     Ok(Json(updated))
 }
 
@@ -3559,27 +3621,27 @@ impl WebEventSink {
                 records.push(metrics.clone());
             }
             tokio::runtime::Handle::current().block_on(async {
-                let project_path = {
+                let project_id = {
                     let mut sessions = self.state.sessions.lock().await;
                     let Some(session) = sessions.get_mut(&self.session_id) else {
                         return;
                     };
-                    let project_path = session
+                    let project_id = session
                         .durable
                         .project
                         .as_ref()
-                        .map(|project| project.path.clone());
+                        .map(|project| project.id.clone());
                     if let Some(existing) = session.metrics.as_mut() {
                         existing.add_assign(&metrics);
                     } else {
                         session.metrics = Some(metrics.clone());
                     }
                     session.updated_at_ms = now_millis();
-                    project_path
+                    project_id
                 };
-                if let Some(project_path) = project_path {
+                if let Some(project_id) = project_id {
                     let mut usage = self.state.project_usage.lock().await;
-                    let stats = usage.entry(project_path).or_default();
+                    let stats = usage.entry(project_id).or_default();
                     stats.add_metrics(&metrics);
                 }
             });
@@ -5381,60 +5443,140 @@ async fn session_events(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let (receiver, replay) = {
+    let (receiver, replay, covered_keys, snapshot) = {
         let sessions = state.sessions.lock().await;
         let session = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
         let receiver = session.sender.subscribe();
         let history = session.history.lock().map_err(|_| StatusCode::CONFLICT)?;
-        let start = session_replay_start(&history, last_event_id.as_deref());
-        (receiver, history[start..].to_vec())
-    };
-
-    let replay_keys = Arc::new(StdMutex::new(
-        replay
+        let window = session_replay_window(&history, last_event_id.as_deref());
+        let replay = history[window.start..].to_vec();
+        let covered_keys = history
             .iter()
             .map(|envelope| envelope.transcript.entry_key.clone())
-            .collect::<HashSet<_>>(),
+            .collect::<HashSet<_>>();
+        let snapshot = SessionStreamSnapshot {
+            session: session_details_from_history(&id, session, &history),
+            reset_history: window.reset_history,
+        };
+        (receiver, replay, covered_keys, snapshot)
+    };
+
+    let covered_keys = Arc::new(StdMutex::new(covered_keys));
+    let initial = futures::stream::iter(
+        replay
+            .into_iter()
+            .filter_map(session_event_sse_event)
+            .map(Ok),
+    )
+    .chain(futures::stream::iter(
+        session_snapshot_sse_event(&snapshot).map(Ok),
     ));
-    let replay = futures::stream::iter(replay.into_iter().filter_map(|envelope| {
-        let data = serde_json::to_string(&envelope).ok()?;
-        Some(Ok(Event::default()
-            .id(envelope.transcript.entry_key)
-            .data(data)))
-    }));
-    let live_replay_keys = Arc::clone(&replay_keys);
+    let live_covered_keys = Arc::clone(&covered_keys);
+    let live_state = state.clone();
+    let live_session_id = id.clone();
     let live = BroadcastStream::new(receiver)
         .take_while(|message| futures::future::ready(message.is_ok()))
         .filter_map(move |message| {
-            let replay_keys = Arc::clone(&live_replay_keys);
+            let covered_keys = Arc::clone(&live_covered_keys);
+            let state = live_state.clone();
+            let session_id = live_session_id.clone();
             async move {
                 let envelope = message.ok()?;
                 let entry_key = envelope.transcript.entry_key.clone();
-                let was_replayed = replay_keys
+                let was_covered = covered_keys
                     .lock()
-                    .map(|mut replay_keys| replay_keys.remove(&entry_key))
+                    .map(|mut keys| keys.remove(&entry_key))
                     .unwrap_or(false);
-                if was_replayed {
+                if was_covered {
                     return None;
                 }
-                let data = serde_json::to_string(&envelope).ok()?;
-                Some(Ok(Event::default().id(entry_key).data(data)))
+                let refresh = envelope.requires_session_snapshot();
+                let revision = envelope.transcript.sequence;
+                let mut events = Vec::new();
+                if let Some(event) = session_event_sse_event(envelope) {
+                    events.push(Ok(event));
+                }
+                if refresh
+                    && let Some(session) = session_details_snapshot(&state, &session_id).await
+                    && session.revision >= revision
+                {
+                    if let Ok(mut keys) = covered_keys.lock() {
+                        keys.extend(
+                            session
+                                .events
+                                .iter()
+                                .filter(|event| event.transcript.sequence > revision)
+                                .map(|event| event.transcript.entry_key.clone()),
+                        );
+                    }
+                    if let Some(event) = session_snapshot_sse_event(&SessionStreamSnapshot {
+                        session,
+                        reset_history: false,
+                    }) {
+                        events.push(Ok(event));
+                    }
+                }
+                (!events.is_empty()).then_some(futures::stream::iter(events))
             }
-        });
-    let stream = replay.chain(live);
+        })
+        .flatten();
+    let stream = initial.chain(live);
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-fn session_replay_start(history: &[EventEnvelope], last_event_id: Option<&str>) -> usize {
-    last_event_id
-        .and_then(|entry_key| {
-            history
-                .iter()
-                .rposition(|envelope| envelope.transcript.entry_key == entry_key)
-                .map(|index| index + 1)
-        })
-        .unwrap_or_else(|| history.len().saturating_sub(SESSION_HISTORY_RESPONSE_LIMIT))
+fn session_event_sse_event(envelope: EventEnvelope) -> Option<Event> {
+    let data = serde_json::to_string(&envelope).ok()?;
+    Some(
+        Event::default()
+            .id(envelope.transcript.entry_key)
+            .data(data),
+    )
+}
+
+fn session_snapshot_sse_event(snapshot: &SessionStreamSnapshot) -> Option<Event> {
+    let data = serde_json::to_string(snapshot).ok()?;
+    let mut event = Event::default().event("session_snapshot").data(data);
+    if let Some(entry_key) = snapshot
+        .session
+        .events
+        .last()
+        .map(|envelope| envelope.transcript.entry_key.as_str())
+    {
+        event = event.id(entry_key);
+    }
+    Some(event)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionReplayWindow {
+    start: usize,
+    reset_history: bool,
+}
+
+fn session_replay_window(
+    history: &[EventEnvelope],
+    last_event_id: Option<&str>,
+) -> SessionReplayWindow {
+    match last_event_id {
+        Some(entry_key) => history
+            .iter()
+            .rposition(|envelope| envelope.transcript.entry_key == entry_key)
+            .map_or(
+                SessionReplayWindow {
+                    start: history.len(),
+                    reset_history: true,
+                },
+                |index| SessionReplayWindow {
+                    start: index + 1,
+                    reset_history: false,
+                },
+            ),
+        None => SessionReplayWindow {
+            start: history.len(),
+            reset_history: true,
+        },
+    }
 }
 
 async fn spawn_unix_rpc_server(
@@ -5565,8 +5707,8 @@ async fn handle_rpc_connection(
         }
         "pb.projects.add" => {
             let params: AddProjectRequest = serde_json::from_value(request.params)?;
-            let result = projects::add_project(params)?;
-            reload_projects(&state).await?;
+            let result =
+                mutate_project_registry(&state, move || projects::add_project(params)).await?;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
         }
         "pb.projects.list" => {
@@ -5576,8 +5718,9 @@ async fn handle_rpc_connection(
         }
         "pb.projects.rm" => {
             let params: RemoveProjectRequest = serde_json::from_value(request.params)?;
-            let result = projects::remove_project(&params.name)?;
-            reload_projects(&state).await?;
+            let result =
+                mutate_project_registry(&state, move || projects::remove_project(&params.name))
+                    .await?;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
         }
         "pb.projects.notifications" => {
@@ -5585,13 +5728,16 @@ async fn handle_rpc_connection(
             let name = params
                 .get("name")
                 .and_then(|value| value.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing project name"))?;
+                .ok_or_else(|| anyhow::anyhow!("missing project name"))?
+                .to_string();
             let notify_on_finish = params
                 .get("notify_on_finish")
                 .and_then(|value| value.as_bool())
                 .ok_or_else(|| anyhow::anyhow!("missing notify_on_finish"))?;
-            let result = projects::set_project_notifications(name, notify_on_finish)?;
-            reload_projects(&state).await?;
+            let result = mutate_project_registry(&state, move || {
+                projects::set_project_notifications(&name, notify_on_finish)
+            })
+            .await?;
             write_rpc_response(reader.get_mut(), request.id, result).await?;
         }
         "pb.session.resume" => {
@@ -5884,7 +6030,7 @@ fn build_project_usage_cache(
             continue;
         };
         cache
-            .entry(project.path.clone())
+            .entry(project.id.clone())
             .or_default()
             .add_metrics(metrics);
     }
@@ -6064,6 +6210,10 @@ fn combined_metrics(records: &[SessionMetricsSnapshot]) -> Option<SessionMetrics
 
 async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
     let sessions = state.sessions.lock().await;
+    session_list_items(&sessions)
+}
+
+fn session_list_items(sessions: &HashMap<String, SessionState>) -> Vec<SessionListItem> {
     let mut items = sessions
         .iter()
         .map(|(session_id, session)| {
@@ -6106,11 +6256,62 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
     items
 }
 
+async fn project_session_snapshot(state: &AppState) -> ProjectSessionSnapshot {
+    let projects = state.projects.lock().await;
+    let sessions = state.sessions.lock().await;
+    ProjectSessionSnapshot {
+        projects: projects.clone(),
+        sessions: session_list_items(&sessions),
+    }
+}
+
 async fn reload_projects(state: &AppState) -> Result<()> {
-    let projects = projects::load_projects()?;
-    let mut current = state.projects.lock().await;
-    *current = projects;
+    let mut current_projects = state.projects.lock().await;
+    let projects = tokio::task::spawn_blocking(projects::load_projects)
+        .await
+        .context("project registry reload task failed")??;
+    let mut sessions = state.sessions.lock().await;
+    for session in sessions.values_mut() {
+        let Some(stored_project) = session.durable.project.as_ref() else {
+            continue;
+        };
+        let Some(current_project) = projects
+            .iter()
+            .find(|project| project.id == stored_project.id)
+        else {
+            continue;
+        };
+        let previous_path = PathBuf::from(&stored_project.path);
+        let current_path = PathBuf::from(&current_project.path);
+        session.durable.project = Some(SessionProject {
+            id: current_project.id.clone(),
+            name: current_project.name.clone(),
+            path: current_project.path.clone(),
+        });
+        if !session.running && session.workdir.as_ref() == Some(&previous_path) {
+            session.workdir = Some(current_path.clone());
+        }
+        if !session.running && session.request_template.workdir.as_ref() == Some(&previous_path) {
+            session.request_template.workdir = Some(current_path);
+        }
+    }
+    *current_projects = projects;
     Ok(())
+}
+
+async fn mutate_project_registry<T, F>(state: &AppState, mutation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let result = {
+        let _registry_guard = state.projects.lock().await;
+        tokio::task::spawn_blocking(mutation)
+            .await
+            .context("project registry mutation task failed")??
+    };
+    reload_projects(state).await?;
+    Ok(result)
 }
 
 async fn project_list_snapshot(state: &AppState) -> Vec<ProjectEntry> {
@@ -6120,25 +6321,26 @@ async fn project_list_snapshot(state: &AppState) -> Vec<ProjectEntry> {
 async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionDetails> {
     let sessions = state.sessions.lock().await;
     let session = sessions.get(id)?;
-    let (events, title, handoff_outcome, revision) = session
-        .history
-        .lock()
-        .map(|history| {
-            let start = history.len().saturating_sub(SESSION_HISTORY_RESPONSE_LIMIT);
-            (
-                history[start..].to_vec(),
-                latest_session_title(&history).or_else(|| session.title.clone()),
-                handoff_outcome_from_history(&history),
-                history
-                    .last()
-                    .map(|envelope| envelope.transcript.sequence)
-                    .unwrap_or(0),
-            )
-        })
-        .unwrap_or_else(|_| (Vec::new(), session.title.clone(), None, 0));
+    let history = session.history.lock().ok()?;
+    Some(session_details_from_history(id, session, &history))
+}
+
+fn session_details_from_history(
+    id: &str,
+    session: &SessionState,
+    history: &[EventEnvelope],
+) -> SessionDetails {
+    let start = history.len().saturating_sub(SESSION_HISTORY_RESPONSE_LIMIT);
+    let events = history[start..].to_vec();
+    let title = latest_session_title(history).or_else(|| session.title.clone());
+    let handoff_outcome = handoff_outcome_from_history(history);
+    let revision = history
+        .last()
+        .map(|envelope| envelope.transcript.sequence)
+        .unwrap_or(0);
     let workflow = latest_workflow_summary(session);
     let goal = latest_goal_checkpoint(session).cloned();
-    Some(SessionDetails {
+    SessionDetails {
         session_id: id.to_string(),
         task: session.task.clone(),
         title,
@@ -6171,7 +6373,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         pending_goal_proposal: session.durable.pending_goal_proposal.clone(),
         pending_goal_change: session.durable.pending_goal_change.clone(),
         revision,
-    })
+    }
 }
 
 async fn github_oauth_callback(Query(query): Query<HashMap<String, String>>) -> Response {
@@ -6335,23 +6537,24 @@ fn publish_event_envelope_linked(
     supersedes: Vec<String>,
 ) {
     envelope.transcript.supersedes = supersedes;
-    if let Ok(mut entries) = history.lock() {
-        let sequence = entries
-            .last()
-            .map_or(1, |entry| entry.transcript.sequence.saturating_add(1));
-        envelope.assign_sequence(sequence);
-        envelope.refresh_projections(&entries);
-        entries.push(envelope.clone());
-        if entries.len() > MAX_HISTORY_EVENTS {
-            *entries = session_store::trim_event_history(
-                std::mem::take(&mut *entries),
-                MAX_HISTORY_EVENTS,
-            );
-        }
-        let _ = sender.send(envelope);
-    } else {
-        let _ = sender.send(envelope);
+    let Ok(mut entries) = history.lock() else {
+        tracing::error!(
+            entry_key = %envelope.transcript.entry_key,
+            "refusing to publish an event because session history is poisoned"
+        );
+        return;
+    };
+    let sequence = entries
+        .last()
+        .map_or(1, |entry| entry.transcript.sequence.saturating_add(1));
+    envelope.assign_sequence(sequence);
+    envelope.refresh_projections(&entries);
+    entries.push(envelope.clone());
+    if entries.len() > MAX_HISTORY_EVENTS {
+        *entries =
+            session_store::trim_event_history(std::mem::take(&mut *entries), MAX_HISTORY_EVENTS);
     }
+    let _ = sender.send(envelope);
 }
 
 #[cfg(test)]
@@ -6413,7 +6616,7 @@ mod workflow_tests {
     }
 
     #[test]
-    fn event_replay_resumes_after_a_known_cursor_and_falls_back_to_a_snapshot() {
+    fn event_replay_resumes_after_a_known_cursor_and_resets_an_evicted_cursor() {
         let history = (0..305)
             .map(|index| {
                 EventEnvelope::new(AgentEvent::UserMessage {
@@ -6425,9 +6628,27 @@ mod workflow_tests {
             .collect::<Vec<_>>();
         let cursor = history[200].transcript.entry_key.as_str();
 
-        assert_eq!(session_replay_start(&history, Some(cursor)), 201);
-        assert_eq!(session_replay_start(&history, Some("missing")), 5);
-        assert_eq!(session_replay_start(&history, None), 5);
+        assert_eq!(
+            session_replay_window(&history, Some(cursor)),
+            SessionReplayWindow {
+                start: 201,
+                reset_history: false,
+            }
+        );
+        assert_eq!(
+            session_replay_window(&history, Some("missing")),
+            SessionReplayWindow {
+                start: history.len(),
+                reset_history: true,
+            }
+        );
+        assert_eq!(
+            session_replay_window(&history, None),
+            SessionReplayWindow {
+                start: history.len(),
+                reset_history: true,
+            }
+        );
     }
 
     #[test]
@@ -6445,6 +6666,7 @@ mod workflow_tests {
         let nested = repo.path().join("packages/web");
         std::fs::create_dir_all(&nested).unwrap();
         let registered = ProjectEntry {
+            id: "project-pb".to_string(),
             name: "pb".to_string(),
             path: repo.path().to_string_lossy().into_owned(),
             repository_root: None,
@@ -6454,12 +6676,14 @@ mod workflow_tests {
         assert_eq!(
             resolve_session_project(std::slice::from_ref(&registered), Some(&nested)),
             Some(SessionProject {
+                id: registered.id.clone(),
                 name: "pb".to_string(),
                 path: registered.path.clone(),
             })
         );
 
         let duplicate = ProjectEntry {
+            id: "project-same-repository".to_string(),
             name: "same-repository".to_string(),
             ..registered.clone()
         };
@@ -6485,6 +6709,30 @@ mod workflow_tests {
         assert_eq!(streamed.transcript.sequence, 1);
         assert_eq!(history[0].transcript.entry_key, entry_key);
         assert_eq!(history[0].transcript.supersedes, vec!["older-entry"]);
+    }
+
+    #[test]
+    fn poisoned_history_never_publishes_an_unsequenced_event() {
+        let (sender, mut receiver) = broadcast::channel(4);
+        let history = StdMutex::new(Vec::new());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = history.lock().unwrap();
+            panic!("poison event history");
+        });
+
+        publish_event(
+            &sender,
+            &history,
+            AgentEvent::SessionTitle {
+                title: "must not escape".to_string(),
+                timestamp_ms: None,
+            },
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -6933,6 +7181,7 @@ mod workflow_tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             projects: Arc::new(Mutex::new(vec![ProjectEntry {
+                id: "project-test".to_string(),
                 name: "test".to_string(),
                 path: repo.path().to_string_lossy().into_owned(),
                 repository_root: None,
@@ -6957,7 +7206,7 @@ mod workflow_tests {
                 }],
                 continuation: crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
                 budget: None,
-                project_name: None,
+                project_id: None,
                 workdir: Some(repo.path().to_string_lossy().into_owned()),
                 model: None,
             },
@@ -6999,6 +7248,7 @@ mod workflow_tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             projects: Arc::new(Mutex::new(vec![ProjectEntry {
+                id: "project-test".to_string(),
                 name: "test".to_string(),
                 path: repo.path().to_string_lossy().into_owned(),
                 repository_root: None,
@@ -7021,7 +7271,7 @@ mod workflow_tests {
                 criteria: Vec::new(),
                 continuation: crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
                 budget: None,
-                project_name: None,
+                project_id: None,
                 workdir: Some(repo.path().to_string_lossy().into_owned()),
                 model: None,
             },

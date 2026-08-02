@@ -1,9 +1,16 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PROJECT_ID_FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectEntry {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,12 +74,39 @@ fn load_projects_from(path: &Path) -> Result<Vec<ProjectEntry>> {
     let registry: ProjectRegistry =
         toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
     let mut projects = registry.projects;
+    let mut assigned_ids = false;
     for project in &mut projects {
+        if project.id.trim().is_empty() {
+            project.id = new_project_id();
+            assigned_ids = true;
+        }
         if project.repository_root.is_none() {
             project.repository_root = repository_root_for(Path::new(&project.path));
         }
     }
     sort_projects(&mut projects);
+    let mut project_ids = HashSet::new();
+    let mut project_names = HashSet::new();
+    let mut project_paths = HashSet::new();
+    for project in &projects {
+        validate_project_id(&project.id)?;
+        validate_project_name(&project.name)?;
+        if project.path.trim().is_empty() || !Path::new(&project.path).is_absolute() {
+            bail!("project '{}' has an invalid path", project.name);
+        }
+        if !project_ids.insert(project.id.as_str()) {
+            bail!("project registry repeats id '{}'", project.id);
+        }
+        if !project_names.insert(project.name.as_str()) {
+            bail!("project registry repeats name '{}'", project.name);
+        }
+        if !project_paths.insert(project.path.as_str()) {
+            bail!("project registry repeats path '{}'", project.path);
+        }
+    }
+    if assigned_ids {
+        save_projects_to(path, &projects)?;
+    }
     Ok(projects)
 }
 
@@ -89,20 +123,32 @@ fn add_project_at(request: AddProjectRequest, registry_path: &Path) -> Result<Pr
     validate_project_name(&name)?;
 
     let path_string = path.to_string_lossy().into_owned();
-    let existing_notify = load_projects_from(registry_path)?
-        .into_iter()
-        .find(|project| project.name == name || project.path == path_string)
-        .map(|project| project.notify_on_finish)
-        .unwrap_or(false);
+    let mut projects = load_projects_from(registry_path)?;
+    let same_name = projects.iter().find(|project| project.name == name);
+    let same_path = projects.iter().find(|project| project.path == path_string);
+    if let (Some(named), Some(located)) = (same_name, same_path)
+        && named.id != located.id
+    {
+        bail!(
+            "project name '{}' and path '{}' identify different registered projects",
+            name,
+            path.display()
+        );
+    }
+    let existing = same_name.or(same_path);
+    let id = existing
+        .map(|project| project.id.clone())
+        .unwrap_or_else(new_project_id);
+    let existing_notify = existing.is_some_and(|project| project.notify_on_finish);
 
     let entry = ProjectEntry {
+        id,
         name: name.clone(),
         path: path_string,
         repository_root: repository_root_for(&path),
         notify_on_finish: existing_notify,
     };
 
-    let mut projects = load_projects_from(registry_path)?;
     projects.retain(|project| project.name != name && project.path != entry.path);
     projects.push(entry.clone());
     sort_projects(&mut projects);
@@ -123,6 +169,25 @@ pub fn remove_project(name: &str) -> Result<ProjectEntry> {
 
 pub fn set_project_notifications(name: &str, notify_on_finish: bool) -> Result<ProjectEntry> {
     set_project_notifications_at(&registry_path()?, name, notify_on_finish)
+}
+
+pub fn set_project_notifications_by_id(id: &str, notify_on_finish: bool) -> Result<ProjectEntry> {
+    set_project_notifications_by_id_at(&registry_path()?, id, notify_on_finish)
+}
+
+fn set_project_notifications_by_id_at(
+    registry_path: &Path,
+    id: &str,
+    notify_on_finish: bool,
+) -> Result<ProjectEntry> {
+    let mut projects = load_projects_from(registry_path)?;
+    let Some(project) = projects.iter_mut().find(|project| project.id == id) else {
+        bail!("project not found: {id}");
+    };
+    project.notify_on_finish = notify_on_finish;
+    let updated = project.clone();
+    save_projects_to(registry_path, &projects)?;
+    Ok(updated)
 }
 
 fn set_project_notifications_at(
@@ -154,7 +219,28 @@ fn save_projects_to(path: &Path, projects: &[ProjectEntry]) -> Result<()> {
     let content = toml::to_string_pretty(&ProjectRegistry {
         projects: projects.to_vec(),
     })?;
-    std::fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))
+    let parent = path
+        .parent()
+        .with_context(|| format!("project registry path has no parent: {}", path.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create a temporary file in {}", parent.display()))?;
+    temporary.write_all(content.as_bytes()).with_context(|| {
+        format!(
+            "failed to write temporary project registry for {}",
+            path.display()
+        )
+    })?;
+    temporary.as_file().sync_all().with_context(|| {
+        format!(
+            "failed to sync temporary project registry for {}",
+            path.display()
+        )
+    })?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
 }
 
 fn validate_project_name(name: &str) -> Result<()> {
@@ -167,8 +253,38 @@ fn validate_project_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_project_id(id: &str) -> Result<()> {
+    if !id.starts_with("project-")
+        || id.len() == "project-".len()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("invalid project id '{id}'");
+    }
+    Ok(())
+}
+
 fn sort_projects(projects: &mut [ProjectEntry]) {
     projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+}
+
+fn new_project_id() -> String {
+    let mut random = [0_u8; 16];
+    if getrandom::getrandom(&mut random).is_ok() {
+        use std::fmt::Write as _;
+        let mut suffix = String::with_capacity(random.len() * 2);
+        for byte in random {
+            write!(&mut suffix, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        return format!("project-{suffix}");
+    }
+    let sequence = PROJECT_ID_FALLBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "project-{}-{}-{sequence}",
+        std::process::id(),
+        crate::session_store::now_millis()
+    )
 }
 
 fn repository_root_for(path: &Path) -> Option<String> {
@@ -210,6 +326,119 @@ mod tests {
         let updated = set_project_notifications_at(&registry, "example", true).unwrap();
         assert!(updated.notify_on_finish);
         assert!(load_projects_from(&registry).unwrap()[0].notify_on_finish);
+
+        let updated = set_project_notifications_by_id_at(&registry, &updated.id, false).unwrap();
+        assert!(!updated.notify_on_finish);
+    }
+
+    #[test]
+    fn project_identity_survives_registry_upgrade_and_repository_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("projects.toml");
+        let first_path = dir.path().join("first");
+        let second_path = dir.path().join("second");
+        std::fs::create_dir_all(&first_path).unwrap();
+        std::fs::create_dir_all(&second_path).unwrap();
+        std::fs::write(
+            &registry,
+            format!(
+                "[[projects]]\nname = \"example\"\npath = \"{}\"\nnotify_on_finish = false\n",
+                first_path.display()
+            ),
+        )
+        .unwrap();
+
+        let upgraded = load_projects_from(&registry).unwrap();
+        assert!(upgraded[0].id.starts_with("project-"));
+        assert_eq!(load_projects_from(&registry).unwrap()[0].id, upgraded[0].id);
+
+        let moved = add_project_at(
+            AddProjectRequest {
+                name: Some("example".to_string()),
+                path: second_path.to_string_lossy().into_owned(),
+            },
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(moved.id, upgraded[0].id);
+        assert_eq!(
+            moved.path,
+            second_path.canonicalize().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn project_update_rejects_ambiguous_existing_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("projects.toml");
+        let first_path = dir.path().join("first");
+        let second_path = dir.path().join("second");
+        std::fs::create_dir_all(&first_path).unwrap();
+        std::fs::create_dir_all(&second_path).unwrap();
+        save_projects_to(
+            &registry,
+            &[
+                ProjectEntry {
+                    id: "project-first".to_string(),
+                    name: "first".to_string(),
+                    path: first_path
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    repository_root: None,
+                    notify_on_finish: false,
+                },
+                ProjectEntry {
+                    id: "project-second".to_string(),
+                    name: "second".to_string(),
+                    path: second_path
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    repository_root: None,
+                    notify_on_finish: false,
+                },
+            ],
+        )
+        .unwrap();
+
+        let error = add_project_at(
+            AddProjectRequest {
+                name: Some("first".to_string()),
+                path: second_path.to_string_lossy().into_owned(),
+            },
+            &registry,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("different registered projects"));
+        assert_eq!(load_projects_from(&registry).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn duplicate_registry_identity_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("projects.toml");
+        std::fs::write(
+            &registry,
+            r#"
+[[projects]]
+id = "project-shared"
+name = "first"
+path = "/tmp/first"
+
+[[projects]]
+id = "project-shared"
+name = "second"
+path = "/tmp/second"
+"#,
+        )
+        .unwrap();
+
+        let error = load_projects_from(&registry).unwrap_err();
+        assert!(error.to_string().contains("repeats id 'project-shared'"));
     }
 
     #[test]
@@ -226,6 +455,7 @@ mod tests {
         let nested = repo.path().join("services").join("payments");
         std::fs::create_dir_all(&nested).unwrap();
         let entry = ProjectEntry {
+            id: "project-payments".to_string(),
             name: "payments".to_string(),
             path: nested
                 .canonicalize()
@@ -250,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn old_project_records_deserialize_without_repository_root() {
+    fn project_records_deserialize_without_derived_registry_fields() {
         let entry: ProjectEntry = toml::from_str(
             r#"
 name = "legacy"
@@ -259,6 +489,7 @@ notify_on_finish = true
 "#,
         )
         .unwrap();
+        assert_eq!(entry.id, "");
         assert_eq!(entry.repository_root, None);
         assert!(entry.notify_on_finish);
     }

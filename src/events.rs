@@ -12,7 +12,7 @@ pub use crate::inference::StageRootAuthorityClass as PromptRootAuthorityClass;
 use crate::session_store::now_millis;
 pub use crate::workflow::WorkflowBlockCause;
 
-pub const EVENT_SCHEMA_VERSION: &str = "v4";
+pub const EVENT_SCHEMA_VERSION: &str = "v5";
 static LAST_EVENT_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
 fn next_event_timestamp_ms() -> u64 {
@@ -292,7 +292,6 @@ impl TranscriptMetadata {
             related_action_key: None,
             summary_redundant: false,
             session_effect: SessionEffect {
-                refresh: false,
                 running: SessionRunningEffect::Unchanged,
                 reset_intent: false,
                 title: None,
@@ -338,7 +337,6 @@ impl std::fmt::Display for GoalChangeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionEffect {
-    pub refresh: bool,
     pub running: SessionRunningEffect,
     pub reset_intent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1428,6 +1426,10 @@ impl EventEnvelope {
         self.evidence = evidence_for_event(&self.event, history);
         self.transcript = transcript_metadata_for_event(&self.event, history, supersedes);
         self.transcript.sequence = sequence;
+    }
+
+    pub fn requires_session_snapshot(&self) -> bool {
+        event_requires_session_snapshot(&self.event)
     }
 
     pub(crate) fn assign_sequence(&mut self, sequence: u64) {
@@ -2858,8 +2860,8 @@ pub(crate) fn event_entry_key(event: &AgentEvent) -> String {
     format!("event:{}", crate::environment_lock::sha256(&serialized))
 }
 
-fn session_effect_for_event(event: &AgentEvent) -> SessionEffect {
-    let refresh = matches!(
+fn event_requires_session_snapshot(event: &AgentEvent) -> bool {
+    matches!(
         event,
         AgentEvent::DeliveryProposed { .. }
             | AgentEvent::GoalProposed { .. }
@@ -2893,7 +2895,10 @@ fn session_effect_for_event(event: &AgentEvent) -> SessionEffect {
             | AgentEvent::SessionStateChanged { .. }
             | AgentEvent::UserQuestion { .. }
             | AgentEvent::UserAnswer { .. }
-    );
+    )
+}
+
+fn session_effect_for_event(event: &AgentEvent) -> SessionEffect {
     let running = match event {
         AgentEvent::Started { .. }
         | AgentEvent::UserAnswer { .. }
@@ -2903,7 +2908,6 @@ fn session_effect_for_event(event: &AgentEvent) -> SessionEffect {
         _ => SessionRunningEffect::Unchanged,
     };
     SessionEffect {
-        refresh,
         running,
         reset_intent: matches!(
             event,
@@ -3902,7 +3906,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_envelopes_reject_unknown_compatibility_fields() {
+    fn v5_envelopes_reject_unknown_compatibility_fields() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::Final {
             content: "done".to_string(),
             profile: AgentProfile::Build,
@@ -3948,7 +3952,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_errors_require_summary_and_detail() {
+    fn v5_errors_require_summary_and_detail() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::Error {
             summary: "Model setup failed".to_string(),
             detail: "llama.cpp failed to load the configured model".to_string(),
@@ -3962,13 +3966,13 @@ mod tests {
             missing["event"].as_object_mut().unwrap().remove(field);
             assert!(
                 serde_json::from_value::<EventEnvelope>(missing).is_err(),
-                "v4 error unexpectedly accepted without {field}"
+                "v5 error unexpectedly accepted without {field}"
             );
         }
     }
 
     #[test]
-    fn v4_tool_results_require_exact_correlation_and_outcome() {
+    fn v5_tool_results_require_exact_correlation_and_outcome() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::ToolResult {
             tool: "read_file".to_string(),
             result: "contents".to_string(),
@@ -3991,7 +3995,7 @@ mod tests {
             missing["event"].as_object_mut().unwrap().remove(field);
             assert!(
                 serde_json::from_value::<EventEnvelope>(missing).is_err(),
-                "v4 tool result unexpectedly accepted without {field}"
+                "v5 tool result unexpectedly accepted without {field}"
             );
         }
     }
@@ -4569,7 +4573,7 @@ mod tests {
             final_message.transcript.session_effect.running,
             SessionRunningEffect::Unchanged
         );
-        assert!(!final_message.transcript.session_effect.refresh);
+        assert!(!final_message.requires_session_snapshot());
         assert!(final_message.transcript.session_effect.reset_intent);
 
         let state = EventEnvelope::new(AgentEvent::SessionStateChanged {
@@ -4582,7 +4586,7 @@ mod tests {
             state.transcript.session_effect.running,
             SessionRunningEffect::Stopped
         );
-        assert!(state.transcript.session_effect.refresh);
+        assert!(state.requires_session_snapshot());
 
         let contradictory = EventEnvelope::new(AgentEvent::SessionStateChanged {
             status: SessionLifecycleStatus::Completed,
@@ -4833,7 +4837,6 @@ mod tests {
             related_action_key: None,
             summary_redundant: false,
             session_effect: SessionEffect {
-                refresh: false,
                 running: SessionRunningEffect::Unchanged,
                 reset_intent: false,
                 title: None,

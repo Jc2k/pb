@@ -309,7 +309,7 @@ and it cannot supply an approval, check result, review judgment, or semantic com
 In user-facing transcripts, Trinity Walker may speak for this deterministic workflow stewardship,
 but the durable event continues to record controller origin, the assisting profile, and its receipt.
 Model-requested actions are attributed to that profile's character. The presentation labels these
-origins **Model** and **Harness**. The v4 event contract requires the producer to identify every
+origins **Model** and **Harness**. The v5 event contract requires the producer to identify every
 model invocation, tool action, controller action, and deterministic correction; consumers never
 borrow a character from adjacent chat. Harness validation messages summarize the teammate mistake
 in plain language and keep the durable structured evidence in a hover-information or

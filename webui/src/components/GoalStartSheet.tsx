@@ -12,7 +12,7 @@ interface GoalStartSheetProps {
   initialObjective: string;
   initialCriteria?: string[];
   sessionId?: string;
-  projectName?: string;
+  projectId?: string;
   projects?: ProjectEntry[];
   onClose: () => void;
   onStarted: (sessionId: string) => void;
@@ -54,20 +54,21 @@ export function GoalStartSheet({
   initialObjective,
   initialCriteria,
   sessionId,
-  projectName,
+  projectId,
   projects = EMPTY_PROJECTS,
   onClose,
   onStarted,
 }: GoalStartSheetProps) {
   const initialCriteriaKey = JSON.stringify(initialCriteria ?? []);
-  const projectOptionsKey = projects.map(({ name }) => name).join("\u0000");
+  const projectOptionsKey = projects.map(({ id, name }) => `${id}\u0000${name}`)
+    .join("\u0001");
   const [objective, setObjective] = useState(initialObjective);
   const [criteria, setCriteria] = useState<string[]>([""]);
   const [continuation, setContinuation] = useState<GoalContinuationPolicy>(
     "review_plan_then_automatic",
   );
-  const [selectedProjectName, setSelectedProjectName] = useState(
-    projectName ?? "",
+  const [selectedProjectId, setSelectedProjectId] = useState(
+    projectId ?? "",
   );
   const [budgetPreset, setBudgetPreset] = useState<BudgetPreset>("standard");
   const [advancedBudget, setAdvancedBudget] = useState<GoalBudget>(
@@ -81,7 +82,7 @@ export function GoalStartSheet({
     if (!open) return;
     setObjective(initialObjective);
     setCriteria(initialCriteria?.length ? initialCriteria : [""]);
-    setSelectedProjectName(projectName ?? projects[0]?.name ?? "");
+    setSelectedProjectId(projectId ?? projects[0]?.id ?? "");
     setBudgetPreset("standard");
     setAdvancedBudget(GOAL_BUDGET_PRESETS.standard);
     setError("");
@@ -89,14 +90,14 @@ export function GoalStartSheet({
     open,
     initialObjective,
     initialCriteriaKey,
-    projectName,
+    projectId,
     projectOptionsKey,
   ]);
 
   if (!open) return null;
 
   const submit = async () => {
-    if (!objective.trim() || (!sessionId && !selectedProjectName)) return;
+    if (!objective.trim() || (!sessionId && !selectedProjectId)) return;
     setSubmitting(true);
     setError("");
     try {
@@ -106,7 +107,7 @@ export function GoalStartSheet({
         body: JSON.stringify({
           session_id: sessionId,
           objective: objective.trim(),
-          project_name: sessionId ? undefined : selectedProjectName,
+          project_id: sessionId ? undefined : selectedProjectId,
           continuation,
           budget: budgetPreset === "advanced"
             ? advancedBudget
@@ -181,18 +182,18 @@ export function GoalStartSheet({
           </div>
         </div>
 
-        {!sessionId && !projectName
+        {!sessionId && !projectId
           ? (
             <label className="goal-field">
               <span>Project</span>
               <select
                 className="form-select"
-                value={selectedProjectName}
-                onChange={(event) => setSelectedProjectName(event.target.value)}
+                value={selectedProjectId}
+                onChange={(event) => setSelectedProjectId(event.target.value)}
               >
                 <option value="">Select a registered project…</option>
                 {projects.map((project) => (
-                  <option key={project.name} value={project.name}>
+                  <option key={project.id} value={project.id}>
                     {project.name}
                   </option>
                 ))}
@@ -389,7 +390,7 @@ export function GoalStartSheet({
             className="btn btn-primary"
             type="button"
             disabled={submitting || voiceInputActive || !objective.trim() ||
-              (!sessionId && !selectedProjectName)}
+              (!sessionId && !selectedProjectId)}
             onClick={() => void submit()}
           >
             {submitting ? "Planning…" : "Plan goal"}

@@ -39,7 +39,8 @@ Deno.test("project sessions leave branch selection to the managed workspace", as
   ok(source.includes('projectSessions[0]?.branch || "Managed automatically"'));
   ok(source.includes("Latest branch"));
   ok(!source.includes("Default branch"));
-  ok(source.includes("project_name: project.name"));
+  ok(source.includes("project_id: project.id"));
+  ok(!source.includes("project_name: project.name"));
   ok(!source.includes("workdir: project.path"));
 });
 
@@ -57,7 +58,7 @@ Deno.test("project routes reset drafts and invalidate project-scoped requests", 
   const source = await Deno.readTextFile("webui/src/pages/ProjectsPage.tsx");
   const projectReset = source.slice(
     source.indexOf('setTask("");'),
-    source.indexOf("}, [name]);", source.indexOf('setTask("");')),
+    source.indexOf("}, [projectId]);", source.indexOf('setTask("");')),
   );
   const settingsStart = source.indexOf(
     "useEffect(() => {\n    invalidateSchemaRequest();",
@@ -65,7 +66,7 @@ Deno.test("project routes reset drafts and invalidate project-scoped requests", 
   );
   const settingsReset = source.slice(
     settingsStart,
-    source.indexOf("}, [name]);", settingsStart),
+    source.indexOf("}, [projectId]);", settingsStart),
   );
 
   for (
@@ -119,13 +120,19 @@ Deno.test("project pages distinguish loading and API failures from empty state",
   ok(page.includes("Project settings may be out of date"));
   ok(page.includes("Loading project settings"));
   ok(page.includes("projectsError && projects.length > 0"));
-  ok(hooks.includes("Project request failed"));
-  ok(hooks.includes("Session request failed"));
-  ok(hooks.includes("sessionsRequest.current.start()"));
-  ok(hooks.includes("projectsRequest.current.start()"));
+  ok(hooks.includes("Project data request failed"));
+  ok(hooks.includes('fetch("/api/project-sessions"'));
+  ok(hooks.includes("dataRequest.current.start()"));
+  ok(hooks.includes("snapshot.projects"));
+  ok(hooks.includes("snapshot.sessions"));
+  ok(hooks.includes("window.setInterval(() => void fetchData(), pollMs)"));
+  ok(!hooks.includes('fetch("/api/sessions"'));
   ok(page.includes("usageRequest.current.start()"));
   ok(page.includes("marketplaceRequest.current.start()"));
   ok(page.includes("installedRequest.current.start()"));
   ok(page.includes('setInstalledError("")'));
   ok(page.includes('setMarketplaceError("")'));
+  ok(page.includes("window.setInterval(() => void fetchProjects(), 5000)"));
+  ok(page.includes("encodeURIComponent(project.id)"));
+  ok(!page.includes("encodeURIComponent(project.name)"));
 });

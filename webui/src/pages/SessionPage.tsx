@@ -6,6 +6,7 @@ import type {
   ComposerMode,
   EventEnvelope,
   SessionDetails,
+  SessionStreamSnapshot,
   WorkflowSummary,
 } from "../types";
 import { IntentControl } from "../components/IntentControl";
@@ -141,13 +142,9 @@ export function SessionPage() {
   const [showMessageTimes, setShowMessageTimes] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
   const sessionRequestRef = useRef(new LatestRequest());
-  const sessionFetchControllerRef = useRef<AbortController | null>(null);
-  const sessionRefreshRequestedRef = useRef(false);
   const actionRequestRef = useRef(new LatestRequest());
   const messageRequestRef = useRef(new LatestRequest());
   const snapshotRevisionRef = useRef<number | null>(null);
-  const latestRefreshEffectRef = useRef(0);
-  const refreshTimerRef = useRef<number | null>(null);
   const latestTitleEffectRef = useRef<
     { sequence: number; title: string } | null
   >(null);
@@ -158,21 +155,52 @@ export function SessionPage() {
   const atBottomRef = useRef(true);
   const messageTimePullStartRef = useRef<{ x: number; y: number } | null>(null);
 
-  const scheduleSessionRefresh = () => {
+  const applySessionSnapshot = (
+    details: SessionDetails,
+    resetHistory = false,
+  ) => {
     if (
-      refreshTimerRef.current !== null ||
-      sessionFetchControllerRef.current !== null
+      snapshotRevisionRef.current !== null &&
+      details.revision < snapshotRevisionRef.current
     ) return;
-    refreshTimerRef.current = window.setTimeout(() => {
-      refreshTimerRef.current = null;
-      void fetchSession();
-    }, 0);
+    snapshotRevisionRef.current = details.revision;
+    const titleEffect = latestTitleEffectRef.current;
+    const runningEffect = latestRunningEffectRef.current;
+    setSession(
+      titleEffect && titleEffect.sequence > details.revision
+        ? { ...details, title: titleEffect.title }
+        : details,
+    );
+    setEvents((previous) => {
+      if (!resetHistory) return mergeEventHistory(details.events, previous);
+      const newer = previous.filter((envelope) =>
+        envelope.transcript.sequence > details.revision
+      );
+      return mergeEventHistory(details.events, newer);
+    });
+    setSessionRunning(
+      runningEffect && runningEffect.sequence > details.revision
+        ? runningEffect.running
+        : details.running,
+    );
+    setSessionError("");
   };
 
   const openEvents = (id: string) => {
     if (sourceRef.current) sourceRef.current.close();
     const src = new EventSource(`/api/sessions/${id}/events`);
     sourceRef.current = src;
+    src.addEventListener("session_snapshot", (message) => {
+      if (sourceRef.current !== src) return;
+      try {
+        const parsed = JSON.parse(
+          (message as MessageEvent<string>).data,
+        ) as SessionStreamSnapshot;
+        applySessionSnapshot(parsed.session, parsed.reset_history);
+      } catch (error) {
+        console.error(error);
+      }
+    });
     src.onmessage = (msg) => {
       if (sourceRef.current !== src) return;
       try {
@@ -201,13 +229,6 @@ export function SessionPage() {
               );
             }
           }
-        }
-        if (effect.refresh) {
-          latestRefreshEffectRef.current = Math.max(
-            latestRefreshEffectRef.current,
-            sequence,
-          );
-          if (newerThanSnapshot) scheduleSessionRefresh();
         }
         if (effect.running === "running") {
           const currentEffect = latestRunningEffectRef.current;
@@ -244,14 +265,7 @@ export function SessionPage() {
   };
 
   const fetchSession = async () => {
-    if (sessionFetchControllerRef.current !== null) {
-      sessionRefreshRequestedRef.current = true;
-      return;
-    }
-    sessionRefreshRequestedRef.current = false;
     const controller = sessionRequestRef.current.start();
-    sessionFetchControllerRef.current = controller;
-    let accepted = false;
     try {
       const res = await fetch(`/api/sessions/${sessionId}`, {
         signal: controller.signal,
@@ -261,29 +275,7 @@ export function SessionPage() {
       }
       const details = (await res.json()) as SessionDetails;
       if (!sessionRequestRef.current.owns(controller)) return;
-      if (
-        snapshotRevisionRef.current !== null &&
-        details.revision < snapshotRevisionRef.current
-      ) {
-        accepted = true;
-        return;
-      }
-      snapshotRevisionRef.current = details.revision;
-      const titleEffect = latestTitleEffectRef.current;
-      const runningEffect = latestRunningEffectRef.current;
-      setSession(
-        titleEffect && titleEffect.sequence > details.revision
-          ? { ...details, title: titleEffect.title }
-          : details,
-      );
-      setEvents((previous) => mergeEventHistory(details.events, previous));
-      setSessionRunning(
-        runningEffect && runningEffect.sequence > details.revision
-          ? runningEffect.running
-          : details.running,
-      );
-      setSessionError("");
-      accepted = true;
+      applySessionSnapshot(details);
     } catch (error) {
       if (
         isAbortError(error) || !sessionRequestRef.current.owns(controller)
@@ -291,17 +283,6 @@ export function SessionPage() {
       setSessionError(
         error instanceof Error ? error.message : "Session request failed",
       );
-    } finally {
-      if (sessionFetchControllerRef.current === controller) {
-        sessionFetchControllerRef.current = null;
-        if (
-          sessionRefreshRequestedRef.current ||
-          (accepted && snapshotRevisionRef.current !== null &&
-            latestRefreshEffectRef.current > snapshotRevisionRef.current)
-        ) {
-          scheduleSessionRefresh();
-        }
-      }
     }
   };
 
@@ -373,7 +354,6 @@ export function SessionPage() {
       setRunningMessageError(
         error instanceof Error ? error.message : "Message could not be sent",
       );
-      await fetchSession();
     }
   };
 
@@ -399,14 +379,12 @@ export function SessionPage() {
         );
       }
       if (!actionRequestRef.current.owns(controller)) return false;
-      await fetchSession();
       return true;
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setActionError(
           error instanceof Error ? error.message : "Could not update the goal",
         );
-        await fetchSession();
       }
       return false;
     } finally {
@@ -471,7 +449,6 @@ export function SessionPage() {
         return;
       }
       setSessionRunning(false);
-      await fetchSession();
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setWorkflowRecoveryError(
@@ -504,7 +481,6 @@ export function SessionPage() {
       }
       setSessionRunning(false);
       setIntent("discuss");
-      await fetchSession();
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setActionError(
@@ -532,7 +508,6 @@ export function SessionPage() {
         );
         return;
       }
-      await fetchSession();
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setActionError(
@@ -593,7 +568,6 @@ export function SessionPage() {
         setActionError(
           await apiErrorMessage(response, "Could not submit the answer"),
         );
-        await fetchSession();
         return;
       }
       setAnswer("");
@@ -660,23 +634,12 @@ export function SessionPage() {
     latestTitleEffectRef.current = null;
     latestRunningEffectRef.current = null;
     snapshotRevisionRef.current = null;
-    latestRefreshEffectRef.current = 0;
-    sessionRefreshRequestedRef.current = false;
-    if (refreshTimerRef.current !== null) {
-      window.clearTimeout(refreshTimerRef.current);
-      refreshTimerRef.current = null;
-    }
     openEvents(sessionId);
     void fetchSession();
     return () => {
       sessionRequestRef.current.abort();
-      sessionFetchControllerRef.current = null;
       actionRequestRef.current.abort();
       messageRequestRef.current.abort();
-      if (refreshTimerRef.current !== null) {
-        window.clearTimeout(refreshTimerRef.current);
-        refreshTimerRef.current = null;
-      }
       sourceRef.current?.close();
     };
   }, [sessionId]);
@@ -866,6 +829,21 @@ export function SessionPage() {
             <i className="bi bi-stop-fill"></i>
           </button>
         </header>
+
+        {sessionError
+          ? (
+            <div className="alert alert-warning m-3 mb-0 py-2" role="alert">
+              This view may be out of date: {sessionError}{" "}
+              <button
+                className="btn btn-sm btn-link"
+                type="button"
+                onClick={() => void fetchSession()}
+              >
+                Try again
+              </button>
+            </div>
+          )
+          : null}
 
         {actionError
           ? (
@@ -1389,7 +1367,6 @@ export function SessionPage() {
               onClose={() => setGoalEditOpen(false)}
               onSubmitted={() => {
                 setGoalEditOpen(false);
-                void fetchSession();
               }}
             />
           )
@@ -1405,7 +1382,6 @@ export function SessionPage() {
           onStarted={() => {
             setGoalStartOpen(false);
             setFollowUp("");
-            void fetchSession();
           }}
         />
       </section>

@@ -29,7 +29,7 @@ Goal for the exact current turn, but the resulting milestone plan still waits fo
 Changing the status filter starts that filtered history from its first batch again. No sessions are
 deleted or hidden from the filter totals.
 
-Session notes use the current version-4 event/session contract. A note written with an incompatible
+Session notes use v5 session state and v5 event envelopes. A note written with an incompatible
 development schema, or missing required current state, is ignored during restore. pb does not guess
 at missing teammate speech, reconstruct old transcript metadata, or derive absent status and usage
 records from neighboring events.
@@ -311,7 +311,7 @@ compatibility mode and works in the registered repository itself, so another edi
 change those files while a task is running. Content fingerprints prevent stale review or commit
 evidence from being accepted, but they are conflict detection rather than filesystem isolation.
 
-Persisted sessions and their events must use the current v4 schemas. Incompatible development-era
+Persisted sessions and their events must use the current v5 schemas. Incompatible development-era
 notes are skipped during restoration instead of being migrated or shown with guessed attribution.
 The current schema requires every session-state key explicitly, using `null` rather than omission
 for inactive state and rejecting unknown compatibility fields. It stores the session start time,
@@ -320,10 +320,14 @@ registered-project identity, pending proposals, and Goal
 change requests directly so the terminal and browser show the same team conversation and actions
 without reconstructing them from nearby events. Session snapshots and live events share a monotonic
 revision, preventing a slower snapshot response from reverting a newer title or running state.
-The browser addresses registered projects by name rather than copying their filesystem paths into
-session or Goal requests. The service resolves that identity and returns structured failures for
-invalid or stale mutations. Live effects at or below the accepted snapshot revision are replay,
-while newer refresh effects are coalesced into a fresh snapshot request.
+The browser addresses registered projects by durable ID rather than copying their names or filesystem
+paths into session, Goal, usage, notification, or integration requests. The service resolves that ID
+and returns structured failures for invalid or stale mutations. Live effects at or below the accepted snapshot revision are replay,
+while the SSE service sends revisioned session snapshots after state-changing events. When a browser
+reconnect cursor is no longer retained, the service marks the snapshot as a history reset rather
+than joining non-contiguous transcript windows. Project pages consume one server-authored registry
+and session snapshot, so projects added or removed through the CLI appear without a browser reload
+and project/session identity cannot drift between separate requests.
 
 The service records an event before making it live. Terminal reattachment atomically captures
 history and subscribes, recovers a lagged receiver from sequence-numbered history, and drains final

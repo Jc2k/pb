@@ -836,7 +836,6 @@ export interface TranscriptMetadata {
 export type SessionRunningEffect = "unchanged" | "running" | "stopped";
 
 export interface SessionEffect {
-  refresh: boolean;
   running: SessionRunningEffect;
   reset_intent: boolean;
   title?: string;
@@ -908,7 +907,7 @@ export interface SessionMetricsSnapshot {
 }
 
 export interface EventEnvelope {
-  version: "v4";
+  version: "v5";
   event: AgentEvent;
   chatter: EventChatter[];
   evidence: EventEvidence[];
@@ -1453,7 +1452,13 @@ export interface SessionDetails {
   revision: number;
 }
 
+export interface SessionStreamSnapshot {
+  session: SessionDetails;
+  reset_history: boolean;
+}
+
 export interface SessionProject {
+  id: string;
   name: string;
   path: string;
 }
@@ -1480,10 +1485,16 @@ export interface PendingGoalChange {
 export type GoalChangeKind = "amendment" | "budget";
 
 export interface ProjectEntry {
+  id: string;
   name: string;
   path: string;
   repository_root?: string;
   notify_on_finish: boolean;
+}
+
+export interface ProjectSessionSnapshot {
+  projects: ProjectEntry[];
+  sessions: SessionItem[];
 }
 
 export interface ProjectUsageStats {

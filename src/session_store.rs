@@ -13,7 +13,7 @@ const NOTES_NAMESPACE: &str = "refs/notes/pb/sessions";
 const MAX_RESTORED_HISTORY_EVENTS: usize = 1_000;
 const SESSION_GIT_NAME: &str = "pb";
 const SESSION_GIT_EMAIL: &str = "pb@localhost";
-pub const SESSION_SCHEMA_VERSION: &str = "v4";
+pub const SESSION_SCHEMA_VERSION: &str = "v5";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +27,7 @@ pub enum SessionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionProject {
+    pub id: String,
     pub name: String,
     pub path: String,
 }
@@ -178,7 +179,12 @@ pub fn restore_registered_sessions(projects: &[ProjectEntry]) -> Vec<PersistedSe
             continue;
         }
         match restore_project_sessions(&root) {
-            Ok(mut restored) => sessions.append(&mut restored),
+            Ok(mut restored) => {
+                for session in &mut restored {
+                    reconcile_registered_project(session, projects);
+                }
+                sessions.append(&mut restored)
+            }
             Err(err) => eprintln!(
                 "failed to restore pb sessions for {}: {err:#}",
                 root.display()
@@ -187,6 +193,31 @@ pub fn restore_registered_sessions(projects: &[ProjectEntry]) -> Vec<PersistedSe
     }
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
     sessions
+}
+
+fn reconcile_registered_project(session: &mut PersistedSession, projects: &[ProjectEntry]) {
+    let Some(stored_project) = session.project.as_ref() else {
+        return;
+    };
+    let Some(current_project) = projects
+        .iter()
+        .find(|candidate| candidate.id == stored_project.id)
+    else {
+        return;
+    };
+    let previous_path = PathBuf::from(&stored_project.path);
+    let current_path = PathBuf::from(&current_project.path);
+    session.project = Some(SessionProject {
+        id: current_project.id.clone(),
+        name: current_project.name.clone(),
+        path: current_project.path.clone(),
+    });
+    if session.workdir.as_ref() == Some(&previous_path) {
+        session.workdir = Some(current_path.clone());
+    }
+    if session.request_template.workdir.as_ref() == Some(&previous_path) {
+        session.request_template.workdir = Some(current_path);
+    }
 }
 
 pub fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSession>> {
@@ -355,7 +386,8 @@ fn validate_authoritative_session_state(session: &PersistedSession) -> Result<()
         bail!("session running flag does not match its status");
     }
     if let Some(project) = session.project.as_ref()
-        && (project.name.trim().is_empty()
+        && (project.id.trim().is_empty()
+            || project.name.trim().is_empty()
             || project.path.trim().is_empty()
             || !Path::new(&project.path).is_absolute())
     {
@@ -1050,6 +1082,58 @@ mod tests {
     }
 
     #[test]
+    fn project_reconciliation_preserves_distinct_managed_workdirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous_path = dir.path().join("previous");
+        let current_path = dir.path().join("current");
+        let managed_path = dir.path().join("managed-session");
+        let mut session = PersistedSession::from_parts(
+            "session-project-move".to_string(),
+            request(&managed_path),
+            Some("pb/test".to_string()),
+            Some(managed_path.clone()),
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        session.project = Some(SessionProject {
+            id: "project-example".to_string(),
+            name: "before".to_string(),
+            path: previous_path.to_string_lossy().into_owned(),
+        });
+        let project = ProjectEntry {
+            id: "project-example".to_string(),
+            name: "after".to_string(),
+            path: current_path.to_string_lossy().into_owned(),
+            repository_root: None,
+            notify_on_finish: false,
+        };
+
+        reconcile_registered_project(&mut session, std::slice::from_ref(&project));
+
+        assert_eq!(session.project.as_ref().unwrap().name, "after");
+        assert_eq!(session.workdir.as_ref(), Some(&managed_path));
+        assert_eq!(
+            session.request_template.workdir.as_ref(),
+            Some(&managed_path)
+        );
+
+        session.workdir = Some(previous_path.clone());
+        session.request_template.workdir = Some(previous_path.clone());
+        session.project = Some(SessionProject {
+            id: "project-example".to_string(),
+            name: "before".to_string(),
+            path: previous_path.to_string_lossy().into_owned(),
+        });
+        reconcile_registered_project(&mut session, &[project]);
+        assert_eq!(session.workdir.as_ref(), Some(&current_path));
+        assert_eq!(
+            session.request_template.workdir.as_ref(),
+            Some(&current_path)
+        );
+    }
+
+    #[test]
     fn persisted_session_title_tracks_session_title_events() {
         let dir = init_repo();
         let request = request(dir.path());
@@ -1070,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_session_without_v4_schema_is_rejected() {
+    fn persisted_session_without_current_schema_is_rejected() {
         let dir = init_repo();
         let session = PersistedSession::from_parts(
             "old-session".to_string(),
@@ -1089,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_v4_session_requires_authoritative_state_fields() {
+    fn persisted_v5_session_requires_authoritative_state_fields() {
         let dir = init_repo();
         let session = PersistedSession::from_parts(
             "malformed-session".to_string(),
@@ -1123,7 +1207,7 @@ mod tests {
             missing.as_object_mut().unwrap().remove(field);
             assert!(
                 parse_session(&serde_json::to_string(&missing).unwrap()).is_err(),
-                "v4 session unexpectedly accepted without {field}"
+                "current session unexpectedly accepted without {field}"
             );
         }
     }
@@ -1382,6 +1466,7 @@ mod tests {
         let mut project = status;
         project.running = false;
         project.project = Some(SessionProject {
+            id: "project-pb".to_string(),
             name: "pb".to_string(),
             path: "relative/path".to_string(),
         });

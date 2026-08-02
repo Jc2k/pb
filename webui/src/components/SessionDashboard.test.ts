@@ -21,7 +21,7 @@ function session(status: SessionItem["status"]): SessionItem {
     intent: null,
     branch: "main",
     workdir: "/tmp/project",
-    project: { name: "project", path: "/tmp/project" },
+    project: { id: "project-1", name: "project", path: "/tmp/project" },
     handoff_outcome: null,
     pending_question: null,
     started_at_ms: Date.now(),

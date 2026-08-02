@@ -30,7 +30,6 @@ function eventEnvelopeDefaults(): Pick<
       supersedes: [],
       summary_redundant: false,
       session_effect: {
-        refresh: false,
         running: "unchanged",
         reset_intent: false,
       },
@@ -49,7 +48,7 @@ function cssRule(css: string, selector: string): string {
 Deno.test("event history merges stream and snapshot data by stable entry key", () => {
   const started: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v4",
+    version: "v5",
     event: {
       type: "started",
       task: "Review the boundary",
@@ -63,7 +62,7 @@ Deno.test("event history merges stream and snapshot data by stable entry key", (
   };
   const streamed: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v4",
+    version: "v5",
     event: {
       type: "user_message",
       message_id: "message-1",
@@ -517,12 +516,13 @@ Deno.test("session transport opens first and lets EventSource reconnect with ded
   ok(page.includes("runningEffect.sequence > details.revision"));
   ok(page.includes("sequence > currentEffect.sequence"));
   ok(page.includes("snapshotRevisionRef.current = details.revision"));
-  ok(
-    page.includes(
-      "latestRefreshEffectRef.current > snapshotRevisionRef.current",
-    ),
-  );
-  ok(page.includes("sessionRefreshRequestedRef.current = true"));
+  ok(page.includes('addEventListener("session_snapshot"'));
+  ok(page.includes("parsed.reset_history"));
+  ok(page.includes("envelope.transcript.sequence > details.revision"));
+  ok(!page.includes("sessionRefreshRequestedRef"));
+  ok(!page.includes("latestRefreshEffectRef"));
+  equal(page.match(/fetchSession\(\)/g)?.length, 3);
+  ok(!page.includes("await fetchSession()"));
   ok(page.includes("session?.pending_delivery_proposal"));
   ok(page.includes("session?.pending_goal_proposal"));
   ok(page.includes("session?.pending_goal_change"));

@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ProjectEntry, SessionItem, SessionStatus } from "../types";
+import type {
+  ProjectEntry,
+  ProjectSessionSnapshot,
+  SessionItem,
+  SessionStatus,
+} from "../types";
 import { notifySessionFinished } from "./helpers";
+import { apiErrorMessage } from "./integrationConfig";
 
 export function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
@@ -53,65 +59,50 @@ export function useProjectSessionData(pollMs = 5000) {
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [sessionsError, setSessionsError] = useState("");
   const [projectsError, setProjectsError] = useState("");
-  const sessionsRequest = useRef(new LatestRequest());
-  const projectsRequest = useRef(new LatestRequest());
+  const dataRequest = useRef(new LatestRequest());
 
-  const fetchSessions = useCallback(async () => {
-    const controller = sessionsRequest.current.start();
+  const fetchData = useCallback(async () => {
+    const controller = dataRequest.current.start();
     try {
-      const res = await fetch("/api/sessions", { signal: controller.signal });
+      const res = await fetch("/api/project-sessions", {
+        signal: controller.signal,
+      });
       if (!res.ok) {
-        throw new Error(`Session request failed (${res.status})`);
+        throw new Error(
+          await apiErrorMessage(res, "Project data request failed"),
+        );
       }
-      const nextSessions = (await res.json()) as SessionItem[];
-      if (!sessionsRequest.current.owns(controller)) return;
-      setSessions(nextSessions);
+      const snapshot = (await res.json()) as ProjectSessionSnapshot;
+      if (!dataRequest.current.owns(controller)) return;
+      setProjects(snapshot.projects);
+      setSessions(snapshot.sessions);
+      setProjectsError("");
       setSessionsError("");
     } catch (error) {
-      if (isAbortError(error) || !sessionsRequest.current.owns(controller)) {
+      if (isAbortError(error) || !dataRequest.current.owns(controller)) {
         return;
       }
-      setSessionsError(
-        error instanceof Error ? error.message : "Session request failed",
-      );
+      const message = error instanceof Error
+        ? error.message
+        : "Project data request failed";
+      setProjectsError(message);
+      setSessionsError(message);
     } finally {
-      if (sessionsRequest.current.owns(controller)) setSessionsLoading(false);
-    }
-  }, []);
-
-  const fetchProjects = useCallback(async () => {
-    const controller = projectsRequest.current.start();
-    try {
-      const res = await fetch("/api/projects", { signal: controller.signal });
-      if (!res.ok) {
-        throw new Error(`Project request failed (${res.status})`);
+      if (dataRequest.current.owns(controller)) {
+        setProjectsLoading(false);
+        setSessionsLoading(false);
       }
-      const nextProjects = (await res.json()) as ProjectEntry[];
-      if (!projectsRequest.current.owns(controller)) return;
-      setProjects(nextProjects);
-      setProjectsError("");
-    } catch (error) {
-      if (isAbortError(error) || !projectsRequest.current.owns(controller)) {
-        return;
-      }
-      setProjectsError(
-        error instanceof Error ? error.message : "Project request failed",
-      );
-    } finally {
-      if (projectsRequest.current.owns(controller)) setProjectsLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void fetchProjects();
-    void fetchSessions();
-    const timer = window.setInterval(() => void fetchSessions(), pollMs);
+    void fetchData();
+    const timer = window.setInterval(() => void fetchData(), pollMs);
     return () => {
       window.clearInterval(timer);
-      sessionsRequest.current.abort();
-      projectsRequest.current.abort();
+      dataRequest.current.abort();
     };
-  }, [fetchProjects, fetchSessions, pollMs]);
+  }, [fetchData, pollMs]);
 
   useProjectFinishNotifications(sessions, projects);
 
@@ -122,8 +113,7 @@ export function useProjectSessionData(pollMs = 5000) {
     projectsLoading,
     sessionsError,
     projectsError,
-    setProjects,
-    refreshProjects: fetchProjects,
-    refreshSessions: fetchSessions,
+    refreshProjects: fetchData,
+    refreshSessions: fetchData,
   };
 }

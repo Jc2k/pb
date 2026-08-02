@@ -345,8 +345,8 @@ export function buildChatPresentation(
   });
 }
 
-export function projectSettingsPath(projectName: string): string {
-  return `/projects/${encodeURIComponent(projectName)}/settings`;
+export function projectSettingsPath(projectId: string): string {
+  return `/projects/${encodeURIComponent(projectId)}/settings`;
 }
 
 export function notificationSupport(): boolean {
@@ -425,7 +425,7 @@ export function sessionBelongsToProject(
   session: SessionItem,
   project: ProjectEntry,
 ): boolean {
-  return session.project?.path === project.path;
+  return session.project?.id === project.id;
 }
 
 export function sessionProjectName(session: SessionItem): string {
