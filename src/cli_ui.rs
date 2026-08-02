@@ -130,15 +130,7 @@ pub fn render_event(envelope: &EventEnvelope) {
         AgentEvent::WorkflowStageCompleted { stage, .. } => {
             print_header("workflow stage", &format!("{stage:?} completed"));
         }
-        AgentEvent::WorkflowBlocked {
-            outcome, reason, ..
-        } => {
-            if envelope.chatter.is_empty() {
-                print_header("workflow blocked", &format!("{outcome:?}: {reason}"));
-            } else {
-                render_chatter(&envelope.chatter);
-            }
-        }
+        AgentEvent::WorkflowBlocked { .. } => render_chatter(&envelope.chatter),
         AgentEvent::WorkflowCompleted { outcome, .. } => {
             print_header("workflow", &format!("completed: {outcome:?}"));
         }
@@ -330,26 +322,7 @@ pub fn render_event(envelope: &EventEnvelope) {
         AgentEvent::UserMessageApplied { message_id, .. } => {
             print_header("user message", &format!("{message_id} applied"));
         }
-        AgentEvent::Correction {
-            actor,
-            summary,
-            message,
-            ..
-        } => {
-            if envelope.chatter.is_empty() {
-                let body = if summary.trim().is_empty() {
-                    message
-                } else {
-                    summary
-                };
-                print_header(
-                    &format!("{} · harness correction", actor.display_name()),
-                    body,
-                );
-            } else {
-                render_chatter(&envelope.chatter);
-            }
-        }
+        AgentEvent::Correction { .. } => render_chatter(&envelope.chatter),
         AgentEvent::SubAgentStarted {
             profile,
             task,
@@ -511,6 +484,7 @@ pub fn render_event(envelope: &EventEnvelope) {
             );
         }
         AgentEvent::SessionTitle { title, .. } => print_header("session title", title),
+        AgentEvent::SessionStateChanged { .. } => {}
         AgentEvent::SessionSummary {
             branch,
             commits,

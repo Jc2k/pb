@@ -21,6 +21,7 @@ function session(status: SessionItem["status"]): SessionItem {
     intent: null,
     branch: "main",
     workdir: "/tmp/project",
+    project: { name: "project", path: "/tmp/project" },
     handoff_outcome: null,
     pending_question: null,
     started_at_ms: Date.now(),
@@ -35,6 +36,7 @@ function session(status: SessionItem["status"]): SessionItem {
     active_goal: false,
     multi_task: null,
     active_multi_task: false,
+    revision: 0,
   };
 }
 

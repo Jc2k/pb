@@ -45,8 +45,58 @@ Deno.test("project pages share live session data and finish notifications", asyn
   const source = await Deno.readTextFile("webui/src/pages/ProjectsPage.tsx");
 
   equal(source.match(/useProjectSessionData\(\)/g)?.length, 2);
+  ok(source.includes("sessionBelongsToProject(session, project)"));
+  ok(!source.includes("session.workdir === project.path"));
   ok(!source.includes("useProjectFinishNotifications"));
   ok(!source.includes('fetch("/api/sessions")'));
+});
+
+Deno.test("project routes reset drafts and invalidate project-scoped requests", async () => {
+  const source = await Deno.readTextFile("webui/src/pages/ProjectsPage.tsx");
+  const projectReset = source.slice(
+    source.indexOf('setTask("");'),
+    source.indexOf("}, [name]);", source.indexOf('setTask("");')),
+  );
+  const settingsStart = source.indexOf(
+    "useEffect(() => {\n    invalidateSchemaRequest();",
+    source.indexOf("export function ProjectSettingsPage"),
+  );
+  const settingsReset = source.slice(
+    settingsStart,
+    source.indexOf("}, [name]);", settingsStart),
+  );
+
+  for (
+    const reset of [
+      'setTask("")',
+      'setIntent("discuss")',
+      "setGoalOpen(false)",
+      "setVoiceInputActive(false)",
+      "setImages([])",
+      'setFilter("all")',
+      'setActiveDetailsTab("usage")',
+      "startRequest.current.abort()",
+    ]
+  ) {
+    ok(projectReset.includes(reset), `missing project route reset: ${reset}`);
+  }
+  for (
+    const reset of [
+      "invalidateSchemaRequest()",
+      "setPendingInstall(null)",
+      "setConfigSchema(null)",
+      'setSchemaError("")',
+      'setIntegrationMutationError("")',
+      "notificationRequest.current.abort()",
+      "integrationMutationRequest.current.abort()",
+    ]
+  ) {
+    ok(settingsReset.includes(reset), `missing settings route reset: ${reset}`);
+  }
+  ok(source.includes("disabled={notificationMutationPending}"));
+  ok(source.includes("startRequest.current.owns(controller)"));
+  ok(source.includes("notificationRequest.current.owns(controller)"));
+  ok(source.includes("integrationMutationRequest.current.owns(controller)"));
 });
 
 Deno.test("project pages distinguish loading and API failures from empty state", async () => {

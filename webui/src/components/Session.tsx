@@ -11,8 +11,8 @@ import {
   formatEventTime,
   formatTranscriptTime,
   getAvatarForProfile,
-  projectName,
   relativeTime,
+  sessionProjectName,
   sessionTitle,
   toolResultForCall,
 } from "../lib/helpers";
@@ -2448,7 +2448,7 @@ export function SessionCard({
         {badge}
       </div>
       <div className="small mt-1 text-body-secondary">
-        <span className="me-2">{projectName(session.workdir)}</span>
+        <span className="me-2">{sessionProjectName(session)}</span>
         <span>{relativeTime(session.updated_at_ms)}</span>
       </div>
     </button>

@@ -29,7 +29,7 @@ Goal for the exact current turn, but the resulting milestone plan still waits fo
 Changing the status filter starts that filtered history from its first batch again. No sessions are
 deleted or hidden from the filter totals.
 
-Session notes use the current version-2 event/session contract. A note written with an incompatible
+Session notes use the current version-4 event/session contract. A note written with an incompatible
 development schema, or missing required current state, is ignored during restore. pb does not guess
 at missing teammate speech, reconstruct old transcript metadata, or derive absent status and usage
 records from neighboring events.
@@ -311,11 +311,15 @@ compatibility mode and works in the registered repository itself, so another edi
 change those files while a task is running. Content fingerprints prevent stale review or commit
 evidence from being accepted, but they are conflict detection rather than filesystem isolation.
 
-Persisted sessions and their events must use the current v3 schemas. Incompatible development-era
+Persisted sessions and their events must use the current v4 schemas. Incompatible development-era
 notes are skipped during restoration instead of being migrated or shown with guessed attribution.
-The current schema stores the session start time, Trinity's authored chatter, structured commit
-summaries, and typed check/commit evidence directly so the terminal and browser show the same team
-conversation without reconstructing it from nearby events.
+The current schema requires every session-state key explicitly, using `null` rather than omission
+for inactive state and rejecting unknown compatibility fields. It stores the session start time,
+Trinity's authored chatter, structured commit summaries, typed check/commit evidence,
+registered-project identity, pending proposals, and Goal
+change requests directly so the terminal and browser show the same team conversation and actions
+without reconstructing them from nearby events. Session snapshots and live events share a monotonic
+revision, preventing a slower snapshot response from reverting a newer title or running state.
 
 If a file is missing, binary, symlinked, stale, oversized, or cannot fit the bounded prompt safely,
 pb does not pretend it was read. The normal model/tool path remains available. Automatic deletion

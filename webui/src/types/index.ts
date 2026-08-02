@@ -113,7 +113,7 @@ export type AgentEvent =
   | {
     type: "goal_change_requested";
     goal_id: string;
-    kind: string;
+    kind: GoalChangeKind;
     summary: string;
     timestamp_ms?: number;
   }
@@ -662,8 +662,8 @@ export type AgentEvent =
     tool_energy_joules?: number;
     tool_energy_kwh?: number;
     wall_runtime_ms: number;
-    started_at_ms?: number;
-    ended_at_ms?: number;
+    started_at_ms: number;
+    ended_at_ms: number;
     total_energy_joules?: number;
     total_energy_kwh?: number;
     gross_energy_joules?: number;
@@ -682,6 +682,13 @@ export type AgentEvent =
   | {
     type: "session_title";
     title: string;
+    timestamp_ms?: number;
+  }
+  | {
+    type: "session_state_changed";
+    status: SessionStatus;
+    running: boolean;
+    paused: boolean;
     timestamp_ms?: number;
   }
   | {
@@ -814,6 +821,7 @@ export type TranscriptKind =
   | "session_summary";
 
 export interface TranscriptMetadata {
+  sequence: number;
   visibility: TranscriptVisibility;
   kind: TranscriptKind;
   entry_key: string;
@@ -883,8 +891,8 @@ export interface SessionMetricsSnapshot {
   tool_energy_joules?: number;
   tool_energy_kwh?: number;
   wall_runtime_ms: number;
-  started_at_ms?: number;
-  ended_at_ms?: number;
+  started_at_ms: number;
+  ended_at_ms: number;
   total_energy_joules?: number;
   total_energy_kwh?: number;
   gross_energy_joules?: number;
@@ -900,7 +908,7 @@ export interface SessionMetricsSnapshot {
 }
 
 export interface EventEnvelope {
-  version: "v3";
+  version: "v4";
   event: AgentEvent;
   chatter: EventChatter[];
   evidence: EventEvidence[];
@@ -1387,6 +1395,7 @@ export interface SessionItem {
   intent: TurnIntent | null;
   branch: string | null;
   workdir: string | null;
+  project: SessionProject | null;
   handoff_outcome: HandoffOutcome | null;
   pending_question: {
     question_id: string;
@@ -1405,6 +1414,7 @@ export interface SessionItem {
   active_goal: boolean;
   multi_task: MultiTaskSummary | null;
   active_multi_task: boolean;
+  revision: number;
 }
 
 export interface SessionDetails {
@@ -1417,6 +1427,7 @@ export interface SessionDetails {
   intent: TurnIntent | null;
   branch: string | null;
   workdir: string | null;
+  project: SessionProject | null;
   handoff_outcome: HandoffOutcome | null;
   pending_question: {
     question_id: string;
@@ -1436,7 +1447,37 @@ export interface SessionDetails {
   active_multi_task: boolean;
   task_plan_rejected: TaskPlanRejected | null;
   task_planning_transcript: TaskPlanningTranscript | null;
+  pending_delivery_proposal: DeliveryProposal | null;
+  pending_goal_proposal: GoalProposal | null;
+  pending_goal_change: PendingGoalChange | null;
+  revision: number;
 }
+
+export interface SessionProject {
+  name: string;
+  path: string;
+}
+
+export interface DeliveryProposal {
+  id: string;
+  source_turn_id: string;
+  task_summary: string;
+}
+
+export interface GoalProposal {
+  id: string;
+  source_turn_id: string;
+  objective: string;
+  criteria: GoalCriterionInput[];
+}
+
+export interface PendingGoalChange {
+  goal_id: string;
+  kind: GoalChangeKind;
+  summary: string;
+}
+
+export type GoalChangeKind = "amendment" | "budget";
 
 export interface ProjectEntry {
   name: string;

@@ -43,6 +43,7 @@ import {
   buildActionTimeline,
   chatEventsWithOnlyLatestStep,
 } from "../lib/sessionUtils";
+import { isAbortError, LatestRequest } from "../lib/hooks";
 
 export function workflowRecoveryPresentation(
   workflow?: WorkflowSummary | null,
@@ -101,13 +102,16 @@ export function mergeEventHistory(
       merged[existing] = envelope;
     }
   }
-  return merged;
+  return merged.sort((left, right) =>
+    left.transcript.sequence - right.transcript.sequence
+  );
 }
 
 export function SessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
   const [session, setSession] = useState<SessionDetails | null>(null);
+  const [sessionError, setSessionError] = useState("");
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [sessionRunning, setSessionRunning] = useState(false);
   const [followUp, setFollowUp] = useState("");
@@ -127,7 +131,13 @@ export function SessionPage() {
   const [workflowRecoveryError, setWorkflowRecoveryError] = useState("");
   const [showMessageTimes, setShowMessageTimes] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
-  const sessionRequestRef = useRef(0);
+  const sessionRequestRef = useRef(new LatestRequest());
+  const latestTitleEffectRef = useRef<
+    { sequence: number; title: string } | null
+  >(null);
+  const latestRunningEffectRef = useRef<
+    { sequence: number; running: boolean } | null
+  >(null);
   const chatRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
   const messageTimePullStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -137,21 +147,52 @@ export function SessionPage() {
     const src = new EventSource(`/api/sessions/${id}/events`);
     sourceRef.current = src;
     src.onmessage = (msg) => {
+      if (sourceRef.current !== src) return;
       try {
         const parsed = JSON.parse(msg.data) as EventEnvelope;
         setEvents((previous) => mergeEventHistory(previous, [parsed]));
         const effect = parsed.transcript.session_effect;
         if (effect.title) {
           const title = effect.title;
-          setSession((current) => current ? { ...current, title } : current);
+          const currentEffect = latestTitleEffectRef.current;
+          if (
+            !currentEffect ||
+            parsed.transcript.sequence > currentEffect.sequence
+          ) {
+            latestTitleEffectRef.current = {
+              sequence: parsed.transcript.sequence,
+              title,
+            };
+            setSession((current) => current ? { ...current, title } : current);
+          }
         }
         if (effect.refresh) {
           void fetchSession();
         }
         if (effect.running === "running") {
-          setSessionRunning(true);
+          const currentEffect = latestRunningEffectRef.current;
+          if (
+            !currentEffect ||
+            parsed.transcript.sequence > currentEffect.sequence
+          ) {
+            latestRunningEffectRef.current = {
+              sequence: parsed.transcript.sequence,
+              running: true,
+            };
+            setSessionRunning(true);
+          }
         } else if (effect.running === "stopped") {
-          setSessionRunning(false);
+          const currentEffect = latestRunningEffectRef.current;
+          if (
+            !currentEffect ||
+            parsed.transcript.sequence > currentEffect.sequence
+          ) {
+            latestRunningEffectRef.current = {
+              sequence: parsed.transcript.sequence,
+              running: false,
+            };
+            setSessionRunning(false);
+          }
         }
         if (effect.reset_intent) {
           setIntent("discuss");
@@ -163,15 +204,39 @@ export function SessionPage() {
   };
 
   const fetchSession = async () => {
-    const request = ++sessionRequestRef.current;
-    const res = await fetch(`/api/sessions/${sessionId}`);
-    if (!res.ok) return;
-    const details = (await res.json()) as SessionDetails;
-    if (request !== sessionRequestRef.current) return;
-    setSession(details);
-    setEvents((previous) => mergeEventHistory(details.events, previous));
-    setSessionRunning(details.running);
-    setAnswer("");
+    const controller = sessionRequestRef.current.start();
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}`, {
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw new Error(`Session request failed (${res.status})`);
+      }
+      const details = (await res.json()) as SessionDetails;
+      if (!sessionRequestRef.current.owns(controller)) return;
+      const titleEffect = latestTitleEffectRef.current;
+      const runningEffect = latestRunningEffectRef.current;
+      setSession(
+        titleEffect && titleEffect.sequence > details.revision
+          ? { ...details, title: titleEffect.title }
+          : details,
+      );
+      setEvents((previous) => mergeEventHistory(details.events, previous));
+      setSessionRunning(
+        runningEffect && runningEffect.sequence > details.revision
+          ? runningEffect.running
+          : details.running,
+      );
+      setSessionError("");
+      setAnswer("");
+    } catch (error) {
+      if (
+        isAbortError(error) || !sessionRequestRef.current.owns(controller)
+      ) return;
+      setSessionError(
+        error instanceof Error ? error.message : "Session request failed",
+      );
+    }
   };
 
   const continueSession = async (
@@ -401,11 +466,14 @@ export function SessionPage() {
     if (!sessionId) return;
     atBottomRef.current = true;
     setSession(null);
+    setSessionError("");
     setEvents([]);
+    latestTitleEffectRef.current = null;
+    latestRunningEffectRef.current = null;
     openEvents(sessionId);
     void fetchSession();
     return () => {
-      sessionRequestRef.current += 1;
+      sessionRequestRef.current.abort();
       sourceRef.current?.close();
     };
   }, [sessionId]);
@@ -449,9 +517,9 @@ export function SessionPage() {
       />
     )
     : null;
-  const deliveryProposal = latestPendingDeliveryProposal(events);
-  const goalProposal = latestPendingGoalProposal(events);
-  const goalChangeRequest = latestGoalChangeRequest(events);
+  const deliveryProposal = session?.pending_delivery_proposal ?? undefined;
+  const goalProposal = session?.pending_goal_proposal ?? undefined;
+  const goalChangeRequest = session?.pending_goal_change ?? undefined;
 
   if (!session) {
     return (
@@ -470,14 +538,33 @@ export function SessionPage() {
               pb
             </span>
           </header>
-          <div className="session-loading" role="status" aria-live="polite">
-            <span
-              className="spinner-border spinner-border-sm"
-              aria-hidden="true"
-            >
-            </span>
-            <span>Loading session…</span>
-          </div>
+          {sessionError
+            ? (
+              <div className="session-loading" role="alert">
+                <span>{sessionError}</span>
+                <button
+                  className="btn btn-sm btn-outline-secondary"
+                  type="button"
+                  onClick={() => void fetchSession()}
+                >
+                  Try again
+                </button>
+              </div>
+            )
+            : (
+              <div
+                className="session-loading"
+                role="status"
+                aria-live="polite"
+              >
+                <span
+                  className="spinner-border spinner-border-sm"
+                  aria-hidden="true"
+                >
+                </span>
+                <span>Loading session…</span>
+              </div>
+            )}
         </section>
       </div>
     );
@@ -784,7 +871,7 @@ export function SessionPage() {
                 void continueSession(
                   deliveryProposal.task_summary,
                   "deliver",
-                  deliveryProposal.proposal_id,
+                  deliveryProposal.id,
                 )}
             >
               Build this
@@ -1115,12 +1202,6 @@ export function SessionPage() {
   );
 }
 
-export interface PendingDeliveryProposal {
-  proposal_id: string;
-  source_turn_id: string;
-  task_summary: string;
-}
-
 export function workflowStageLabel(stage: string): string {
   switch (stage) {
     case "planning":
@@ -1186,80 +1267,4 @@ export function workflowProgressLabel(stage: string, outcome?: string): string {
 
 export function readyEvidenceLabel(commitOid: string): string {
   return `Reviewed commit ${commitOid.slice(0, 12)} is ready to publish`;
-}
-
-export function latestPendingDeliveryProposal(
-  events: EventEnvelope[],
-): PendingDeliveryProposal | undefined {
-  let pending: PendingDeliveryProposal | undefined;
-  for (const { event } of events) {
-    if (event.type === "delivery_proposed") {
-      pending = {
-        proposal_id: event.proposal_id,
-        source_turn_id: event.source_turn_id,
-        task_summary: event.task_summary,
-      };
-    } else if (
-      event.type === "conversation_turn_started" && event.intent === "deliver"
-    ) {
-      pending = undefined;
-    }
-  }
-  return pending;
-}
-
-export interface PendingGoalProposal {
-  proposal_id: string;
-  source_turn_id: string;
-  objective: string;
-  criteria: { text: string; verifier?: string }[];
-}
-
-export function latestPendingGoalProposal(
-  events: EventEnvelope[],
-): PendingGoalProposal | undefined {
-  let pending: PendingGoalProposal | undefined;
-  for (const { event } of events) {
-    if (event.type === "goal_proposed") {
-      pending = {
-        proposal_id: event.proposal_id,
-        source_turn_id: event.source_turn_id,
-        objective: event.objective,
-        criteria: event.criteria,
-      };
-    } else if (event.type === "goal_started") {
-      pending = undefined;
-    }
-  }
-  return pending;
-}
-
-export interface PendingGoalChangeRequest {
-  goal_id: string;
-  kind: string;
-  summary: string;
-}
-
-export function latestGoalChangeRequest(
-  events: EventEnvelope[],
-): PendingGoalChangeRequest | undefined {
-  let pending: PendingGoalChangeRequest | undefined;
-  for (const { event } of events) {
-    if (event.type === "goal_change_requested") {
-      pending = {
-        goal_id: event.goal_id,
-        kind: event.kind,
-        summary: event.summary,
-      };
-    } else if (
-      event.type === "goal_amendment_requested" ||
-      event.type === "goal_resumed" ||
-      event.type === "goal_completed" ||
-      event.type === "goal_failed" ||
-      event.type === "goal_cancelled"
-    ) {
-      pending = undefined;
-    }
-  }
-  return pending;
 }

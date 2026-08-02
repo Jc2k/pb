@@ -67,12 +67,17 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
     typeProfiles.sort(),
     rustEnumVariants(agents, "AgentProfile").map(snakeCase).sort(),
   );
+  deepEqual(
+    typescriptStringUnion(types, "SessionStatus").sort(),
+    rustEnumVariants(events, "SessionLifecycleStatus").map(snakeCase).sort(),
+  );
 
   for (
     const [rustSource, typeName] of [
       [events, "TeamMessageTone"],
       [events, "TeamMessagePurpose"],
       [events, "CorrectionKind"],
+      [events, "GoalChangeKind"],
       [events, "ChatterAudience"],
       [events, "TranscriptVisibility"],
       [events, "TranscriptKind"],
@@ -93,6 +98,7 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       "chatter: EventChatter[]",
       "evidence: EventEvidence[]",
       "transcript: TranscriptMetadata",
+      "sequence: number",
       "entry_key: string",
       "supersedes: string[]",
       "summary_redundant: boolean",
@@ -111,17 +117,20 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
     ]
   ) {
     if (!types.includes(required)) {
-      throw new Error(`missing required v3 event field: ${required}`);
+      throw new Error(`missing required v4 event field: ${required}`);
     }
   }
 });
 
-Deno.test("v3 consumers do not reconstruct omitted server state", async () => {
-  const [helpers, session, energy] = await Promise.all([
-    Deno.readTextFile("webui/src/lib/helpers.ts"),
-    Deno.readTextFile("webui/src/components/Session.tsx"),
-    Deno.readTextFile("webui/src/lib/energy.ts"),
-  ]);
+Deno.test("v4 consumers do not reconstruct omitted server state", async () => {
+  const [helpers, session, sessionPage, projectsPage, energy] = await Promise
+    .all([
+      Deno.readTextFile("webui/src/lib/helpers.ts"),
+      Deno.readTextFile("webui/src/components/Session.tsx"),
+      Deno.readTextFile("webui/src/pages/SessionPage.tsx"),
+      Deno.readTextFile("webui/src/pages/ProjectsPage.tsx"),
+      Deno.readTextFile("webui/src/lib/energy.ts"),
+    ]);
 
   for (
     const workaround of [
@@ -131,17 +140,26 @@ Deno.test("v3 consumers do not reconstruct omitted server state", async () => {
       "teammateFeedback.detail || event.reason",
       'String(event.message || "")',
       "rawDetail.startsWith",
+      "latestPendingDeliveryProposal",
+      "latestPendingGoalProposal",
+      "latestGoalChangeRequest",
+      "projectName(",
+      "metrics.ended_at_ms ??",
+      "metrics.started_at_ms ??",
     ]
   ) {
-    if (helpers.includes(workaround) || session.includes(workaround)) {
+    if (
+      helpers.includes(workaround) || session.includes(workaround) ||
+      sessionPage.includes(workaround) || projectsPage.includes(workaround)
+    ) {
       throw new Error(
-        `v3 UI still reconstructs server state with: ${workaround}`,
+        `v4 UI still reconstructs server state with: ${workaround}`,
       );
     }
   }
   if (energy.includes("legacy") || energy.includes("llm_energy_kwh ??")) {
     throw new Error(
-      "v3 energy totals still contain a legacy snapshot fallback",
+      "v4 energy totals still contain a legacy snapshot fallback",
     );
   }
 });

@@ -4,7 +4,7 @@ import type {
   SessionAttachment,
   SessionItem,
 } from "../types";
-import { projectName, relativeTime, sessionTitle } from "../lib/helpers";
+import { relativeTime, sessionProjectName, sessionTitle } from "../lib/helpers";
 import { formatEnergy } from "../lib/energy";
 
 export type SessionFilter = "all" | SessionItem["status"];
@@ -224,7 +224,7 @@ export function SessionRows({
                 <span className="session-main">
                   <strong>{sessionTitle(session)}</strong>
                   <small>
-                    {projectName(session.workdir)} <i className="bi bi-git"></i>
+                    {sessionProjectName(session)} <i className="bi bi-git"></i>
                     {" "}
                     {session.branch || "Managed workspace"}
                   </small>

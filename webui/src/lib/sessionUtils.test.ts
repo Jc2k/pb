@@ -19,6 +19,7 @@ function eventEnvelopeDefaults(): Pick<
     chatter: [],
     evidence: [],
     transcript: {
+      sequence: testEventIndex,
       visibility: "visible",
       kind: "conversation",
       entry_key: `test-event-${testEventIndex}`,
@@ -37,7 +38,7 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "controller_observation",
         actor: { kind: "automation", id: "trinity" },
@@ -64,7 +65,7 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "llm_invocation",
         step: 1,
@@ -99,7 +100,7 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -115,7 +116,7 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -131,7 +132,7 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -163,7 +164,7 @@ Deno.test("buildActionTimeline preserves chronology and actor provenance", () =>
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "tool_call",
         tool: "read_file",
@@ -175,7 +176,7 @@ Deno.test("buildActionTimeline preserves chronology and actor provenance", () =>
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "controller_observation",
         actor: { kind: "automation", id: "trinity" },
@@ -202,7 +203,7 @@ Deno.test("buildActionTimeline preserves chronology and actor provenance", () =>
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "tool_result",
         tool: "read_file",
@@ -227,7 +228,7 @@ Deno.test("buildActionTimeline preserves chronology and actor provenance", () =>
 Deno.test("getToolDetail shows session_title call title", () => {
   const call: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     transcript: {
       ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
@@ -250,7 +251,7 @@ Deno.test("getToolDetail shows session_title call title", () => {
 Deno.test("getToolDetail keeps search scope and summarizes workflow submissions", () => {
   const search: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     transcript: {
       ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
@@ -268,7 +269,7 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
   };
   const changes: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     transcript: {
       ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
@@ -286,7 +287,7 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
   };
   const plan: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     transcript: {
       ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
@@ -308,7 +309,7 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
   };
   const incompletePlan: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     transcript: {
       ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
@@ -340,7 +341,7 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
 Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
   const call: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     event: {
       type: "tool_call",
       tool: "lsp_proactive_diagnostics",
@@ -352,7 +353,7 @@ Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
   };
   const result: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     transcript: {
       ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
@@ -386,7 +387,7 @@ Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
 Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
   const call: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     event: {
       type: "tool_call",
       tool: "lsp_proactive_diagnostics",
@@ -398,7 +399,7 @@ Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
   };
   const result: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     transcript: {
       ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
@@ -439,7 +440,7 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -458,7 +459,7 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -498,7 +499,7 @@ Deno.test("buildToolSummaries shows joules, power, and parallel measurement scop
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -516,7 +517,7 @@ Deno.test("buildToolSummaries shows joules, power, and parallel measurement scop
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -549,7 +550,7 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "started",
         task: "Implement loading state",
@@ -562,7 +563,7 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "activity",
@@ -576,7 +577,7 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "activity",
@@ -601,7 +602,7 @@ Deno.test("running user messages stay in chat while delivery acknowledgements st
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -616,7 +617,7 @@ Deno.test("running user messages stay in chat while delivery acknowledgements st
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "evidence_only",
@@ -639,7 +640,7 @@ Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated 
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "final",
         content: "Fixed the bug.",
@@ -648,7 +649,7 @@ Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -689,7 +690,7 @@ Deno.test("chat hides internal closure checkpoints and deduplicates blocked deli
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "evidence_only",
@@ -705,7 +706,7 @@ Deno.test("chat hides internal closure checkpoints and deduplicates blocked deli
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "workflow_blocked",
         cause: "other",
@@ -716,7 +717,7 @@ Deno.test("chat hides internal closure checkpoints and deduplicates blocked deli
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -752,7 +753,7 @@ Deno.test("handoff progress is replaced by the teammate result while raw evidenc
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -770,7 +771,7 @@ Deno.test("handoff progress is replaced by the teammate result while raw evidenc
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "evidence_only",
@@ -792,7 +793,7 @@ Deno.test("handoff progress is replaced by the teammate result while raw evidenc
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -829,7 +830,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -847,7 +848,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -865,7 +866,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -883,7 +884,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     ...Array.from({ length: 6 }, (_, index): EventEnvelope => ({
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "activity",
@@ -898,7 +899,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     })),
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -916,7 +917,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -931,7 +932,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -974,7 +975,7 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "tool_call",
         tool: "read_file",
@@ -986,7 +987,7 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -1007,7 +1008,7 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       event: {
         type: "tool_call",
         tool: "read_file",
@@ -1019,7 +1020,7 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -1040,7 +1041,7 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -1071,7 +1072,7 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -1089,7 +1090,7 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -1105,7 +1106,7 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v3",
+      version: "v4",
       transcript: {
         ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
@@ -1130,7 +1131,7 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
 Deno.test("work-unit progress credits do not split adjacent action runs", () => {
   const visible = chatEventsWithOnlyLatestStep([{
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     transcript: {
       ...eventEnvelopeDefaults().transcript,
       visibility: "evidence_only",

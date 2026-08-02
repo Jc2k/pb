@@ -34,7 +34,9 @@ use crate::integrations::{
 use crate::projects::{
     self, AddProjectRequest, ProjectEntry, RemoveProjectRequest, UpdateProjectNotificationsRequest,
 };
-use crate::session_store::{self, PersistedSession, SessionStatus, latest_session_title};
+use crate::session_store::{
+    self, PendingGoalChange, PersistedSession, SessionProject, SessionStatus, latest_session_title,
+};
 use crate::sleep_prevention::{SleepPrevention, SleepPreventionStatus};
 
 const MAX_HISTORY_EVENTS: usize = 1_000;
@@ -197,6 +199,7 @@ pub struct SessionListItem {
     pub intent: Option<crate::workflow::TurnIntent>,
     pub branch: Option<String>,
     pub workdir: Option<String>,
+    pub project: Option<SessionProject>,
     pub handoff_outcome: Option<HandoffOutcome>,
     pub pending_question: Option<PendingQuestionView>,
     pub started_at_ms: u64,
@@ -211,6 +214,7 @@ pub struct SessionListItem {
     pub active_goal: bool,
     pub multi_task: Option<MultiTaskSummary>,
     pub active_multi_task: bool,
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +315,7 @@ pub struct SessionDetails {
     pub intent: Option<crate::workflow::TurnIntent>,
     pub branch: Option<String>,
     pub workdir: Option<String>,
+    pub project: Option<SessionProject>,
     pub handoff_outcome: Option<HandoffOutcome>,
     pub pending_question: Option<PendingQuestionView>,
     pub events: Vec<EventEnvelope>,
@@ -326,6 +331,10 @@ pub struct SessionDetails {
     pub active_multi_task: bool,
     pub task_plan_rejected: Option<crate::task_queue::TaskPlanRejected>,
     pub task_planning_transcript: Option<crate::task_queue::TaskPlanningTranscript>,
+    pub pending_delivery_proposal: Option<crate::workflow::DeliveryProposal>,
+    pub pending_goal_proposal: Option<crate::goal::GoalProposal>,
+    pub pending_goal_change: Option<PendingGoalChange>,
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,12 +423,21 @@ struct PendingQuestionState {
     responder: std::sync::mpsc::Sender<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DurableSessionProjection {
+    project: Option<SessionProject>,
+    pending_delivery_proposal: Option<crate::workflow::DeliveryProposal>,
+    pending_goal_proposal: Option<crate::goal::GoalProposal>,
+    pending_goal_change: Option<PendingGoalChange>,
+}
+
 #[derive(Debug)]
 struct SessionState {
     task: String,
     title: Option<String>,
     branch: Option<String>,
     workdir: Option<PathBuf>,
+    durable: DurableSessionProjection,
     request_template: AgentRequest,
     running: bool,
     paused: bool,
@@ -954,6 +972,14 @@ async fn start_session_inner(
     request.attachments =
         materialize_attachments(&session_id, request.workdir.as_deref(), req.attachments)?;
 
+    let registered_projects = projects::load_projects()?;
+    let project = resolve_session_project(&registered_projects, request.workdir.as_deref());
+    *state.projects.lock().await = registered_projects;
+    let durable = DurableSessionProjection {
+        project,
+        ..DurableSessionProjection::default()
+    };
+
     let now = now_millis();
     let usage_records = Arc::new(StdMutex::new(Vec::new()));
     let session = SessionState {
@@ -961,6 +987,7 @@ async fn start_session_inner(
         title: None,
         branch: request.branch.clone(),
         workdir: request.workdir.clone(),
+        durable: durable.clone(),
         request_template: request.clone(),
         running: false,
         paused: false,
@@ -1004,6 +1031,7 @@ async fn start_session_inner(
         Vec::new(),
         None,
         Vec::new(),
+        durable,
     );
 
     dispatch_next_session(state.clone());
@@ -1076,6 +1104,8 @@ async fn start_goal_inner(
         session.request_template.goal_context = None;
         session.request_template.workflow_checkpoint = None;
         session.request_template.workflow_stage = None;
+        session.durable.pending_goal_proposal = None;
+        session.durable.pending_goal_change = None;
         session.goal = Some(checkpoint.clone());
         session.running = false;
         session.paused = true;
@@ -1129,11 +1159,16 @@ async fn start_goal_inner(
     if let Some(model) = req.model {
         request.model = model;
     }
+    let project = resolve_session_project(&registered_projects, Some(&workdir));
     let mut session = SessionState {
         task: objective.clone(),
         title: Some(objective),
         branch: None,
         workdir: Some(workdir),
+        durable: DurableSessionProjection {
+            project,
+            ..DurableSessionProjection::default()
+        },
         request_template: request,
         running: false,
         paused: true,
@@ -1190,6 +1225,46 @@ fn ensure_goal_workdir_registered(
         );
     }
     Ok(())
+}
+
+fn resolve_session_project(
+    projects: &[ProjectEntry],
+    workdir: Option<&std::path::Path>,
+) -> Option<SessionProject> {
+    let workdir = workdir?.canonicalize().ok()?;
+    if let Some(project) = projects.iter().find(|project| {
+        PathBuf::from(&project.path)
+            .canonicalize()
+            .is_ok_and(|path| path == workdir)
+    }) {
+        return Some(SessionProject {
+            name: project.name.clone(),
+            path: project.path.clone(),
+        });
+    }
+    let workdir_root = crate::agent_core::find_git_root(&workdir)
+        .unwrap_or_else(|| workdir.clone())
+        .canonicalize()
+        .ok()?;
+    let mut matching = projects.iter().filter(|project| {
+        let root = project
+            .repository_root
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&project.path));
+        crate::agent_core::find_git_root(&root)
+            .unwrap_or(root)
+            .canonicalize()
+            .is_ok_and(|root| root == workdir_root)
+    });
+    let project = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    Some(SessionProject {
+        name: project.name.clone(),
+        path: project.path.clone(),
+    })
 }
 
 fn publish_goal_started(session: &mut SessionState, checkpoint: &crate::goal::GoalCheckpoint) {
@@ -1344,6 +1419,7 @@ async fn resume_goal(
 ) -> Result<Json<GoalResponse>, StatusCode> {
     let response = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
         run.resume(now_millis())?;
+        session.durable.pending_goal_change = None;
         session.pause_token.store(false, Ordering::SeqCst);
         configure_goal_milestone_request(session, run)?;
         session.status = SessionStatus::Queued;
@@ -1386,6 +1462,7 @@ async fn cancel_goal(
     }
     let mut run = session.goal.take().unwrap().run;
     run.cancel(now_millis());
+    session.durable.pending_goal_change = None;
     let checkpoint = crate::goal::GoalCheckpoint::new(run).map_err(internal_status)?;
     publish_event(
         &session.sender,
@@ -1424,6 +1501,7 @@ async fn accept_goal(
         .run
         .accept(&req.goal_sha256, &checkpoint.sha256, now_millis())
         .map_err(conflict_status)?;
+    session.durable.pending_goal_change = None;
     checkpoint = crate::goal::GoalCheckpoint::new(checkpoint.run).map_err(internal_status)?;
     publish_event(
         &session.sender,
@@ -1485,6 +1563,7 @@ async fn amend_goal(
                 timestamp_ms: Some(now_millis()),
             },
         );
+        session.durable.pending_goal_change = None;
         session.status = SessionStatus::Paused;
         session.paused = true;
         Ok(())
@@ -2100,13 +2179,20 @@ async fn continue_session(
     request.workflow_checkpoint = None;
     request.goal_context = None;
     request.turn_id = new_turn_id(&id);
-    let cited_proposal = {
-        let history = session
-            .history
-            .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        proposal_from_history(&history, req.proposal_id.as_deref())
-            .map_err(|_| StatusCode::BAD_REQUEST)?
+    if req.proposal_id.is_some() && request.intent != Some(crate::workflow::TurnIntent::Deliver) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let cited_proposal = match req.proposal_id.as_deref() {
+        Some(proposal_id) => Some(
+            session
+                .durable
+                .pending_delivery_proposal
+                .as_ref()
+                .filter(|proposal| proposal.id == proposal_id)
+                .cloned()
+                .ok_or(StatusCode::BAD_REQUEST)?,
+        ),
+        None => None,
     };
     request.conversation_handoff = delivery_handoff_for_turn(
         request.intent,
@@ -2131,6 +2217,9 @@ async fn continue_session(
     session.task = request.task.clone();
     session.title = None;
     session.request_template = request.clone();
+    if request.intent == Some(crate::workflow::TurnIntent::Deliver) {
+        session.durable.pending_delivery_proposal = None;
+    }
     session.running = false;
     session.paused = false;
     session.status = SessionStatus::Queued;
@@ -2157,6 +2246,7 @@ async fn continue_session(
     let completed_goals = session.completed_goals.clone();
     let multi_task = session.multi_task.clone();
     let completed_multi_tasks = session.completed_multi_tasks.clone();
+    let durable = session.durable.clone();
     drop(sessions);
     persist_session_snapshot(
         &id,
@@ -2172,6 +2262,7 @@ async fn continue_session(
         completed_goals,
         multi_task,
         completed_multi_tasks,
+        durable,
     );
     dispatch_next_session(state.clone());
 
@@ -2366,6 +2457,7 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
     let completed_goals = session.completed_goals.clone();
     let multi_task = session.multi_task.clone();
     let completed_multi_tasks = session.completed_multi_tasks.clone();
+    let durable = session.durable.clone();
     drop(sessions);
     persist_session_snapshot(
         &id,
@@ -2381,6 +2473,7 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
         completed_goals,
         multi_task,
         completed_multi_tasks,
+        durable,
     );
     dispatch_next_session(state.clone());
     Ok(SessionResponse { session_id: id })
@@ -2476,6 +2569,7 @@ async fn restart_delivery_inner(state: AppState, id: String) -> Result<SessionRe
     let completed_workflows = session.completed_workflows.clone();
     let completed_goals = session.completed_goals.clone();
     let completed_multi_tasks = session.completed_multi_tasks.clone();
+    let durable = session.durable.clone();
     drop(sessions);
     persist_session_snapshot(
         &id,
@@ -2491,6 +2585,7 @@ async fn restart_delivery_inner(state: AppState, id: String) -> Result<SessionRe
         completed_goals,
         None,
         completed_multi_tasks,
+        durable,
     );
     dispatch_next_session(state);
     Ok(SessionResponse { session_id: id })
@@ -2687,6 +2782,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
     let completed_goals = session.completed_goals.clone();
     let multi_task = session.multi_task.clone();
     let completed_multi_tasks = session.completed_multi_tasks.clone();
+    let durable = session.durable.clone();
     let status = session.status;
     drop(sessions);
     persist_session_snapshot(
@@ -2703,6 +2799,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         completed_goals,
         multi_task,
         completed_multi_tasks,
+        durable,
     );
     if terminate_environment {
         crate::session_environment::terminate_global_session(&id)?;
@@ -2781,6 +2878,7 @@ async fn answer_question_inner(
         let completed_goals = session.completed_goals.clone();
         let multi_task = session.multi_task.clone();
         let completed_multi_tasks = session.completed_multi_tasks.clone();
+        let durable = session.durable.clone();
         let question_id = req.question_id.clone();
         pending
             .responder
@@ -2816,19 +2914,37 @@ async fn answer_question_inner(
             completed_goals,
             multi_task,
             completed_multi_tasks,
+            durable,
         );
     }
     state.update_sleep_prevention_working(true);
     Ok(SessionResponse { session_id: id })
 }
 
-fn effective_session_title(session: &SessionState) -> Option<String> {
-    session
-        .history
-        .lock()
-        .ok()
-        .and_then(|history| latest_session_title(&history))
-        .or_else(|| session.title.clone())
+fn session_history_summary(
+    session: &SessionState,
+) -> (Option<String>, Option<HandoffOutcome>, u64) {
+    let Ok(history) = session.history.lock() else {
+        return (session.title.clone(), None, 0);
+    };
+    (
+        latest_session_title(&history).or_else(|| session.title.clone()),
+        handoff_outcome_from_history(&history),
+        history
+            .last()
+            .map(|envelope| envelope.transcript.sequence)
+            .unwrap_or(0),
+    )
+}
+
+fn handoff_outcome_from_history(history: &[EventEnvelope]) -> Option<HandoffOutcome> {
+    history.iter().rev().find_map(|envelope| {
+        if let AgentEvent::HandoffSummary { summary, .. } = &envelope.event {
+            Some(summary.outcome)
+        } else {
+            None
+        }
+    })
 }
 
 fn session_usage_records(session: &SessionState) -> Vec<SessionMetricsSnapshot> {
@@ -2837,18 +2953,6 @@ fn session_usage_records(session: &SessionState) -> Vec<SessionMetricsSnapshot> 
         .lock()
         .map(|records| records.clone())
         .unwrap_or_default()
-}
-
-fn latest_handoff_outcome(session: &SessionState) -> Option<HandoffOutcome> {
-    session.history.lock().ok().and_then(|history| {
-        history.iter().rev().find_map(|envelope| {
-            if let AgentEvent::HandoffSummary { summary, .. } = &envelope.event {
-                Some(summary.outcome)
-            } else {
-                None
-            }
-        })
-    })
 }
 
 fn latest_workflow_summary(session: &SessionState) -> Option<crate::workflow::WorkflowSummary> {
@@ -2920,91 +3024,17 @@ fn task_deadline_ms(checkpoint: &crate::task_queue::MultiTaskCheckpoint) -> Opti
 async fn list_sessions(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Json<Vec<SessionListItem>> {
-    let sessions = state.sessions.lock().await;
-    let mut items = sessions
-        .iter()
-        .map(|(session_id, session)| {
-            let workflow = latest_workflow_summary(session);
-            let goal = latest_goal_checkpoint(session);
-            SessionListItem {
-                session_id: session_id.clone(),
-                task: session.task.clone(),
-                title: effective_session_title(session),
-                running: session.running,
-                paused: session.paused,
-                status: session.status,
-                intent: session.request_template.intent,
-                branch: session.branch.clone(),
-                workdir: session
-                    .workdir
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned()),
-                handoff_outcome: latest_handoff_outcome(session),
-                pending_question: session.pending_question.as_ref().map(pending_question_view),
-                started_at_ms: session.started_at_ms,
-                updated_at_ms: session.updated_at_ms,
-                metrics: session.metrics.clone(),
-                usage_records: session_usage_records(session),
-                workflow_id: workflow.as_ref().map(|workflow| workflow.id.clone()),
-                workflow_stage: workflow.as_ref().map(|workflow| workflow.stage),
-                workflow_outcome: workflow.as_ref().and_then(|workflow| workflow.outcome),
-                strict_workflow: strict_workflow_enabled(session),
-                goal: goal.map(|checkpoint| crate::goal::GoalSummary::from(&checkpoint.run)),
-                active_goal: session.goal.is_some(),
-                multi_task: latest_multi_task_checkpoint(session).map(multi_task_summary),
-                active_multi_task: session.multi_task.is_some(),
-            }
-        })
-        .collect::<Vec<_>>();
-    items.sort_by_key(|b| std::cmp::Reverse(b.updated_at_ms));
-    Json(items)
+    Json(session_list_snapshot(&state).await)
 }
 
 async fn get_session(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
 ) -> Result<Json<SessionDetails>, StatusCode> {
-    let sessions = state.sessions.lock().await;
-    let session = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-    let events = session
-        .history
-        .lock()
-        .map(|history| {
-            let start = history.len().saturating_sub(SESSION_HISTORY_RESPONSE_LIMIT);
-            history[start..].to_vec()
-        })
-        .unwrap_or_default();
-    let workflow = latest_workflow_summary(session);
-    let goal = latest_goal_checkpoint(session).cloned();
-    Ok(Json(SessionDetails {
-        session_id: id,
-        task: session.task.clone(),
-        title: effective_session_title(session),
-        running: session.running,
-        paused: session.paused,
-        status: session.status,
-        intent: session.request_template.intent,
-        branch: session.branch.clone(),
-        workdir: session
-            .workdir
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
-        handoff_outcome: latest_handoff_outcome(session),
-        pending_question: session.pending_question.as_ref().map(pending_question_view),
-        events,
-        started_at_ms: session.started_at_ms,
-        updated_at_ms: session.updated_at_ms,
-        metrics: session.metrics.clone(),
-        usage_records: session_usage_records(session),
-        workflow,
-        strict_workflow: strict_workflow_enabled(session),
-        goal,
-        active_goal: session.goal.is_some(),
-        multi_task: latest_multi_task_checkpoint(session).cloned(),
-        active_multi_task: session.multi_task.is_some(),
-        task_plan_rejected: session.request_template.task_plan_rejected.clone(),
-        task_planning_transcript: session.request_template.task_planning_transcript.clone(),
-    }))
+    session_details_snapshot(&state, &id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn status(
@@ -3067,13 +3097,20 @@ async fn delete_session_inner(state: AppState, id: &str) -> Result<DeleteSession
         sessions.remove(id).expect("session exists")
     };
 
-    if let Some(workdir) = session.workdir.or(session.request_template.workdir) {
-        if let Some(metrics) = &session.metrics {
-            let mut usage = state.project_usage.lock().await;
-            if let Some(stats) = usage.get_mut(&workdir.to_string_lossy().into_owned()) {
-                stats.subtract_metrics(metrics);
-            }
+    let project_path = session
+        .durable
+        .project
+        .as_ref()
+        .map(|project| project.path.clone());
+    if let Some(metrics) = &session.metrics
+        && let Some(project_path) = project_path
+    {
+        let mut usage = state.project_usage.lock().await;
+        if let Some(stats) = usage.get_mut(&project_path) {
+            stats.subtract_metrics(metrics);
         }
+    }
+    if let Some(workdir) = session.workdir.or(session.request_template.workdir) {
         session_store::delete_session(&workdir, id)?;
     }
     crate::session_environment::terminate_global_session(id)?;
@@ -3275,6 +3312,7 @@ struct WebEventSink {
     completed_goals: Vec<crate::goal::GoalCheckpoint>,
     multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
     completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
+    durable: DurableSessionProjection,
     pending_user_messages: Arc<StdMutex<VecDeque<QueuedUserMessage>>>,
     accepting_user_messages: Arc<AtomicBool>,
     pause_token: Arc<AtomicBool>,
@@ -3302,27 +3340,27 @@ impl WebEventSink {
                 records.push(metrics.clone());
             }
             tokio::runtime::Handle::current().block_on(async {
-                let workdir = {
+                let project_path = {
                     let mut sessions = self.state.sessions.lock().await;
                     let Some(session) = sessions.get_mut(&self.session_id) else {
                         return;
                     };
-                    let workdir = session
-                        .workdir
+                    let project_path = session
+                        .durable
+                        .project
                         .as_ref()
-                        .or(self.persisted_workdir.as_ref())
-                        .map(|path| path.to_string_lossy().into_owned());
+                        .map(|project| project.path.clone());
                     if let Some(existing) = session.metrics.as_mut() {
                         existing.add_assign(&metrics);
                     } else {
                         session.metrics = Some(metrics.clone());
                     }
                     session.updated_at_ms = now_millis();
-                    workdir
+                    project_path
                 };
-                if let Some(workdir) = workdir {
+                if let Some(project_path) = project_path {
                     let mut usage = self.state.project_usage.lock().await;
-                    let stats = usage.entry(workdir).or_default();
+                    let stats = usage.entry(project_path).or_default();
                     stats.add_metrics(&metrics);
                 }
             });
@@ -3338,6 +3376,50 @@ impl WebEventSink {
                     }
                 });
             }
+        }
+        if let AgentEvent::DeliveryProposed {
+            proposal_id,
+            source_turn_id,
+            task_summary,
+            ..
+        } = &envelope.event
+        {
+            let proposal = crate::workflow::DeliveryProposal {
+                id: proposal_id.clone(),
+                source_turn_id: source_turn_id.clone(),
+                task_summary: task_summary.clone(),
+            };
+            self.durable.pending_delivery_proposal = Some(proposal.clone());
+            tokio::runtime::Handle::current().block_on(async {
+                let mut sessions = self.state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&self.session_id) {
+                    session.durable.pending_delivery_proposal = Some(proposal);
+                    session.updated_at_ms = now_millis();
+                }
+            });
+        }
+        if let AgentEvent::GoalProposed {
+            proposal_id,
+            source_turn_id,
+            objective,
+            criteria,
+            ..
+        } = &envelope.event
+        {
+            let proposal = crate::goal::GoalProposal {
+                id: proposal_id.clone(),
+                source_turn_id: source_turn_id.clone(),
+                objective: objective.clone(),
+                criteria: criteria.clone(),
+            };
+            self.durable.pending_goal_proposal = Some(proposal.clone());
+            tokio::runtime::Handle::current().block_on(async {
+                let mut sessions = self.state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&self.session_id) {
+                    session.durable.pending_goal_proposal = Some(proposal);
+                    session.updated_at_ms = now_millis();
+                }
+            });
         }
         publish_event_envelope_linked(&self.sender, &self.history, envelope, supersedes);
         if self.goal.is_some() {
@@ -3370,6 +3452,7 @@ impl WebEventSink {
             self.completed_goals.clone(),
             self.multi_task.clone(),
             self.completed_multi_tasks.clone(),
+            self.durable.clone(),
         );
         entry_key
     }
@@ -3442,6 +3525,7 @@ impl EventSink for WebEventSink {
             self.completed_goals.clone(),
             self.multi_task.clone(),
             self.completed_multi_tasks.clone(),
+            self.durable.clone(),
         );
         messages
     }
@@ -3529,6 +3613,7 @@ impl EventSink for WebEventSink {
                 self.completed_goals.clone(),
                 self.multi_task.clone(),
                 self.completed_multi_tasks.clone(),
+                self.durable.clone(),
             );
             return Ok(());
         }
@@ -3595,6 +3680,7 @@ impl EventSink for WebEventSink {
                 self.completed_goals.clone(),
                 self.multi_task.clone(),
                 self.completed_multi_tasks.clone(),
+                self.durable.clone(),
             );
             return Ok(());
         }
@@ -3657,6 +3743,7 @@ impl EventSink for WebEventSink {
             self.completed_goals.clone(),
             self.multi_task.clone(),
             self.completed_multi_tasks.clone(),
+            self.durable.clone(),
         );
         Ok(())
     }
@@ -3693,6 +3780,7 @@ impl EventSink for WebEventSink {
             self.completed_goals.clone(),
             self.multi_task.clone(),
             self.completed_multi_tasks.clone(),
+            self.durable.clone(),
         );
         Ok(())
     }
@@ -3756,13 +3844,16 @@ impl EventSink for WebEventSink {
         ))
     }
 
-    fn request_goal_change(&mut self, kind: &str, summary: &str) -> Result<String> {
-        let kind = kind.to_string();
+    fn request_goal_change(
+        &mut self,
+        kind: crate::events::GoalChangeKind,
+        summary: &str,
+    ) -> Result<String> {
         let summary = summary.to_string();
-        tokio::runtime::Handle::current().block_on(async {
-            let sessions = self.state.sessions.lock().await;
+        let pending = tokio::runtime::Handle::current().block_on(async {
+            let mut sessions = self.state.sessions.lock().await;
             let session = sessions
-                .get(&self.session_id)
+                .get_mut(&self.session_id)
                 .with_context(|| format!("session not found: {}", self.session_id))?;
             let goal_id = session
                 .goal
@@ -3771,6 +3862,12 @@ impl EventSink for WebEventSink {
                 .run
                 .id
                 .clone();
+            let pending = PendingGoalChange {
+                goal_id: goal_id.clone(),
+                kind: kind.clone(),
+                summary: summary.clone(),
+            };
+            session.durable.pending_goal_change = Some(pending.clone());
             publish_event(
                 &session.sender,
                 &session.history,
@@ -3781,8 +3878,9 @@ impl EventSink for WebEventSink {
                     timestamp_ms: Some(now_millis()),
                 },
             );
-            Ok::<(), anyhow::Error>(())
+            Ok::<PendingGoalChange, anyhow::Error>(pending)
         })?;
+        self.durable.pending_goal_change = Some(pending);
         self.request_goal_pause(&format!("{kind} review requested: {summary}"))?;
         Ok(format!(
             "{kind} request recorded and the goal will pause for human review"
@@ -3839,6 +3937,7 @@ impl EventSink for WebEventSink {
                     session.completed_goals.clone(),
                     session.multi_task.clone(),
                     session.completed_multi_tasks.clone(),
+                    session.durable.clone(),
                 );
             }
             self.state.update_sleep_prevention_working(false);
@@ -3884,6 +3983,16 @@ fn dispatch_next_session(state: AppState) {
                     .accepting_user_messages
                     .store(true, Ordering::SeqCst);
                 session.updated_at_ms = now_millis();
+                publish_event(
+                    &session.sender,
+                    &session.history,
+                    AgentEvent::SessionStateChanged {
+                        status: crate::events::SessionLifecycleStatus::Running,
+                        running: true,
+                        paused: false,
+                        timestamp_ms: Some(now_millis()),
+                    },
+                );
                 (
                     Some((
                         session_id,
@@ -3898,6 +4007,7 @@ fn dispatch_next_session(state: AppState) {
                         session.completed_goals.clone(),
                         session.multi_task.clone(),
                         session.completed_multi_tasks.clone(),
+                        session.durable.clone(),
                     )),
                     true,
                 )
@@ -3924,6 +4034,7 @@ fn dispatch_next_session(state: AppState) {
             completed_goals,
             multi_task,
             completed_multi_tasks,
+            durable,
         ) = next;
         persist_session_snapshot(
             &session_id,
@@ -3939,6 +4050,7 @@ fn dispatch_next_session(state: AppState) {
             completed_goals,
             multi_task,
             completed_multi_tasks,
+            durable.clone(),
         );
         spawn_agent_run(state, session_id, request);
     });
@@ -3957,6 +4069,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             completed_goals,
             multi_task,
             completed_multi_tasks,
+            durable,
             pending_user_messages,
             accepting_user_messages,
             pause_token,
@@ -3980,6 +4093,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 session.completed_goals.clone(),
                 session.multi_task.clone(),
                 session.completed_multi_tasks.clone(),
+                session.durable.clone(),
                 Arc::clone(&session.pending_user_messages),
                 Arc::clone(&session.accepting_user_messages),
                 Arc::clone(&session.pause_token),
@@ -4016,6 +4130,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 completed_goals,
                 multi_task,
                 completed_multi_tasks,
+                durable,
                 pending_user_messages,
                 accepting_user_messages,
                 pause_token,
@@ -4044,6 +4159,12 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             let mut final_status = SessionStatus::Completed;
             match result {
                 Ok(Ok(run_result)) => {
+                    if let Some(proposal) = run_result.delivery_proposal.clone() {
+                        session.durable.pending_delivery_proposal = Some(proposal);
+                    }
+                    if let Some(proposal) = run_result.goal_proposal.clone() {
+                        session.durable.pending_goal_proposal = Some(proposal);
+                    }
                     session.request_template.task_plan_rejected =
                         run_result.task_plan_rejected.clone();
                     session.request_template.task_planning_transcript =
@@ -4115,6 +4236,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                             session.request_template.workflow_checkpoint = None;
                         }
                     } else if let Some(task_goal) = run_result.task_goal {
+                        session.durable.pending_goal_proposal = None;
+                        session.durable.pending_goal_change = None;
                         match activate_single_task_goal(session, &session_id, task_goal) {
                             Ok(()) => {
                                 final_status = SessionStatus::Paused;
@@ -4135,6 +4258,8 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                             }
                         }
                     } else if let Some(proposal) = run_result.requested_goal {
+                        session.durable.pending_goal_proposal = None;
+                        session.durable.pending_goal_change = None;
                         match activate_requested_goal(
                             session,
                             &session_id,
@@ -4160,6 +4285,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                             }
                         }
                     } else if let Some(handoff) = run_result.requested_delivery {
+                        session.durable.pending_delivery_proposal = None;
                         session.request_template.intent =
                             Some(crate::workflow::TurnIntent::Deliver);
                         session.request_template.task = handoff.task_summary.clone();
@@ -4219,6 +4345,23 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             session.cancel_token.store(false, Ordering::SeqCst);
             session.pause_token.store(false, Ordering::SeqCst);
             session.status = final_status;
+            let status = match final_status {
+                SessionStatus::Queued => crate::events::SessionLifecycleStatus::Queued,
+                SessionStatus::Running => crate::events::SessionLifecycleStatus::Running,
+                SessionStatus::Paused => crate::events::SessionLifecycleStatus::Paused,
+                SessionStatus::Completed => crate::events::SessionLifecycleStatus::Completed,
+                SessionStatus::Failed => crate::events::SessionLifecycleStatus::Failed,
+            };
+            publish_event(
+                &session.sender,
+                &session.history,
+                AgentEvent::SessionStateChanged {
+                    status,
+                    running: session.running,
+                    paused: session.paused,
+                    timestamp_ms: Some(now_millis()),
+                },
+            );
             persist_session_snapshot(
                 &session_id,
                 &session.request_template,
@@ -4233,6 +4376,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 session.completed_goals.clone(),
                 session.multi_task.clone(),
                 session.completed_multi_tasks.clone(),
+                session.durable.clone(),
             );
         }
         drop(sessions);
@@ -4948,6 +5092,7 @@ fn apply_goal_run_result(
             );
             session.completed_goals.push(checkpoint);
             session.goal = None;
+            session.durable.pending_goal_change = None;
             session.request_template.workflow_checkpoint = None;
             Ok((SessionStatus::Completed, false))
         }
@@ -4955,6 +5100,7 @@ fn apply_goal_run_result(
             publish_goal_failed(session, &checkpoint);
             session.completed_goals.push(checkpoint);
             session.goal = None;
+            session.durable.pending_goal_change = None;
             session.request_template.workflow_checkpoint = None;
             Ok((SessionStatus::Failed, false))
         }
@@ -4969,6 +5115,7 @@ fn fail_active_goal_engine(session: &mut SessionState, reason: String) {
     let Some(checkpoint) = session.goal.take() else {
         return;
     };
+    session.durable.pending_goal_change = None;
     let mut run = checkpoint.run;
     run.fail_external(crate::goal::GoalOutcome::EngineError, reason, now_millis());
     match crate::goal::GoalCheckpoint::new(run) {
@@ -5024,7 +5171,7 @@ async fn session_events(
         (receiver, history[start..].to_vec())
     };
 
-    let delivered = Arc::new(StdMutex::new(
+    let replay_keys = Arc::new(StdMutex::new(
         replay
             .iter()
             .map(|envelope| envelope.transcript.entry_key.clone())
@@ -5036,19 +5183,19 @@ async fn session_events(
             .id(envelope.transcript.entry_key)
             .data(data)))
     }));
-    let live_delivered = Arc::clone(&delivered);
+    let live_replay_keys = Arc::clone(&replay_keys);
     let live = BroadcastStream::new(receiver)
         .take_while(|message| futures::future::ready(message.is_ok()))
         .filter_map(move |message| {
-            let delivered = Arc::clone(&live_delivered);
+            let replay_keys = Arc::clone(&live_replay_keys);
             async move {
                 let envelope = message.ok()?;
                 let entry_key = envelope.transcript.entry_key.clone();
-                let is_new = delivered
+                let was_replayed = replay_keys
                     .lock()
-                    .map(|mut delivered| delivered.insert(entry_key.clone()))
+                    .map(|mut replay_keys| replay_keys.remove(&entry_key))
                     .unwrap_or(false);
-                if !is_new {
+                if was_replayed {
                     return None;
                 }
                 let data = serde_json::to_string(&envelope).ok()?;
@@ -5430,14 +5577,14 @@ fn build_project_usage_cache(
 ) -> HashMap<String, ProjectUsageStats> {
     let mut cache: HashMap<String, ProjectUsageStats> = HashMap::new();
     for session in sessions.values() {
-        let Some(workdir) = &session.workdir else {
+        let Some(project) = &session.durable.project else {
             continue;
         };
         let Some(metrics) = &session.metrics else {
             continue;
         };
         cache
-            .entry(workdir.to_string_lossy().into_owned())
+            .entry(project.path.clone())
             .or_default()
             .add_metrics(metrics);
     }
@@ -5451,6 +5598,12 @@ fn session_from_persisted(mut persisted: PersistedSession) -> (String, SessionSt
     let usage_records = persisted.usage_records.clone();
     let metrics = persisted.metrics.clone();
     let pending_user_messages = std::mem::take(&mut persisted.pending_user_messages);
+    let durable = DurableSessionProjection {
+        project: persisted.project,
+        pending_delivery_proposal: persisted.pending_delivery_proposal,
+        pending_goal_proposal: persisted.pending_goal_proposal,
+        pending_goal_change: persisted.pending_goal_change,
+    };
     let history = Arc::new(StdMutex::new(persisted.events));
     let pending_user_messages =
         Arc::new(StdMutex::new(pending_user_messages.into_iter().collect()));
@@ -5469,6 +5622,7 @@ fn session_from_persisted(mut persisted: PersistedSession) -> (String, SessionSt
             title,
             branch: persisted.branch,
             workdir: persisted.workdir,
+            durable,
             request_template,
             running: false,
             paused: status == SessionStatus::Paused,
@@ -5516,6 +5670,7 @@ fn persist_session_snapshot(
     completed_goals: Vec<crate::goal::GoalCheckpoint>,
     multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
     completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
+    durable: DurableSessionProjection,
 ) {
     let events = history
         .lock()
@@ -5546,6 +5701,10 @@ fn persist_session_snapshot(
     persisted.multi_task = multi_task;
     persisted.completed_multi_tasks = completed_multi_tasks;
     persisted.pending_user_messages = pending_user_messages;
+    persisted.project = durable.project;
+    persisted.pending_delivery_proposal = durable.pending_delivery_proposal;
+    persisted.pending_goal_proposal = durable.pending_goal_proposal;
+    persisted.pending_goal_change = durable.pending_goal_change;
     if let Err(err) = session_store::save_session(&persisted) {
         eprintln!("failed to persist pb session {session_id}: {err:#}");
     }
@@ -5587,6 +5746,7 @@ fn persist_live_session(session_id: &str, session: &SessionState) {
         session.completed_goals.clone(),
         session.multi_task.clone(),
         session.completed_multi_tasks.clone(),
+        session.durable.clone(),
     );
 }
 
@@ -5609,10 +5769,11 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
         .map(|(session_id, session)| {
             let workflow = latest_workflow_summary(session);
             let goal = latest_goal_checkpoint(session);
+            let (title, handoff_outcome, revision) = session_history_summary(session);
             SessionListItem {
                 session_id: session_id.clone(),
                 task: session.task.clone(),
-                title: effective_session_title(session),
+                title,
                 running: session.running,
                 paused: session.paused,
                 status: session.status,
@@ -5622,7 +5783,8 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
                     .workdir
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned()),
-                handoff_outcome: latest_handoff_outcome(session),
+                project: session.durable.project.clone(),
+                handoff_outcome,
                 pending_question: session.pending_question.as_ref().map(pending_question_view),
                 started_at_ms: session.started_at_ms,
                 updated_at_ms: session.updated_at_ms,
@@ -5636,6 +5798,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
                 active_goal: session.goal.is_some(),
                 multi_task: latest_multi_task_checkpoint(session).map(multi_task_summary),
                 active_multi_task: session.multi_task.is_some(),
+                revision,
             }
         })
         .collect::<Vec<_>>();
@@ -5657,20 +5820,28 @@ async fn project_list_snapshot(state: &AppState) -> Vec<ProjectEntry> {
 async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionDetails> {
     let sessions = state.sessions.lock().await;
     let session = sessions.get(id)?;
-    let events = session
+    let (events, title, handoff_outcome, revision) = session
         .history
         .lock()
         .map(|history| {
             let start = history.len().saturating_sub(SESSION_HISTORY_RESPONSE_LIMIT);
-            history[start..].to_vec()
+            (
+                history[start..].to_vec(),
+                latest_session_title(&history).or_else(|| session.title.clone()),
+                handoff_outcome_from_history(&history),
+                history
+                    .last()
+                    .map(|envelope| envelope.transcript.sequence)
+                    .unwrap_or(0),
+            )
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|_| (Vec::new(), session.title.clone(), None, 0));
     let workflow = latest_workflow_summary(session);
     let goal = latest_goal_checkpoint(session).cloned();
     Some(SessionDetails {
         session_id: id.to_string(),
         task: session.task.clone(),
-        title: effective_session_title(session),
+        title,
         running: session.running,
         paused: session.paused,
         status: session.status,
@@ -5680,7 +5851,8 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
             .workdir
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
-        handoff_outcome: latest_handoff_outcome(session),
+        project: session.durable.project.clone(),
+        handoff_outcome,
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
         started_at_ms: session.started_at_ms,
@@ -5695,6 +5867,10 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         active_multi_task: session.multi_task.is_some(),
         task_plan_rejected: session.request_template.task_plan_rejected.clone(),
         task_planning_transcript: session.request_template.task_planning_transcript.clone(),
+        pending_delivery_proposal: session.durable.pending_delivery_proposal.clone(),
+        pending_goal_proposal: session.durable.pending_goal_proposal.clone(),
+        pending_goal_change: session.durable.pending_goal_change.clone(),
+        revision,
     })
 }
 
@@ -5808,35 +5984,6 @@ fn bounded_handoff_text(text: &str) -> String {
     }
 }
 
-fn proposal_from_history(
-    history: &[EventEnvelope],
-    proposal_id: Option<&str>,
-) -> Result<Option<crate::workflow::DeliveryProposal>> {
-    let Some(proposal_id) = proposal_id else {
-        return Ok(None);
-    };
-    history
-        .iter()
-        .rev()
-        .find_map(|envelope| match &envelope.event {
-            AgentEvent::DeliveryProposed {
-                proposal_id: id,
-                source_turn_id,
-                task_summary,
-                ..
-            } if id == proposal_id => Some(crate::workflow::DeliveryProposal {
-                id: id.clone(),
-                source_turn_id: source_turn_id.clone(),
-                task_summary: task_summary.clone(),
-            }),
-            _ => None,
-        })
-        .map(Some)
-        .with_context(|| {
-            format!("delivery proposal '{proposal_id}' does not belong to this session")
-        })
-}
-
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5872,6 +6019,10 @@ fn publish_event_envelope_linked(
 ) {
     envelope.transcript.supersedes = supersedes;
     if let Ok(mut entries) = history.lock() {
+        let sequence = entries
+            .last()
+            .map_or(1, |entry| entry.transcript.sequence.saturating_add(1));
+        envelope.assign_sequence(sequence);
         envelope.refresh_projections(&entries);
         let _ = sender.send(envelope.clone());
         entries.push(envelope);
@@ -5931,6 +6082,42 @@ mod workflow_tests {
     }
 
     #[test]
+    fn session_project_resolution_uses_registered_identity_without_path_guessing() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let nested = repo.path().join("packages/web");
+        std::fs::create_dir_all(&nested).unwrap();
+        let registered = ProjectEntry {
+            name: "pb".to_string(),
+            path: repo.path().to_string_lossy().into_owned(),
+            repository_root: None,
+            notify_on_finish: false,
+        };
+
+        assert_eq!(
+            resolve_session_project(std::slice::from_ref(&registered), Some(&nested)),
+            Some(SessionProject {
+                name: "pb".to_string(),
+                path: registered.path.clone(),
+            })
+        );
+
+        let duplicate = ProjectEntry {
+            name: "same-repository".to_string(),
+            ..registered.clone()
+        };
+        assert!(resolve_session_project(&[registered, duplicate], Some(&nested)).is_none());
+    }
+
+    #[test]
     fn timestamped_publication_preserves_the_stream_and_history_entry_key() {
         let (sender, mut receiver) = broadcast::channel(4);
         let history = StdMutex::new(Vec::new());
@@ -5946,6 +6133,7 @@ mod workflow_tests {
         let streamed = receiver.try_recv().unwrap();
         let history = history.lock().unwrap();
         assert_eq!(streamed.transcript.entry_key, entry_key);
+        assert_eq!(streamed.transcript.sequence, 1);
         assert_eq!(history[0].transcript.entry_key, entry_key);
         assert_eq!(history[0].transcript.supersedes, vec!["older-entry"]);
     }

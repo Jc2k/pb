@@ -6,14 +6,14 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent_core::{AgentRequest, find_git_root};
-use crate::events::{AgentEvent, EventEnvelope, SessionMetricsSnapshot};
+use crate::events::{AgentEvent, EventEnvelope, GoalChangeKind, SessionMetricsSnapshot};
 use crate::projects::ProjectEntry;
 
 const NOTES_NAMESPACE: &str = "refs/notes/pb/sessions";
 const MAX_RESTORED_HISTORY_EVENTS: usize = 1_000;
 const SESSION_GIT_NAME: &str = "pb";
 const SESSION_GIT_EMAIL: &str = "pb@localhost";
-pub const SESSION_SCHEMA_VERSION: &str = "v3";
+pub const SESSION_SCHEMA_VERSION: &str = "v4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,30 +25,43 @@ pub enum SessionStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionProject {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingGoalChange {
+    pub goal_id: String,
+    pub kind: GoalChangeKind,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedSession {
     pub schema_version: String,
     pub session_id: String,
     pub task: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub branch: Option<String>,
     pub workdir: Option<PathBuf>,
+    pub project: Option<SessionProject>,
+    pub pending_delivery_proposal: Option<crate::workflow::DeliveryProposal>,
+    pub pending_goal_proposal: Option<crate::goal::GoalProposal>,
+    pub pending_goal_change: Option<PendingGoalChange>,
     pub request_template: AgentRequest,
     pub running: bool,
     pub status: SessionStatus,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<SessionMetricsSnapshot>,
     pub usage_records: Vec<SessionMetricsSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<crate::workflow::WorkflowCheckpoint>,
     pub completed_workflows: Vec<crate::workflow::WorkflowSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::goal::GoalCheckpoint>,
     pub completed_goals: Vec<crate::goal::GoalCheckpoint>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
     pub completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
     pub pending_user_messages: Vec<crate::events::QueuedUserMessage>,
@@ -58,13 +71,21 @@ pub struct PersistedSession {
 impl PersistedSession {
     pub fn from_parts(
         session_id: String,
-        request_template: AgentRequest,
+        mut request_template: AgentRequest,
         branch: Option<String>,
         workdir: Option<PathBuf>,
         running: bool,
         status: SessionStatus,
-        events: Vec<EventEnvelope>,
+        mut events: Vec<EventEnvelope>,
     ) -> Self {
+        request_template.session_id.clone_from(&session_id);
+        let mut last_sequence = 0;
+        for envelope in &mut events {
+            if envelope.transcript.sequence <= last_sequence {
+                envelope.assign_sequence(last_sequence.saturating_add(1));
+            }
+            last_sequence = envelope.transcript.sequence;
+        }
         let now = now_millis();
         let started_at_ms = events
             .iter()
@@ -89,6 +110,10 @@ impl PersistedSession {
             title: latest_session_title(&events),
             branch,
             workdir,
+            project: None,
+            pending_delivery_proposal: None,
+            pending_goal_proposal: None,
+            pending_goal_change: None,
             request_template,
             running,
             status,
@@ -251,20 +276,53 @@ fn parse_session(payload: &str) -> Result<PersistedSession> {
     if schema_version != SESSION_SCHEMA_VERSION {
         bail!("unsupported session schema '{schema_version}'; expected '{SESSION_SCHEMA_VERSION}'");
     }
+    for field in [
+        "title",
+        "branch",
+        "workdir",
+        "project",
+        "pending_delivery_proposal",
+        "pending_goal_proposal",
+        "pending_goal_change",
+        "metrics",
+        "workflow",
+        "goal",
+        "multi_task",
+    ] {
+        if value.get(field).is_none() {
+            bail!("session note has no {field}");
+        }
+    }
     let session: PersistedSession =
         serde_json::from_value(value).context("failed to parse session note")?;
+    validate_authoritative_session_state(&session)?;
     let mut entry_keys = HashSet::new();
+    let mut last_sequence = 0;
     for (index, envelope) in session.events.iter().enumerate() {
         envelope
-            .validate_persisted()
+            .validate_persisted_with_history(&session.events[..index])
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("session event {index} has invalid server projections"))?;
+        if envelope.transcript.sequence <= last_sequence {
+            bail!(
+                "session event {index} has non-monotonic transcript sequence {}",
+                envelope.transcript.sequence
+            );
+        }
+        for superseded in &envelope.transcript.supersedes {
+            if !entry_keys.contains(superseded.as_str()) {
+                bail!(
+                    "session event {index} supersedes unknown or future transcript entry '{superseded}'"
+                );
+            }
+        }
         if !entry_keys.insert(envelope.transcript.entry_key.as_str()) {
             bail!(
                 "session event {index} repeats transcript entry key '{}'",
                 envelope.transcript.entry_key
             );
         }
+        last_sequence = envelope.transcript.sequence;
     }
     if let Some(goal) = session.goal.as_ref() {
         goal.validate()
@@ -285,6 +343,79 @@ fn parse_session(payload: &str) -> Result<PersistedSession> {
             .context("completed multi-Task checkpoint is invalid")?;
     }
     Ok(session)
+}
+
+fn validate_authoritative_session_state(session: &PersistedSession) -> Result<()> {
+    if session.session_id.trim().is_empty()
+        || session.request_template.session_id != session.session_id
+    {
+        bail!("session identity does not match its request template");
+    }
+    if session.running != (session.status == SessionStatus::Running) {
+        bail!("session running flag does not match its status");
+    }
+    if let Some(project) = session.project.as_ref()
+        && (project.name.trim().is_empty()
+            || project.path.trim().is_empty()
+            || !Path::new(&project.path).is_absolute())
+    {
+        bail!("session project identity is invalid");
+    }
+    if let Some(proposal) = session.pending_delivery_proposal.as_ref()
+        && (proposal.id.trim().is_empty()
+            || proposal.source_turn_id.trim().is_empty()
+            || proposal.task_summary.trim().is_empty())
+    {
+        bail!("pending delivery proposal is invalid");
+    }
+    if let Some(proposal) = session.pending_goal_proposal.as_ref()
+        && (proposal.id.trim().is_empty()
+            || proposal.source_turn_id.trim().is_empty()
+            || proposal.objective.trim().is_empty()
+            || proposal
+                .criteria
+                .iter()
+                .any(|criterion| criterion.text.trim().is_empty()))
+    {
+        bail!("pending Goal proposal is invalid");
+    }
+    if let Some(change) = session.pending_goal_change.as_ref()
+        && (change.goal_id.trim().is_empty()
+            || change.summary.trim().is_empty()
+            || session
+                .goal
+                .as_ref()
+                .is_none_or(|goal| goal.run.id != change.goal_id))
+    {
+        bail!("pending Goal change does not match the active Goal");
+    }
+    let mut message_ids = HashSet::new();
+    if session.pending_user_messages.iter().any(|message| {
+        message.message_id.trim().is_empty()
+            || message.message.trim().is_empty()
+            || !message_ids.insert(message.message_id.as_str())
+    }) {
+        bail!("pending user messages are invalid");
+    }
+    if session
+        .usage_records
+        .iter()
+        .any(|metrics| metrics.ended_at_ms < metrics.started_at_ms)
+    {
+        bail!("session usage record ends before it starts");
+    }
+    let mut combined: Option<SessionMetricsSnapshot> = None;
+    for metrics in &session.usage_records {
+        if let Some(existing) = combined.as_mut() {
+            existing.add_assign(metrics);
+        } else {
+            combined = Some(metrics.clone());
+        }
+    }
+    if session.metrics != combined {
+        bail!("session metrics do not match its usage records");
+    }
+    Ok(())
 }
 
 fn latest_session_metrics(events: &[EventEnvelope]) -> Option<SessionMetricsSnapshot> {
@@ -337,12 +468,21 @@ pub(crate) fn trim_event_history(
         let overflow = events.len().saturating_sub(keep_tail);
         events.drain(..overflow);
         events.insert(0, started);
-        events
     } else {
         let overflow = events.len() - maximum;
         events.drain(..overflow);
-        events
     }
+    let retained = events
+        .iter()
+        .map(|event| event.transcript.entry_key.clone())
+        .collect::<HashSet<_>>();
+    for event in &mut events {
+        event
+            .transcript
+            .supersedes
+            .retain(|entry_key| retained.contains(entry_key));
+    }
+    events
 }
 
 fn workspace_root(session: &PersistedSession) -> Option<PathBuf> {
@@ -619,8 +759,8 @@ mod tests {
             tool_energy_joules: None,
             tool_energy_kwh: None,
             wall_runtime_ms: 1_000,
-            started_at_ms: Some(started_at_ms),
-            ended_at_ms: Some(started_at_ms + 1_000),
+            started_at_ms,
+            ended_at_ms: started_at_ms + 1_000,
             total_energy_joules: Some(joules),
             total_energy_kwh: Some(joules / 3_600_000.0),
             gross_energy_joules: Some(joules + 2.0),
@@ -780,8 +920,8 @@ mod tests {
         assert_eq!(metrics.prompt_tokens, 25);
         assert_eq!(metrics.wall_runtime_ms, 2_000);
         assert_eq!(metrics.total_energy_joules, Some(50.0));
-        assert_eq!(metrics.started_at_ms, Some(1_000));
-        assert_eq!(metrics.ended_at_ms, Some(4_000));
+        assert_eq!(metrics.started_at_ms, 1_000);
+        assert_eq!(metrics.ended_at_ms, 4_000);
     }
 
     #[test]
@@ -851,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_session_without_v3_schema_is_rejected() {
+    fn persisted_session_without_v4_schema_is_rejected() {
         let dir = init_repo();
         let session = PersistedSession::from_parts(
             "old-session".to_string(),
@@ -870,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_v3_session_requires_authoritative_state_fields() {
+    fn persisted_v4_session_requires_authoritative_state_fields() {
         let dir = init_repo();
         let session = PersistedSession::from_parts(
             "malformed-session".to_string(),
@@ -884,22 +1024,33 @@ mod tests {
         let value = serde_json::to_value(session).unwrap();
 
         for field in [
+            "title",
+            "branch",
+            "workdir",
             "status",
             "started_at_ms",
             "usage_records",
             "pending_user_messages",
+            "project",
+            "pending_delivery_proposal",
+            "pending_goal_proposal",
+            "pending_goal_change",
+            "metrics",
+            "workflow",
+            "goal",
+            "multi_task",
         ] {
             let mut missing = value.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(
                 parse_session(&serde_json::to_string(&missing).unwrap()).is_err(),
-                "v3 session unexpectedly accepted without {field}"
+                "v4 session unexpectedly accepted without {field}"
             );
         }
     }
 
     #[test]
-    fn persisted_v2_sessions_are_rejected_without_migration() {
+    fn old_sessions_are_rejected_without_migration() {
         let dir = init_repo();
         let session = PersistedSession::from_parts(
             "old-session".to_string(),
@@ -910,15 +1061,17 @@ mod tests {
             SessionStatus::Completed,
             Vec::new(),
         );
-        let mut value = serde_json::to_value(session).unwrap();
-        value["schema_version"] = serde_json::Value::String("v2".to_string());
-
-        let error = parse_session(&serde_json::to_string(&value).unwrap()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported session schema 'v2'")
-        );
+        let value = serde_json::to_value(session).unwrap();
+        for version in ["v2", "v3"] {
+            let mut old = value.clone();
+            old["schema_version"] = serde_json::Value::String(version.to_string());
+            let error = parse_session(&serde_json::to_string(&old).unwrap()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unsupported session schema '{version}'"))
+            );
+        }
     }
 
     #[test]
@@ -1006,15 +1159,169 @@ mod tests {
         assert!(parse_session(&serde_json::to_string(&invalid_projection).unwrap()).is_err());
 
         let mut duplicate = session;
-        duplicate.events.push(correction);
+        let mut repeated_key = correction;
+        repeated_key.assign_sequence(2);
+        duplicate.events.push(repeated_key);
         let error = parse_session(&serde_json::to_string(&duplicate).unwrap()).unwrap_err();
         assert!(error.to_string().contains("repeats transcript entry key"));
+    }
+
+    #[test]
+    fn session_parser_rejects_dangling_supersession_and_non_monotonic_sequence() {
+        let dir = init_repo();
+        let title = EventEnvelope::new(AgentEvent::SessionTitle {
+            title: "Authoritative state".to_string(),
+            timestamp_ms: Some(1),
+        });
+        let mut dangling = PersistedSession::from_parts(
+            "dangling-supersession".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            vec![title],
+        );
+        let own_key = dangling.events[0].transcript.entry_key.clone();
+        dangling.events[0].transcript.supersedes = vec![own_key];
+        let error = parse_session(&serde_json::to_string(&dangling).unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown or future transcript entry")
+        );
+
+        let mut unordered = PersistedSession::from_parts(
+            "unordered-sequence".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            vec![
+                EventEnvelope::new(AgentEvent::SessionTitle {
+                    title: "First".to_string(),
+                    timestamp_ms: Some(1),
+                }),
+                EventEnvelope::new(AgentEvent::SessionTitle {
+                    title: "Second".to_string(),
+                    timestamp_ms: Some(2),
+                }),
+            ],
+        );
+        unordered.events[1].assign_sequence(1);
+        let error = parse_session(&serde_json::to_string(&unordered).unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("non-monotonic transcript sequence")
+        );
+    }
+
+    #[test]
+    fn session_parser_rejects_contradictory_authoritative_state() {
+        let dir = init_repo();
+        let mut status = PersistedSession::from_parts(
+            "contradictory-state".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        status.running = true;
+        assert!(parse_session(&serde_json::to_string(&status).unwrap()).is_err());
+
+        let mut project = status;
+        project.running = false;
+        project.project = Some(SessionProject {
+            name: "pb".to_string(),
+            path: "relative/path".to_string(),
+        });
+        assert!(parse_session(&serde_json::to_string(&project).unwrap()).is_err());
+
+        let mut metrics = PersistedSession::from_parts(
+            "contradictory-metrics".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            vec![metrics_event(1, 1.0, 1_000)],
+        );
+        metrics.usage_records.clear();
+        assert!(parse_session(&serde_json::to_string(&metrics).unwrap()).is_err());
+
+        let mut proposal = PersistedSession::from_parts(
+            "invalid-proposal".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        proposal.pending_delivery_proposal = Some(crate::workflow::DeliveryProposal {
+            id: String::new(),
+            source_turn_id: "turn-1".to_string(),
+            task_summary: "Deliver".to_string(),
+        });
+        assert!(parse_session(&serde_json::to_string(&proposal).unwrap()).is_err());
+
+        let mut unknown = serde_json::to_value(PersistedSession::from_parts(
+            "unknown-state".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        ))
+        .unwrap();
+        unknown["legacy_running"] = serde_json::Value::Bool(false);
+        assert!(parse_session(&serde_json::to_string(&unknown).unwrap()).is_err());
     }
 
     #[test]
     fn save_restore_and_delete_session_note() {
         let dir = init_repo();
         let request = request(dir.path());
+        let check = EventEnvelope::new(AgentEvent::CheckResult {
+            check_id: "rust".to_string(),
+            exit_status: 0,
+            success: true,
+            timed_out: false,
+            output: "all tests passed".to_string(),
+            truncated: false,
+            duration_ms: 1,
+            fingerprint: "check-fingerprint".to_string(),
+            command: Some("cargo test --all-targets".to_string()),
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            executor: Some("local".to_string()),
+            source: None,
+            command_fingerprint: None,
+            dependency_outputs: std::collections::BTreeMap::new(),
+            output_fingerprint: None,
+            reused: false,
+            skip_reason: None,
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        let mut team_message = EventEnvelope::new(AgentEvent::TeamMessage {
+            actor: crate::events::TeamActor::workflow_steward(),
+            tone: crate::events::TeamMessageTone::Success,
+            purpose: crate::events::TeamMessagePurpose::General,
+            handoff: None,
+            message: "Everything affected passed.".to_string(),
+            detail: Some("cargo test --all-targets".to_string()),
+            evidence: vec![crate::events::EvidenceRef::Check {
+                check_id: "rust".to_string(),
+            }],
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        team_message.refresh_projections(std::slice::from_ref(&check));
         let session = PersistedSession::from_parts(
             "session-123".to_string(),
             request,
@@ -1029,19 +1336,8 @@ mod tests {
                     nesting_depth: None,
                     timestamp_ms: None,
                 }),
-                EventEnvelope::new(AgentEvent::TeamMessage {
-                    actor: crate::events::TeamActor::workflow_steward(),
-                    tone: crate::events::TeamMessageTone::Success,
-                    purpose: crate::events::TeamMessagePurpose::General,
-                    handoff: None,
-                    message: "Everything affected passed.".to_string(),
-                    detail: Some("cargo test --all-targets".to_string()),
-                    evidence: vec![crate::events::EvidenceRef::Check {
-                        check_id: "rust".to_string(),
-                    }],
-                    nesting_depth: None,
-                    timestamp_ms: None,
-                }),
+                check,
+                team_message,
             ],
         );
 
@@ -1051,9 +1347,9 @@ mod tests {
         assert_eq!(restored[0].session_id, "session-123");
         assert!(!restored[0].running);
         assert!(!restored[0].request_template.legacy_prompt_owned_delivery);
-        assert_eq!(restored[0].events.len(), 2);
+        assert_eq!(restored[0].events.len(), 3);
         assert!(matches!(
-            &restored[0].events[1].event,
+            &restored[0].events[2].event,
             AgentEvent::TeamMessage {
                 actor: crate::events::TeamActor::Automation(
                     crate::events::AutomationActor::Trinity

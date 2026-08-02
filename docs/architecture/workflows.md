@@ -503,7 +503,7 @@ Tool schemas are derived from this matrix for every stage. A request-level allow
 policy can narrow the set further. Neither can broaden it.
 The legacy model-owned `todo`, `git_commit`, and `git_revert` schemas are retired from every current
 surface. The accepted plan, typed stage artifacts, checkpoint, deterministic checks, and managed
-commit already own that state and authority. Incompatible pre-v3 sessions are not restored, and no
+commit already own that state and authority. Incompatible pre-v4 sessions are not restored, and no
 current allowlist or policy can revive the retired tools.
 
 ## Agent-tool runtime contract
@@ -788,7 +788,7 @@ repeating actor identity in every row. Character attribution is
 presentation over typed events; it never changes a controller event into a model tool call or
 claims that a model requested an automatic action.
 
-The version-2 event envelope is also the shared conversational boundary. Corrections and workflow
+The version-4 event envelope is also the shared conversational boundary. Corrections and workflow
 stops require producer-authored correction kinds and block causes; team messages require a typed
 purpose and embed their own handoff summary when they report an outcome. Rust projects those events
 into required, ordered `chatter` records containing actor, tone, optional headline, plain-language
@@ -812,17 +812,25 @@ Consumers render that split directly instead of extracting a heading from diagno
 
 The daemon persists the complete envelope and current session state as authored, and replay treats
 both as authoritative. There is no replay hydration, old projection reconstruction, or recovery of
-missing status, title, metrics, usage windows, or pending messages from adjacent events. Persisted
-sessions carry the matching v3 session schema and malformed or incompatible notes are skipped during
-restoration rather than migrated. Event envelopes carry server-authored chatter, typed embedded
-check/commit evidence for team messages, and structured commit summaries. Session restoration
-validates projection shape and unique transcript entry keys before admitting a note.
+missing status, title, metrics, usage windows, pending messages, proposals, or Goal-change requests
+from adjacent events. Persisted sessions carry the matching v4 session schema and malformed or
+incompatible notes are skipped during restoration rather than migrated. Each session also persists
+its resolved registered-project identity instead of asking the browser to compare worktree paths or
+guess a project name. Every v4 state key is present explicitly, including nullable state, and
+unknown compatibility fields are rejected. Event envelopes carry server-authored chatter, typed
+embedded check/commit evidence for team messages, structured commit summaries, and a strictly
+increasing transcript sequence. Session restoration validates every projection against its payload
+and prior history, requires evidence references to resolve exactly once, rejects dangling or forward
+supersession, and admits only unique entry keys in increasing sequence order.
 
 The live event endpoint subscribes before taking its history snapshot, assigns each SSE record the
 durable transcript entry key, and resumes after `Last-Event-ID`. A lagged subscriber is disconnected
-so the browser's normal EventSource reconnection can replay from that cursor. The React client merges
-the HTTP snapshot and stream by entry key, so neither their arrival order nor reconnection creates a
-gap or duplicate. Terminal,
+so the browser's normal EventSource reconnection can replay from that cursor. Session list and detail
+responses carry the same latest transcript sequence as a revision. The React client merges HTTP and
+stream data by entry key and sequence, aborts superseded detail requests, and overlays only stream
+effects newer than the response revision, so neither arrival order nor reconnection can revert
+title or lifecycle state. Explicit lifecycle events are published after terminal state changes.
+Terminal,
 harness, and web consumers therefore render the same Trinity-authored messages; the browser owns
 only visual layout and optional local-username addressing. It does not parse raw controller JSON,
 recognize event-name prefixes for cache invalidation, compare diagnostic summary wording, scan later

@@ -12,7 +12,7 @@ pub use crate::inference::StageRootAuthorityClass as PromptRootAuthorityClass;
 use crate::session_store::now_millis;
 pub use crate::workflow::WorkflowBlockCause;
 
-pub const EVENT_SCHEMA_VERSION: &str = "v3";
+pub const EVENT_SCHEMA_VERSION: &str = "v4";
 static LAST_EVENT_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
 fn next_event_timestamp_ms() -> u64 {
@@ -179,6 +179,7 @@ pub enum ChatterAudience {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventChatter {
     pub actor: TeamActor,
     pub tone: TeamMessageTone,
@@ -261,7 +262,9 @@ pub enum TranscriptKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TranscriptMetadata {
+    pub sequence: u64,
     pub visibility: TranscriptVisibility,
     pub kind: TranscriptKind,
     pub entry_key: String,
@@ -279,6 +282,7 @@ pub struct TranscriptMetadata {
 impl TranscriptMetadata {
     fn pending() -> Self {
         Self {
+            sequence: 1,
             visibility: TranscriptVisibility::EvidenceOnly,
             kind: TranscriptKind::Evidence,
             entry_key: String::new(),
@@ -305,7 +309,34 @@ pub enum SessionRunningEffect {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifecycleStatus {
+    Queued,
+    Running,
+    Paused,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalChangeKind {
+    Amendment,
+    Budget,
+}
+
+impl std::fmt::Display for GoalChangeKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Amendment => "amendment",
+            Self::Budget => "budget",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionEffect {
     pub refresh: bool,
     pub running: SessionRunningEffect,
@@ -379,7 +410,7 @@ impl std::fmt::Display for TerminationReason {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMetricsSnapshot {
     pub llm_invocations: usize,
     pub llm_runtime_ms: u64,
@@ -400,10 +431,8 @@ pub struct SessionMetricsSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_energy_kwh: Option<f64>,
     pub wall_runtime_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at_ms: Option<u64>,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_energy_joules: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -518,13 +547,11 @@ impl SessionMetricsSnapshot {
             .saturating_add(other.cache_persistence_failures);
         self.wall_runtime_ms = self.wall_runtime_ms.saturating_add(other.wall_runtime_ms);
         self.started_at_ms = match (self.started_at_ms, other.started_at_ms) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (left, right) => left.or(right),
+            (0, right) => right,
+            (left, 0) => left,
+            (left, right) => left.min(right),
         };
-        self.ended_at_ms = match (self.ended_at_ms, other.ended_at_ms) {
-            (Some(left), Some(right)) => Some(left.max(right)),
-            (left, right) => left.or(right),
-        };
+        self.ended_at_ms = self.ended_at_ms.max(other.ended_at_ms);
         add_optional(&mut self.llm_energy_joules, other.llm_energy_joules);
         add_optional(&mut self.llm_energy_kwh, other.llm_energy_kwh);
         add_optional(&mut self.tool_energy_joules, other.tool_energy_joules);
@@ -738,7 +765,7 @@ impl ModelInvocationPurpose {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentEvent {
     Started {
         task: String,
@@ -861,7 +888,7 @@ pub enum AgentEvent {
     },
     GoalChangeRequested {
         goal_id: String,
-        kind: String,
+        kind: GoalChangeKind,
         summary: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
@@ -1245,6 +1272,13 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
+    SessionStateChanged {
+        status: SessionLifecycleStatus,
+        running: bool,
+        paused: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
+    },
     LlmInvocation {
         step: usize,
         purpose: ModelInvocationPurpose,
@@ -1291,10 +1325,8 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_energy_kwh: Option<f64>,
         wall_runtime_ms: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        started_at_ms: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ended_at_ms: Option<u64>,
+        started_at_ms: u64,
+        ended_at_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total_energy_joules: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1348,6 +1380,7 @@ pub enum AgentEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventEnvelope {
     #[serde(deserialize_with = "deserialize_event_version")]
     pub version: String,
@@ -1389,13 +1422,29 @@ impl EventEnvelope {
     }
 
     pub fn refresh_projections(&mut self, history: &[EventEnvelope]) {
+        let sequence = self.transcript.sequence;
         let supersedes = self.transcript.supersedes.clone();
         self.chatter = chatter_for_event(&self.event, history, &supersedes);
         self.evidence = evidence_for_event(&self.event, history);
         self.transcript = transcript_metadata_for_event(&self.event, history, supersedes);
+        self.transcript.sequence = sequence;
+    }
+
+    pub(crate) fn assign_sequence(&mut self, sequence: u64) {
+        self.transcript.sequence = sequence;
     }
 
     pub fn validate_persisted(&self) -> Result<(), String> {
+        self.validate_persisted_with_history(&[])
+    }
+
+    pub(crate) fn validate_persisted_with_history(
+        &self,
+        history: &[EventEnvelope],
+    ) -> Result<(), String> {
+        if self.transcript.sequence == 0 {
+            return Err("event transcript sequence must be positive".to_string());
+        }
         if self.transcript.entry_key != event_entry_key(&self.event) {
             return Err("event transcript entry key does not match its payload".to_string());
         }
@@ -1410,6 +1459,19 @@ impl EventEnvelope {
         let unique_supersedes = self.transcript.supersedes.iter().collect::<HashSet<_>>();
         if unique_supersedes.len() != self.transcript.supersedes.len() {
             return Err("event transcript contains duplicate supersession keys".to_string());
+        }
+
+        let expected =
+            transcript_metadata_for_event(&self.event, history, self.transcript.supersedes.clone());
+        if self.transcript.visibility != expected.visibility
+            || self.transcript.kind != expected.kind
+            || self.transcript.tool_summary != expected.tool_summary
+            || self.transcript.dedupe_key != expected.dedupe_key
+            || self.transcript.related_action_key != expected.related_action_key
+            || self.transcript.summary_redundant != expected.summary_redundant
+            || self.transcript.session_effect != expected.session_effect
+        {
+            return Err("event transcript metadata does not match its payload".to_string());
         }
 
         match &self.event {
@@ -1444,6 +1506,37 @@ impl EventEnvelope {
             }
             _ => {}
         }
+        if self.chatter != chatter_for_event(&self.event, history, &self.transcript.supersedes) {
+            return Err("event chatter projections do not match its payload".to_string());
+        }
+
+        if let AgentEvent::SessionMetrics {
+            started_at_ms,
+            ended_at_ms,
+            ..
+        } = &self.event
+            && ended_at_ms < started_at_ms
+        {
+            return Err("session metrics end before they start".to_string());
+        }
+        if let AgentEvent::SessionStateChanged {
+            status,
+            running,
+            paused,
+            ..
+        } = &self.event
+        {
+            let expected = match status {
+                SessionLifecycleStatus::Running => (true, false),
+                SessionLifecycleStatus::Paused => (false, true),
+                SessionLifecycleStatus::Queued
+                | SessionLifecycleStatus::Completed
+                | SessionLifecycleStatus::Failed => (false, false),
+            };
+            if (*running, *paused) != expected {
+                return Err("session lifecycle flags do not match its status".to_string());
+            }
+        }
 
         let AgentEvent::TeamMessage { evidence, .. } = &self.event else {
             if !self.evidence.is_empty() {
@@ -1451,7 +1544,7 @@ impl EventEnvelope {
             }
             return Ok(());
         };
-        if evidence.iter().collect::<HashSet<_>>().len() != evidence.len() {
+        if evidence.iter().cloned().collect::<HashSet<_>>().len() != evidence.len() {
             return Err("team message contains duplicate evidence references".to_string());
         }
         if evidence.iter().any(|reference| match reference {
@@ -1460,28 +1553,34 @@ impl EventEnvelope {
         }) {
             return Err("team message contains an empty evidence reference".to_string());
         }
-        if self.evidence.iter().any(|projection| {
-            !evidence
-                .iter()
-                .any(|reference| match (reference, projection) {
-                    (
-                        EvidenceRef::Check { check_id },
-                        EventEvidence::Check(CheckEvidence {
-                            check_id: projected,
-                            ..
-                        }),
-                    ) => check_id == projected,
-                    (
-                        EvidenceRef::Commit { oid },
-                        EventEvidence::Commit(CommitEvidence {
-                            oid: Some(projected),
-                            ..
-                        }),
-                    ) => oid == projected,
-                    _ => false,
-                })
-        }) {
-            return Err("team message evidence projection has no matching reference".to_string());
+        let projected = self
+            .evidence
+            .iter()
+            .map(|projection| match projection {
+                EventEvidence::Check(CheckEvidence { check_id, .. }) => Ok(EvidenceRef::Check {
+                    check_id: check_id.clone(),
+                }),
+                EventEvidence::Commit(CommitEvidence { oid: Some(oid), .. }) => {
+                    Ok(EvidenceRef::Commit { oid: oid.clone() })
+                }
+                EventEvidence::Commit(CommitEvidence { oid: None, .. }) => {
+                    Err("team message commit evidence projection has no object id".to_string())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if projected.iter().cloned().collect::<HashSet<_>>().len() != projected.len() {
+            return Err("team message contains duplicate evidence projections".to_string());
+        }
+        if projected.len() != evidence.len()
+            || projected.iter().cloned().collect::<HashSet<_>>()
+                != evidence.iter().cloned().collect::<HashSet<_>>()
+        {
+            return Err(
+                "team message evidence projections do not match its references".to_string(),
+            );
+        }
+        if self.evidence != evidence_for_event(&self.event, history) {
+            return Err("team message evidence projections do not match prior events".to_string());
         }
         Ok(())
     }
@@ -2548,6 +2647,23 @@ impl EventEnvelope {
                     timestamp_ms: Some(now),
                 },
             },
+            AgentEvent::SessionStateChanged {
+                status,
+                running,
+                paused,
+                ..
+            } => Self {
+                version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                evidence: Vec::new(),
+                transcript: TranscriptMetadata::pending(),
+                event: AgentEvent::SessionStateChanged {
+                    status,
+                    running,
+                    paused,
+                    timestamp_ms: Some(now),
+                },
+            },
             AgentEvent::SessionSummary {
                 branch,
                 commits,
@@ -2724,6 +2840,7 @@ fn transcript_metadata_for_event(
     };
     let entry_key = event_entry_key(event);
     TranscriptMetadata {
+        sequence: 1,
         visibility,
         kind,
         entry_key,
@@ -2744,7 +2861,8 @@ pub(crate) fn event_entry_key(event: &AgentEvent) -> String {
 fn session_effect_for_event(event: &AgentEvent) -> SessionEffect {
     let refresh = matches!(
         event,
-        AgentEvent::GoalProposed { .. }
+        AgentEvent::DeliveryProposed { .. }
+            | AgentEvent::GoalProposed { .. }
             | AgentEvent::GoalStarted { .. }
             | AgentEvent::GoalPlanAwaitingApproval { .. }
             | AgentEvent::GoalPlanApproved { .. }
@@ -2772,14 +2890,16 @@ fn session_effect_for_event(event: &AgentEvent) -> SessionEffect {
             | AgentEvent::TaskPlanAccepted { .. }
             | AgentEvent::TaskPlanRejected { .. }
             | AgentEvent::TasksChanged { .. }
-            | AgentEvent::SessionSummary { .. }
+            | AgentEvent::SessionStateChanged { .. }
             | AgentEvent::UserQuestion { .. }
+            | AgentEvent::UserAnswer { .. }
     );
     let running = match event {
-        AgentEvent::Started { .. } | AgentEvent::UserAnswer { .. } => SessionRunningEffect::Running,
+        AgentEvent::Started { .. }
+        | AgentEvent::UserAnswer { .. }
+        | AgentEvent::SessionStateChanged { running: true, .. } => SessionRunningEffect::Running,
         AgentEvent::UserQuestion { .. }
-        | AgentEvent::Final { .. }
-        | AgentEvent::SessionSummary { .. } => SessionRunningEffect::Stopped,
+        | AgentEvent::SessionStateChanged { running: false, .. } => SessionRunningEffect::Stopped,
         _ => SessionRunningEffect::Unchanged,
     };
     SessionEffect {
@@ -3782,6 +3902,25 @@ mod tests {
     }
 
     #[test]
+    fn v4_envelopes_reject_unknown_compatibility_fields() {
+        let value = serde_json::to_value(EventEnvelope::new(AgentEvent::Final {
+            content: "done".to_string(),
+            profile: AgentProfile::Build,
+            nesting_depth: None,
+            timestamp_ms: None,
+        }))
+        .unwrap();
+
+        let mut unknown_event = value.clone();
+        unknown_event["event"]["legacy_content"] = Value::String("done".to_string());
+        assert!(serde_json::from_value::<EventEnvelope>(unknown_event).is_err());
+
+        let mut unknown_envelope = value;
+        unknown_envelope["legacy_chatter"] = Value::Array(Vec::new());
+        assert!(serde_json::from_value::<EventEnvelope>(unknown_envelope).is_err());
+    }
+
+    #[test]
     fn timestamped_envelopes_assign_unique_ordered_event_identity() {
         let event = || AgentEvent::Final {
             content: "done".to_string(),
@@ -3809,7 +3948,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_errors_require_summary_and_detail() {
+    fn v4_errors_require_summary_and_detail() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::Error {
             summary: "Model setup failed".to_string(),
             detail: "llama.cpp failed to load the configured model".to_string(),
@@ -3823,13 +3962,13 @@ mod tests {
             missing["event"].as_object_mut().unwrap().remove(field);
             assert!(
                 serde_json::from_value::<EventEnvelope>(missing).is_err(),
-                "v3 error unexpectedly accepted without {field}"
+                "v4 error unexpectedly accepted without {field}"
             );
         }
     }
 
     #[test]
-    fn v3_tool_results_require_exact_correlation_and_outcome() {
+    fn v4_tool_results_require_exact_correlation_and_outcome() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::ToolResult {
             tool: "read_file".to_string(),
             result: "contents".to_string(),
@@ -3852,7 +3991,7 @@ mod tests {
             missing["event"].as_object_mut().unwrap().remove(field);
             assert!(
                 serde_json::from_value::<EventEnvelope>(missing).is_err(),
-                "v3 tool result unexpectedly accepted without {field}"
+                "v4 tool result unexpectedly accepted without {field}"
             );
         }
     }
@@ -4320,7 +4459,138 @@ mod tests {
                 if commit.oid.as_deref() == Some("abc123")
                     && commit.subject.as_deref() == Some("fix: strengthen event boundary")
         ));
-        envelope.validate_persisted().unwrap();
+        envelope.validate_persisted_with_history(&history).unwrap();
+    }
+
+    #[test]
+    fn persisted_team_message_evidence_must_be_complete_unique_and_historical() {
+        let history = vec![EventEnvelope::new(AgentEvent::CheckResult {
+            check_id: "web-tests".to_string(),
+            exit_status: 0,
+            success: true,
+            timed_out: false,
+            output: "all tests passed".to_string(),
+            truncated: false,
+            duration_ms: 250,
+            fingerprint: "check-fingerprint".to_string(),
+            command: Some("deno task test:web".to_string()),
+            cwd: Some("/workspace".to_string()),
+            executor: Some("local".to_string()),
+            source: None,
+            command_fingerprint: None,
+            dependency_outputs: BTreeMap::new(),
+            output_fingerprint: None,
+            reused: false,
+            skip_reason: None,
+            nesting_depth: None,
+            timestamp_ms: Some(1),
+        })];
+        let mut envelope = EventEnvelope::new(AgentEvent::TeamMessage {
+            actor: TeamActor::workflow_steward(),
+            tone: TeamMessageTone::Success,
+            purpose: TeamMessagePurpose::HandoffOutcome,
+            handoff: None,
+            message: "The web checks passed.".to_string(),
+            detail: None,
+            evidence: vec![EvidenceRef::Check {
+                check_id: "web-tests".to_string(),
+            }],
+            nesting_depth: None,
+            timestamp_ms: Some(2),
+        });
+        envelope.refresh_projections(&history);
+        envelope.validate_persisted_with_history(&history).unwrap();
+
+        let projection = envelope.evidence[0].clone();
+        envelope.evidence.clear();
+        assert!(envelope.validate_persisted_with_history(&history).is_err());
+
+        envelope.evidence = vec![projection.clone(), projection];
+        assert!(envelope.validate_persisted_with_history(&history).is_err());
+
+        envelope.refresh_projections(&history);
+        assert!(envelope.validate_persisted_with_history(&[]).is_err());
+    }
+
+    #[test]
+    fn persisted_event_metadata_and_metric_interval_are_authoritative() {
+        let mut title = EventEnvelope::new(AgentEvent::SessionTitle {
+            title: "A stronger boundary".to_string(),
+            timestamp_ms: Some(1),
+        });
+        title.transcript.session_effect.title = None;
+        assert!(title.validate_persisted().is_err());
+
+        let metrics = EventEnvelope::new(AgentEvent::SessionMetrics {
+            llm_invocations: 1,
+            prompt_tokens: 1,
+            generated_tokens: 1,
+            llm_runtime_ms: 1,
+            tool_runtime_ms: 0,
+            wall_runtime_ms: 1,
+            tool_calls: 0,
+            cache_persistence_queued_checkpoints: 0,
+            cache_persistence_completed_checkpoints: 0,
+            cache_persistence_wall_ms: 0,
+            cache_persistence_failures: 0,
+            llm_energy_joules: None,
+            llm_energy_kwh: None,
+            tool_energy_joules: None,
+            tool_energy_kwh: None,
+            total_energy_joules: None,
+            total_energy_kwh: None,
+            gross_energy_joules: None,
+            adjusted_energy_joules: None,
+            average_power_watts: None,
+            energy_measured_ms: None,
+            energy_coverage: None,
+            energy_source: None,
+            display_energy_excluded: false,
+            idle_baseline_applied: false,
+            energy_complete: false,
+            energy_exclusive: false,
+            started_at_ms: 2,
+            ended_at_ms: 1,
+            nesting_depth: None,
+            timestamp_ms: Some(2),
+        });
+        assert!(metrics.validate_persisted().is_err());
+    }
+
+    #[test]
+    fn lifecycle_effects_are_published_only_after_state_transitions() {
+        let final_message = EventEnvelope::new(AgentEvent::Final {
+            content: "Done".to_string(),
+            profile: AgentProfile::Build,
+            nesting_depth: None,
+            timestamp_ms: Some(1),
+        });
+        assert_eq!(
+            final_message.transcript.session_effect.running,
+            SessionRunningEffect::Unchanged
+        );
+        assert!(!final_message.transcript.session_effect.refresh);
+        assert!(final_message.transcript.session_effect.reset_intent);
+
+        let state = EventEnvelope::new(AgentEvent::SessionStateChanged {
+            status: SessionLifecycleStatus::Completed,
+            running: false,
+            paused: false,
+            timestamp_ms: Some(2),
+        });
+        assert_eq!(
+            state.transcript.session_effect.running,
+            SessionRunningEffect::Stopped
+        );
+        assert!(state.transcript.session_effect.refresh);
+
+        let contradictory = EventEnvelope::new(AgentEvent::SessionStateChanged {
+            status: SessionLifecycleStatus::Completed,
+            running: true,
+            paused: false,
+            timestamp_ms: Some(3),
+        });
+        assert!(contradictory.validate_persisted().is_err());
     }
 
     #[test]
@@ -4553,6 +4823,7 @@ mod tests {
             audience: ChatterAudience::Team,
         }];
         envelope.transcript = TranscriptMetadata {
+            sequence: 1,
             visibility: TranscriptVisibility::EvidenceOnly,
             kind: TranscriptKind::Evidence,
             entry_key: "persisted-entry".to_string(),

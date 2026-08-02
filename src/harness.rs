@@ -336,6 +336,11 @@ impl EventSink for HarnessEventSink {
             return;
         };
         let mut envelope = EventEnvelope::new_superseding(event, supersedes);
+        let sequence = state
+            .events
+            .last()
+            .map_or(1, |entry| entry.transcript.sequence.saturating_add(1));
+        envelope.assign_sequence(sequence);
         envelope.refresh_projections(&state.events);
         render_event(&envelope);
 
@@ -418,10 +423,13 @@ impl EventSink for HarnessEventSink {
             AgentEvent::GoalPauseRequested { .. } => {
                 state.audit.goal_pause_requests += 1;
             }
-            AgentEvent::GoalChangeRequested { kind, .. } => match kind.as_str() {
-                "amendment" => state.audit.goal_amendment_requests += 1,
-                "budget" => state.audit.goal_budget_requests += 1,
-                _ => {}
+            AgentEvent::GoalChangeRequested { kind, .. } => match kind {
+                crate::events::GoalChangeKind::Amendment => {
+                    state.audit.goal_amendment_requests += 1;
+                }
+                crate::events::GoalChangeKind::Budget => {
+                    state.audit.goal_budget_requests += 1;
+                }
             },
             AgentEvent::WorkflowStageStarted { stage, .. } => {
                 state.audit.workflow_stage_sequence.push(*stage);
@@ -691,10 +699,11 @@ impl EventSink for HarnessEventSink {
         ))
     }
 
-    fn request_goal_change(&mut self, kind: &str, summary: &str) -> Result<String> {
-        if !matches!(kind, "amendment" | "budget") {
-            bail!("unsupported harness Goal change request kind '{kind}'");
-        }
+    fn request_goal_change(
+        &mut self,
+        kind: crate::events::GoalChangeKind,
+        summary: &str,
+    ) -> Result<String> {
         let goal_id = self
             .state
             .lock()
@@ -705,7 +714,7 @@ impl EventSink for HarnessEventSink {
             .context("goal change requires a configured harness Goal context")?;
         self.emit(AgentEvent::GoalChangeRequested {
             goal_id: goal_id.clone(),
-            kind: kind.to_string(),
+            kind,
             summary: compact_detail(summary),
             timestamp_ms: Some(now_millis()),
         });
@@ -3823,10 +3832,16 @@ mod tests {
         sink.configure_goal_context(&goal).unwrap();
         sink.request_goal_pause("goal-harness-g8: inspect evidence")
             .unwrap();
-        sink.request_goal_change("amendment", "goal-harness-g8: narrow the remaining scope")
-            .unwrap();
-        sink.request_goal_change("budget", "goal-harness-g8: request ten more turns")
-            .unwrap();
+        sink.request_goal_change(
+            crate::events::GoalChangeKind::Amendment,
+            "goal-harness-g8: narrow the remaining scope",
+        )
+        .unwrap();
+        sink.request_goal_change(
+            crate::events::GoalChangeKind::Budget,
+            "goal-harness-g8: request ten more turns",
+        )
+        .unwrap();
 
         let (_, _, audit) = sink.snapshot().unwrap();
         assert_eq!(audit.goal_id.as_deref(), Some("goal-harness-g8"));

@@ -265,7 +265,11 @@ pub trait EventSink {
         bail!("goal pause is unavailable outside a daemon-managed goal")
     }
 
-    fn request_goal_change(&mut self, _kind: &str, _summary: &str) -> Result<String> {
+    fn request_goal_change(
+        &mut self,
+        _kind: crate::events::GoalChangeKind,
+        _summary: &str,
+    ) -> Result<String> {
         bail!("goal change requests are unavailable outside a daemon-managed goal")
     }
 
@@ -3531,8 +3535,8 @@ fn run_agent_inner<S: EventSink>(
         tool_energy_joules: nonzero_f64(outcome.metrics.tool_energy_joules),
         tool_energy_kwh: nonzero_f64(outcome.metrics.tool_energy_kwh),
         wall_runtime_ms,
-        started_at_ms: Some(turn_started_at_ms),
-        ended_at_ms: Some(turn_ended_at_ms),
+        started_at_ms: turn_started_at_ms,
+        ended_at_ms: turn_ended_at_ms,
         total_energy_joules: turn_energy.map(|estimate| estimate.joules),
         total_energy_kwh: turn_energy.map(|estimate| estimate.kwh),
         gross_energy_joules: turn_energy.map(|estimate| estimate.gross_joules),
@@ -13383,7 +13387,11 @@ impl EventSink for WorkflowCheckpointingSink<'_> {
         self.sink.request_goal_pause(reason)
     }
 
-    fn request_goal_change(&mut self, kind: &str, summary: &str) -> Result<String> {
+    fn request_goal_change(
+        &mut self,
+        kind: crate::events::GoalChangeKind,
+        summary: &str,
+    ) -> Result<String> {
         self.sink.request_goal_change(kind, summary)
     }
 
@@ -21923,7 +21931,10 @@ fn run_tool(
                 .as_ref()
                 .context("goal_request_amendment requires an active durable goal")?;
             let summary = bounded_goal_request_text(arguments, "summary")?;
-            sink.request_goal_change("amendment", &format!("{}: {summary}", goal.id))
+            sink.request_goal_change(
+                crate::events::GoalChangeKind::Amendment,
+                &format!("{}: {summary}", goal.id),
+            )
         }
         "goal_request_budget" => {
             let goal = context
@@ -21950,7 +21961,10 @@ fn run_tool(
             } else {
                 format!("{reason}; requested {requested}")
             };
-            sink.request_goal_change("budget", &format!("{}: {summary}", goal.id))
+            sink.request_goal_change(
+                crate::events::GoalChangeKind::Budget,
+                &format!("{}: {summary}", goal.id),
+            )
         }
         "submit_plan" => {
             let projected = project_plan_path_groups(

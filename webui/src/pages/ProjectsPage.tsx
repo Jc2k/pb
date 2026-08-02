@@ -35,9 +35,9 @@ import {
 } from "../lib/integrationConfig";
 import {
   ensureNotificationPermission,
-  projectName,
   projectSettingsPath,
   relativeTime,
+  sessionBelongsToProject,
   sessionTitle,
   uniqueInstalledIntegrations,
   uniqueIntegrations,
@@ -102,7 +102,7 @@ export function ProjectsPage() {
             : (
               projects.map((project) => {
                 const projectSessions = sessions.filter((session) =>
-                  session.workdir === project.path
+                  sessionBelongsToProject(session, project)
                 );
                 const running = projectSessions.filter((session) =>
                   session.status === "running"
@@ -221,12 +221,15 @@ export function ProjectPage() {
   const [usageLoading, setUsageLoading] = useState(true);
   const [usageError, setUsageError] = useState("");
   const usageRequest = useRef(new LatestRequest());
+  const startRequest = useRef(new LatestRequest());
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
   const projectSessions = useMemo(
     () =>
       project
-        ? sessions.filter((session) => session.workdir === project.path)
+        ? sessions.filter((session) =>
+          sessionBelongsToProject(session, project)
+        )
         : [],
     [project, sessions],
   );
@@ -243,6 +246,20 @@ export function ProjectPage() {
     projectSessions,
   ]);
   const latestBranch = projectSessions[0]?.branch || "Managed automatically";
+
+  useEffect(() => {
+    setTask("");
+    setIntent("discuss");
+    setGoalOpen(false);
+    setIsSubmitting(false);
+    setSubmitError("");
+    setVoiceInputActive(false);
+    setImages([]);
+    setFilter("all");
+    setActiveDetailsTab("usage");
+    startRequest.current.abort();
+    return () => startRequest.current.abort();
+  }, [name]);
 
   useEffect(() => {
     if (!name || !project) {
@@ -293,6 +310,7 @@ export function ProjectPage() {
     }
     setIsSubmitting(true);
     setSubmitError("");
+    const controller = startRequest.current.start();
     try {
       const res = await fetch("/api/sessions", {
         method: "POST",
@@ -303,18 +321,21 @@ export function ProjectPage() {
           workdir: project.path,
           attachments: images,
         }),
+        signal: controller.signal,
       });
       if (!res.ok) {
         throw new Error(`Could not start the session (${res.status})`);
       }
       const data = (await res.json()) as { session_id: string };
+      if (!startRequest.current.owns(controller)) return;
       navigate(`/sessions/${data.session_id}`);
     } catch (error) {
+      if (isAbortError(error) || !startRequest.current.owns(controller)) return;
       setSubmitError(
         error instanceof Error ? error.message : "Could not start the session",
       );
     } finally {
-      setIsSubmitting(false);
+      if (startRequest.current.owns(controller)) setIsSubmitting(false);
     }
   };
 
@@ -727,6 +748,10 @@ export function ProjectSettingsPage() {
   const [marketplaceError, setMarketplaceError] = useState("");
   const [installedError, setInstalledError] = useState("");
   const [integrationMutationError, setIntegrationMutationError] = useState("");
+  const [notificationMutationPending, setNotificationMutationPending] =
+    useState(false);
+  const notificationRequest = useRef(new LatestRequest());
+  const integrationMutationRequest = useRef(new LatestRequest());
   const [integrationSearch, setIntegrationSearch] = useState("");
   const [integrationCategory, setIntegrationCategory] = useState<
     IntegrationKind | "all"
@@ -747,6 +772,8 @@ export function ProjectSettingsPage() {
     projectsRequest.current.abort();
     marketplaceRequest.current.abort();
     installedRequest.current.abort();
+    notificationRequest.current.abort();
+    integrationMutationRequest.current.abort();
   }, []);
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
@@ -862,6 +889,20 @@ export function ProjectSettingsPage() {
   }, [fetchProjects]);
 
   useEffect(() => {
+    invalidateSchemaRequest();
+    setPendingInstall(null);
+    setConfigSchema(null);
+    setSchemaLoading(false);
+    setSchemaError("");
+    setSubmitError("");
+    setSubmitting(false);
+    setIntegrationMutationError("");
+    setNotificationMutationPending(false);
+    notificationRequest.current.abort();
+    integrationMutationRequest.current.abort();
+  }, [name]);
+
+  useEffect(() => {
     setInstalled([]);
     setInstalledError("");
     setIntegrationMutationError("");
@@ -870,9 +911,11 @@ export function ProjectSettingsPage() {
   }, [fetchInstalledIntegrations]);
 
   const toggleProjectNotifications = async () => {
-    if (!project) return;
+    if (!project || notificationMutationPending) return;
     const notifyOnFinish = nextProjectNotificationPreference(project);
     if (notifyOnFinish) void ensureNotificationPermission();
+    setNotificationMutationPending(true);
+    const controller = notificationRequest.current.start();
     try {
       const res = await fetch(
         `/api/projects/${encodeURIComponent(project.name)}/notifications`,
@@ -880,18 +923,30 @@ export function ProjectSettingsPage() {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ notify_on_finish: notifyOnFinish }),
+          signal: controller.signal,
         },
       );
       if (!res.ok) {
         throw new Error(`Could not update notifications (${res.status})`);
       }
-      void fetchProjects();
+      const updated = (await res.json()) as ProjectEntry;
+      if (!notificationRequest.current.owns(controller)) return;
+      setProjects((current) =>
+        current.map((entry) => entry.name === updated.name ? updated : entry)
+      );
     } catch (error) {
+      if (
+        isAbortError(error) || !notificationRequest.current.owns(controller)
+      ) return;
       setProjectsError(
         error instanceof Error
           ? error.message
           : "Could not update notifications",
       );
+    } finally {
+      if (notificationRequest.current.owns(controller)) {
+        setNotificationMutationPending(false);
+      }
     }
   };
 
@@ -907,6 +962,8 @@ export function ProjectSettingsPage() {
       : "install",
   ) => {
     if (!project || !containerImage.trim()) return;
+    integrationMutationRequest.current.abort();
+    setSubmitting(false);
     const pending = {
       kind,
       containerImage: containerImage.trim(),
@@ -965,20 +1022,27 @@ export function ProjectSettingsPage() {
       return;
     }
     setIntegrationMutationError("");
+    setSubmitting(false);
+    const controller = integrationMutationRequest.current.start();
     try {
       const res = await fetch(
         `/api/projects/${encodeURIComponent(project.name)}/integrations/${
           encodeURIComponent(item.name)
         }`,
-        { method: "DELETE" },
+        { method: "DELETE", signal: controller.signal },
       );
       if (!res.ok) {
         throw new Error(
           await integrationApiError(res, "Could not remove the integration"),
         );
       }
+      if (!integrationMutationRequest.current.owns(controller)) return;
       void fetchInstalledIntegrations();
     } catch (error) {
+      if (
+        isAbortError(error) ||
+        !integrationMutationRequest.current.owns(controller)
+      ) return;
       setIntegrationMutationError(
         error instanceof Error
           ? error.message
@@ -991,6 +1055,7 @@ export function ProjectSettingsPage() {
     if (!project || !pendingInstall) return;
     setSubmitting(true);
     setSubmitError("");
+    const controller = integrationMutationRequest.current.start();
     try {
       const res = await fetch(
         `/api/projects/${encodeURIComponent(project.name)}/integrations`,
@@ -1000,6 +1065,7 @@ export function ProjectSettingsPage() {
           body: JSON.stringify(
             integrationInstallPayload(pendingInstall, env, configSchema),
           ),
+          signal: controller.signal,
         },
       );
       if (!res.ok) {
@@ -1007,28 +1073,37 @@ export function ProjectSettingsPage() {
           await integrationApiError(res, "Could not install the integration"),
         );
       }
+      if (!integrationMutationRequest.current.owns(controller)) return;
       invalidateSchemaRequest();
       setPendingInstall(null);
       setConfigSchema(null);
       setSchemaError("");
       void fetchInstalledIntegrations();
     } catch (error) {
+      if (
+        isAbortError(error) ||
+        !integrationMutationRequest.current.owns(controller)
+      ) return;
       setSubmitError(
         error instanceof Error
           ? error.message
           : "Could not install the integration",
       );
     } finally {
-      setSubmitting(false);
+      if (integrationMutationRequest.current.owns(controller)) {
+        setSubmitting(false);
+      }
     }
   };
 
   const cancelIntegration = () => {
+    integrationMutationRequest.current.abort();
     invalidateSchemaRequest();
     setPendingInstall(null);
     setConfigSchema(null);
     setSchemaError("");
     setSubmitError("");
+    setSubmitting(false);
   };
 
   return (
@@ -1092,6 +1167,7 @@ export function ProjectSettingsPage() {
                 }`}
                 role="switch"
                 aria-checked={project.notify_on_finish}
+                disabled={notificationMutationPending}
                 onClick={() => void toggleProjectNotifications()}
               >
                 <span>{project.notify_on_finish ? "On" : "Off"}</span>

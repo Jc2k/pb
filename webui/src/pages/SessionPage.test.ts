@@ -2,9 +2,6 @@
 import { ok } from "node:assert/strict";
 import { equal } from "node:assert/strict";
 import {
-  latestGoalChangeRequest,
-  latestPendingDeliveryProposal,
-  latestPendingGoalProposal,
   mergeEventHistory,
   readyEvidenceLabel,
   workflowOutcomeLabel,
@@ -25,6 +22,7 @@ function eventEnvelopeDefaults(): Pick<
     chatter: [],
     evidence: [],
     transcript: {
+      sequence: testEventIndex,
       visibility: "visible",
       kind: "conversation",
       entry_key: `test-event-${testEventIndex}`,
@@ -50,7 +48,7 @@ function cssRule(css: string, selector: string): string {
 Deno.test("event history merges stream and snapshot data by stable entry key", () => {
   const started: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     event: {
       type: "started",
       task: "Review the boundary",
@@ -64,7 +62,7 @@ Deno.test("event history merges stream and snapshot data by stable entry key", (
   };
   const streamed: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v3",
+    version: "v4",
     event: {
       type: "user_message",
       message_id: "message-1",
@@ -84,92 +82,6 @@ Deno.test("event history merges stream and snapshot data by stable entry key", (
   equal(merged.length, 2);
   equal(merged[0], started);
   equal(merged[1], corrected);
-});
-
-Deno.test("delivery proposal remains conversational until an explicit Build turn", () => {
-  const events: EventEnvelope[] = [
-    {
-      ...eventEnvelopeDefaults(),
-      version: "v3",
-      event: {
-        type: "delivery_proposed",
-        proposal_id: "proposal-1",
-        source_turn_id: "turn-1",
-        task_summary: "Implement the agreed change",
-      },
-    },
-  ];
-  equal(latestPendingDeliveryProposal(events)?.proposal_id, "proposal-1");
-
-  events.push({
-    ...eventEnvelopeDefaults(),
-    version: "v3",
-    event: {
-      type: "conversation_turn_started",
-      turn_id: "turn-2",
-      intent: "discuss",
-      task: "What would that affect?",
-    },
-  });
-  equal(latestPendingDeliveryProposal(events)?.proposal_id, "proposal-1");
-
-  events.push({
-    ...eventEnvelopeDefaults(),
-    version: "v3",
-    event: {
-      type: "conversation_turn_started",
-      turn_id: "turn-3",
-      intent: "deliver",
-      task: "Go ahead",
-    },
-  });
-  equal(latestPendingDeliveryProposal(events), undefined);
-});
-
-Deno.test("goal proposal stays read-only until a durable goal starts", () => {
-  const events: EventEnvelope[] = [{
-    ...eventEnvelopeDefaults(),
-    version: "v3",
-    event: {
-      type: "goal_proposed",
-      proposal_id: "goal-proposal-1",
-      source_turn_id: "turn-1",
-      objective: "Ship goal mode",
-      criteria: [{ text: "Persist checkpoints", verifier: "review_required" }],
-    },
-  }];
-  equal(latestPendingGoalProposal(events)?.objective, "Ship goal mode");
-  events.push({
-    ...eventEnvelopeDefaults(),
-    version: "v3",
-    event: {
-      type: "goal_started",
-      goal_id: "goal-1",
-      objective: "Ship goal mode",
-      plan_sha256: "digest",
-    },
-  });
-  equal(latestPendingGoalProposal(events), undefined);
-});
-
-Deno.test("model goal change requests remain pending only until a user path resolves them", () => {
-  const events: EventEnvelope[] = [{
-    ...eventEnvelopeDefaults(),
-    version: "v3",
-    event: {
-      type: "goal_change_requested",
-      goal_id: "goal-1",
-      kind: "budget",
-      summary: "Need one more checked pass",
-    },
-  }];
-  equal(latestGoalChangeRequest(events)?.kind, "budget");
-  events.push({
-    ...eventEnvelopeDefaults(),
-    version: "v3",
-    event: { type: "goal_resumed", goal_id: "goal-1" },
-  });
-  equal(latestGoalChangeRequest(events), undefined);
 });
 
 Deno.test("strict workflow stages and outcomes use compact truthful labels", () => {
@@ -597,5 +509,17 @@ Deno.test("session transport opens first and lets EventSource reconnect with ded
   );
   ok(page.includes("mergeEventHistory(previous, [parsed])"));
   ok(page.includes("mergeEventHistory(details.events, previous)"));
+  ok(page.includes("if (sourceRef.current !== src) return;"));
+  ok(page.includes("new LatestRequest()"));
+  ok(page.includes("sessionRequestRef.current.owns(controller)"));
+  ok(page.includes("titleEffect.sequence > details.revision"));
+  ok(page.includes("runningEffect.sequence > details.revision"));
+  ok(page.includes("parsed.transcript.sequence > currentEffect.sequence"));
+  ok(page.includes("session?.pending_delivery_proposal"));
+  ok(page.includes("session?.pending_goal_proposal"));
+  ok(page.includes("session?.pending_goal_change"));
+  ok(!page.includes("latestPendingDeliveryProposal"));
+  ok(!page.includes("latestPendingGoalProposal"));
+  ok(!page.includes("latestGoalChangeRequest"));
   ok(!page.includes("src.onerror"));
 });

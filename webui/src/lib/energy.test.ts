@@ -27,6 +27,8 @@ function currentMetrics(
     energy_complete: false,
     energy_exclusive: false,
     ...values,
+    started_at_ms: values.started_at_ms ?? 0,
+    ended_at_ms: values.ended_at_ms ?? 0,
   };
 }
 

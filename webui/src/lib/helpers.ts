@@ -365,7 +365,9 @@ export async function notifySessionFinished(
   projects: ProjectEntry[],
 ) {
   if (session.status !== "completed" && session.status !== "failed") return;
-  const project = projects.find((entry) => entry.path === session.workdir);
+  const project = projects.find((entry) =>
+    sessionBelongsToProject(session, entry)
+  );
   if (!project?.notify_on_finish) return;
   if (!(await ensureNotificationPermission())) return;
   const title = handoffNotificationTitle(
@@ -419,10 +421,15 @@ export function handoffNotificationTitle(
   }
 }
 
-export function projectName(workdir?: string | null): string {
-  if (!workdir) return "Unknown project";
-  const parts = workdir.replace(/\\/g, "/").split("/").filter(Boolean);
-  return parts[parts.length - 1] || workdir;
+export function sessionBelongsToProject(
+  session: SessionItem,
+  project: ProjectEntry,
+): boolean {
+  return session.project?.path === project.path;
+}
+
+export function sessionProjectName(session: SessionItem): string {
+  return session.project?.name ?? "Unknown project";
 }
 
 export function usageStatsForToday(
@@ -439,8 +446,8 @@ export function usageStatsForToday(
     if (!session.metrics) return;
     session.usage_records.forEach((metrics) => {
       const runtime = metricRuntimeMs(metrics);
-      const endedAt = metrics.ended_at_ms ?? session.updated_at_ms;
-      const startedAt = metrics.started_at_ms ?? Math.max(0, endedAt - runtime);
+      const endedAt = metrics.ended_at_ms;
+      const startedAt = metrics.started_at_ms;
       const interval = Math.max(1, endedAt - startedAt);
       const overlap = Math.max(
         0,
