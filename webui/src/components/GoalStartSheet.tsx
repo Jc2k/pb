@@ -4,6 +4,7 @@ import type {
   GoalContinuationPolicy,
   ProjectEntry,
 } from "../types";
+import { apiErrorMessage } from "../lib/integrationConfig";
 import { VoiceInputButton } from "./VoiceInputButton";
 
 interface GoalStartSheetProps {
@@ -11,11 +12,13 @@ interface GoalStartSheetProps {
   initialObjective: string;
   initialCriteria?: string[];
   sessionId?: string;
-  workdir?: string;
+  projectName?: string;
   projects?: ProjectEntry[];
   onClose: () => void;
   onStarted: (sessionId: string) => void;
 }
+
+const EMPTY_PROJECTS: ProjectEntry[] = [];
 
 type BudgetPreset = "compact" | "standard" | "extended" | "advanced";
 
@@ -51,17 +54,21 @@ export function GoalStartSheet({
   initialObjective,
   initialCriteria,
   sessionId,
-  workdir,
-  projects = [],
+  projectName,
+  projects = EMPTY_PROJECTS,
   onClose,
   onStarted,
 }: GoalStartSheetProps) {
+  const initialCriteriaKey = JSON.stringify(initialCriteria ?? []);
+  const projectOptionsKey = projects.map(({ name }) => name).join("\u0000");
   const [objective, setObjective] = useState(initialObjective);
   const [criteria, setCriteria] = useState<string[]>([""]);
   const [continuation, setContinuation] = useState<GoalContinuationPolicy>(
     "review_plan_then_automatic",
   );
-  const [selectedWorkdir, setSelectedWorkdir] = useState(workdir ?? "");
+  const [selectedProjectName, setSelectedProjectName] = useState(
+    projectName ?? "",
+  );
   const [budgetPreset, setBudgetPreset] = useState<BudgetPreset>("standard");
   const [advancedBudget, setAdvancedBudget] = useState<GoalBudget>(
     GOAL_BUDGET_PRESETS.standard,
@@ -74,16 +81,22 @@ export function GoalStartSheet({
     if (!open) return;
     setObjective(initialObjective);
     setCriteria(initialCriteria?.length ? initialCriteria : [""]);
-    setSelectedWorkdir(workdir ?? projects[0]?.path ?? "");
+    setSelectedProjectName(projectName ?? projects[0]?.name ?? "");
     setBudgetPreset("standard");
     setAdvancedBudget(GOAL_BUDGET_PRESETS.standard);
     setError("");
-  }, [open, initialObjective, initialCriteria, workdir, projects]);
+  }, [
+    open,
+    initialObjective,
+    initialCriteriaKey,
+    projectName,
+    projectOptionsKey,
+  ]);
 
   if (!open) return null;
 
   const submit = async () => {
-    if (!objective.trim() || (!sessionId && !selectedWorkdir)) return;
+    if (!objective.trim() || (!sessionId && !selectedProjectName)) return;
     setSubmitting(true);
     setError("");
     try {
@@ -93,7 +106,7 @@ export function GoalStartSheet({
         body: JSON.stringify({
           session_id: sessionId,
           objective: objective.trim(),
-          workdir: sessionId ? undefined : selectedWorkdir,
+          project_name: sessionId ? undefined : selectedProjectName,
           continuation,
           budget: budgetPreset === "advanced"
             ? advancedBudget
@@ -106,14 +119,18 @@ export function GoalStartSheet({
       });
       if (!response.ok) {
         setError(
-          response.status === 409
-            ? "This session already has active work."
-            : "pb could not create this goal. Check the repository and limits.",
+          await apiErrorMessage(response, "pb could not create this goal."),
         );
         return;
       }
       const result = (await response.json()) as { session_id: string };
       onStarted(result.session_id);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "pb could not create this goal.",
+      );
     } finally {
       setSubmitting(false);
     }
@@ -164,18 +181,18 @@ export function GoalStartSheet({
           </div>
         </div>
 
-        {!sessionId && !workdir
+        {!sessionId && !projectName
           ? (
             <label className="goal-field">
               <span>Project</span>
               <select
                 className="form-select"
-                value={selectedWorkdir}
-                onChange={(event) => setSelectedWorkdir(event.target.value)}
+                value={selectedProjectName}
+                onChange={(event) => setSelectedProjectName(event.target.value)}
               >
                 <option value="">Select a registered project…</option>
                 {projects.map((project) => (
-                  <option key={project.path} value={project.path}>
+                  <option key={project.name} value={project.name}>
                     {project.name}
                   </option>
                 ))}
@@ -372,7 +389,7 @@ export function GoalStartSheet({
             className="btn btn-primary"
             type="button"
             disabled={submitting || voiceInputActive || !objective.trim() ||
-              (!sessionId && !selectedWorkdir)}
+              (!sessionId && !selectedProjectName)}
             onClick={() => void submit()}
           >
             {submitting ? "Planning…" : "Plan goal"}

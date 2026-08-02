@@ -46,7 +46,7 @@ Deno.test("goal setup exposes criteria, continuation, three presets, advanced li
       open
       initialObjective="Ship durable goal mode"
       initialCriteria={["Persist checkpoints"]}
-      workdir="/project"
+      projectName="project"
       onClose={() => {}}
       onStarted={() => {}}
     />,

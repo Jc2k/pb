@@ -320,6 +320,16 @@ registered-project identity, pending proposals, and Goal
 change requests directly so the terminal and browser show the same team conversation and actions
 without reconstructing them from nearby events. Session snapshots and live events share a monotonic
 revision, preventing a slower snapshot response from reverting a newer title or running state.
+The browser addresses registered projects by name rather than copying their filesystem paths into
+session or Goal requests. The service resolves that identity and returns structured failures for
+invalid or stale mutations. Live effects at or below the accepted snapshot revision are replay,
+while newer refresh effects are coalesced into a fresh snapshot request.
+
+The service records an event before making it live. Terminal reattachment atomically captures
+history and subscribes, recovers a lagged receiver from sequence-numbered history, and drains final
+events before reporting that the session finished. Retention may exceed its nominal event count to
+preserve the prior records required to validate server-authored chatter, evidence, supersession,
+and transcript projections on strict restore.
 
 If a file is missing, binary, symlinked, stale, oversized, or cannot fit the bounded prompt safely,
 pb does not pretend it was read. The normal model/tool path remains available. Automatic deletion

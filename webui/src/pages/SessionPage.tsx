@@ -44,6 +44,14 @@ import {
   chatEventsWithOnlyLatestStep,
 } from "../lib/sessionUtils";
 import { isAbortError, LatestRequest } from "../lib/hooks";
+import { apiErrorMessage } from "../lib/integrationConfig";
+
+export function isNewerThanSnapshot(
+  sequence: number,
+  revision: number | null,
+): boolean {
+  return revision !== null && sequence > revision;
+}
 
 export function workflowRecoveryPresentation(
   workflow?: WorkflowSummary | null,
@@ -129,9 +137,17 @@ export function SessionPage() {
   const [taskRecoveryBusy, setTaskRecoveryBusy] = useState(false);
   const [workflowRecoveryBusy, setWorkflowRecoveryBusy] = useState(false);
   const [workflowRecoveryError, setWorkflowRecoveryError] = useState("");
+  const [actionError, setActionError] = useState("");
   const [showMessageTimes, setShowMessageTimes] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
   const sessionRequestRef = useRef(new LatestRequest());
+  const sessionFetchControllerRef = useRef<AbortController | null>(null);
+  const sessionRefreshRequestedRef = useRef(false);
+  const actionRequestRef = useRef(new LatestRequest());
+  const messageRequestRef = useRef(new LatestRequest());
+  const snapshotRevisionRef = useRef<number | null>(null);
+  const latestRefreshEffectRef = useRef(0);
+  const refreshTimerRef = useRef<number | null>(null);
   const latestTitleEffectRef = useRef<
     { sequence: number; title: string } | null
   >(null);
@@ -141,6 +157,17 @@ export function SessionPage() {
   const chatRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
   const messageTimePullStartRef = useRef<{ x: number; y: number } | null>(null);
+
+  const scheduleSessionRefresh = () => {
+    if (
+      refreshTimerRef.current !== null ||
+      sessionFetchControllerRef.current !== null
+    ) return;
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null;
+      void fetchSession();
+    }, 0);
+  };
 
   const openEvents = (id: string) => {
     if (sourceRef.current) sourceRef.current.close();
@@ -152,49 +179,62 @@ export function SessionPage() {
         const parsed = JSON.parse(msg.data) as EventEnvelope;
         setEvents((previous) => mergeEventHistory(previous, [parsed]));
         const effect = parsed.transcript.session_effect;
+        const sequence = parsed.transcript.sequence;
+        const newerThanSnapshot = isNewerThanSnapshot(
+          sequence,
+          snapshotRevisionRef.current,
+        );
         if (effect.title) {
           const title = effect.title;
           const currentEffect = latestTitleEffectRef.current;
           if (
             !currentEffect ||
-            parsed.transcript.sequence > currentEffect.sequence
+            sequence > currentEffect.sequence
           ) {
             latestTitleEffectRef.current = {
-              sequence: parsed.transcript.sequence,
+              sequence,
               title,
             };
-            setSession((current) => current ? { ...current, title } : current);
+            if (newerThanSnapshot) {
+              setSession((current) =>
+                current ? { ...current, title } : current
+              );
+            }
           }
         }
         if (effect.refresh) {
-          void fetchSession();
+          latestRefreshEffectRef.current = Math.max(
+            latestRefreshEffectRef.current,
+            sequence,
+          );
+          if (newerThanSnapshot) scheduleSessionRefresh();
         }
         if (effect.running === "running") {
           const currentEffect = latestRunningEffectRef.current;
           if (
             !currentEffect ||
-            parsed.transcript.sequence > currentEffect.sequence
+            sequence > currentEffect.sequence
           ) {
             latestRunningEffectRef.current = {
-              sequence: parsed.transcript.sequence,
+              sequence,
               running: true,
             };
-            setSessionRunning(true);
+            if (newerThanSnapshot) setSessionRunning(true);
           }
         } else if (effect.running === "stopped") {
           const currentEffect = latestRunningEffectRef.current;
           if (
             !currentEffect ||
-            parsed.transcript.sequence > currentEffect.sequence
+            sequence > currentEffect.sequence
           ) {
             latestRunningEffectRef.current = {
-              sequence: parsed.transcript.sequence,
+              sequence,
               running: false,
             };
-            setSessionRunning(false);
+            if (newerThanSnapshot) setSessionRunning(false);
           }
         }
-        if (effect.reset_intent) {
+        if (effect.reset_intent && newerThanSnapshot) {
           setIntent("discuss");
         }
       } catch (err) {
@@ -204,7 +244,14 @@ export function SessionPage() {
   };
 
   const fetchSession = async () => {
+    if (sessionFetchControllerRef.current !== null) {
+      sessionRefreshRequestedRef.current = true;
+      return;
+    }
+    sessionRefreshRequestedRef.current = false;
     const controller = sessionRequestRef.current.start();
+    sessionFetchControllerRef.current = controller;
+    let accepted = false;
     try {
       const res = await fetch(`/api/sessions/${sessionId}`, {
         signal: controller.signal,
@@ -214,6 +261,14 @@ export function SessionPage() {
       }
       const details = (await res.json()) as SessionDetails;
       if (!sessionRequestRef.current.owns(controller)) return;
+      if (
+        snapshotRevisionRef.current !== null &&
+        details.revision < snapshotRevisionRef.current
+      ) {
+        accepted = true;
+        return;
+      }
+      snapshotRevisionRef.current = details.revision;
       const titleEffect = latestTitleEffectRef.current;
       const runningEffect = latestRunningEffectRef.current;
       setSession(
@@ -228,7 +283,7 @@ export function SessionPage() {
           : details.running,
       );
       setSessionError("");
-      setAnswer("");
+      accepted = true;
     } catch (error) {
       if (
         isAbortError(error) || !sessionRequestRef.current.owns(controller)
@@ -236,6 +291,17 @@ export function SessionPage() {
       setSessionError(
         error instanceof Error ? error.message : "Session request failed",
       );
+    } finally {
+      if (sessionFetchControllerRef.current === controller) {
+        sessionFetchControllerRef.current = null;
+        if (
+          sessionRefreshRequestedRef.current ||
+          (accepted && snapshotRevisionRef.current !== null &&
+            latestRefreshEffectRef.current > snapshotRevisionRef.current)
+        ) {
+          scheduleSessionRefresh();
+        }
+      }
     }
   };
 
@@ -249,41 +315,65 @@ export function SessionPage() {
       setGoalStartOpen(true);
       return;
     }
-    await fetch(`/api/sessions/${sessionId}/continue`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        task,
-        intent: requestedIntent,
-        proposal_id: proposalId,
-      }),
-    });
-    setFollowUp("");
-    setSessionRunning(false);
+    setActionError("");
+    const controller = actionRequestRef.current.start();
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}/continue`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task,
+          intent: requestedIntent,
+          proposal_id: proposalId,
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(
+          await apiErrorMessage(response, "Could not continue the session"),
+        );
+      }
+      if (!actionRequestRef.current.owns(controller)) return;
+      setFollowUp("");
+      setSessionRunning(false);
+    } catch (error) {
+      if (isAbortError(error) || !actionRequestRef.current.owns(controller)) {
+        return;
+      }
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : "Could not continue the session",
+      );
+    }
   };
 
   const sendRunningMessage = async () => {
     const message = runningMessage.trim();
     if (!message) return;
     setRunningMessageError("");
-    const response = await fetch(`/api/sessions/${sessionId}/message`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message }),
-    });
-    if (response.ok) {
-      setRunningMessage("");
-      return;
-    }
-    if (response.status === 409) {
+    const controller = messageRequestRef.current.start();
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}/message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(
+          await apiErrorMessage(response, "Message could not be sent"),
+        );
+      }
+      if (messageRequestRef.current.owns(controller)) setRunningMessage("");
+    } catch (error) {
+      if (isAbortError(error) || !messageRequestRef.current.owns(controller)) {
+        return;
+      }
       setRunningMessageError(
-        "The task stopped accepting in-flight messages before this could be sent.",
+        error instanceof Error ? error.message : "Message could not be sent",
       );
       await fetchSession();
-    } else if (response.status === 429) {
-      setRunningMessageError("Too many messages are waiting to be picked up.");
-    } else {
-      setRunningMessageError("Message could not be sent.");
     }
   };
 
@@ -294,16 +384,33 @@ export function SessionPage() {
     const goal = session?.active_goal ? session.goal : undefined;
     if (!goal) return false;
     setGoalBusy(true);
+    setActionError("");
+    const controller = actionRequestRef.current.start();
     try {
       const response = await fetch(`/api/goals/${goal.run.id}/${action}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ goal_sha256: goal.sha256, ...body }),
+        signal: controller.signal,
       });
+      if (!response.ok) {
+        throw new Error(
+          await apiErrorMessage(response, "Could not update the goal"),
+        );
+      }
+      if (!actionRequestRef.current.owns(controller)) return false;
       await fetchSession();
-      return response.ok;
+      return true;
+    } catch (error) {
+      if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
+        setActionError(
+          error instanceof Error ? error.message : "Could not update the goal",
+        );
+        await fetchSession();
+      }
+      return false;
     } finally {
-      setGoalBusy(false);
+      if (actionRequestRef.current.owns(controller)) setGoalBusy(false);
     }
   };
 
@@ -347,40 +454,95 @@ export function SessionPage() {
   const recoverWorkflow = async (action: "resume" | "restart-delivery") => {
     setWorkflowRecoveryBusy(true);
     setWorkflowRecoveryError("");
+    const controller = actionRequestRef.current.start();
     try {
       const response = await fetch(`/api/sessions/${sessionId}/${action}`, {
         method: "POST",
+        signal: controller.signal,
       });
+      if (!actionRequestRef.current.owns(controller)) return;
       if (!response.ok) {
         setWorkflowRecoveryError(
-          action === "restart-delivery"
-            ? "The delivery could not restart from the current files. Refresh the session and try again."
-            : "The preserved stage is not ready to resume yet.",
+          await apiErrorMessage(
+            response,
+            "The session is not ready to resume.",
+          ),
         );
+        return;
       }
       setSessionRunning(false);
       await fetchSession();
+    } catch (error) {
+      if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
+        setWorkflowRecoveryError(
+          error instanceof Error
+            ? error.message
+            : "Could not resume the session",
+        );
+      }
     } finally {
-      setWorkflowRecoveryBusy(false);
+      if (actionRequestRef.current.owns(controller)) {
+        setWorkflowRecoveryBusy(false);
+      }
     }
   };
 
   const cancelSession = async () => {
-    await fetch(`/api/sessions/${sessionId}/cancel`, { method: "POST" });
-    setSessionRunning(false);
-    setIntent("discuss");
-    await fetchSession();
+    setActionError("");
+    const controller = actionRequestRef.current.start();
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}/cancel`, {
+        method: "POST",
+        signal: controller.signal,
+      });
+      if (!actionRequestRef.current.owns(controller)) return;
+      if (!response.ok) {
+        setActionError(
+          await apiErrorMessage(response, "Could not stop the session"),
+        );
+        return;
+      }
+      setSessionRunning(false);
+      setIntent("discuss");
+      await fetchSession();
+    } catch (error) {
+      if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
+        setActionError(
+          error instanceof Error ? error.message : "Could not stop the session",
+        );
+      }
+    }
   };
 
   const recoverTaskPlanning = async (
     action: "retry-task-planning" | "run-as-one-build",
   ) => {
     setTaskRecoveryBusy(true);
+    setActionError("");
+    const controller = actionRequestRef.current.start();
     try {
-      await fetch(`/api/sessions/${sessionId}/${action}`, { method: "POST" });
+      const response = await fetch(`/api/sessions/${sessionId}/${action}`, {
+        method: "POST",
+        signal: controller.signal,
+      });
+      if (!actionRequestRef.current.owns(controller)) return;
+      if (!response.ok) {
+        setActionError(
+          await apiErrorMessage(response, "Could not recover task planning"),
+        );
+        return;
+      }
       await fetchSession();
+    } catch (error) {
+      if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Could not recover task planning",
+        );
+      }
     } finally {
-      setTaskRecoveryBusy(false);
+      if (actionRequestRef.current.owns(controller)) setTaskRecoveryBusy(false);
     }
   };
 
@@ -414,16 +576,37 @@ export function SessionPage() {
   const answerQuestion = async (choice?: string) => {
     const selectedAnswer = choice ?? answer.trim();
     if (!selectedAnswer || !session?.pending_question) return;
-    await fetch(`/api/sessions/${sessionId}/answer`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        question_id: session.pending_question.question_id,
-        answer: selectedAnswer,
-      }),
-    });
-    setAnswer("");
-    setSessionRunning(true);
+    setActionError("");
+    const controller = actionRequestRef.current.start();
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question_id: session.pending_question.question_id,
+          answer: selectedAnswer,
+        }),
+        signal: controller.signal,
+      });
+      if (!actionRequestRef.current.owns(controller)) return;
+      if (!response.ok) {
+        setActionError(
+          await apiErrorMessage(response, "Could not submit the answer"),
+        );
+        await fetchSession();
+        return;
+      }
+      setAnswer("");
+      setSessionRunning(true);
+    } catch (error) {
+      if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Could not submit the answer",
+        );
+      }
+    }
   };
 
   const onChatScroll = () => {
@@ -467,13 +650,33 @@ export function SessionPage() {
     atBottomRef.current = true;
     setSession(null);
     setSessionError("");
+    setActionError("");
     setEvents([]);
+    setFollowUp("");
+    setRunningMessage("");
+    setRunningMessageError("");
+    setAnswer("");
+    setIntent("discuss");
     latestTitleEffectRef.current = null;
     latestRunningEffectRef.current = null;
+    snapshotRevisionRef.current = null;
+    latestRefreshEffectRef.current = 0;
+    sessionRefreshRequestedRef.current = false;
+    if (refreshTimerRef.current !== null) {
+      window.clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+    }
     openEvents(sessionId);
     void fetchSession();
     return () => {
       sessionRequestRef.current.abort();
+      sessionFetchControllerRef.current = null;
+      actionRequestRef.current.abort();
+      messageRequestRef.current.abort();
+      if (refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
       sourceRef.current?.close();
     };
   }, [sessionId]);
@@ -663,6 +866,14 @@ export function SessionPage() {
             <i className="bi bi-stop-fill"></i>
           </button>
         </header>
+
+        {actionError
+          ? (
+            <div className="alert alert-danger m-3 mb-0 py-2" role="alert">
+              {actionError}
+            </div>
+          )
+          : null}
 
         {session.multi_task
           ? (

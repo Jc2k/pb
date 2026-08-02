@@ -44,6 +44,7 @@ const SESSION_HISTORY_RESPONSE_LIMIT: usize = 300;
 const MAX_USER_MESSAGE_CHARS: usize = 8_000;
 const MAX_PENDING_USER_MESSAGES: usize = 32;
 static USER_MESSAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static ID_FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const SERVICE_WORKER_JS: &str = r#"self.addEventListener("install",(event)=>{self.skipWaiting();});
 self.addEventListener("activate",(event)=>{event.waitUntil(self.clients.claim());});
@@ -85,6 +86,8 @@ pub struct StartSessionRequest {
     pub proposal_id: Option<String>,
     pub model: Option<String>,
     pub model_dir: Option<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
     pub workdir: Option<String>,
     pub branch: Option<String>,
     pub max_steps: Option<usize>,
@@ -144,6 +147,8 @@ pub struct StartGoalRequest {
     pub continuation: crate::goal::GoalContinuationPolicy,
     #[serde(default)]
     pub budget: Option<crate::goal::GoalBudget>,
+    #[serde(default)]
+    pub project_name: Option<String>,
     #[serde(default)]
     pub workdir: Option<String>,
     #[serde(default)]
@@ -772,6 +777,56 @@ impl IntoResponse for IntegrationApiError {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ApiErrorBody {
+    code: &'static str,
+    error: String,
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, code: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            status,
+            code,
+            message: error.to_string().chars().take(2_000).collect(),
+        }
+    }
+}
+
+impl From<StatusCode> for ApiError {
+    fn from(status: StatusCode) -> Self {
+        let (code, message) = match status {
+            StatusCode::BAD_REQUEST => ("invalid_request", "The request is invalid."),
+            StatusCode::NOT_FOUND => ("not_found", "The requested resource was not found."),
+            StatusCode::CONFLICT => ("state_conflict", "The resource state has changed."),
+            StatusCode::PAYLOAD_TOO_LARGE => ("payload_too_large", "The request is too large."),
+            StatusCode::TOO_MANY_REQUESTS => ("queue_full", "The request queue is full."),
+            _ => ("internal_error", "pb could not complete the request."),
+        };
+        Self::new(status, code, message)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(ApiErrorBody {
+                code: self.code,
+                error: self.message,
+            }),
+        )
+            .into_response()
+    }
+}
+
 async fn get_integration_config_schema(
     Query(query): Query<IntegrationSchemaQuery>,
 ) -> Result<Json<IntegrationConfigSchema>, IntegrationApiError> {
@@ -890,11 +945,11 @@ async fn remove_global_lsp_integration(
 async fn start_session(
     State((state, defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<StartSessionRequest>,
-) -> Result<Json<SessionResponse>, StatusCode> {
+) -> Result<Json<SessionResponse>, ApiError> {
     start_session_inner(state, defaults, req)
         .await
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, "session_start_rejected", error))
 }
 
 async fn start_session_inner(
@@ -904,25 +959,46 @@ async fn start_session_inner(
 ) -> Result<SessionResponse> {
     let session_id = new_session_id();
     let (sender, _) = broadcast::channel(256);
+    let task = req.task.trim().to_string();
+    if task.is_empty() {
+        bail!("session task must not be empty");
+    }
+    if req.project_name.is_some() && req.workdir.is_some() {
+        bail!("choose project_name or workdir, not both");
+    }
+    let mut registered_projects = projects::load_projects()?;
+    let named_project = req
+        .project_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| registered_session_project(&registered_projects, name))
+        .transpose()?;
 
     let mut request = defaults.clone();
-    request.task = req.task.clone();
+    request.task = task.clone();
     if let Some(model) = req.model {
         request.model = model;
     }
     if let Some(model_dir) = req.model_dir {
         request.model_dir = Some(PathBuf::from(model_dir));
     }
-    let explicit_workdir = req
-        .workdir
-        .as_deref()
-        .filter(|workdir| !workdir.trim().is_empty());
+    let explicit_workdir = named_project
+        .as_ref()
+        .map(|(workdir, _)| workdir.as_path())
+        .or_else(|| {
+            req.workdir
+                .as_deref()
+                .filter(|workdir| !workdir.trim().is_empty())
+                .map(std::path::Path::new)
+        });
     if let Some(workdir) = explicit_workdir {
         request.workdir = Some(PathBuf::from(workdir));
         request.repository_less = false;
-    } else if let Some(bootstrap) = maybe_bootstrap_project(&req.task)? {
+    } else if let Some(bootstrap) = maybe_bootstrap_project(&task)? {
         request.workdir = Some(bootstrap);
         request.repository_less = false;
+        registered_projects = projects::load_projects()?;
     } else {
         request.workdir = None;
         request.repository_less = true;
@@ -972,8 +1048,9 @@ async fn start_session_inner(
     request.attachments =
         materialize_attachments(&session_id, request.workdir.as_deref(), req.attachments)?;
 
-    let registered_projects = projects::load_projects()?;
-    let project = resolve_session_project(&registered_projects, request.workdir.as_deref());
+    let project = named_project
+        .map(|(_, project)| project)
+        .or_else(|| resolve_session_project(&registered_projects, request.workdir.as_deref()));
     *state.projects.lock().await = registered_projects;
     let durable = DurableSessionProjection {
         project,
@@ -1013,6 +1090,9 @@ async fn start_session_inner(
 
     {
         let mut sessions = state.sessions.lock().await;
+        if sessions.contains_key(&session_id) {
+            bail!("generated session id collision");
+        }
         sessions.insert(session_id.clone(), session);
     }
 
@@ -1042,13 +1122,13 @@ async fn start_session_inner(
 async fn start_goal(
     State((state, defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<StartGoalRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     start_goal_inner(state, defaults, req)
         .await
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, "failed to start goal");
-            StatusCode::BAD_REQUEST
+            ApiError::new(StatusCode::BAD_REQUEST, "goal_start_rejected", error)
         })
 }
 
@@ -1058,7 +1138,7 @@ async fn start_goal_inner(
     req: StartGoalRequest,
 ) -> Result<GoalResponse> {
     let now = now_millis();
-    let goal_id = format!("goal-{now}");
+    let goal_id = new_durable_id("goal");
     let objective = req.objective.trim().to_string();
     if objective.is_empty() {
         bail!("goal objective must not be empty");
@@ -1068,8 +1148,22 @@ async fn start_goal_inner(
     // second application lock while it is changing durable session state.
     let registered_projects = state.projects.lock().await.clone();
     let mut sessions = state.sessions.lock().await;
-    let session_id = req.session_id.clone().unwrap_or_else(new_session_id);
+    let requested_existing_session = req.session_id.is_some();
+    let session_id = req.session_id.clone().unwrap_or_else(|| {
+        loop {
+            let candidate = new_session_id();
+            if !sessions.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    });
     if let Some(session) = sessions.get_mut(&session_id) {
+        if !requested_existing_session {
+            bail!("generated session id collision");
+        }
+        if req.project_name.is_some() || req.workdir.is_some() {
+            bail!("an existing session already determines the goal project");
+        }
         if session.goal.is_some() || session.running || session.pending_question.is_some() {
             bail!("session already has active work");
         }
@@ -1120,11 +1214,25 @@ async fn start_goal_inner(
         });
     }
 
-    let workdir = req
-        .workdir
+    if req.project_name.is_some() && req.workdir.is_some() {
+        bail!("choose project_name or workdir, not both");
+    }
+    let named_project = req
+        .project_name
         .as_deref()
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| registered_session_project(&registered_projects, name))
+        .transpose()?;
+    let workdir = named_project
+        .as_ref()
+        .map(|(workdir, _)| workdir.clone())
+        .or_else(|| {
+            req.workdir
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from)
+        })
         .context("goal mode requires a registered repository")?;
     ensure_goal_workdir_registered(&registered_projects, &workdir)?;
     let policy = goal_policy_for_request(Some(&workdir))?;
@@ -1159,7 +1267,9 @@ async fn start_goal_inner(
     if let Some(model) = req.model {
         request.model = model;
     }
-    let project = resolve_session_project(&registered_projects, Some(&workdir));
+    let project = named_project
+        .map(|(_, project)| project)
+        .or_else(|| resolve_session_project(&registered_projects, Some(&workdir)));
     let mut session = SessionState {
         task: objective.clone(),
         title: Some(objective),
@@ -1267,6 +1377,23 @@ fn resolve_session_project(
     })
 }
 
+fn registered_session_project(
+    projects: &[ProjectEntry],
+    project_name: &str,
+) -> Result<(PathBuf, SessionProject)> {
+    let project = projects
+        .iter()
+        .find(|project| project.name == project_name)
+        .with_context(|| format!("registered project not found: {project_name}"))?;
+    Ok((
+        PathBuf::from(&project.path),
+        SessionProject {
+            name: project.name.clone(),
+            path: project.path.clone(),
+        },
+    ))
+}
+
 fn publish_goal_started(session: &mut SessionState, checkpoint: &crate::goal::GoalCheckpoint) {
     publish_event(
         &session.sender,
@@ -1318,7 +1445,7 @@ async fn approve_goal_plan(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     let response = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
         let plan_sha256 = req
             .plan_sha256
@@ -1349,7 +1476,7 @@ async fn revise_goal_draft(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalAmendmentRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
         validate_goal_task_amendment(session, &req.objective, &req.criteria, req.budget)?;
         run.revise_initial_plan(
@@ -1382,7 +1509,7 @@ async fn pause_goal(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     let response = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
         let paused = run.request_pause(now_millis())?;
         session.pause_token.store(true, Ordering::SeqCst);
@@ -1416,7 +1543,7 @@ async fn resume_goal(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     let response = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
         run.resume(now_millis())?;
         session.durable.pending_goal_change = None;
@@ -1444,12 +1571,16 @@ async fn cancel_goal(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     let mut sessions = state.sessions.lock().await;
     let (session_id, session) = find_active_goal_session_mut(&mut sessions, &id)?;
     let checkpoint = session.goal.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     if checkpoint.sha256 != req.goal_sha256 {
-        return Err(StatusCode::CONFLICT);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "goal_revision_conflict",
+            "the goal changed; refresh before retrying",
+        ));
     }
     if session.running {
         session.pause_token.store(false, Ordering::SeqCst);
@@ -1489,13 +1620,17 @@ async fn accept_goal(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     let mut sessions = state.sessions.lock().await;
     let (session_id, session) = find_active_goal_session_mut(&mut sessions, &id)?;
     let mut checkpoint = session.goal.take().ok_or(StatusCode::NOT_FOUND)?;
     if checkpoint.sha256 != req.goal_sha256 {
         session.goal = Some(checkpoint);
-        return Err(StatusCode::CONFLICT);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "goal_revision_conflict",
+            "the goal changed; refresh before retrying",
+        ));
     }
     checkpoint
         .run
@@ -1535,10 +1670,10 @@ async fn amend_goal(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalAmendmentRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
         validate_goal_task_amendment(session, &req.objective, &req.criteria, req.budget)?;
-        let amendment_id = format!("amendment-{}", now_millis());
+        let amendment_id = new_durable_id("amendment");
         run.propose_amendment(
             amendment_id.clone(),
             req.goal_sha256.clone(),
@@ -1576,7 +1711,7 @@ async fn approve_goal_amendment(
     Path((id, amendment_id)): Path<(String, String)>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     let response = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
         let pending = run
             .pending_amendment
@@ -1621,7 +1756,7 @@ async fn discard_goal_amendment(
     Path((id, amendment_id)): Path<(String, String)>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
-) -> Result<Json<GoalResponse>, StatusCode> {
+) -> Result<Json<GoalResponse>, ApiError> {
     mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
         if run
             .pending_amendment
@@ -1654,18 +1789,26 @@ async fn mutate_active_goal(
     goal_id: &str,
     expected_sha256: &str,
     mutate: impl FnOnce(&mut SessionState, &mut crate::goal::GoalRun) -> Result<()>,
-) -> Result<GoalResponse, StatusCode> {
+) -> Result<GoalResponse, ApiError> {
     let mut sessions = state.sessions.lock().await;
     let (session_id, session) = find_active_goal_session_mut(&mut sessions, goal_id)?;
     let mut checkpoint = session.goal.take().ok_or(StatusCode::NOT_FOUND)?;
     if checkpoint.sha256 != expected_sha256 {
         session.goal = Some(checkpoint);
-        return Err(StatusCode::CONFLICT);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "goal_revision_conflict",
+            "the goal changed; refresh before retrying",
+        ));
     }
     if let Err(error) = mutate(session, &mut checkpoint.run) {
         session.goal = Some(checkpoint);
         tracing::warn!(%error, "goal mutation rejected");
-        return Err(StatusCode::CONFLICT);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "goal_mutation_rejected",
+            error,
+        ));
     }
     checkpoint = crate::goal::GoalCheckpoint::new(checkpoint.run).map_err(internal_status)?;
     session.updated_at_ms = now_millis();
@@ -2159,20 +2302,44 @@ async fn continue_session(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<ContinueSessionRequest>,
-) -> Result<Json<SessionResponse>, StatusCode> {
+) -> Result<Json<SessionResponse>, ApiError> {
+    let task = req.task.trim().to_string();
+    if task.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_task",
+            "session task must not be empty",
+        ));
+    }
     let mut sessions = state.sessions.lock().await;
-    let session = sessions.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let session = sessions.get_mut(&id).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "session not found",
+        )
+    })?;
     if !matches!(
         session.status,
         SessionStatus::Completed | SessionStatus::Failed
     ) {
-        return Err(StatusCode::CONFLICT);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "session_not_continuable",
+            "only a completed or failed session can be continued",
+        ));
     }
 
     let mut request = session.request_template.clone();
-    request.task = req.task;
-    let workflow_policy = workflow_policy_for_request(session.workdir.as_deref())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    request.task = task;
+    let workflow_policy =
+        workflow_policy_for_request(session.workdir.as_deref()).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workflow_policy_failed",
+                error,
+            )
+        })?;
     request.intent = Some(req.intent.unwrap_or(workflow_policy.default_intent));
     request.workflow_policy = Some(workflow_policy);
     request.workflow_stage = None;
@@ -2180,7 +2347,11 @@ async fn continue_session(
     request.goal_context = None;
     request.turn_id = new_turn_id(&id);
     if req.proposal_id.is_some() && request.intent != Some(crate::workflow::TurnIntent::Deliver) {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_proposal",
+            "only a delivery turn can cite a delivery proposal",
+        ));
     }
     let cited_proposal = match req.proposal_id.as_deref() {
         Some(proposal_id) => Some(
@@ -2190,7 +2361,13 @@ async fn continue_session(
                 .as_ref()
                 .filter(|proposal| proposal.id == proposal_id)
                 .cloned()
-                .ok_or(StatusCode::BAD_REQUEST)?,
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_proposal",
+                        "delivery proposal is missing or stale",
+                    )
+                })?,
         ),
         None => None,
     };
@@ -2204,10 +2381,13 @@ async fn continue_session(
     request.branch = session.branch.clone();
     request.workdir = session.workdir.clone();
     request.prior_check_evidence = {
-        let history = session
-            .history
-            .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let history = session.history.lock().map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_history_unavailable",
+                "session history is unavailable",
+            )
+        })?;
         let events = history
             .iter()
             .map(|envelope| envelope.event.clone())
@@ -2273,30 +2453,59 @@ async fn send_session_message(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<SendSessionMessageRequest>,
-) -> Result<Json<SendSessionMessageResponse>, StatusCode> {
+) -> Result<Json<SendSessionMessageResponse>, ApiError> {
     let message = req.message.trim().to_string();
     if message.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_message",
+            "message must not be empty",
+        ));
     }
     if message.chars().count() > MAX_USER_MESSAGE_CHARS {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "message_too_large",
+            format!("message must contain at most {MAX_USER_MESSAGE_CHARS} characters"),
+        ));
     }
 
     let mut sessions = state.sessions.lock().await;
-    let session = sessions.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let session = sessions.get_mut(&id).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "session not found",
+        )
+    })?;
     if session.status != SessionStatus::Running || !session.running {
-        return Err(StatusCode::CONFLICT);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "session_not_running",
+            "messages can only be sent to a running session",
+        ));
     }
     let message_id = new_user_message_id(&id);
-    let mut pending = session
-        .pending_user_messages
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut pending = session.pending_user_messages.lock().map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "message_queue_unavailable",
+            "message queue is unavailable",
+        )
+    })?;
     if !session.accepting_user_messages.load(Ordering::SeqCst) {
-        return Err(StatusCode::CONFLICT);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "message_window_closed",
+            "the agent is no longer accepting messages for this turn",
+        ));
     }
     if pending.len() >= MAX_PENDING_USER_MESSAGES {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "message_queue_full",
+            "the pending message queue is full",
+        ));
     }
     pending.push_back(QueuedUserMessage {
         message_id: message_id.clone(),
@@ -2320,13 +2529,17 @@ async fn send_session_message(
 async fn resume_session(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<SessionResponse>, StatusCode> {
+) -> Result<Json<SessionResponse>, ApiError> {
     resume_session_inner(state, id)
         .await
         .map(Json)
         .map_err(|err| match err.downcast_ref::<ResumeSessionError>() {
-            Some(ResumeSessionError::NotFound) => StatusCode::NOT_FOUND,
-            Some(ResumeSessionError::Conflict) | None => StatusCode::CONFLICT,
+            Some(ResumeSessionError::NotFound) => {
+                ApiError::new(StatusCode::NOT_FOUND, "session_not_found", err)
+            }
+            Some(ResumeSessionError::Conflict) | None => {
+                ApiError::new(StatusCode::CONFLICT, "session_not_resumable", err)
+            }
         })
 }
 
@@ -2482,11 +2695,11 @@ async fn resume_session_inner(state: AppState, id: String) -> Result<SessionResp
 async fn restart_delivery(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<SessionResponse>, StatusCode> {
+) -> Result<Json<SessionResponse>, ApiError> {
     restart_delivery_inner(state, id)
         .await
         .map(Json)
-        .map_err(|_| StatusCode::CONFLICT)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, "delivery_not_restartable", error))
 }
 
 fn prepare_blocked_workflow_restart(session: &mut SessionState, session_id: &str) -> Result<()> {
@@ -2594,17 +2807,17 @@ async fn restart_delivery_inner(state: AppState, id: String) -> Result<SessionRe
 async fn retry_task_planning(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<SessionResponse>, StatusCode> {
+) -> Result<Json<SessionResponse>, ApiError> {
     recover_task_plan(state, id, crate::agent_core::TaskPlanningPreference::Auto)
         .await
         .map(Json)
-        .map_err(|_| StatusCode::CONFLICT)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, "task_plan_not_recoverable", error))
 }
 
 async fn run_as_one_build(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<SessionResponse>, StatusCode> {
+) -> Result<Json<SessionResponse>, ApiError> {
     recover_task_plan(
         state,
         id,
@@ -2612,7 +2825,7 @@ async fn run_as_one_build(
     )
     .await
     .map(Json)
-    .map_err(|_| StatusCode::CONFLICT)
+    .map_err(|error| ApiError::new(StatusCode::CONFLICT, "task_plan_not_recoverable", error))
 }
 
 async fn recover_task_plan(
@@ -2679,11 +2892,11 @@ async fn recover_task_plan(
 async fn cancel_session(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<SessionResponse>, StatusCode> {
+) -> Result<Json<SessionResponse>, ApiError> {
     cancel_session_inner(state, id)
         .await
         .map(Json)
-        .map_err(|_| StatusCode::CONFLICT)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, "session_not_cancellable", error))
 }
 
 async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResponse> {
@@ -2811,14 +3024,20 @@ async fn answer_question(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<AnswerQuestionRequest>,
-) -> Result<Json<SessionResponse>, StatusCode> {
+) -> Result<Json<SessionResponse>, ApiError> {
     answer_question_inner(state, id, req)
         .await
         .map(Json)
         .map_err(|err| match err.downcast_ref::<AnswerQuestionError>() {
-            Some(AnswerQuestionError::NotFound) => StatusCode::NOT_FOUND,
-            Some(AnswerQuestionError::Gone) => StatusCode::GONE,
-            Some(AnswerQuestionError::Conflict) | None => StatusCode::CONFLICT,
+            Some(AnswerQuestionError::NotFound) => {
+                ApiError::new(StatusCode::NOT_FOUND, "session_not_found", err)
+            }
+            Some(AnswerQuestionError::Gone) => {
+                ApiError::new(StatusCode::GONE, "question_closed", err)
+            }
+            Some(AnswerQuestionError::Conflict) | None => {
+                ApiError::new(StatusCode::CONFLICT, "question_mismatch", err)
+            }
         })
 }
 
@@ -3896,7 +4115,7 @@ impl EventSink for WebEventSink {
         if question.is_empty() {
             anyhow::bail!("ask_user question must not be empty");
         }
-        let question_id = format!("question-{}", now_millis());
+        let question_id = new_durable_id("question");
         let (tx, rx) = std::sync::mpsc::channel();
         let event = AgentEvent::UserQuestion {
             question_id: question_id.clone(),
@@ -4904,7 +5123,7 @@ fn activate_requested_goal(
     ensure_goal_workdir_registered(registered_projects, &workdir)?;
     let now = now_millis();
     let run = crate::goal::GoalRun::start(
-        format!("goal-{now}"),
+        new_durable_id("goal"),
         session_id.to_string(),
         proposal.objective.clone(),
         proposal.criteria,
@@ -5330,7 +5549,11 @@ async fn handle_rpc_connection(
                     write_rpc_error(
                         reader.get_mut(),
                         request.id,
-                        format!("goal request failed with HTTP status {}", status.as_u16()),
+                        format!(
+                            "goal request failed with HTTP status {}: {}",
+                            status.status.as_u16(),
+                            status.message
+                        ),
                     )
                     .await?
                 }
@@ -5487,11 +5710,13 @@ async fn watch_session(
         let history = session
             .history
             .lock()
-            .map(|history| history.clone())
-            .unwrap_or_default();
+            .map_err(|_| anyhow::anyhow!("session history lock is poisoned: {session_id}"))?;
+        // Publishers append while holding this same lock and only then broadcast. Subscribing
+        // before cloning the locked history makes the snapshot/live handoff atomic.
+        let receiver = session.sender.subscribe();
         (
-            session.sender.subscribe(),
-            history,
+            receiver,
+            history.clone(),
             session.status == SessionStatus::Queued
                 || session.status == SessionStatus::Running
                 || session.pending_question.is_some(),
@@ -5508,53 +5733,128 @@ async fn watch_session(
     )
     .await?;
 
+    let mut last_sequence = 0;
     for envelope in history {
-        let notification = RpcNotification {
-            method: "pb.session.event",
-            params: envelope,
-        };
-        write_json_line(stream, &notification).await?;
+        last_sequence = last_sequence.max(envelope.transcript.sequence);
+        write_session_event(stream, envelope).await?;
     }
 
     loop {
-        let is_running = {
-            let sessions = state.sessions.lock().await;
-            sessions
-                .get(&session_id)
-                .map(|session| {
-                    session.status == SessionStatus::Queued
-                        || session.status == SessionStatus::Running
-                        || session.pending_question.is_some()
-                })
-                .unwrap_or(false)
-        };
-        if !is_running {
-            let notification = RpcNotification {
-                method: "pb.session.finished",
-                params: SessionFinished {
-                    session_id: session_id.clone(),
-                    running: false,
-                },
-            };
-            write_json_line(stream, &notification).await?;
-            break;
-        }
-
         tokio::select! {
+            biased;
             message = receiver.recv() => {
-                if let Ok(envelope) = message {
-                    let notification = RpcNotification {
-                        method: "pb.session.event",
-                        params: envelope,
-                    };
-                    write_json_line(stream, &notification).await?;
+                match message {
+                    Ok(envelope) if envelope.transcript.sequence <= last_sequence => {}
+                    Ok(envelope) if envelope.transcript.sequence == last_sequence.saturating_add(1) => {
+                        last_sequence = envelope.transcript.sequence;
+                        write_session_event(stream, envelope).await?;
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let (_, replay) = terminal_session_snapshot(&state, &session_id, last_sequence).await?;
+                        for envelope in replay {
+                            last_sequence = envelope.transcript.sequence;
+                            write_session_event(stream, envelope).await?;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let (is_running, replay) = terminal_session_snapshot(&state, &session_id, last_sequence).await?;
+                        for envelope in replay {
+                            write_session_event(stream, envelope).await?;
+                        }
+                        if is_running {
+                            bail!("session event stream closed while session is running: {session_id}");
+                        }
+                        let notification = RpcNotification {
+                            method: "pb.session.finished",
+                            params: SessionFinished {
+                                session_id: session_id.clone(),
+                                running: false,
+                            },
+                        };
+                        write_json_line(stream, &notification).await?;
+                        break;
+                    }
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                let (is_running, replay) = terminal_session_snapshot(&state, &session_id, last_sequence).await?;
+                for envelope in replay {
+                    last_sequence = envelope.transcript.sequence;
+                    write_session_event(stream, envelope).await?;
+                }
+                if !is_running {
+                    let notification = RpcNotification {
+                        method: "pb.session.finished",
+                        params: SessionFinished {
+                            session_id: session_id.clone(),
+                            running: false,
+                        },
+                    };
+                    write_json_line(stream, &notification).await?;
+                    break;
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+async fn write_session_event(
+    stream: &mut tokio::net::UnixStream,
+    envelope: EventEnvelope,
+) -> Result<()> {
+    let notification = RpcNotification {
+        method: "pb.session.event",
+        params: envelope,
+    };
+    write_json_line(stream, &notification).await
+}
+
+async fn terminal_session_snapshot(
+    state: &AppState,
+    session_id: &str,
+    last_sequence: u64,
+) -> Result<(bool, Vec<EventEnvelope>)> {
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+    let history = session
+        .history
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session history lock is poisoned: {session_id}"))?;
+    let replay = terminal_replay_after(&history, last_sequence)?;
+    let is_running = session.status == SessionStatus::Queued
+        || session.status == SessionStatus::Running
+        || session.pending_question.is_some();
+    Ok((is_running, replay))
+}
+
+fn terminal_replay_after(
+    history: &[EventEnvelope],
+    last_sequence: u64,
+) -> Result<Vec<EventEnvelope>> {
+    let replay = history
+        .iter()
+        .filter(|envelope| envelope.transcript.sequence > last_sequence)
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(first) = replay.first()
+        && first.transcript.sequence != last_sequence.saturating_add(1)
+    {
+        bail!(
+            "session event history no longer contains sequence {}",
+            last_sequence.saturating_add(1)
+        );
+    }
+    if replay
+        .windows(2)
+        .any(|pair| pair[1].transcript.sequence != pair[0].transcript.sequence.saturating_add(1))
+    {
+        bail!("session event history contains a sequence gap");
+    }
+    Ok(replay)
 }
 
 fn restore_sessions(project_entries: &[ProjectEntry]) -> HashMap<String, SessionState> {
@@ -5917,12 +6217,29 @@ fn serve_asset(path: &str) -> Response {
 }
 
 fn new_session_id() -> String {
-    let now = now_millis();
-    format!("session-{now}")
+    new_durable_id("session")
 }
 
 fn new_turn_id(session_id: &str) -> String {
-    format!("turn-{session_id}-{}", now_millis())
+    new_durable_id(&format!("turn-{session_id}"))
+}
+
+fn new_durable_id(prefix: &str) -> String {
+    let mut random = [0_u8; 16];
+    if getrandom::getrandom(&mut random).is_ok() {
+        use std::fmt::Write as _;
+        let mut suffix = String::with_capacity(random.len() * 2);
+        for byte in random {
+            write!(&mut suffix, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        return format!("{prefix}-{suffix}");
+    }
+    let sequence = ID_FALLBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{prefix}-{}-{}-{sequence}",
+        std::process::id(),
+        now_millis()
+    )
 }
 
 fn new_user_message_id(session_id: &str) -> String {
@@ -6024,14 +6341,14 @@ fn publish_event_envelope_linked(
             .map_or(1, |entry| entry.transcript.sequence.saturating_add(1));
         envelope.assign_sequence(sequence);
         envelope.refresh_projections(&entries);
-        let _ = sender.send(envelope.clone());
-        entries.push(envelope);
+        entries.push(envelope.clone());
         if entries.len() > MAX_HISTORY_EVENTS {
             *entries = session_store::trim_event_history(
                 std::mem::take(&mut *entries),
                 MAX_HISTORY_EVENTS,
             );
         }
+        let _ = sender.send(envelope);
     } else {
         let _ = sender.send(envelope);
     }
@@ -6061,6 +6378,38 @@ mod workflow_tests {
             }]
         );
         assert!(pending_user_messages_from_events(&[queued, applied]).is_empty());
+    }
+
+    #[test]
+    fn terminal_replay_detects_eviction_gaps_and_resumes_contiguously() {
+        let mut history = (1..=3)
+            .map(|sequence| {
+                let mut envelope = EventEnvelope::new(AgentEvent::SessionTitle {
+                    title: format!("title {sequence}"),
+                    timestamp_ms: Some(sequence),
+                });
+                envelope.assign_sequence(sequence);
+                envelope
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal_replay_after(&history, 1)
+                .unwrap()
+                .iter()
+                .map(|event| event.transcript.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        history.remove(1);
+        assert!(terminal_replay_after(&history, 1).is_err());
+    }
+
+    #[test]
+    fn durable_ids_are_collision_safe_and_namespaced() {
+        let ids = (0..1_000).map(|_| new_session_id()).collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 1_000);
+        assert!(ids.iter().all(|id| id.starts_with("session-")));
     }
 
     #[test]
@@ -6206,7 +6555,7 @@ mod workflow_tests {
             }),
         )
         .await;
-        assert_eq!(rejected.unwrap_err(), StatusCode::CONFLICT);
+        assert_eq!(rejected.unwrap_err().status, StatusCode::CONFLICT);
     }
 
     fn request(workdir: &std::path::Path) -> AgentRequest {
@@ -6608,6 +6957,7 @@ mod workflow_tests {
                 }],
                 continuation: crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
                 budget: None,
+                project_name: None,
                 workdir: Some(repo.path().to_string_lossy().into_owned()),
                 model: None,
             },
@@ -6626,7 +6976,7 @@ mod workflow_tests {
         assert_eq!(goal.sha256, response.goal_sha256);
 
         let stale = mutate_active_goal(&state, &response.goal_id, "stale", |_, _| Ok(())).await;
-        assert_eq!(stale.unwrap_err(), StatusCode::CONFLICT);
+        assert_eq!(stale.unwrap_err().status, StatusCode::CONFLICT);
         let unchanged = get_goal(Path(response.goal_id), State((state, request(repo.path()))))
             .await
             .unwrap()
@@ -6671,6 +7021,7 @@ mod workflow_tests {
                 criteria: Vec::new(),
                 continuation: crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
                 budget: None,
+                project_name: None,
                 workdir: Some(repo.path().to_string_lossy().into_owned()),
                 model: None,
             },

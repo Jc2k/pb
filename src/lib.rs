@@ -2236,6 +2236,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
                     .model_dir
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
+                project_name: None,
                 workdir: args
                     .workdir
                     .as_ref()
@@ -2306,6 +2307,7 @@ async fn run_goal_command(command: GoalCommand) -> Result<()> {
                         .collect(),
                     continuation,
                     budget: None,
+                    project_name: None,
                     workdir: Some(workdir.to_string_lossy().into_owned()),
                     model: None,
                 },

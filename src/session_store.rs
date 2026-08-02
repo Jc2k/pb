@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -449,40 +449,119 @@ fn trim_events(events: Vec<EventEnvelope>) -> Vec<EventEnvelope> {
     trim_event_history(events, MAX_RESTORED_HISTORY_EVENTS)
 }
 
-pub(crate) fn trim_event_history(
-    mut events: Vec<EventEnvelope>,
-    maximum: usize,
-) -> Vec<EventEnvelope> {
+pub(crate) fn trim_event_history(events: Vec<EventEnvelope>, maximum: usize) -> Vec<EventEnvelope> {
     if events.len() <= maximum {
         return events;
     }
     if maximum == 0 {
         return Vec::new();
     }
+    let mut retained = HashSet::new();
     if matches!(
         events.first().map(|entry| &entry.event),
         Some(AgentEvent::Started { .. })
     ) {
-        let started = events.remove(0);
-        let keep_tail = maximum - 1;
-        let overflow = events.len().saturating_sub(keep_tail);
-        events.drain(..overflow);
-        events.insert(0, started);
+        retained.insert(0);
+        let keep_tail = maximum.saturating_sub(1);
+        retained.extend(events.len().saturating_sub(keep_tail)..events.len());
     } else {
-        let overflow = events.len() - maximum;
-        events.drain(..overflow);
+        retained.extend(events.len() - maximum..events.len());
     }
-    let retained = events
+
+    // Event projections are authoritative persisted data. Retaining an event therefore also
+    // retains every earlier event needed to recompute its projections during strict restore.
+    // The configured maximum is deliberately soft when preserving that dependency closure.
+    let entry_indices = events
         .iter()
-        .map(|event| event.transcript.entry_key.clone())
-        .collect::<HashSet<_>>();
-    for event in &mut events {
-        event
+        .enumerate()
+        .map(|(index, event)| (event.transcript.entry_key.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut pending = retained.iter().copied().collect::<VecDeque<_>>();
+    while let Some(index) = pending.pop_front() {
+        let envelope = &events[index];
+        let mut dependencies = envelope
             .transcript
             .supersedes
-            .retain(|entry_key| retained.contains(entry_key));
+            .iter()
+            .filter_map(|entry_key| entry_indices.get(entry_key.as_str()).copied())
+            .collect::<Vec<_>>();
+
+        match &envelope.event {
+            AgentEvent::ToolResult { tool, call_id, .. } => {
+                if let Some(dependency) = events[..index].iter().rposition(|candidate| {
+                    matches!(
+                        &candidate.event,
+                        AgentEvent::ToolCall {
+                            tool: called_tool,
+                            call_id: called_id,
+                            ..
+                        } if called_tool == tool && called_id == call_id
+                    )
+                }) {
+                    dependencies.push(dependency);
+                }
+            }
+            AgentEvent::SessionSummary { .. } => {
+                if let Some(dependency) = events[..index]
+                    .iter()
+                    .rposition(|candidate| matches!(candidate.event, AgentEvent::Final { .. }))
+                {
+                    dependencies.push(dependency);
+                }
+                if let Some(dependency) = events[..index].iter().rposition(|candidate| {
+                    matches!(candidate.event, AgentEvent::WorkflowBlocked { .. })
+                }) {
+                    dependencies.push(dependency);
+                }
+            }
+            AgentEvent::TeamMessage { evidence, .. } => {
+                for reference in evidence {
+                    let dependency = match reference {
+                        crate::events::EvidenceRef::Check { check_id } => {
+                            events[..index].iter().rposition(|candidate| {
+                                matches!(
+                                    &candidate.event,
+                                    AgentEvent::CheckResult { check_id: candidate, .. }
+                                        if candidate == check_id
+                                )
+                            })
+                        }
+                        crate::events::EvidenceRef::Commit { oid } => {
+                            events[..index].iter().rposition(|candidate| {
+                                matches!(
+                                    &candidate.event,
+                                    AgentEvent::CommitResult { oid: Some(candidate), .. }
+                                        if candidate == oid
+                                )
+                            })
+                        }
+                    };
+                    dependencies.extend(dependency);
+                }
+            }
+            _ => {}
+        }
+
+        if envelope.transcript.related_action_key.is_some()
+            && let Some(dependency) = events[..index]
+                .iter()
+                .rposition(|candidate| matches!(candidate.event, AgentEvent::ToolCall { .. }))
+        {
+            dependencies.push(dependency);
+        }
+
+        for dependency in dependencies {
+            if retained.insert(dependency) {
+                pending.push_back(dependency);
+            }
+        }
     }
+
     events
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, event)| retained.contains(&index).then_some(event))
+        .collect()
 }
 
 fn workspace_root(session: &PersistedSession) -> Option<PathBuf> {
@@ -1130,6 +1209,73 @@ mod tests {
             &trimmed[1].event,
             AgentEvent::SessionTitle { title, .. } if title == "two"
         ));
+    }
+
+    #[test]
+    fn trimmed_history_keeps_projection_dependencies_and_strictly_restores() {
+        let dir = init_repo();
+        let mut events = vec![EventEnvelope::new(AgentEvent::Started {
+            task: "Review the boundary".to_string(),
+            model: "local-model".to_string(),
+            profile: crate::agent_core::AgentProfile::Review,
+            workspace: dir.path().to_string_lossy().into_owned(),
+            focus_root: Some(dir.path().to_string_lossy().into_owned()),
+            branch: "pb/test".to_string(),
+            attachments: Vec::new(),
+            timestamp_ms: Some(1),
+        })];
+        let mut push = |mut envelope: EventEnvelope| {
+            envelope.assign_sequence(events.len() as u64 + 1);
+            envelope.refresh_projections(&events);
+            events.push(envelope);
+        };
+        push(EventEnvelope::new(AgentEvent::ToolCall {
+            tool: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+            call_id: "call-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            actor: crate::events::TeamActor::agent(crate::agent_core::AgentProfile::Review),
+            nesting_depth: None,
+            timestamp_ms: Some(2),
+        }));
+        push(EventEnvelope::new(AgentEvent::ToolResult {
+            tool: "read_file".to_string(),
+            result: "contents".to_string(),
+            call_id: "call-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            outcome: crate::events::ToolOutcome::Succeeded,
+            actor: crate::events::TeamActor::agent(crate::agent_core::AgentProfile::Review),
+            duration_ms: 1,
+            energy_joules: None,
+            energy_kwh: None,
+            average_power_watts: None,
+            energy_shared_calls: None,
+            nesting_depth: None,
+            timestamp_ms: Some(3),
+        }));
+        push(EventEnvelope::new(AgentEvent::SessionTitle {
+            title: "Retained tail".to_string(),
+            timestamp_ms: Some(4),
+        }));
+
+        let trimmed = trim_event_history(events, 3);
+        assert_eq!(
+            trimmed.len(),
+            4,
+            "the history limit is soft for dependencies"
+        );
+        assert!(matches!(trimmed[1].event, AgentEvent::ToolCall { .. }));
+
+        let session = PersistedSession::from_parts(
+            "session-projection-closure".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            trimmed,
+        );
+        parse_session(&serde_json::to_string(&session).unwrap()).unwrap();
     }
 
     #[test]

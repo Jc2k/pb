@@ -6,6 +6,7 @@ import type {
   GoalCriterionInput,
 } from "../types";
 import { VoiceInputButton } from "./VoiceInputButton";
+import { apiErrorMessage } from "../lib/integrationConfig";
 
 interface Props {
   goal: GoalCheckpoint;
@@ -25,9 +26,11 @@ export function GoalAmendmentSheet({ goal, onClose, onSubmitted }: Props) {
   );
   const [budget, setBudget] = useState<GoalBudget>(goal.run.budget);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
   const [voiceInputActive, setVoiceInputActive] = useState(false);
   const submit = async () => {
     setBusy(true);
+    setError("");
     try {
       const response = await fetch(
         `/api/goals/${goal.run.id}/${initialDraft ? "draft" : "amendments"}`,
@@ -43,7 +46,15 @@ export function GoalAmendmentSheet({ goal, onClose, onSubmitted }: Props) {
           }),
         },
       );
-      if (response.ok) onSubmitted();
+      if (!response.ok) {
+        setError(await apiErrorMessage(response, "Could not update the goal"));
+        return;
+      }
+      onSubmitted();
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Could not update the goal",
+      );
     } finally {
       setBusy(false);
     }
@@ -82,6 +93,9 @@ export function GoalAmendmentSheet({ goal, onClose, onSubmitted }: Props) {
             ? "Updating the draft generates a new plan digest. No repository work starts until you approve it."
             : "Completed milestones and their evidence remain unchanged. pb will review a new plan for unfinished work."}
         </p>
+        {error
+          ? <p className="text-danger small" role="alert">{error}</p>
+          : null}
         <div className="goal-field">
           <label htmlFor="goal-amend-objective">Objective</label>
           <div className="voice-prompt-field">

@@ -26,6 +26,18 @@ HTTP/SSE interface to the browser and a local Unix-socket RPC interface to the C
 render the same typed events and server-authored teammate chatter, and can reconnect to the same
 persisted session.
 
+**Shipped.** The daemon appends each envelope to authoritative history before broadcasting it.
+Terminal attachment subscribes while that history is locked, then switches from the captured
+snapshot to live delivery without a publication gap. A lagged terminal receiver replays every
+missing sequence from history before continuing, and terminal completion is announced only after
+the final replay. History retention is dependency-aware: the nominal bound is soft when a retained
+projection needs an earlier tool call, superseded entry, final/block reason, check, or commit.
+
+The browser starts repository-backed work with a registered project name; resolving that identity
+to a filesystem path belongs to the daemon. CLI commands may still supply an explicit workdir.
+Mutating HTTP responses use a typed error code and server-authored message, so the web adapter does
+not infer domain state from bare HTTP status numbers.
+
 ## Component responsibilities
 
 | Component | Owns | Does not own |

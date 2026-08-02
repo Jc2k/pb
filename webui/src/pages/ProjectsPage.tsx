@@ -30,6 +30,7 @@ import { IntentControl } from "../components/IntentControl";
 import { VoiceInputButton } from "../components/VoiceInputButton";
 import { GoalStartSheet } from "../components/GoalStartSheet";
 import {
+  apiErrorMessage,
   integrationApiError,
   integrationInstallPayload,
 } from "../lib/integrationConfig";
@@ -318,13 +319,15 @@ export function ProjectPage() {
         body: JSON.stringify({
           task: task.trim(),
           intent,
-          workdir: project.path,
+          project_name: project.name,
           attachments: images,
         }),
         signal: controller.signal,
       });
       if (!res.ok) {
-        throw new Error(`Could not start the session (${res.status})`);
+        throw new Error(
+          await apiErrorMessage(res, "Could not start the session"),
+        );
       }
       const data = (await res.json()) as { session_id: string };
       if (!startRequest.current.owns(controller)) return;
@@ -642,7 +645,7 @@ export function ProjectPage() {
       <GoalStartSheet
         open={goalOpen}
         initialObjective={task}
-        workdir={project?.path}
+        projectName={project?.name}
         onClose={() => setGoalOpen(false)}
         onStarted={(sessionId) => navigate(`/sessions/${sessionId}`)}
       />

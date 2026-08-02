@@ -30,7 +30,7 @@ export function integrationInstallPayload(
   };
 }
 
-export async function integrationApiError(
+export async function apiErrorMessage(
   response: Response,
   fallback: string,
 ): Promise<string> {
@@ -47,6 +47,8 @@ export async function integrationApiError(
   }
   return response.status ? `${fallback} (HTTP ${response.status})` : fallback;
 }
+
+export const integrationApiError = apiErrorMessage;
 
 export function schemaPropertyType(property: JsonSchemaProperty): string {
   return Array.isArray(property.type)

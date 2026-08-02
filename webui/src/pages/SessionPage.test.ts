@@ -2,6 +2,7 @@
 import { ok } from "node:assert/strict";
 import { equal } from "node:assert/strict";
 import {
+  isNewerThanSnapshot,
   mergeEventHistory,
   readyEvidenceLabel,
   workflowOutcomeLabel,
@@ -514,7 +515,14 @@ Deno.test("session transport opens first and lets EventSource reconnect with ded
   ok(page.includes("sessionRequestRef.current.owns(controller)"));
   ok(page.includes("titleEffect.sequence > details.revision"));
   ok(page.includes("runningEffect.sequence > details.revision"));
-  ok(page.includes("parsed.transcript.sequence > currentEffect.sequence"));
+  ok(page.includes("sequence > currentEffect.sequence"));
+  ok(page.includes("snapshotRevisionRef.current = details.revision"));
+  ok(
+    page.includes(
+      "latestRefreshEffectRef.current > snapshotRevisionRef.current",
+    ),
+  );
+  ok(page.includes("sessionRefreshRequestedRef.current = true"));
   ok(page.includes("session?.pending_delivery_proposal"));
   ok(page.includes("session?.pending_goal_proposal"));
   ok(page.includes("session?.pending_goal_change"));
@@ -522,4 +530,10 @@ Deno.test("session transport opens first and lets EventSource reconnect with ded
   ok(!page.includes("latestPendingGoalProposal"));
   ok(!page.includes("latestGoalChangeRequest"));
   ok(!page.includes("src.onerror"));
+});
+
+Deno.test("stream effects apply only beyond an accepted snapshot revision", () => {
+  equal(isNewerThanSnapshot(11, null), false);
+  equal(isNewerThanSnapshot(11, 11), false);
+  equal(isNewerThanSnapshot(12, 11), true);
 });

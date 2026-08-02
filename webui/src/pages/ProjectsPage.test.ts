@@ -39,6 +39,8 @@ Deno.test("project sessions leave branch selection to the managed workspace", as
   ok(source.includes('projectSessions[0]?.branch || "Managed automatically"'));
   ok(source.includes("Latest branch"));
   ok(!source.includes("Default branch"));
+  ok(source.includes("project_name: project.name"));
+  ok(!source.includes("workdir: project.path"));
 });
 
 Deno.test("project pages share live session data and finish notifications", async () => {
