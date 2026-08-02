@@ -179,6 +179,32 @@ struct WebSearchResult {
 pub trait EventSink {
     fn emit(&mut self, event: AgentEvent);
 
+    /// Emit an event and return the exact transcript entry key assigned to it. Producers retain
+    /// this key when a later event explicitly replaces the earlier transcript entry.
+    fn emit_keyed(&mut self, event: AgentEvent) -> String {
+        let entry_key = crate::events::event_entry_key(&event);
+        self.emit(event);
+        entry_key
+    }
+
+    /// Emit an event that explicitly replaces named transcript entries. Durable sinks override
+    /// this to preserve the relationship in the event envelope.
+    fn emit_superseding(&mut self, event: AgentEvent, supersedes: Vec<String>) {
+        let _ = supersedes;
+        self.emit(event);
+    }
+
+    /// Emit a correction that a later terminal workflow event will replace in the conversational
+    /// transcript. The durable sink retains the exact entry key; no consumer infers adjacency.
+    fn emit_terminal_precursor(&mut self, event: AgentEvent) {
+        self.emit(event);
+    }
+
+    /// Drain exact producer-authored precursor keys for the next terminal workflow event.
+    fn take_terminal_precursor_keys(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Report whether user-authored messages are waiting without acknowledging them. Workflow
     /// controllers use this at role and deterministic boundaries so reviewers never consume
     /// feedback intended for an authoring stage.
@@ -2762,8 +2788,8 @@ fn run_agent_inner<S: EventSink>(
                     "{message}"
                 );
                 sink.emit(AgentEvent::Error {
-                    message: message.clone(),
                     summary: "Flash-MoE setup failed".to_string(),
+                    detail: message.clone(),
                     nesting_depth: Some(0),
                     timestamp_ms: Some(now_millis()),
                 });
@@ -2801,8 +2827,8 @@ fn run_agent_inner<S: EventSink>(
             Err(error) => {
                 let message = format!("llama.cpp setup failed for {}: {error}", args.model);
                 sink.emit(AgentEvent::Error {
-                    message: message.clone(),
                     summary: "Model setup failed".to_string(),
+                    detail: message.clone(),
                     nesting_depth: Some(0),
                     timestamp_ms: Some(now_millis()),
                 });
@@ -6878,9 +6904,9 @@ fn run_proactive_lsp_pass(
             "workspace_fingerprint": workspace_fingerprint,
             "workspace_epoch": workspace_epoch,
         }),
-        call_id: Some(call_id.clone()),
-        batch_id: Some(call_id.clone()),
-        actor: Some(actor),
+        call_id: call_id.clone(),
+        batch_id: call_id.clone(),
+        actor: actor,
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
     });
@@ -6909,15 +6935,15 @@ fn run_proactive_lsp_pass(
     sink.emit(AgentEvent::ToolResult {
         tool: lsp::PROACTIVE_LSP_TOOL_NAME.to_string(),
         result: serialized,
-        call_id: Some(call_id.clone()),
-        batch_id: Some(call_id),
-        outcome: Some(if report.complete {
+        call_id: call_id.clone(),
+        batch_id: call_id,
+        outcome: if report.complete {
             crate::events::ToolOutcome::Succeeded
         } else {
             crate::events::ToolOutcome::Failed
-        }),
-        actor: Some(actor),
-        duration_ms: Some(duration_ms),
+        },
+        actor: actor,
+        duration_ms,
         energy_joules: energy.map(|estimate| estimate.joules),
         energy_kwh: energy.map(|estimate| estimate.kwh),
         average_power_watts: energy.map(|estimate| estimate.average_watts),
@@ -7592,7 +7618,7 @@ fn run_agent_steps(
         }
         if sink.should_cancel() {
             sink.emit(AgentEvent::Correction {
-                kind: crate::events::CorrectionKind::General,
+                kind: crate::events::CorrectionKind::Lifecycle,
                 message: "The user cancelled this run; repository content and collected evidence are being preserved."
                     .to_string(),
                 summary: "Run cancelled".to_string(),
@@ -7613,7 +7639,7 @@ fn run_agent_steps(
         }
         if sink.should_pause() {
             sink.emit(AgentEvent::Correction {
-                kind: crate::events::CorrectionKind::General,
+                kind: crate::events::CorrectionKind::Lifecycle,
                 message: "The user requested a goal pause; the current workflow is checkpointing before another model or tool action."
                     .to_string(),
                 summary: "Goal pausing".to_string(),
@@ -7713,7 +7739,7 @@ fn run_agent_steps(
                         gate.diagnostic_failure_feedback = Some(truncate_chars(&feedback, 8_000));
                     }
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::Diagnostics,
                         message: feedback.clone(),
                         summary: "Automatic language-server diagnostics need repair".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -7741,7 +7767,7 @@ fn run_agent_steps(
                 sink,
             )? {
                 sink.emit(AgentEvent::Correction {
-                    kind: crate::events::CorrectionKind::General,
+                    kind: crate::events::CorrectionKind::Diagnostics,
                     message: feedback.clone(),
                     summary: "Harness diagnostic preview".to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -7859,7 +7885,7 @@ fn run_agent_steps(
                     _ => unreachable!("only closeable contract stages reach this branch"),
                 };
                 sink.emit(AgentEvent::Correction {
-                    kind: crate::events::CorrectionKind::General,
+                    kind: crate::events::CorrectionKind::ContractEvidence,
                     message: message.to_string(),
                     summary: summary.to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -7899,7 +7925,7 @@ fn run_agent_steps(
                 let summary = "Complete proposed-path review evidence";
                 let message = "Fresh controller observations cover every existing path in the exact proposed plan. Review those task-focused bytes and submit the plan verdict now; repository reads are removed from this turn so generic file pagination cannot replace the actual critique.";
                 sink.emit(AgentEvent::Correction {
-                    kind: crate::events::CorrectionKind::General,
+                    kind: crate::events::CorrectionKind::ContractEvidence,
                     message: message.to_string(),
                     summary: summary.to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -8027,7 +8053,7 @@ fn run_agent_steps(
                     instruction
                 };
                 sink.emit(AgentEvent::Correction {
-                    kind: crate::events::CorrectionKind::General,
+                    kind: crate::events::CorrectionKind::WorkUnit,
                     message: instruction.clone(),
                     summary: "Active accepted-plan work unit".to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -8044,7 +8070,7 @@ fn run_agent_steps(
                     "Harness creation work unit: the next missing accepted-plan path is {path}. Create that exact path now with one complete write_file payload within the current allowance."
                 );
                 sink.emit(AgentEvent::Correction {
-                    kind: crate::events::CorrectionKind::General,
+                    kind: crate::events::CorrectionKind::WorkUnit,
                     message: instruction.clone(),
                     summary: "Next accepted-plan creation work unit".to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -8246,7 +8272,7 @@ fn run_agent_steps(
         };
         let closure_messages = closure_checkpoint.as_ref().map(|checkpoint| {
             sink.emit(AgentEvent::Correction {
-                kind: crate::events::CorrectionKind::General,
+                kind: crate::events::CorrectionKind::WorkflowClosure,
                 message: checkpoint.clone(),
                 summary: "Workflow closure checkpoint".to_string(),
                 actor: crate::events::TeamActor::workflow_steward(),
@@ -8307,7 +8333,7 @@ fn run_agent_steps(
             Err(error) => {
                 if error.downcast_ref::<PreInferenceCancellation>().is_some() {
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::Lifecycle,
                         message: "The user cancelled this run during pre-inference preparation; repository content and collected evidence are being preserved, and no model invocation was started."
                             .to_string(),
                         summary: "Run cancelled".to_string(),
@@ -8329,8 +8355,8 @@ fn run_agent_steps(
                 let termination_reason = termination_reason_for_runtime_error(&error);
                 emit_context_limit_event(&error, nesting_depth, sink);
                 sink.emit(AgentEvent::Error {
-                    message: format!("{error:#}"),
                     summary: format!("Agent terminated: {termination_reason}"),
+                    detail: format!("{error:#}"),
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
@@ -8441,7 +8467,7 @@ fn run_agent_steps(
                         )
                     };
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::InvalidAction,
                         message: retry_limit_message,
                         summary: "Teammate action retries exhausted".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -8461,7 +8487,7 @@ fn run_agent_steps(
                 }
 
                 sink.emit(AgentEvent::Correction {
-                    kind: crate::events::CorrectionKind::General,
+                    kind: crate::events::CorrectionKind::InvalidAction,
                     message: error_msg.clone(),
                     summary: parse_summary.clone(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -8525,7 +8551,7 @@ fn run_agent_steps(
                         feedback.push_str(&precondition);
                     }
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::StageSubmission,
                         message: feedback.clone(),
                         summary: "Workflow stage submission required".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -8580,7 +8606,7 @@ fn run_agent_steps(
                         gate.diagnostic_failure_feedback = Some(truncate_chars(&feedback, 8_000));
                         drop(gate);
                         sink.emit(AgentEvent::Correction {
-                            kind: crate::events::CorrectionKind::General,
+                            kind: crate::events::CorrectionKind::Diagnostics,
                             message: feedback.clone(),
                             summary: "Automatic language-server diagnostics blocked handoff"
                                 .to_string(),
@@ -8620,7 +8646,7 @@ fn run_agent_steps(
                         stable_hash(feedback.as_str()),
                     );
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::Handoff,
                         message: feedback.clone(),
                         summary: if args.contract.is_some() {
                             "Acceptance contract rejected final response".to_string()
@@ -8664,10 +8690,10 @@ fn run_agent_steps(
                     }
                     if gate_failure_count >= MAX_IDENTICAL_GATE_FAILURES {
                         sink.emit(AgentEvent::Error {
-                            message: format!(
+                            summary: "Deterministic completion gate loop".to_string(),
+                            detail: format!(
                                 "the same completion gate fact blocked finalization {gate_failure_count} times; stopping deterministically without a monitor retry"
                             ),
-                            summary: "Deterministic completion gate loop".to_string(),
                             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                             timestamp_ms: Some(now_millis()),
                         });
@@ -8759,7 +8785,7 @@ fn run_agent_steps(
                                 });
                             }
                             sink.emit(AgentEvent::Correction {
-                                kind: crate::events::CorrectionKind::General,
+                                kind: crate::events::CorrectionKind::Handoff,
                                 message: feedback.clone(),
                                 summary: "The handoff teammate returned failed checks for repair"
                                     .to_string(),
@@ -8778,8 +8804,8 @@ fn run_agent_steps(
                         }
                         HandoffAttempt::ExecutorUnavailable { detail, .. } => {
                             sink.emit(AgentEvent::Error {
-                                message: detail,
                                 summary: "Handoff executor unavailable".to_string(),
+                                detail,
                                 nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                                 timestamp_ms: Some(now_millis()),
                             });
@@ -8795,8 +8821,8 @@ fn run_agent_steps(
                         }
                         HandoffAttempt::CommitBlocked { detail, .. } => {
                             sink.emit(AgentEvent::Error {
-                                message: detail,
                                 summary: "Handoff commit blocked".to_string(),
+                                detail,
                                 nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                                 timestamp_ms: Some(now_millis()),
                             });
@@ -8846,7 +8872,7 @@ fn run_agent_steps(
                             detail: Some(feedback.clone()),
                         };
                         sink.emit(AgentEvent::Correction {
-                            kind: crate::events::CorrectionKind::General,
+                            kind: crate::events::CorrectionKind::RequirementsRemain,
                             message: feedback.clone(),
                             summary: "Task requirements remain after handoff".to_string(),
                             actor: crate::events::TeamActor::workflow_steward(),
@@ -8948,7 +8974,7 @@ fn run_agent_steps(
                     if loop_failure_count.is_some_and(|count| count >= MAX_IDENTICAL_GATE_FAILURES)
                     {
                         let (summary, message) = deterministic_tool_loop_error(args.profile);
-                        sink.emit(AgentEvent::Correction {
+                        sink.emit_terminal_precursor(AgentEvent::Correction {
                             kind: crate::events::CorrectionKind::RepeatedTool,
                             message,
                             summary,
@@ -8987,13 +9013,27 @@ fn run_agent_steps(
                     ProgressPreflightDecision::Continue => {}
                     ProgressPreflightDecision::Redirect(feedback) => {
                         messages.push(ChatMessage::text("assistant", output.clone()));
-                        record_progress_warning(&feedback, nesting_depth, messages, sink);
+                        record_progress_warning(
+                            &feedback,
+                            false,
+                            args.profile,
+                            nesting_depth,
+                            messages,
+                            sink,
+                        );
                         step = step.saturating_add(1);
                         continue;
                     }
                     ProgressPreflightDecision::Block(feedback) => {
                         messages.push(ChatMessage::text("assistant", output.clone()));
-                        record_progress_warning(&feedback, nesting_depth, messages, sink);
+                        record_progress_warning(
+                            &feedback,
+                            true,
+                            args.profile,
+                            nesting_depth,
+                            messages,
+                            sink,
+                        );
                         return Ok(StepRunOutcome {
                             reached_final: false,
                             contract_status: incomplete_contract_status(args),
@@ -9108,7 +9148,14 @@ fn run_agent_steps(
                     });
                 }
                 if let ProgressDecision::Block(feedback) = &progress_decision {
-                    record_progress_warning(feedback, nesting_depth, messages, sink);
+                    record_progress_warning(
+                        feedback,
+                        true,
+                        args.profile,
+                        nesting_depth,
+                        messages,
+                        sink,
+                    );
                     return Ok(StepRunOutcome {
                         reached_final: false,
                         contract_status: incomplete_contract_status(args),
@@ -9121,7 +9168,7 @@ fn run_agent_steps(
                 }
                 if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::RepeatedTool,
                         message: feedback.clone(),
                         summary: "Repeated tool call detected".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -9134,7 +9181,14 @@ fn run_agent_steps(
                         &feedback,
                     ));
                 } else if let ProgressDecision::Warn(feedback) = progress_decision {
-                    record_progress_warning(&feedback, nesting_depth, messages, sink);
+                    record_progress_warning(
+                        &feedback,
+                        false,
+                        args.profile,
+                        nesting_depth,
+                        messages,
+                        sink,
+                    );
                 }
             }
             AgentAction::ToolCalls {
@@ -9160,7 +9214,7 @@ fn run_agent_steps(
                     if loop_failure_count.is_some_and(|count| count >= MAX_IDENTICAL_GATE_FAILURES)
                     {
                         let (summary, message) = deterministic_tool_loop_error(args.profile);
-                        sink.emit(AgentEvent::Correction {
+                        sink.emit_terminal_precursor(AgentEvent::Correction {
                             kind: crate::events::CorrectionKind::RepeatedTool,
                             message,
                             summary,
@@ -9199,13 +9253,27 @@ fn run_agent_steps(
                     ProgressPreflightDecision::Continue => {}
                     ProgressPreflightDecision::Redirect(feedback) => {
                         messages.push(ChatMessage::text("assistant", output.clone()));
-                        record_progress_warning(&feedback, nesting_depth, messages, sink);
+                        record_progress_warning(
+                            &feedback,
+                            false,
+                            args.profile,
+                            nesting_depth,
+                            messages,
+                            sink,
+                        );
                         step = step.saturating_add(1);
                         continue;
                     }
                     ProgressPreflightDecision::Block(feedback) => {
                         messages.push(ChatMessage::text("assistant", output.clone()));
-                        record_progress_warning(&feedback, nesting_depth, messages, sink);
+                        record_progress_warning(
+                            &feedback,
+                            true,
+                            args.profile,
+                            nesting_depth,
+                            messages,
+                            sink,
+                        );
                         return Ok(StepRunOutcome {
                             reached_final: false,
                             contract_status: incomplete_contract_status(args),
@@ -9317,7 +9385,14 @@ fn run_agent_steps(
                     });
                 }
                 if let ProgressDecision::Block(feedback) = &progress_decision {
-                    record_progress_warning(feedback, nesting_depth, messages, sink);
+                    record_progress_warning(
+                        feedback,
+                        true,
+                        args.profile,
+                        nesting_depth,
+                        messages,
+                        sink,
+                    );
                     return Ok(StepRunOutcome {
                         reached_final: false,
                         contract_status: incomplete_contract_status(args),
@@ -9330,7 +9405,7 @@ fn run_agent_steps(
                 }
                 if let Some(feedback) = loop_check.feedback {
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::RepeatedTool,
                         message: feedback.clone(),
                         summary: "Repeated tool call detected".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -9343,7 +9418,14 @@ fn run_agent_steps(
                         &feedback,
                     ));
                 } else if let ProgressDecision::Warn(feedback) = progress_decision {
-                    record_progress_warning(&feedback, nesting_depth, messages, sink);
+                    record_progress_warning(
+                        &feedback,
+                        false,
+                        args.profile,
+                        nesting_depth,
+                        messages,
+                        sink,
+                    );
                 }
             }
         }
@@ -9367,7 +9449,7 @@ fn run_agent_steps(
                     gate.diagnostic_failure_feedback = Some(truncate_chars(&feedback, 8_000));
                     drop(gate);
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::Diagnostics,
                         message: feedback.clone(),
                         summary: "Automatic language-server diagnostics blocked final grace"
                             .to_string(),
@@ -9657,8 +9739,8 @@ fn run_final_grace(
                     timestamp_ms: Some(now_millis()),
                 });
                 sink.emit(AgentEvent::Error {
-                    message: format!("{error:#}"),
                     summary: format!("Final grace terminated: {termination_reason}"),
+                    detail: format!("{error:#}"),
                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                     timestamp_ms: Some(now_millis()),
                 });
@@ -9873,7 +9955,7 @@ fn run_final_grace(
                         detail: Some(feedback.clone()),
                     };
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::RequirementsRemain,
                         message: feedback.clone(),
                         summary: "Task requirements remain after final handoff".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -9978,7 +10060,7 @@ fn record_completion_metrics(
         step,
         purpose,
         workflow_stage: args.workflow_stage,
-        profile: Some(args.profile),
+        profile: args.profile,
         duration_ms: completion.duration_ms,
         prompt_tokens: completion.prompt_tokens,
         generated_tokens: completion.generated_tokens,
@@ -10271,7 +10353,7 @@ fn run_step_limit_monitor(
 ) -> Result<Option<String>> {
     if let Err(error) = run_budget.borrow_mut().reserve_advisory_call() {
         sink.emit(AgentEvent::Correction {
-            kind: crate::events::CorrectionKind::General,
+            kind: crate::events::CorrectionKind::AdvisoryBudget,
             message: format!("step-limit monitor skipped: {error}"),
             summary: "Advisory budget exhausted".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
@@ -10760,6 +10842,17 @@ fn durable_event_call_ids(batch_id: &str, calls: &[AgentToolCall]) -> BTreeMap<S
         .collect()
 }
 
+fn durable_event_call_id(
+    model_call_id: Option<&str>,
+    durable_call_ids: &BTreeMap<String, String>,
+) -> Result<String> {
+    let model_call_id = model_call_id.context("normalized tool call is missing its call id")?;
+    durable_call_ids
+        .get(model_call_id)
+        .cloned()
+        .with_context(|| format!("tool call '{model_call_id}' is missing its durable event id"))
+}
+
 fn durable_event_batch_id(
     session_id: &str,
     turn_id: &str,
@@ -10854,31 +10947,24 @@ fn execute_tool_calls(
         let calls_for_transcript = calls.clone();
         let mut outcomes = Vec::with_capacity(call_count);
         for call in calls {
+            let event_call_id = durable_event_call_id(call.id.as_deref(), &durable_call_ids)?;
             sink.emit(AgentEvent::ToolCall {
                 tool: call.tool.clone(),
                 arguments: call.arguments.clone(),
-                call_id: call
-                    .id
-                    .as_ref()
-                    .and_then(|id| durable_call_ids.get(id))
-                    .cloned(),
-                batch_id: Some(batch_id.clone()),
-                actor: Some(crate::events::TeamActor::agent(env.args.profile)),
+                call_id: event_call_id.clone(),
+                batch_id: batch_id.clone(),
+                actor: crate::events::TeamActor::agent(env.args.profile),
                 nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
                 timestamp_ms: Some(now_millis()),
             });
             sink.emit(AgentEvent::ToolResult {
                 tool: call.tool.clone(),
                 result: feedback.clone(),
-                call_id: call
-                    .id
-                    .as_ref()
-                    .and_then(|id| durable_call_ids.get(id))
-                    .cloned(),
-                batch_id: Some(batch_id.clone()),
-                outcome: Some(crate::events::ToolOutcome::Rejected),
-                actor: Some(crate::events::TeamActor::agent(env.args.profile)),
-                duration_ms: Some(0),
+                call_id: event_call_id,
+                batch_id: batch_id.clone(),
+                outcome: crate::events::ToolOutcome::Rejected,
+                actor: crate::events::TeamActor::agent(env.args.profile),
+                duration_ms: 0,
                 energy_joules: None,
                 energy_kwh: None,
                 average_power_watts: None,
@@ -10909,7 +10995,7 @@ fn execute_tool_calls(
             &feedback,
         ));
         sink.emit(AgentEvent::Correction {
-            kind: crate::events::CorrectionKind::General,
+            kind: crate::events::CorrectionKind::DependentToolBatch,
             message: feedback,
             summary: "Dependent tool batch rejected".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
@@ -10942,16 +11028,13 @@ fn execute_tool_calls(
     let mut results = Vec::new();
     for mut call in calls {
         bind_work_unit_target(&mut call, env.active_work_unit.as_ref())?;
+        let event_call_id = durable_event_call_id(call.id.as_deref(), &durable_call_ids)?;
         sink.emit(AgentEvent::ToolCall {
             tool: call.tool.clone(),
             arguments: call.arguments.clone(),
-            call_id: call
-                .id
-                .as_ref()
-                .and_then(|id| durable_call_ids.get(id))
-                .cloned(),
-            batch_id: Some(batch_id.clone()),
-            actor: Some(crate::events::TeamActor::agent(env.args.profile)),
+            call_id: event_call_id,
+            batch_id: batch_id.clone(),
+            actor: crate::events::TeamActor::agent(env.args.profile),
             nesting_depth: (env.nesting_depth > 0).then_some(env.nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
@@ -11429,7 +11512,7 @@ fn execute_tool_calls(
         }
         if !success {
             sink.emit(AgentEvent::Correction {
-                kind: crate::events::CorrectionKind::General,
+                kind: crate::events::CorrectionKind::ToolFailure,
                 message: result.clone(),
                 summary: format!("{} tool call was not executed successfully", tool),
                 actor: crate::events::TeamActor::workflow_steward(),
@@ -11463,17 +11546,15 @@ fn execute_tool_calls(
             &mut metrics.tool_energy_kwh,
             energy,
         );
+        let event_call_id = durable_event_call_id(tool_call_id.as_deref(), &durable_call_ids)?;
         sink.emit(AgentEvent::ToolResult {
             tool: tool.clone(),
             result: result.clone(),
-            call_id: tool_call_id
-                .as_ref()
-                .and_then(|id| durable_call_ids.get(id))
-                .cloned(),
-            batch_id: Some(batch_id.clone()),
-            outcome: Some(durable_tool_outcome(&tool, success, cache_hit, &result)),
-            actor: Some(crate::events::TeamActor::agent(env.args.profile)),
-            duration_ms: Some(duration_ms),
+            call_id: event_call_id,
+            batch_id: batch_id.clone(),
+            outcome: durable_tool_outcome(&tool, success, cache_hit, &result),
+            actor: crate::events::TeamActor::agent(env.args.profile),
+            duration_ms,
             energy_joules: energy.map(|estimate| estimate.joules),
             energy_kwh: energy.map(|estimate| estimate.kwh),
             average_power_watts: energy.map(|estimate| estimate.average_watts),
@@ -11713,7 +11794,7 @@ fn inline_implementation_completion_disposition(
             sink,
         )? {
             sink.emit(AgentEvent::Correction {
-                kind: crate::events::CorrectionKind::General,
+                kind: crate::events::CorrectionKind::Diagnostics,
                 message: feedback.clone(),
                 summary: "Harness diagnostic preview".to_string(),
                 actor: crate::events::TeamActor::workflow_steward(),
@@ -12410,7 +12491,7 @@ fn grant_work_unit_progress_turn(
     sink.workflow_work_unit_progress_earned(&unit.id)?;
     *effective_max_steps = effective_max_steps.saturating_add(1);
     sink.emit(AgentEvent::Correction {
-        kind: crate::events::CorrectionKind::General,
+        kind: crate::events::CorrectionKind::WorkUnit,
         message: format!(
             "Harness progress credit: work unit {} produced a new content/evidence transition; one bounded stage turn was earned ({}/4). Failed, repeated, cached, no-op, and bookkeeping actions earn no credit.",
             unit.id,
@@ -12659,19 +12740,26 @@ fn discovered_diagnostic_preview_check(
 
 fn record_progress_warning(
     feedback: &str,
+    terminal: bool,
+    profile: AgentProfile,
     nesting_depth: usize,
     messages: &mut Vec<ChatMessage>,
     sink: &mut dyn EventSink,
 ) {
-    sink.emit(AgentEvent::Correction {
-        kind: crate::events::CorrectionKind::General,
+    let event = AgentEvent::Correction {
+        kind: crate::events::CorrectionKind::NoProgress,
         message: feedback.to_string(),
         summary: "No-progress tool outcome detected".to_string(),
         actor: crate::events::TeamActor::workflow_steward(),
-        assisting_profile: None,
+        assisting_profile: Some(profile),
         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
         timestamp_ms: Some(now_millis()),
-    });
+    };
+    if terminal {
+        sink.emit_terminal_precursor(event);
+    } else {
+        sink.emit(event);
+    }
     messages.push(correction_chat_message(
         "No-progress tool outcome detected",
         feedback,
@@ -12690,7 +12778,7 @@ fn record_blocked_tool_loop(
         "This consecutive duplicate tool action was blocked before execution. Choose a different action.",
     );
     sink.emit(AgentEvent::Correction {
-        kind: crate::events::CorrectionKind::General,
+        kind: crate::events::CorrectionKind::RepeatedTool,
         message: feedback.to_string(),
         summary: format!("{} repeated the same action", profile.teammate_first_name()),
         actor: crate::events::TeamActor::workflow_steward(),
@@ -12936,7 +13024,7 @@ impl crate::task_queue::TaskPlanningModel for TaskPlanningCompletionModel<'_> {
             step: self.invocation_step,
             purpose: crate::events::ModelInvocationPurpose::TaskPartitioning,
             workflow_stage: None,
-            profile: Some(args.profile),
+            profile: args.profile,
             duration_ms: output.duration_ms,
             prompt_tokens: output.prompt_tokens,
             generated_tokens: output.generated_tokens,
@@ -13241,6 +13329,22 @@ impl EventSink for WorkflowCheckpointingSink<'_> {
         self.sink.emit(event);
     }
 
+    fn emit_keyed(&mut self, event: AgentEvent) -> String {
+        self.sink.emit_keyed(event)
+    }
+
+    fn emit_superseding(&mut self, event: AgentEvent, supersedes: Vec<String>) {
+        self.sink.emit_superseding(event, supersedes);
+    }
+
+    fn emit_terminal_precursor(&mut self, event: AgentEvent) {
+        self.sink.emit_terminal_precursor(event);
+    }
+
+    fn take_terminal_precursor_keys(&mut self) -> Vec<String> {
+        self.sink.take_terminal_precursor_keys()
+    }
+
     fn has_user_messages(&self) -> bool {
         self.sink.has_user_messages()
     }
@@ -13529,13 +13633,19 @@ fn run_delivery_workflow(
             if resumed_commit_matches_reviewed_delta(&run, &expected_control, workspace_root)? {
                 run.git_control = Some(current_control.clone());
             } else {
-                resume_block_reason = Some(format!(
-                    "Git control state differs from the workflow checkpoint ({})",
-                    expected_control.difference(&current_control)
+                resume_block_reason = Some((
+                    crate::workflow::WorkflowBlockCause::GitControlChanged,
+                    format!(
+                        "Git control state differs from the workflow checkpoint ({})",
+                        expected_control.difference(&current_control)
+                    ),
                 ));
             }
         } else if let Err(error) = validate_resumed_delivery_content(&run, workspace_root) {
-            resume_block_reason = Some(format!("workspace cannot safely resume: {error:#}"));
+            resume_block_reason = Some((
+                crate::workflow::WorkflowBlockCause::RepositoryContentChanged,
+                format!("workspace cannot safely resume: {error:#}"),
+            ));
         }
         resumed = true;
         run
@@ -13569,9 +13679,10 @@ fn run_delivery_workflow(
         .git_control
         .clone()
         .context("delivery workflow has no Git control baseline")?;
-    if let Some(reason) = resume_block_reason {
+    if let Some((cause, reason)) = resume_block_reason {
         run.apply(crate::workflow::WorkflowEvent::Blocked {
             outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            cause,
             reason,
         })?;
     }
@@ -13712,6 +13823,7 @@ fn run_delivery_workflow(
         if consumed_stage_steps >= stage_step_limit {
             run.apply(crate::workflow::WorkflowEvent::Failed {
                 outcome: crate::workflow::WorkflowOutcome::StepLimit,
+                cause: crate::workflow::WorkflowBlockCause::Other,
                 reason: format!(
                     "model stage {stage:?} exhausted its cumulative {}-step budget across validation attempts",
                     stage_step_limit
@@ -13778,6 +13890,7 @@ fn run_delivery_workflow(
             if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
                 run.apply(crate::workflow::WorkflowEvent::Blocked {
                     outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                    cause: crate::workflow::WorkflowBlockCause::RepositoryContentChanged,
                     reason: "repository content changed after harness checks and before isolated code review"
                         .to_string(),
                 })?;
@@ -13786,6 +13899,7 @@ fn run_delivery_workflow(
             if let Err(error) = validate_code_review_scope(&run, workspace_root) {
                 run.apply(crate::workflow::WorkflowEvent::Failed {
                     outcome: crate::workflow::WorkflowOutcome::ReviewFailed,
+                    cause: crate::workflow::WorkflowBlockCause::Other,
                     reason: format!("code review scope is unsafe: {error:#}"),
                 })?;
                 return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
@@ -13949,6 +14063,7 @@ fn run_delivery_workflow(
             if current.fingerprint != run.planning_content().fingerprint {
                 run.apply(crate::workflow::WorkflowEvent::Blocked {
                     outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                    cause: crate::workflow::WorkflowBlockCause::RepositoryContentChanged,
                     reason: workflow_content_drift_reason(stage, run.planning_content(), &current),
                 })?;
                 return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
@@ -13958,6 +14073,7 @@ fn run_delivery_workflow(
         if workflow_control_baseline != current_control {
             run.apply(crate::workflow::WorkflowEvent::Blocked {
                 outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                cause: crate::workflow::WorkflowBlockCause::GitControlChanged,
                 reason: format!(
                     "model stage {stage:?} changed Git control state ({}); content was preserved but delivery cannot continue",
                     workflow_control_baseline.difference(&current_control)
@@ -13970,6 +14086,7 @@ fn run_delivery_workflow(
             if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
                 run.apply(crate::workflow::WorkflowEvent::Blocked {
                     outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                    cause: crate::workflow::WorkflowBlockCause::RepositoryContentChanged,
                     reason: "repository content changed while isolated code review was running"
                         .to_string(),
                 })?;
@@ -13995,9 +14112,11 @@ fn run_delivery_workflow(
                     nesting_depth: None,
                     timestamp_ms: Some(now_millis()),
                 });
+                let _ = sink.take_terminal_precursor_keys();
                 continue;
             }
             if route_pending_workflow_intervention(&mut run, workspace_root, sink)? {
+                let _ = sink.take_terminal_precursor_keys();
                 validation_feedback = None;
                 validation_signature = None;
                 repeated_validation_failures = 0;
@@ -14015,6 +14134,7 @@ fn run_delivery_workflow(
         if stage_outcome.control_violation.is_some() {
             run.apply(crate::workflow::WorkflowEvent::Failed {
                 outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                cause: crate::workflow::WorkflowBlockCause::GitControlChanged,
                 reason: stage_outcome
                     .control_violation
                     .unwrap_or_else(|| "workflow control state changed".to_string()),
@@ -14042,8 +14162,20 @@ fn run_delivery_workflow(
                     stage_outcome.termination_reason
                 )
             };
+            let cause = if stage_outcome.termination_reason == TerminationReason::GateLoop {
+                crate::workflow::WorkflowBlockCause::DeterministicRepeatLimit
+            } else if workflow_outcome == crate::workflow::WorkflowOutcome::PlanRejected {
+                crate::workflow::WorkflowBlockCause::PlanningRejected
+            } else if workflow_outcome == crate::workflow::WorkflowOutcome::ExecutorUnavailable {
+                crate::workflow::WorkflowBlockCause::ExecutorUnavailable
+            } else if workflow_outcome == crate::workflow::WorkflowOutcome::CommitBlocked {
+                crate::workflow::WorkflowBlockCause::CommitBlocked
+            } else {
+                crate::workflow::WorkflowBlockCause::Other
+            };
             run.apply(crate::workflow::WorkflowEvent::Failed {
                 outcome: workflow_outcome,
+                cause,
                 reason,
             })?;
             return delivery_terminal_outcome(run, metrics, has_acceptance_contract, sink);
@@ -14238,7 +14370,7 @@ fn run_delivery_workflow(
                     repeated_validation_failures = 1;
                 }
                 sink.emit(AgentEvent::Correction {
-                    kind: crate::events::CorrectionKind::General,
+                    kind: crate::events::CorrectionKind::ArtifactValidation,
                     message: feedback.clone(),
                     summary: "Workflow artifact validation failed".to_string(),
                     actor: crate::events::TeamActor::workflow_steward(),
@@ -14260,6 +14392,11 @@ fn run_delivery_workflow(
                     };
                     run.apply(crate::workflow::WorkflowEvent::Failed {
                         outcome,
+                        cause: if outcome == crate::workflow::WorkflowOutcome::PlanRejected {
+                            crate::workflow::WorkflowBlockCause::PlanningRejected
+                        } else {
+                            crate::workflow::WorkflowBlockCause::Other
+                        },
                         reason: format!(
                             "the same invalid {stage:?} submission was rejected {repeated_validation_failures} times: {error:#}"
                         ),
@@ -14587,6 +14724,7 @@ fn run_delivery_checks(
             Err(error) => {
                 run.apply(crate::workflow::WorkflowEvent::Blocked {
                     outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+                    cause: crate::workflow::WorkflowBlockCause::ExecutorUnavailable,
                     reason: format!("failed to select affected checks: {error:#}"),
                 })?;
                 checkpoint_delivery(run, sink)?;
@@ -14598,6 +14736,7 @@ fn run_delivery_checks(
         Err(error) => {
             run.apply(crate::workflow::WorkflowEvent::Blocked {
                 outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+                cause: crate::workflow::WorkflowBlockCause::ExecutorUnavailable,
                 reason: format!("affected check executor unavailable: {error:#}"),
             })?;
             checkpoint_delivery(run, sink)?;
@@ -14608,6 +14747,7 @@ fn run_delivery_checks(
     if control_baseline != &current_control {
         run.apply(crate::workflow::WorkflowEvent::Blocked {
             outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            cause: crate::workflow::WorkflowBlockCause::GitControlChanged,
             reason: format!(
                 "project checks changed Git control state ({}); delivery stopped",
                 control_baseline.difference(&current_control)
@@ -14620,6 +14760,7 @@ fn run_delivery_checks(
     if content_before.fingerprint != content_after.fingerprint {
         run.apply(crate::workflow::WorkflowEvent::Failed {
             outcome: crate::workflow::WorkflowOutcome::ChecksFailed,
+            cause: crate::workflow::WorkflowBlockCause::RepositoryContentChanged,
             reason: "project checks changed reviewable repository content; use a declared run_task output or make checks side-effect-free"
                 .to_string(),
         })?;
@@ -14654,6 +14795,7 @@ fn run_delivery_checks(
             }
             run.apply(crate::workflow::WorkflowEvent::Failed {
                 outcome: crate::workflow::WorkflowOutcome::ContractUnsatisfied,
+                cause: crate::workflow::WorkflowBlockCause::Other,
                 reason: feedback,
             })?;
             checkpoint_delivery(run, sink)?;
@@ -14961,6 +15103,7 @@ fn run_delivery_commit(
     if control_baseline != &current_control {
         run.apply(crate::workflow::WorkflowEvent::Blocked {
             outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            cause: crate::workflow::WorkflowBlockCause::GitControlChanged,
             reason: format!(
                 "Git control state changed before managed commit ({})",
                 control_baseline.difference(&current_control)
@@ -14973,6 +15116,7 @@ fn run_delivery_commit(
     if run.content_fingerprint.as_deref() != Some(current.fingerprint.as_str()) {
         run.apply(crate::workflow::WorkflowEvent::Blocked {
             outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            cause: crate::workflow::WorkflowBlockCause::RepositoryContentChanged,
             reason: "repository content changed after code review".to_string(),
         })?;
         checkpoint_delivery(run, sink)?;
@@ -14982,6 +15126,7 @@ fn run_delivery_commit(
         if !check_evidence_is_current(workspace_root, graph, &run.checks, check_id)? {
             run.apply(crate::workflow::WorkflowEvent::Blocked {
                 outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                cause: crate::workflow::WorkflowBlockCause::RepositoryContentChanged,
                 reason: format!("check '{check_id}' is stale before commit"),
             })?;
             checkpoint_delivery(run, sink)?;
@@ -14997,6 +15142,7 @@ fn run_delivery_commit(
         Err(error) => {
             run.apply(crate::workflow::WorkflowEvent::Blocked {
                 outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                cause: crate::workflow::WorkflowBlockCause::CommitBlocked,
                 reason: format!("managed commit failed: {error:#}"),
             })?;
             checkpoint_delivery(run, sink)?;
@@ -15006,6 +15152,7 @@ fn run_delivery_commit(
         Ok(ManagedCommitOutcome::Blocked(reason)) => {
             run.apply(crate::workflow::WorkflowEvent::Blocked {
                 outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                cause: crate::workflow::WorkflowBlockCause::CommitBlocked,
                 reason,
             })?;
             checkpoint_delivery(run, sink)?;
@@ -15014,6 +15161,7 @@ fn run_delivery_commit(
         Ok(ManagedCommitOutcome::NoChange) => {
             run.apply(crate::workflow::WorkflowEvent::Blocked {
                 outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+                cause: crate::workflow::WorkflowBlockCause::CommitBlocked,
                 reason: "delta-bearing reviewed workflow had no task-owned change at commit"
                     .to_string(),
             })?;
@@ -15034,6 +15182,7 @@ fn run_delivery_commit(
     {
         run.apply(crate::workflow::WorkflowEvent::Failed {
             outcome: crate::workflow::WorkflowOutcome::ContractUnsatisfied,
+            cause: crate::workflow::WorkflowBlockCause::Other,
             reason: feedback,
         })?;
         checkpoint_delivery(run, sink)?;
@@ -15719,16 +15868,20 @@ fn delivery_terminal_outcome(
         outcome,
         crate::workflow::WorkflowOutcome::Ready | crate::workflow::WorkflowOutcome::NoChange
     ) {
-        sink.emit(AgentEvent::WorkflowBlocked {
-            workflow_id: checkpoint.run.id.clone(),
-            outcome,
-            cause: checkpoint
-                .run
-                .blocked_cause
-                .unwrap_or_else(|| crate::events::WorkflowBlockCause::classify(outcome, &detail)),
-            reason: detail.clone(),
-            timestamp_ms: Some(now_millis()),
-        });
+        let supersedes = sink.take_terminal_precursor_keys();
+        sink.emit_superseding(
+            AgentEvent::WorkflowBlocked {
+                workflow_id: checkpoint.run.id.clone(),
+                outcome,
+                cause: checkpoint
+                    .run
+                    .blocked_cause
+                    .context("terminal workflow has no producer-authored blocked cause")?,
+                reason: detail.clone(),
+                timestamp_ms: Some(now_millis()),
+            },
+            supersedes,
+        );
     }
     sink.emit(AgentEvent::WorkflowCompleted {
         workflow_id: checkpoint.run.id.clone(),
@@ -17512,7 +17665,7 @@ fn generate_and_parse_action_with_retries(
             step,
             purpose,
             workflow_stage: request.workflow_stage,
-            profile: Some(request.profile),
+            profile: request.profile,
             duration_ms: completion.duration_ms,
             prompt_tokens: completion.prompt_tokens,
             generated_tokens: completion.generated_tokens,
@@ -17655,7 +17808,7 @@ fn generate_and_parse_action_with_retries(
                     cap_growth_used = true;
                     let instruction = "The attempted mutation stopped before forming a valid call, and the teammate explicitly said one more file excerpt was needed. The accepted-plan target is already fixed. Call only read_file now with one center line and optional capped context for the smallest missing excerpt; do not retry the mutation or request the whole file in this recovery turn.";
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::MissingEvidence,
                         message: instruction.to_string(),
                         summary: "Requesting missing bounded evidence".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -17697,7 +17850,7 @@ fn generate_and_parse_action_with_retries(
                     }
                     let retry_scope = retry_tools.as_deref().unwrap_or(tools);
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::TruncatedAction,
                         message: truncation_action_retry_instruction(args, retry_scope),
                         summary: "Retrying truncated action with thinking disabled".to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -17834,7 +17987,7 @@ fn generate_and_parse_action_with_retries(
                         )
                     };
                     sink.emit(AgentEvent::Correction {
-                        kind: crate::events::CorrectionKind::General,
+                        kind: crate::events::CorrectionKind::MutationRecovery,
                         message: instruction.clone(),
                         summary: summary.to_string(),
                         actor: crate::events::TeamActor::workflow_steward(),
@@ -19658,7 +19811,7 @@ fn maybe_inject_controller_task_observations(
     let summary = "Task-focused repository evidence";
     let message = "The controller already supplied current task-relevant bytes from the strongest matching existing path. Do not reread that file wholesale or follow a generic continuation through unrelated code. Submit the stage artifact when this evidence is sufficient; if one concrete fact is missing, request only its bounded line range.";
     sink.emit(AgentEvent::Correction {
-        kind: crate::events::CorrectionKind::General,
+        kind: crate::events::CorrectionKind::RepositoryEvidence,
         message: message.to_string(),
         summary: summary.to_string(),
         actor: crate::events::TeamActor::workflow_steward(),
@@ -31158,7 +31311,7 @@ the next imagined action"#;
             AgentEvent::ToolResult {
                 tool,
                 result,
-                actor: Some(crate::events::TeamActor::Agent(AgentProfile::Build)),
+                actor: crate::events::TeamActor::Agent(AgentProfile::Build),
                 ..
             } if tool == "edit_file" && result.contains("inline_completion=accepted")
         )));
@@ -34772,7 +34925,7 @@ the next imagined action"#;
             agent_tool_errors::ToolFailureReason::UnknownTool
         );
         assert_eq!(envelope.suggested_tool.as_deref(), Some("read_file"));
-        assert_eq!(*duration_ms, Some(0));
+        assert_eq!(*duration_ms, 0);
         assert_eq!(
             events
                 .iter()
@@ -39359,9 +39512,9 @@ the next imagined action"#;
             event,
             AgentEvent::ToolCall {
                 tool,
-                actor: Some(crate::events::TeamActor::Automation(
+                actor: crate::events::TeamActor::Automation(
                     crate::events::AutomationActor::Trinity
-                )),
+                ),
                 ..
             } if tool == lsp::PROACTIVE_LSP_TOOL_NAME
         )));

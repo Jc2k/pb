@@ -194,27 +194,20 @@ pub struct SessionListItem {
     pub running: bool,
     pub paused: bool,
     pub status: SessionStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<crate::workflow::TurnIntent>,
     pub branch: Option<String>,
     pub workdir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_outcome: Option<HandoffOutcome>,
+    pub pending_question: Option<PendingQuestionView>,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub usage_records: Vec<SessionMetricsSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_stage: Option<crate::workflow::WorkflowStage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_outcome: Option<crate::workflow::WorkflowOutcome>,
     pub strict_workflow: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::goal::GoalSummary>,
     pub active_goal: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_task: Option<MultiTaskSummary>,
     pub active_multi_task: bool,
 }
@@ -314,30 +307,22 @@ pub struct SessionDetails {
     pub running: bool,
     pub paused: bool,
     pub status: SessionStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<crate::workflow::TurnIntent>,
     pub branch: Option<String>,
     pub workdir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_outcome: Option<HandoffOutcome>,
     pub pending_question: Option<PendingQuestionView>,
     pub events: Vec<EventEnvelope>,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub usage_records: Vec<SessionMetricsSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<crate::workflow::WorkflowSummary>,
     pub strict_workflow: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::goal::GoalCheckpoint>,
     pub active_goal: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
     pub active_multi_task: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_plan_rejected: Option<crate::task_queue::TaskPlanRejected>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_planning_transcript: Option<crate::task_queue::TaskPlanningTranscript>,
 }
 
@@ -2459,7 +2444,7 @@ fn prepare_blocked_workflow_restart(session: &mut SessionState, session_id: &str
         &session.sender,
         &session.history,
         AgentEvent::Correction {
-            kind: crate::events::CorrectionKind::General,
+            kind: crate::events::CorrectionKind::TaskPlanningRecovery,
             message: "I kept the blocked plan and review in the session history, accepted the repository's current files as the new baseline, and started a fresh planning pass."
                 .to_string(),
             summary: "Restarting delivery from current files".to_string(),
@@ -2574,7 +2559,7 @@ async fn recover_task_plan(
         &session.sender,
         &session.history,
         AgentEvent::Correction {
-            kind: crate::events::CorrectionKind::General,
+            kind: crate::events::CorrectionKind::TaskPlanningRecovery,
             message: format!(
                 "{action}. Repository state and existing commits remain unchanged until the selected workflow delivers."
             ),
@@ -2624,7 +2609,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         &session.sender,
         &session.history,
         AgentEvent::Correction {
-            kind: crate::events::CorrectionKind::General,
+            kind: crate::events::CorrectionKind::Lifecycle,
             message: "Cancellation requested. Repository content and workflow evidence will be preserved."
                 .to_string(),
             summary: "Cancellation requested".to_string(),
@@ -2950,6 +2935,7 @@ async fn list_sessions(
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned()),
                 handoff_outcome: latest_handoff_outcome(session),
+                pending_question: session.pending_question.as_ref().map(pending_question_view),
                 updated_at_ms: session.updated_at_ms,
                 metrics: session.metrics.clone(),
                 usage_records: session_usage_records(session),
@@ -3286,6 +3272,7 @@ struct WebEventSink {
     accepting_user_messages: Arc<AtomicBool>,
     pause_token: Arc<AtomicBool>,
     cancel_token: Arc<AtomicBool>,
+    terminal_precursor_keys: Vec<String>,
 }
 
 impl EventSink for WebEventSink {
@@ -3294,6 +3281,10 @@ impl EventSink for WebEventSink {
     }
 
     fn emit(&mut self, event: AgentEvent) {
+        self.emit_superseding(event, Vec::new());
+    }
+
+    fn emit_superseding(&mut self, event: AgentEvent, supersedes: Vec<String>) {
         if let AgentEvent::Started {
             workspace,
             focus_root,
@@ -3347,7 +3338,7 @@ impl EventSink for WebEventSink {
                 });
             }
         }
-        publish_event(&self.sender, &self.history, event);
+        publish_event_linked(&self.sender, &self.history, event, supersedes);
         if self.goal.is_some() {
             self.goal = tokio::runtime::Handle::current().block_on(async {
                 let sessions = self.state.sessions.lock().await;
@@ -3379,6 +3370,16 @@ impl EventSink for WebEventSink {
             self.multi_task.clone(),
             self.completed_multi_tasks.clone(),
         );
+    }
+
+    fn emit_terminal_precursor(&mut self, event: AgentEvent) {
+        let entry_key = crate::events::event_entry_key(&event);
+        self.emit(event);
+        self.terminal_precursor_keys.push(entry_key);
+    }
+
+    fn take_terminal_precursor_keys(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.terminal_precursor_keys)
     }
 
     fn has_user_messages(&self) -> bool {
@@ -4000,6 +4001,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 accepting_user_messages,
                 pause_token,
                 cancel_token,
+                terminal_precursor_keys: Vec::new(),
             };
             run_agent_managed(request_for_run.clone(), &models_root, sink)
         })
@@ -4045,7 +4047,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                                     &session.history,
                                     AgentEvent::Error {
                                         summary: "Task controller failed".to_string(),
-                                        message: format!("{error:#}"),
+                                        detail: format!("{error:#}"),
                                         nesting_depth: None,
                                         timestamp_ms: Some(now_millis()),
                                     },
@@ -4069,7 +4071,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                                     &session.history,
                                     AgentEvent::Error {
                                         summary: "Goal controller failed".to_string(),
-                                        message: format!("{error:#}"),
+                                        detail: format!("{error:#}"),
                                         nesting_depth: None,
                                         timestamp_ms: Some(now_millis()),
                                     },
@@ -4106,7 +4108,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                                     &session.history,
                                     AgentEvent::Error {
                                         summary: "Goal Task activation failed".to_string(),
-                                        message: format!("{error:#}"),
+                                        detail: format!("{error:#}"),
                                         nesting_depth: None,
                                         timestamp_ms: Some(now_millis()),
                                     },
@@ -4131,7 +4133,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                                     &session.history,
                                     AgentEvent::Error {
                                         summary: "Goal activation failed".to_string(),
-                                        message: format!("{error:#}"),
+                                        detail: format!("{error:#}"),
                                         nesting_depth: None,
                                         timestamp_ms: Some(now_millis()),
                                     },
@@ -4171,7 +4173,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         &session.history,
                         AgentEvent::Error {
                             summary: "Session failed".to_string(),
-                            message: format!("{err:#}"),
+                            detail: format!("{err:#}"),
                             nesting_depth: None,
                             timestamp_ms: Some(now_millis()),
                         },
@@ -4188,7 +4190,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                         &session.history,
                         AgentEvent::Error {
                             summary: "Session failed".to_string(),
-                            message: format!("{err:#}"),
+                            detail: format!("{err:#}"),
                             nesting_depth: None,
                             timestamp_ms: Some(now_millis()),
                         },
@@ -5382,34 +5384,18 @@ fn build_project_usage_cache(
 fn session_from_persisted(mut persisted: PersistedSession) -> (String, SessionState) {
     let (sender, _) = broadcast::channel(256);
     let session_id = persisted.session_id.clone();
-    let title = latest_session_title(&persisted.events).or(persisted.title);
-    let usage_records = if persisted.usage_records.is_empty() {
-        persisted
-            .events
-            .iter()
-            .filter_map(|envelope| SessionMetricsSnapshot::from_event(&envelope.event))
-            .collect::<Vec<_>>()
-    } else {
-        persisted.usage_records.clone()
-    };
-    let metrics = persisted
-        .metrics
-        .clone()
-        .or_else(|| combined_metrics(&usage_records));
-    let pending_user_messages = if persisted.pending_user_messages.is_empty() {
-        pending_user_messages_from_events(&persisted.events)
-    } else {
-        std::mem::take(&mut persisted.pending_user_messages)
-    };
-    crate::events::hydrate_event_projections(&mut persisted.events);
+    let title = persisted.title;
+    let usage_records = persisted.usage_records.clone();
+    let metrics = persisted.metrics.clone();
+    let pending_user_messages = std::mem::take(&mut persisted.pending_user_messages);
     let history = Arc::new(StdMutex::new(persisted.events));
     let pending_user_messages =
         Arc::new(StdMutex::new(pending_user_messages.into_iter().collect()));
-    let interrupted = persisted.running || persisted.status == Some(SessionStatus::Running);
+    let interrupted = persisted.running || persisted.status == SessionStatus::Running;
     let status = if interrupted {
         SessionStatus::Paused
     } else {
-        persisted.status.unwrap_or(SessionStatus::Completed)
+        persisted.status
     };
     let mut request_template = persisted.request_template;
     request_template.workflow_checkpoint = persisted.workflow.clone();
@@ -5573,6 +5559,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned()),
                 handoff_outcome: latest_handoff_outcome(session),
+                pending_question: session.pending_question.as_ref().map(pending_question_view),
                 updated_at_ms: session.updated_at_ms,
                 metrics: session.metrics.clone(),
                 usage_records: session_usage_records(session),
@@ -5798,7 +5785,17 @@ fn publish_event(
     history: &StdMutex<Vec<EventEnvelope>>,
     event: AgentEvent,
 ) {
+    publish_event_linked(sender, history, event, Vec::new());
+}
+
+fn publish_event_linked(
+    sender: &broadcast::Sender<EventEnvelope>,
+    history: &StdMutex<Vec<EventEnvelope>>,
+    event: AgentEvent,
+    supersedes: Vec<String>,
+) {
     let mut envelope = EventEnvelope::with_timestamp(event);
+    envelope.transcript.supersedes = supersedes;
     if let Ok(mut entries) = history.lock() {
         envelope.refresh_projections(&entries);
         let _ = sender.send(envelope.clone());
@@ -6056,7 +6053,14 @@ mod workflow_tests {
             Vec::new(),
         );
         persisted.workflow = Some(checkpoint.clone());
-        let (session_id, restored) = session_from_persisted(persisted);
+        let (session_id, mut restored) = session_from_persisted(persisted);
+        let (question_sender, _question_receiver) = std::sync::mpsc::channel();
+        restored.pending_question = Some(PendingQuestionState {
+            question_id: "question-web-restore".to_string(),
+            question: "Which release should I target?".to_string(),
+            choices: vec!["Next".to_string(), "Current".to_string()],
+            responder: question_sender,
+        });
 
         assert_eq!(restored.status, SessionStatus::Paused);
         assert!(restored.paused);
@@ -6083,8 +6087,16 @@ mod workflow_tests {
             list[0].workflow_stage,
             Some(crate::workflow::WorkflowStage::Planning)
         );
+        assert_eq!(
+            list[0].pending_question.as_ref().unwrap().question_id,
+            "question-web-restore"
+        );
         assert!(list[0].strict_workflow);
         let details = session_details_snapshot(&state, &session_id).await.unwrap();
+        assert_eq!(
+            details.pending_question.as_ref().unwrap().choices,
+            ["Next", "Current"]
+        );
         assert_eq!(details.workflow.unwrap().id, "workflow-web-restore");
         assert!(details.strict_workflow);
     }
@@ -6111,6 +6123,7 @@ mod workflow_tests {
         .unwrap();
         run.apply(crate::workflow::WorkflowEvent::Blocked {
             outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+            cause: crate::workflow::WorkflowBlockCause::ExecutorUnavailable,
             reason: "executor unavailable".to_string(),
         })
         .unwrap();
@@ -6196,6 +6209,7 @@ mod workflow_tests {
         .unwrap();
         run.apply(crate::workflow::WorkflowEvent::Blocked {
             outcome: crate::workflow::WorkflowOutcome::CommitBlocked,
+            cause: crate::workflow::WorkflowBlockCause::RepositoryContentChanged,
             reason: "repository content changed while the read-only PlanReview stage was running"
                 .to_string(),
         })

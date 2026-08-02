@@ -4,7 +4,7 @@ export interface TeamPresentation {
   name: string;
   role: string;
   avatar: string;
-  provenance: "Model" | "Harness" | "Legacy";
+  provenance: "Model" | "Harness";
 }
 
 const PROFILES: Record<string, Omit<TeamPresentation, "provenance">> = {
@@ -92,40 +92,23 @@ export function profileAccentClass(profile: string): string {
     : "teammate-neutral";
 }
 
-export function teamActorPresentation(
-  actor?: TeamActor,
-): TeamPresentation {
-  if (actor?.kind === "agent") {
+export function teamActorPresentation(actor: TeamActor): TeamPresentation {
+  if (actor.kind === "agent") {
     return {
       ...profilePresentation(actor.id),
       provenance: "Model",
     };
   }
-  if (actor?.kind === "automation") {
-    return { ...TRINITY_STEWARD, provenance: "Harness" };
-  }
-  return {
-    name: "Agent",
-    role: "Earlier session",
-    avatar: "/static/images/avatar.png",
-    provenance: "Legacy",
-  };
+  return { ...TRINITY_STEWARD, provenance: "Harness" };
 }
 
-export function teamActorKey(actor?: TeamActor): string {
-  return actor ? `${actor.kind}:${actor.id}` : "legacy:unknown";
+export function teamActorKey(actor: TeamActor): string {
+  return `${actor.kind}:${actor.id}`;
 }
 
-export function teamActorAccentClass(actor?: TeamActor): string {
-  if (actor?.kind === "automation") {
+export function teamActorAccentClass(actor: TeamActor): string {
+  if (actor.kind === "automation") {
     return "teammate-message trinity-message";
   }
-  if (actor?.kind === "agent") {
-    return `teammate-message ${profileAccentClass(actor.id)}`;
-  }
-  return "";
-}
-
-export function workflowStewardActor(): TeamActor {
-  return { kind: "automation", id: "trinity" };
+  return `teammate-message ${profileAccentClass(actor.id)}`;
 }

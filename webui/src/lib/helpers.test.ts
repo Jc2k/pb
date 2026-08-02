@@ -1,6 +1,10 @@
 /// <reference lib="deno.ns" />
 import { equal } from "node:assert/strict";
-import type { EventEnvelope } from "../types/index";
+import type {
+  EventEnvelope,
+  SessionItem,
+  SessionMetricsSnapshot,
+} from "../types/index";
 import {
   buildChatPresentation,
   CHAT_TIME_GAP_MS,
@@ -15,10 +19,85 @@ import {
   usageStatsForToday,
 } from "./helpers.ts";
 
+let testEventIndex = 0;
+function eventEnvelopeDefaults(): Pick<
+  EventEnvelope,
+  "chatter" | "transcript"
+> {
+  testEventIndex += 1;
+  return {
+    chatter: [],
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      entry_key: `test-event-${testEventIndex}`,
+      supersedes: [],
+      summary_redundant: false,
+      session_effect: {
+        refresh: false,
+        running: "unchanged",
+        reset_intent: false,
+      },
+    },
+  };
+}
+
+function currentMetrics(
+  values: Partial<SessionMetricsSnapshot> = {},
+): SessionMetricsSnapshot {
+  return {
+    llm_invocations: 0,
+    llm_runtime_ms: 0,
+    prompt_tokens: 0,
+    generated_tokens: 0,
+    tool_calls: 0,
+    tool_runtime_ms: 0,
+    cache_persistence_queued_checkpoints: 0,
+    cache_persistence_completed_checkpoints: 0,
+    cache_persistence_wall_ms: 0,
+    cache_persistence_failures: 0,
+    wall_runtime_ms: 0,
+    display_energy_excluded: false,
+    idle_baseline_applied: false,
+    energy_complete: false,
+    energy_exclusive: false,
+    ...values,
+  };
+}
+
+function currentSession(values: Partial<SessionItem>): SessionItem {
+  return {
+    session_id: "session",
+    task: "Task",
+    title: null,
+    running: false,
+    paused: false,
+    status: "completed",
+    intent: null,
+    branch: null,
+    workdir: null,
+    handoff_outcome: null,
+    pending_question: null,
+    updated_at_ms: 0,
+    metrics: null,
+    usage_records: [],
+    workflow_id: null,
+    workflow_stage: null,
+    workflow_outcome: null,
+    strict_workflow: false,
+    goal: null,
+    active_goal: false,
+    multi_task: null,
+    active_multi_task: false,
+    ...values,
+  };
+}
+
 Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "reasoning",
         content: "First thought",
@@ -27,11 +106,13 @@ Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "llm_invocation",
         step: 1,
         profile: "review",
+        purpose: "conversation",
         duration_ms: 500,
         prompt_tokens: 10,
         generated_tokens: 5,
@@ -39,7 +120,8 @@ Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "final",
         content: "Same speaker",
@@ -48,9 +130,11 @@ Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "correction",
+        kind: "artifact_validation",
         message: "Specific guidance",
         summary: "Repeated tool call detected",
         actor: { kind: "automation", id: "trinity" },
@@ -58,9 +142,11 @@ Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "correction",
+        kind: "artifact_validation",
         message: "More specific guidance",
         summary: "No-progress tool outcome detected",
         actor: { kind: "automation", id: "trinity" },
@@ -161,29 +247,39 @@ Deno.test("every named agent profile has a packaged avatar", async () => {
 Deno.test("groupActionEvents separates profile and steward actions", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: { type: "reasoning", content: "thinking", profile: "build" },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_call",
         tool: "read_file",
         arguments: { path: "Cargo.toml" },
+        call_id: "read-cargo",
+        batch_id: "batch-cargo",
         actor: { kind: "agent", id: "build" },
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_result",
         tool: "read_file",
         result: "[package]",
+        call_id: "read-cargo",
+        batch_id: "batch-cargo",
+        outcome: "succeeded",
         actor: { kind: "agent", id: "build" },
+        duration_ms: 1,
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "controller_closure",
         workflow_id: "workflow-1",
@@ -194,7 +290,8 @@ Deno.test("groupActionEvents separates profile and steward actions", () => {
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: { type: "final", content: "done", profile: "build" },
     },
   ];
@@ -224,21 +321,29 @@ Deno.test("groupActionEvents separates profile and steward actions", () => {
 Deno.test("groupActionEvents presents proactive LSP work as Trinity's routine action", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_call",
         tool: "lsp_proactive_diagnostics",
         arguments: { mode: "syntax", paths: ["src/lib.rs"] },
+        call_id: "lsp-1",
+        batch_id: "batch-lsp",
         actor: { kind: "automation", id: "trinity" },
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_result",
         tool: "lsp_proactive_diagnostics",
         result: JSON.stringify({ diagnostics: [] }),
+        call_id: "lsp-1",
+        batch_id: "batch-lsp",
+        outcome: "succeeded",
         actor: { kind: "automation", id: "trinity" },
+        duration_ms: 1,
       },
     },
   ];
@@ -253,7 +358,8 @@ Deno.test("groupActionEvents presents proactive LSP work as Trinity's routine ac
 Deno.test("groupActionEvents folds adjacent tool-only inferences by the same teammate into one run", () => {
   const actor = { kind: "agent", id: "plan" } as const;
   const inference = (step: number): EventEnvelope => ({
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "llm_invocation",
       step,
@@ -267,27 +373,34 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
   const events: EventEnvelope[] = [
     inference(1),
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_call",
         tool: "glob",
         arguments: { pattern: "webui/**/*.tsx" },
         call_id: "one",
+        batch_id: "batch-one",
         actor,
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_result",
         tool: "glob",
         result: "ProjectsPage.tsx",
         call_id: "one",
+        batch_id: "batch-one",
+        outcome: "succeeded",
         actor,
+        duration_ms: 1,
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_batch",
         call_count: 1,
@@ -299,29 +412,38 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
     },
     inference(2),
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_call",
         tool: "read_file",
         arguments: { path: "webui/src/pages/ProjectsPage.tsx" },
         call_id: "two",
+        batch_id: "batch-two",
         actor,
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_result",
         tool: "read_file",
         result: "source",
         call_id: "two",
+        batch_id: "batch-two",
+        outcome: "succeeded",
         actor,
+        duration_ms: 1,
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "correction",
+        kind: "artifact_validation",
+        summary: "Submit the plan",
         message: "Submit the plan now",
         actor: { kind: "automation", id: "trinity" },
       },
@@ -343,18 +465,21 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
 
 Deno.test("groupActionEvents places inference timing after chat-only model work", () => {
   const inference: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "llm_invocation",
       step: 1,
       profile: "review",
+      purpose: "conversation",
       duration_ms: 1000,
       prompt_tokens: 100,
       generated_tokens: 10,
     },
   };
   const reasoning: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "reasoning",
       content: "I found the issue.",
@@ -362,7 +487,8 @@ Deno.test("groupActionEvents places inference timing after chat-only model work"
     },
   };
   const final: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "final",
       content: "The issue is confirmed.",
@@ -381,20 +507,24 @@ Deno.test("groupActionEvents places inference timing after chat-only model work"
 Deno.test("groupActionEvents hides timing when a model call produced no visible work", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "llm_invocation",
         step: 4,
         profile: "review",
+        purpose: "conversation",
         duration_ms: 30_000,
         prompt_tokens: 100,
         generated_tokens: 10,
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "correction",
+        kind: "artifact_validation",
         summary: "Repeated tool call detected",
         message: "The duplicate action was blocked.",
         actor: { kind: "automation", id: "trinity" },
@@ -412,18 +542,21 @@ Deno.test("groupActionEvents keeps teammate reasoning visible before its action 
   const actor = { kind: "agent", id: "build" } as const;
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "llm_invocation",
         step: 1,
         profile: "build",
+        purpose: "conversation",
         duration_ms: 1000,
         prompt_tokens: 100,
         generated_tokens: 10,
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "reasoning",
         content: "I will inspect the exact target first.",
@@ -431,23 +564,29 @@ Deno.test("groupActionEvents keeps teammate reasoning visible before its action 
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_call",
         tool: "read_file",
         arguments: { path: "webui/src/pages/ProjectsPage.tsx" },
         call_id: "one",
+        batch_id: "batch-one",
         actor,
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_result",
         tool: "read_file",
         result: "source",
         call_id: "one",
+        batch_id: "batch-one",
+        outcome: "succeeded",
         actor,
+        duration_ms: 1,
       },
     },
   ];
@@ -467,7 +606,8 @@ Deno.test("groupActionEvents keeps teammate reasoning visible before its action 
 Deno.test("groupActionEvents correlates reordered identical tools across intervening messages", () => {
   const actor = { kind: "agent", id: "build" } as const;
   const callA: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "tool_call",
       tool: "read_file",
@@ -478,7 +618,8 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
     },
   };
   const callB: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "tool_call",
       tool: "read_file",
@@ -489,15 +630,19 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
     },
   };
   const correction: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "correction",
+      kind: "artifact_validation",
+      summary: "Keep going",
       message: "keep going",
       actor: { kind: "automation", id: "trinity" },
     },
   };
   const resultB: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "tool_result",
       tool: "read_file",
@@ -506,10 +651,12 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
       batch_id: "batch",
       outcome: "succeeded",
       actor,
+      duration_ms: 1,
     },
   };
   const resultA: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "tool_result",
       tool: "read_file",
@@ -518,6 +665,7 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
       batch_id: "batch",
       outcome: "succeeded",
       actor,
+      duration_ms: 1,
     },
   };
 
@@ -552,41 +700,42 @@ Deno.test("projectSettingsPath encodes project names under the project URL", () 
 
 Deno.test("usageStatsForToday sums metrics for sessions updated today", () => {
   const today = new Date("2026-06-26T12:00:00");
+  const todayMetrics = currentMetrics({
+    llm_invocations: 1,
+    llm_runtime_ms: 1000,
+    prompt_tokens: 120,
+    generated_tokens: 30,
+    tool_calls: 2,
+    tool_runtime_ms: 500,
+    wall_runtime_ms: 1500,
+    total_energy_joules: 10_800,
+    energy_complete: true,
+    energy_exclusive: true,
+  });
+  const yesterdayMetrics = currentMetrics({
+    llm_invocations: 1,
+    llm_runtime_ms: 2000,
+    prompt_tokens: 400,
+    generated_tokens: 100,
+    tool_calls: 5,
+    tool_runtime_ms: 1000,
+    wall_runtime_ms: 3000,
+  });
   const sessions = [
-    {
+    currentSession({
       session_id: "today",
       task: "Current work",
-      running: false,
-      paused: false,
-      status: "completed" as const,
       updated_at_ms: new Date("2026-06-26T08:30:00").getTime(),
-      metrics: {
-        llm_invocations: 1,
-        llm_runtime_ms: 1000,
-        prompt_tokens: 120,
-        generated_tokens: 30,
-        tool_calls: 2,
-        tool_runtime_ms: 500,
-        llm_energy_kwh: 0.001,
-        tool_energy_kwh: 0.002,
-      },
-    },
-    {
+      metrics: todayMetrics,
+      usage_records: [todayMetrics],
+    }),
+    currentSession({
       session_id: "yesterday",
       task: "Old work",
-      running: false,
-      paused: false,
-      status: "completed" as const,
       updated_at_ms: new Date("2026-06-25T23:59:59").getTime(),
-      metrics: {
-        llm_invocations: 1,
-        llm_runtime_ms: 2000,
-        prompt_tokens: 400,
-        generated_tokens: 100,
-        tool_calls: 5,
-        tool_runtime_ms: 1000,
-      },
-    },
+      metrics: yesterdayMetrics,
+      usage_records: [yesterdayMetrics],
+    }),
   ];
 
   const stats = usageStatsForToday(sessions, today);
@@ -598,7 +747,7 @@ Deno.test("usageStatsForToday sums metrics for sessions updated today", () => {
 });
 
 Deno.test("usageStatsForToday uses per-turn windows and apportions midnight overlap", () => {
-  const record = {
+  const record = currentMetrics({
     llm_invocations: 1,
     llm_runtime_ms: 120_000,
     prompt_tokens: 80,
@@ -609,17 +758,14 @@ Deno.test("usageStatsForToday uses per-turn windows and apportions midnight over
     started_at_ms: new Date("2026-06-25T23:59:00").getTime(),
     ended_at_ms: new Date("2026-06-26T00:01:00").getTime(),
     total_energy_joules: 120,
-  };
-  const stats = usageStatsForToday([{
+  });
+  const stats = usageStatsForToday([currentSession({
     session_id: "midnight",
     task: "Cross midnight",
-    running: false,
-    paused: false,
-    status: "completed",
     updated_at_ms: record.ended_at_ms,
     metrics: record,
     usage_records: [record],
-  }], new Date("2026-06-26T12:00:00"));
+  })], new Date("2026-06-26T12:00:00"));
 
   equal(stats.tokens, 50);
   equal(stats.runtime_ms, 60_000);

@@ -29,6 +29,11 @@ Goal for the exact current turn, but the resulting milestone plan still waits fo
 Changing the status filter starts that filtered history from its first batch again. No sessions are
 deleted or hidden from the filter totals.
 
+Session notes use the current version-2 event/session contract. A note written with an incompatible
+development schema, or missing required current state, is ignored during restore. pb does not guess
+at missing teammate speech, reconstruct old transcript metadata, or derive absent status and usage
+records from neighboring events.
+
 Starting work from a project page leaves branch and managed-workspace selection to pb. The page does
 not offer a synthetic list of branch names. Session rows show the branch reported by pb or identify
 the managed workspace when no branch applies; the overview shows only the latest session's branch.
@@ -306,8 +311,8 @@ compatibility mode and works in the registered repository itself, so another edi
 change those files while a task is running. Content fingerprints prevent stale review or commit
 evidence from being accepted, but they are conflict detection rather than filesystem isolation.
 
-Sessions saved before actor attribution remain readable. Their model tool actions appear as
-**Legacy** rather than being guessed from the closest chat message.
+Persisted sessions and their events must use the current v2 schemas. Incompatible development-era
+notes are skipped during restoration instead of being migrated or shown with guessed attribution.
 
 If a file is missing, binary, symlinked, stale, oversized, or cannot fit the bounded prompt safely,
 pb does not pretend it was read. The normal model/tool path remains available. Automatic deletion

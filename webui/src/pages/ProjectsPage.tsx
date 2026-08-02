@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import type {
   ComposerMode,
@@ -46,7 +46,16 @@ import {
 import { useProjectSessionData } from "../lib/hooks";
 
 export function ProjectsPage() {
-  const { projects, sessions } = useProjectSessionData();
+  const {
+    projects,
+    sessions,
+    projectsLoading,
+    sessionsLoading,
+    projectsError,
+    sessionsError,
+    refreshProjects,
+    refreshSessions,
+  } = useProjectSessionData();
 
   return (
     <PageShell contentClassName="projects-index-wrap">
@@ -60,7 +69,26 @@ export function ProjectsPage() {
 
       <section className="sessions-section">
         <div className="project-list session-list list-group">
-          {projects.length === 0
+          {projectsLoading && projects.length === 0
+            ? (
+              <div className="list-group-item text-secondary small">
+                Loading projects…
+              </div>
+            )
+            : projectsError && projects.length === 0
+            ? (
+              <div className="list-group-item text-danger small">
+                <span>{projectsError}</span>{" "}
+                <button
+                  type="button"
+                  className="btn btn-sm btn-link"
+                  onClick={() => void refreshProjects()}
+                >
+                  Try again
+                </button>
+              </div>
+            )
+            : projects.length === 0
             ? (
               <div className="list-group-item text-secondary small">
                 No registered projects. Add one with{" "}
@@ -95,8 +123,11 @@ export function ProjectsPage() {
                         running ? "status-running" : "status-completed"
                       }`}
                     >
-                      {projectSessions.length}{" "}
-                      session{projectSessions.length === 1 ? "" : "s"}
+                      {sessionsLoading
+                        ? "Loading sessions…"
+                        : `${projectSessions.length} session${
+                          projectSessions.length === 1 ? "" : "s"
+                        }`}
                     </span>
                     <Link
                       className="btn btn-sm btn-icon btn-outline-secondary"
@@ -114,6 +145,32 @@ export function ProjectsPage() {
               })
             )}
         </div>
+        {projectsError && projects.length > 0 && (
+          <div className="alert alert-warning mt-3" role="alert">
+            Projects may be out of date: {projectsError}{" "}
+            <button
+              type="button"
+              className="btn btn-sm btn-link"
+              onClick={() =>
+                void refreshProjects()}
+            >
+              Try again
+            </button>
+          </div>
+        )}
+        {sessionsError && (
+          <div className="alert alert-warning mt-3" role="alert">
+            Session counts may be out of date: {sessionsError}{" "}
+            <button
+              type="button"
+              className="btn btn-sm btn-link"
+              onClick={() =>
+                void refreshSessions()}
+            >
+              Try again
+            </button>
+          </div>
+        )}
       </section>
     </PageShell>
   );
@@ -131,11 +188,21 @@ export function ProjectPage() {
     { projectName: string }
   >();
   const navigate = useNavigate();
-  const { projects, sessions } = useProjectSessionData();
+  const {
+    projects,
+    sessions,
+    projectsLoading,
+    sessionsLoading,
+    projectsError,
+    sessionsError,
+    refreshProjects,
+    refreshSessions,
+  } = useProjectSessionData();
   const [task, setTask] = useState("");
   const [intent, setIntent] = useState<ComposerMode>("discuss");
   const [goalOpen, setGoalOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState("");
   const [voiceInputActive, setVoiceInputActive] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
   const [filter, setFilter] = useState<SessionFilter>("all");
@@ -147,6 +214,8 @@ export function ProjectPage() {
     runtime_ms: 0,
     tool_calls: 0,
   });
+  const [usageLoading, setUsageLoading] = useState(true);
+  const [usageError, setUsageError] = useState("");
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
   const projectSessions = useMemo(
@@ -171,20 +240,40 @@ export function ProjectPage() {
   const latestBranch = projectSessions[0]?.branch || "Managed automatically";
 
   useEffect(() => {
-    if (!name) return;
-    const fetchUsage = () =>
-      fetch(`/api/projects/${encodeURIComponent(name)}/usage`)
-        .then((
-          res,
-        ) => (res.ok
-          ? res.json()
-          : { tokens: 0, runtime_ms: 0, tool_calls: 0 })
-        )
-        .then((stats: ProjectUsageStats) => setUsage(stats));
+    if (!name || !project) return;
+    let active = true;
+    setUsageLoading(true);
+    setUsageError("");
+    const fetchUsage = async () => {
+      try {
+        const res = await fetch(
+          `/api/projects/${encodeURIComponent(name)}/usage`,
+        );
+        if (!res.ok) {
+          throw new Error(`Usage request failed (${res.status})`);
+        }
+        const nextUsage = (await res.json()) as ProjectUsageStats;
+        if (active) {
+          setUsage(nextUsage);
+          setUsageError("");
+        }
+      } catch (error) {
+        if (active) {
+          setUsageError(
+            error instanceof Error ? error.message : "Usage request failed",
+          );
+        }
+      } finally {
+        if (active) setUsageLoading(false);
+      }
+    };
     void fetchUsage();
     const timer = window.setInterval(() => void fetchUsage(), 5000);
-    return () => window.clearInterval(timer);
-  }, [name]);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [name, project?.path]);
 
   const startProjectSession = async () => {
     if (!project || !task.trim()) return;
@@ -193,6 +282,7 @@ export function ProjectPage() {
       return;
     }
     setIsSubmitting(true);
+    setSubmitError("");
     try {
       const res = await fetch("/api/sessions", {
         method: "POST",
@@ -204,21 +294,31 @@ export function ProjectPage() {
           attachments: images,
         }),
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        throw new Error(`Could not start the session (${res.status})`);
+      }
       const data = (await res.json()) as { session_id: string };
       navigate(`/sessions/${data.session_id}`);
+    } catch (error) {
+      setSubmitError(
+        error instanceof Error ? error.message : "Could not start the session",
+      );
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  const usageList = (
-    <UsageMetrics
-      usage={usage}
-      todaysUsage={todaysUsage}
-      scopeLabel="Across project sessions"
-    />
-  );
+  const usageList = usageLoading
+    ? <p className="text-secondary small">Loading usage…</p>
+    : usageError
+    ? <p className="text-danger small">{usageError}</p>
+    : (
+      <UsageMetrics
+        usage={usage}
+        todaysUsage={todaysUsage}
+        scopeLabel="Across project sessions"
+      />
+    );
 
   return (
     <PageShell
@@ -245,7 +345,44 @@ export function ProjectPage() {
             )}
           </div>
 
-          {project
+          {project && projectsError && (
+            <div className="alert alert-warning" role="alert">
+              Project details may be out of date: {projectsError}{" "}
+              <button
+                type="button"
+                className="btn btn-sm btn-link"
+                onClick={() =>
+                  void refreshProjects()}
+              >
+                Try again
+              </button>
+            </div>
+          )}
+
+          {projectsLoading && !project
+            ? (
+              <div className="card soft-card">
+                <div className="card-body text-secondary">
+                  Loading project…
+                </div>
+              </div>
+            )
+            : projectsError && !project
+            ? (
+              <div className="card soft-card">
+                <div className="card-body text-danger">
+                  {projectsError}{" "}
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-link"
+                    onClick={() => void refreshProjects()}
+                  >
+                    Try again
+                  </button>
+                </div>
+              </div>
+            )
+            : project
             ? (
               <form
                 className="card soft-card composer-card"
@@ -269,6 +406,11 @@ export function ProjectPage() {
                     readOnly={voiceInputActive}
                   />
                   <ImageAttachments images={images} setImages={setImages} />
+                  {submitError && (
+                    <p className="text-danger small" role="alert">
+                      {submitError}
+                    </p>
+                  )}
                   <div className="composer-actions">
                     <div className="quick-actions">
                       <IntentControl
@@ -335,112 +477,136 @@ export function ProjectPage() {
               </div>
             )}
 
-          <section className="sessions-section project-sessions-panel">
-            <h2>Project sessions</h2>
-            <SessionFilters
-              filter={filter}
-              counts={counts}
-              onFilterChange={setFilter}
-            />
-            <SessionRows
-              sessions={visibleSessions}
-              emptyText="No sessions match this filter."
-              paginationKey={filter}
-              onOpenSession={(session) =>
-                navigate(`/sessions/${session.session_id}`)}
-            />
-          </section>
-        </section>
-
-        <aside className="project-aside">
-          <div className="details-tabs card soft-card">
-            <div className="card-body">
-              <div className="details-heading">
-                <h2>Project details</h2>
-                <i className="bi bi-lock"></i>
-              </div>
-              <div
-                className="tab-nav"
-                role="tablist"
-                aria-label="Project details tabs"
-              >
-                {(["usage", "overview", "snapshot"] as ProjectDetailsTab[]).map(
-                  (tab) => (
-                    <button
-                      key={tab}
-                      type="button"
-                      role="tab"
-                      className={`nav-link${
-                        activeDetailsTab === tab ? " active" : ""
-                      }`}
-                      onClick={() => setActiveDetailsTab(tab)}
-                    >
-                      {tab.charAt(0).toUpperCase() + tab.slice(1)}
-                    </button>
-                  ),
-                )}
-              </div>
-              {activeDetailsTab === "usage" && (
-                <div className="info-list usage-list">
-                  {usageList}
-                  <p className="privacy-note">
-                    <i className="bi bi-lock"></i>{" "}
-                    All usage is local and private.
-                  </p>
+          {project && (
+            <section className="sessions-section project-sessions-panel">
+              <h2>Project sessions</h2>
+              {sessionsError && (
+                <div className="alert alert-warning" role="alert">
+                  {sessionsError}{" "}
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-link"
+                    onClick={() =>
+                      void refreshSessions()}
+                  >
+                    Try again
+                  </button>
                 </div>
               )}
-              {activeDetailsTab === "overview" && (
+              {sessionsLoading
+                ? <p className="text-secondary small">Loading sessions…</p>
+                : (
+                  <>
+                    <SessionFilters
+                      filter={filter}
+                      counts={counts}
+                      onFilterChange={setFilter}
+                    />
+                    <SessionRows
+                      sessions={visibleSessions}
+                      emptyText="No sessions match this filter."
+                      paginationKey={filter}
+                      onOpenSession={(session) =>
+                        navigate(`/sessions/${session.session_id}`)}
+                    />
+                  </>
+                )}
+            </section>
+          )}
+        </section>
+
+        {project && (
+          <aside className="project-aside">
+            <div className="details-tabs card soft-card">
+              <div className="card-body">
+                <div className="details-heading">
+                  <h2>Project details</h2>
+                  <i className="bi bi-lock"></i>
+                </div>
+                <div
+                  className="tab-nav"
+                  role="tablist"
+                  aria-label="Project details tabs"
+                >
+                  {(["usage", "overview", "snapshot"] as ProjectDetailsTab[])
+                    .map(
+                      (tab) => (
+                        <button
+                          key={tab}
+                          type="button"
+                          role="tab"
+                          className={`nav-link${
+                            activeDetailsTab === tab ? " active" : ""
+                          }`}
+                          onClick={() => setActiveDetailsTab(tab)}
+                        >
+                          {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                        </button>
+                      ),
+                    )}
+                </div>
+                {activeDetailsTab === "usage" && (
+                  <div className="info-list usage-list">
+                    {usageList}
+                    <p className="privacy-note">
+                      <i className="bi bi-lock"></i>{" "}
+                      All usage is local and private.
+                    </p>
+                  </div>
+                )}
+                {activeDetailsTab === "overview" && (
+                  <ProjectOverview
+                    currentStatus={projectSessions[0]?.status || "queued"}
+                    latestBranch={latestBranch}
+                    lastActive={lastActive}
+                    sessionCount={projectSessions.length}
+                  />
+                )}
+                {activeDetailsTab === "snapshot" && (
+                  <ProjectSnapshot
+                    project={project}
+                    lastSession={projectSessions[0]}
+                  />
+                )}
+              </div>
+            </div>
+            <section className="card soft-card aside-card desktop-card">
+              <div className="card-body">
+                <div className="card-title-row">
+                  <h2>Local usage</h2>
+                  <i className="bi bi-info-circle"></i>
+                </div>
+                <div className="info-list usage-list">{usageList}</div>
+                <p className="privacy-note">
+                  <i className="bi bi-lock"></i> All usage is local and private.
+                </p>
+              </div>
+            </section>
+            <section className="card soft-card aside-card desktop-card">
+              <div className="card-body">
+                <h2>Project overview</h2>
                 <ProjectOverview
                   currentStatus={projectSessions[0]?.status || "queued"}
                   latestBranch={latestBranch}
                   lastActive={lastActive}
                   sessionCount={projectSessions.length}
                 />
-              )}
-              {activeDetailsTab === "snapshot" && (
+              </div>
+            </section>
+            <section className="card soft-card aside-card desktop-card">
+              <div className="card-body">
+                <h2>Project snapshot</h2>
                 <ProjectSnapshot
                   project={project}
                   lastSession={projectSessions[0]}
                 />
-              )}
-            </div>
-          </div>
-          <section className="card soft-card aside-card desktop-card">
-            <div className="card-body">
-              <div className="card-title-row">
-                <h2>Local usage</h2>
-                <i className="bi bi-info-circle"></i>
               </div>
-              <div className="info-list usage-list">{usageList}</div>
-              <p className="privacy-note">
-                <i className="bi bi-lock"></i> All usage is local and private.
-              </p>
-            </div>
-          </section>
-          <section className="card soft-card aside-card desktop-card">
-            <div className="card-body">
-              <h2>Project overview</h2>
-              <ProjectOverview
-                currentStatus={projectSessions[0]?.status || "queued"}
-                latestBranch={latestBranch}
-                lastActive={lastActive}
-                sessionCount={projectSessions.length}
-              />
-            </div>
-          </section>
-          <section className="card soft-card aside-card desktop-card">
-            <div className="card-body">
-              <h2>Project snapshot</h2>
-              <ProjectSnapshot
-                project={project}
-                lastSession={projectSessions[0]}
-              />
-            </div>
-          </section>
-          <p className="device-note">
-            <i className="bi bi-lock"></i> All data stays on your device.
-          </p>
-        </aside>
+            </section>
+            <p className="device-note">
+              <i className="bi bi-lock"></i> All data stays on your device.
+            </p>
+          </aside>
+        )}
       </div>
       <GoalStartSheet
         open={goalOpen}
@@ -534,6 +700,8 @@ export function ProjectSettingsPage() {
     { projectName: string }
   >();
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsError, setProjectsError] = useState("");
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
   const [installed, setInstalled] = useState<InstalledIntegration[]>([]);
   const [pendingInstall, setPendingInstall] = useState<
@@ -573,10 +741,23 @@ export function ProjectSettingsPage() {
     return matchesCategory && matchesSearch;
   });
 
-  const fetchProjects = () =>
-    fetch("/api/projects")
-      .then((res) => (res.ok ? res.json() : []))
-      .then((entries: ProjectEntry[]) => setProjects(entries));
+  const fetchProjects = useCallback(async () => {
+    setProjectsLoading(true);
+    try {
+      const res = await fetch("/api/projects");
+      if (!res.ok) {
+        throw new Error(`Project request failed (${res.status})`);
+      }
+      setProjects((await res.json()) as ProjectEntry[]);
+      setProjectsError("");
+    } catch (error) {
+      setProjectsError(
+        error instanceof Error ? error.message : "Project request failed",
+      );
+    } finally {
+      setProjectsLoading(false);
+    }
+  }, []);
 
   const fetchInstalledIntegrations = async () => {
     if (!name) return;
@@ -634,7 +815,7 @@ export function ProjectSettingsPage() {
             : "Could not load the integration marketplace",
         )
       );
-  }, []);
+  }, [fetchProjects]);
 
   useEffect(() => {
     void fetchInstalledIntegrations();
@@ -644,15 +825,26 @@ export function ProjectSettingsPage() {
     if (!project) return;
     const notifyOnFinish = nextProjectNotificationPreference(project);
     if (notifyOnFinish) void ensureNotificationPermission();
-    const res = await fetch(
-      `/api/projects/${encodeURIComponent(project.name)}/notifications`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ notify_on_finish: notifyOnFinish }),
-      },
-    );
-    if (res.ok) void fetchProjects();
+    try {
+      const res = await fetch(
+        `/api/projects/${encodeURIComponent(project.name)}/notifications`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ notify_on_finish: notifyOnFinish }),
+        },
+      );
+      if (!res.ok) {
+        throw new Error(`Could not update notifications (${res.status})`);
+      }
+      void fetchProjects();
+    } catch (error) {
+      setProjectsError(
+        error instanceof Error
+          ? error.message
+          : "Could not update notifications",
+      );
+    }
   };
 
   const prepareIntegrationInstall = async (
@@ -803,125 +995,157 @@ export function ProjectSettingsPage() {
         <h1>{project?.name || name || "Project"} settings</h1>
       </section>
 
-      {project && (
-        <div className="project-settings-stack">
-          <section
-            className="settings-card notification-card"
-            aria-labelledby="project-notifications-title"
-          >
-            <div>
-              <h2 id="project-notifications-title">Notifications</h2>
-              <p>
-                Choose whether this project sends browser notifications when
-                sessions complete or fail.
-              </p>
-            </div>
+      {projectsLoading && !project
+        ? <p className="text-secondary small">Loading project settings…</p>
+        : projectsError && !project
+        ? (
+          <div className="alert alert-danger" role="alert">
+            {projectsError}{" "}
             <button
               type="button"
-              className={`notification-switch ${
-                project.notify_on_finish ? "is-on" : ""
-              }`}
-              role="switch"
-              aria-checked={project.notify_on_finish}
-              onClick={() => void toggleProjectNotifications()}
+              className="btn btn-sm btn-link"
+              onClick={() => void fetchProjects()}
             >
-              <span>{project.notify_on_finish ? "On" : "Off"}</span>
-              <i></i>
+              Try again
             </button>
-          </section>
-
-          <section
-            className="settings-card mcp-store-card"
-            aria-labelledby="mcp-store-title"
-          >
-            <div className="mcp-store-header">
-              <div>
-                <h2 id="mcp-store-title">MCP store</h2>
-                <p>Install and configure MCP servers scoped to this project.</p>
-              </div>
-            </div>
-            <div className="mcp-store-toolbar">
-              <label className="mcp-search-field">
-                <i className="bi bi-search"></i>
-                <input
-                  value={integrationSearch}
-                  onChange={(event) => setIntegrationSearch(event.target.value)}
-                  placeholder="Search MCP servers..."
-                  aria-label="Search MCP servers"
-                />
-              </label>
-              <select
-                className="mcp-category-select"
-                value={integrationCategory}
-                onChange={(event) =>
-                  setIntegrationCategory(
-                    event.target.value as IntegrationKind | "all",
-                  )}
-                aria-label="Filter MCP servers by category"
-              >
-                <option value="all">All categories</option>
-                <option value="mcp">MCP</option>
-              </select>
-            </div>
-            <IntegrationList
-              marketplace={filteredMarketplace}
-              installed={integrationCategory === "all" ||
-                  integrationCategory === "mcp"
-                ? installed
-                : []}
-              installedIcon="bi bi-plug"
-              emptyText="No MCP servers match your filters."
-              onInstall={(item) =>
-                void prepareIntegrationInstall(
-                  item.kind,
-                  item.container_image,
-                  item.name,
-                )}
-              onConfigure={(item) =>
-                void prepareIntegrationInstall(
-                  item.kind,
-                  item.container_image,
-                  item.name,
-                  "disabled" in item,
-                  "disabled" in item ? item.env : undefined,
-                  "source_container_image" in item
-                    ? item.source_container_image
-                    : undefined,
-                )}
-              onUpgrade={(item) =>
-                void prepareIntegrationInstall(
-                  item.kind,
-                  item.source_container_image || item.container_image,
-                  item.name,
-                  true,
-                  item.env,
-                  item.source_container_image || item.container_image,
-                  "upgrade",
-                )}
-              onRemove={(item) => void removeIntegration(item)}
-            />
-            {integrationError && (
-              <div className="alert alert-danger mt-3 mb-0">
-                {integrationError}
+          </div>
+        )
+        : !project
+        ? <p className="text-secondary small">Project not found.</p>
+        : (
+          <div className="project-settings-stack">
+            {projectsError && (
+              <div className="alert alert-warning" role="alert">
+                Project settings may be out of date: {projectsError}{" "}
+                <button
+                  type="button"
+                  className="btn btn-sm btn-link"
+                  onClick={() => void fetchProjects()}
+                >
+                  Try again
+                </button>
               </div>
             )}
-          </section>
-          {pendingInstall && (
-            <div className="integration-modal-backdrop">
-              <IntegrationConfigForm
-                pending={pendingInstall}
-                schemaResponse={configSchema}
-                loading={schemaLoading}
-                error={schemaError}
-                submitError={submitError}
-                submitting={submitting}
-                onCancel={cancelIntegration}
-                onInstall={(env) => void installIntegration(env)}
+            <section
+              className="settings-card notification-card"
+              aria-labelledby="project-notifications-title"
+            >
+              <div>
+                <h2 id="project-notifications-title">Notifications</h2>
+                <p>
+                  Choose whether this project sends browser notifications when
+                  sessions complete or fail.
+                </p>
+              </div>
+              <button
+                type="button"
+                className={`notification-switch ${
+                  project.notify_on_finish ? "is-on" : ""
+                }`}
+                role="switch"
+                aria-checked={project.notify_on_finish}
+                onClick={() => void toggleProjectNotifications()}
+              >
+                <span>{project.notify_on_finish ? "On" : "Off"}</span>
+                <i></i>
+              </button>
+            </section>
+
+            <section
+              className="settings-card mcp-store-card"
+              aria-labelledby="mcp-store-title"
+            >
+              <div className="mcp-store-header">
+                <div>
+                  <h2 id="mcp-store-title">MCP store</h2>
+                  <p>
+                    Install and configure MCP servers scoped to this project.
+                  </p>
+                </div>
+              </div>
+              <div className="mcp-store-toolbar">
+                <label className="mcp-search-field">
+                  <i className="bi bi-search"></i>
+                  <input
+                    value={integrationSearch}
+                    onChange={(event) =>
+                      setIntegrationSearch(event.target.value)}
+                    placeholder="Search MCP servers..."
+                    aria-label="Search MCP servers"
+                  />
+                </label>
+                <select
+                  className="mcp-category-select"
+                  value={integrationCategory}
+                  onChange={(event) =>
+                    setIntegrationCategory(
+                      event.target.value as IntegrationKind | "all",
+                    )}
+                  aria-label="Filter MCP servers by category"
+                >
+                  <option value="all">All categories</option>
+                  <option value="mcp">MCP</option>
+                </select>
+              </div>
+              <IntegrationList
+                marketplace={filteredMarketplace}
+                installed={integrationCategory === "all" ||
+                    integrationCategory === "mcp"
+                  ? installed
+                  : []}
+                installedIcon="bi bi-plug"
+                emptyText="No MCP servers match your filters."
+                onInstall={(item) =>
+                  void prepareIntegrationInstall(
+                    item.kind,
+                    item.container_image,
+                    item.name,
+                  )}
+                onConfigure={(item) =>
+                  void prepareIntegrationInstall(
+                    item.kind,
+                    item.container_image,
+                    item.name,
+                    "disabled" in item,
+                    "disabled" in item ? item.env : undefined,
+                    "source_container_image" in item
+                      ? item.source_container_image
+                      : undefined,
+                  )}
+                onUpgrade={(item) =>
+                  void prepareIntegrationInstall(
+                    item.kind,
+                    item.source_container_image || item.container_image,
+                    item.name,
+                    true,
+                    item.env,
+                    item.source_container_image || item.container_image,
+                    "upgrade",
+                  )}
+                onRemove={(item) => void removeIntegration(item)}
               />
-            </div>
-          )}
-        </div>
-      )}
+              {integrationError && (
+                <div className="alert alert-danger mt-3 mb-0">
+                  {integrationError}
+                </div>
+              )}
+            </section>
+            {pendingInstall && (
+              <div className="integration-modal-backdrop">
+                <IntegrationConfigForm
+                  pending={pendingInstall}
+                  schemaResponse={configSchema}
+                  loading={schemaLoading}
+                  error={schemaError}
+                  submitError={submitError}
+                  submitting={submitting}
+                  onCancel={cancelIntegration}
+                  onInstall={(env) => void installIntegration(env)}
+                />
+              </div>
+            )}
+          </div>
+        )}
     </PageShell>
   );
 }

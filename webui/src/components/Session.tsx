@@ -17,7 +17,6 @@ import {
   toolResultForCall,
 } from "../lib/helpers";
 import {
-  errorSummary,
   getToolDetail,
   harnessEfficiencyStats,
   profileJobTitle,
@@ -40,7 +39,6 @@ import {
   profileAccentClass,
   teamActorAccentClass,
   teamActorPresentation,
-  workflowStewardActor,
 } from "../lib/team";
 
 function formatHumanDurationMs(ms?: number): string {
@@ -118,7 +116,7 @@ function trinityAssistanceSummary(
 function mutationCandidateCount(
   event: Extract<AgentEvent, { type: "llm_invocation" }>,
 ): number {
-  return Object.values(event.native?.mutation_constraint_rejections || {})
+  return Object.values(event.native?.mutation_constraint_rejections ?? {})
     .reduce((total, count) => total + Math.max(0, count), 0);
 }
 
@@ -287,7 +285,7 @@ export function ActionGroupBubble({
   controllerActions,
   showIdentity = true,
 }: {
-  actor?: import("../types").TeamActor;
+  actor: import("../types").TeamActor;
   assistingProfile?: string;
   inferenceEvents: EventEnvelope[];
   toolCalls: EventEnvelope[];
@@ -301,7 +299,7 @@ export function ActionGroupBubble({
   if (toolCalls.length === 0 && controllerActions.length === 0) return null;
 
   const teammate = teamActorPresentation(actor);
-  const isTrinity = actor?.kind === "automation";
+  const isTrinity = actor.kind === "automation";
   const accentClass = teamActorAccentClass(actor);
 
   const toolItems = toolCalls
@@ -317,7 +315,7 @@ export function ActionGroupBubble({
 
       const result = toolResultForCall(e, toolResults);
       if (result?.event.type === "tool_result") {
-        statusClass = result.event.outcome || "unknown";
+        statusClass = result.event.outcome;
       }
       detailText = getToolDetail(e, result);
 
@@ -408,7 +406,7 @@ export function ActionGroupBubble({
     }`
     : actionCount === 1
     ? actionNames
-    : actor?.kind === "automation"
+    : actor.kind === "automation"
     ? `${actionCount} harness actions${assisting ? ` for ${assisting}` : ""}`
     : `${actionCount} actions`;
   const firstEvent = toolCalls[0] || controllerActions[0];
@@ -555,13 +553,8 @@ function ErrorEventBubble({
   event: Extract<AgentEvent, { type: "error" }>;
 }) {
   const [isOpen, setIsOpen] = useState(false);
-  const summary = errorSummary(event);
-  const rawDetail = String(event.message || "").trim();
-  const detail = rawDetail.startsWith(`${summary}:`)
-    ? rawDetail.slice(summary.length + 1).trim()
-    : rawDetail === summary
-    ? ""
-    : rawDetail;
+  const summary = event.summary.trim();
+  const detail = event.detail.trim();
   const hasDetail = detail.length > 0;
 
   return (
@@ -591,7 +584,7 @@ function ErrorEventBubble({
             {!hasDetail
               ? (
                 <p className="mb-0">
-                  {summary || "No error details provided."}
+                  {summary}
                 </p>
               )
               : null}
@@ -611,11 +604,9 @@ function CorrectionNotice({
 }) {
   const event = envelope.event;
   if (event.type !== "correction") return null;
-  const copy = envelope.chatter?.find(({ audience }) => audience === "team");
-  const actor = copy?.actor || event.actor || workflowStewardActor();
-  const teammate = teamActorPresentation(actor);
-  const message = copy?.message || "Trinity has an update for this task.";
-  const technicalDetail = prettyTechnicalDetail(copy?.detail || event.message);
+  const copy = envelope.chatter.find(({ audience }) => audience === "team")!;
+  const teammate = teamActorPresentation(copy.actor);
+  const technicalDetail = prettyTechnicalDetail(event.message);
 
   return (
     <article
@@ -642,10 +633,10 @@ function CorrectionNotice({
           title={`${teammate.name} correction evidence`}
           teammateName={teammate.name}
         >
-          {copy?.headline
+          {copy.headline
             ? <strong className="feedback-heading">{copy.headline}</strong>
             : null}
-          <RichText content={message} />
+          <RichText content={copy.message} />
         </TechnicalDetailsBubble>
       </div>
       <MessageTime timestampMs={event.timestamp_ms} />
@@ -662,15 +653,13 @@ function WorkflowBlockedNotice({
   envelope: EventEnvelope;
   showIdentity?: boolean;
 }) {
-  const teammateFeedback = envelope.chatter?.find(
+  const teammateFeedback = envelope.chatter.find(
     ({ audience }) => audience === "team",
-  );
-  const userFeedback = envelope.chatter?.find(
+  )!;
+  const userFeedback = envelope.chatter.find(
     ({ audience }) => audience === "current_user",
-  );
-  const teammate = teamActorPresentation(
-    teammateFeedback?.actor || workflowStewardActor(),
-  );
+  )!;
+  const teammate = teamActorPresentation(teammateFeedback.actor);
   const [currentUsername, setCurrentUsername] = useState<string>();
 
   useEffect(() => {
@@ -689,15 +678,12 @@ function WorkflowBlockedNotice({
     return () => controller.abort();
   }, []);
 
-  const teammateMessage = teammateFeedback?.message ||
-    "Team, this delivery is on hold at a safe boundary because the reported problem needs a different approach.";
-  const requestMessage = userFeedback?.message ||
-    "Can you start a follow-up task here and add any context that could help the team find a different way forward?";
-  const userMessage = currentUsername && userFeedback
+  const requestMessage = userFeedback.message;
+  const userMessage = currentUsername
     ? `@${currentUsername}, ${requestMessage.charAt(0).toLocaleLowerCase()}${
       requestMessage.slice(1)
     }`
-    : requestMessage;
+    : userFeedback.message;
 
   return (
     <>
@@ -721,13 +707,11 @@ function WorkflowBlockedNotice({
           </div>
           <TechnicalDetailsBubble
             className="correction-bubble"
-            detail={prettyTechnicalDetail(
-              teammateFeedback?.detail || event.reason,
-            )}
+            detail={prettyTechnicalDetail(teammateFeedback.detail)}
             title="Why this task is on hold"
             teammateName={teammate.name}
           >
-            <RichText content={teammateMessage} />
+            <RichText content={teammateFeedback.message} />
           </TechnicalDetailsBubble>
         </div>
         <MessageTime timestampMs={event.timestamp_ms} />
@@ -958,7 +942,7 @@ function TeamMessageBubble({
   const index = events.indexOf(envelope);
   const priorEvents = events.slice(0, index < 0 ? events.length : index);
   const recentPriorEvents = [...priorEvents].reverse();
-  const evidenceIds = new Set(event.evidence_ids || []);
+  const evidenceIds = new Set(event.evidence_ids);
   const checkEvidence = Array.from(evidenceIds)
     .filter((id) => id.startsWith("check:"))
     .map((id) => id.slice("check:".length))
@@ -1312,7 +1296,7 @@ function ActionInferenceDetails({
                       <span>Step {event.step}</span>
                       <small>
                         {sentenceCaseIdentifier(
-                          event.purpose || "unclassified",
+                          event.purpose,
                         )} · {formatHumanDurationMs(event.duration_ms)}
                       </small>
                     </summary>
@@ -1440,16 +1424,12 @@ function ActionInferenceDetails({
   );
 }
 
-function InferenceDetails({
-  event,
-  activityProfile,
-}: {
+function InferenceDetails({ event }: {
   event: Extract<AgentEvent, { type: "llm_invocation" }>;
-  activityProfile?: string;
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const longPressTimer = useRef<number | undefined>(undefined);
-  const profile = event.profile || activityProfile || "build";
+  const profile = event.profile;
   const teammate = profileName(profile);
   const teammateFirstName = teammate.split(/\s+/, 1)[0];
   const totalTokens = event.prompt_tokens + event.generated_tokens;
@@ -1508,7 +1488,7 @@ function InferenceDetails({
               <MetricField
                 label="Purpose"
                 value={sentenceCaseIdentifier(
-                  event.purpose || "unclassified",
+                  event.purpose,
                 )}
               />
               <MetricField
@@ -1716,12 +1696,11 @@ function SessionMetricsDetails({
   const coverage = event.energy_coverage === undefined
     ? "Unknown"
     : `${Math.round(event.energy_coverage * 100)}%`;
-  const hasMeasurementMetadata = (event.wall_runtime_ms ?? 0) > 0 ||
+  const hasMeasurementMetadata = event.wall_runtime_ms > 0 ||
     event.total_energy_joules !== undefined ||
     event.energy_source !== undefined;
-  const hasCachePersistence =
-    (event.cache_persistence_queued_checkpoints ?? 0) > 0 ||
-    (event.cache_persistence_failures ?? 0) > 0;
+  const hasCachePersistence = event.cache_persistence_queued_checkpoints > 0 ||
+    event.cache_persistence_failures > 0;
   const efficiency = harnessEfficiencyStats(evidenceEvents);
   const assistanceSummary = trinityAssistanceSummary(efficiency);
   const preventedActions = efficiency.duplicateActionsPrevented +
@@ -1984,11 +1963,11 @@ function SessionMetricsDetails({
                       label="Checkpoints"
                       value={`${
                         formatNumber(
-                          event.cache_persistence_completed_checkpoints ?? 0,
+                          event.cache_persistence_completed_checkpoints,
                         )
                       } of ${
                         formatNumber(
-                          event.cache_persistence_queued_checkpoints ?? 0,
+                          event.cache_persistence_queued_checkpoints,
                         )
                       }`}
                     />
@@ -1996,14 +1975,14 @@ function SessionMetricsDetails({
                       label="Duration"
                       value={`${
                         formatNumber(
-                          event.cache_persistence_wall_ms ?? 0,
+                          event.cache_persistence_wall_ms,
                         )
                       } ms`}
                     />
                     <MetricField
                       label="Failures"
                       value={formatNumber(
-                        event.cache_persistence_failures ?? 0,
+                        event.cache_persistence_failures,
                       )}
                     />
                   </dl>
@@ -2019,13 +1998,11 @@ function SessionMetricsDetails({
 
 export function MessageBubble({
   envelope,
-  activityProfile,
   evidenceEvents = [],
   workflow,
   showIdentity = true,
 }: {
   envelope: EventEnvelope;
-  activityProfile?: string;
   evidenceEvents?: EventEnvelope[];
   workflow?: WorkflowSummary;
   showIdentity?: boolean;
@@ -2284,7 +2261,7 @@ export function MessageBubble({
       );
 
     case "llm_invocation":
-      return <InferenceDetails event={e} activityProfile={activityProfile} />;
+      return <InferenceDetails event={e} />;
 
     case "workflow_artifact_accepted":
       return e.artifact_kind === "plan" &&

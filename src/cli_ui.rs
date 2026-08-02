@@ -153,11 +153,9 @@ pub fn render_event(envelope: &EventEnvelope) {
         AgentEvent::Reasoning {
             content, profile, ..
         } => print_header(profile.teammate_name(), content),
-        AgentEvent::ToolCall { tool, actor, .. } => {
-            print_header(&action_label(*actor, "agent action"), tool)
-        }
+        AgentEvent::ToolCall { tool, actor, .. } => print_header(&action_label(*actor), tool),
         AgentEvent::ControllerObservation { receipt, actor, .. } => print_header(
-            &action_label(Some(*actor), "harness action"),
+            &action_label(*actor),
             &format_controller_observation(
                 receipt.operation.as_str(),
                 &receipt.path,
@@ -166,10 +164,10 @@ pub fn render_event(envelope: &EventEnvelope) {
             ),
         ),
         AgentEvent::ControllerClosure { reason, actor, .. } => {
-            print_header(&action_label(Some(*actor), "harness action"), reason)
+            print_header(&action_label(*actor), reason)
         }
         AgentEvent::ControllerMutation { receipt, actor, .. } => print_header(
-            &action_label(Some(*actor), "harness action"),
+            &action_label(*actor),
             &format_controller_delete(&receipt.path),
         ),
         AgentEvent::ToolBatch {
@@ -197,10 +195,7 @@ pub fn render_event(envelope: &EventEnvelope) {
             energy_shared_calls,
             ..
         } => {
-            let mut details = duration_ms
-                .map(|ms| format!("{ms} ms"))
-                .into_iter()
-                .collect::<Vec<_>>();
+            let mut details = vec![format!("{duration_ms} ms")];
             if let Some(joules) = energy_joules {
                 details.push(format_energy(*joules));
             }
@@ -567,7 +562,9 @@ pub fn render_event(envelope: &EventEnvelope) {
                 receipt.wall_millis
             ),
         ),
-        AgentEvent::Error { message, .. } => eprintln!("error: {message}"),
+        AgentEvent::Error {
+            summary, detail, ..
+        } => eprintln!("error: {summary}: {detail}"),
     }
 }
 
@@ -612,27 +609,25 @@ fn format_controller_delete(path: &str) -> String {
     format!("deleted {path} · tracked and Git-recoverable")
 }
 
-fn action_label(actor: Option<TeamActor>, fallback: &str) -> String {
+fn action_label(actor: TeamActor) -> String {
     match actor {
-        Some(actor @ TeamActor::Agent(_)) => {
+        actor @ TeamActor::Agent(_) => {
             format!("{} action · model", actor.display_name())
         }
-        Some(actor @ TeamActor::Automation(_)) => {
+        actor @ TeamActor::Automation(_) => {
             format!("{} action · harness", actor.display_name())
         }
-        None => format!("{fallback} · legacy origin"),
     }
 }
 
-fn action_result_label(actor: Option<TeamActor>) -> String {
+fn action_result_label(actor: TeamActor) -> String {
     match actor {
-        Some(actor @ TeamActor::Agent(_)) => {
+        actor @ TeamActor::Agent(_) => {
             format!("{} action result · model", actor.display_name())
         }
-        Some(actor @ TeamActor::Automation(_)) => {
+        actor @ TeamActor::Automation(_) => {
             format!("{} action result · harness", actor.display_name())
         }
-        None => "tool result · legacy origin".to_string(),
     }
 }
 
@@ -663,24 +658,20 @@ mod tests {
     #[test]
     fn terminal_action_labels_use_the_responsible_teammate() {
         assert_eq!(
-            action_label(Some(TeamActor::agent(AgentProfile::Build)), "agent action"),
+            action_label(TeamActor::agent(AgentProfile::Build)),
             "Kate Libby action · model"
         );
         assert_eq!(
-            action_label(Some(TeamActor::workflow_steward()), "harness action"),
+            action_label(TeamActor::workflow_steward()),
             "Trinity Walker action · harness"
         );
         assert_eq!(
-            action_result_label(Some(TeamActor::workflow_steward())),
+            action_result_label(TeamActor::workflow_steward()),
             "Trinity Walker action result · harness"
         );
         assert_eq!(
             actor_message_label(TeamActor::workflow_steward()),
             "Trinity Walker · harness"
-        );
-        assert_eq!(
-            action_label(None, "agent action"),
-            "agent action · legacy origin"
         );
     }
 }

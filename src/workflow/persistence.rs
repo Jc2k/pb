@@ -146,12 +146,7 @@ impl From<&WorkflowRun> for WorkflowSummary {
             ready_evidence: run.ready_evidence.clone(),
             paused_stage: run.paused_stage,
             blocked_reason: run.blocked_reason.clone(),
-            blocked_cause: run.blocked_cause.or_else(|| {
-                Some(WorkflowBlockCause::classify(
-                    run.outcome?,
-                    run.blocked_reason.as_deref()?,
-                ))
-            }),
+            blocked_cause: run.blocked_cause,
             recovery: match (run.stage, run.outcome) {
                 (WorkflowStage::Blocked, Some(WorkflowOutcome::ExecutorUnavailable)) => {
                     Some(WorkflowRecovery::Resume)
@@ -405,6 +400,7 @@ mod tests {
         .unwrap();
         run.apply(WorkflowEvent::Blocked {
             outcome: WorkflowOutcome::CommitBlocked,
+            cause: WorkflowBlockCause::RepositoryContentChanged,
             reason: "repository content changed during review".to_string(),
         })
         .unwrap();

@@ -11,7 +11,7 @@ pub use crate::inference::StageRootAuthorityClass as PromptRootAuthorityClass;
 use crate::session_store::now_millis;
 pub use crate::workflow::WorkflowBlockCause;
 
-pub const EVENT_SCHEMA_VERSION: &str = "v1";
+pub const EVENT_SCHEMA_VERSION: &str = "v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,9 +80,6 @@ pub enum FinalGraceStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationActor {
-    /// Legacy durable identity used by sessions written before automation was
-    /// presented as a stable teammate.
-    Handoff,
     Trinity,
 }
 
@@ -105,15 +102,9 @@ impl TeamActor {
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Agent(profile) => profile.teammate_name(),
-            Self::Automation(AutomationActor::Handoff | AutomationActor::Trinity) => {
-                "Trinity Walker"
-            }
+            Self::Automation(AutomationActor::Trinity) => "Trinity Walker",
         }
     }
-}
-
-fn workflow_steward_actor() -> TeamActor {
-    TeamActor::workflow_steward()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,20 +116,17 @@ pub enum TeamMessageTone {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamMessagePurpose {
-    #[default]
     General,
     HandoffProgress,
     HandoffOutcome,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CorrectionKind {
-    #[default]
-    General,
     ArtifactValidation,
     RepositoryEvidence,
     ContractEvidence,
@@ -164,110 +152,9 @@ pub enum CorrectionKind {
     ToolFailure,
 }
 
-impl CorrectionKind {
-    fn classify(summary: &str, detail: &str) -> Self {
-        let summary = summary.trim();
-        if summary == "Workflow artifact validation failed"
-            || (summary.starts_with("submit_")
-                && summary.ends_with(" tool call was not executed successfully"))
-        {
-            Self::ArtifactValidation
-        } else if serde_json::from_str::<Value>(detail)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .as_deref()
-            == Some("tool_failure")
-        {
-            Self::ToolFailure
-        } else if summary == "Task-focused repository evidence" {
-            Self::RepositoryEvidence
-        } else if summary.contains("contract planning evidence")
-            || summary.contains("contract review evidence")
-            || summary.contains("proposed-path review evidence")
-        {
-            Self::ContractEvidence
-        } else if summary.contains("accepted-plan")
-            || summary == "Work-unit progress earned one bounded turn"
-        {
-            Self::WorkUnit
-        } else if summary.contains("using host execution")
-            || summary.contains("CPU-only llama.cpp fallback")
-        {
-            Self::RuntimeFallback
-        } else if summary == "Repeated tool call detected"
-            || summary == "Repeated tool call blocked"
-            || summary.contains("repeated the same action")
-            || summary.contains("reached the repeat limit")
-        {
-            Self::RepeatedTool
-        } else if summary == "No-progress tool outcome detected" {
-            Self::NoProgress
-        } else if summary == "Dependent tool batch rejected" {
-            Self::DependentToolBatch
-        } else if summary == "Workflow stage submission required" {
-            Self::StageSubmission
-        } else if summary == "Teammate action retries exhausted"
-            || summary.contains("Parse retry limit")
-            || summary.contains("Invalid pb JSON action")
-            || summary.to_lowercase().contains("unparsable")
-        {
-            Self::InvalidAction
-        } else if summary.contains("bounded step limit") {
-            Self::StepLimit
-        } else if summary == "Advisory budget exhausted" {
-            Self::AdvisoryBudget
-        } else if summary == "Requesting missing bounded evidence" {
-            Self::MissingEvidence
-        } else if summary.contains("truncated action") {
-            Self::TruncatedAction
-        } else if summary.contains("mutation recovery")
-            || summary.contains("compact atomic mutation")
-            || summary.contains("constrained mutation")
-            || summary.contains("payload-bound atomic mutation")
-        {
-            Self::MutationRecovery
-        } else if matches!(
-            summary,
-            "Run cancelled" | "Goal pausing" | "Cancellation requested"
-        ) {
-            Self::Lifecycle
-        } else if matches!(
-            summary,
-            "Restarting delivery from current files"
-                | "Retrying Task planning"
-                | "Running as one Build"
-        ) {
-            Self::TaskPlanningRecovery
-        } else if summary == "Tool not available" {
-            Self::ToolUnavailable
-        } else if summary.contains("Task requirements remain") {
-            Self::RequirementsRemain
-        } else if summary.contains("handoff")
-            || summary.starts_with("Agent terminated:")
-            || summary.starts_with("Final grace terminated:")
-            || summary.contains("Completion gate")
-            || summary.contains("Acceptance contract")
-        {
-            Self::Handoff
-        } else if summary.to_lowercase().contains("diagnostic") {
-            Self::Diagnostics
-        } else if summary == "Workflow closure checkpoint" {
-            Self::WorkflowClosure
-        } else {
-            Self::General
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatterAudience {
-    #[default]
     Team,
     CurrentUser,
 }
@@ -279,9 +166,7 @@ pub struct EventChatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headline: Option<String>,
     pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    #[serde(default)]
+    pub detail: String,
     pub audience: ChatterAudience,
 }
 
@@ -300,14 +185,12 @@ pub enum TranscriptKind {
     Activity,
     Evidence,
     Correction,
-    RepeatedToolDetected,
     RepeatedToolCorrection,
     NoProgressCorrection,
     DependentToolBatchCorrection,
     HandoffCorrection,
     WorkflowClosureCheckpoint,
     WorkUnitProgress,
-    TerminalToolLoopError,
     WorkflowBlocked,
     SessionSummary,
 }
@@ -317,7 +200,6 @@ pub struct TranscriptMetadata {
     pub visibility: TranscriptVisibility,
     pub kind: TranscriptKind,
     pub entry_key: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supersedes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_summary: Option<String>,
@@ -325,8 +207,46 @@ pub struct TranscriptMetadata {
     pub dedupe_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub related_action_key: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub summary_redundant: bool,
+    pub session_effect: SessionEffect,
+}
+
+impl TranscriptMetadata {
+    fn pending() -> Self {
+        Self {
+            visibility: TranscriptVisibility::EvidenceOnly,
+            kind: TranscriptKind::Evidence,
+            entry_key: String::new(),
+            supersedes: Vec::new(),
+            tool_summary: None,
+            dedupe_key: None,
+            related_action_key: None,
+            summary_redundant: false,
+            session_effect: SessionEffect {
+                refresh: false,
+                running: SessionRunningEffect::Unchanged,
+                reset_intent: false,
+                title: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRunningEffect {
+    Unchanged,
+    Running,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEffect {
+    pub refresh: bool,
+    pub running: SessionRunningEffect,
+    pub reset_intent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,13 +277,10 @@ pub struct HandoffCommitSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffSummary {
     pub outcome: HandoffOutcome,
-    #[serde(default)]
     pub affected_components: Vec<String>,
-    #[serde(default)]
     pub checks: Vec<HandoffCheckSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<HandoffCommitSummary>,
-    #[serde(default)]
     pub changed_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -405,13 +322,9 @@ pub struct SessionMetricsSnapshot {
     pub generated_tokens: usize,
     pub tool_calls: usize,
     pub tool_runtime_ms: u64,
-    #[serde(default)]
     pub cache_persistence_queued_checkpoints: usize,
-    #[serde(default)]
     pub cache_persistence_completed_checkpoints: usize,
-    #[serde(default)]
     pub cache_persistence_wall_ms: u64,
-    #[serde(default)]
     pub cache_persistence_failures: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_energy_joules: Option<f64>,
@@ -421,7 +334,6 @@ pub struct SessionMetricsSnapshot {
     pub tool_energy_joules: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_energy_kwh: Option<f64>,
-    #[serde(default)]
     pub wall_runtime_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<u64>,
@@ -443,13 +355,9 @@ pub struct SessionMetricsSnapshot {
     pub energy_coverage: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy_source: Option<String>,
-    #[serde(default)]
     pub display_energy_excluded: bool,
-    #[serde(default)]
     pub idle_baseline_applied: bool,
-    #[serde(default)]
     pub energy_complete: bool,
-    #[serde(default)]
     pub energy_exclusive: bool,
 }
 
@@ -593,8 +501,8 @@ impl SessionMetricsSnapshot {
 ///
 /// S0 records post-generation measurements without changing prompt construction. Later
 /// small-model reliability milestones fill the compaction/cache/closure counters from their
-/// deterministic control paths. Keeping this nested and optional on `LlmInvocation` preserves
-/// compatibility with stored v1 events.
+/// deterministic control paths. The nested object remains optional because some invocation
+/// surfaces do not collect agent-loop context measurements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRetryReason {
@@ -609,10 +517,8 @@ pub enum AgentRetryReason {
 pub struct AgentContextUsage {
     pub context_capacity: usize,
     pub reserved_generation_tokens: usize,
-    #[serde(default)]
     pub safety_margin_tokens: usize,
     pub usable_prompt_capacity: usize,
-    #[serde(default)]
     pub preflight_prompt_tokens: usize,
     pub prompt_utilization_bps: u32,
     pub message_chars: usize,
@@ -624,21 +530,14 @@ pub struct AgentContextUsage {
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_reason: Option<AgentRetryReason>,
-    #[serde(default)]
     pub compacted_messages: usize,
-    #[serde(default)]
     pub omitted_tool_result_chars: usize,
-    #[serde(default)]
     pub read_cache_hits: usize,
-    #[serde(default)]
     pub closure_checkpoints: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation_payload_char_limit: Option<usize>,
-    #[serde(default)]
     pub serialized_action_chars: usize,
-    #[serde(default)]
     pub carried_evidence_entries: usize,
-    #[serde(default)]
     pub carried_evidence_bytes: usize,
 }
 
@@ -647,7 +546,6 @@ pub struct PromptCacheUsage {
     pub source: String,
     pub cached_tokens: usize,
     pub prefilled_tokens: usize,
-    #[serde(default)]
     pub restore_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub miss_reason: Option<PromptCacheMissReason>,
@@ -661,7 +559,6 @@ pub struct PromptCacheUsage {
 pub struct PromptRootUsage {
     pub descriptor_version: u32,
     pub backend: String,
-    #[serde(default)]
     pub cache_format_version: String,
     pub model_namespace_sha256: String,
     pub rendered_token_sha256: String,
@@ -682,11 +579,8 @@ pub struct NativeGenerationUsage {
     pub cached_tokens: usize,
     pub prefill_wall_ms: u64,
     pub prefill_tokens_per_second: f64,
-    #[serde(default)]
     pub prefill_metal_commands: usize,
-    #[serde(default)]
     pub prefill_host_upload_bytes: usize,
-    #[serde(default)]
     pub prefill_host_readback_bytes: usize,
     pub decode_tokens: usize,
     pub decode_wall_ms: u64,
@@ -696,7 +590,6 @@ pub struct NativeGenerationUsage {
     pub active_experts_per_token: Option<usize>,
     pub expert_strategy: String,
     pub prefill_command_kind: String,
-    #[serde(default)]
     pub prefill_command_reason: String,
     pub thinking_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -707,13 +600,9 @@ pub struct NativeGenerationUsage {
     pub tool_constraint_dialect: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_schema_sha256: Option<String>,
-    #[serde(default)]
     pub rejected_constraint_candidates: usize,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mutation_constraint_rejections: BTreeMap<String, usize>,
-    #[serde(default)]
     pub mutation_snapshot_files: usize,
-    #[serde(default)]
     pub mutation_snapshot_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint_terminal_state: Option<String>,
@@ -721,21 +610,17 @@ pub struct NativeGenerationUsage {
     pub constraint_guarantee_rung: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_boundary: Option<crate::inference::SemanticBoundaryStats>,
-    #[serde(default)]
     pub decode_recovery: crate::inference::DecodeRecovery,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeRefillUsage {
     pub cache_lookup_wall_ms: u64,
-    #[serde(default)]
     pub disk_read_decode_wall_ms: u64,
-    #[serde(default)]
     pub cpu_state_validation_allocation_wall_ms: u64,
     pub state_hydration_wall_ms: u64,
     pub fresh_suffix_prefill_wall_ms: u64,
     pub snapshot_capture_wall_ms: u64,
-    #[serde(default)]
     pub persistence_queue_wall_ms: u64,
 }
 
@@ -757,10 +642,9 @@ fn add_optional(target: &mut Option<f64>, value: Option<f64>) {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelInvocationPurpose {
-    #[default]
     Unclassified,
     Conversation,
     TaskPartitioning,
@@ -794,13 +678,11 @@ pub enum AgentEvent {
     Started {
         task: String,
         model: String,
-        #[serde(default)]
         profile: AgentProfile,
         workspace: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         focus_root: Option<String>,
         branch: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<SessionAttachment>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
@@ -1007,7 +889,6 @@ pub enum AgentEvent {
     WorkflowBlocked {
         workflow_id: String,
         outcome: crate::workflow::WorkflowOutcome,
-        #[serde(default)]
         cause: WorkflowBlockCause,
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1025,7 +906,6 @@ pub enum AgentEvent {
     StepStarted {
         step: usize,
         max_steps: usize,
-        #[serde(default)]
         profile: AgentProfile,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
@@ -1034,7 +914,6 @@ pub enum AgentEvent {
     },
     ModelLoading {
         model: String,
-        #[serde(default)]
         profile: AgentProfile,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
@@ -1052,12 +931,9 @@ pub enum AgentEvent {
     ToolCall {
         tool: String,
         arguments: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        call_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        batch_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<TeamActor>,
+        call_id: String,
+        batch_id: String,
+        actor: TeamActor,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1065,7 +941,6 @@ pub enum AgentEvent {
     },
     ControllerObservation {
         receipt: crate::workflow::ControllerObservationReceipt,
-        #[serde(default = "workflow_steward_actor")]
         actor: TeamActor,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assisting_profile: Option<AgentProfile>,
@@ -1078,7 +953,6 @@ pub enum AgentEvent {
         workflow_id: String,
         stage: crate::workflow::WorkflowStage,
         reason: String,
-        #[serde(default = "workflow_steward_actor")]
         actor: TeamActor,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assisting_profile: Option<AgentProfile>,
@@ -1089,7 +963,6 @@ pub enum AgentEvent {
     },
     ControllerMutation {
         receipt: crate::workflow::ControllerMutationReceipt,
-        #[serde(default = "workflow_steward_actor")]
         actor: TeamActor,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assisting_profile: Option<AgentProfile>,
@@ -1112,16 +985,11 @@ pub enum AgentEvent {
     ToolResult {
         tool: String,
         result: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        call_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        batch_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        outcome: Option<ToolOutcome>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<TeamActor>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        duration_ms: Option<u64>,
+        call_id: String,
+        batch_id: String,
+        outcome: ToolOutcome,
+        actor: TeamActor,
+        duration_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         energy_joules: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1150,7 +1018,6 @@ pub enum AgentEvent {
         safety_margin_tokens: usize,
         usable_prompt_capacity: usize,
         measured_prompt_tokens: usize,
-        #[serde(default)]
         largest_sections: Vec<ContextSectionUsage>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
@@ -1161,7 +1028,6 @@ pub enum AgentEvent {
         executor_id: String,
         kind: String,
         success: bool,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
         detail: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
@@ -1185,11 +1051,9 @@ pub enum AgentEvent {
         source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command_fingerprint: Option<String>,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         dependency_outputs: BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_fingerprint: Option<String>,
-        #[serde(default, skip_serializing_if = "is_false")]
         reused: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skip_reason: Option<String>,
@@ -1201,14 +1065,12 @@ pub enum AgentEvent {
     TeamMessage {
         actor: TeamActor,
         tone: TeamMessageTone,
-        #[serde(default)]
         purpose: TeamMessagePurpose,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         handoff: Option<HandoffSummary>,
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         evidence_ids: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
@@ -1230,9 +1092,7 @@ pub enum AgentEvent {
         oid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         changed_paths: Vec<String>,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
         detail: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
@@ -1242,9 +1102,7 @@ pub enum AgentEvent {
     UserQuestion {
         question_id: String,
         question: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         choices: Vec<String>,
-        #[serde(default)]
         profile: AgentProfile,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
@@ -1268,11 +1126,8 @@ pub enum AgentEvent {
     },
     Correction {
         message: String,
-        #[serde(default)]
         kind: CorrectionKind,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
-        #[serde(default = "workflow_steward_actor")]
         actor: TeamActor,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assisting_profile: Option<AgentProfile>,
@@ -1327,12 +1182,10 @@ pub enum AgentEvent {
     },
     LlmInvocation {
         step: usize,
-        #[serde(default)]
         purpose: ModelInvocationPurpose,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_stage: Option<crate::workflow::WorkflowStage>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        profile: Option<AgentProfile>,
+        profile: AgentProfile,
         duration_ms: u64,
         prompt_tokens: usize,
         generated_tokens: usize,
@@ -1360,13 +1213,9 @@ pub enum AgentEvent {
         generated_tokens: usize,
         tool_calls: usize,
         tool_runtime_ms: u64,
-        #[serde(default)]
         cache_persistence_queued_checkpoints: usize,
-        #[serde(default)]
         cache_persistence_completed_checkpoints: usize,
-        #[serde(default)]
         cache_persistence_wall_ms: u64,
-        #[serde(default)]
         cache_persistence_failures: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         llm_energy_joules: Option<f64>,
@@ -1376,7 +1225,6 @@ pub enum AgentEvent {
         tool_energy_joules: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_energy_kwh: Option<f64>,
-        #[serde(default)]
         wall_runtime_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         started_at_ms: Option<u64>,
@@ -1398,13 +1246,9 @@ pub enum AgentEvent {
         energy_coverage: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         energy_source: Option<String>,
-        #[serde(default)]
         display_energy_excluded: bool,
-        #[serde(default)]
         idle_baseline_applied: bool,
-        #[serde(default)]
         energy_complete: bool,
-        #[serde(default)]
         energy_exclusive: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
@@ -1414,31 +1258,23 @@ pub enum AgentEvent {
     SessionSummary {
         branch: String,
         commits: String,
-        #[serde(default)]
         reached_final: bool,
-        #[serde(default)]
         contract_status: ContractStatus,
-        #[serde(default)]
         verified_completed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         termination_reason: Option<TerminationReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         handoff_outcome: Option<HandoffOutcome>,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
         power_summary: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
         diff_stat: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
         diff: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
     Error {
-        message: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
+        detail: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1446,37 +1282,49 @@ pub enum AgentEvent {
     },
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
+    #[serde(deserialize_with = "deserialize_event_version")]
     pub version: String,
     pub event: AgentEvent,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chatter: Vec<EventChatter>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcript: Option<TranscriptMetadata>,
+    pub transcript: TranscriptMetadata,
+}
+
+fn deserialize_event_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = String::deserialize(deserializer)?;
+    if version != EVENT_SCHEMA_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported event schema '{version}'; expected '{EVENT_SCHEMA_VERSION}'"
+        )));
+    }
+    Ok(version)
 }
 
 impl EventEnvelope {
-    pub fn new(mut event: AgentEvent) -> Self {
-        normalize_event_semantics(&mut event);
+    pub fn new(event: AgentEvent) -> Self {
+        Self::new_superseding(event, Vec::new())
+    }
+
+    pub fn new_superseding(event: AgentEvent, supersedes: Vec<String>) -> Self {
         let mut envelope = Self {
             version: EVENT_SCHEMA_VERSION.to_string(),
             event,
             chatter: Vec::new(),
-            transcript: None,
+            transcript: TranscriptMetadata::pending(),
         };
         envelope.refresh_projections(&[]);
+        envelope.transcript.supersedes = supersedes;
         envelope
     }
 
     pub fn refresh_projections(&mut self, history: &[EventEnvelope]) {
-        normalize_event_semantics(&mut self.event);
-        self.chatter = chatter_for_event(&self.event, history);
-        self.transcript = Some(transcript_metadata_for_event(&self.event, history));
+        let supersedes = self.transcript.supersedes.clone();
+        self.chatter = chatter_for_event(&self.event, history, &supersedes);
+        self.transcript = transcript_metadata_for_event(&self.event, history, supersedes);
     }
 
     pub fn with_timestamp(event: AgentEvent) -> Self {
@@ -1494,7 +1342,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Started {
                     task,
                     model,
@@ -1512,7 +1360,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::HarnessExperimentConfigured {
                     observation_rendering,
                     timestamp_ms: Some(now),
@@ -1526,7 +1374,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ConversationTurnStarted {
                     turn_id,
                     intent,
@@ -1542,7 +1390,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::DeliveryProposed {
                     proposal_id,
                     source_turn_id,
@@ -1748,7 +1596,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowStarted {
                     workflow_id,
                     source_turn_id,
@@ -1764,7 +1612,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowResumed {
                     workflow_id,
                     stage,
@@ -1777,7 +1625,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowStageStarted {
                     workflow_id,
                     stage,
@@ -1793,7 +1641,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowArtifactAccepted {
                     workflow_id,
                     artifact_kind,
@@ -1811,7 +1659,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowChallengeRaised {
                     workflow_id,
                     challenge_id,
@@ -1829,7 +1677,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowEvidenceInvalidated {
                     workflow_id,
                     previous_fingerprint,
@@ -1843,7 +1691,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowStageCompleted {
                     workflow_id,
                     stage,
@@ -1859,7 +1707,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowBlocked {
                     workflow_id,
                     outcome,
@@ -1877,7 +1725,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowCompleted {
                     workflow_id,
                     outcome,
@@ -1895,7 +1743,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::StepStarted {
                     step,
                     max_steps,
@@ -1912,7 +1760,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ModelLoading {
                     model,
                     profile,
@@ -1928,7 +1776,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Reasoning {
                     content,
                     profile,
@@ -1947,7 +1795,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ToolCall {
                     tool,
                     arguments,
@@ -1967,7 +1815,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ControllerObservation {
                     receipt,
                     actor,
@@ -1987,7 +1835,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ControllerClosure {
                     workflow_id,
                     stage,
@@ -2007,7 +1855,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ControllerMutation {
                     receipt,
                     actor,
@@ -2027,7 +1875,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ToolBatch {
                     call_count,
                     parallel_safe_count,
@@ -2055,7 +1903,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ToolResult {
                     tool,
                     result,
@@ -2084,7 +1932,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ContextLimit {
                     context_capacity,
                     reserved_generation_tokens,
@@ -2105,7 +1953,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ExecutorStarted {
                     executor_id,
                     kind,
@@ -2137,7 +1985,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::CheckResult {
                     check_id,
                     exit_status,
@@ -2173,7 +2021,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::TeamMessage {
                     actor,
                     tone,
@@ -2193,7 +2041,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::HandoffSummary {
                     summary,
                     nesting_depth,
@@ -2213,7 +2061,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::CommitResult {
                     success,
                     created,
@@ -2235,7 +2083,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::UserQuestion {
                     question_id,
                     question,
@@ -2251,7 +2099,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::UserAnswer {
                     question_id,
                     answer,
@@ -2265,7 +2113,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::UserMessage {
                     message_id,
                     message,
@@ -2275,7 +2123,7 @@ impl EventEnvelope {
             AgentEvent::UserMessageApplied { message_id, .. } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::UserMessageApplied {
                     message_id,
                     timestamp_ms: Some(now),
@@ -2292,7 +2140,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Correction {
                     message,
                     kind,
@@ -2311,7 +2159,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SubAgentStarted {
                     profile,
                     task,
@@ -2327,7 +2175,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SubAgentFinished {
                     profile,
                     result,
@@ -2343,7 +2191,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Diff {
                     path,
                     diff,
@@ -2359,7 +2207,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Final {
                     content,
                     profile,
@@ -2375,7 +2223,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::FinalGrace {
                     status,
                     detail,
@@ -2402,7 +2250,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::LlmInvocation {
                     step,
                     purpose,
@@ -2456,7 +2304,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SessionMetrics {
                     llm_invocations,
                     llm_runtime_ms,
@@ -2494,7 +2342,7 @@ impl EventEnvelope {
             AgentEvent::SessionTitle { title, .. } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SessionTitle {
                     title,
                     timestamp_ms: Some(now),
@@ -2516,7 +2364,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SessionSummary {
                     branch,
                     commits,
@@ -2533,17 +2381,17 @@ impl EventEnvelope {
                 },
             },
             AgentEvent::Error {
-                message,
                 summary,
+                detail,
                 nesting_depth,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Error {
-                    message,
                     summary,
+                    detail,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
@@ -2555,7 +2403,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
-                transcript: None,
+                transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SemanticGate {
                     receipt,
                     nesting_depth,
@@ -2563,64 +2411,15 @@ impl EventEnvelope {
                 },
             },
         };
-        normalize_event_semantics(&mut envelope.event);
         envelope.refresh_projections(&[]);
         envelope
-    }
-}
-
-fn normalize_event_semantics(event: &mut AgentEvent) {
-    match event {
-        AgentEvent::Correction {
-            message,
-            kind,
-            summary,
-            ..
-        } if *kind == CorrectionKind::General => {
-            *kind = CorrectionKind::classify(summary, message);
-        }
-        AgentEvent::WorkflowBlocked {
-            outcome,
-            cause,
-            reason,
-            ..
-        } if *cause == WorkflowBlockCause::Other => {
-            *cause = WorkflowBlockCause::classify(*outcome, reason);
-        }
-        _ => {}
-    }
-}
-
-pub fn refresh_event_projections(events: &mut [EventEnvelope]) {
-    for index in 0..events.len() {
-        let (history, current_and_rest) = events.split_at_mut(index);
-        if let Some(current) = current_and_rest.first_mut() {
-            current.refresh_projections(history);
-        }
-    }
-}
-
-pub fn hydrate_event_projections(events: &mut [EventEnvelope]) {
-    for index in 0..events.len() {
-        let (history, current_and_rest) = events.split_at_mut(index);
-        let Some(current) = current_and_rest.first_mut() else {
-            continue;
-        };
-        normalize_event_semantics(&mut current.event);
-        let projected_chatter = chatter_for_event(&current.event, history);
-        let projected_transcript = transcript_metadata_for_event(&current.event, history);
-        if current.chatter.is_empty() {
-            current.chatter = projected_chatter;
-        }
-        if current.transcript.is_none() {
-            current.transcript = Some(projected_transcript);
-        }
     }
 }
 
 fn transcript_metadata_for_event(
     event: &AgentEvent,
     history: &[EventEnvelope],
+    supersedes: Vec<String>,
 ) -> TranscriptMetadata {
     let (visibility, kind, dedupe_key, related_action_key, summary_redundant) = match event {
         AgentEvent::Correction {
@@ -2725,84 +2524,72 @@ fn transcript_metadata_for_event(
         visibility,
         kind,
         entry_key,
-        supersedes: superseded_entry_keys(event, history),
+        supersedes,
         tool_summary: tool_summary_for_event(event, history),
         dedupe_key,
         related_action_key,
         summary_redundant,
+        session_effect: session_effect_for_event(event),
     }
 }
 
-fn event_entry_key(event: &AgentEvent) -> String {
+pub(crate) fn event_entry_key(event: &AgentEvent) -> String {
     let serialized = serde_json::to_vec(event).unwrap_or_default();
     format!("event:{}", crate::environment_lock::sha256(&serialized))
 }
 
-fn superseded_entry_keys(event: &AgentEvent, history: &[EventEnvelope]) -> Vec<String> {
-    match event {
-        AgentEvent::TeamMessage {
-            actor,
-            purpose: TeamMessagePurpose::HandoffOutcome,
-            ..
-        } => history
-            .iter()
-            .rev()
-            .find_map(|envelope| match &envelope.event {
-                AgentEvent::TeamMessage {
-                    actor: prior_actor,
-                    purpose: TeamMessagePurpose::HandoffProgress,
-                    ..
-                } if prior_actor == actor => envelope
-                    .transcript
-                    .as_ref()
-                    .map(|metadata| metadata.entry_key.clone()),
-                _ => None,
-            })
-            .into_iter()
-            .collect(),
-        AgentEvent::TeamMessage {
-            actor: TeamActor::Automation(_),
-            tone: TeamMessageTone::Info,
-            purpose: TeamMessagePurpose::General,
-            ..
-        } => history
-            .iter()
-            .rev()
-            .find_map(|envelope| match &envelope.event {
-                AgentEvent::TeamMessage {
-                    actor: TeamActor::Automation(_),
-                    tone: TeamMessageTone::Info,
-                    purpose: TeamMessagePurpose::General,
-                    ..
-                } => envelope
-                    .transcript
-                    .as_ref()
-                    .map(|metadata| metadata.entry_key.clone()),
-                _ => None,
-            })
-            .into_iter()
-            .collect(),
-        AgentEvent::WorkflowBlocked { .. } => history
-            .iter()
-            .rev()
-            .take_while(|envelope| {
-                envelope.transcript.as_ref().is_none_or(|metadata| {
-                    metadata.visibility != TranscriptVisibility::Visible
-                        || matches!(
-                            envelope.event,
-                            AgentEvent::Correction { .. } | AgentEvent::Error { .. }
-                        )
-                })
-            })
-            .filter_map(|envelope| match &envelope.event {
-                AgentEvent::Correction { .. } | AgentEvent::Error { .. } => envelope
-                    .transcript
-                    .as_ref()
-                    .map(|metadata| metadata.entry_key.clone()),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
+fn session_effect_for_event(event: &AgentEvent) -> SessionEffect {
+    let refresh = matches!(
+        event,
+        AgentEvent::GoalProposed { .. }
+            | AgentEvent::GoalStarted { .. }
+            | AgentEvent::GoalPlanAwaitingApproval { .. }
+            | AgentEvent::GoalPlanApproved { .. }
+            | AgentEvent::GoalMilestoneStarted { .. }
+            | AgentEvent::GoalMilestoneCompleted { .. }
+            | AgentEvent::GoalPauseRequested { .. }
+            | AgentEvent::GoalResumed { .. }
+            | AgentEvent::GoalPaused { .. }
+            | AgentEvent::GoalAmendmentRequested { .. }
+            | AgentEvent::GoalChangeRequested { .. }
+            | AgentEvent::GoalAmendmentResolved { .. }
+            | AgentEvent::GoalReadyForReview { .. }
+            | AgentEvent::GoalCompleted { .. }
+            | AgentEvent::GoalFailed { .. }
+            | AgentEvent::GoalCancelled { .. }
+            | AgentEvent::WorkflowStarted { .. }
+            | AgentEvent::WorkflowResumed { .. }
+            | AgentEvent::WorkflowStageStarted { .. }
+            | AgentEvent::WorkflowArtifactAccepted { .. }
+            | AgentEvent::WorkflowChallengeRaised { .. }
+            | AgentEvent::WorkflowEvidenceInvalidated { .. }
+            | AgentEvent::WorkflowStageCompleted { .. }
+            | AgentEvent::WorkflowBlocked { .. }
+            | AgentEvent::WorkflowCompleted { .. }
+            | AgentEvent::TaskPlanAccepted { .. }
+            | AgentEvent::TaskPlanRejected { .. }
+            | AgentEvent::TasksChanged { .. }
+            | AgentEvent::SessionSummary { .. }
+            | AgentEvent::UserQuestion { .. }
+    );
+    let running = match event {
+        AgentEvent::Started { .. } | AgentEvent::UserAnswer { .. } => SessionRunningEffect::Running,
+        AgentEvent::UserQuestion { .. }
+        | AgentEvent::Final { .. }
+        | AgentEvent::SessionSummary { .. } => SessionRunningEffect::Stopped,
+        _ => SessionRunningEffect::Unchanged,
+    };
+    SessionEffect {
+        refresh,
+        running,
+        reset_intent: matches!(
+            event,
+            AgentEvent::Final { .. } | AgentEvent::SessionSummary { .. }
+        ),
+        title: match event {
+            AgentEvent::SessionTitle { title, .. } => Some(title.clone()),
+            _ => None,
+        },
     }
 }
 
@@ -2826,8 +2613,7 @@ fn tool_summary_for_event(event: &AgentEvent, history: &[EventEnvelope]) -> Opti
             else {
                 return None;
             };
-            ((call_id.is_some() && call_id == called_id)
-                || (call_id.is_none() && called_tool == tool))
+            (call_id == called_id && called_tool == tool)
                 .then(|| tool_summary(tool, arguments, Some(result)))
         }),
         _ => None,
@@ -3064,6 +2850,13 @@ fn lsp_tool_summary(arguments: &Value, result: Option<&str>) -> String {
     format!("{mode} · {scanned} file{} · clean", plural(scanned))
 }
 
+fn tool_action_key(tool: &str, arguments: &Value) -> String {
+    format!(
+        "tool:{tool}:{}",
+        crate::agent_context::normalized_arguments_sha256(arguments)
+    )
+}
+
 fn latest_tool_action_key(history: &[EventEnvelope]) -> Option<String> {
     history.iter().rev().find_map(|envelope| {
         let AgentEvent::ToolCall {
@@ -3072,10 +2865,7 @@ fn latest_tool_action_key(history: &[EventEnvelope]) -> Option<String> {
         else {
             return None;
         };
-        Some(format!(
-            "tool:{tool}:{}",
-            crate::agent_context::normalized_arguments_sha256(arguments)
-        ))
+        Some(tool_action_key(tool, arguments))
     })
 }
 
@@ -3117,7 +2907,11 @@ fn correction_dedupe_key(summary: &str, detail: &str) -> Option<String> {
     (!summary.trim().is_empty()).then(|| format!("correction:{}", summary.trim()))
 }
 
-fn chatter_for_event(event: &AgentEvent, history: &[EventEnvelope]) -> Vec<EventChatter> {
+fn chatter_for_event(
+    event: &AgentEvent,
+    history: &[EventEnvelope],
+    supersedes: &[String],
+) -> Vec<EventChatter> {
     match event {
         AgentEvent::Correction {
             message,
@@ -3132,38 +2926,15 @@ fn chatter_for_event(event: &AgentEvent, history: &[EventEnvelope]) -> Vec<Event
             *kind,
             summary,
             message,
-            history,
         )],
         AgentEvent::WorkflowBlocked {
             outcome,
             cause,
             reason,
             ..
-        } => workflow_blocked_chatter(*outcome, *cause, reason, history),
+        } => workflow_blocked_chatter(*outcome, *cause, reason, history, supersedes),
         _ => Vec::new(),
     }
-}
-
-fn latest_agent_profile(history: &[EventEnvelope]) -> Option<AgentProfile> {
-    history
-        .iter()
-        .rev()
-        .find_map(|envelope| match &envelope.event {
-            AgentEvent::LlmInvocation {
-                profile: Some(profile),
-                ..
-            }
-            | AgentEvent::StepStarted { profile, .. }
-            | AgentEvent::ModelLoading { profile, .. }
-            | AgentEvent::Reasoning { profile, .. }
-            | AgentEvent::Final { profile, .. }
-            | AgentEvent::Started { profile, .. } => Some(*profile),
-            AgentEvent::ToolCall {
-                actor: Some(TeamActor::Agent(profile)),
-                ..
-            } => Some(*profile),
-            _ => None,
-        })
 }
 
 fn first_name(name: &str) -> &str {
@@ -3174,7 +2945,7 @@ fn chatter(
     actor: TeamActor,
     headline: Option<String>,
     message: String,
-    detail: Option<String>,
+    detail: String,
     audience: ChatterAudience,
 ) -> EventChatter {
     EventChatter {
@@ -3193,11 +2964,8 @@ fn correction_chatter(
     kind: CorrectionKind,
     summary: &str,
     detail: &str,
-    history: &[EventEnvelope],
 ) -> EventChatter {
-    let profile = assisting_profile
-        .or_else(|| latest_agent_profile(history))
-        .or_else(|| detail.contains("Planning").then_some(AgentProfile::Plan));
+    let profile = assisting_profile;
     let teammate_name = profile
         .map(AgentProfile::teammate_name)
         .unwrap_or("the model");
@@ -3475,7 +3243,7 @@ fn correction_chatter(
         actor,
         headline,
         message,
-        Some(detail.to_string()),
+        detail.to_string(),
         ChatterAudience::Team,
     )
 }
@@ -3592,9 +3360,12 @@ fn workflow_blocked_chatter(
     cause: WorkflowBlockCause,
     reason: &str,
     history: &[EventEnvelope],
+    supersedes: &[String],
 ) -> Vec<EventChatter> {
-    let recent_history = history.iter().rev().take(5).collect::<Vec<_>>();
-    let repeated_action = recent_history.iter().find_map(|envelope| {
+    let repeated_action = history.iter().rev().find_map(|envelope| {
+        if !supersedes.contains(&envelope.transcript.entry_key) {
+            return None;
+        }
         let AgentEvent::Correction {
             message,
             kind,
@@ -3604,52 +3375,36 @@ fn workflow_blocked_chatter(
         else {
             return None;
         };
-        (*kind == CorrectionKind::RepeatedTool).then_some((message, *assisting_profile))
+        matches!(
+            kind,
+            CorrectionKind::RepeatedTool | CorrectionKind::NoProgress
+        )
+        .then_some((
+            message,
+            *assisting_profile,
+            envelope.transcript.related_action_key.as_deref(),
+        ))
     });
-    let recent_profile = history
-        .iter()
-        .rev()
-        .find_map(|envelope| match &envelope.event {
-            AgentEvent::LlmInvocation {
-                profile: Some(profile),
-                ..
-            }
-            | AgentEvent::StepStarted { profile, .. }
-            | AgentEvent::ModelLoading { profile, .. }
-            | AgentEvent::Reasoning { profile, .. }
-            | AgentEvent::Started { profile, .. } => Some(*profile),
-            AgentEvent::ToolCall {
-                actor: Some(TeamActor::Agent(profile)),
-                ..
-            } => Some(*profile),
-            _ => None,
-        });
-    let repeated_profile = repeated_action
-        .and_then(|(_, profile)| profile)
-        .or(recent_profile);
+    let repeated_profile = repeated_action.and_then(|(_, profile, _)| profile);
     let repeated_name = repeated_profile
         .map(AgentProfile::teammate_name)
         .unwrap_or("A teammate");
     let repeated_first_name = first_name(repeated_name);
     let planning_first_name = first_name(AgentProfile::Plan.teammate_name());
-    let tool_calls = history
-        .iter()
-        .filter_map(|envelope| match &envelope.event {
-            AgentEvent::ToolCall {
-                tool, arguments, ..
-            } => Some((tool, arguments)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let repeated_path = tool_calls
-        .last()
-        .and_then(|(latest_tool, latest_arguments)| {
-            let repeated = tool_calls[..tool_calls.len().saturating_sub(1)]
+    let repeated_path = repeated_action
+        .and_then(|(_, _, related_action_key)| related_action_key)
+        .and_then(|related_action_key| {
+            history
                 .iter()
-                .any(|(tool, arguments)| tool == latest_tool && arguments == latest_arguments);
-            repeated
-                .then(|| latest_arguments.get("path").and_then(Value::as_str))
-                .flatten()
+                .rev()
+                .find_map(|envelope| match &envelope.event {
+                    AgentEvent::ToolCall {
+                        tool, arguments, ..
+                    } if tool_action_key(tool, arguments) == related_action_key => {
+                        arguments.get("path").and_then(Value::as_str)
+                    }
+                    _ => None,
+                })
         });
 
     let planning_failure = cause == WorkflowBlockCause::PlanningRejected
@@ -3706,7 +3461,7 @@ fn workflow_blocked_chatter(
     };
     let detail = repeated_action.map_or_else(
         || reason.to_string(),
-        |(message, _)| format!("{message}\n{reason}"),
+        |(message, _, _)| format!("{message}\n{reason}"),
     );
 
     vec![
@@ -3714,14 +3469,14 @@ fn workflow_blocked_chatter(
             TeamActor::workflow_steward(),
             None,
             teammate_message,
-            Some(detail),
+            detail,
             ChatterAudience::Team,
         ),
         chatter(
             TeamActor::workflow_steward(),
             None,
             format!("Can you {user_request}?"),
-            None,
+            String::new(),
             ChatterAudience::CurrentUser,
         ),
     ]
@@ -3731,28 +3486,74 @@ fn workflow_blocked_chatter(
 mod tests {
     use super::*;
 
+    fn refresh_history(events: &mut [EventEnvelope]) {
+        for index in 0..events.len() {
+            let (history, current_and_rest) = events.split_at_mut(index);
+            current_and_rest[0].refresh_projections(history);
+        }
+    }
+
     #[test]
-    fn legacy_session_summary_deserializes_with_truthful_defaults() {
-        let json = r#"{
-            "version":"v1",
-            "event":{
-                "type":"session_summary",
-                "branch":"task",
-                "commits":"",
-                "summary":"legacy"
-            }
-        }"#;
-        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            envelope.event,
-            AgentEvent::SessionSummary {
-                reached_final: false,
-                contract_status: ContractStatus::Unspecified,
-                verified_completed: false,
-                termination_reason: None,
-                ..
-            }
-        ));
+    fn v1_envelopes_without_server_projections_are_rejected() {
+        let mut value = serde_json::to_value(EventEnvelope::new(AgentEvent::Final {
+            content: "done".to_string(),
+            profile: AgentProfile::Build,
+            nesting_depth: None,
+            timestamp_ms: None,
+        }))
+        .unwrap();
+        value["version"] = Value::String("v1".to_string());
+
+        assert!(serde_json::from_value::<EventEnvelope>(value).is_err());
+    }
+
+    #[test]
+    fn v2_errors_require_summary_and_detail() {
+        let value = serde_json::to_value(EventEnvelope::new(AgentEvent::Error {
+            summary: "Model setup failed".to_string(),
+            detail: "llama.cpp failed to load the configured model".to_string(),
+            nesting_depth: None,
+            timestamp_ms: None,
+        }))
+        .unwrap();
+
+        for field in ["summary", "detail"] {
+            let mut missing = value.clone();
+            missing["event"].as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<EventEnvelope>(missing).is_err(),
+                "v2 error unexpectedly accepted without {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_tool_results_require_exact_correlation_and_outcome() {
+        let value = serde_json::to_value(EventEnvelope::new(AgentEvent::ToolResult {
+            tool: "read_file".to_string(),
+            result: "contents".to_string(),
+            call_id: "call-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            outcome: ToolOutcome::Succeeded,
+            actor: TeamActor::agent(AgentProfile::Review),
+            duration_ms: 1,
+            energy_joules: None,
+            energy_kwh: None,
+            average_power_watts: None,
+            energy_shared_calls: None,
+            nesting_depth: None,
+            timestamp_ms: None,
+        }))
+        .unwrap();
+
+        for field in ["call_id", "batch_id", "outcome", "duration_ms"] {
+            let mut missing = value.clone();
+            missing["event"].as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<EventEnvelope>(missing).is_err(),
+                "v2 tool result unexpectedly accepted without {field}"
+            );
+        }
     }
 
     #[test]
@@ -3760,9 +3561,9 @@ mod tests {
         let envelope = EventEnvelope::with_timestamp(AgentEvent::ToolCall {
             tool: "read_file".to_string(),
             arguments: serde_json::json!({"path": "src/lib.rs"}),
-            call_id: Some("call-1".to_string()),
-            batch_id: Some("batch-1".to_string()),
-            actor: Some(TeamActor::agent(AgentProfile::Review)),
+            call_id: "call-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            actor: TeamActor::agent(AgentProfile::Review),
             nesting_depth: None,
             timestamp_ms: None,
         });
@@ -3771,9 +3572,9 @@ mod tests {
         assert!(matches!(
             restored.event,
             AgentEvent::ToolCall {
-                call_id: Some(ref call_id),
-                batch_id: Some(ref batch_id),
-                actor: Some(TeamActor::Agent(AgentProfile::Review)),
+                ref call_id,
+                ref batch_id,
+                actor: TeamActor::Agent(AgentProfile::Review),
                 timestamp_ms: Some(_),
                 ..
             } if call_id == "call-1" && batch_id == "batch-1"
@@ -3782,11 +3583,11 @@ mod tests {
         let result = EventEnvelope::with_timestamp(AgentEvent::ToolResult {
             tool: "read_file".to_string(),
             result: "contents".to_string(),
-            call_id: Some("call-1".to_string()),
-            batch_id: Some("batch-1".to_string()),
-            outcome: Some(ToolOutcome::Succeeded),
-            actor: Some(TeamActor::agent(AgentProfile::Review)),
-            duration_ms: Some(1),
+            call_id: "call-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            outcome: ToolOutcome::Succeeded,
+            actor: TeamActor::agent(AgentProfile::Review),
+            duration_ms: 1,
             energy_joules: None,
             energy_kwh: None,
             average_power_watts: None,
@@ -3799,8 +3600,8 @@ mod tests {
         assert!(matches!(
             restored.event,
             AgentEvent::ToolResult {
-                call_id: Some(ref call_id),
-                outcome: Some(ToolOutcome::Succeeded),
+                ref call_id,
+                outcome: ToolOutcome::Succeeded,
                 ..
             } if call_id == "call-1"
         ));
@@ -3865,95 +3666,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_actions_remain_readable_without_inventing_model_attribution() {
-        let legacy_tool = r#"{
-            "version":"v1",
-            "event":{"type":"tool_call","tool":"read_file","arguments":{"path":"README.md"}}
-        }"#;
-        let envelope: EventEnvelope = serde_json::from_str(legacy_tool).unwrap();
-        assert!(matches!(
-            envelope.event,
-            AgentEvent::ToolCall {
-                actor: None,
-                call_id: None,
-                batch_id: None,
-                ..
-            }
-        ));
-
-        let legacy_result = r#"{
-            "version":"v1",
-            "event":{"type":"tool_result","tool":"read_file","result":"contents"}
-        }"#;
-        let envelope: EventEnvelope = serde_json::from_str(legacy_result).unwrap();
-        assert!(matches!(
-            envelope.event,
-            AgentEvent::ToolResult {
-                actor: None,
-                call_id: None,
-                outcome: None,
-                ..
-            }
-        ));
-
-        let legacy_controller = r#"{
-            "version":"v1",
-            "event":{
-                "type":"controller_closure",
-                "workflow_id":"workflow-1",
-                "stage":"implementing",
-                "reason":"No change required"
-            }
-        }"#;
-        let envelope: EventEnvelope = serde_json::from_str(legacy_controller).unwrap();
-        assert!(matches!(
-            envelope.event,
-            AgentEvent::ControllerClosure {
-                actor: TeamActor::Automation(AutomationActor::Trinity),
-                assisting_profile: None,
-                nesting_depth: None,
-                ..
-            }
-        ));
-
-        let legacy_correction = r#"{
-            "version":"v1",
-            "event":{"type":"correction","message":"Try again","summary":"Retrying"}
-        }"#;
-        let envelope: EventEnvelope = serde_json::from_str(legacy_correction).unwrap();
-        assert!(matches!(
-            envelope.event,
-            AgentEvent::Correction {
-                actor: TeamActor::Automation(AutomationActor::Trinity),
-                assisting_profile: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn legacy_session_metrics_deserialize_without_claiming_measurement_quality() {
-        let json = r#"{
-            "version":"v1",
-            "event":{
-                "type":"session_metrics",
-                "llm_invocations":1,
-                "llm_runtime_ms":10,
-                "prompt_tokens":2,
-                "generated_tokens":3,
-                "tool_calls":0,
-                "tool_runtime_ms":0
-            }
-        }"#;
-        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
-        let metrics = SessionMetricsSnapshot::from_event(&envelope.event).unwrap();
-        assert_eq!(metrics.wall_runtime_ms, 0);
-        assert!(metrics.total_energy_joules.is_none());
-        assert!(!metrics.energy_complete);
-        assert!(!metrics.energy_exclusive);
-    }
-
-    #[test]
     fn cumulative_metrics_use_authoritative_energy_and_wall_time() {
         let mut total = SessionMetricsSnapshot {
             prompt_tokens: 10,
@@ -3994,71 +3706,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_started_event_deserializes_without_focus_root() {
-        let json = r#"{
-            "version":"v1",
-            "event":{
-                "type":"started",
-                "task":"legacy",
-                "model":"model",
-                "workspace":"/repo",
-                "branch":"pb/legacy",
-                "attachments":[]
-            }
-        }"#;
-        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            envelope.event,
-            AgentEvent::Started {
-                focus_root: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn legacy_activity_events_default_to_the_build_profile() {
-        for event in [
-            r#"{"type":"model_loading","model":"legacy"}"#,
-            r#"{"type":"step_started","step":1,"max_steps":2}"#,
-        ] {
-            let json = format!(r#"{{"version":"v1","event":{event}}}"#);
-            let envelope: EventEnvelope = serde_json::from_str(&json).unwrap();
-            assert!(matches!(
-                envelope.event,
-                AgentEvent::ModelLoading {
-                    profile: AgentProfile::Build,
-                    ..
-                } | AgentEvent::StepStarted {
-                    profile: AgentProfile::Build,
-                    ..
-                }
-            ));
-        }
-    }
-
-    #[test]
-    fn legacy_workflow_completion_has_no_publication_evidence_claim() {
-        let json = r#"{
-            "version":"v1",
-            "event":{
-                "type":"workflow_completed",
-                "workflow_id":"legacy-workflow",
-                "outcome":"ready",
-                "checkpoint_sha256":"legacy-checkpoint"
-            }
-        }"#;
-        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            envelope.event,
-            AgentEvent::WorkflowCompleted {
-                ready_evidence_sha256: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn new_session_summary_serializes_explicit_outcome_fields() {
         let envelope = EventEnvelope::new(AgentEvent::SessionSummary {
             branch: "task".to_string(),
@@ -4080,25 +3727,6 @@ mod tests {
         assert_eq!(value["event"]["verified_completed"], false);
         assert_eq!(value["event"]["termination_reason"], "final");
         assert_eq!(value["event"]["handoff_outcome"], "ready");
-    }
-
-    #[test]
-    fn legacy_llm_invocation_without_context_usage_remains_readable() {
-        let json = r#"{
-            "version":"v1",
-            "event":{
-                "type":"llm_invocation",
-                "step":1,
-                "duration_ms":10,
-                "prompt_tokens":20,
-                "generated_tokens":3
-            }
-        }"#;
-        let envelope: EventEnvelope = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            envelope.event,
-            AgentEvent::LlmInvocation { context: None, .. }
-        ));
     }
 
     #[test]
@@ -4129,7 +3757,7 @@ mod tests {
             step: 2,
             purpose: ModelInvocationPurpose::WorkflowReview,
             workflow_stage: Some(crate::workflow::WorkflowStage::CodeReview),
-            profile: Some(AgentProfile::Review),
+            profile: AgentProfile::Review,
             duration_ms: 10,
             prompt_tokens: 4960,
             generated_tokens: 3,
@@ -4251,48 +3879,13 @@ mod tests {
             } if restored == context
         ));
 
-        let mut legacy: Value = serde_json::from_str(&json).unwrap();
-        let native = legacy
+        let mut incomplete: Value = serde_json::from_str(&json).unwrap();
+        let native = incomplete
             .pointer_mut("/event/native")
             .and_then(Value::as_object_mut)
             .unwrap();
         native.remove("prefill_metal_commands");
-        native.remove("prefill_host_upload_bytes");
-        native.remove("prefill_host_readback_bytes");
-        native.remove("tool_constraint_dialect");
-        native.remove("mutation_constraint_rejections");
-        native.remove("mutation_snapshot_files");
-        native.remove("mutation_snapshot_bytes");
-        native.remove("constraint_guarantee_rung");
-        native.remove("semantic_boundary");
-        native.remove("decode_recovery");
-        let legacy: EventEnvelope = serde_json::from_value(legacy).unwrap();
-        let AgentEvent::LlmInvocation {
-            native: Some(legacy_native),
-            ..
-        } = &legacy.event
-        else {
-            panic!("expected legacy native invocation usage");
-        };
-        assert!(legacy_native.mutation_constraint_rejections.is_empty());
-        assert!(matches!(
-            legacy.event,
-            AgentEvent::LlmInvocation {
-                native: Some(NativeGenerationUsage {
-                    prefill_metal_commands: 0,
-                    prefill_host_upload_bytes: 0,
-                    prefill_host_readback_bytes: 0,
-                    tool_constraint_dialect: None,
-                    mutation_snapshot_files: 0,
-                    mutation_snapshot_bytes: 0,
-                    constraint_guarantee_rung: None,
-                    semantic_boundary: None,
-                    decode_recovery: crate::inference::DecodeRecovery::CandidateProbeOnly,
-                    ..
-                }),
-                ..
-            }
-        ));
+        assert!(serde_json::from_value::<EventEnvelope>(incomplete).is_err());
     }
 
     #[test]
@@ -4326,7 +3919,7 @@ mod tests {
     #[test]
     fn handoff_team_messages_round_trip_for_restored_sessions() {
         let envelope = EventEnvelope::new(AgentEvent::TeamMessage {
-            actor: TeamActor::Automation(AutomationActor::Handoff),
+            actor: TeamActor::Automation(AutomationActor::Trinity),
             tone: TeamMessageTone::Warning,
             purpose: crate::events::TeamMessagePurpose::General,
             handoff: None,
@@ -4341,7 +3934,7 @@ mod tests {
         assert!(matches!(
             restored.event,
             AgentEvent::TeamMessage {
-                actor: TeamActor::Automation(AutomationActor::Handoff),
+                actor: TeamActor::Automation(AutomationActor::Trinity),
                 tone: TeamMessageTone::Warning,
                 message,
                 detail: Some(detail),
@@ -4356,7 +3949,7 @@ mod tests {
     #[test]
     fn correction_chatter_is_server_authored_and_round_trips() {
         let envelope = EventEnvelope::new(AgentEvent::Correction {
-            kind: crate::events::CorrectionKind::General,
+            kind: crate::events::CorrectionKind::RepositoryEvidence,
             message: "technical controller guidance".to_string(),
             summary: "Task-focused repository evidence".to_string(),
             actor: TeamActor::workflow_steward(),
@@ -4373,7 +3966,7 @@ mod tests {
                 ..
             }
         ));
-        let transcript = envelope.transcript.as_ref().unwrap();
+        let transcript = &envelope.transcript;
         assert_eq!(transcript.visibility, TranscriptVisibility::Visible);
         assert_eq!(transcript.kind, TranscriptKind::Correction);
         assert_eq!(
@@ -4384,10 +3977,7 @@ mod tests {
             envelope.chatter[0].message,
             "Dade, I found the task-relevant code and pulled out the strongest matching sections. Use them to finish the plan. If one concrete fact is still missing, read only the relevant lines instead of rereading the whole file."
         );
-        assert_eq!(
-            envelope.chatter[0].detail.as_deref(),
-            Some("technical controller guidance")
-        );
+        assert_eq!(envelope.chatter[0].detail, "technical controller guidance");
 
         let restored: EventEnvelope =
             serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
@@ -4397,7 +3987,7 @@ mod tests {
     #[test]
     fn correction_chatter_turns_tool_failures_into_teammate_guidance() {
         let envelope = EventEnvelope::new(AgentEvent::Correction {
-            kind: crate::events::CorrectionKind::General,
+            kind: crate::events::CorrectionKind::ToolFailure,
             message: serde_json::json!({
                 "type": "tool_failure",
                 "tool": "read_file",
@@ -4417,16 +4007,13 @@ mod tests {
         );
         assert!(!envelope.chatter[0].message.contains("/private/tmp"));
         assert_eq!(
-            envelope
-                .transcript
-                .as_ref()
-                .and_then(|metadata| metadata.dedupe_key.as_deref()),
+            envelope.transcript.dedupe_key.as_deref(),
             Some("tool_failure:read_file:missing:webui/src/components/SessionRows.tsx")
         );
     }
 
     #[test]
-    fn workflow_blocked_chatter_uses_prior_events_for_terminal_parity() {
+    fn workflow_blocked_chatter_uses_explicit_precursor_links_for_terminal_parity() {
         let repeated_arguments = serde_json::json!({
             "path": "webui/src/components/SessionRows.tsx"
         });
@@ -4434,23 +4021,23 @@ mod tests {
             EventEnvelope::new(AgentEvent::ToolCall {
                 tool: "read_file".to_string(),
                 arguments: repeated_arguments.clone(),
-                call_id: Some("call-1".to_string()),
-                batch_id: None,
-                actor: Some(TeamActor::agent(AgentProfile::Review)),
+                call_id: "call-1".to_string(),
+                batch_id: "batch-1".to_string(),
+                actor: TeamActor::agent(AgentProfile::Review),
                 nesting_depth: None,
                 timestamp_ms: None,
             }),
             EventEnvelope::new(AgentEvent::ToolCall {
                 tool: "read_file".to_string(),
                 arguments: repeated_arguments,
-                call_id: Some("call-2".to_string()),
-                batch_id: None,
-                actor: Some(TeamActor::agent(AgentProfile::Review)),
+                call_id: "call-2".to_string(),
+                batch_id: "batch-1".to_string(),
+                actor: TeamActor::agent(AgentProfile::Review),
                 nesting_depth: None,
                 timestamp_ms: None,
             }),
             EventEnvelope::new(AgentEvent::Correction {
-                kind: crate::events::CorrectionKind::General,
+                kind: crate::events::CorrectionKind::RepeatedTool,
                 message: "The repeated path still does not exist.".to_string(),
                 summary: "Eugene reached the repeat limit".to_string(),
                 actor: TeamActor::workflow_steward(),
@@ -4459,36 +4046,32 @@ mod tests {
                 timestamp_ms: None,
             }),
         ];
-        refresh_event_projections(&mut history);
-        let repeated_action_key = history[2]
-            .transcript
-            .as_ref()
-            .and_then(|metadata| metadata.related_action_key.as_deref());
+        refresh_history(&mut history);
+        let repeated_action_key = history[2].transcript.related_action_key.as_deref();
         assert!(repeated_action_key.is_some_and(|key| key.starts_with("tool:read_file:")));
+        let correction_entry_key = history[2].transcript.entry_key.clone();
         let reason = "Eugene stopped making progress in the CodeReview stage and reached a deterministic repeat limit";
-        let mut blocked = EventEnvelope::new(AgentEvent::WorkflowBlocked {
-            workflow_id: "workflow-1".to_string(),
-            outcome: crate::workflow::WorkflowOutcome::ReviewFailed,
-            cause: WorkflowBlockCause::DeterministicRepeatLimit,
-            reason: reason.to_string(),
-            timestamp_ms: None,
-        });
+        let mut blocked = EventEnvelope::new_superseding(
+            AgentEvent::WorkflowBlocked {
+                workflow_id: "workflow-1".to_string(),
+                outcome: crate::workflow::WorkflowOutcome::ReviewFailed,
+                cause: WorkflowBlockCause::DeterministicRepeatLimit,
+                reason: reason.to_string(),
+                timestamp_ms: None,
+            },
+            vec![correction_entry_key],
+        );
         blocked.refresh_projections(&history);
 
         assert_eq!(blocked.chatter.len(), 2);
-        assert_eq!(
-            blocked.transcript.as_ref().map(|metadata| metadata.kind),
-            Some(TranscriptKind::WorkflowBlocked)
-        );
+        assert_eq!(blocked.transcript.kind, TranscriptKind::WorkflowBlocked);
         assert_eq!(
             blocked.chatter[0].message,
             "Eugene, `webui/src/components/SessionRows.tsx` does not exist. You tried to read it again after I flagged that, then repeated the same action once more. I blocked that last attempt, so your review—and this delivery—are now on hold."
         );
         assert_eq!(
-            blocked.chatter[0].detail.as_deref(),
-            Some(
-                "The repeated path still does not exist.\nEugene stopped making progress in the CodeReview stage and reached a deterministic repeat limit"
-            )
+            blocked.chatter[0].detail,
+            "The repeated path still does not exist.\nEugene stopped making progress in the CodeReview stage and reached a deterministic repeat limit"
         );
         assert_eq!(
             blocked.chatter[1].message,
@@ -4522,14 +4105,14 @@ mod tests {
             }),
         ];
 
-        refresh_event_projections(&mut history);
+        refresh_history(&mut history);
 
         assert_eq!(
-            history[1]
-                .transcript
-                .as_ref()
-                .map(|metadata| (metadata.kind, metadata.summary_redundant)),
-            Some((TranscriptKind::SessionSummary, true))
+            (
+                history[1].transcript.kind,
+                history[1].transcript.summary_redundant,
+            ),
+            (TranscriptKind::SessionSummary, true)
         );
     }
 
@@ -4558,7 +4141,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_hydration_preserves_persisted_server_projections() {
+    fn round_trip_preserves_persisted_server_projections() {
         let mut envelope = EventEnvelope::new(AgentEvent::Correction {
             kind: CorrectionKind::RepositoryEvidence,
             message: "technical detail".to_string(),
@@ -4573,10 +4156,10 @@ mod tests {
             tone: TeamMessageTone::Success,
             headline: Some("Persisted wording".to_string()),
             message: "This exact authored message must survive replay.".to_string(),
-            detail: None,
+            detail: String::new(),
             audience: ChatterAudience::Team,
         }];
-        envelope.transcript = Some(TranscriptMetadata {
+        envelope.transcript = TranscriptMetadata {
             visibility: TranscriptVisibility::EvidenceOnly,
             kind: TranscriptKind::Evidence,
             entry_key: "persisted-entry".to_string(),
@@ -4585,22 +4168,23 @@ mod tests {
             dedupe_key: None,
             related_action_key: None,
             summary_redundant: false,
-        });
-        let mut events = vec![envelope];
-
-        hydrate_event_projections(&mut events);
+            session_effect: SessionEffect {
+                refresh: false,
+                running: SessionRunningEffect::Unchanged,
+                reset_intent: false,
+                title: None,
+            },
+        };
+        let events = vec![
+            serde_json::from_str::<EventEnvelope>(&serde_json::to_string(&envelope).unwrap())
+                .unwrap(),
+        ];
 
         assert_eq!(
             events[0].chatter[0].headline.as_deref(),
             Some("Persisted wording")
         );
-        assert_eq!(
-            events[0]
-                .transcript
-                .as_ref()
-                .map(|metadata| metadata.entry_key.as_str()),
-            Some("persisted-entry")
-        );
+        assert_eq!(events[0].transcript.entry_key.as_str(), "persisted-entry");
     }
 
     #[test]
@@ -4612,9 +4196,9 @@ mod tests {
                     "mode": "settled",
                     "paths": ["src/lib.rs", "src/main.rs"]
                 }),
-                call_id: Some("lsp-1".to_string()),
-                batch_id: None,
-                actor: Some(TeamActor::workflow_steward()),
+                call_id: "lsp-1".to_string(),
+                batch_id: "batch-lsp".to_string(),
+                actor: TeamActor::workflow_steward(),
                 nesting_depth: None,
                 timestamp_ms: None,
             }),
@@ -4628,11 +4212,11 @@ mod tests {
                     "stale": false
                 })
                 .to_string(),
-                call_id: Some("lsp-1".to_string()),
-                batch_id: None,
-                outcome: Some(ToolOutcome::Failed),
-                actor: Some(TeamActor::workflow_steward()),
-                duration_ms: None,
+                call_id: "lsp-1".to_string(),
+                batch_id: "batch-lsp".to_string(),
+                outcome: ToolOutcome::Failed,
+                actor: TeamActor::workflow_steward(),
+                duration_ms: 0,
                 energy_joules: None,
                 energy_kwh: None,
                 average_power_watts: None,
@@ -4642,13 +4226,10 @@ mod tests {
             }),
         ];
 
-        refresh_event_projections(&mut events);
+        refresh_history(&mut events);
 
         assert_eq!(
-            events[1]
-                .transcript
-                .as_ref()
-                .and_then(|metadata| metadata.tool_summary.as_deref()),
+            events[1].transcript.tool_summary.as_deref(),
             Some("settled · 1 blocking diagnostic in 2 files · 3 deferred")
         );
     }
@@ -4663,19 +4244,20 @@ mod tests {
             changed_paths: vec!["webui/src/App.tsx".to_string()],
             detail: None,
         };
-        let mut events = vec![
-            EventEnvelope::new(AgentEvent::TeamMessage {
-                actor: TeamActor::workflow_steward(),
-                tone: TeamMessageTone::Info,
-                purpose: TeamMessagePurpose::HandoffProgress,
-                handoff: None,
-                message: "Checking the web app.".to_string(),
-                detail: None,
-                evidence_ids: Vec::new(),
-                nesting_depth: None,
-                timestamp_ms: None,
-            }),
-            EventEnvelope::new(AgentEvent::TeamMessage {
+        let progress = EventEnvelope::new(AgentEvent::TeamMessage {
+            actor: TeamActor::workflow_steward(),
+            tone: TeamMessageTone::Info,
+            purpose: TeamMessagePurpose::HandoffProgress,
+            handoff: None,
+            message: "Checking the web app.".to_string(),
+            detail: None,
+            evidence_ids: Vec::new(),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+        let progress_key = progress.transcript.entry_key.clone();
+        let mut outcome = EventEnvelope::new_superseding(
+            AgentEvent::TeamMessage {
                 actor: TeamActor::workflow_steward(),
                 tone: TeamMessageTone::Success,
                 purpose: TeamMessagePurpose::HandoffOutcome,
@@ -4685,21 +4267,13 @@ mod tests {
                 evidence_ids: Vec::new(),
                 nesting_depth: None,
                 timestamp_ms: None,
-            }),
-        ];
-
-        refresh_event_projections(&mut events);
-        let progress_key = events[0]
-            .transcript
-            .as_ref()
-            .map(|metadata| metadata.entry_key.clone())
-            .unwrap();
+            },
+            vec![progress_key.clone()],
+        );
+        outcome.refresh_projections(std::slice::from_ref(&progress));
         assert_eq!(
-            events[1]
-                .transcript
-                .as_ref()
-                .map(|metadata| metadata.supersedes.as_slice()),
-            Some([progress_key].as_slice())
+            outcome.transcript.supersedes.as_slice(),
+            [progress_key].as_slice()
         );
     }
 }

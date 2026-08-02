@@ -503,8 +503,8 @@ Tool schemas are derived from this matrix for every stage. A request-level allow
 policy can narrow the set further. Neither can broaden it.
 The legacy model-owned `todo`, `git_commit`, and `git_revert` schemas are retired from every current
 surface. The accepted plan, typed stage artifacts, checkpoint, deterministic checks, and managed
-commit already own that state and authority. Persisted legacy sessions remain readable, but a new
-allowlist or policy cannot revive the retired tools.
+commit already own that state and authority. Incompatible pre-v2 sessions are not restored, and no
+current allowlist or policy can revive the retired tools.
 
 ## Agent-tool runtime contract
 
@@ -728,14 +728,14 @@ the production controller-block arm. The controller records actual origin, exact
 coverage, fingerprints, and content-derived action identity. Model tools and controller actions
 remain distinct durable events. Each new model tool event also records the active profile
 character. Controller actions and deterministic corrections record Trinity Walker as the workflow
-steward plus the profile she is assisting when that context is available. Older tool events without
-an actor remain explicitly unattributed rather than inheriting a nearby profile.
+steward plus the profile she is assisting when that context is available. The v2 contract requires
+an actor on every model tool, controller action, model invocation, and deterministic correction.
 
-New tool calls and results also carry a stable call id, optional batch id, and a typed result outcome
-(`succeeded`, `failed`, `rejected`, `timed_out`, `cancelled`, or `cache_replay`). Consumers correlate
-by id even when parallel results arrive out of order or a correction occurs between call and result.
-Legacy events use a bounded tool/actor fallback only when both sides lack an id, and an absent legacy
-outcome remains unknown rather than being displayed as success.
+Every v2 tool call and result carries a required stable call id and batch id. Each result also carries
+a required typed outcome (`succeeded`, `failed`, `rejected`, `timed_out`, `cancelled`, or
+`cache_replay`) and measured duration. Consumers correlate by call id even when parallel results
+arrive out of order or a correction occurs between call and result; records missing that identity or
+outcome are rejected instead of matched by tool name or nearby actor.
 
 An exact active small-file observation may satisfy read-before-write only while its current
 fingerprint and complete prompt bytes remain valid. For an oversized UTF-8 Modify work unit, pb may
@@ -788,20 +788,36 @@ repeating actor identity in every row. Character attribution is
 presentation over typed events; it never changes a controller event into a model tool call or
 claims that a model requested an automatic action.
 
-The event envelope is also the shared conversational boundary. Corrections and workflow stops carry
-typed correction kinds and block causes; team messages carry a typed purpose and embed their own
-handoff summary when they report an outcome. Rust projects those events into ordered `chatter`
-records containing actor, tone, optional headline, plain-language message, technical detail, and
-explicit team-or-user audience. Stable transcript metadata separately declares visibility, event
-kind, stable entry identity, explicit supersession, related action, a typed tool-presentation
-summary, and whether a terminal summary repeats earlier event copy. The daemon persists that
-projection as authored. Replay treats persisted projections as authoritative and hydrates only
-fields missing from older records, so a new binary cannot silently rewrite historical teammate
-speech. Terminal, harness, and web consumers therefore render the same Trinity-authored messages;
-the browser owns only visual layout and optional local-username addressing. It does not parse raw
-controller JSON, compare diagnostic summary wording, scan later events for an unrelated handoff, or
-correlate raw tool arguments to invent or deduplicate teammate speech. Raw event fields remain intact
-as machine-readable evidence and progressive detail.
+The version-2 event envelope is also the shared conversational boundary. Corrections and workflow
+stops require producer-authored correction kinds and block causes; team messages require a typed
+purpose and embed their own handoff summary when they report an outcome. Rust projects those events
+into required, ordered `chatter` records containing actor, tone, optional headline, plain-language
+message, technical detail, and explicit team-or-user audience. Required transcript metadata
+separately declares visibility, event kind, stable entry identity, explicit supersession, related
+action, a typed tool-presentation summary, whether a terminal summary repeats earlier event copy,
+and the session refresh/running/title effect for live clients. Supersession links are exact entry
+keys retained and supplied by the producer; projection never guesses a replacement by actor,
+wording, or adjacency.
+
+Every tool call and result also carries a required durable call ID and batch ID. Results require a
+typed outcome and measured duration, so replay and browser grouping correlate exact calls without a
+tool-name or actor fallback. Current session list/detail responses always include their nullable
+state fields and empty collections explicitly, including pending questions and per-turn usage
+records; the TypeScript contract does not model those server fields as optionally omitted.
+
+Error events likewise carry a required concise summary and a separate required diagnostic detail.
+Consumers render that split directly instead of extracting a heading from diagnostic prose.
+
+The daemon persists the complete envelope and current session state as authored, and replay treats
+both as authoritative. There is no replay hydration, v1 projection reconstruction, or recovery of
+missing status, title, metrics, usage windows, or pending messages from adjacent events. Persisted
+sessions carry the matching v2 session schema and malformed or incompatible notes are skipped during
+restoration rather than migrated. Terminal,
+harness, and web consumers therefore render the same Trinity-authored messages; the browser owns
+only visual layout and optional local-username addressing. It does not parse raw controller JSON,
+recognize event-name prefixes for cache invalidation, compare diagnostic summary wording, scan later
+events for an unrelated handoff, or correlate raw tool arguments to invent or deduplicate teammate
+speech. Raw event fields remain intact as machine-readable evidence and progressive detail.
 
 The web UI gives every Trinity-owned row the same restrained lilac identity treatment on provenance,
 information affordances, and a narrow surface accent; avatars remain unoutlined. Other named
@@ -820,9 +836,9 @@ line. Stage changes, teammate chat, user messages, and material Trinity feedback
 boundaries. Internal bounded-turn accounting does not split a run. A terminal repeat-limit error
 remains durable evidence but is not rendered as a second actorless red card when Trinity's terminal
 delivery feedback already explains it; an adjacent workflow stop is combined into one conversational
-handoff without merging the underlying durable causes. When the same failed action produced an
-earlier identical correction, the transcript keeps the first explanation and repeated teammate
-action but suppresses stale duplicate corrections before the terminal outcome. The terminal outcome
+handoff without merging the underlying durable causes. When a producer explicitly replaces an
+earlier progress or correction entry, the transcript keeps every raw event but suppresses the exact
+superseded entry. The terminal outcome
 renders as two ordinary Trinity messages rather than a status card: the first directly tells the
 responsible teammate what went wrong and that their task is on hold, and the second addresses the
 local user by username with an available follow-up, restart, or resume request. The transcript does

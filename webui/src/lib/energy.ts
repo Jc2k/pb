@@ -3,24 +3,11 @@ import type { SessionMetricsSnapshot } from "../types";
 export function metricEnergyJoules(
   metrics: SessionMetricsSnapshot,
 ): number | undefined {
-  if (metrics.total_energy_joules !== undefined) {
-    return metrics.total_energy_joules;
-  }
-  // Current snapshots never promote overlapping diagnostic spans when the
-  // authoritative outer scope was unavailable (for example, another pb
-  // process owned the meter). The fallback below is only for legacy records.
-  if ((metrics.wall_runtime_ms ?? 0) > 0) return undefined;
-  const legacy = (metrics.llm_energy_joules ?? 0) +
-    (metrics.tool_energy_joules ?? 0);
-  if (legacy > 0) return legacy;
-  const legacyKwh = (metrics.llm_energy_kwh ?? 0) +
-    (metrics.tool_energy_kwh ?? 0);
-  return legacyKwh > 0 ? legacyKwh * 3_600_000 : undefined;
+  return metrics.total_energy_joules;
 }
 
 export function metricRuntimeMs(metrics: SessionMetricsSnapshot): number {
-  return metrics.wall_runtime_ms ||
-    metrics.llm_runtime_ms + metrics.tool_runtime_ms;
+  return metrics.wall_runtime_ms;
 }
 
 export function formatEnergy(joules?: number): string {

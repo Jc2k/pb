@@ -87,4 +87,58 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       rustEnumVariants(rustSource, typeName).map(snakeCase).sort(),
     );
   }
+
+  for (
+    const required of [
+      "chatter: EventChatter[]",
+      "transcript: TranscriptMetadata",
+      "entry_key: string",
+      "supersedes: string[]",
+      "summary_redundant: boolean",
+      "session_effect: SessionEffect",
+      "cause: WorkflowBlockCause",
+      "purpose: TeamMessagePurpose",
+      "kind: CorrectionKind",
+      "summary: string",
+      "detail: string",
+      "call_id: string",
+      "batch_id: string",
+      "evidence_ids: string[]",
+      "usage_records: SessionMetricsSnapshot[]",
+    ]
+  ) {
+    if (!types.includes(required)) {
+      throw new Error(`missing required v2 event field: ${required}`);
+    }
+  }
+});
+
+Deno.test("v2 consumers do not reconstruct omitted server state", async () => {
+  const [helpers, session, energy] = await Promise.all([
+    Deno.readTextFile("webui/src/lib/helpers.ts"),
+    Deno.readTextFile("webui/src/components/Session.tsx"),
+    Deno.readTextFile("webui/src/lib/energy.ts"),
+  ]);
+
+  for (
+    const workaround of [
+      "session.usage_records?.length",
+      "call.event.call_id || result.event.call_id",
+      'event.purpose || "unclassified"',
+      "teammateFeedback.detail || event.reason",
+      'String(event.message || "")',
+      "rawDetail.startsWith",
+    ]
+  ) {
+    if (helpers.includes(workaround) || session.includes(workaround)) {
+      throw new Error(
+        `v2 UI still reconstructs server state with: ${workaround}`,
+      );
+    }
+  }
+  if (energy.includes("legacy") || energy.includes("llm_energy_kwh ??")) {
+    throw new Error(
+      "v2 energy totals still contain a legacy snapshot fallback",
+    );
+  }
 });

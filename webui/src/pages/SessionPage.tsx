@@ -42,11 +42,10 @@ import {
 import {
   buildActionTimeline,
   chatEventsWithOnlyLatestStep,
-  latestAssistantProfile,
 } from "../lib/sessionUtils";
 
 export function workflowRecoveryPresentation(
-  workflow?: WorkflowSummary,
+  workflow?: WorkflowSummary | null,
 ): {
   title: string;
   description: string;
@@ -120,32 +119,20 @@ export function SessionPage() {
       try {
         const parsed = JSON.parse(msg.data) as EventEnvelope;
         setEvents((prev) => [...prev, parsed]);
-        if (parsed.event.type === "session_title") {
-          const title = parsed.event.title;
+        const effect = parsed.transcript.session_effect;
+        if (effect.title) {
+          const title = effect.title;
           setSession((current) => current ? { ...current, title } : current);
         }
-        if (
-          parsed.event.type.startsWith("goal_") ||
-          parsed.event.type.startsWith("workflow_") ||
-          parsed.event.type === "task_plan_accepted" ||
-          parsed.event.type === "task_plan_rejected" ||
-          parsed.event.type === "tasks_changed" ||
-          parsed.event.type === "session_summary"
-        ) {
+        if (effect.refresh) {
           void fetchSession();
         }
-        if (parsed.event.type === "started") {
+        if (effect.running === "running") {
           setSessionRunning(true);
-        } else if (parsed.event.type === "user_question") {
+        } else if (effect.running === "stopped") {
           setSessionRunning(false);
-          void fetchSession();
-        } else if (parsed.event.type === "user_answer") {
-          setSessionRunning(true);
-        } else if (
-          parsed.event.type === "final" ||
-          parsed.event.type === "session_summary"
-        ) {
-          setSessionRunning(false);
+        }
+        if (effect.reset_intent) {
           setIntent("discuss");
         }
       } catch (err) {
@@ -640,9 +627,8 @@ export function SessionPage() {
                       : (
                         <MessageBubble
                           envelope={grouped as EventEnvelope}
-                          activityProfile={latestAssistantProfile(events)}
                           evidenceEvents={events}
-                          workflow={session.workflow}
+                          workflow={session.workflow ?? undefined}
                           showIdentity={showIdentity}
                         />
                       );

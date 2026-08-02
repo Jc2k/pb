@@ -93,7 +93,6 @@ pub enum WorkflowControlAssertion {
     NoChangeCreatesNoCommit,
     ResumePreservesStageAndBudget,
     WebHarnessProjectionParity,
-    LegacyStateHasNoStrictClaim,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -408,9 +407,9 @@ fn parse_control_fixture_corpus(contents: &str) -> Result<ControlFixtureCorpus> 
             );
         }
     }
-    if corpus.workflow_fixtures.len() != 25 {
+    if corpus.workflow_fixtures.len() != 24 {
         bail!(
-            "harness workflow fixture corpus must contain the 25 required assertions; found {}",
+            "harness workflow fixture corpus must contain the 24 required assertions; found {}",
             corpus.workflow_fixtures.len()
         );
     }
@@ -1484,6 +1483,7 @@ fn execute_workflow_assertion_tail(
                 })?;
             state.run.apply(crate::workflow::WorkflowEvent::Blocked {
                 outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+                cause: crate::workflow::WorkflowBlockCause::ExecutorUnavailable,
                 reason: "pause for recovery".to_string(),
             })?;
             let encoded = serde_json::to_vec(&crate::workflow::WorkflowCheckpoint::new(
@@ -1614,43 +1614,6 @@ fn execute_workflow_assertion_tail(
                 tool_calls: outcome.tool_calls,
                 ..WorkflowAssertionObservation::default()
             })
-        }
-        WorkflowControlAssertion::LegacyStateHasNoStrictClaim => {
-            let state = workflow_fixture_state()?;
-            let request = workflow_fixture_request(state.scratch.path())?;
-            let persisted = crate::session_store::PersistedSession::from_parts(
-                "legacy-workflow-fixture".to_string(),
-                request,
-                None,
-                Some(state.scratch.path().to_path_buf()),
-                false,
-                crate::session_store::SessionStatus::Completed,
-                Vec::new(),
-            );
-            let mut value = serde_json::to_value(persisted)?;
-            let object = value
-                .as_object_mut()
-                .context("persisted session is not an object")?;
-            object.remove("workflow");
-            object.remove("completed_workflows");
-            if let Some(request) = object
-                .get_mut("request_template")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                request.remove("intent");
-                request.remove("workflow_policy");
-                request.remove("workflow_checkpoint");
-                request.remove("turn_id");
-            }
-            let restored: crate::session_store::PersistedSession = serde_json::from_value(value)?;
-            require_workflow_fixture(
-                restored.workflow.is_none()
-                    && restored.completed_workflows.is_empty()
-                    && restored.request_template.workflow_policy.is_none()
-                    && restored.request_template.workflow_checkpoint.is_none(),
-                "legacy state acquired a strict workflow claim",
-            )?;
-            Ok(WorkflowAssertionObservation::default())
         }
         _ => bail!("workflow assertion was routed to the wrong evaluator"),
     }
@@ -3625,7 +3588,7 @@ fn summarize_fixture(
     )
     .then(|| {
         events.iter().rev().find_map(|event| match event {
-            AgentEvent::Error { message, .. } => Some(message.clone()),
+            AgentEvent::Error { detail, .. } => Some(detail.clone()),
             _ => None,
         })
     })
@@ -4304,11 +4267,9 @@ mod tests {
         let trace = summarize_tool_trace(&[AgentEvent::ToolCall {
             tool: "write_file".repeat(20),
             arguments: arguments.clone(),
-            call_id: None,
-            batch_id: None,
-            actor: Some(crate::events::TeamActor::agent(
-                crate::agent_core::AgentProfile::Build,
-            )),
+            call_id: "call-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            actor: crate::events::TeamActor::agent(crate::agent_core::AgentProfile::Build),
             nesting_depth: None,
             timestamp_ms: None,
         }]);

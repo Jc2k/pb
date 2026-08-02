@@ -87,14 +87,14 @@ pub fn run_handoff(
         return Ok(HandoffAttempt::NoChange(summary));
     }
 
-    if !plan.checks.is_empty() {
+    let progress_entry_key = if !plan.checks.is_empty() {
         let labels = plan
             .checks
             .iter()
             .filter_map(|id| graph.checks.get(id))
             .map(|check| check.label.as_str())
             .collect::<Vec<_>>();
-        sink.emit(AgentEvent::TeamMessage {
+        Some(sink.emit_keyed(AgentEvent::TeamMessage {
             actor: handoff_actor(),
             tone: TeamMessageTone::Info,
             purpose: crate::events::TeamMessagePurpose::HandoffProgress,
@@ -107,8 +107,10 @@ pub fn run_handoff(
             evidence_ids: Vec::new(),
             nesting_depth: event_nesting_depth,
             timestamp_ms: Some(now_millis()),
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     let run = match runtime.run_plan(&plan, EvidenceSource::Handoff, nesting_depth, sink) {
         Ok(run) => run,
@@ -129,7 +131,7 @@ pub fn run_handoff(
                 changed_paths: plan.changed_paths,
                 detail: Some(detail.clone()),
             };
-            sink.emit(AgentEvent::TeamMessage {
+            sink.emit_superseding(AgentEvent::TeamMessage {
                 actor: handoff_actor(),
                 tone: TeamMessageTone::Error,
                 purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
@@ -141,7 +143,7 @@ pub fn run_handoff(
                 evidence_ids: Vec::new(),
                 nesting_depth: event_nesting_depth,
                 timestamp_ms: Some(now_millis()),
-            });
+            }, progress_entry_key.iter().cloned().collect());
             emit_summary(sink, summary.clone(), event_nesting_depth);
             return Ok(HandoffAttempt::ExecutorUnavailable { summary, detail });
         }
@@ -169,7 +171,7 @@ pub fn run_handoff(
                     changed_paths: current_changed_paths,
                     detail: Some(detail.clone()),
                 };
-                sink.emit(AgentEvent::TeamMessage {
+                sink.emit_superseding(AgentEvent::TeamMessage {
                     actor: handoff_actor(),
                     tone: TeamMessageTone::Error,
                     purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
@@ -181,7 +183,7 @@ pub fn run_handoff(
                     evidence_ids,
                     nesting_depth: event_nesting_depth,
                     timestamp_ms: Some(now_millis()),
-                });
+                }, progress_entry_key.iter().cloned().collect());
                 emit_summary(sink, summary.clone(), event_nesting_depth);
                 return Ok(HandoffAttempt::CommitBlocked { summary, detail });
             }
@@ -217,17 +219,20 @@ pub fn run_handoff(
             "Everything affected passed. The task’s existing commit is ready to hand back."
                 .to_string()
         };
-        sink.emit(AgentEvent::TeamMessage {
-            actor: handoff_actor(),
-            tone: TeamMessageTone::Success,
-            purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
-            handoff: Some(summary.clone()),
-            message,
-            detail: None,
-            evidence_ids,
-            nesting_depth: event_nesting_depth,
-            timestamp_ms: Some(now_millis()),
-        });
+        sink.emit_superseding(
+            AgentEvent::TeamMessage {
+                actor: handoff_actor(),
+                tone: TeamMessageTone::Success,
+                purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+                handoff: Some(summary.clone()),
+                message,
+                detail: None,
+                evidence_ids,
+                nesting_depth: event_nesting_depth,
+                timestamp_ms: Some(now_millis()),
+            },
+            progress_entry_key.iter().cloned().collect(),
+        );
         emit_summary(sink, summary.clone(), event_nesting_depth);
         return Ok(if outcome == HandoffOutcome::NoChange {
             HandoffAttempt::NoChange(summary)
@@ -269,20 +274,23 @@ pub fn run_handoff(
         changed_paths: plan.changed_paths,
         detail: Some(feedback.clone()),
     };
-    sink.emit(AgentEvent::TeamMessage {
-        actor: handoff_actor(),
-        tone: TeamMessageTone::Warning,
-        purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
-        handoff: Some(summary.clone()),
-        message: format!(
-            "{} failed. I’ve sent that back to Kate for another pass.",
-            natural_list(&failed.iter().map(String::as_str).collect::<Vec<_>>())
-        ),
-        detail: Some(feedback.clone()),
-        evidence_ids,
-        nesting_depth: event_nesting_depth,
-        timestamp_ms: Some(now_millis()),
-    });
+    sink.emit_superseding(
+        AgentEvent::TeamMessage {
+            actor: handoff_actor(),
+            tone: TeamMessageTone::Warning,
+            purpose: crate::events::TeamMessagePurpose::HandoffOutcome,
+            handoff: Some(summary.clone()),
+            message: format!(
+                "{} failed. I’ve sent that back to Kate for another pass.",
+                natural_list(&failed.iter().map(String::as_str).collect::<Vec<_>>())
+            ),
+            detail: Some(feedback.clone()),
+            evidence_ids,
+            nesting_depth: event_nesting_depth,
+            timestamp_ms: Some(now_millis()),
+        },
+        progress_entry_key.iter().cloned().collect(),
+    );
     emit_summary(sink, summary.clone(), event_nesting_depth);
     Ok(HandoffAttempt::NeedsRepair {
         summary,

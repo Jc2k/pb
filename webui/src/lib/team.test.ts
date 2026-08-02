@@ -5,7 +5,6 @@ import {
   profilePresentation,
   teamActorAccentClass,
   teamActorPresentation,
-  workflowStewardActor,
 } from "./team.ts";
 
 Deno.test("profile characters own model actions", () => {
@@ -18,17 +17,12 @@ Deno.test("profile characters own model actions", () => {
 });
 
 Deno.test("Trinity owns harness workflow stewardship", () => {
-  deepEqual(workflowStewardActor(), { kind: "automation", id: "trinity" });
-  const trinity = teamActorPresentation(workflowStewardActor());
+  const actor = { kind: "automation", id: "trinity" } as const;
+  deepEqual(actor, { kind: "automation", id: "trinity" });
+  const trinity = teamActorPresentation(actor);
   equal(trinity.name, "Trinity Walker");
   equal(trinity.role, "Team steward");
   equal(trinity.provenance, "Harness");
-});
-
-Deno.test("legacy actorless tool actions remain unattributed", () => {
-  const legacy = teamActorPresentation();
-  equal(legacy.name, "Agent");
-  equal(legacy.provenance, "Legacy");
 });
 
 Deno.test("team message accents follow profile avatar palettes", () => {
@@ -39,8 +33,7 @@ Deno.test("team message accents follow profile avatar palettes", () => {
     "teammate-message teammate-build",
   );
   equal(
-    teamActorAccentClass(workflowStewardActor()),
+    teamActorAccentClass({ kind: "automation", id: "trinity" }),
     "teammate-message trinity-message",
   );
-  equal(teamActorAccentClass(), "");
 });

@@ -246,10 +246,12 @@ pub enum WorkflowEvent {
     },
     Blocked {
         outcome: WorkflowOutcome,
+        cause: super::WorkflowBlockCause,
         reason: String,
     },
     Failed {
         outcome: WorkflowOutcome,
+        cause: super::WorkflowBlockCause,
         reason: String,
     },
     Cancelled {
@@ -563,7 +565,11 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
                 repository_remote,
             )?);
         }
-        WorkflowEvent::Blocked { outcome, reason } => {
+        WorkflowEvent::Blocked {
+            outcome,
+            cause,
+            reason,
+        } => {
             if !matches!(
                 outcome,
                 WorkflowOutcome::ExecutorUnavailable | WorkflowOutcome::CommitBlocked
@@ -574,10 +580,14 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.stage = WorkflowStage::Blocked;
             run.outcome = Some(outcome);
             let reason = required("blocked reason", reason)?;
-            run.blocked_cause = Some(super::WorkflowBlockCause::classify(outcome, &reason));
+            run.blocked_cause = Some(cause);
             run.blocked_reason = Some(reason);
         }
-        WorkflowEvent::Failed { outcome, reason } => {
+        WorkflowEvent::Failed {
+            outcome,
+            cause,
+            reason,
+        } => {
             if matches!(
                 outcome,
                 WorkflowOutcome::Ready | WorkflowOutcome::NoChange | WorkflowOutcome::Cancelled
@@ -588,7 +598,7 @@ pub fn reduce(mut run: WorkflowRun, event: WorkflowEvent) -> Result<WorkflowRun>
             run.paused_stage = None;
             run.outcome = Some(outcome);
             let reason = required("failure reason", reason)?;
-            run.blocked_cause = Some(super::WorkflowBlockCause::classify(outcome, &reason));
+            run.blocked_cause = Some(cause);
             run.blocked_reason = Some(reason);
         }
         WorkflowEvent::Cancelled { reason } => {

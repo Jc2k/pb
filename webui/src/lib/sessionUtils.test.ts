@@ -5,17 +5,39 @@ import {
   buildActionTimeline,
   buildToolSummaries,
   chatEventsWithOnlyLatestStep,
-  errorSummary,
   getToolDetail,
   harnessEfficiencyStats,
-  latestAssistantProfile,
   trustedSessionSummaryCommitLines,
 } from "./sessionUtils.ts";
+
+let testEventIndex = 0;
+function eventEnvelopeDefaults(): Pick<
+  EventEnvelope,
+  "chatter" | "transcript"
+> {
+  testEventIndex += 1;
+  return {
+    chatter: [],
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      entry_key: `test-event-${testEventIndex}`,
+      supersedes: [],
+      summary_redundant: false,
+      session_effect: {
+        refresh: false,
+        running: "unchanged",
+        reset_intent: false,
+      },
+    },
+  };
+}
 
 Deno.test("harness efficiency uses durable help and prevention evidence", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "controller_observation",
         actor: { kind: "automation", id: "trinity" },
@@ -41,10 +63,13 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "llm_invocation",
         step: 1,
+        purpose: "conversation",
+        profile: "build",
         duration_ms: 100,
         prompt_tokens: 10,
         generated_tokens: 2,
@@ -62,44 +87,60 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
           model_family: "test",
           expert_strategy: "test",
           prefill_command_kind: "test",
+          prefill_command_reason: "test fixture",
           thinking_enabled: false,
           rejected_constraint_candidates: 7,
           mutation_constraint_rejections: { invalid_syntax: 3 },
+          mutation_snapshot_files: 0,
+          mutation_snapshot_bytes: 0,
+          decode_recovery: "candidate_probe_only",
         },
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "repeated_tool_correction",
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
+        actor: { kind: "automation", id: "trinity" },
         summary: "Repeated tool call blocked",
         message: "duplicate",
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "dependent_tool_batch_correction",
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
+        actor: { kind: "automation", id: "trinity" },
         summary: "Dependent tool batch rejected",
         message: "dependent",
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "no_progress_correction",
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
+        actor: { kind: "automation", id: "trinity" },
         summary: "No-progress tool outcome detected",
         message: "loop",
       },
@@ -121,16 +162,20 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
 Deno.test("buildActionTimeline preserves chronology and actor provenance", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_call",
         tool: "read_file",
         arguments: { path: "src/lib.rs" },
+        call_id: "read-lib",
+        batch_id: "batch-read-lib",
         actor: { kind: "agent", id: "review" },
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "controller_observation",
         actor: { kind: "automation", id: "trinity" },
@@ -156,27 +201,33 @@ Deno.test("buildActionTimeline preserves chronology and actor provenance", () =>
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_result",
         tool: "read_file",
         result: "contents",
+        call_id: "read-lib",
+        batch_id: "batch-read-lib",
+        outcome: "succeeded",
         actor: { kind: "agent", id: "review" },
+        duration_ms: 1,
       },
     },
   ];
 
   const timeline = buildActionTimeline(events);
   equal(timeline.length, 2);
-  equal(timeline[0].actor?.kind, "agent");
+  equal(timeline[0].actor.kind, "agent");
   equal(timeline[0].result?.event.type, "tool_result");
-  equal(timeline[1].actor?.kind, "automation");
+  equal(timeline[1].actor.kind, "automation");
   equal(timeline[1].assistingProfile, "review");
 });
 
 Deno.test("strict workflow summaries require typed commit evidence", () => {
   const workflow: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "workflow_started",
       workflow_id: "run-1",
@@ -185,13 +236,16 @@ Deno.test("strict workflow summaries require typed commit evidence", () => {
     },
   };
   const commit: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "commit_result",
       success: true,
       created: true,
       reused: false,
       oid: "abc123",
+      changed_paths: [],
+      detail: "",
     },
   };
 
@@ -204,15 +258,17 @@ Deno.test("strict workflow summaries require typed commit evidence", () => {
     ["abc delivery commit"],
   );
   deepEqual(
-    trustedSessionSummaryCommitLines("abc legacy summary", []),
-    ["abc legacy summary"],
+    trustedSessionSummaryCommitLines("abc non-workflow summary", []),
+    ["abc non-workflow summary"],
   );
 });
 
 Deno.test("getToolDetail shows session_title call title", () => {
   const call: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     transcript: {
+      ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
       kind: "conversation",
       tool_summary: "Wire title tool",
@@ -220,7 +276,10 @@ Deno.test("getToolDetail shows session_title call title", () => {
     event: {
       type: "tool_call",
       tool: "session_title",
+      actor: { kind: "agent", id: "build" },
       arguments: { title: "Wire title tool" },
+      call_id: "title-1",
+      batch_id: "batch-title",
     },
   };
 
@@ -229,8 +288,10 @@ Deno.test("getToolDetail shows session_title call title", () => {
 
 Deno.test("getToolDetail keeps search scope and summarizes workflow submissions", () => {
   const search: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     transcript: {
+      ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
       kind: "conversation",
       tool_summary: "branch.*selector · in webui",
@@ -238,12 +299,17 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
     event: {
       type: "tool_call",
       tool: "search",
+      actor: { kind: "agent", id: "build" },
       arguments: { pattern: "branch.*selector", path: "webui" },
+      call_id: "search-1",
+      batch_id: "batch-search",
     },
   };
   const changes: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     transcript: {
+      ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
       kind: "conversation",
       tool_summary: "Recent sessions and changes",
@@ -251,12 +317,17 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
     event: {
       type: "tool_call",
       tool: "session_changes",
+      actor: { kind: "agent", id: "build" },
       arguments: {},
+      call_id: "changes-1",
+      batch_id: "batch-changes",
     },
   };
   const plan: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     transcript: {
+      ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
       kind: "conversation",
       tool_summary: "1 requirement · 1 step · 1 acceptance check",
@@ -264,6 +335,9 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
     event: {
       type: "tool_call",
       tool: "submit_plan",
+      actor: { kind: "agent", id: "plan" },
+      call_id: "plan-1",
+      batch_id: "batch-plan",
       arguments: {
         requirements: [{ id: "r1" }],
         steps: [{ id: "s1" }],
@@ -272,8 +346,10 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
     },
   };
   const incompletePlan: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     transcript: {
+      ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
       kind: "conversation",
       tool_summary: "Incomplete plan · missing required sections",
@@ -281,7 +357,10 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
     event: {
       type: "tool_call",
       tool: "submit_plan",
+      actor: { kind: "agent", id: "plan" },
       arguments: { requirements: [], steps: [], acceptance: [] },
+      call_id: "plan-2",
+      batch_id: "batch-plan",
     },
   };
 
@@ -299,17 +378,22 @@ Deno.test("getToolDetail keeps search scope and summarizes workflow submissions"
 
 Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
   const call: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "tool_call",
       tool: "lsp_proactive_diagnostics",
       arguments: { mode: "settled", paths: ["src/lib.rs", "src/main.rs"] },
+      call_id: "lsp-complete",
+      batch_id: "batch-lsp-complete",
       actor: { kind: "automation", id: "trinity" },
     },
   };
   const result: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     transcript: {
+      ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
       kind: "conversation",
       tool_summary: "settled · 1 blocking diagnostic in 2 files · 3 deferred",
@@ -317,6 +401,11 @@ Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
     event: {
       type: "tool_result",
       tool: "lsp_proactive_diagnostics",
+      actor: { kind: "automation", id: "trinity" },
+      call_id: "lsp-complete",
+      batch_id: "batch-lsp-complete",
+      outcome: "succeeded",
+      duration_ms: 1,
       result: JSON.stringify({
         scanned_paths: ["src/lib.rs", "src/main.rs"],
         diagnostics: [{ path: "src/lib.rs" }],
@@ -324,7 +413,6 @@ Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
         omitted_paths: 3,
         stale: false,
       }),
-      actor: { kind: "automation", id: "trinity" },
     },
   };
 
@@ -336,17 +424,22 @@ Deno.test("getToolDetail summarizes Trinity's proactive LSP pass", () => {
 
 Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
   const call: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "tool_call",
       tool: "lsp_proactive_diagnostics",
       arguments: { mode: "settled", paths: ["src/lib.rs"] },
       call_id: "lsp-1",
+      batch_id: "batch-lsp-1",
+      actor: { kind: "automation", id: "trinity" },
     },
   };
   const result: EventEnvelope = {
-    version: "1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     transcript: {
+      ...eventEnvelopeDefaults().transcript,
       visibility: "visible",
       kind: "conversation",
       tool_summary: "settled · incomplete evidence · 1/2 server/file targets",
@@ -368,7 +461,10 @@ Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
         completed_targets: [{ server: "rust", path: "src/lib.rs" }],
       }),
       call_id: "lsp-1",
+      batch_id: "batch-lsp-1",
       outcome: "failed",
+      actor: { kind: "automation", id: "trinity" },
+      duration_ms: 1,
     },
   };
 
@@ -381,8 +477,10 @@ Deno.test("getToolDetail never presents partial LSP coverage as clean", () => {
 Deno.test("buildToolSummaries includes session_title parameters in drawer details", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "conversation",
         tool_summary: "Wire title tool",
@@ -390,13 +488,18 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
       event: {
         type: "tool_call",
         tool: "session_title",
+        actor: { kind: "agent", id: "build" },
         arguments: { title: "Wire title tool" },
+        call_id: "title-1",
+        batch_id: "batch-title",
         timestamp_ms: 1_782_735_600_000,
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "conversation",
         tool_summary: "Wire title tool",
@@ -404,7 +507,11 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
       event: {
         type: "tool_result",
         tool: "session_title",
+        actor: { kind: "agent", id: "build" },
         result: "session title set: Wire title tool",
+        call_id: "title-1",
+        batch_id: "batch-title",
+        outcome: "succeeded",
         duration_ms: 4,
       },
     },
@@ -429,8 +536,10 @@ Deno.test("buildToolSummaries includes session_title parameters in drawer detail
 Deno.test("buildToolSummaries shows joules, power, and parallel measurement scope", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "conversation",
         tool_summary: "power",
@@ -438,12 +547,17 @@ Deno.test("buildToolSummaries shows joules, power, and parallel measurement scop
       event: {
         type: "tool_call",
         tool: "web_search",
+        actor: { kind: "agent", id: "research" },
         arguments: { query: "power" },
+        call_id: "search-power",
+        batch_id: "batch-search-power",
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "conversation",
         tool_summary: "power",
@@ -451,7 +565,11 @@ Deno.test("buildToolSummaries shows joules, power, and parallel measurement scop
       event: {
         type: "tool_result",
         tool: "web_search",
+        actor: { kind: "agent", id: "research" },
         result: "done",
+        call_id: "search-power",
+        batch_id: "batch-search-power",
+        outcome: "succeeded",
         duration_ms: 1_500,
         energy_joules: 42,
         average_power_watts: 28,
@@ -469,19 +587,23 @@ Deno.test("buildToolSummaries shows joules, power, and parallel measurement scop
 Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicator", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "started",
         task: "Implement loading state",
         model: "/models/local.gguf",
         workspace: "/repo",
         branch: "feat-loading-state",
+        attachments: [],
         profile: "build",
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "activity",
         kind: "activity",
       },
@@ -492,8 +614,10 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "activity",
         kind: "activity",
       },
@@ -515,8 +639,10 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
 Deno.test("running user messages stay in chat while delivery acknowledgements stay internal", () => {
   const events: EventEnvelope[] = [
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "conversation",
         entry_key: "handoff-progress",
@@ -528,8 +654,10 @@ Deno.test("running user messages stay in chat while delivery acknowledgements st
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "evidence_only",
         kind: "evidence",
       },
@@ -549,7 +677,8 @@ Deno.test("running user messages stay in chat while delivery acknowledgements st
 Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated by final message", () => {
   const events: EventEnvelope[] = [
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "final",
         content: "Fixed the bug.",
@@ -557,8 +686,10 @@ Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated 
       },
     },
     {
-      version: "1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "session_summary",
         summary_redundant: true,
@@ -567,7 +698,13 @@ Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated 
         type: "session_summary",
         branch: "fix-duplicate-summary",
         commits: "abc123 fix: avoid duplicate summary",
+        reached_final: true,
+        contract_status: "satisfied",
+        verified_completed: true,
         summary: " Fixed the bug. ",
+        power_summary: "",
+        diff_stat: "",
+        diff: "",
       },
     },
   ];
@@ -576,7 +713,7 @@ Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated 
 
   equal(summaryEvent.event.type, "session_summary");
   if (summaryEvent.event.type === "session_summary") {
-    equal(summaryEvent.event.summary, undefined);
+    equal(summaryEvent.event.summary, "");
     equal(summaryEvent.event.commits, "abc123 fix: avoid duplicate summary");
   }
 });
@@ -584,30 +721,37 @@ Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated 
 Deno.test("chat hides internal closure checkpoints and deduplicates blocked delivery text", () => {
   const events: EventEnvelope[] = [
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "evidence_only",
         kind: "workflow_closure_checkpoint",
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
         summary: "Workflow closure checkpoint",
         message: '{"type":"workflow_closure_checkpoint","stage":"planning"}',
         actor: { kind: "automation", id: "trinity" },
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "workflow_blocked",
+        cause: "other",
         workflow_id: "workflow-1",
         outcome: "plan_rejected",
         reason: "The planning submission was rejected three times.",
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "session_summary",
         summary_redundant: true,
@@ -616,7 +760,13 @@ Deno.test("chat hides internal closure checkpoints and deduplicates blocked deli
         type: "session_summary",
         branch: "main",
         commits: "",
+        reached_final: false,
+        contract_status: "unsatisfied",
+        verified_completed: false,
         summary: "The planning submission was rejected three times.",
+        power_summary: "",
+        diff_stat: "",
+        diff: "",
       },
     },
   ];
@@ -628,56 +778,34 @@ Deno.test("chat hides internal closure checkpoints and deduplicates blocked deli
   ]);
   const summary = visible[1].event;
   equal(summary.type, "session_summary");
-  if (summary.type === "session_summary") equal(summary.summary, undefined);
-});
-
-Deno.test("latestAssistantProfile falls back to the started profile for early activity", () => {
-  const events: EventEnvelope[] = [
-    {
-      version: "1",
-      event: {
-        type: "started",
-        task: "Implement loading state",
-        model: "/models/local.gguf",
-        workspace: "/repo",
-        branch: "feat-loading-state",
-        profile: "build",
-      },
-    },
-    {
-      version: "1",
-      event: {
-        type: "step_started",
-        step: 1,
-        max_steps: 20,
-        profile: "build",
-      },
-    },
-  ];
-
-  equal(latestAssistantProfile(events), "build");
+  if (summary.type === "session_summary") equal(summary.summary, "");
 });
 
 Deno.test("handoff progress is replaced by the teammate result while raw evidence stays out of chat", () => {
   const events: EventEnvelope[] = [
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "conversation",
         entry_key: "handoff-progress",
       },
       event: {
         type: "team_message",
-        actor: { kind: "automation", id: "handoff" },
+        actor: { kind: "automation", id: "trinity" },
         tone: "info",
         purpose: "handoff_progress",
         message: "I’m checking the API tests.",
+        evidence_ids: [],
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "evidence_only",
         kind: "evidence",
       },
@@ -691,18 +819,22 @@ Deno.test("handoff progress is replaced by the teammate result while raw evidenc
         truncated: false,
         duration_ms: 10,
         fingerprint: "input",
+        dependency_outputs: {},
+        reused: false,
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "conversation",
         supersedes: ["handoff-progress"],
       },
       event: {
         type: "team_message",
-        actor: { kind: "automation", id: "handoff" },
+        actor: { kind: "automation", id: "trinity" },
         tone: "warning",
         purpose: "handoff_outcome",
         handoff: {
@@ -712,6 +844,7 @@ Deno.test("handoff progress is replaced by the teammate result while raw evidenc
           changed_paths: [],
         },
         message: "The API tests failed. I sent that back to Kate.",
+        evidence_ids: [],
       },
     },
   ];
@@ -725,29 +858,20 @@ Deno.test("handoff progress is replaced by the teammate result while raw evidenc
   if (message.type === "team_message") equal(message.tone, "warning");
 });
 
-Deno.test("errorSummary prefers explicit error summaries", () => {
-  equal(
-    errorSummary({
-      type: "error",
-      summary: "Invalid pb JSON action on step 10/12",
-      message:
-        "Invalid pb JSON action on step 10/12: failed to parse agent JSON action",
-    }),
-    "Invalid pb JSON action on step 10/12",
-  );
-});
-
 Deno.test("terminal repeat errors stay in evidence but collapse into Trinity feedback in chat", () => {
   const events: EventEnvelope[] = [
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
-        kind: "repeated_tool_detected",
+        kind: "repeated_tool_correction",
         entry_key: "repeat-detected-1",
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
         summary: "Repeated tool call detected",
         message: "Choose another action.",
         actor: { kind: "automation", id: "trinity" },
@@ -755,14 +879,17 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "repeated_tool_correction",
         entry_key: "repeat-correction-1",
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
         summary: "Eugene reached the repeat limit",
         message: "The duplicate was blocked.",
         actor: { kind: "automation", id: "trinity" },
@@ -770,14 +897,17 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
-        kind: "repeated_tool_detected",
+        kind: "repeated_tool_correction",
         entry_key: "repeat-detected-2",
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
         summary: "Repeated tool call detected",
         message: "Use a different action.",
         actor: { kind: "automation", id: "trinity" },
@@ -785,8 +915,10 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       },
     },
     ...Array.from({ length: 6 }, (_, index): EventEnvelope => ({
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "activity",
         kind: "activity",
       },
@@ -798,14 +930,17 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       },
     })),
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "repeated_tool_correction",
         entry_key: "repeat-correction-2",
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
         summary: "Eugene reached the repeat limit",
         message: "The final duplicate was blocked before execution.",
         actor: { kind: "automation", id: "trinity" },
@@ -813,21 +948,25 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
-        kind: "terminal_tool_loop_error",
+        kind: "conversation",
         entry_key: "repeat-error",
       },
       event: {
         type: "error",
         summary: "Kate reached the repeat limit",
-        message: "No further model turn ran.",
+        detail: "No further model turn ran.",
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "workflow_blocked",
         supersedes: [
@@ -840,6 +979,7 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
       },
       event: {
         type: "workflow_blocked",
+        cause: "other",
         workflow_id: "workflow-1",
         outcome: "commit_blocked",
         reason: "model stage Implementing changed Git control state (HEAD)",
@@ -866,17 +1006,22 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
   });
   const events: EventEnvelope[] = [
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_call",
         tool: "read_file",
         arguments: { path: "webui/src/components/SessionRows.tsx" },
+        call_id: "read-1",
+        batch_id: "batch-read",
         actor: { kind: "agent", id: "review" },
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "correction",
         entry_key: "failed-read-1",
@@ -886,6 +1031,7 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
         summary: "read_file failed",
         message: failedRead,
         actor: { kind: "automation", id: "trinity" },
@@ -893,17 +1039,22 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "tool_call",
         tool: "read_file",
         arguments: { path: "webui/src/components/SessionRows.tsx" },
+        call_id: "read-2",
+        batch_id: "batch-read",
         actor: { kind: "agent", id: "review" },
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "correction",
         entry_key: "failed-read-2",
@@ -913,6 +1064,7 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
         summary: "read_file tool call was not executed successfully",
         message: repeatedFailedRead,
         actor: { kind: "automation", id: "trinity" },
@@ -920,14 +1072,17 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "workflow_blocked",
         supersedes: ["failed-read-2"],
       },
       event: {
         type: "workflow_blocked",
+        cause: "other",
         workflow_id: "workflow-1",
         outcome: "step_limit",
         reason:
@@ -948,14 +1103,17 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
 Deno.test("no-progress loop errors collapse into the terminal Trinity message", () => {
   const events: EventEnvelope[] = [
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "no_progress_correction",
         entry_key: "no-progress",
       },
       event: {
         type: "correction",
+        kind: "artifact_validation",
         summary: "No-progress tool outcome detected",
         message: "Use a different action that changes the work unit.",
         actor: { kind: "automation", id: "trinity" },
@@ -963,28 +1121,33 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
-        kind: "terminal_tool_loop_error",
+        kind: "conversation",
         entry_key: "no-progress-error",
       },
       event: {
         type: "error",
         summary: "No-progress tool loop",
-        message:
+        detail:
           "The same read result reached its deterministic stop threshold.",
       },
     },
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       transcript: {
+        ...eventEnvelopeDefaults().transcript,
         visibility: "visible",
         kind: "workflow_blocked",
         supersedes: ["no-progress", "no-progress-error"],
       },
       event: {
         type: "workflow_blocked",
+        cause: "other",
         workflow_id: "workflow-1",
         outcome: "step_limit",
         reason:
@@ -999,13 +1162,16 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
 
 Deno.test("work-unit progress credits do not split adjacent action runs", () => {
   const visible = chatEventsWithOnlyLatestStep([{
-    version: "v1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     transcript: {
+      ...eventEnvelopeDefaults().transcript,
       visibility: "evidence_only",
       kind: "work_unit_progress",
     },
     event: {
       type: "correction",
+      kind: "artifact_validation",
       summary: "Work-unit progress earned one bounded turn",
       message: "Internal bounded turn accounting.",
       actor: { kind: "automation", id: "trinity" },

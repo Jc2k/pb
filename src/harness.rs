@@ -230,6 +230,7 @@ struct JournalState {
     summary: CapturedSummary,
     audit: HarnessRunAudit,
     write_error: Option<String>,
+    terminal_precursor_keys: Vec<String>,
     workflow_checkpoint: PathBuf,
     multi_task_checkpoint: PathBuf,
 }
@@ -270,6 +271,7 @@ impl HarnessEventSink {
                 summary: CapturedSummary::default(),
                 audit: HarnessRunAudit::default(),
                 write_error: None,
+                terminal_precursor_keys: Vec::new(),
                 workflow_checkpoint: workflow_checkpoint.to_path_buf(),
                 multi_task_checkpoint: workflow_checkpoint
                     .with_file_name("multi-task-checkpoint.json"),
@@ -325,11 +327,15 @@ impl HarnessEventSink {
 
 impl EventSink for HarnessEventSink {
     fn emit(&mut self, event: AgentEvent) {
+        self.emit_superseding(event, Vec::new());
+    }
+
+    fn emit_superseding(&mut self, event: AgentEvent, supersedes: Vec<String>) {
         let Ok(mut state) = self.state.lock() else {
             eprintln!("pb harness: event journal lock was poisoned");
             return;
         };
-        let mut envelope = EventEnvelope::new(event);
+        let mut envelope = EventEnvelope::new_superseding(event, supersedes);
         envelope.refresh_projections(&state.events);
         render_event(&envelope);
 
@@ -362,7 +368,7 @@ impl EventSink for HarnessEventSink {
                 state.audit.controller_closures += 1;
             }
             AgentEvent::Error {
-                message, summary, ..
+                detail, summary, ..
             } => {
                 let bounded_stop = matches!(
                     summary.as_str(),
@@ -381,7 +387,7 @@ impl EventSink for HarnessEventSink {
                         "experiment_error"
                     },
                     title: nonempty_or(summary, "agent error"),
-                    detail: compact_detail(message),
+                    detail: compact_detail(detail),
                 });
             }
             AgentEvent::Correction {
@@ -576,6 +582,21 @@ impl EventSink for HarnessEventSink {
             state.write_error = Some(write_errors.join("; "));
         }
         state.events.push(envelope);
+    }
+
+    fn emit_terminal_precursor(&mut self, event: AgentEvent) {
+        let entry_key = crate::events::event_entry_key(&event);
+        self.emit(event);
+        if let Ok(mut state) = self.state.lock() {
+            state.terminal_precursor_keys.push(entry_key);
+        }
+    }
+
+    fn take_terminal_precursor_keys(&mut self) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.terminal_precursor_keys))
+            .unwrap_or_default()
     }
 
     fn checkpoint_workflow(
@@ -3095,6 +3116,7 @@ mod tests {
         blocked_run
             .apply(crate::workflow::WorkflowEvent::Blocked {
                 outcome: crate::workflow::WorkflowOutcome::ExecutorUnavailable,
+                cause: crate::workflow::WorkflowBlockCause::ExecutorUnavailable,
                 reason: "configured executor is unavailable".to_string(),
             })
             .unwrap();
@@ -3428,7 +3450,7 @@ mod tests {
             });
         }
         sink.emit(AgentEvent::Correction {
-            kind: crate::events::CorrectionKind::General,
+            kind: crate::events::CorrectionKind::ToolUnavailable,
             message: "mutation denied".to_string(),
             summary: "Tool not available".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
@@ -3825,14 +3847,14 @@ mod tests {
         )
         .unwrap();
         sink.emit(AgentEvent::Error {
-            message: "model returned prose instead of a bounded action".to_string(),
             summary: "Invalid pb JSON action on step 1/3".to_string(),
+            detail: "model returned prose instead of a bounded action".to_string(),
             nesting_depth: None,
             timestamp_ms: None,
         });
         sink.emit(AgentEvent::Error {
-            message: "three equivalent parse failures".to_string(),
             summary: "Parse retry limit reached".to_string(),
+            detail: "three equivalent parse failures".to_string(),
             nesting_depth: None,
             timestamp_ms: None,
         });
@@ -3970,7 +3992,7 @@ mod tests {
         )
         .unwrap();
         sink.emit(AgentEvent::Correction {
-            kind: crate::events::CorrectionKind::General,
+            kind: crate::events::CorrectionKind::WorkUnit,
             message: "create alpha.txt now".to_string(),
             summary: "Next accepted-plan creation work unit".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
@@ -4019,22 +4041,25 @@ mod tests {
             &events.with_extension("checkpoint.json"),
         )
         .unwrap();
-        for (summary, message) in [
+        for (kind, summary, message) in [
             (
+                crate::events::CorrectionKind::WorkUnit,
                 "Active accepted-plan work unit",
                 "Harness work unit path:0: create slug.js now",
             ),
             (
+                crate::events::CorrectionKind::WorkUnit,
                 "Work-unit progress earned one bounded turn",
                 "Harness progress credit: work unit path:0 produced a new transition",
             ),
             (
+                crate::events::CorrectionKind::Diagnostics,
                 "Harness diagnostic preview",
                 "Harness diagnostic preview passed. This grants no final evidence.",
             ),
         ] {
             sink.emit(AgentEvent::Correction {
-                kind: crate::events::CorrectionKind::General,
+                kind,
                 message: message.to_string(),
                 summary: summary.to_string(),
                 actor: crate::events::TeamActor::workflow_steward(),

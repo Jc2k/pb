@@ -18,9 +18,22 @@ function session(status: SessionItem["status"]): SessionItem {
     running: status === "running",
     paused: status === "paused",
     status,
+    intent: null,
     branch: "main",
     workdir: "/tmp/project",
+    handoff_outcome: null,
+    pending_question: null,
     updated_at_ms: Date.now(),
+    metrics: null,
+    usage_records: [],
+    workflow_id: null,
+    workflow_stage: null,
+    workflow_outcome: null,
+    strict_workflow: false,
+    goal: null,
+    active_goal: false,
+    multi_task: null,
+    active_multi_task: false,
   };
 }
 

@@ -9,7 +9,7 @@ import type {
   TeamActor,
 } from "../types/index";
 import { metricEnergyJoules, metricRuntimeMs } from "./energy";
-import { teamActorKey, workflowStewardActor } from "./team";
+import { teamActorKey } from "./team";
 
 export { getAvatarForProfile } from "./team";
 
@@ -63,7 +63,7 @@ export function sessionPageDocumentTitle(
 
 export type ActionGroup = {
   type: "action_group";
-  actor?: TeamActor;
+  actor: TeamActor;
   assistingProfile?: string;
   inferenceEvents: EventEnvelope[];
   toolCalls: EventEnvelope[];
@@ -92,14 +92,7 @@ export function toolEventsMatch(
   if (call.event.type !== "tool_call" || result.event.type !== "tool_result") {
     return false;
   }
-  if (call.event.call_id || result.event.call_id) {
-    return Boolean(
-      call.event.call_id && result.event.call_id &&
-        call.event.call_id === result.event.call_id,
-    );
-  }
-  return call.event.tool === result.event.tool &&
-    teamActorKey(call.event.actor) === teamActorKey(result.event.actor);
+  return call.event.call_id === result.event.call_id;
 }
 
 export function toolResultForCall(
@@ -142,7 +135,7 @@ export function groupActionEvents(
     }
     grouped.push({
       type: "action_group",
-      actor: currentActor,
+      actor: currentActor!,
       assistingProfile: currentAssistingProfile,
       inferenceEvents: [...currentInferenceEvents],
       toolCalls: [...currentToolCalls],
@@ -157,16 +150,14 @@ export function groupActionEvents(
     currentAssistingProfile = undefined;
   };
 
-  const beginOrSwitchGroup = (
-    actor: TeamActor | undefined,
-    assistingProfile?: string,
-  ) => {
+  const beginOrSwitchGroup = (actor: TeamActor, assistingProfile?: string) => {
     const hasActions = currentToolCalls.length > 0 ||
       currentToolResults.length > 0 || currentControllerActions.length > 0 ||
       currentInferenceEvents.length > 0;
     if (
       hasActions &&
-      (teamActorKey(currentActor) !== teamActorKey(actor) ||
+      (currentActor === undefined ||
+        teamActorKey(currentActor) !== teamActorKey(actor) ||
         currentAssistingProfile !== assistingProfile)
     ) flush();
     const groupIsEmpty = currentToolCalls.length === 0 &&
@@ -193,9 +184,10 @@ export function groupActionEvents(
 
     if (event.event.type === "llm_invocation") {
       flushPendingInferences();
-      pendingInferenceActor = event.event.profile
-        ? { kind: "agent" as const, id: event.event.profile }
-        : undefined;
+      pendingInferenceActor = {
+        kind: "agent" as const,
+        id: event.event.profile,
+      };
       pendingInferenceEvents.push(event);
     } else if (
       event.event.type === "reasoning" ||
@@ -209,6 +201,7 @@ export function groupActionEvents(
       const actor = event.event.actor;
       if (
         pendingInferenceEvents.length > 0 &&
+        pendingInferenceActor !== undefined &&
         teamActorKey(pendingInferenceActor) !== teamActorKey(actor)
       ) {
         flushPendingInferences();
@@ -252,7 +245,7 @@ export function groupActionEvents(
     ) {
       flushPendingInferences();
       beginOrSwitchGroup(
-        event.event.actor || workflowStewardActor(),
+        event.event.actor,
         event.event.assisting_profile,
       );
       currentControllerActions.push(event);
@@ -293,7 +286,7 @@ function chatItemSpeakerKey(
   item: EventEnvelope | ActionGroup,
 ): string | undefined {
   if (isActionGroup(item)) {
-    return item.actor ? teamActorKey(item.actor) : undefined;
+    return teamActorKey(item.actor);
   }
 
   const event = item.event;
@@ -307,9 +300,9 @@ function chatItemSpeakerKey(
     case "user_question":
       return `agent:${event.profile}`;
     case "correction":
-      return teamActorKey(event.actor || workflowStewardActor());
+      return teamActorKey(event.actor);
     case "workflow_blocked": {
-      const speaker = item.chatter?.find((entry) => entry.audience === "team")
+      const speaker = item.chatter.find((entry) => entry.audience === "team")
         ?.actor;
       return speaker ? teamActorKey(speaker) : undefined;
     }
@@ -321,7 +314,7 @@ function chatItemSpeakerKey(
       return "system:delivery";
     case "tool_call":
     case "tool_result":
-      return event.actor ? teamActorKey(event.actor) : undefined;
+      return teamActorKey(event.actor);
     default:
       return undefined;
   }
@@ -403,7 +396,7 @@ export async function notifySessionFinished(
 }
 
 export function handoffNotificationTitle(
-  outcome: HandoffOutcome | undefined,
+  outcome: HandoffOutcome | null | undefined,
   status: SessionItem["status"],
 ): string {
   switch (outcome) {
@@ -426,7 +419,7 @@ export function handoffNotificationTitle(
   }
 }
 
-export function projectName(workdir?: string): string {
+export function projectName(workdir?: string | null): string {
   if (!workdir) return "Unknown project";
   const parts = workdir.replace(/\\/g, "/").split("/").filter(Boolean);
   return parts[parts.length - 1] || workdir;
@@ -444,10 +437,7 @@ export function usageStatsForToday(
   const totals: ProjectUsageStats = { tokens: 0, runtime_ms: 0, tool_calls: 0 };
   sessions.forEach((session) => {
     if (!session.metrics) return;
-    const records = session.usage_records?.length
-      ? session.usage_records
-      : [session.metrics];
-    records.forEach((metrics) => {
+    session.usage_records.forEach((metrics) => {
       const runtime = metricRuntimeMs(metrics);
       const endedAt = metrics.ended_at_ms ?? session.updated_at_ms;
       const startedAt = metrics.started_at_ms ?? Math.max(0, endedAt - runtime);

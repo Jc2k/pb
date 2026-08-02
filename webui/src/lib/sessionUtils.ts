@@ -2,7 +2,6 @@ import type { AgentEvent, EventEnvelope, TeamActor } from "../types";
 import { TOOL_FRIENDLY_NAMES, TOOL_ICONS } from "./constants";
 import { formatEnergy, formatPower } from "./energy";
 import { toolEventsMatch } from "./helpers";
-import { workflowStewardActor } from "./team";
 
 export { profileJobTitle, profileName } from "./team";
 
@@ -20,7 +19,7 @@ export interface ToolSummary {
 }
 
 export interface ActionTimelineItem {
-  actor?: TeamActor;
+  actor: TeamActor;
   assistingProfile?: string;
   envelope: EventEnvelope;
   result?: EventEnvelope;
@@ -69,16 +68,15 @@ export function harnessEfficiencyStats(
     if (event.type === "llm_invocation" && event.native) {
       stats.collarCandidatesFiltered += Math.max(
         0,
-        event.native.rejected_constraint_candidates || 0,
+        event.native.rejected_constraint_candidates,
       );
       stats.mutationCandidatesFiltered += Object.values(
-        event.native.mutation_constraint_rejections || {},
+        event.native.mutation_constraint_rejections,
       ).reduce((total, count) => total + Math.max(0, count), 0);
       continue;
     }
 
-    switch (envelope.transcript?.kind) {
-      case "repeated_tool_detected":
+    switch (envelope.transcript.kind) {
       case "repeated_tool_correction":
         stats.duplicateActionsPrevented += 1;
         break;
@@ -99,8 +97,8 @@ export function getToolDetail(
   toolResult?: EventEnvelope,
 ): string | null {
   if (toolCall.event.type !== "tool_call") return null;
-  return toolResult?.transcript?.tool_summary ??
-    toolCall.transcript?.tool_summary ?? null;
+  return toolResult?.transcript.tool_summary ??
+    toolCall.transcript.tool_summary ?? null;
 }
 
 export function buildToolSummaries(events: EventEnvelope[]): ToolSummary[] {
@@ -152,7 +150,7 @@ export function buildActionTimeline(
       event.type === "controller_mutation"
     ) {
       items.push({
-        actor: event.actor || workflowStewardActor(),
+        actor: event.actor,
         assistingProfile: event.assisting_profile,
         envelope,
       });
@@ -236,14 +234,13 @@ function addToolSummaryItem(
 function withoutRedundantSessionSummary(event: EventEnvelope): EventEnvelope {
   if (
     event.event.type !== "session_summary" || !event.event.summary ||
-    !event.transcript?.summary_redundant
+    !event.transcript.summary_redundant
   ) {
     return event;
   }
-  const { summary: _summary, ...sessionSummary } = event.event;
   return {
     ...event,
-    event: sessionSummary,
+    event: { ...event.event, summary: "" },
   };
 }
 
@@ -251,48 +248,17 @@ export function chatEventsWithOnlyLatestStep(
   events: EventEnvelope[],
 ): EventEnvelope[] {
   const superseded = new Set(
-    events.flatMap((event) => event.transcript?.supersedes || []),
+    events.flatMap((event) => event.transcript.supersedes),
   );
   const chatEvents = events
     .filter((event) =>
-      event.transcript?.visibility !== "evidence_only" &&
-      (!event.transcript?.entry_key ||
-        !superseded.has(event.transcript.entry_key))
+      event.transcript.visibility !== "evidence_only" &&
+      !superseded.has(event.transcript.entry_key)
     )
     .map(withoutRedundantSessionSummary);
   const lastVisibleIndex = chatEvents.length - 1;
   return chatEvents.filter((event, index) => {
-    return event.transcript?.visibility !== "activity" ||
+    return event.transcript.visibility !== "activity" ||
       index === lastVisibleIndex;
   });
-}
-
-export function latestAssistantProfile(
-  events: EventEnvelope[],
-): string | undefined {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i].event;
-    if (
-      event.type === "started" ||
-      event.type === "reasoning" ||
-      event.type === "final" ||
-      event.type === "user_question" ||
-      event.type === "sub_agent_started" ||
-      event.type === "sub_agent_finished"
-    ) {
-      return event.profile;
-    }
-  }
-  return undefined;
-}
-
-export function errorSummary(
-  event: Extract<AgentEvent, { type: "error" }>,
-): string {
-  const summary = event.summary?.trim();
-  if (summary) return summary;
-  const message = String(event.message || "").trim();
-  const firstLine = message.split("\n").find((line) => line.trim())?.trim();
-  if (!firstLine) return "Agent error";
-  return firstLine.length > 120 ? `${firstLine.slice(0, 117)}…` : firstLine;
 }

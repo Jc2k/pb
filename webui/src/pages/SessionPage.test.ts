@@ -14,6 +14,29 @@ import {
 
 import type { EventEnvelope } from "../types/index.ts";
 
+let testEventIndex = 0;
+function eventEnvelopeDefaults(): Pick<
+  EventEnvelope,
+  "chatter" | "transcript"
+> {
+  testEventIndex += 1;
+  return {
+    chatter: [],
+    transcript: {
+      visibility: "visible",
+      kind: "conversation",
+      entry_key: `test-event-${testEventIndex}`,
+      supersedes: [],
+      summary_redundant: false,
+      session_effect: {
+        refresh: false,
+        running: "unchanged",
+        reset_intent: false,
+      },
+    },
+  };
+}
+
 function cssRule(css: string, selector: string): string {
   const start = css.indexOf(`${selector} {`);
   ok(start >= 0, `missing CSS rule for ${selector}`);
@@ -25,7 +48,8 @@ function cssRule(css: string, selector: string): string {
 Deno.test("delivery proposal remains conversational until an explicit Build turn", () => {
   const events: EventEnvelope[] = [
     {
-      version: "v1",
+      ...eventEnvelopeDefaults(),
+      version: "v2",
       event: {
         type: "delivery_proposed",
         proposal_id: "proposal-1",
@@ -37,7 +61,8 @@ Deno.test("delivery proposal remains conversational until an explicit Build turn
   equal(latestPendingDeliveryProposal(events)?.proposal_id, "proposal-1");
 
   events.push({
-    version: "v1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "conversation_turn_started",
       turn_id: "turn-2",
@@ -48,7 +73,8 @@ Deno.test("delivery proposal remains conversational until an explicit Build turn
   equal(latestPendingDeliveryProposal(events)?.proposal_id, "proposal-1");
 
   events.push({
-    version: "v1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "conversation_turn_started",
       turn_id: "turn-3",
@@ -61,7 +87,8 @@ Deno.test("delivery proposal remains conversational until an explicit Build turn
 
 Deno.test("goal proposal stays read-only until a durable goal starts", () => {
   const events: EventEnvelope[] = [{
-    version: "v1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "goal_proposed",
       proposal_id: "goal-proposal-1",
@@ -72,7 +99,8 @@ Deno.test("goal proposal stays read-only until a durable goal starts", () => {
   }];
   equal(latestPendingGoalProposal(events)?.objective, "Ship goal mode");
   events.push({
-    version: "v1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "goal_started",
       goal_id: "goal-1",
@@ -85,7 +113,8 @@ Deno.test("goal proposal stays read-only until a durable goal starts", () => {
 
 Deno.test("model goal change requests remain pending only until a user path resolves them", () => {
   const events: EventEnvelope[] = [{
-    version: "v1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: {
       type: "goal_change_requested",
       goal_id: "goal-1",
@@ -95,7 +124,8 @@ Deno.test("model goal change requests remain pending only until a user path reso
   }];
   equal(latestGoalChangeRequest(events)?.kind, "budget");
   events.push({
-    version: "v1",
+    ...eventEnvelopeDefaults(),
+    version: "v2",
     event: { type: "goal_resumed", goal_id: "goal-1" },
   });
   equal(latestGoalChangeRequest(events), undefined);
@@ -203,10 +233,11 @@ Deno.test("session corrections render as direct steward chat with progressive de
 
   ok(types.includes('type: "correction"'));
   ok(types.includes("interface EventChatter"));
-  ok(types.includes("chatter?: EventChatter[]"));
+  ok(types.includes("chatter: EventChatter[]"));
+  ok(types.includes("transcript: TranscriptMetadata"));
   ok(component.includes('case "correction"'));
   ok(component.includes("function CorrectionNotice"));
-  ok(component.includes("workflowStewardActor()"));
+  ok(component.includes("teamActorPresentation(copy.actor)"));
   ok(component.includes("Correction from ${teammate.name}"));
   ok(component.includes('audience === "team"'));
   ok(!component.includes("trinityCorrectionCopy("));
@@ -226,7 +257,7 @@ Deno.test("session corrections render as direct steward chat with progressive de
   ok(component.includes('className="action-origin"'));
   ok(component.includes("chat-event-message"));
   ok(component.includes("trinity-message"));
-  ok(component.includes("<RichText content={message} />"));
+  ok(component.includes("<RichText content={copy.message} />"));
   ok(css.includes(".correction-bubble"));
   ok(css.includes("--trinity-accent:"));
   ok(css.includes(".teammate-message .thought-bubble"));
@@ -249,7 +280,7 @@ Deno.test("accepted delivery plans and reviewer prose stay visible in chat", asy
   ok(component.includes("Implementation"));
   ok(component.includes("Done when"));
   ok(component.includes('case "workflow_artifact_accepted"'));
-  ok(page.includes("workflow={session.workflow}"));
+  ok(page.includes("workflow={session.workflow ?? undefined}"));
   ok(!component.includes("Notes from this run"));
   ok(!helpers.includes("reasoningEvents:"));
 });
@@ -275,7 +306,7 @@ Deno.test("assistant and Trinity prose share safe inline Markdown rendering", as
   ok(component.includes("parseInlineRichText(content)"));
   ok(component.includes('className="rich-text-inline-code"'));
   ok(component.includes("<RichText content={e.content} />"));
-  ok(component.includes("<RichText content={message} />"));
+  ok(component.includes("<RichText content={copy.message} />"));
 });
 
 Deno.test("final assistant messages use profile avatars", async () => {
@@ -345,7 +376,7 @@ Deno.test("session metrics stay compact while inference details remain available
     component.indexOf("function InferenceDetails"),
   );
 
-  ok(types.includes("power_summary?: string"));
+  ok(types.includes("power_summary: string"));
   ok(
     component.includes(
       "funEnergySummary(totalRuntimeMs, totalTokens, totalEnergyJoules)",
@@ -429,8 +460,8 @@ Deno.test("session metrics stay compact while inference details remain available
 Deno.test("terminal Trinity feedback uses server-authored chatter and addresses the current user", async () => {
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
 
-  ok(component.includes("const teammateFeedback = envelope.chatter?.find("));
-  ok(component.includes("const userFeedback = envelope.chatter?.find("));
+  ok(component.includes("const teammateFeedback = envelope.chatter.find("));
+  ok(component.includes("const userFeedback = envelope.chatter.find("));
   ok(component.includes('audience === "current_user"'));
   ok(component.includes("@${currentUsername}, ${"));
   ok(!component.includes("Choose **Build** below"));

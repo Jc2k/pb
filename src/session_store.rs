@@ -13,6 +13,7 @@ const NOTES_NAMESPACE: &str = "refs/notes/pb/sessions";
 const MAX_RESTORED_HISTORY_EVENTS: usize = 1_000;
 const SESSION_GIT_NAME: &str = "pb";
 const SESSION_GIT_EMAIL: &str = "pb@localhost";
+pub const SESSION_SCHEMA_VERSION: &str = "v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +27,7 @@ pub enum SessionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
+    pub schema_version: String,
     pub session_id: String,
     pub task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -34,26 +36,20 @@ pub struct PersistedSession {
     pub workdir: Option<PathBuf>,
     pub request_template: AgentRequest,
     pub running: bool,
-    #[serde(default)]
-    pub status: Option<SessionStatus>,
+    pub status: SessionStatus,
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<SessionMetricsSnapshot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub usage_records: Vec<SessionMetricsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<crate::workflow::WorkflowCheckpoint>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_workflows: Vec<crate::workflow::WorkflowSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::goal::GoalCheckpoint>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_goals: Vec<crate::goal::GoalCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_user_messages: Vec<crate::events::QueuedUserMessage>,
     pub events: Vec<EventEnvelope>,
 }
@@ -73,6 +69,7 @@ impl PersistedSession {
             .filter_map(|envelope| SessionMetricsSnapshot::from_event(&envelope.event))
             .collect::<Vec<_>>();
         Self {
+            schema_version: SESSION_SCHEMA_VERSION.to_string(),
             session_id,
             task: request_template.task.clone(),
             title: latest_session_title(&events),
@@ -80,7 +77,7 @@ impl PersistedSession {
             workdir,
             request_template,
             running,
-            status: Some(status),
+            status,
             updated_at_ms: now_millis(),
             metrics: latest_session_metrics(&events),
             usage_records,
@@ -197,21 +194,13 @@ pub fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSe
                     }
                     session.multi_task = crate::task_queue::MultiTaskCheckpoint::new(run).ok();
                 }
-                session.status = Some(
-                    match session.status.unwrap_or({
-                        if session.running {
-                            SessionStatus::Running
-                        } else {
-                            SessionStatus::Completed
-                        }
-                    }) {
-                        SessionStatus::Running | SessionStatus::Queued | SessionStatus::Paused => {
-                            SessionStatus::Paused
-                        }
-                        SessionStatus::Completed => SessionStatus::Completed,
-                        SessionStatus::Failed => SessionStatus::Failed,
-                    },
-                );
+                session.status = match session.status {
+                    SessionStatus::Running | SessionStatus::Queued | SessionStatus::Paused => {
+                        SessionStatus::Paused
+                    }
+                    SessionStatus::Completed => SessionStatus::Completed,
+                    SessionStatus::Failed => SessionStatus::Failed,
+                };
                 session.running = false;
                 session.events = trim_events(session.events);
                 sessions.push(session);
@@ -240,15 +229,14 @@ fn read_note(workspace_root: &Path, note_ref: &str) -> Result<String> {
 fn parse_session(payload: &str) -> Result<PersistedSession> {
     let value: serde_json::Value =
         serde_json::from_str(payload).context("failed to parse session note")?;
-    let legacy_prompt_owned_delivery = value
-        .get("request_template")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|request| {
-            request
-                .get("intent")
-                .map_or(true, serde_json::Value::is_null)
-        });
-    let mut session: PersistedSession =
+    let schema_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .context("session note has no schema_version")?;
+    if schema_version != SESSION_SCHEMA_VERSION {
+        bail!("unsupported session schema '{schema_version}'; expected '{SESSION_SCHEMA_VERSION}'");
+    }
+    let session: PersistedSession =
         serde_json::from_value(value).context("failed to parse session note")?;
     if let Some(goal) = session.goal.as_ref() {
         goal.validate()
@@ -268,7 +256,6 @@ fn parse_session(payload: &str) -> Result<PersistedSession> {
             .validate()
             .context("completed multi-Task checkpoint is invalid")?;
     }
-    session.request_template.legacy_prompt_owned_delivery = legacy_prompt_owned_delivery;
     Ok(session)
 }
 
@@ -728,7 +715,7 @@ mod tests {
             active.goal.as_ref().unwrap().run.paused_stage,
             Some(crate::goal::GoalStage::RunningMilestone)
         );
-        assert_eq!(active.status, Some(SessionStatus::Paused));
+        assert_eq!(active.status, SessionStatus::Paused);
     }
 
     #[test]
@@ -813,10 +800,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_persisted_session_deserializes_without_workflow_claims() {
+    fn persisted_session_without_v2_schema_is_rejected() {
         let dir = init_repo();
         let session = PersistedSession::from_parts(
-            "legacy-session".to_string(),
+            "old-session".to_string(),
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
@@ -825,37 +812,34 @@ mod tests {
             Vec::new(),
         );
         let mut value = serde_json::to_value(session).unwrap();
-        let object = value.as_object_mut().unwrap();
-        object.remove("workflow");
-        object.remove("completed_workflows");
-        object
-            .get_mut("request_template")
-            .unwrap()
-            .as_object_mut()
-            .unwrap()
-            .retain(|field, _| {
-                !matches!(
-                    field.as_str(),
-                    "turn_id"
-                        | "intent"
-                        | "workflow_policy"
-                        | "workflow_stage"
-                        | "conversation_handoff"
-                )
-            });
+        value.as_object_mut().unwrap().remove("schema_version");
 
-        let restored = parse_session(&serde_json::to_string(&value).unwrap()).unwrap();
-        assert!(restored.workflow.is_none());
-        assert!(restored.completed_workflows.is_empty());
-        assert!(restored.request_template.intent.is_none());
-        assert!(restored.request_template.workflow_policy.is_none());
-        assert!(restored.request_template.workflow_stage.is_none());
-        assert!(restored.request_template.turn_id.is_empty());
-        assert!(restored.request_template.conversation_handoff.is_none());
-        assert!(restored.request_template.legacy_prompt_owned_delivery);
+        let error = parse_session(&serde_json::to_string(&value).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("has no schema_version"));
+    }
 
-        let restored_again = parse_session(&serde_json::to_string(&restored).unwrap()).unwrap();
-        assert!(restored_again.request_template.legacy_prompt_owned_delivery);
+    #[test]
+    fn persisted_v2_session_requires_authoritative_state_fields() {
+        let dir = init_repo();
+        let session = PersistedSession::from_parts(
+            "malformed-session".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        let value = serde_json::to_value(session).unwrap();
+
+        for field in ["status", "usage_records", "pending_user_messages"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                parse_session(&serde_json::to_string(&missing).unwrap()).is_err(),
+                "v2 session unexpectedly accepted without {field}"
+            );
+        }
     }
 
     #[test]

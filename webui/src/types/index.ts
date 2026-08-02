@@ -200,7 +200,7 @@ export type AgentEvent =
     type: "workflow_blocked";
     workflow_id: string;
     outcome: WorkflowOutcome;
-    cause?: WorkflowBlockCause;
+    cause: WorkflowBlockCause;
     reason: string;
     timestamp_ms?: number;
   }
@@ -219,7 +219,7 @@ export type AgentEvent =
     workspace: string;
     focus_root?: string;
     branch: string;
-    attachments?: SessionAttachment[];
+    attachments: SessionAttachment[];
     profile: AgentProfile;
     timestamp_ms?: number;
   }
@@ -249,9 +249,9 @@ export type AgentEvent =
     type: "tool_call";
     tool: string;
     arguments: unknown;
-    call_id?: string;
-    batch_id?: string;
-    actor?: TeamActor;
+    call_id: string;
+    batch_id: string;
+    actor: TeamActor;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -283,7 +283,7 @@ export type AgentEvent =
       >;
       fallback_reason?: string;
     };
-    actor?: TeamActor;
+    actor: TeamActor;
     assisting_profile?: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
@@ -293,7 +293,7 @@ export type AgentEvent =
     workflow_id: string;
     stage: WorkflowStage;
     reason: string;
-    actor?: TeamActor;
+    actor: TeamActor;
     assisting_profile?: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
@@ -316,7 +316,7 @@ export type AgentEvent =
       adopted: boolean;
       recovery: string;
     };
-    actor?: TeamActor;
+    actor: TeamActor;
     assisting_profile?: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
@@ -335,17 +335,17 @@ export type AgentEvent =
     type: "tool_result";
     tool: string;
     result: string;
-    call_id?: string;
-    batch_id?: string;
-    outcome?:
+    call_id: string;
+    batch_id: string;
+    outcome:
       | "succeeded"
       | "failed"
       | "rejected"
       | "timed_out"
       | "cancelled"
       | "cache_replay";
-    actor?: TeamActor;
-    duration_ms?: number;
+    actor: TeamActor;
+    duration_ms: number;
     energy_joules?: number;
     energy_kwh?: number;
     average_power_watts?: number;
@@ -358,7 +358,7 @@ export type AgentEvent =
     executor_id: string;
     kind: string;
     success: boolean;
-    detail?: string;
+    detail: string;
     timestamp_ms?: number;
   }
   | {
@@ -376,9 +376,9 @@ export type AgentEvent =
     executor?: string;
     source?: string;
     command_fingerprint?: string;
-    dependency_outputs?: Record<string, string>;
+    dependency_outputs: Record<string, string>;
     output_fingerprint?: string;
-    reused?: boolean;
+    reused: boolean;
     skip_reason?: string;
     nesting_depth?: number;
     timestamp_ms?: number;
@@ -387,11 +387,11 @@ export type AgentEvent =
     type: "team_message";
     actor: TeamActor;
     tone: TeamMessageTone;
-    purpose?: TeamMessagePurpose;
+    purpose: TeamMessagePurpose;
     handoff?: HandoffSummary;
     message: string;
     detail?: string;
-    evidence_ids?: string[];
+    evidence_ids: string[];
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -408,8 +408,8 @@ export type AgentEvent =
     reused: boolean;
     oid?: string;
     subject?: string;
-    changed_paths?: string[];
-    detail?: string;
+    changed_paths: string[];
+    detail: string;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -417,7 +417,7 @@ export type AgentEvent =
     type: "user_question";
     question_id: string;
     question: string;
-    choices?: string[];
+    choices: string[];
     profile: AgentProfile;
     timestamp_ms?: number;
   }
@@ -441,9 +441,9 @@ export type AgentEvent =
   | {
     type: "correction";
     message: string;
-    kind?: CorrectionKind;
-    summary?: string;
-    actor?: TeamActor;
+    kind: CorrectionKind;
+    summary: string;
+    actor: TeamActor;
     assisting_profile?: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
@@ -497,7 +497,7 @@ export type AgentEvent =
   | {
     type: "llm_invocation";
     step: number;
-    purpose?:
+    purpose:
       | "unclassified"
       | "conversation"
       | "task_partitioning"
@@ -507,8 +507,8 @@ export type AgentEvent =
       | "workflow_mutation"
       | "workflow_closure"
       | "workflow_recovery";
-    workflow_stage?: string;
-    profile?: AgentProfile;
+    workflow_stage?: WorkflowStage;
+    profile: AgentProfile;
     duration_ms: number;
     prompt_tokens: number;
     generated_tokens: number;
@@ -516,7 +516,7 @@ export type AgentEvent =
       source: string;
       cached_tokens: number;
       prefilled_tokens: number;
-      restore_ms?: number;
+      restore_ms: number;
       miss_reason?:
         | "cache_disabled"
         | "cold_session"
@@ -534,7 +534,7 @@ export type AgentEvent =
       root?: {
         descriptor_version: number;
         backend: string;
-        cache_format_version?: string;
+        cache_format_version: string;
         model_namespace_sha256: string;
         rendered_token_sha256: string;
         tokens: number;
@@ -606,7 +606,7 @@ export type AgentEvent =
       active_experts_per_token?: number;
       expert_strategy: string;
       prefill_command_kind: string;
-      prefill_command_reason?: string;
+      prefill_command_reason: string;
       thinking_enabled: boolean;
       refill?: {
         cache_lookup_wall_ms: number;
@@ -621,10 +621,23 @@ export type AgentEvent =
       tool_constraint_dialect?: string;
       tool_schema_sha256?: string;
       rejected_constraint_candidates: number;
-      mutation_constraint_rejections?: Record<string, number>;
-      mutation_snapshot_files?: number;
-      mutation_snapshot_bytes?: number;
+      mutation_constraint_rejections: Record<string, number>;
+      mutation_snapshot_files: number;
+      mutation_snapshot_bytes: number;
       constraint_terminal_state?: string;
+      constraint_guarantee_rung?: string;
+      semantic_boundary?: {
+        probes: number;
+        allows: number;
+        rejects: number;
+        defers: number;
+        wall_millis: number;
+        receipt?: SemanticGateReceipt;
+      };
+      decode_recovery:
+        | "candidate_probe_only"
+        | "replay_from_boundary"
+        | "snapshot_and_restore";
     };
     energy_joules?: number;
     energy_kwh?: number;
@@ -640,15 +653,15 @@ export type AgentEvent =
     generated_tokens: number;
     tool_calls: number;
     tool_runtime_ms: number;
-    cache_persistence_queued_checkpoints?: number;
-    cache_persistence_completed_checkpoints?: number;
-    cache_persistence_wall_ms?: number;
-    cache_persistence_failures?: number;
+    cache_persistence_queued_checkpoints: number;
+    cache_persistence_completed_checkpoints: number;
+    cache_persistence_wall_ms: number;
+    cache_persistence_failures: number;
     llm_energy_joules?: number;
     llm_energy_kwh?: number;
     tool_energy_joules?: number;
     tool_energy_kwh?: number;
-    wall_runtime_ms?: number;
+    wall_runtime_ms: number;
     started_at_ms?: number;
     ended_at_ms?: number;
     total_energy_joules?: number;
@@ -659,10 +672,10 @@ export type AgentEvent =
     energy_measured_ms?: number;
     energy_coverage?: number;
     energy_source?: string;
-    display_energy_excluded?: boolean;
-    idle_baseline_applied?: boolean;
-    energy_complete?: boolean;
-    energy_exclusive?: boolean;
+    display_energy_excluded: boolean;
+    idle_baseline_applied: boolean;
+    energy_complete: boolean;
+    energy_exclusive: boolean;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -675,29 +688,29 @@ export type AgentEvent =
     type: "session_summary";
     branch: string;
     commits: string;
-    reached_final?: boolean;
-    contract_status?: "unspecified" | "unsatisfied" | "satisfied";
-    verified_completed?: boolean;
+    reached_final: boolean;
+    contract_status: "unspecified" | "unsatisfied" | "satisfied";
+    verified_completed: boolean;
     termination_reason?: string;
     handoff_outcome?: HandoffOutcome;
-    summary?: string;
-    power_summary?: string;
-    diff_stat?: string;
-    diff?: string;
+    summary: string;
+    power_summary: string;
+    diff_stat: string;
+    diff: string;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
     type: "error";
-    message: string;
-    summary?: string;
+    summary: string;
+    detail: string;
     nesting_depth?: number;
     timestamp_ms?: number;
   };
 
 export type TeamActor =
   | { kind: "agent"; id: AgentProfile }
-  | { kind: "automation"; id: "trinity" | "handoff" };
+  | { kind: "automation"; id: "trinity" };
 
 export type TeamMessageTone = "info" | "success" | "warning" | "error";
 
@@ -707,7 +720,6 @@ export type TeamMessagePurpose =
   | "handoff_outcome";
 
 export type CorrectionKind =
-  | "general"
   | "artifact_validation"
   | "repository_evidence"
   | "contract_evidence"
@@ -749,7 +761,7 @@ export interface EventChatter {
   tone: TeamMessageTone;
   headline?: string;
   message: string;
-  detail?: string;
+  detail: string;
   audience: ChatterAudience;
 }
 
@@ -760,26 +772,34 @@ export type TranscriptKind =
   | "activity"
   | "evidence"
   | "correction"
-  | "repeated_tool_detected"
   | "repeated_tool_correction"
   | "no_progress_correction"
   | "dependent_tool_batch_correction"
   | "handoff_correction"
   | "workflow_closure_checkpoint"
   | "work_unit_progress"
-  | "terminal_tool_loop_error"
   | "workflow_blocked"
   | "session_summary";
 
 export interface TranscriptMetadata {
   visibility: TranscriptVisibility;
   kind: TranscriptKind;
-  entry_key?: string;
-  supersedes?: string[];
+  entry_key: string;
+  supersedes: string[];
   tool_summary?: string;
   dedupe_key?: string;
   related_action_key?: string;
-  summary_redundant?: boolean;
+  summary_redundant: boolean;
+  session_effect: SessionEffect;
+}
+
+export type SessionRunningEffect = "unchanged" | "running" | "stopped";
+
+export interface SessionEffect {
+  refresh: boolean;
+  running: SessionRunningEffect;
+  reset_intent: boolean;
+  title?: string;
 }
 
 export type HandoffOutcome =
@@ -817,11 +837,15 @@ export interface SessionMetricsSnapshot {
   generated_tokens: number;
   tool_calls: number;
   tool_runtime_ms: number;
+  cache_persistence_queued_checkpoints: number;
+  cache_persistence_completed_checkpoints: number;
+  cache_persistence_wall_ms: number;
+  cache_persistence_failures: number;
   llm_energy_joules?: number;
   llm_energy_kwh?: number;
   tool_energy_joules?: number;
   tool_energy_kwh?: number;
-  wall_runtime_ms?: number;
+  wall_runtime_ms: number;
   started_at_ms?: number;
   ended_at_ms?: number;
   total_energy_joules?: number;
@@ -832,17 +856,17 @@ export interface SessionMetricsSnapshot {
   energy_measured_ms?: number;
   energy_coverage?: number;
   energy_source?: string;
-  display_energy_excluded?: boolean;
-  idle_baseline_applied?: boolean;
-  energy_complete?: boolean;
-  energy_exclusive?: boolean;
+  display_energy_excluded: boolean;
+  idle_baseline_applied: boolean;
+  energy_complete: boolean;
+  energy_exclusive: boolean;
 }
 
 export interface EventEnvelope {
-  version: string;
+  version: "v2";
   event: AgentEvent;
-  chatter?: EventChatter[];
-  transcript?: TranscriptMetadata;
+  chatter: EventChatter[];
+  transcript: TranscriptMetadata;
 }
 
 export interface SemanticGateReceipt {
@@ -1318,60 +1342,60 @@ export interface WorkflowSummary {
 export interface SessionItem {
   session_id: string;
   task: string;
-  title?: string | null;
+  title: string | null;
   running: boolean;
   paused: boolean;
   status: SessionStatus;
-  intent?: TurnIntent;
-  branch?: string;
-  workdir?: string;
-  handoff_outcome?: HandoffOutcome;
-  pending_question?: {
+  intent: TurnIntent | null;
+  branch: string | null;
+  workdir: string | null;
+  handoff_outcome: HandoffOutcome | null;
+  pending_question: {
     question_id: string;
     question: string;
-    choices?: string[];
-  };
+    choices: string[];
+  } | null;
   updated_at_ms: number;
-  metrics?: SessionMetricsSnapshot | null;
-  usage_records?: SessionMetricsSnapshot[];
-  workflow_id?: string;
-  workflow_stage?: WorkflowStage;
-  workflow_outcome?: WorkflowOutcome;
-  strict_workflow?: boolean;
-  goal?: GoalSummary;
-  active_goal?: boolean;
-  multi_task?: MultiTaskSummary;
-  active_multi_task?: boolean;
+  metrics: SessionMetricsSnapshot | null;
+  usage_records: SessionMetricsSnapshot[];
+  workflow_id: string | null;
+  workflow_stage: WorkflowStage | null;
+  workflow_outcome: WorkflowOutcome | null;
+  strict_workflow: boolean;
+  goal: GoalSummary | null;
+  active_goal: boolean;
+  multi_task: MultiTaskSummary | null;
+  active_multi_task: boolean;
 }
 
 export interface SessionDetails {
   session_id: string;
   task: string;
-  title?: string | null;
+  title: string | null;
   running: boolean;
   paused: boolean;
   status: SessionStatus;
-  intent?: TurnIntent;
-  branch?: string;
-  workdir?: string;
-  handoff_outcome?: HandoffOutcome;
-  pending_question?: {
+  intent: TurnIntent | null;
+  branch: string | null;
+  workdir: string | null;
+  handoff_outcome: HandoffOutcome | null;
+  pending_question: {
     question_id: string;
     question: string;
-    choices?: string[];
-  };
+    choices: string[];
+  } | null;
   events: EventEnvelope[];
   updated_at_ms: number;
-  metrics?: SessionMetricsSnapshot | null;
-  usage_records?: SessionMetricsSnapshot[];
-  workflow?: WorkflowSummary;
-  strict_workflow?: boolean;
-  goal?: GoalCheckpoint;
-  active_goal?: boolean;
-  multi_task?: MultiTaskCheckpoint;
-  active_multi_task?: boolean;
-  task_plan_rejected?: TaskPlanRejected;
-  task_planning_transcript?: TaskPlanningTranscript;
+  metrics: SessionMetricsSnapshot | null;
+  usage_records: SessionMetricsSnapshot[];
+  workflow: WorkflowSummary | null;
+  strict_workflow: boolean;
+  goal: GoalCheckpoint | null;
+  active_goal: boolean;
+  multi_task: MultiTaskCheckpoint | null;
+  active_multi_task: boolean;
+  task_plan_rejected: TaskPlanRejected | null;
+  task_planning_transcript: TaskPlanningTranscript | null;
 }
 
 export interface ProjectEntry {
